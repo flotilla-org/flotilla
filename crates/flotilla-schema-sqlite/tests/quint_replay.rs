@@ -27,7 +27,7 @@ fn replay_quint_streams() {
         let file = path.file_name().unwrap().to_string_lossy();
         let field = if file.starts_with("message_race-") {
             "source"
-        } else if file.starts_with("inbox_delivery-") || file.starts_with("controller_delivery-") {
+        } else if file.starts_with("inbox_delivery-") || file.starts_with("service_delivery-") {
             "stream"
         } else {
             continue;
@@ -50,6 +50,7 @@ fn replay_quint_streams() {
                     vec![Frame::Keepalive {
                         home: "home".into(),
                         watermark: Watermark { home_seq: sequence, applied_through: moment(row.at) },
+                        homes: vec!["home".into()],
                     }]
                 } else {
                     let mut write = source.write().unwrap();

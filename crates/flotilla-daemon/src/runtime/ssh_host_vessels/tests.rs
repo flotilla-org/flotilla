@@ -13,7 +13,7 @@ use flotilla_provider_runtime::{
     host_environment::{HostEnvironment, HostSupply},
     ProcessCommandRunner,
 };
-use flotilla_resources::{FulfilmentFacts, Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSource, TerminalSessionSpec};
+use flotilla_resources::FulfilmentFacts;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
@@ -440,8 +440,8 @@ async fn two_vessels_on_one_host_each_get_their_own_agent_and_socket() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_caller_that_stops_waiting_does_not_cut_off_its_vessels_agent_upgrade() {
     let host = host(Arc::new(ProcessCommandRunner));
-    let build = (0..4 * 1024 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
-    let gate = Gate::closing_after(1024 * 1024);
+    let build = (0..256 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
+    let gate = Gate::closing_after(64 * 1024);
     let agents = Arc::new(LocalAgents::upgrading(build.clone(), Arc::clone(&gate)));
     let (sockets, _received) = recording_sockets(host.state.path());
     let vessels = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
@@ -470,8 +470,8 @@ async fn a_caller_that_stops_waiting_does_not_cut_off_its_vessels_agent_upgrade(
 #[tokio::test(flavor = "multi_thread")]
 async fn retiring_a_vessel_mid_preparation_closes_what_the_preparation_leaves() {
     let host = host(Arc::new(ProcessCommandRunner));
-    let build = (0..4 * 1024 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
-    let gate = Gate::closing_after(1024 * 1024);
+    let build = (0..256 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
+    let gate = Gate::closing_after(64 * 1024);
     let agents = Arc::new(LocalAgents::upgrading(build, Arc::clone(&gate)));
     let (sockets, _received) = recording_sockets(host.state.path());
     let vessels = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
@@ -669,45 +669,27 @@ fn vessel_environment_is_composed_from_the_layer_supplies_and_forward() {
     );
 }
 
-fn crew_spec(vessel: &str) -> TerminalSessionSpec {
-    TerminalSessionSpec::builder()
-        .env_ref(ENVIRONMENT.to_string())
-        .role("coder".to_string())
-        .source(TerminalSessionSource::Agent {
-            selector: Selector { capability: "code".into(), adapter: None, model: None },
-            brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: String::new(), copies: Vec::new() },
-            context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: "convoy-9".into(), vessel_ref: vessel.into() }),
-            message: None,
-        })
-        .cwd("/work".to_string())
-        .pool("cleat".to_string())
-        .build()
-}
-
 // A convoy homed on another daemon may place its vessel on this daemon's
 // SSH host: its replicated session keeps the vessel's agent alive.
 // Mutation check: listing local records only retires that agent.
 #[tokio::test]
 async fn a_replicated_tool_session_keeps_its_vessel_live() {
-    use flotilla_protocol::NodeId;
-    let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
-    let actuator = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("actuator"));
-    let sessions = home.clone().using::<TerminalSession>("flotilla");
-    sessions
-        .create(
-            &flotilla_resources::InputMeta::builder()
-                .name("terminal-convoy-9-work-coder".to_string())
-                .labels(BTreeMap::from([(flotilla_resources::VESSEL_REF_LABEL.to_string(), "convoy-9-work".to_string())]))
-                .build(),
-            &TerminalSessionSpec { source: TerminalSessionSource::Tool { command: "sh".into() }, ..crew_spec("convoy-9-work") },
-        )
-        .await
-        .expect("home session");
-    actuator
-        .replica_writer::<TerminalSession>(NodeId::new("home"), "flotilla")
-        .replace(&sessions.list().await.expect("home sessions"), chrono::Utc::now())
-        .await
-        .expect("replicate");
+    use flotilla_provisioning_testkit::EngineBackend;
+    use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource};
+    let home = EngineBackend::open_in("home", "flotilla");
+    let actuator = EngineBackend::open_in("actuator", "flotilla");
+    // The tool session the home requested for its vessel, in this daemon's environment.
+    home.engine.terminals.request(&TerminalLaunchRequest {
+        session: "terminal-convoy-9-work-coder".into(),
+        environment: ENVIRONMENT.into(),
+        vessel: Some("convoy-9-work".into()),
+        role: "coder".into(),
+        pool: "cleat".into(),
+        cwd: "/work".into(),
+        env: BTreeMap::new(),
+        source: TerminalLaunchSource::Tool { command: "sh".into() },
+    });
+    flotilla_provisioning_testkit::replicate_home(&home.service, home.home(), &actuator.service);
     let live = live_vessels(&actuator, "flotilla", ENVIRONMENT).await.expect("live vessels");
     assert_eq!(live, BTreeSet::from(["convoy-9-work".to_string()]));
     assert!(live_vessels(&actuator, "flotilla", "host-direct-b2").await.expect("live vessels").is_empty());

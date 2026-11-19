@@ -23,6 +23,7 @@ use flotilla_engine_store::{
     open_home, StoreLog,
 };
 use flotilla_resources::{
+    engine_records::{LogPosition, Since, UnloggedJournal},
     manifest_roots::{refusal_evidence, refusals, removals, root_stall, ManifestRoots, PassReport, RootDeclaration, RootView},
     DocumentKey, DocumentPhase, DocumentState, ManifestRootSpec, ManifestRootStatus, Resolution, ResolutionAction, ResolutionOutcome,
 };
@@ -30,7 +31,12 @@ use flotilla_schema::{Identity, Kind, KindCode, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
 
+use chrono::{DateTime, Utc};
+
 use super::manifest_root_import::document_name;
+use super::reads::created_at;
+use super::resume::followed_since;
+use super::watch::CommitsSeen;
 use crate::stored::manifest_root::{
     Act, Applied, DocumentName, ManifestRoot, Outcome, Rebind, RequestResolution, Resolve, Retire, RootEdge, RootRefusal, RootRequest,
     RootState, SourceFailed, Suspend, Unsuspend,
@@ -39,13 +45,22 @@ use crate::stored::manifest_root::{
 const ROOT: KindCode = <Resource<ManifestRoot> as Kind>::CODE;
 
 /// The name `name` was declared under: a generation's name without its `.<n>`.
-fn base(name: &str) -> &str {
+pub(crate) fn base(name: &str) -> &str {
     name.split_once('.').map_or(name, |(base, _)| base)
 }
 
 /// The generation of an engine name: 0 for the declared name itself.
 fn generation(name: &str) -> u64 {
     name.split_once('.').and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
+}
+
+/// The engine name of generation `generation` of the root declared as `name`.
+pub(crate) fn generation_name(name: &str, generation: u64) -> String {
+    if generation == 0 {
+        name.to_owned()
+    } else {
+        format!("{name}.{generation}")
+    }
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -58,6 +73,8 @@ type Roots = BTreeMap<(String, String), Resource<ManifestRoot>>;
 struct Resident {
     follower: Follower,
     roots: Roots,
+    /// When each held root was created, by home and engine name.
+    created: BTreeMap<(String, String), DateTime<Utc>>,
 }
 
 /// The ManifestRoots of the decided store at one home.
@@ -66,8 +83,14 @@ pub struct EngineManifestRoots {
     home: String,
     roots: Mutex<Home<ManifestRoot, StoreLog>>,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
     /// The last pass's judgement of each document of each root homed here, by engine name.
     judged: Mutex<BTreeMap<String, BTreeMap<DocumentKey, DocumentState>>>,
+    /// How many times a judgement changed since this home started; each change ticks watchers.
+    judged_changes: tokio::sync::watch::Sender<u64>,
+    /// The root each change of a judgement touched. Taken under `judged`.
+    unlogged: Mutex<UnloggedJournal>,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -78,9 +101,18 @@ impl EngineManifestRoots {
         let log = StoreLog::new(service.store());
         let home = log.home().to_owned();
         let roots = open_home::<ManifestRoot>(log)?;
-        let resident = Resident { follower: Follower::new([ROOT]), roots: BTreeMap::new() };
-        let opened =
-            Self { service, home, roots: Mutex::new(roots), resident: Mutex::new(resident), judged: Mutex::new(BTreeMap::new()), clock };
+        let resident = Resident { follower: Follower::new([ROOT]), roots: BTreeMap::new(), created: BTreeMap::new() };
+        let opened = Self {
+            commits: CommitsSeen::follow(&service, [ROOT]),
+            service,
+            home,
+            roots: Mutex::new(roots),
+            resident: Mutex::new(resident),
+            judged: Mutex::new(BTreeMap::new()),
+            judged_changes: tokio::sync::watch::Sender::new(0),
+            unlogged: Mutex::default(),
+            clock,
+        };
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
@@ -102,6 +134,9 @@ impl EngineManifestRoots {
     /// Brings the resident map up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         self.service
             .with_store(|store| {
@@ -114,7 +149,8 @@ impl EngineManifestRoots {
                 }
                 Ok(())
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())
+            .inspect_err(|_| self.commits.give_back())?;
         Ok(resident)
     }
 
@@ -150,18 +186,23 @@ impl EngineManifestRoots {
     /// Root `name`'s live generation at each home. A retired generation keeps its records for
     /// attribution but is no longer declared, so no view shows it, as the old store's deleted root.
     fn views(&self, resident: &Resident, name: Option<&str>) -> Vec<RootView> {
-        let mut chosen = BTreeMap::<(String, String), &Resource<ManifestRoot>>::new();
-        for ((home, engine), root) in &resident.roots {
-            if name.is_some_and(|name| base(engine) != name) || !matches!(root.state(), RootState::Bound { .. }) {
-                continue;
-            }
-            let slot = chosen.entry((home.clone(), base(engine).to_owned())).or_insert(root);
-            if generation(root.name()) > generation(slot.name()) {
-                *slot = root;
-            }
-        }
-        chosen.into_iter().map(|((home, _), root)| self.view(&home, root)).collect()
+        live_roots(resident, name).into_iter().map(|(home, root)| self.view(&home, root)).collect()
     }
+}
+
+/// Root `name`'s (or every root's) live generation at each home, with its home.
+fn live_roots<'a>(resident: &'a Resident, name: Option<&str>) -> Vec<(String, &'a Resource<ManifestRoot>)> {
+    let mut chosen = BTreeMap::<(String, String), &Resource<ManifestRoot>>::new();
+    for ((home, engine), root) in &resident.roots {
+        if name.is_some_and(|name| base(engine) != name) || !matches!(root.state(), RootState::Bound { .. }) {
+            continue;
+        }
+        let slot = chosen.entry((home.clone(), base(engine).to_owned())).or_insert(root);
+        if generation(root.name()) > generation(slot.name()) {
+            *slot = root;
+        }
+    }
+    chosen.into_iter().map(|((home, _), root)| (home, root)).collect()
 }
 
 /// Applies `edge` to root `engine` of `roots`; a write that changes nothing is done.
@@ -194,20 +235,28 @@ fn reload(read: &mut Read<'_>, resident: &mut Resident, identity: &Identity) -> 
     }
     let key = (identity.home.clone(), identity.name.clone());
     match read.resolve(ROOT, &identity.name, &identity.home)?.map(|id| read.load::<Resource<ManifestRoot>>(id)).transpose()?.flatten() {
-        Some(loaded) => resident.roots.insert(key, loaded.value.with_identity(&loaded.name, loaded.version)),
-        None => resident.roots.remove(&key),
-    };
+        Some(loaded) => {
+            resident.created.insert(key.clone(), created_at(read, loaded.id)?);
+            resident.roots.insert(key, loaded.value.with_identity(&loaded.name, loaded.version));
+        }
+        None => {
+            resident.created.remove(&key);
+            resident.roots.remove(&key);
+        }
+    }
     Ok(())
 }
 
 /// Reads every root homed at `home` into the resident map, in place of what it held.
 fn rescan(read: &mut Read<'_>, resident: &mut Resident, home: &str) -> Result<(), StoreError> {
     resident.roots.retain(|(owner, _), _| owner != home);
+    resident.created.retain(|(owner, _), _| owner != home);
     let mut after = None;
     loop {
         let page = read.scan::<Resource<ManifestRoot>>(home, after, 64)?;
         for id in page.ids {
             if let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? {
+                resident.created.insert((home.to_owned(), loaded.name.clone()), created_at(read, id)?);
                 resident.roots.insert((home.to_owned(), loaded.name.clone()), loaded.value.with_identity(&loaded.name, loaded.version));
             }
         }
@@ -390,10 +439,7 @@ impl ManifestRoots for EngineManifestRoots {
             }
             if open {
                 let last = roots.resources().filter(|root| base(root.name()) == name).map(|root| generation(root.name())).max();
-                let next = match last {
-                    None => name.to_owned(),
-                    Some(last) => format!("{name}.{}", last + 1),
-                };
+                let next = generation_name(name, last.map_or(0, |last| last + 1));
                 let request = RootRequest {
                     host: declaration.host.clone(),
                     path: declaration.path.clone(),
@@ -439,7 +485,14 @@ impl ManifestRoots for EngineManifestRoots {
         // The judgement follows the records just written; the settlements below are each their own
         // write, and a pass that fails among them is repeated whole by the next, which the claimed
         // check and `Unchanged` absorb.
-        locked(&self.judged).insert(engine.clone(), pass.documents.clone());
+        {
+            let mut judged = locked(&self.judged);
+            let before = judged.insert(engine.clone(), pass.documents.clone());
+            if before.as_ref() != Some(&pass.documents) {
+                let count = locked(&self.unlogged).record([base(&engine).to_owned()]);
+                self.judged_changes.send_replace(count);
+            }
+        }
         // Settle each resolution the pass claimed and finished.
         let resolutions = locked(&self.roots).get(&engine).map(|root| root.spec().resolutions.clone()).unwrap_or_default();
         for (key, document) in &pass.documents {
@@ -520,4 +573,178 @@ impl ManifestRoots for EngineManifestRoots {
             self.apply(&engine, Unsuspend { document }).map(drop)
         }
     }
+}
+
+impl std::fmt::Debug for EngineManifestRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineManifestRoots").field("home", &self.home).finish_non_exhaustive()
+    }
+}
+
+const ROOT_KIND: &str = "ManifestRoot";
+
+/// A root as the resource kind serves it.
+type RootRecord = flotilla_resources::engine_records::Record<flotilla_resources::ManifestRoot>;
+
+impl EngineManifestRoots {
+    /// Every home's live root (named `name`, when given) as the resource.
+    fn objects(&self, name: Option<&str>) -> Result<Vec<RootRecord>, String> {
+        let resident = self.refresh()?;
+        live_roots(&resident, name)
+            .into_iter()
+            .map(|(home, root)| {
+                let view = self.view(&home, root);
+                // The live generation's creation: a rebind opens the next generation as a new record.
+                let created_at = resident
+                    .created
+                    .get(&(home.clone(), root.name().to_owned()))
+                    .copied()
+                    .ok_or_else(|| format!("{ROOT_KIND} {} at {home} has no creation time", root.name()))?;
+                Ok(RootRecord {
+                    name: view.name,
+                    home,
+                    version: root.version().0,
+                    created_at,
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    spec: view.spec,
+                    status: Some(view.status),
+                })
+            })
+            .collect()
+    }
+}
+
+impl flotilla_store::EnginePort for EngineManifestRoots {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<flotilla_resources::ManifestRoot>(self);
+    }
+}
+
+/// The generic resource verbs read roots; a root is written only by its home's manifest
+/// reconciler and the `flotilla manifest` commands.
+#[async_trait::async_trait]
+impl flotilla_resources::engine_records::KindRecords<flotilla_resources::ManifestRoot> for EngineManifestRoots {
+    fn codes(&self) -> Vec<KindCode> {
+        vec![ROOT]
+    }
+
+    /// From a watch that reads the log after each commit, and from the judge of documents.
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        flotilla_resources::engine_records::Ticks::Followed
+    }
+
+    /// A judgement ticks as it changes.
+    fn commit_mark(&self) -> Option<flotilla_resources::engine_records::CommitMark> {
+        Some(super::commit_mark(&self.service, self.codes()))
+    }
+
+    /// This home's judgements of its roots' documents.
+    fn unlogged_changes(&self) -> Option<u64> {
+        Some(locked(&self.unlogged).count())
+    }
+
+    fn home(&self) -> String {
+        self.home.clone()
+    }
+
+    async fn get(&self, name: &str) -> Result<Option<RootRecord>, String> {
+        let mut held = self.objects(Some(name))?;
+        held.sort_by_key(|object| (object.home != self.home, object.home.clone()));
+        Ok(held.into_iter().next())
+    }
+
+    async fn list(&self) -> Result<Vec<RootRecord>, String> {
+        let mut by_name = BTreeMap::new();
+        let mut objects = self.objects(None)?;
+        objects.sort_by_key(|object| (object.home != self.home, object.home.clone()));
+        for object in objects {
+            by_name.entry(object.name.clone()).or_insert(object);
+        }
+        Ok(by_name.into_values().collect())
+    }
+
+    async fn sources(&self) -> Result<Vec<RootRecord>, String> {
+        self.objects(None)
+    }
+
+    /// Positioned before the roots are read, so a change among them is named again, never missed.
+    async fn positioned(&self) -> Result<(Vec<RootRecord>, LogPosition), String> {
+        let position = self.position().await?;
+        Ok((self.objects(None)?, position))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        let homes = self.refresh()?.follower.cursors().clone();
+        Ok(LogPosition { homes, unlogged: Some(locked(&self.unlogged).read()) })
+    }
+
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let (changed, homes) = match followed_since(&self.service, [ROOT], position)? {
+            Ok(followed) => followed,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        let unlogged = locked(&self.unlogged);
+        let mut names = match unlogged.since(position.unlogged.as_ref()) {
+            Ok(names) => names,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        names.extend(changed.iter().map(|identity| base(&identity.name).to_owned()));
+        Ok(Since::Changed { names, through: LogPosition { homes, unlogged: Some(unlogged.read()) } })
+    }
+
+    async fn copies(&self, name: &str) -> Result<Vec<RootRecord>, String> {
+        self.objects(Some(name))
+    }
+
+    async fn apply(
+        &self,
+        name: &str,
+        _version: Option<u64>,
+        _labels: &BTreeMap<String, String>,
+        _annotations: &BTreeMap<String, String>,
+        _spec: &flotilla_resources::ManifestRootSpec,
+    ) -> Result<RootRecord, flotilla_resources::engine_records::WriteError> {
+        Err(root_refusal(name).into())
+    }
+
+    async fn set_status(
+        &self,
+        name: &str,
+        _version: u64,
+        _status: &flotilla_resources::ManifestRootStatus,
+    ) -> Result<RootRecord, flotilla_resources::engine_records::WriteError> {
+        Err(root_refusal(name).into())
+    }
+
+    async fn delete(&self, name: &str) -> Result<(), String> {
+        Err(root_refusal(name))
+    }
+
+    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
+        let watch = super::watch::EngineWatch::start(Arc::clone(&self.service), [ROOT]).map_err(|error| error.to_string())?;
+        let logged = futures::stream::unfold(watch, |mut watch| async move {
+            match watch.next(|_, _| Ok(())).await {
+                Ok(()) => Some(((), watch)),
+                Err(error) => {
+                    tracing::warn!(%error, "ManifestRoot records watch ended");
+                    None
+                }
+            }
+        });
+        let mut judged = self.judged_changes.subscribe();
+        judged.mark_unchanged();
+        // The port is gone once its sender is; the log alone ticks from then on.
+        let judged = futures::stream::unfold(judged, |mut judged| async move {
+            judged.changed().await.ok()?;
+            Some(((), judged))
+        });
+        Ok(Box::pin(futures::stream::select(logged, judged)))
+    }
+}
+
+fn root_refusal(name: &str) -> String {
+    format!(
+        "{ROOT_KIND} {name} is written only by its home's manifest reconciler, from its declared source; resolve its documents with `flotilla manifest`"
+    )
 }

@@ -1,16 +1,25 @@
 //! The shared tables every kind's tables reference.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt::Write as _,
+};
 
-use crate::{quote_ident, render_ddl_with, render_views, DdlMode, StoreError, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
-use flotilla_schema::{ColumnType, KindRegistry, Table, TableSet};
-use rusqlite::{Connection, OptionalExtension};
+use crate::{quote_ident, render_ddl_with, render_indexes, render_views, DdlMode, StoreError, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
+use flotilla_schema::{ColumnDef, ColumnType, KindRegistry, Table, TableSet};
+use rusqlite::Connection;
 
 /// `strings` interns names and interned columns; `resource_identity` holds every resource's
 /// (kind, name, home), with homes filtered through `resource_identity_by_home`, and its `seq`:
 /// the home sequence of the last event written or applied for it, kept after a delete as a
-/// tombstone, so replaying an older event is a duplicate; `objects` holds frozen documents by
-/// hash, always ADR 0063 canonical CBOR, so no media column; `home_sequence.last` is each home's
+/// tombstone, so replaying an older event is a duplicate; and its `created_at`, in nanoseconds
+/// since the epoch (a `CreatedAt`), not the microseconds every other stored time uses: the old
+/// store stamped records to the nanosecond and a managed checkout's name hashes that stamp's
+/// RFC 3339 string, so an imported record must keep it exactly. It is the creation time of the
+/// last create: written by that create (here, applied from its home or restored from its home's
+/// snapshot) and by nothing else, so an edit, edge or delete keeps it and a create again replaces
+/// it. NULL until a create: an identity first written for a reference's target. `objects` holds
+/// frozen documents by hash, always ADR 0063 canonical CBOR, so no media column; `home_sequence.last` is each home's
 /// sequence, which never decreases, so a sequence never repeats.
 ///
 /// `log` is the per-home event log (#3392 G8): one entry per write, keyed by the home and the
@@ -40,6 +49,10 @@ use rusqlite::{Connection, OptionalExtension};
 /// partial `log_expunges` a home's expunge entries, the tombstones `apply` checks an event for an
 /// unknown identity against, so that check visits expunges only, not every later entry.
 ///
+/// `snapshot_cause` holds, for a record this store installed from a snapshot, the change that
+/// snapshot carried as its cause: no entry here explains such a record until its next one
+/// arrives, which deletes the row; the next snapshot of its home replaces it.
+///
 /// No database created by an earlier generation of these tables exists: the first production
 /// generation is the baseline, and ADR 0047's N→N+1 rule applies from then.
 pub(crate) const SHARED_DDL: &str = "\
@@ -53,6 +66,7 @@ CREATE TABLE IF NOT EXISTS resource_identity (
   id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),
   seq INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER,
   UNIQUE (kind, name, home)) STRICT;
 CREATE INDEX IF NOT EXISTS resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE IF NOT EXISTS objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
@@ -92,6 +106,11 @@ CREATE TABLE IF NOT EXISTS stream_watermark (
 CREATE TABLE IF NOT EXISTS stream_history (
   home INTEGER PRIMARY KEY REFERENCES strings(id), home_seq INTEGER NOT NULL CHECK (home_seq >= 0)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS snapshot_cause (
+  resource INTEGER PRIMARY KEY REFERENCES resource_identity(id) ON DELETE CASCADE,
+  home INTEGER NOT NULL REFERENCES strings(id),
+  change_seq INTEGER NOT NULL,
+  FOREIGN KEY (home, change_seq) REFERENCES change(home, seq)) STRICT, WITHOUT ROWID;
 ";
 
 /// The readable view of `log` (#3392 D4): each entry with its home and resource named by their
@@ -152,6 +171,7 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("identities_page", IDENTITIES_PAGE),
     ("removed_max", REMOVED_MAX),
     ("floor_raise", FLOOR_RAISE),
+    ("floor_set", FLOOR_SET),
     ("floor_get", FLOOR_GET),
     ("watermark_put", WATERMARK_PUT),
     ("log_append", LOG_APPEND),
@@ -162,10 +182,15 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("change_exists", CHANGE_EXISTS),
     ("change_seqs", CHANGE_SEQS),
     ("change_naming", CHANGE_NAMING),
+    ("change_named", CHANGE_NAMED),
     ("log_last_change", LOG_LAST_CHANGE),
+    ("snapshot_cause_get", SNAPSHOT_CAUSE_GET),
+    ("snapshot_cause_put", SNAPSHOT_CAUSE_PUT),
+    ("snapshot_cause_delete", SNAPSHOT_CAUSE_DELETE),
     ("log_cause", LOG_CAUSE),
     ("log_by_resource", LOG_BY_RESOURCE),
     ("log_by_home", LOG_BY_HOME),
+    ("log_last_edge", LOG_LAST_EDGE),
     ("log_about_first", LOG_ABOUT_FIRST),
     ("log_about_after", LOG_ABOUT_AFTER),
     ("log_expunge", LOG_EXPUNGE),
@@ -173,7 +198,11 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("string_id", STRING_ID),
     ("string_insert", STRING_INSERT),
     ("identity_resolve", IDENTITY_RESOLVE),
+    ("identity_named", IDENTITY_NAMED),
     ("identity_insert", IDENTITY_INSERT),
+    ("identity_set_created", IDENTITY_SET_CREATED),
+    ("identity_restore_created", IDENTITY_RESTORE_CREATED),
+    ("identity_created", IDENTITY_CREATED),
     ("identity_of", IDENTITY_OF),
     ("identity_delete", IDENTITY_DELETE),
     ("sequence_next", SEQUENCE_NEXT),
@@ -202,11 +231,20 @@ pub(crate) const CHANGE_EXISTS: &str = "SELECT 1 FROM change WHERE home = ?1 AND
 /// A home's changes between two of its sequences, in order: those a stream sends between entries.
 pub(crate) const CHANGE_SEQS: &str = "SELECT seq FROM change WHERE home = ?1 AND seq > ?2 AND seq < ?3 ORDER BY seq";
 /// The newest change at a home naming a record as an item, by `change_items_by_record`.
+/// Whether any held change names a record as an item, by `change_items_by_record`.
+pub(crate) const CHANGE_NAMED: &str = "SELECT 1 FROM change_items WHERE record = ?1 LIMIT 1";
 pub(crate) const CHANGE_NAMING: &str =
     "SELECT change_seq FROM change_items WHERE record = ?1 AND change_home = ?2 ORDER BY change_seq DESC LIMIT 1";
 /// A resource's newest entry's change, by `log_by_resource`: why it is as it is.
 pub(crate) const LOG_LAST_CHANGE: &str =
     "SELECT (SELECT s FROM strings WHERE id = home), change FROM log WHERE resource = ?1 ORDER BY home_seq DESC LIMIT 1";
+/// The change a record installed from a snapshot holds as its cause, while no entry here
+/// explains it: [`snapshot_cause`](SHARED_DDL)'s one row for the resource.
+pub(crate) const SNAPSHOT_CAUSE_GET: &str =
+    "SELECT (SELECT s FROM strings WHERE id = home), change_seq FROM snapshot_cause WHERE resource = ?1";
+pub(crate) const SNAPSHOT_CAUSE_PUT: &str = "INSERT INTO snapshot_cause (resource, home, change_seq) VALUES (?1, ?2, ?3) \
+     ON CONFLICT (resource) DO UPDATE SET home = excluded.home, change_seq = excluded.change_seq";
+pub(crate) const SNAPSHOT_CAUSE_DELETE: &str = "DELETE FROM snapshot_cause WHERE resource = ?1";
 pub(crate) const LOG_CAUSE: &str = "SELECT cause FROM log WHERE home = ?1 AND home_seq = ?2";
 /// The columns an entry is read back with, in `LogRow` order: its strings through `strings`' primary key.
 macro_rules! log_select {
@@ -221,6 +259,8 @@ macro_rules! log_select {
 }
 pub(crate) const LOG_BY_RESOURCE: &str = log_select!("WHERE l.resource = ?1 AND l.home_seq > ?2 ORDER BY l.home_seq LIMIT ?3");
 pub(crate) const LOG_BY_HOME: &str = log_select!("WHERE l.home = ?1 AND l.home_seq > ?2 ORDER BY l.home_seq LIMIT ?3");
+/// A resource's newest entry of one edge, by `log_by_resource`: what a snapshot carries of it.
+pub(crate) const LOG_LAST_EDGE: &str = log_select!("WHERE l.resource = ?1 AND l.edge = ?2 ORDER BY l.home_seq DESC LIMIT 1");
 /// The shared statements that sort their result through a temporary b-tree, by their labels in
 /// `Store::statements`. Entries about one master page in their changes' time order, the same on
 /// every replica; the time is the change's (#4024), so the sort follows the `log_about` search,
@@ -238,7 +278,16 @@ pub(crate) const LOG_EXPUNGED_AFTER: &str = "SELECT effect FROM log WHERE home =
 pub(crate) const STRING_ID: &str = "SELECT id FROM strings WHERE domain = ?1 AND s = ?2";
 pub(crate) const STRING_INSERT: &str = "INSERT INTO strings (domain, s) VALUES (?1, ?2)";
 pub(crate) const IDENTITY_RESOLVE: &str = "SELECT id FROM resource_identity WHERE kind = ?1 AND name = ?2 AND home = ?3";
+/// Every home's identity of one kind and name, by home, through the (kind, name, home) key.
+pub(crate) const IDENTITY_NAMED: &str = "SELECT id FROM resource_identity WHERE kind = ?1 AND name = ?2 ORDER BY home";
 pub(crate) const IDENTITY_INSERT: &str = "INSERT INTO resource_identity (kind, name, home) VALUES (?1, ?2, ?3)";
+/// A create's time on its identity: the time of change `?3` of home `?2`, which the create names,
+/// widened from microseconds to nanoseconds.
+pub(crate) const IDENTITY_SET_CREATED: &str =
+    "UPDATE resource_identity SET created_at = (SELECT at * 1000 FROM change WHERE home = ?2 AND seq = ?3) WHERE id = ?1";
+/// A creation time given outright: an import create's, or one a snapshot carries from the home.
+pub(crate) const IDENTITY_RESTORE_CREATED: &str = "UPDATE resource_identity SET created_at = ?1 WHERE id = ?2";
+pub(crate) const IDENTITY_CREATED: &str = "SELECT created_at FROM resource_identity WHERE id = ?1";
 pub(crate) const IDENTITY_OF: &str =
     "SELECT i.kind, n.s, h.s FROM resource_identity i JOIN strings n ON n.id = i.name JOIN strings h ON h.id = i.home WHERE i.id = ?1";
 pub(crate) const IDENTITY_DELETE: &str = "DELETE FROM resource_identity WHERE id = ?1";
@@ -252,9 +301,16 @@ pub(crate) const SEQUENCE_RAISE: &str =
 pub(crate) const OBJECT_EXISTS: &str = "SELECT 1 FROM objects WHERE hash = ?1";
 pub(crate) const SEQUENCE_LAST: &str = "SELECT last FROM home_sequence WHERE home = ?1";
 pub(crate) const OBJECT_BYTES: &str = "SELECT bytes FROM objects WHERE hash = ?1";
-/// Read once per view on open, outside the runtime's statements: it reads the schema table, which
-/// has no index to search by key.
-pub(crate) const VIEW_SQL: &str = "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?1";
+/// Every stored statement of one type of schema object, by name. Read once on open, outside the
+/// runtime's statements: the schema table has no index to search by name, so reading it once is
+/// one scan where a read per object would be one each.
+const SCHEMA_SQL: &str = "SELECT name, sql FROM sqlite_schema WHERE type = ?1";
+
+fn stored_schema(conn: &Connection, kind: &str) -> rusqlite::Result<HashMap<String, String>> {
+    let mut statement = conn.prepare(SCHEMA_SQL)?;
+    let rows = statement.query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
 
 /// The whole schema a store with these kinds holds: shared tables and `codes`, then each kind in
 /// code order, with its `codes` rows and readable views, then the readable `log_view`. Like the
@@ -290,11 +346,46 @@ pub(crate) fn render_schema(kinds: &KindRegistry, mode: DdlMode, shared: &str, l
 /// connections re-prepare on.
 pub(crate) fn sync_views(conn: &Connection, kinds: &KindRegistry) -> rusqlite::Result<()> {
     let log = (LOG_VIEW.to_owned(), log_view());
+    // Each view is compared, and replaced, once, so the statements read before any is replaced hold.
+    let stored = stored_schema(conn, "view")?;
+    let mut replace = String::new();
     for (name, sql) in kinds.iter().flat_map(render_views).chain([log]).chain(progress_views()) {
-        let stored: Option<String> = conn.query_row(VIEW_SQL, [&name], |row| row.get(0)).optional()?;
-        if stored.as_deref() != Some(sql.as_str()) {
-            conn.execute_batch(&format!("DROP VIEW IF EXISTS {};\n{sql};", quote_ident(&name)))?;
+        if stored.get(&name) != Some(&sql) {
+            let _ = writeln!(replace, "DROP VIEW IF EXISTS {};\n{sql};", quote_ident(&name));
         }
+    }
+    if !replace.is_empty() {
+        conn.execute_batch(&replace)?;
+    }
+    Ok(())
+}
+
+/// Brings every kind table's indexes up to its kind's declarations on open, after the
+/// `IF NOT EXISTS` DDL has created any that are missing: an index whose stored statement differs
+/// from the declared one is dropped and created again, and an index on a kind table that the kind
+/// no longer declares is dropped. Indexes on tables of kinds outside `kinds`, and SQLite's own
+/// (which hold no statement), are left alone. An unchanged schema writes nothing.
+pub(crate) fn sync_indexes(conn: &Connection, kinds: &KindRegistry) -> rusqlite::Result<()> {
+    let declared: HashMap<String, String> = kinds.iter().flat_map(|set| render_indexes(set, DdlMode::Create)).collect();
+    let tables: BTreeSet<&str> = kinds.iter().flat_map(|set| set.tables.iter().map(|table| table.name.as_str())).collect();
+    let mut statement = conn.prepare("SELECT name, tbl_name, sql FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL")?;
+    let stored = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut replace = String::new();
+    for (name, _, sql) in stored.iter().filter(|(_, table, _)| tables.contains(table.as_str())) {
+        match declared.get(name) {
+            Some(want) if want == sql => {}
+            Some(want) => {
+                let _ = writeln!(replace, "DROP INDEX {};\n{want};", quote_ident(name));
+            }
+            None => {
+                let _ = writeln!(replace, "DROP INDEX {};", quote_ident(name));
+            }
+        }
+    }
+    if !replace.is_empty() {
+        conn.execute_batch(&replace)?;
     }
     Ok(())
 }
@@ -315,9 +406,18 @@ pub(crate) fn has_string_domain(conn: &Connection) -> rusqlite::Result<bool> {
     conn.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info('strings') WHERE name = 'domain')", [], |row| row.get(0))
 }
 
+/// Whether opening adds `column` to a stored table that lacks it (ADR 0047 N→N+1): a nullable
+/// column, whose rows the previous generation wrote read as NULL, absent being the honest value,
+/// or a NOT NULL column declaring a previous-generation default. A NOT NULL column without one
+/// has no value to give those rows, so its table is refused.
+fn opening_adds(column: &ColumnDef) -> bool {
+    column.nullable || column.previous_generation_default().is_some()
+}
+
 /// Refuses a kind table whose columns differ from its kind's: the backend's own columns (`id` and
 /// `version` on the root, the parent key below it), and the key and data columns. Order is not
-/// compared: statements name their columns, and an additive upgrade (`ADD COLUMN`) appends.
+/// compared: statements name their columns, and a table an earlier build altered appends. A
+/// column opening adds is added by [`check_kind_codes`]' rebuild, which runs first.
 pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Result<(), StoreError> {
     let mut statement = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
     for set in kinds.iter() {
@@ -327,17 +427,7 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
                 Some(_) => vec![set.parent_key_column().to_owned()],
             };
             expected.extend(table.key.iter().chain(&table.columns).map(|column| column.name.clone()));
-            let mut found = statement.query_map([&table.name], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
-            // Explicit ADR 0047 N→N+1 defaults only: no broad migration policy.
-            // Remove each column's default/upgrade eligibility one roll after its
-            // field lands; once no eligible columns remain this check only reads.
-            // The open transaction rolls this back if any other drift remains.
-            for column in &table.columns {
-                if !found.contains(&column.name) && column.previous_generation_default().is_some() {
-                    conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {};", quote_ident(&table.name), crate::ddl::column(column)))?;
-                    found.push(column.name.clone());
-                }
-            }
+            let found = statement.query_map([&table.name], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
             if found.iter().collect::<BTreeSet<_>>() != expected.iter().collect::<BTreeSet<_>>() {
                 return Err(StoreError::KindTableDrift { table: table.name.clone(), expected, found });
             }
@@ -350,10 +440,13 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
 /// a CHECK in place, so a table whose stored code lists are each a subset of its kind's, at least
 /// one strictly, and which is otherwise exactly the table this build renders, is rebuilt with the
 /// current definition by [`widen_table`]. "Otherwise exactly" is an exact match of the stored
-/// `CREATE TABLE` text, less only the columns [`check_kind_columns`] may add (those declaring a
-/// previous-generation default), which the rebuild adds with their default; it runs first, so a
-/// table needing both is widened rather than refused. A table whose text an earlier `ALTER TABLE`
-/// changed is not widened: it refuses with [`StoreError::KindCodeDrift`].
+/// `CREATE TABLE` text. A table whose stored text differs only in holding NOT NULL on columns this
+/// build declares nullable is widened the same way (ADR 0047 N→N+1), with or without missing codes.
+///
+/// Two more tables are rebuilt to this build's text (ADR 0047 N→N+1), whatever their codes: one
+/// lacking only columns opening adds ([`opening_adds`]), which the rebuild adds as NULL or with
+/// their default, and one an earlier build's opening altered by `ADD COLUMN` ([`added_in_place`]),
+/// whose text, and lost CHECKs, would otherwise stop it from ever widening.
 ///
 /// Any other difference refuses: a stored code the kind no longer declares, a missing code in a
 /// table that differs in more than its codes, or a coded column whose CHECK cannot be read, which
@@ -366,16 +459,17 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
 /// transaction `PRAGMA foreign_keys` cannot change): with them on, the drop would delete each
 /// child table's rows through their `ON DELETE CASCADE`.
 pub(crate) fn check_kind_codes(conn: &Connection, kinds: &KindRegistry) -> Result<(), StoreError> {
-    let mut statement = conn.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1")?;
+    // Read again after a table is rebuilt, which is rare, so each table's text is as stored.
+    let mut tables = stored_schema(conn, "table")?;
     let mut columns = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
     for set in kinds.iter() {
         for table in &set.tables {
-            let Some(sql) = statement.query_row([&table.name], |row| row.get::<_, String>(0)).optional()? else { continue };
+            let Some(sql) = tables.get(&table.name).cloned() else { continue };
             let present = columns.query_map([&table.name], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
             // The table as this build renders it with the stored code lists and without the
             // columns opening may add, and the first column missing codes.
             let mut stored_table = table.clone();
-            stored_table.columns.retain(|column| present.contains(&column.name) || column.previous_generation_default().is_none());
+            stored_table.columns.retain(|column| present.contains(&column.name) || !opening_adds(column));
             let mut missing = None;
             for column in stored_table.key.iter_mut().chain(stored_table.columns.iter_mut()) {
                 let ColumnType::Code(codes) = &mut column.ty else { continue };
@@ -395,12 +489,45 @@ pub(crate) fn check_kind_codes(conn: &Connection, kinds: &KindRegistry) -> Resul
                 }
                 *codes = stored;
             }
-            let Some((column, missing)) = missing else { continue };
-            if crate::ddl::create_table(set, &stored_table, "") != sql {
+            // A column this build declares nullable that the stored table holds NOT NULL is a
+            // widening too (ADR 0047 N→N+1): every stored row is still valid, and the rebuild
+            // lets the column hold NULL. Taken only when the stored text is otherwise this
+            // build's table, as for codes.
+            let mut was_required = stored_table.clone();
+            for column in was_required.columns.iter_mut().filter(|column| column.nullable && present.contains(&column.name)) {
+                let required = ColumnDef { nullable: false, ..column.clone() };
+                if sql.contains(&crate::ddl::column(&required)) {
+                    *column = required;
+                }
+            }
+            let nullability_widens = was_required != stored_table && crate::ddl::create_table(set, &was_required, "") == sql;
+            // A table lacking only columns opening adds is rebuilt with them (ADR 0047 N→N+1),
+            // never altered in place: `ADD COLUMN` would leave text this build does not render.
+            let absent: Vec<&ColumnDef> = table.columns.iter().filter(|column| !present.contains(&column.name)).collect();
+            let lacks_columns = !absent.is_empty() && absent.iter().all(|column| opening_adds(column));
+            // A table an earlier build's `ADD COLUMN` changed is rebuilt once to this build's text.
+            let altered = absent.is_empty()
+                && !nullability_widens
+                && crate::ddl::create_table(set, &stored_table, "") != sql
+                && added_in_place(set, &stored_table, &present, &sql);
+            if lacks_columns || altered {
+                widen_table(conn, set, table, &present)?;
+                tables = stored_schema(conn, "table")?;
+                continue;
+            }
+            let Some((column, missing)) = missing else {
+                if nullability_widens {
+                    widen_table(conn, set, table, &present)?;
+                    tables = stored_schema(conn, "table")?;
+                }
+                continue;
+            };
+            if crate::ddl::create_table(set, &stored_table, "") != sql && !nullability_widens {
                 return Err(StoreError::KindCodeDrift { table: table.name.clone(), column, missing });
             }
             // Every coded column is rebuilt with its kind's codes, not only the first one missing some.
             widen_table(conn, set, table, &present)?;
+            tables = stored_schema(conn, "table")?;
         }
     }
     Ok(())
@@ -457,6 +584,38 @@ fn widen_table(conn: &Connection, set: &TableSet, table: &Table, present: &[Stri
     Ok(())
 }
 
+/// Whether `sql`, a stored table's text, is `table` (as this build renders it with the stored
+/// codes) as an earlier build's opening left it: created without its last columns in `present`
+/// (the order the table stores them), each one opening adds, and then given each by `ADD COLUMN`.
+/// The earlier statements are replayed on an empty database, so the comparison is SQLite's own
+/// edit of the text, which also drops the table CHECKs an `ADD COLUMN` cannot add.
+fn added_in_place(set: &TableSet, table: &Table, present: &[String], sql: &str) -> bool {
+    let mut added = Vec::new();
+    for name in present.iter().rev() {
+        let Some(column) = table.columns.iter().find(|column| &column.name == name).filter(|column| opening_adds(column)) else {
+            break;
+        };
+        added.insert(0, column);
+        let created = Table {
+            columns: table.columns.iter().filter(|kept| !added.iter().any(|column| column.name == kept.name)).cloned().collect(),
+            ..table.clone()
+        };
+        // A table these columns' CHECKs need cannot have been created without them: no match.
+        let replayed = || -> rusqlite::Result<String> {
+            let replay = Connection::open_in_memory()?;
+            replay.execute_batch(&crate::ddl::create_table(set, &created, ""))?;
+            for column in &added {
+                replay.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {};", quote_ident(&table.name), crate::ddl::column(column)))?;
+            }
+            replay.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1", [&table.name], |row| row.get(0))
+        };
+        if replayed().is_ok_and(|replayed| replayed == sql) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Shared progress views use the same sync-on-open policy as kind views.
 fn progress_views() -> Vec<(String, String)> {
     [("stream_watermark", "home_seq, applied_through"), ("stream_history", "home_seq")]
@@ -473,6 +632,10 @@ fn progress_views() -> Vec<(String, String)> {
 pub(crate) const WATERMARK_PUT: &str = "INSERT INTO stream_watermark (home, home_seq, applied_through) VALUES (?1, ?2, ?3) ON CONFLICT(home) DO UPDATE SET home_seq = excluded.home_seq, applied_through = excluded.applied_through";
 pub(crate) const FLOOR_GET: &str = "SELECT home_seq FROM stream_history WHERE home = ?1";
 pub(crate) const FLOOR_RAISE: &str = "INSERT INTO stream_history (home, home_seq) VALUES (?1, ?2) ON CONFLICT(home) DO UPDATE SET home_seq = max(home_seq, excluded.home_seq)";
+/// A replica's floor for a home at the cut of the snapshot it installed: a reset home's later
+/// cut may be lower than an earlier one.
+pub(crate) const FLOOR_SET: &str =
+    "INSERT INTO stream_history (home, home_seq) VALUES (?1, ?2) ON CONFLICT(home) DO UPDATE SET home_seq = excluded.home_seq";
 pub(crate) const REMOVED_MAX: &str = "SELECT max(home_seq) FROM log WHERE resource = ?1";
 pub(crate) const IDENTITIES_PAGE: &str = "SELECT id FROM resource_identity WHERE home = ?1 AND kind = ?2 AND id > ?3 ORDER BY id LIMIT ?4";
 pub(crate) const HOME_LOG_CLEAR: &str = "DELETE FROM log WHERE home = ?1";

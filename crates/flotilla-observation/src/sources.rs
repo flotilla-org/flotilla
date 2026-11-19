@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_change_request::{
     observation::{ChangeRequestKey, ChangeRequestObservationSource},
-    BoundObservations, ChangeRequestTracker,
+    BoundObservations, ChangeRequestTracker, MergeCheck,
 };
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_provider_runtime::ObservationError;
@@ -118,6 +118,11 @@ pub trait ChangeRequestQueryPort: Send + Sync {
         namespace: &str,
         repository: &RepositorySpec,
     ) -> Result<Arc<dyn ChangeRequestTracker>, String>;
+
+    /// Git's judgement of `repository`'s change requests' merges, made in this host's clone of
+    /// it, for trackers whose forge leaves conflicts ambiguous. It finds the clone only when
+    /// asked; with none here it judges nothing.
+    fn merge_check(&self, repository: &RepositorySpec) -> Arc<dyn MergeCheck>;
 }
 
 /// Issue observations resolved from declared forge identities and convoy references.
@@ -434,7 +439,8 @@ impl ProviderChangeRequestObservationSource {
         }
         let provider = self.query_port.discover_repository_change_request(subject.namespace(), &repository.object.spec).await?;
         let crew_logins = crew_logins.into_iter().map(|(number, logins)| (number, logins.into_iter().collect())).collect();
-        let result = provider.observe_bound(&numbers, &crew_logins).await;
+        let merge_check = self.query_port.merge_check(&repository.object.spec);
+        let result = provider.observe_bound(&numbers, &crew_logins, Some(merge_check.as_ref())).await;
         let delay = observation_cache_delay(observation_rate_limit_error(&result).and_then(ObservationError::retry_at), Utc::now());
         let status = if let Some(error) = observation_rate_limit_error(&result) {
             observation_during_cooldown(&result, subject.number(), error)

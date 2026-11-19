@@ -6,7 +6,7 @@ use std::{
 use flotilla_protocol::ConfiguredResourceLimits;
 use serde::{Deserialize, Serialize};
 
-use crate::{placement::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch, ControllerRetry, ResourceError};
+use crate::{placement::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch, ResourceError};
 
 define_resource!(
     Environment,
@@ -334,10 +334,9 @@ pub struct EnvironmentStatus {
     pub registry_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential_delivery_retry: Option<ControllerRetry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential_refresh_retry: Option<ControllerRetry>,
+    // Retired with credential delivery's controller (#3108): `credential_delivery_retry` and
+    // `credential_refresh_retry`. Earlier records carrying them still decode, as the struct
+    // accepts and drops unknown fields.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,12 +365,6 @@ pub enum EnvironmentStatusPatch {
     MarkFailed {
         message: String,
     },
-    CredentialDelivery {
-        retry: Option<ControllerRetry>,
-    },
-    CredentialRefresh {
-        retry: Option<ControllerRetry>,
-    },
 }
 
 impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
@@ -396,8 +389,6 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 }
                 status.runtime_observation.get_or_insert_with(Default::default).merge(observation);
             }
-            Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
-            Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
             Self::MarkReady { configured_limits, docker_container_id, image_ref, local_image_id, registry_digest } => {
                 status.configured_limits = configured_limits.clone();
                 status.phase = EnvironmentPhase::Ready;

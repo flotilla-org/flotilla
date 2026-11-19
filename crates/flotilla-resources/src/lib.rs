@@ -4,6 +4,8 @@
 #![allow(clippy::double_must_use)]
 
 pub mod access_delivery;
+pub mod agent_activity;
+pub use agent_activity::crew_attention;
 pub mod account_access;
 pub use access_delivery::{AccessDelivery, AccessDeliverySpec};
 pub use account_access::{AccountBinding, AccountBindingSpec, AccountProvision, AccountProvisionSpec};
@@ -17,6 +19,7 @@ mod charter_store;
 pub use charter_store::{CharterPointer, CharterSource, CharterStoreBinding};
 #[doc(hidden)]
 pub mod checkout;
+pub mod checkout_records;
 #[doc(hidden)]
 pub mod clock;
 mod clone;
@@ -24,6 +27,7 @@ mod controller_retry;
 #[doc(hidden)]
 pub mod convoy;
 mod convoy_ensure;
+pub mod convoy_records;
 mod credential;
 pub mod crew_defaults;
 pub use crew_defaults::{
@@ -49,23 +53,27 @@ pub use image_layer::{
 pub mod delivery_hold;
 #[doc(hidden)]
 pub mod digest;
-pub use digest::{digest_bucket, DigestQuery, PartitionDigest, DIGEST_FANOUT};
+pub mod discovered_checkouts;
+pub use digest::{digest_bucket, DIGEST_FANOUT};
+pub mod clone_records;
 #[doc(hidden)]
 pub mod definition_provenance;
 pub mod definitions;
 pub mod engine_records;
 mod environment;
+pub mod environment_records;
 #[doc(hidden)]
 pub mod error;
 #[doc(hidden)]
-pub mod event;
 #[doc(hidden)]
 pub mod field_ownership;
 mod fleet_designation;
 mod forge;
 mod fulfilment_kind;
+pub mod held_joins;
 #[doc(hidden)]
 pub mod host;
+pub mod image_build_records;
 mod issue;
 pub mod labels;
 mod leaf;
@@ -75,13 +83,11 @@ pub mod manifest_roots;
 #[doc(hidden)]
 pub mod message;
 mod message_inbox;
-mod message_migration;
 #[doc(hidden)]
 pub mod placement;
 mod platform;
 #[doc(hidden)]
 pub mod prepared_snapshot;
-mod principal_attention;
 mod project;
 pub mod provider_placement;
 mod provisioning_identity;
@@ -94,14 +100,17 @@ pub mod resource;
 #[doc(hidden)]
 pub mod retention;
 mod review_bundle;
+pub mod standing_roles;
 mod status_patch;
-pub mod terminal_launches;
+pub mod terminal_records;
 #[doc(hidden)]
 pub mod terminal_session;
 #[doc(hidden)]
 #[doc(hidden)]
 pub mod vessel;
 mod vessel_occupancy;
+pub mod vessel_planning;
+pub mod vessel_records;
 pub mod vessel_seats;
 mod watch;
 #[doc(hidden)]
@@ -121,28 +130,31 @@ pub use checkout::{
 };
 pub use clock::{Clock, SystemClock};
 pub use clone::{Clone, CloneFailurePolicy, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
-pub use controller_retry::{ControllerRetry, ControllerRetryDisposition, RetryBackoff, RetryCeiling, PROVISIONING_RETRY_BACKOFF};
+pub use controller_retry::{
+    ControllerRetry, ControllerRetryDisposition, RetryBackoff, RetryCeiling, LOCAL_RETRY_BACKOFF, LOCAL_RETRY_LIMIT,
+    PROVISIONING_RETRY_BACKOFF,
+};
 pub use convoy::{
-    active_change_request_subjects, bound_change_request_address, change_request_leaf_set, controller_patches, convoy_reference_context,
-    convoy_sanctions_checkout_reclaim, convoy_subject_rows, evaluate_crew_completion, evaluate_landing_settlement,
-    expected_change_request_leaves, expected_checkout_refs, external_patches, instantiate_exit, instantiate_turn_delivery,
-    observed_change_request_subjects, observed_digest_claims, pinned_placement_ref, pinned_workflow_ref, provisioning_patches, reconcile,
-    select_convoy_child_sources, select_convoy_children, subject_relationship_conflicts, vessel_placement_pin, BoundChangeRequest,
-    ChangeRequestLeafSet, Convoy, ConvoyAttention, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionClaim, CrewCompletionOverride, CrewCompletionRefusal,
-    CrewCompletionRefusalCause, CrewWorkPhase, CrewWorkState, DeclaredSubject, DiscoveredSubject, InputValue, InstantiatedExit,
-    InstantiatedExitEntry, InstantiatedTurnDelivery, IssueSnapshot, LandingClaim, LandingEntry, LandingTurn, LeafMaker, LifecycleMutation,
-    NudgeObligation, PendingBrief, PendingSupervisorTurn, PlacementStatus, QueuedTurnObservation, ReconcileOutcome, ResumeIntent,
-    SettlementEvaluation, SettlementMode, SettlementSubject, StallCause, StallEvidenceSource, StallNudge, StallProposedDisposition,
-    StallReason, StallRung, StallSupervisor, StalledCondition, SubjectDiscovery, SubjectDiscoverySource, SupersededCrewClaim,
-    TargetMismatch, TurnDeliveryEpisode, TurnDeliveryFailure, TurnDeliveryFailureKind, TurnDeliveryOutcome, TurnDeliveryRung,
-    TurnDeliveryStatus, UnmetSettlementExpectation, UnresolvedChangeRequestSubject, VesselPlacementPin, WorkCompletionAuthority, WorkPhase,
-    WorkState, WorkflowSnapshot, CONVOY_TEARDOWN_FINALIZER, ENSURED_FROM_ANNOTATION, FORCE_TEARDOWN_ANNOTATION,
-    PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
+    active_change_request_subjects, bound_change_request_address, change_request_leaf_set, change_request_record_names, controller_patches,
+    convoy_change_request_names, convoy_reference_context, convoy_sanctions_checkout_reclaim, convoy_subject_rows,
+    evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs, external_patches, instantiate_exit,
+    instantiate_turn_delivery, leaves_seat, observed_change_request_subjects, observed_digest_claims, pinned_placement_ref,
+    pinned_workflow_ref, provisioning_patches, select_convoy_child_sources, select_convoy_children, subject_relationship_conflicts,
+    vessel_placement_pin, BoundChangeRequest, ChangeRequestLeafSet, Convoy, ConvoyAttention, ConvoyIssue, ConvoyPhase,
+    ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewCompletionOverride,
+    CrewCompletionRefusal, CrewCompletionRefusalCause, CrewWorkPhase, CrewWorkState, DeclaredSubject, DiscoveredSubject, InputValue,
+    InstantiatedExit, InstantiatedExitEntry, InstantiatedTurnDelivery, IssueSnapshot, LandingClaim, LandingEntry, LandingTurn, LeafMaker,
+    NudgeObligation, PlacementStatus, QueuedTurnObservation, ResumeIntent, SettlementEvaluation, SettlementMode, SettlementSubject,
+    StallCause, StallEvidenceSource, StallNudge, StallProposedDisposition, StallReason, StallRung, StallSupervisor, StalledCondition,
+    Stalls, SubjectDiscovery, SubjectDiscoverySource, SupersededCrewClaim, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryFailure,
+    TurnDeliveryFailureKind, TurnDeliveryOutcome, TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation,
+    UnresolvedChangeRequestSubject, VesselPlacementPin, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    ADOPTED_CHECKOUT_ANNOTATION, CONVOY_UNREADABLE_ANNOTATION, ENSURED_FROM_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION,
+    VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{
-    ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus,
-    ConvoyEnsureStatusPatch, DRIVER_ADMISSION_CONDITION_TYPE,
+    config_changes, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
+    ConvoyEnsureStatus,
 };
 pub use credential::{
     capped_github_app_permissions, permission_level_rank, validate_matching_grant_permissions, CloneCredentials, CredentialConsumer,
@@ -159,19 +171,18 @@ pub use environment::{
     HOST_DIRECT_NAME_PREFIX,
 };
 pub use error::{FinalizerWaitReason, ResourceError};
-pub use event::{Event, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};
 pub use field_ownership::{FieldOwnershipViolation, WriterIdentity, WriterRole};
 pub use fleet_designation::{FleetDesignation, FleetDesignationSpec, FLEET_DESIGNATION_NAME};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use forge::{Forge, ForgeKind, ForgeSpec};
 pub use fulfilment_kind::{FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation};
 pub use host::{
-    acting_daemon_ref, canonical_host_id, CachedModelProbe, CredentialExpiry, FoldedHostObservations, FulfilmentFacts, FulfilmentImage,
+    acting_daemon_ref, canonical_host_id, remote_condition_type, CachedModelProbe, CredentialExpiry, FulfilmentFacts, FulfilmentImage,
     HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, HostStatusPatch, ModelFact, ModelFactSource, ModelProbeState,
-    AGENT_ADAPTERS_CAPABILITY, AMBIENT_CLAUDE_CREDENTIAL_SCOPE, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
-    ENVIRONMENT_PROVIDERS_CAPABILITY, HEARTBEAT_READY_TTL_SECS, HEARTBEAT_REFRESH_SECS, HELD_CREDENTIALS_CAPABILITY,
-    LOCAL_ROWS_MISSING_REASON, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PROJECTION_PARITY_CONDITION,
-    SLEEP_INHIBITION_CONDITION_TYPE, SSH_HOST_CAPABILITY, TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
+    SshVesselSlots, AGENT_ADAPTERS_CAPABILITY, AMBIENT_CLAUDE_CREDENTIAL_SCOPE, CODEX_CENTRAL_LOGIN_CAPABILITY,
+    CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY, HEARTBEAT_READY_TTL_SECS, HEARTBEAT_REFRESH_SECS,
+    HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, REMOTE_CONDITION_PREFIX, SLEEP_INHIBITION_CONDITION_TYPE,
+    SSH_HOST_CAPABILITY, TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
 };
 pub use issue::{Issue, IssueSpec, IssueStatus, IssueStatusPatch, ObservedIssueState};
 pub use labels::{
@@ -190,12 +201,6 @@ pub use manifest_root::{
 pub use placement::{DockerImagePullPolicy, PlacementImageSource, DOCKER_POLICY_NAME_PREFIX};
 pub use platform::Platform;
 pub use prepared_snapshot::{content_hash, is_prepared_snapshot, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND};
-pub use principal_attention::{
-    Demand, DemandAddressee, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DemandStatus, DemandStatusPatch,
-    DemandTransition, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
-    CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION,
-    ENSURE_DRIFT_ATTENTION_PREFIX, ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION,
-};
 pub use project::{
     normalize_issue_source, normalize_project_spec, resolve_project_issue_sources_from_inventory, DeclarationRefusedCondition,
     DispatchLane, DispatchMission, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, IssueFieldValue, IssueFilter, IssueSource,
@@ -203,7 +208,9 @@ pub use project::{
     ProjectRepositorySpec, ProjectSpec, ProjectStatus, ProjectStatusPatch, ResolvedIssueSourceBinding,
     DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
-pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_clone_key, forge_repo_key, repo_key};
+pub use provisioning_identity::{
+    canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_clone_key, forge_repo_key, remote_host, repo_key,
+};
 pub use replica::{
     compare_replica_reads, pick_replica_read, ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass,
     ResourceProvenance, ORIGIN_ROOT_ANNOTATION,
@@ -228,16 +235,13 @@ pub use review_bundle::{
 };
 pub use status_patch::{NoStatusPatch, StatusPatch};
 pub use terminal_session::{
-    looks_like_terminal_reply, terminal_session_attach_target, terminal_session_attach_target_with_stale_status, CrewCompletionPending,
-    CrewMessageDelivery, CrewMessageSender, CrewSessionStatus, InnerCommandStatus, ScreenObstruction, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalOccupancy,
-    TerminalSession, TerminalSessionAttachTarget, TerminalSessionDegradedCondition, TerminalSessionIdentity, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTarget,
-    CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE, CONTROLLER_FENCE_UNVERIFIABLE_REASON, TERMINAL_DELIVERY_EXPIRED_REASON,
-    TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON,
+    looks_like_terminal_reply, terminal_session_attach_target, terminal_session_attach_target_with_stale_status, CrewSessionStatus,
+    InnerCommandStatus, ScreenObstruction, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalBrief,
+    TerminalCrewContext, TerminalOccupancy, TerminalSession, TerminalSessionAttachTarget, TerminalSessionIdentity, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionTarget,
 };
 pub use vessel::{
-    vessel_resource_name, Vessel, VesselImage, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION,
+    vessel_resource_name, Vessel, VesselImage, VesselPhase, VesselSpec, VesselStatus, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 pub use vessel_occupancy::{home_copies_first, HostOccupancy};
@@ -263,15 +267,12 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::ImageLayer>($($argument),*);
         $callback::<$crate::CrewDefaults>($($argument),*);
         $callback::<$crate::FulfilmentKind>($($argument),*);
-        $callback::<$crate::Demand>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::FleetDesignation>($($argument),*);
         $callback::<$crate::Forge>($($argument),*);
-        $callback::<$crate::Event>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
         $callback::<$crate::ManifestRoot>($($argument),*);
         $callback::<$crate::Project>($($argument),*);
-        $callback::<$crate::Regard>($($argument),*);
         $callback::<$crate::Repository>($($argument),*);
         $callback::<$crate::TerminalSession>($($argument),*);
         $callback::<$crate::Vessel>($($argument),*);
@@ -280,14 +281,14 @@ macro_rules! for_each_registered_resource {
 }
 pub use fulfilment_kind::{effective_grants, least_privilege_grants, version_at_least, CapabilityNeed};
 pub use message::{
-    message_record_name, HeldMessageBatch, Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec,
-    MessageStatus, MessageStatusPatch, MessageSubmission, OperatorMessageDelivery, ResolvedMessageReceiver, STALL_KIND,
+    message_record_name, Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec, MessageStatus,
+    MessageStatusPatch, MessageSubmission, OperatorMessageDelivery, ResolvedMessageReceiver, STALL_KIND,
 };
 pub use message_inbox::{
-    message_expectation_open, message_supersedes, parse_topic_address, qualify_message_address, qualify_message_spec,
-    validate_message_address, MessageAddressContext, ROLE_ADDRESS_ANNOTATION,
+    convoy_crew_seats, convoy_of_segment, convoy_seat_turns, convoy_segment, crew_convoy_prefix, crew_role_address,
+    parse_crew_role_address, parse_topic_address, qualify_message_address, validate_message_address, MessageAddressContext,
+    ROLE_ADDRESS_ANNOTATION,
 };
-pub use message_migration::{legacy_message_sender, legacy_message_spec};
 pub use workflow_template::{
     builtin_workflow_templates, current_builtin_workflow_name, implement_review_workflow_spec, interactive_single_workflow_spec,
     leaf_operator, legacy_field_path, legacy_template_text, parse_leaf_template, single_agent_shepherd_workflow_spec,
@@ -298,6 +299,7 @@ pub use workflow_template::{
 };
 
 pub mod role_cascade;
+pub use convoy::admission::{AdmissionDocument, AdmissionDocumentError};
 pub use convoy::promises;
 pub use credential::{HostActionSelector, HostImageAction};
 pub use fleet_designation::ImageCacheBinding;

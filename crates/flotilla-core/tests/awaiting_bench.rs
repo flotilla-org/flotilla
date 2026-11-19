@@ -13,7 +13,7 @@
 
 use std::{sync::Arc, time::Instant};
 
-use flotilla_core::primitives::awaiting::{AwaitingReplies, STALL};
+use flotilla_engine_messages::awaiting::{AwaitingReplies, STALL};
 use flotilla_schema::{Address, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::machines::{
@@ -38,6 +38,9 @@ fn spec(n: usize) -> AwaitingReplySpec {
         kind: if stall { STALL.into() } else { "reply".into() },
         awaited: Awaited::Reply,
         deadline: n.is_multiple_of(2).then_some(Timestamp(1_000_000 + n as i64)),
+        report: None,
+        stall_reason: None,
+        proposed_disposition: None,
     }
 }
 

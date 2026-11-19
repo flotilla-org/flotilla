@@ -1,4 +1,29 @@
 use super::*;
+use crate::testkits::engine::runtime_checkouts;
+use flotilla_admission::repository_inspection::{LocalCheckoutInspection, RepositoryInspection, RepositoryInspector};
+
+/// Every inspected path is a checkout of `repository` on `main`, on host `host_ref`.
+struct CheckoutOf {
+    repository: RepositorySpec,
+    host_ref: String,
+}
+
+#[async_trait::async_trait]
+impl RepositoryInspector for CheckoutOf {
+    async fn inspect_path(&self, path: &std::path::Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        Ok(RepositoryInspection {
+            spec: self.repository.clone(),
+            checkout: LocalCheckoutInspection::builder()
+                .path(path.to_path_buf())
+                .host_ref(self.host_ref.clone())
+                .git_ref("main".to_string())
+                .is_main(true)
+                .build(),
+            transport_url: self.repository.live_remote().map(str::to_string),
+            replaces_prior_repository: false,
+        })
+    }
+}
 
 pub(super) async fn crew_provisioning_recovery_scenario() {
     async fn promise(daemon: &InProcessDaemon, context: CrewCommandContext, operation: flotilla_protocol::commands::CrewPromiseOperation) {
@@ -24,7 +49,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
     let backend = daemon.resource_backend();
 
-    register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup resources");
+    let provisioning = engine_startup(&daemon, NAMESPACE, &profile).await.expect("startup resources");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat");
     let mut state = ControllerRuntimeState::new(
         Arc::clone(&daemon),
@@ -36,13 +61,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     );
     state.local_core_count = || Ok(std::num::NonZeroUsize::new(32).expect("32 cores"));
     let state = Arc::new(state);
-    let controller_handles = spawn_controller_loops(
-        Arc::clone(&state),
-        NAMESPACE,
-        Duration::from_millis(20),
-        ControllerSupervision::default(),
-        RuntimeHealth::default(),
-    );
+    let controller_handles =
+        spawn_controller_loops(Arc::clone(&state), &provisioning, NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
 
     backend
         .clone()
@@ -82,6 +102,12 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         )
         .await
         .expect("crew workflow");
+    // This daemon's runner answers agent probes only, so the checkout's inspection is stood in.
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
+    let host_ref = daemon.local_host_id().expect("local host id").to_string();
+    daemon.set_repository_inspector(Arc::new(CheckoutOf { repository: repository.clone(), host_ref })).await;
+    // The project is on the repository the checkout is of.
+    flotilla_store_testkit::fixtures::project_on_repository(&backend, NAMESPACE, NAMESPACE, &repository, "main").await;
 
     let mut rx = daemon.subscribe();
     let create_id = daemon
@@ -91,9 +117,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
                     name: "crew-convoy".to_string(),
                     workflow_ref: "crew-workflow".to_string(),
                     inputs: Vec::new(),
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
                     r#ref: Some("main".to_string()),
-                    project_ref: None,
+                    project_ref: NAMESPACE.to_string(),
                     placement_policy: Some(profile.host_direct_policy_name()),
                     adopted_checkout: Some(Box::new(repo.clone())),
                 })
@@ -101,10 +126,11 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         )
         .await
         .expect("create crew convoy");
-    assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "crew-convoy".to_string() });
+    let created = wait_for_command_result(&mut rx, create_id).await;
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let crew_record = convoy_record_name(&backend, "crew-convoy").await;
+    assert_eq!(created, created_launch(NAMESPACE, &crew_record));
     wait_until(|| {
         let convoys = convoys.clone();
         let crew_record = crew_record.clone();
@@ -120,6 +146,19 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     .await;
 
     let terminals = backend.clone().using::<TerminalSession>(NAMESPACE);
+    // The work runs once its vessel is ready; its crews are seated after, the coder first.
+    wait_until(|| {
+        let terminals = terminals.clone();
+        async move {
+            terminals.list().await.is_ok_and(|sessions| {
+                sessions
+                    .items
+                    .iter()
+                    .any(|session| session.spec.role == "coder" && session.status.as_ref().is_some_and(|status| status.crew.is_some()))
+            })
+        }
+    })
+    .await;
     let coder = terminals
         .list()
         .await
@@ -131,7 +170,16 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     let TerminalSessionSource::Agent { context, .. } = &coder.spec.source else { panic!("coder must be an agent") };
     let coder_id = coder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("coder identity").id.clone();
     assert_eq!(coder.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str()), Some("codex"));
-    assert!(terminals.list().await.expect("terminal list").items.iter().any(|session| session.spec.role == "watcher"));
+    // The tool crew is seated beside the coder, its session ensured in the pool.
+    wait_until(|| {
+        let terminals = terminals.clone();
+        let pool = Arc::clone(&pool);
+        async move {
+            terminals.list().await.is_ok_and(|sessions| sessions.items.iter().any(|session| session.spec.role == "watcher"))
+                && pool.ensured.lock().await.iter().any(|launch| launch.session_name.ends_with("-watcher"))
+        }
+    })
+    .await;
     assert!(terminals.list().await.expect("terminal list").items.iter().all(|session| session.spec.role != "reviewer"));
     let ensured = pool.ensured.lock().await;
     let coder_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-coder")).expect("coder launch");
@@ -192,34 +240,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     // never launched as working.
     assert_eq!(initial_status.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::Pending);
     assert_eq!(initial_status.crew_work["implement"]["reviewer"].started_at, None);
-    assert!(!initial_status.crew_work["implement"].contains_key("watcher"));
-
-    let mut rx = daemon.subscribe();
-    let refused_complete_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: crew_context.clone(),
-                    message: Some("delegate attempted completion".to_string()),
-                    disposition: None,
-                    decision_ledger_ref: None,
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect("dispatch refused completion");
-    assert!(matches!(wait_for_command_result(&mut rx, refused_complete_id).await,
-            CommandValue::CrewCompletionAdvisory { pending } if pending.iter().any(|p| p.contains("decision-ledger"))));
-    let after_refusal = convoys.get(&crew_record).await.expect("crew convoy after refusal").status.expect("convoy status after refusal");
-    assert_eq!(after_refusal.phase, initial_status.phase);
-    assert_eq!(after_refusal.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert!(after_refusal.crew_work["implement"]["coder"].completion_refusal.is_none());
-    assert_eq!(
-        terminals.get(&coder.metadata.name).await.expect("coder session after refusal").status.expect("coder session status").phase,
-        TerminalSessionPhase::Running,
-        "refused completion must leave the crew session alive"
-    );
+    // The view lists every crew member of the work; the tool crew owes nothing.
+    assert!(initial_status.promises.get("implement").and_then(|roles| roles.get("watcher")).is_none_or(Vec::is_empty));
 
     let ledger_name = flotilla_resources::address::record_name(
         &flotilla_resources::address::artifact_address(&crew_record, "coder", "decision-ledger", &crew_record).expect("artifact address"),
@@ -238,7 +260,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
                     "comment_url".to_string(),
                     serde_json::json!("https://github.com/flotilla-org/flotilla/pull/1875#issuecomment-coder"),
                 )]))
-                .digest("test-ledger-digest".to_string())
+                .digest(flotilla_resources::artifact::blob_digest_of(b"ledger"))
                 .size(1)
                 .media_type("text/markdown".to_string())
                 .expires_at(Utc::now() + chrono::Duration::days(1))
@@ -247,22 +269,6 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .await
         .expect("publish coder ledger artifact");
 
-    let mut rx = daemon.subscribe();
-    let coder_complete_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: crew_context.clone(),
-                    message: Some("implementation ready".to_string()),
-                    disposition: None,
-                    decision_ledger_ref: None,
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect("coder complete");
-    assert!(matches!(wait_for_command_result(&mut rx, coder_complete_id).await, CommandValue::CrewCompletionAdvisory { .. }));
     wait_until(|| {
         let convoys = convoys.clone();
         let crew_record = crew_record.clone();
@@ -287,6 +293,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
             Command::builder()
                 .action(CommandAction::CrewHandoff {
                     carries: Vec::new(),
+                    reassign: Vec::new(),
                     context: crew_context.clone(),
                     target: "reviewer".to_string(),
                     message: "Review commit abc123".to_string(),
@@ -333,8 +340,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     .await;
 
     pool.set_captured_screen(&reviewer.metadata.name, "• Working (1s • esc to interrupt)\n› Ask Codex to do anything").await;
-    // A follow-up carries a new obligation so the reopened coder remains live
-    // across the daemon restart; previously it waited for a completion claim.
+    // The reviewer declares a follow-up obligation and reassigns it with the hand-back, so the
+    // reopened coder owes it and remains live across the daemon restart.
     promise(
         &daemon,
         CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
@@ -347,6 +354,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
             Command::builder()
                 .action(CommandAction::CrewHandoff {
                     carries: Vec::new(),
+                    reassign: vec!["recovery-work".into()],
                     context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
                     target: "coder".to_string(),
                     message: "Address the review findings".to_string(),
@@ -356,13 +364,14 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .await
         .expect("hand back to coder");
     assert_eq!(wait_for_command_result(&mut rx, hand_back_id).await, CommandValue::Ok);
-    let messages = backend.using::<flotilla_resources::Message>(NAMESPACE);
-    let coder_delivery_id = messages
-        .list()
+    // Messages are the engine's: read them through the Message path's views.
+    let messages = daemon.message_primitives().expect("the engine Message path");
+    let backend = daemon.resource_backend();
+    let coder_delivery_id = flotilla_engine_messages_testkit::views(&messages, &backend, NAMESPACE)
         .await
         .unwrap()
-        .items
         .into_iter()
+        .map(|message| message.object)
         .find(|message| message.spec.receiver.ends_with("/implement/coder") && message.spec.body.ends_with("Address the review findings"))
         .expect("running coder handoff should be accepted in its durable inbox")
         .metadata
@@ -381,14 +390,15 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     .await;
     pool.set_captured_screen(&coder.metadata.name, "• Working (1s • esc to interrupt)\n› Ask Codex to do anything").await;
     wait_until_with_timeout(Duration::from_secs(5), || {
-        let messages = messages.clone();
+        let messages = Arc::clone(&messages);
+        let backend = backend.clone();
         let coder_delivery_id = coder_delivery_id.clone();
         async move {
-            messages
-                .get(&coder_delivery_id)
+            flotilla_engine_messages_testkit::views(&messages, &backend, NAMESPACE)
                 .await
                 .ok()
-                .and_then(|message| message.status)
+                .and_then(|views| views.into_iter().find(|message| message.object.metadata.name == coder_delivery_id))
+                .and_then(|message| message.object.status)
                 .is_some_and(|status| status.phase.has_delivery_evidence())
         }
     })
@@ -405,17 +415,27 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     .await;
     let reopened = convoys.get(&crew_record).await.expect("reopened convoy").status.expect("reopened status");
     assert_eq!(reopened.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert_eq!(reopened.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::HandedBack);
+    // The hand-back moved only `recovery-work`: the reviewer still owes its own ledger, so it is
+    // still working.
+    assert_eq!(reopened.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::Working);
 
     for handle in controller_handles {
         handle.abort();
         let _ = handle.await;
     }
     pool.remove_session(&coder.metadata.name).await;
-    let listed_before_restart = convoys.list().await.expect("convoys before daemon restart");
-    let mut convoy_watch =
-        convoys.watch(flotilla_resources::WatchStart::resuming_from(&listed_before_restart)).await.expect("watch convoy recovery");
+    // A restart is a new process: the first daemon, and its Message path's homes, are gone
+    // before the second opens the same stores.
+    let stopped = Arc::downgrade(&daemon);
+    drop((state, messages, rx, daemon));
+    wait_until_with_timeout(Duration::from_secs(5), || {
+        let stopped = stopped.clone();
+        async move { stopped.upgrade().is_none() }
+    })
+    .await;
     let (daemon, pool) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
+    let host_ref = daemon.local_host_id().expect("local host id after restart").to_string();
+    daemon.set_repository_inspector(Arc::new(CheckoutOf { repository: repository.clone(), host_ref })).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry after restart");
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile after restart");
     let surviving_sessions = terminals
@@ -435,6 +455,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         })
         .collect();
     pool.add_sessions(surviving_sessions).await;
+    let provisioning = engine_provisioning(&daemon).await;
     let state = Arc::new(ControllerRuntimeState::new(
         Arc::clone(&daemon),
         Arc::clone(&config),
@@ -443,13 +464,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         profile.host_id.clone(),
         profile.host_direct_environment_name(),
     ));
-    let controller_handles = spawn_controller_loops(
-        Arc::clone(&state),
-        NAMESPACE,
-        Duration::from_millis(20),
-        ControllerSupervision::default(),
-        RuntimeHealth::default(),
-    );
+    let controller_handles =
+        spawn_controller_loops(Arc::clone(&state), &provisioning, NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
     wait_until(|| {
         let terminals = terminals.clone();
         let name = coder.metadata.name.clone();
@@ -476,22 +492,18 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         }
     })
     .await;
-    let mut saw_interrupted_work = false;
-    let mut saw_interrupted_convoy = false;
-    while !(saw_interrupted_work && saw_interrupted_convoy) {
-        let event = tokio::time::timeout(Duration::from_secs(1), convoy_watch.next())
-            .await
-            .expect("interruption should be durably observable")
-            .expect("convoy watch should remain open")
-            .expect("convoy watch event");
-        let convoy = match event {
-            flotilla_resources::WatchEvent::Added(convoy) | flotilla_resources::WatchEvent::Modified(convoy) => convoy,
-            flotilla_resources::WatchEvent::Deleted(_) | flotilla_resources::WatchEvent::DeletedByName(_) => continue,
-        };
-        let Some(status) = convoy.status else { continue };
-        saw_interrupted_work |= status.work.get("implement").is_some_and(|work| work.phase == WorkPhase::Interrupted);
-        saw_interrupted_convoy |= status.phase == ConvoyPhase::Interrupted;
-    }
+    // The lost session stays observable as its launch's history: the launch before the revived
+    // one ended lost.
+    let reads = daemon.lifecycle_reads();
+    let lost = reads
+        .terminals()
+        .and_then(|terminals| terminals.every())
+        .expect("terminal launches")
+        .into_iter()
+        .filter(|launch| launch.session_name() == coder.metadata.name)
+        .filter(|launch| matches!(launch.reading, flotilla_protocol::LifecycleReading::Lost { .. }))
+        .count();
+    assert!(lost >= 1, "the coder's lost launch should be durably observable");
     let revived_coder = terminals.get(&coder.metadata.name).await.expect("revived coder");
     let revived_coder_id = revived_coder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("revived identity").id.clone();
     let reviewer = terminals
@@ -504,7 +516,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .expect("reviewer session after restart");
     let reviewer_id = reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).expect("revived reviewer identity").id.clone();
 
-    let attach = daemon.resolve_attach_command_internal("crew-convoy/implement/coder").await.expect("attach coder");
+    let attach = daemon.resolve_attach_command_internal(&format!("{crew_record}/implement/coder")).await.expect("attach coder");
     let [flotilla_protocol::ResolvedAttachAction::Command(args)] = attach.plan.0.as_slice() else {
         panic!("expected one local attach command, got {:?}", attach.plan);
     };
@@ -513,7 +525,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     let ledgers = backend.using::<flotilla_resources::Artifact>(NAMESPACE);
     let prior_ledger = ledgers.get(&ledger_name).await.expect("coder ledger");
     let mut revised_ledger = prior_ledger.spec.clone();
-    revised_ledger.digest = "test-ledger-revision".to_string();
+    revised_ledger.digest = flotilla_resources::artifact::blob_digest_of(b"test-ledger-revision");
     revised_ledger
         .summary
         .insert("comment_url".to_string(), serde_json::json!("https://github.com/flotilla-org/flotilla/pull/1875#issuecomment-recomplete"));
@@ -532,28 +544,12 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     )
     .await;
     let mut rx = daemon.subscribe();
-    let coder_recomplete_id = daemon
-        .execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some(revived_coder_id.clone()), ..Default::default() },
-                    message: Some("review findings addressed".to_string()),
-                    disposition: None,
-                    decision_ledger_ref: None,
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect("coder re-complete");
-    assert!(matches!(wait_for_command_result(&mut rx, coder_recomplete_id).await, CommandValue::CrewCompletionAdvisory { .. }));
-
-    let mut rx = daemon.subscribe();
     let return_to_reviewer_id = daemon
         .execute(
             Command::builder()
                 .action(CommandAction::CrewHandoff {
                     carries: Vec::new(),
+                    reassign: Vec::new(),
                     context: CrewCommandContext { crew_id: Some(revived_coder_id), ..Default::default() },
                     target: "reviewer".to_string(),
                     message: "Please verify the fixes".to_string(),
@@ -564,40 +560,40 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .expect("return to reviewer");
     assert_eq!(wait_for_command_result(&mut rx, return_to_reviewer_id).await, CommandValue::Ok);
 
-    let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
-    let checkout = checkouts
-        .list()
-        .await
-        .expect("checkout list")
-        .items
-        .into_iter()
-        .find(|checkout| checkout.metadata.lifecycle_authority().ok().flatten() == Some(LifecycleAuthority::Adopted))
-        .expect("adopted checkout");
-    let mut integration = checkout.status.expect("checkout status").integration;
-    integration.landed = flotilla_resources::IntegrationCondition::builder()
-        .value(flotilla_resources::ConditionValue::True)
-        .details(vec!["no change request exists for branch".to_string()])
-        .observed_at(Utc::now().to_rfc3339())
-        .build();
-    flotilla_store::apply_status_patch(
-        &checkouts,
-        &checkout.metadata.name,
-        &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration) },
-    )
-    .await
-    .expect("record observed absence of a change request");
-    record_successful_empty_branch_scan(&backend, &crew_record).await;
-    // This recovery fixture's reviewer has no promises. The operator override
-    // remains available; advisory completion cannot terminalize an empty role.
+    // The engine holds the adopted checkout; its home's inspection records that its branch landed
+    // with no change request.
+    {
+        use flotilla_resources::checkout_records::{CheckoutRecords as _, Inspection};
+        let checkouts = runtime_checkouts(&daemon);
+        let checkout = checkouts
+            .checkouts
+            .here()
+            .expect("checkouts here")
+            .into_iter()
+            .find(|checkout| !checkout.ended() && matches!(checkout.spec, flotilla_resources::CheckoutSpec::Observed(_)))
+            .expect("adopted checkout");
+        checkouts
+            .checkouts
+            .inspected(
+                &checkout.name,
+                Inspection {
+                    landed: Some(true),
+                    landed_details: vec!["no change request exists for branch".to_string()],
+                    ..Default::default()
+                },
+            )
+            .expect("record observed absence of a change request");
+    }
+    record_successful_empty_branch_scan(&daemon, &crew_record).await;
+    // This recovery fixture's reviewer never publishes the ledger it owes, so only the operator's
+    // forced completion ends its part.
     assert_eq!(
         daemon
             .crew_complete_as_principal_internal(
                 &CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
                 Some("changes accepted".into()),
                 None,
-                None,
-                true,
-                Some(flotilla_protocol::PrincipalRef::implicit_for_namespace(NAMESPACE)),
+                flotilla_protocol::PrincipalRef::implicit_for_namespace(NAMESPACE),
             )
             .await
             .unwrap(),
@@ -613,7 +609,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     .await;
     let completed = convoys.get(&crew_record).await.expect("completed convoy").status.expect("completed status");
     assert_eq!(completed.work["implement"].phase, WorkPhase::Complete);
-    assert!(completed.crew_work["implement"].values().all(|state| state.phase == flotilla_resources::CrewWorkPhase::Done));
+    // The crew that owed promises is done; the view derives the others' phases from their seats.
+    assert_eq!(completed.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
 
     backend
         .clone()
@@ -642,9 +639,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
                     name: "unknown-convoy".to_string(),
                     workflow_ref: "unknown-capability".to_string(),
                     inputs: Vec::new(),
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
                     r#ref: Some("main".to_string()),
-                    project_ref: None,
+                    project_ref: NAMESPACE.to_string(),
                     placement_policy: Some(profile.host_direct_policy_name()),
                     adopted_checkout: Some(Box::new(repo)),
                 })

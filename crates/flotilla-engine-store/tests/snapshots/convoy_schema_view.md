@@ -4,22 +4,22 @@ Kind tables only; the shared tables are in `convoy.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
-| `awaiting_reply` | root | 12 | – | – | `open_by_sender` (sender), `open_by_subject` (subject), `by_message` (message), `deadline` (deadline) |
-| `convoy` | root | 9 | – | `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_quota` (state data), `convoy_retired` (state data) | `open_by_project` (project) |
+| `awaiting_reply` | root | 15 | – | – | `open_by_sender` (sender), `open_by_subject` (subject), `by_message` (message), `deadline` (deadline) |
+| `convoy` | root | 14 | – | `convoy_subjects` (records), `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_retired_duties` (state data) | `open_by_project` (project), `by_launch` (project, launch_of, launch) |
+| `convoy_subjects` | records | 6 | – | – | – |
 | `convoy_duties` | child | 6 | 1: `scope` 1 | `convoy_duties_scope_promises` (child) | – |
 | `convoy_duties_scope_promises` | child | 3 | – | – | – |
-| `convoy_seats` | records | 10 | – | – | – |
+| `convoy_seats` | records | 11 | – | – | – |
 | `convoy_promises` | records | 12 | – | `convoy_promises_submissions` (records) | `by_label` (unique convoy, label) |
 | `convoy_promises_submissions` | records | 8 | – | – | `by_address` (address) |
-| `convoy_quota` | state data | 3 | – | – | – |
-| `convoy_retired` | state data | 2 | – | – | – |
+| `convoy_retired_duties` | state data | 2 | – | – | – |
 
 Tables wider than 30 columns:
 - none
 
 States with data (one label column, then data shared by name across the labels):
 - `awaiting_reply`.`state`: label `state` and `state_since`; data columns `reason`; data tables –
-- `convoy`.`state`: label `state` and `state_since`; data columns `reason`; data tables `convoy_quota`, `convoy_retired`
+- `convoy`.`state`: label `state` and `state_since`; data columns `disposition`, `cause`, `reason`; data tables `convoy_retired_duties`
 
 Interned column domains:
 
@@ -29,7 +29,10 @@ Interned column domains:
 | `awaiting_reply` | `recipient` | `ad` |
 | `awaiting_reply` | `subject` | `ad` |
 | `awaiting_reply` | `kind` | `ak` |
+| `convoy` | `launch_of` | `ln` |
+| `convoy` | `workflow_ref` | `wf` |
 | `convoy` | `project` | `ad` |
+| `convoy_subjects` | `subject` | `ad` |
 | `convoy_duties` | `owner_role` | `rl` |
 | `convoy_duties` | `owner_seat` | `st` |
 | `convoy_seats` | `role` | `rl` |
@@ -45,4 +48,3 @@ Interned column domains:
 | `convoy_promises_submissions` | `address` | `ad` |
 | `convoy_promises_submissions` | `by_role` | `rl` |
 | `convoy_promises_submissions` | `by_seat` | `st` |
-| `convoy_quota` | `key` | `vc` |

@@ -298,7 +298,7 @@ pub struct CredentialStore {
     ledger_delivery_environment: Mutex<BTreeMap<String, LedgerDeliveryRecord>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
-    github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
+    github_app_deliveries: Mutex<GithubAppDeliveries>,
     github_app_delivery_locks: Mutex<GithubAppDeliveryLocks>,
     github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
     github_app_installations: Mutex<BTreeMap<GithubAppInstallationRequest, u64>>,
@@ -332,15 +332,23 @@ struct GithubAppDelivery {
     expires_at: DateTime<Utc>,
     refresh_failures: usize,
     next_refresh_attempt_at: Option<DateTime<Utc>>,
+    /// When the current run of failed refreshes began, and the latest one's error.
+    first_refresh_failure_at: Option<DateTime<Utc>>,
+    last_refresh_error: Option<String>,
     installation_repository: Option<String>,
     scope: Option<GithubAppScope>,
+    /// The scope was set to something other than the one last minted for: resolve it again.
+    scope_dirty: bool,
 }
 
 impl GithubAppDelivery {
-    fn record_refresh_failure(&mut self, now: DateTime<Utc>) -> bool {
+    /// Backs off the next attempt, never past expiry. Once the token has expired a failure
+    /// schedules nothing: only an event (a definition change, a crew resume, a person) retries it.
+    fn record_refresh_failure(&mut self, now: DateTime<Utc>, error: String) -> bool {
         self.refresh_failures += 1;
-        let inside_margin = now + GITHUB_APP_REFRESH_MARGIN >= self.expires_at;
-        if inside_margin {
+        self.first_refresh_failure_at.get_or_insert(now);
+        self.last_refresh_error = Some(error);
+        if now >= self.expires_at {
             self.next_refresh_attempt_at = None;
         } else {
             let mut delay = GITHUB_APP_INITIAL_REFRESH_BACKOFF.min(GITHUB_APP_MAX_REFRESH_BACKOFF);
@@ -350,10 +358,189 @@ impl GithubAppDelivery {
                 }
                 delay = (delay * 2).min(GITHUB_APP_MAX_REFRESH_BACKOFF);
             }
-            self.next_refresh_attempt_at = Some(now + delay);
+            self.next_refresh_attempt_at = Some((now + delay).min(self.expires_at));
         }
-        self.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || inside_margin
+        self.should_surface(now)
     }
+
+    fn should_surface(&self, now: DateTime<Utc>) -> bool {
+        self.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || now + GITHUB_APP_REFRESH_MARGIN >= self.expires_at
+    }
+
+    /// Failed, and expired with it: no attempt is scheduled until an event.
+    fn gave_up(&self) -> bool {
+        self.refresh_failures > 0 && self.next_refresh_attempt_at.is_none()
+    }
+
+    /// When the next timed attempt falls due: the backoff after a failure, otherwise the
+    /// refresh point. None once it gave up.
+    fn due_at(&self) -> Option<DateTime<Utc>> {
+        if self.refresh_failures > 0 {
+            self.next_refresh_attempt_at
+        } else {
+            Some(github_app_refresh_at(self.issued_at, self.expires_at))
+        }
+    }
+}
+
+type GithubAppKey = (String, String);
+
+/// The registered GitHub App deliveries, keyed by environment and credential, with the
+/// indexes a refresh pass reads instead of walking every delivery: when each falls due, which
+/// scopes changed, which gave up, which are failing, and which projects scope which.
+#[derive(Default)]
+struct GithubAppDeliveries {
+    deliveries: BTreeMap<GithubAppKey, GithubAppDelivery>,
+    due: BTreeSet<(DateTime<Utc>, GithubAppKey)>,
+    dirty: BTreeSet<GithubAppKey>,
+    gave_up: BTreeSet<GithubAppKey>,
+    failing: BTreeSet<GithubAppKey>,
+    by_project: BTreeMap<String, BTreeSet<GithubAppKey>>,
+}
+
+impl GithubAppDeliveries {
+    fn get(&self, key: &GithubAppKey) -> Option<&GithubAppDelivery> {
+        self.deliveries.get(key)
+    }
+
+    fn contains_key(&self, key: &GithubAppKey) -> bool {
+        self.deliveries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.deliveries.is_empty()
+    }
+
+    fn index(&mut self, key: &GithubAppKey, delivery: &GithubAppDelivery) {
+        if let Some(at) = delivery.due_at() {
+            self.due.insert((at, key.clone()));
+        }
+        if delivery.scope_dirty {
+            self.dirty.insert(key.clone());
+        }
+        if delivery.gave_up() {
+            self.gave_up.insert(key.clone());
+        }
+        if delivery.refresh_failures > 0 {
+            self.failing.insert(key.clone());
+        }
+        for project in delivery.scope.iter().flat_map(|scope| &scope.projects) {
+            self.by_project.entry(project.clone()).or_default().insert(key.clone());
+        }
+    }
+
+    fn unindex(&mut self, key: &GithubAppKey, delivery: &GithubAppDelivery) {
+        if let Some(at) = delivery.due_at() {
+            self.due.remove(&(at, key.clone()));
+        }
+        self.dirty.remove(key);
+        self.gave_up.remove(key);
+        self.failing.remove(key);
+        for project in delivery.scope.iter().flat_map(|scope| &scope.projects) {
+            if let Some(keys) = self.by_project.get_mut(project) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    self.by_project.remove(project);
+                }
+            }
+        }
+    }
+
+    fn insert(&mut self, key: GithubAppKey, delivery: GithubAppDelivery) {
+        if let Some(before) = self.deliveries.remove(&key) {
+            self.unindex(&key, &before);
+        }
+        self.index(&key, &delivery);
+        self.deliveries.insert(key, delivery);
+    }
+
+    fn extend(&mut self, deliveries: impl IntoIterator<Item = (GithubAppKey, GithubAppDelivery)>) {
+        for (key, delivery) in deliveries {
+            self.insert(key, delivery);
+        }
+    }
+
+    fn remove(&mut self, key: &GithubAppKey) -> Option<GithubAppDelivery> {
+        let removed = self.deliveries.remove(key)?;
+        self.unindex(key, &removed);
+        Some(removed)
+    }
+
+    /// Changes `key`'s delivery, if held and `keep` accepts it, keeping the indexes in step.
+    fn update<T>(
+        &mut self,
+        key: &GithubAppKey,
+        keep: impl FnOnce(&GithubAppDelivery) -> bool,
+        change: impl FnOnce(&mut GithubAppDelivery) -> T,
+    ) -> Option<T> {
+        let mut delivery = self.deliveries.remove(key)?;
+        if !keep(&delivery) {
+            self.deliveries.insert(key.clone(), delivery);
+            return None;
+        }
+        self.unindex(key, &delivery);
+        let changed = change(&mut delivery);
+        self.index(key, &delivery);
+        self.deliveries.insert(key.clone(), delivery);
+        Some(changed)
+    }
+
+    /// Forgets every delivery to `environment`, found by its key range.
+    fn remove_environment(&mut self, environment: &str) {
+        let keys = self
+            .deliveries
+            .range((environment.to_owned(), String::new())..)
+            .take_while(|((held, _), _)| held == environment)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
+    /// The deliveries a refresh pass at `now` woken by `wake` tries: those due, those whose scope
+    /// changed or names a project the wake names, and, when it retries them, those that gave up.
+    fn candidates(&self, now: DateTime<Utc>, wake: &GithubAppRefreshWake) -> Vec<(GithubAppKey, GithubAppDelivery)> {
+        let mut keys = self.due.iter().take_while(|(at, _)| *at <= now).map(|(_, key)| key).collect::<BTreeSet<_>>();
+        keys.extend(&self.dirty);
+        keys.extend(wake.projects.iter().filter_map(|project| self.by_project.get(project)).flatten());
+        if wake.retry_given_up {
+            keys.extend(&self.gave_up);
+        }
+        keys.into_iter().filter_map(|key| self.deliveries.get(key).map(|delivery| (key.clone(), delivery.clone()))).collect()
+    }
+
+    /// When the next refresh or retry falls due: now while a scope waits to be resolved again.
+    fn next_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.dirty.is_empty() {
+            return Some(now);
+        }
+        self.due.first().map(|(at, _)| *at)
+    }
+
+    fn failing(&self) -> impl Iterator<Item = (&GithubAppKey, &GithubAppDelivery)> {
+        self.failing.iter().filter_map(|key| self.deliveries.get_key_value(key))
+    }
+}
+
+/// What wakes a GitHub App refresh pass besides due times.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GithubAppRefreshWake {
+    /// Projects whose membership may have changed: deliveries scoped by them are resolved again.
+    pub projects: BTreeSet<String>,
+    /// A definition changed or a person asked: deliveries that gave up are tried again.
+    pub retry_given_up: bool,
+}
+
+/// What a GitHub App refresh pass did.
+#[derive(Debug, Default)]
+pub struct GithubAppRefresh {
+    /// Its failures, and late refreshes that succeeded.
+    pub errors: Vec<CredentialRefreshError>,
+    /// The environments with a delivery it re-minted or failed to: what they report delivered
+    /// may have changed, a failure past expiry dropping the credential.
+    pub environments: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -369,6 +556,8 @@ pub struct CredentialRefreshError {
     pub credential_name: Option<String>,
     pub message: String,
     pub should_surface: bool,
+    /// When this run of failures began, where the store knows it.
+    pub first_failure_at: Option<DateTime<Utc>>,
 }
 
 const GITHUB_APP_REFRESH_FAILURE_THRESHOLD: usize = 3;
@@ -569,7 +758,7 @@ impl CredentialStore {
             ledger_delivery_environment: Mutex::new(BTreeMap::new()),
             materials: Mutex::new(BTreeMap::new()),
             git_config_fragments: Mutex::new(BTreeMap::new()),
-            github_app_deliveries: Mutex::new(BTreeMap::new()),
+            github_app_deliveries: Mutex::default(),
             github_app_delivery_locks: Mutex::new(BTreeMap::new()),
             github_app_adoption_failures: Mutex::new(BTreeMap::new()),
             github_app_installations: Mutex::new(BTreeMap::new()),
@@ -920,11 +1109,14 @@ impl CredentialStore {
                         expires_at,
                         refresh_failures: 0,
                         next_refresh_attempt_at: None,
+                        first_refresh_failure_at: None,
+                        last_refresh_error: None,
                         installation_repository: match &spec.consumer {
                             CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
                             _ => None,
                         },
                         scope: None,
+                        scope_dirty: false,
                     },
                 ));
             }
@@ -1104,6 +1296,7 @@ impl CredentialStore {
             credential_name: None,
             message,
             should_surface: *failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD,
+            first_failure_at: None,
         }
     }
 
@@ -1276,7 +1469,7 @@ impl CredentialStore {
             self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
             self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
             self.git_config_fragments.lock().await.remove(environment_ref);
-            self.github_app_deliveries.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
+            self.github_app_deliveries.lock().await.remove_environment(environment_ref);
             self.github_app_adoption_failures.lock().await.remove(environment_ref);
             Ok(())
         })
@@ -1344,6 +1537,11 @@ impl CredentialStore {
 
     pub fn tracked_work_deliveries(&self) -> BoxFuture<'_, BTreeMap<String, BTreeSet<String>>> {
         Box::pin(async move { self.work_deliveries.lock().await.clone() })
+    }
+
+    /// The credentials this daemon delivered to `environment_ref`, read by its key.
+    pub fn tracked_work_delivery<'a>(&'a self, environment_ref: &'a str) -> BoxFuture<'a, BTreeSet<String>> {
+        Box::pin(async move { self.work_deliveries.lock().await.get(environment_ref).cloned().unwrap_or_default() })
     }
 
     /// Reconcile the files and cached material for one work environment. The
@@ -1443,69 +1641,55 @@ impl CredentialStore {
         })
     }
 
-    /// Re-mint and atomically replace GitHub App files that are approaching
-    /// expiry. The daemon calls this from its host-side periodic loop; vessels
-    /// receive only the resulting file and never the App signing material.
+    /// Re-mints and atomically replaces the GitHub App files whose refresh is due; vessels receive
+    /// only the resulting file and never the App signing material.
     pub fn refresh_due_github_app_tokens(&self) -> BoxFuture<'_, Vec<CredentialRefreshError>> {
+        Box::pin(async move { self.refresh_github_app_tokens(&GithubAppRefreshWake::default()).await.errors })
+    }
+
+    /// One refresh pass: the deliveries whose refresh or retry is due, those whose scope `wake`
+    /// names or that were given a new scope, and, when `wake` says so, those that gave up.
+    pub fn refresh_github_app_tokens<'a>(&'a self, wake: &'a GithubAppRefreshWake) -> BoxFuture<'a, GithubAppRefresh> {
         Box::pin(async move {
             let now = self.clock.now();
-            let deliveries =
-                self.github_app_deliveries.lock().await.iter().map(|(key, delivery)| (key.clone(), delivery.clone())).collect::<Vec<_>>();
+            // Only the deliveries the indexes name: never a walk over every delivery.
+            let deliveries = self.github_app_deliveries.lock().await.candidates(now, wake);
             let mut errors = Vec::new();
+            let mut reminted = BTreeSet::new();
             for (key, delivery) in deliveries {
+                let touched = delivery.scope_dirty
+                    || delivery.scope.as_ref().is_some_and(|scope| scope.projects.iter().any(|project| wake.projects.contains(project)));
+                let waiting = if delivery.gave_up() { !wake.retry_given_up } else { delivery.due_at().is_some_and(|due| now < due) };
+                if waiting && !touched {
+                    continue;
+                }
                 let mut request = delivery.request.clone();
                 if let Some(scope) = &delivery.scope {
                     let repositories = match self.resolve_github_app_scope(scope).await {
                         Ok(repositories) => repositories,
                         Err(error) => {
-                            let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
-                            errors.push(CredentialRefreshError {
-                                environment_ref: key.0.clone(),
-                                credential_name: Some(key.1.clone()),
-                                message: self.refresh_failure_message(&key.1, delivery.expires_at, &error),
-                                should_surface,
-                            });
+                            errors.extend(self.record_refresh_failure(&key, &delivery, &error).await);
                             continue;
                         }
                     };
                     request.repositories = repositories;
                     request.permissions = scope.permissions.clone().or_else(|| delivery.request.permissions.clone());
                 }
-                let refresh_at = github_app_refresh_at(delivery.issued_at, delivery.expires_at);
-                if now < refresh_at
-                    && request.repositories == delivery.request.repositories
-                    && request.permissions == delivery.request.permissions
-                {
-                    continue;
-                }
-                if request.repositories == delivery.request.repositories
-                    && request.permissions == delivery.request.permissions
-                    && now + GITHUB_APP_REFRESH_MARGIN < delivery.expires_at
-                    && delivery.next_refresh_attempt_at.is_some_and(|next| now < next)
-                {
+                let unchanged =
+                    request.repositories == delivery.request.repositories && request.permissions == delivery.request.permissions;
+                if waiting && unchanged {
+                    self.settle_scope(&key, delivery.generation).await;
                     continue;
                 }
                 let token = match self.mint_github_app(&mut request, delivery.installation_repository.as_deref()).await {
                     Ok(token) => token,
                     Err(error) => {
-                        let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
-                        errors.push(CredentialRefreshError {
-                            environment_ref: key.0.clone(),
-                            credential_name: Some(key.1.clone()),
-                            message: self.refresh_failure_message(&key.1, delivery.expires_at, &error),
-                            should_surface,
-                        });
+                        errors.extend(self.record_refresh_failure(&key, &delivery, &error).await);
                         continue;
                     }
                 };
                 if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
-                    let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
-                    errors.push(CredentialRefreshError {
-                        environment_ref: key.0.clone(),
-                        credential_name: Some(key.1.clone()),
-                        message: self.refresh_failure_message(&key.1, delivery.expires_at, &error),
-                        should_surface,
-                    });
+                    errors.extend(self.record_refresh_failure(&key, &delivery, &error).await);
                     continue;
                 }
                 let _delivery_guard = self.github_app_delivery_lock(&key).await.lock_owned().await;
@@ -1516,13 +1700,7 @@ impl CredentialStore {
                     continue;
                 };
                 if let Err(error) = replace_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
-                    let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
-                    errors.push(CredentialRefreshError {
-                        environment_ref: key.0.clone(),
-                        credential_name: Some(key.1.clone()),
-                        message: self.refresh_failure_message(&key.1, current.expires_at, &error),
-                        should_surface,
-                    });
+                    errors.extend(self.record_refresh_failure(&key, &current, &error).await);
                     continue;
                 }
                 if self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at {
@@ -1531,23 +1709,67 @@ impl CredentialStore {
                         credential_name: Some(key.1.clone()),
                         message: self.refresh_failure_message(&key.1, current.expires_at, "refresh started inside the expiry margin"),
                         should_surface: true,
+                        first_failure_at: current.first_refresh_failure_at,
                     });
                 }
                 let mut deliveries = self.github_app_deliveries.lock().await;
-                if let Some(current) = deliveries.get_mut(&key).filter(|current| current.generation == delivery.generation) {
-                    current.expires_at = token.expires_at;
-                    current.issued_at = self.clock.now();
-                    current.refresh_failures = 0;
-                    current.next_refresh_attempt_at = None;
-                    // Successful remints accept the explicit request when the response omits it;
-                    // no request and no response still means unknown.
-                    current.effective_permissions = token.permissions.or_else(|| request.permissions.clone());
-                    current.request = request;
-                }
+                let generation = delivery.generation;
+                deliveries.update(
+                    &key,
+                    |current| current.generation == generation,
+                    |current| {
+                        current.expires_at = token.expires_at;
+                        current.issued_at = self.clock.now();
+                        current.refresh_failures = 0;
+                        current.next_refresh_attempt_at = None;
+                        current.first_refresh_failure_at = None;
+                        current.last_refresh_error = None;
+                        current.scope_dirty = false;
+                        // Successful remints accept the explicit request when the response omits it;
+                        // no request and no response still means unknown.
+                        current.effective_permissions = token.permissions.or_else(|| request.permissions.clone());
+                        current.request = request;
+                    },
+                );
                 drop(deliveries);
                 self.record_delivered_capabilities(std::slice::from_ref(&key)).await;
+                reminted.insert(key.0);
             }
-            errors
+            // Each failure names its delivery's environment.
+            reminted.extend(errors.iter().map(|error: &CredentialRefreshError| error.environment_ref.clone()));
+            GithubAppRefresh { errors, environments: reminted }
+        })
+    }
+
+    /// When the next GitHub App refresh or retry falls due, if any delivery has one scheduled.
+    pub fn next_github_app_refresh_at(&self) -> BoxFuture<'_, Option<DateTime<Utc>>> {
+        Box::pin(async move {
+            let now = self.clock.now();
+            self.github_app_deliveries.lock().await.next_at(now)
+        })
+    }
+
+    /// Every GitHub App delivery whose refreshes are failing now, with the latest error and when
+    /// its run of failures began.
+    pub fn github_app_refresh_failures(&self) -> BoxFuture<'_, Vec<CredentialRefreshError>> {
+        Box::pin(async move {
+            let now = self.clock.now();
+            self.github_app_deliveries
+                .lock()
+                .await
+                .failing()
+                .map(|((environment_ref, name), delivery)| CredentialRefreshError {
+                    environment_ref: environment_ref.clone(),
+                    credential_name: Some(name.clone()),
+                    message: self.refresh_failure_message(
+                        name,
+                        delivery.expires_at,
+                        delivery.last_refresh_error.as_deref().unwrap_or_default(),
+                    ),
+                    should_surface: delivery.should_surface(now),
+                    first_failure_at: delivery.first_refresh_failure_at,
+                })
+                .collect()
         })
     }
 
@@ -1571,9 +1793,14 @@ impl CredentialStore {
         Box::pin(async move {
             let mut deliveries = self.github_app_deliveries.lock().await;
             for (name, scope) in scopes {
-                if let Some(delivery) = deliveries.get_mut(&(environment_ref.to_string(), name.clone())) {
-                    delivery.scope = Some(scope.clone());
-                }
+                deliveries.update(
+                    &(environment_ref.to_string(), name.clone()),
+                    |delivery| delivery.scope.as_ref() != Some(scope),
+                    |delivery| {
+                        delivery.scope = Some(scope.clone());
+                        delivery.scope_dirty = true;
+                    },
+                );
             }
         })
     }
@@ -1591,12 +1818,40 @@ impl CredentialStore {
         self.github_repository_names(&repositories).await
     }
 
-    async fn record_refresh_failure(&self, key: &(String, String), generation: uuid::Uuid) -> bool {
+    /// Records a failed refresh of `delivery`, unless it was replaced meanwhile: the error to
+    /// report, if it still stands.
+    async fn record_refresh_failure(
+        &self,
+        key: &(String, String),
+        delivery: &GithubAppDelivery,
+        error: &str,
+    ) -> Option<CredentialRefreshError> {
+        let now = self.clock.now();
         let mut deliveries = self.github_app_deliveries.lock().await;
-        let Some(current) = deliveries.get_mut(key).filter(|current| current.generation == generation) else {
-            return false;
-        };
-        current.record_refresh_failure(self.clock.now())
+        deliveries.update(
+            key,
+            |current| current.generation == delivery.generation,
+            |current| {
+                let message = self.refresh_failure_message(&key.1, current.expires_at, error);
+                let should_surface = current.record_refresh_failure(now, error.to_owned());
+                CredentialRefreshError {
+                    environment_ref: key.0.clone(),
+                    credential_name: Some(key.1.clone()),
+                    message,
+                    should_surface,
+                    first_failure_at: current.first_refresh_failure_at,
+                }
+            },
+        )
+    }
+
+    /// The scope `delivery` was given resolves to what it already holds.
+    async fn settle_scope(&self, key: &(String, String), generation: uuid::Uuid) {
+        self.github_app_deliveries.lock().await.update(
+            key,
+            |current| current.generation == generation,
+            |current| current.scope_dirty = false,
+        );
     }
 
     /// A bound credential's current declaration and material, for its account binding's delivery
@@ -1899,6 +2154,9 @@ impl CredentialStore {
                     "#!/bin/sh\nGH_TOKEN=$(cat \"$GITHUB_TOKEN_FILE\") || exit $?\nexport GH_TOKEN\nexec {} \"$@\"\n",
                     shell_single_quote(gh_path)
                 );
+                // Its preflight below runs it through sh, never by path: a concurrent fork may still
+                // hold the write descriptor, and exec of the file would fail with ETXTBSY. The crew
+                // execs it by name from PATH only after delivery, once no such fork remains.
                 write_executable(&*runner, &gh_wrapper, &gh_wrapper_contents, "gh token-file wrapper").await?;
                 let git_helper = credential_dir.join("git-credential-github-app");
                 let git_helper_contents = "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nhost=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$host\" = github.com ] || exit 0\nprintf 'username=x-access-token\\n'\nprintf 'password='\ncat \"$GITHUB_TOKEN_FILE\"\nprintf '\\n'\n";
@@ -1909,7 +2167,7 @@ impl CredentialStore {
                         "sh",
                         &[
                             "-c",
-                            "unset GH_TOKEN GITHUB_TOKEN; GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories --silent",
+                            "unset GH_TOKEN GITHUB_TOKEN; GITHUB_TOKEN_FILE=\"$1\" /bin/sh \"$2\" api installation/repositories --silent",
                             "flotilla-github-app-preflight",
                             &token_file,
                             &gh_wrapper_path,
@@ -1925,12 +2183,7 @@ impl CredentialStore {
                 }
                 env.insert("PATH".to_string(), format!("{}:{path}", credential_dir.to_string_lossy()));
                 git_credential = Some(GitCredentialContribution {
-                    fragment: git_credential_fragment(
-                        name,
-                        "github-app",
-                        "https://github.com",
-                        format!("!{}", git_helper.to_string_lossy()),
-                    ),
+                    fragment: git_credential_fragment(name, "github-app", "https://github.com", sh_helper(&git_helper.to_string_lossy())),
                     preflight: Some(GitCredentialPreflight::GithubApp { token_file }),
                 });
             }
@@ -1982,7 +2235,7 @@ impl CredentialStore {
                 env.insert("FORGEJO_API_URL".to_string(), format!("{server_url}/api/v1"));
                 env.insert("FORGEJO_USERNAME".to_string(), username.to_string());
                 git_credential = Some(GitCredentialContribution {
-                    fragment: git_credential_fragment(name, "forgejo", credential_url, format!("!{helper_path}")),
+                    fragment: git_credential_fragment(name, "forgejo", credential_url, sh_helper(&helper_path)),
                     preflight: (!already_prepared).then(|| GitCredentialPreflight::Forgejo {
                         host: match parsed_url.port() {
                             Some(port) => format!("{host}:{port}"),
@@ -2020,7 +2273,7 @@ impl CredentialStore {
                         .map_err(|error| format!("write Git credential helper: {error}"))?;
                 }
                 git_credential = Some(GitCredentialContribution {
-                    fragment: git_credential_fragment(name, "git-http-token", credential_url, format!("!{helper_path}")),
+                    fragment: git_credential_fragment(name, "git-http-token", credential_url, sh_helper(&helper_path)),
                     preflight: (!already_prepared).then_some(GitCredentialPreflight::GitHttpToken { host }),
                 });
             }
@@ -2191,6 +2444,13 @@ fn forgejo_git_host(server_url: &str) -> Result<String, String> {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     })
+}
+
+/// The Git credential helper value running the script at `path` through sh. The script is never
+/// exec'd: this daemon has just written it, and a concurrent fork may still hold the write
+/// descriptor, so exec would fail with ETXTBSY.
+fn sh_helper(path: &str) -> String {
+    format!("!/bin/sh {}", shell_single_quote(path))
 }
 
 fn git_credential_fragment(credential_name: &str, adapter: &str, credential_url: impl Into<String>, helper: impl Into<String>) -> Fragment {
@@ -2504,6 +2764,52 @@ mod tests {
 
     use super::*;
 
+    // Behaviour: a Git credential helper delivered while other threads spawn processes runs at
+    // its preflight every time. A fork during the helper's write holds the write descriptor until
+    // it execs, so a helper exec'd by path fails with ETXTBSY; delivery runs it through sh. Its
+    // state path holds a space and a single quote, which the helper value quotes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delivered_git_helpers_run_while_other_threads_spawn() {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawners = (0..6)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    use std::os::unix::process::CommandExt;
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut command = std::process::Command::new("true");
+                        // A child that runs code before exec, as the daemon's detaching spawns
+                        // do, holds the descriptors it forked with for that long.
+                        // SAFETY: the child only sleeps, which is async-signal-safe.
+                        unsafe {
+                            command.pre_exec(|| {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                Ok(())
+                            });
+                        }
+                        let _ = command.status();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let base = tempfile::tempdir().expect("tempdir");
+        let mut failures = Vec::new();
+        for round in 0..600 {
+            let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+            create_git_http_token_spec(&backend, "lab-forgejo", "forgejo.lab", "TEST_FORGEJO_TOKEN").await;
+            let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
+            let runner = Arc::new(ProcessCommandRunner);
+            let state = base.path().join(format!("crew's state {round}"));
+            let store = CredentialStore::new(backend, "flotilla", env, EnvironmentBag::new(), runner.clone(), state);
+            if let Err(error) = store.prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner).await {
+                failures.push(error);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        spawners.into_iter().for_each(|spawner| spawner.join().expect("spawner"));
+        assert_eq!(failures, Vec::<String>::new(), "every delivery's helper ran");
+    }
+
     #[derive(Default)]
     struct TestEnv(BTreeMap<String, String>);
 
@@ -2728,7 +3034,7 @@ mod tests {
                 .using::<Convoy>("flotilla")
                 .create(
                     &InputMeta::builder().name("crew".into()).build(),
-                    &ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build(),
+                    &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role("crew".into()).build(),
                 )
                 .await
                 .expect("convoy");
@@ -2766,7 +3072,6 @@ mod tests {
                                 convoy: "crew".into(),
                                 vessel_ref: "vessel".into(),
                             }),
-                            message: None,
                         },
                     },
                 )
@@ -2964,8 +3269,11 @@ mod tests {
                 expires_at: now + Duration::hours(1),
                 refresh_failures: 0,
                 next_refresh_attempt_at: None,
+                first_refresh_failure_at: None,
+                last_refresh_error: None,
                 installation_repository: None,
                 scope: None,
+                scope_dirty: false,
             },
         );
         clock.advance(Duration::minutes(29));
@@ -3033,8 +3341,11 @@ mod tests {
                 expires_at: now + Duration::hours(1),
                 refresh_failures: 0,
                 next_refresh_attempt_at: None,
+                first_refresh_failure_at: None,
+                last_refresh_error: None,
                 installation_repository: None,
                 scope: None,
+                scope_dirty: false,
             },
         );
 
@@ -3059,13 +3370,17 @@ mod tests {
         clock.advance(Duration::minutes(8) + Duration::seconds(20));
         assert_eq!(store.refresh_due_github_app_tokens().await.len(), 1);
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 7);
+        // Inside the expiry margin the backoff holds, clamped to expiry, rather than retrying at every pass.
         clock.advance(Duration::seconds(10));
+        assert!(store.refresh_due_github_app_tokens().await.is_empty(), "the margin does not cut the backoff short");
+        assert_eq!(store.next_github_app_refresh_at().await, Some(now + Duration::minutes(59) + Duration::seconds(50)));
+        clock.advance(Duration::minutes(4) + Duration::seconds(50));
         let errors = store.refresh_due_github_app_tokens().await;
         assert_eq!(errors.len(), 1);
         assert!(errors[0].should_surface, "entry into expiry margin needs immediate attention");
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 8);
 
-        clock.advance(Duration::minutes(33));
+        clock.advance(Duration::minutes(30) + Duration::seconds(10));
         let errors = store.refresh_due_github_app_tokens().await;
         assert_eq!(errors.len(), 1);
         assert!(!errors[0].should_surface, "a new token starts a new failure sequence");
@@ -3074,6 +3389,148 @@ mod tests {
         clock.advance(Duration::seconds(1));
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 10, "backoff resets after a successful mint");
+    }
+
+    #[tokio::test]
+    async fn an_expired_github_app_delivery_is_retried_only_by_an_event() {
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let clock = Arc::new(VirtualClock::new(now));
+        let minter = Arc::new(FakeGithubAppTokenMinter {
+            tokens: StdMutex::new(VecDeque::from([
+                Err("outage 1".to_string()),
+                Err("outage 2".to_string()),
+                Ok(GithubAppToken { permissions: None, value: "recovered".to_string(), expires_at: now + Duration::hours(6) }),
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_github_app_minter(
+            ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
+            PathBuf::from("/state"),
+        );
+        store.github_app_deliveries.lock().await.insert(
+            ("vessel".to_string(), "github-app".to_string()),
+            GithubAppDelivery {
+                effective_permissions: None,
+                generation: uuid::Uuid::new_v4(),
+                request: GithubAppMintRequest {
+                    installation_id: 1,
+                    app_id_path: "app-id".to_string(),
+                    private_key_path: "key".to_string(),
+                    repositories: vec!["flotilla".to_string()],
+                    permissions: None,
+                },
+                runner,
+                token_file: PathBuf::from("/state/credentials/github-app/token"),
+                issued_at: now,
+                expires_at: now + Duration::hours(1),
+                refresh_failures: 0,
+                next_refresh_attempt_at: None,
+                first_refresh_failure_at: None,
+                last_refresh_error: None,
+                installation_repository: None,
+                scope: None,
+                scope_dirty: false,
+            },
+        );
+        // A failure just before expiry backs off no further than expiry; the one at expiry gives up.
+        clock.advance(Duration::minutes(59) + Duration::seconds(50));
+        assert_eq!(store.refresh_due_github_app_tokens().await.len(), 1);
+        assert_eq!(store.next_github_app_refresh_at().await, Some(now + Duration::hours(1)));
+        clock.advance(Duration::seconds(10));
+        assert_eq!(store.refresh_due_github_app_tokens().await.len(), 1);
+        assert_eq!(store.next_github_app_refresh_at().await, None, "an expired delivery schedules no attempt");
+        let failing = store.github_app_refresh_failures().await;
+        assert_eq!(failing.len(), 1);
+        assert!(failing[0].should_surface && failing[0].message.contains("expired"), "{failing:?}");
+        assert_eq!(failing[0].first_failure_at, Some(now + Duration::minutes(59) + Duration::seconds(50)));
+        clock.advance(Duration::hours(3));
+        assert!(store.refresh_due_github_app_tokens().await.is_empty(), "no timed retry after giving up");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 2);
+        let event = GithubAppRefreshWake { retry_given_up: true, ..GithubAppRefreshWake::default() };
+        let errors = store.refresh_github_app_tokens(&event).await.errors;
+        // It recovers, reporting that the refresh came after expiry.
+        assert!(errors.len() == 1 && errors[0].message.contains("refresh started inside the expiry margin"), "{errors:?}");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 3);
+        assert!(store.github_app_refresh_failures().await.is_empty());
+        assert!(store.next_github_app_refresh_at().await.is_some());
+    }
+
+    // A re-mint names its environment whether it fails or not, so its cards read the delivery
+    // again: the failure at expiry drops the credential from what the environment reports, and
+    // from the card section rendered from it.
+    #[tokio::test]
+    async fn a_failed_re_mint_past_expiry_names_its_environment_and_drops_the_credential() {
+        use flotilla_capability_contract::SessionCapabilitySource;
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let clock = Arc::new(VirtualClock::new(now));
+        let minter = Arc::new(FakeGithubAppTokenMinter {
+            tokens: StdMutex::new(VecDeque::from([
+                Ok(GithubAppToken { permissions: None, value: "refreshed".to_string(), expires_at: now + Duration::hours(1) }),
+                Err("outage 1".to_string()),
+                Err("outage 2".to_string()),
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_github_app_minter(
+            ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
+            PathBuf::from("/state"),
+        );
+        let key = ("vessel".to_string(), "github-app".to_string());
+        store.github_app_deliveries.lock().await.insert(
+            key.clone(),
+            GithubAppDelivery {
+                effective_permissions: None,
+                generation: uuid::Uuid::new_v4(),
+                request: GithubAppMintRequest {
+                    installation_id: 1,
+                    app_id_path: "app-id".to_string(),
+                    private_key_path: "key".to_string(),
+                    repositories: vec!["flotilla".to_string()],
+                    permissions: None,
+                },
+                runner,
+                token_file: PathBuf::from("/state/credentials/github-app/token"),
+                issued_at: now - Duration::hours(1),
+                expires_at: now,
+                refresh_failures: 0,
+                next_refresh_attempt_at: None,
+                first_refresh_failure_at: None,
+                last_refresh_error: None,
+                installation_repository: None,
+                scope: None,
+                scope_dirty: false,
+            },
+        );
+        store.record_delivered_capabilities(std::slice::from_ref(&key)).await;
+        let references = BTreeSet::from(["github-app".to_string()]);
+        let card =
+            || async { flotilla_capability_contract::credential_card(&store.credentials("vessel", &references).await.expect("observed")) };
+        let named = || async { store.refresh_github_app_tokens(&GithubAppRefreshWake::default()).await.environments };
+        assert_eq!(named().await, BTreeSet::from(["vessel".to_string()]), "a re-mint that succeeds names its environment");
+        assert!(card().await.contains("github-app"));
+        // A failure before expiry names it too, and the credential is still delivered.
+        clock.advance(Duration::minutes(59) + Duration::seconds(50));
+        assert_eq!(named().await, BTreeSet::from(["vessel".to_string()]));
+        assert!(card().await.contains("github-app"));
+        // The failure at expiry gives up and names it; the card no longer lists the credential.
+        clock.advance(Duration::seconds(10));
+        assert_eq!(named().await, BTreeSet::from(["vessel".to_string()]));
+        assert_eq!(store.next_github_app_refresh_at().await, None, "an expired delivery schedules no attempt");
+        assert!(store.credentials("vessel", &references).await.expect("observed").is_empty());
+        assert!(!card().await.contains("github-app"), "{}", card().await);
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 3);
     }
 
     #[tokio::test]
@@ -4307,7 +4764,8 @@ interactions:
         {
             let calls = runner.calls.lock().expect("calls lock");
             assert!(calls.iter().any(|(command, args, _)| {
-                command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
+                command == "sh"
+                    && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" /bin/sh \"$2\" api installation/repositories"))
             }));
             assert!(calls
                 .iter()
@@ -5025,7 +5483,7 @@ interactions:
             .expect("staged shared Git config");
         assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
         assert!(gitconfig.contains(
-            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"
+            "[credential \"https://forgejo.lab\"]\n\thelper = !/bin/sh '/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token'"
         ));
         assert!(gitconfig.contains("# fragment: credential/gh github"));
         assert!(gitconfig.contains("# fragment: credential/git-http-token lab-forgejo"));
@@ -5084,7 +5542,7 @@ interactions:
             .expect("staged shared Git config");
         assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
         assert!(gitconfig.contains(
-            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"
+            "[credential \"https://forgejo.lab\"]\n\thelper = !/bin/sh '/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token'"
         ));
     }
 
@@ -5136,7 +5594,7 @@ interactions:
             writes[2],
             (
                 PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
-                "# fragment: credential/git-http-token lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
+                "# fragment: credential/git-http-token lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/bin/sh '/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token'\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
             )
         );
         let protected = runner.protected_writes.lock().expect("protected writes lock");

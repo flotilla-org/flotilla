@@ -6,7 +6,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{EnvironmentInfo, HostName, HostSummary, IssueSource, NodeInfo, PeerConnectionState, RepositoryKey, ViewAddress};
+use crate::{EnvironmentInfo, HostName, HostSummary, IssueSource, NodeId, NodeInfo, PeerConnectionState, RepositoryKey, ViewAddress};
 
 /// Provider health across categories. Outer key: category (e.g. "vcs",
 /// "change_request"). Inner key: provider name. Value: healthy.
@@ -228,6 +228,9 @@ pub struct CrewListMember {
     pub role: String,
     pub kind: String,
     pub state: String,
+    /// The vessel holding this member, when it is not the listed vessel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vessel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,7 +251,6 @@ pub enum CrewAttention {
     Working,
     NeedsInput,
     DeliveryUnconfirmed,
-    ControllerFenceUnverifiable,
     Idle,
     Unobservable,
     /// Idle, but text nobody submitted sits in the composer (#3460).
@@ -262,7 +264,6 @@ impl std::fmt::Display for CrewAttention {
         formatter.write_str(match self {
             Self::Working => "working",
             Self::NeedsInput => "needs input",
-            Self::ControllerFenceUnverifiable => "waiting for cleat composer evidence",
             Self::DeliveryUnconfirmed => "delivery unconfirmed",
             Self::Idle => "idle",
             Self::Unobservable => "unobservable",
@@ -504,8 +505,6 @@ pub struct FleetHostRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub daemon_rss_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_sync: Option<crate::BlobSyncStatus>,
     #[serde(default)]
     #[builder(default)]
@@ -671,11 +670,30 @@ pub struct FleetReplicaStatus {
     pub message: Option<String>,
 }
 
-/// Committed decided-stream progress and the latest consecutive round failures.
+/// A home's committed decided-stream progress here, derived from each path that follows it.
 /// Query health only: this is not a stored resource schema.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeStreamStatus {
     pub watermark: u64,
+    /// The latest round any path completed. A followed home ends every round within the
+    /// producer's frame wait, so an old time means the home is not being followed.
+    #[serde(default)]
+    pub followed_at: Option<DateTime<Utc>>,
+    /// Set only when every path is failing; a failing path beside a healthy one is degraded.
+    pub last_error: Option<String>,
+    pub consecutive_failures: u64,
+    #[serde(default)]
+    pub paths: Vec<ChangeStreamPathStatus>,
+}
+
+/// One way this host follows a home's log: from the home itself, or through a peer passing it on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeStreamPathStatus {
+    /// The peer passing the home's log on; `None` when the home serves it directly.
+    #[serde(default)]
+    pub via: Option<NodeId>,
+    #[serde(default)]
+    pub followed_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub consecutive_failures: u64,
 }
@@ -810,15 +828,20 @@ pub struct CrewStallRow {
     pub project_display_name: Option<String>,
     pub convoy: String,
     pub convoy_display_name: String,
-    pub vessel: String,
+    /// Absent where the stall's record names no vessel: an operator-rung attention read from
+    /// another host names only the convoy and role.
+    pub vessel: Option<String>,
     pub role: String,
     pub rung: Option<StallRung>,
     pub supervisor: Option<String>,
     pub supervisor_absence_reason: Option<String>,
     pub began_at: Option<DateTime<Utc>>,
     pub age_seconds: Option<u64>,
+    /// When the stall judge's operator-rung attention was admitted; not when the stall began.
+    pub raised_at: Option<DateTime<Utc>>,
     pub proposed_disposition: Option<crate::StallProposedDisposition>,
-    pub evidence: String,
+    /// Absent where no record read here states it: a stall's evidence is its home's note.
+    pub evidence: Option<String>,
     /// Equal keys flag possible shared causes, without guessing from keywords.
     pub cause_group: String,
     pub shared_cause_count: usize,

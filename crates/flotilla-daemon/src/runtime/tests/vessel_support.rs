@@ -46,6 +46,8 @@ pub(super) struct SharedStore {
 }
 
 impl SharedStore {
+    // Only the Linux-only acceptance tests use this.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     /// The holder of the link at `path` into the entry for `sha256`, while the store holds it.
     pub(super) fn holder(&self, path: &Path, sha256: &str) -> Option<&Path> {
         let (linked, holder) = self.uses.get(path)?;
@@ -81,11 +83,15 @@ impl RunnerVesselAgents {
         self.vessels.lock().expect("vessels").get(&paths.agent).cloned().unwrap_or_default()
     }
 
+    // Only the Linux-only acceptance tests use this.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     /// The shared store as it stands.
     pub(super) fn store(&self) -> SharedStore {
         self.store.lock().expect("store").clone()
     }
 
+    // Only the Linux-only acceptance tests use this.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     /// Collect the store after the vessel agent at `released` retires, as drydock's
     /// `--collect --release` does once its idle time has passed: the agent's uses go,
     /// then every entry no remaining use links.

@@ -110,12 +110,30 @@ fn format_manifest_status_row(row: &serde_json::Value, resolution_action: Option
     )
 }
 
-fn drifted_ensure_names(objects: impl IntoIterator<Item = serde_json::Value>) -> Result<std::collections::BTreeSet<String>> {
+/// The ensures whose current generation (newest live convoy ensured from them) was admitted under
+/// another configuration than they declare now. Drift is derived from the generation, never held.
+fn drifted_ensure_names(
+    ensures: impl IntoIterator<Item = serde_json::Value>,
+    convoys: impl IntoIterator<Item = serde_json::Value>,
+) -> Result<std::collections::BTreeSet<String>> {
+    use flotilla_resources::{Convoy, ConvoyEnsure, K8sResourceObject, ResourceObject, ENSURED_FROM_ANNOTATION};
+    let mut current = std::collections::BTreeMap::<String, ResourceObject<Convoy>>::new();
+    for object in convoys {
+        let convoy = ResourceObject::from_k8s_object(serde_json::from_value::<K8sResourceObject<Convoy>>(object)?)?;
+        let Some(ensure) = convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).cloned() else { continue };
+        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            continue;
+        }
+        if current.get(&ensure).is_none_or(|held| held.spec.generation < convoy.spec.generation) {
+            current.insert(ensure, convoy);
+        }
+    }
     let mut names = std::collections::BTreeSet::new();
-    for object in objects {
-        let ensure: flotilla_resources::K8sResourceObject<flotilla_resources::ConvoyEnsure> = serde_json::from_value(object)?;
-        let ensure = flotilla_resources::ResourceObject::from_k8s_object(ensure)?;
-        if ensure.status.as_ref().is_some_and(|status| status.config_drift.is_some()) {
+    for object in ensures {
+        let ensure = ResourceObject::from_k8s_object(serde_json::from_value::<K8sResourceObject<ConvoyEnsure>>(object)?)?;
+        let Some(generation) = current.get(&ensure.metadata.name) else { continue };
+        let admitted = generation.status.as_ref().and_then(|status| status.ensure_admission.as_ref());
+        if !flotilla_resources::config_changes(&ensure.spec, admitted).is_empty() {
             // Replicas share namespace/name identity. Authority routing resolves
             // the active generation and rejects ambiguous multiple admissions.
             names.insert(ensure.metadata.name);
@@ -130,18 +148,23 @@ pub async fn run_ensure_command(cli: &Cli, command: EnsureSubCommand, format: Ou
     let node_id = resolve_optional_host_node(cli, host.as_deref()).await?;
     let daemon = connect_daemon(cli).await?;
     let names = if drifted {
-        let response = ResourceClient::new(daemon.clone())
-            .list(
+        let client = ResourceClient::new(daemon.clone());
+        let list = |kind: &str| {
+            client.list(
                 ResourceListRequest::builder()
-                    .kind("ConvoyEnsure".to_string())
+                    .kind(kind.to_string())
                     .namespace(namespace.clone())
                     .maybe_node_id(node_id.clone())
                     .include_replicas(true)
                     .build(),
             )
-            .await
-            .map_err(|error| color_eyre::eyre::eyre!(error))?;
-        drifted_ensure_names(response.records.into_iter().filter_map(|record| record.object))?
+        };
+        let ensures = list("ConvoyEnsure").await.map_err(|error| color_eyre::eyre::eyre!(error))?;
+        let convoys = list("Convoy").await.map_err(|error| color_eyre::eyre::eyre!(error))?;
+        drifted_ensure_names(
+            ensures.records.into_iter().filter_map(|record| record.object),
+            convoys.records.into_iter().filter_map(|record| record.object),
+        )?
     } else {
         std::collections::BTreeSet::from([name.expect("clap requires a name without --drifted")])
     };
@@ -211,35 +234,70 @@ pub async fn run_manifest_resolution(
 mod tests {
     use flotilla_store_memory::InMemoryBackend;
 
+    // Behaviour (#3108): an ensure is drifted when its current generation, the newest live convoy
+    // ensured from it, was admitted under another configuration; older or ended generations and
+    // replica copies do not count twice, and a malformed record is an error, not a silent skip.
     #[tokio::test]
-    async fn drifted_batch_selection_decodes_typed_status_and_deduplicates_replicas() {
-        use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, InputMeta};
+    async fn drifted_batch_selection_reads_each_roles_current_generation() {
+        use flotilla_resources::{
+            Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyPhase, ConvoySpec, InputMeta, ResourceObject, ENSURED_FROM_ANNOTATION,
+        };
         use flotilla_store::ResourceBackend;
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut ensure = backend
-            .using::<ConvoyEnsure>("flotilla")
-            .create(
-                &InputMeta::builder().name("governor".to_string()).build(),
-                &ConvoyEnsureSpec::builder()
-                    .project_ref("demo".to_string())
-                    .role("governor".to_string())
-                    .workflow_ref("standing".to_string())
-                    .repositories(vec![])
-                    .build(),
-            )
-            .await
-            .expect("create ensure");
-        let healthy = serde_json::to_value(ensure.to_k8s_object()).expect("healthy record");
-        ensure.status.get_or_insert_with(Default::default).config_drift =
-            Some(flotilla_resources::ConvoyEnsureConfigDrift { changes: vec!["workflow".to_string()], observed_at: chrono::Utc::now() });
-        let drifted = serde_json::to_value(ensure.to_k8s_object()).expect("drifted record");
+        let declared = |role: &str, workflow: &str| {
+            ConvoyEnsureSpec::builder()
+                .project_ref("demo".to_string())
+                .role(role.to_string())
+                .workflow_ref(workflow.to_string())
+                .repositories(vec![])
+                .build()
+        };
+        let mut ensures = Vec::new();
+        for role in ["governor", "scout"] {
+            let ensure = backend
+                .using::<ConvoyEnsure>("flotilla")
+                .create(&InputMeta::builder().name(role.to_string()).build(), &declared(role, "standing"))
+                .await
+                .expect("create ensure");
+            ensures.push(serde_json::to_value(ensure.to_k8s_object()).expect("ensure record"));
+        }
+        let generation = |name: &str, ensure: &str, generation: u64, phase: ConvoyPhase, admitted: &ConvoyEnsureSpec| {
+            let backend = backend.clone();
+            let (name, ensure, admitted) = (name.to_string(), ensure.to_string(), admitted.clone());
+            async move {
+                let mut convoy: ResourceObject<Convoy> = backend
+                    .using::<Convoy>("flotilla")
+                    .create(
+                        &InputMeta::builder()
+                            .name(name)
+                            .annotations(std::collections::BTreeMap::from([(ENSURED_FROM_ANNOTATION.to_string(), ensure)]))
+                            .build(),
+                        &ConvoySpec::builder().workflow_ref("standing".into()).project_ref("demo".into()).generation(generation).build(),
+                    )
+                    .await
+                    .expect("create convoy");
+                let status = convoy.status.get_or_insert_with(Default::default);
+                status.phase = phase;
+                status.ensure_admission = Some(admitted);
+                serde_json::to_value(convoy.to_k8s_object()).expect("convoy record")
+            }
+        };
+        let convoys = vec![
+            // The governor's current generation predates a workflow change; an ended newer one does not count.
+            generation("governor-1", "governor", 1, ConvoyPhase::Active, &declared("governor", "older")).await,
+            generation("governor-2", "governor", 2, ConvoyPhase::Failed, &declared("governor", "standing")).await,
+            // The scout's current generation is its newest live one, admitted as declared.
+            generation("scout-1", "scout", 1, ConvoyPhase::Active, &declared("scout", "older")).await,
+            generation("scout-2", "scout", 2, ConvoyPhase::Active, &declared("scout", "standing")).await,
+        ];
+        let replicated = ensures.iter().chain(ensures.iter()).cloned();
         assert_eq!(
-            super::drifted_ensure_names([healthy, drifted.clone(), drifted.clone()]).expect("typed selection"),
+            super::drifted_ensure_names(replicated, convoys.clone()).expect("typed selection"),
             std::collections::BTreeSet::from(["governor".to_string()])
         );
-        let mut malformed = drifted;
-        malformed["status"]["config_drift"] = serde_json::json!("invalid drift condition");
-        assert!(super::drifted_ensure_names([malformed]).is_err(), "malformed records must not silently disappear");
+        let mut malformed = convoys[0].clone();
+        malformed["status"]["ensure_admission"] = serde_json::json!("invalid admission");
+        assert!(super::drifted_ensure_names(ensures, [malformed]).is_err(), "malformed records must not silently disappear");
     }
 
     #[test]

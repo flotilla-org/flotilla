@@ -136,7 +136,6 @@ pub async fn build_plan(
 
     match action {
         CommandAction::QueryChangeStream { .. }
-        | CommandAction::QueryResourceDigest { .. }
         | CommandAction::QueryResourceList { .. }
         | CommandAction::QueryManifestRoots { .. }
         | CommandAction::QueryResourceGet { .. }
@@ -145,11 +144,11 @@ pub async fn build_plan(
         | CommandAction::ResourceManifestResolve { .. }
         | CommandAction::ConvoyEnsureRoll { .. }
         | CommandAction::ResourceReconcileNow { .. }
-        | CommandAction::MessageDeliverBatch { .. }
-        | CommandAction::MessageFailBatch { .. }
         | CommandAction::PersonInbox { .. }
         | CommandAction::PersonAcknowledge { .. }
         | CommandAction::PersonAnswer { .. }
+        | CommandAction::CheckoutRecheck { .. }
+        | CommandAction::CheckoutArchive { .. }
         | CommandAction::ResourceStatusPatch { .. }
         | CommandAction::ResourceDelete { .. }
         | CommandAction::ResourceWatch { .. } => {
@@ -288,6 +287,7 @@ pub async fn build_plan(
         | CommandAction::QueryFulfilmentList {}
         | CommandAction::QueryImageBuild { .. }
         | CommandAction::ImageCheck { .. }
+        | CommandAction::ImageBuildRetry { .. }
         | CommandAction::QueryFleetList { .. }
         | CommandAction::QueryCrewStalls { .. }
         | CommandAction::QueryCrewCapabilities { .. }

@@ -1,5 +1,6 @@
 //! Declared equality queries shared by storage adapters and resource HTTP.
-use crate::{MessageQuery, ReadResourceList, Resource, ResourceBackend, ResourceError, ResourceKind, TypedResolver};
+use crate::{MessageQuery, ReadResourceList, Resource, ResourceBackend, ResourceError, ResourceKind, ResourceObject, TypedResolver};
+use flotilla_resources::engine_records::IndexCover;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -58,12 +59,6 @@ pub struct StoreQuery {
     pub message: Option<MessageQuery>,
     #[serde(default)]
     pub include_replicas: bool,
-    /// Internal source view used by stores with a separate durable replica store.
-    #[serde(default)]
-    pub replicas_only: bool,
-    /// Override which local names shadow replicas when composing two stores.
-    #[serde(default)]
-    pub replica_shadowing: Option<ReplicaShadowing>,
     #[serde(default = "suppress_default")]
     pub suppress_self_origin: bool,
 }
@@ -87,13 +82,6 @@ impl FieldQuery {
         }
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReplicaShadowing {
-    pub origin_root: flotilla_protocol::NodeId,
-    pub local_names: BTreeSet<String>,
-}
-
 /// Stable order across adapters: name, then local before replicas, then origin.
 pub fn sort_query_items(items: &mut [crate::ReadResourceObject<crate::SerializedResource>]) {
     sort_query_rows(items, |item| (item.object.metadata.name.as_str(), &item.provenance));
@@ -123,7 +111,7 @@ pub struct OwnerQuery {
 }
 impl OwnerQuery {
     pub fn key(&self) -> String {
-        serde_json::json!([self.api_version, self.kind, self.name]).to_string()
+        owner_key(&self.api_version, &self.kind, &self.name)
     }
 }
 impl Default for StoreQuery {
@@ -138,13 +126,11 @@ impl Default for StoreQuery {
             present: Vec::new(),
             label_prefixes: BTreeMap::new(),
             all_sources_for_matches: false,
-            replica_shadowing: None,
             any_of: None,
             merged_definitions: false,
             owner: None,
             message: None,
             include_replicas: false,
-            replicas_only: false,
             suppress_self_origin: true,
         }
     }
@@ -204,8 +190,6 @@ impl StoreQuery {
             all_sources_for_matches: _,
             message,
             include_replicas: _,
-            replicas_only: _,
-            replica_shadowing: _,
             suppress_self_origin: _,
         } = self;
         let selects = !labels.is_empty()
@@ -224,6 +208,22 @@ impl StoreQuery {
         } else {
             crate::ReadOperation::List
         }
+    }
+    /// What the query's own keys select, by index keys as [`QueryIndex`] names them: each
+    /// equality on a label or field, each field's values, and each missing or present field, all
+    /// of which a row must meet. Its alternatives and relations are the reader's to cover.
+    pub(crate) fn index_parts(&self) -> Vec<IndexCover> {
+        let key = |key: String, value: String| IndexCover::AnyKey(BTreeSet::from([(key, value)]));
+        let mut parts: Vec<IndexCover> = self.labels.iter().map(|(label, value)| key(format!("label:{label}"), value.clone())).collect();
+        parts.extend(self.fields.iter().map(|(path, value)| key(format!("field:{path}"), value.clone())));
+        parts.extend(
+            self.field_values
+                .iter()
+                .map(|(path, values)| IndexCover::AnyKey(values.iter().map(|value| (format!("field:{path}"), value.clone())).collect())),
+        );
+        parts.extend(self.missing_fields.iter().map(|path| key(format!("missing:{path}"), String::new())));
+        parts.extend(self.present.iter().map(|path| key(format!("present:{path}"), String::new())));
+        parts
     }
     fn validate_at(&self, kind: ResourceKind, depth: usize) -> Result<(), ResourceError> {
         if self.all_sources_for_matches
@@ -255,7 +255,6 @@ impl StoreQuery {
                 || depth > 0
                 || !self.include_replicas
                 || self.suppress_self_origin
-                || self.replicas_only
                 || !self.labels.is_empty()
                 || self.owner.is_some()
                 || self.message.is_some()
@@ -293,10 +292,11 @@ impl StoreQuery {
 }
 impl<T: Resource> TypedResolver<T> {
     pub async fn query_declared(&self, query: &StoreQuery) -> Result<ReadResourceList<T>, ResourceError> {
-        if let Some(reads) = self.backend.definitions::<T>(&self.namespace).engine_reads().await {
-            // This resolver reads this home's rows: the engine's records written here (#3824).
-            let local = StoreQuery { include_replicas: false, ..query.clone() };
-            return Ok(ReadResourceList { items: crate::definition::select_reads(reads?, &local)? });
+        // The engine's reads select only by declared fields, as the store does: refuse the rest first.
+        query.validate(ResourceKind::of::<T>())?;
+        if let Some(reads) = self.backend.definitions::<T>(&self.namespace).engine_reads_for(query).await {
+            // The query decides whether other homes' rows count, as it does for the old store.
+            return Ok(ReadResourceList { items: crate::definition::select_reads(reads?, query)? });
         }
         let items = self.backend.store().query_decoded(ResourceKind::of::<T>(), &self.namespace, query).await?.into_typed()?;
         Ok(ReadResourceList { items })
@@ -304,7 +304,8 @@ impl<T: Resource> TypedResolver<T> {
 }
 impl ResourceBackend {
     pub async fn query_declared<T: Resource>(&self, namespace: &str, query: &StoreQuery) -> Result<ReadResourceList<T>, ResourceError> {
-        if let Some(reads) = self.definitions::<T>(namespace).engine_reads().await {
+        query.validate(ResourceKind::of::<T>())?;
+        if let Some(reads) = self.definitions::<T>(namespace).engine_reads_for(query).await {
             return Ok(ReadResourceList { items: crate::definition::select_reads(reads?, query)? });
         }
         Ok(ReadResourceList { items: self.store().query_decoded(ResourceKind::of::<T>(), namespace, query).await?.into_typed()? })
@@ -318,8 +319,67 @@ pub struct QueryIndex {
     entries: BTreeMap<(String, String), BTreeSet<String>>,
     keys: HashMap<String, Vec<(String, String)>>,
 }
+/// An owner's index key.
+pub(crate) fn owner_key(api_version: &str, kind: &str, name: &str) -> String {
+    serde_json::json!([api_version, kind, name]).to_string()
+}
+
+/// The index keys of `value`, a resource's JSON document, as [`QueryIndex`] holds them.
+pub fn value_index_keys(value: &Value) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    if let Some(labels) = value.pointer("/metadata/labels").and_then(Value::as_object) {
+        for (key, value) in labels {
+            if let Some(value) = value.as_str() {
+                keys.push((format!("label:{key}"), value.into()));
+            }
+        }
+    }
+    // Only declared paths are indexed; large embedded workflow bodies do
+    // not create incidental query indexes.
+    if let Some(kind) =
+        crate::declared_resource_kinds().into_iter().find(|kind| Some(kind.paths.kind) == value.get("kind").and_then(Value::as_str))
+    {
+        for path in kind.queryable_fields {
+            let fields = declared_field_values(value, path);
+            if !fields.is_empty() {
+                keys.push((format!("present:{path}"), String::new()));
+            }
+            if fields.is_empty() {
+                keys.push((format!("missing:{path}"), String::new()));
+            }
+            for value in fields {
+                keys.push((format!("field:{path}"), value));
+            }
+        }
+    }
+    if let Some(owners) = value.pointer("/metadata/ownerReferences").and_then(Value::as_array) {
+        for owner in owners {
+            if let (Some(version), Some(kind), Some(name)) = (
+                owner.get("apiVersion").and_then(Value::as_str),
+                owner.get("kind").and_then(Value::as_str),
+                owner.get("name").and_then(Value::as_str),
+            ) {
+                keys.push(("owner".into(), owner_key(version, kind, name)));
+            }
+        }
+    }
+    keys
+}
+
 impl QueryIndex {
+    /// Indexes `value`, a resource's JSON document, as `name`; or drops `name` when there is none.
     pub fn update(&mut self, name: &str, value: Option<&Value>) {
+        self.set(name, value.map(value_index_keys));
+    }
+
+    /// Indexes `object` as `name`; or drops `name` when there is none.
+    pub fn update_object<T: crate::Resource>(&mut self, name: &str, object: Option<&ResourceObject<T>>) -> Result<(), ResourceError> {
+        let keys = object.map(crate::object_index_keys).transpose()?;
+        self.set(name, keys);
+        Ok(())
+    }
+
+    fn set(&mut self, name: &str, keys: Option<Vec<(String, String)>>) {
         self.names.remove(name);
         if let Some(keys) = self.keys.remove(name) {
             for key in keys {
@@ -331,44 +391,7 @@ impl QueryIndex {
                 }
             }
         }
-        let Some(value) = value else { return };
-        let mut keys = Vec::new();
-        if let Some(labels) = value.pointer("/metadata/labels").and_then(Value::as_object) {
-            for (key, value) in labels {
-                if let Some(value) = value.as_str() {
-                    keys.push((format!("label:{key}"), value.into()));
-                }
-            }
-        }
-        // Only declared paths are indexed; large embedded workflow bodies do
-        // not create incidental query indexes.
-        if let Some(kind) =
-            crate::declared_resource_kinds().into_iter().find(|kind| Some(kind.paths.kind) == value.get("kind").and_then(Value::as_str))
-        {
-            for path in kind.queryable_fields {
-                let fields = declared_field_values(value, path);
-                if !fields.is_empty() {
-                    keys.push((format!("present:{path}"), String::new()));
-                }
-                if fields.is_empty() {
-                    keys.push((format!("missing:{path}"), String::new()));
-                }
-                for value in fields {
-                    keys.push((format!("field:{path}"), value));
-                }
-            }
-        }
-        if let Some(owners) = value.pointer("/metadata/ownerReferences").and_then(Value::as_array) {
-            for owner in owners {
-                if let (Some(version), Some(kind), Some(name)) = (
-                    owner.get("apiVersion").and_then(Value::as_str),
-                    owner.get("kind").and_then(Value::as_str),
-                    owner.get("name").and_then(Value::as_str),
-                ) {
-                    keys.push(("owner".into(), serde_json::json!([version, kind, name]).to_string()));
-                }
-            }
-        }
+        let Some(keys) = keys else { return };
         for key in &keys {
             self.entries.entry(key.clone()).or_default().insert(name.into());
         }
@@ -510,7 +533,7 @@ pub fn merge_query_definitions(
         }
         selected
     };
-    Ok(crate::definition::overlay_builtins(kind.paths.kind, namespace, merged, names.as_ref())?
+    Ok(crate::definition::with_builtins(kind.paths.kind, namespace, merged, names.as_ref())?
         .into_iter()
         .map(|object| crate::ReadResourceObject { object, provenance: crate::ResourceProvenance::Local })
         .collect())
@@ -526,60 +549,28 @@ pub fn declared_field_values(value: &Value, path: &str) -> Vec<String> {
             _ => None,
         }
     }
-    // Stored N-generation Convoy specs may still carry legacy issues and a
-    // bound request. Normalize their virtual subject index at write/backfill,
-    // without rewriting the stored body or decoding it during a query.
-    if path == "spec.subjects.*.subject" && value.get("kind").and_then(Value::as_str) == Some("Convoy") {
-        let legacy = value.get("spec").is_some_and(|spec| {
+    // The values a kind derives from its spec for a path ([`Resource::indexed_values`]). Only
+    // those paths decode the spec, and a Convoy's only when it carries legacy subjects.
+    fn derived<R: Resource>(value: &Value, path: &str) -> Option<Vec<String>> {
+        let spec = serde_json::from_value::<R::Spec>(value.get("spec")?.clone()).ok()?;
+        R::indexed_values(&spec, path)
+    }
+    let legacy_subjects = || {
+        value.get("spec").is_some_and(|spec| {
             spec.get("change_request").is_some_and(|value| !value.is_null())
                 || spec.get("issues").and_then(Value::as_array).is_some_and(|issues| !issues.is_empty())
-        });
-        if legacy {
-            if let Ok(spec) = serde_json::from_value::<flotilla_resources::ConvoySpec>(value["spec"].clone()) {
-                if let Ok(subjects) = spec.declared_subjects() {
-                    return subjects
-                        .into_iter()
-                        .filter_map(|entry| serde_json::to_value(entry.subject).ok())
-                        .map(|subject| subject.to_string())
-                        .collect();
-                }
-            }
+        })
+    };
+    let derived = match (value.get("kind").and_then(Value::as_str), path) {
+        (Some("Convoy"), "spec.subjects.*.subject") if legacy_subjects() => derived::<flotilla_resources::Convoy>(value, path),
+        (Some("Forge"), "spec.remote_hosts.*") => derived::<flotilla_resources::Forge>(value, path),
+        (Some("Repository"), "spec.catalog_targets.*" | flotilla_resources::repository::FORGE_SERVICE_URL_FIELD) => {
+            derived::<flotilla_resources::Repository>(value, path)
         }
-    }
-    // Forge remote matching is case-insensitive over declared aliases, SSH
-    // aliases and the canonical HTTPS host. Index that same virtual inventory.
-    if path == "spec.remote_hosts.*" && value.get("kind").and_then(Value::as_str) == Some("Forge") {
-        if let Ok(spec) = serde_json::from_value::<flotilla_resources::ForgeSpec>(value["spec"].clone()) {
-            return spec
-                .hosts
-                .iter()
-                .map(|host| host.to_ascii_lowercase())
-                .chain(std::iter::once(spec.git_ssh_host.to_ascii_lowercase()))
-                .chain(spec.https_url.split_once("://").and_then(|(_, rest)| rest.split('/').next()).map(str::to_ascii_lowercase))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-        }
-    }
-    // Catalog aliases are a virtual indexed projection of the immutable
-    // repository identity. Their bodies retain the existing stored shape.
-    if path == "spec.catalog_targets.*" && value.get("kind").and_then(Value::as_str) == Some("Repository") {
-        if let Ok(spec) = serde_json::from_value::<flotilla_resources::RepositorySpec>(value["spec"].clone()) {
-            let mut targets = BTreeSet::from([spec.leaf_slug(), spec.catalog_slug()]);
-            match spec.identity() {
-                flotilla_resources::RepositoryIdentity::Forge { owner, repo_name, .. } => {
-                    targets.insert(format!("{owner}/{repo_name}"));
-                }
-                flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => {
-                    targets.insert(flotilla_resources::descriptive_repo_slug(canonical_remote));
-                    if let Some(forge) = spec.forge() {
-                        targets.insert(forge.repository.clone());
-                    }
-                }
-                flotilla_resources::RepositoryIdentity::Local { .. } => {}
-            }
-            return targets.into_iter().collect();
-        }
+        _ => None,
+    };
+    if let Some(values) = derived {
+        return values;
     }
     if let Some((array, suffix)) = array_field_path(path) {
         fn walk(value: &Value, parts: &[&str], result: &mut Vec<String>) {

@@ -72,7 +72,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .kind(AwarenessKind::Convoy)
                 .label(convoy.name.clone())
                 .state(convoy_state(convoy.phase, convoy.initializing))
-                .phase(AwarenessPhase::Convoy(convoy.phase))
+                .maybe_phase(convoy.phase.map(AwarenessPhase::Convoy))
                 .as_of(as_of)
                 .refs(vec![convoy.resource.clone()])
                 .issue_refs(convoy.issues.iter().map(|issue| issue.reference.clone()).collect())
@@ -305,14 +305,7 @@ fn group_kind_for_query(scope: Option<&QueryScope>, grouping: AwarenessGrouping)
 
 fn group_key_for_convoy(grouping: AwarenessGrouping, convoy: &ConvoyRow) -> GroupKey {
     match grouping {
-        AwarenessGrouping::Project => {
-            convoy.project_ref.as_deref().map(|project| project_ref_key(&convoy.resource.namespace, project)).unwrap_or_else(|| {
-                convoy.repo.as_ref().map_or_else(
-                    || GroupKey::new("unparented", "Unparented"),
-                    |repo| GroupKey::new(format!("repo/{}", repo.0), repo.0.clone()),
-                )
-            })
-        }
+        AwarenessGrouping::Project => project_ref_key(&convoy.resource.namespace, &convoy.project_ref),
         AwarenessGrouping::Convoy => {
             GroupKey::new(format!("convoy/{}/{}", convoy.resource.namespace, convoy.resource.name), convoy.name.clone())
         }
@@ -326,7 +319,9 @@ fn project_ref_key(default_namespace: &str, value: &str) -> GroupKey {
     GroupKey::scoped(QueryScope::new(default_namespace, value))
 }
 
-fn convoy_state(phase: ConvoyPhase, initializing: bool) -> AwarenessState {
+fn convoy_state(phase: Option<ConvoyPhase>, initializing: bool) -> AwarenessState {
+    // An unreadable launch's state is unknown.
+    let Some(phase) = phase else { return AwarenessState::Unknown };
     if initializing {
         return AwarenessState::Waiting;
     }
@@ -415,18 +410,17 @@ fn entry_is_terminal(entry: &AwarenessEntry) -> bool {
 mod tests {
     use chrono::TimeZone;
     use flotilla_protocol::{HostName, Issue, IssueRef, IssueSource, IssueState, RepositoryKey, ResourceRef, SessionPhase};
-    use flotilla_resources::TerminalAttentionState;
 
     use super::*;
     use crate::salience::{AttentionFact, RaisedFact};
 
-    fn convoy(project_ref: Option<&str>, name: &str, phase: ConvoyPhase) -> ConvoyRow {
+    fn convoy(project_ref: &str, name: &str, phase: ConvoyPhase) -> ConvoyRow {
         ConvoyRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", name))
             .name(name.to_string())
             .workflow_ref("implement")
             .phase(phase)
-            .maybe_project_ref(project_ref.map(str::to_owned))
+            .project_ref(project_ref)
             .build()
     }
 
@@ -456,7 +450,7 @@ mod tests {
         let (nodes, _) = project_awareness(AwarenessInput {
             scope: Some(scope.clone()),
             grouping: AwarenessGrouping::Project,
-            convoys: vec![convoy(Some("flotilla/platform"), "ship-it", ConvoyPhase::Active)],
+            convoys: vec![convoy("flotilla/platform", "ship-it", ConvoyPhase::Active)],
             issues: vec![ScopedIssueRow { scope: Some(scope.clone()), row: issue("862", "awareness band") }],
             independents: vec![IndependentRow::builder()
                 .resource(ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", "scratch"))
@@ -482,7 +476,7 @@ mod tests {
 
     #[test]
     fn convoy_labels_describe_only_the_convoy() {
-        let mut convoy = convoy(Some("flotilla/platform"), "ship-it", ConvoyPhase::Active);
+        let mut convoy = convoy("flotilla/platform", "ship-it", ConvoyPhase::Active);
         convoy.subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
             subject: flotilla_protocol::Subject {
                 kind: flotilla_protocol::SubjectKind::ChangeRequest,
@@ -517,7 +511,7 @@ mod tests {
             grouping: AwarenessGrouping::Project,
             limit: AwarenessLimit { groups: 2, entries: 32 },
             projects: vec![empty.clone(), active.clone(), overflow],
-            convoys: vec![convoy(Some("flotilla/active"), "ship-it", ConvoyPhase::Active)],
+            convoys: vec![convoy("flotilla/active", "ship-it", ConvoyPhase::Active)],
             ..AwarenessInput::default()
         });
 
@@ -549,7 +543,7 @@ mod tests {
         let (nodes, _) = project_awareness(AwarenessInput {
             scope: Some(scope.clone()),
             grouping: AwarenessGrouping::Convoy,
-            convoys: vec![convoy(Some("flotilla/platform"), "ship-it", ConvoyPhase::Active)],
+            convoys: vec![convoy("flotilla/platform", "ship-it", ConvoyPhase::Active)],
             ..AwarenessInput::default()
         });
 
@@ -560,12 +554,28 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_launch_has_unknown_state_and_no_phase() {
+        let mut unreadable = convoy("flotilla/platform", "broken", ConvoyPhase::Pending);
+        unreadable.phase = None;
+        unreadable.unreadable = Some("admission document does not decode".into());
+        let (nodes, _) = project_awareness(AwarenessInput {
+            grouping: AwarenessGrouping::Convoy,
+            convoys: vec![unreadable],
+            ..AwarenessInput::default()
+        });
+
+        let entry = nodes.iter().flat_map(|node| &node.entries).find(|entry| entry.kind == AwarenessKind::Convoy).expect("convoy entry");
+        assert_eq!(entry.state, AwarenessState::Unknown);
+        assert_eq!(entry.phase, None);
+    }
+
+    #[test]
     fn grouping_parameter_changes_shape_without_changing_input_facts() {
         let input = AwarenessInput {
             grouping: AwarenessGrouping::Project,
             convoys: vec![
-                convoy(Some("flotilla/platform"), "first", ConvoyPhase::Active),
-                convoy(Some("flotilla/platform"), "second", ConvoyPhase::Pending),
+                convoy("flotilla/platform", "first", ConvoyPhase::Active),
+                convoy("flotilla/platform", "second", ConvoyPhase::Pending),
             ],
             ..AwarenessInput::default()
         };
@@ -578,9 +588,9 @@ mod tests {
 
     #[test]
     fn same_role_convoys_use_resource_identity_in_awareness_ids() {
-        let mut andamento = convoy(Some("flotilla/andamento"), "governor", ConvoyPhase::Active);
+        let mut andamento = convoy("flotilla/andamento", "governor", ConvoyPhase::Active);
         andamento.resource.name = "governor-andamento-01234567".to_owned();
-        let mut wheelhouse = convoy(Some("flotilla/wheelhouse"), "governor", ConvoyPhase::Active);
+        let mut wheelhouse = convoy("flotilla/wheelhouse", "governor", ConvoyPhase::Active);
         wheelhouse.resource.name = "governor-wheelhouse-89abcdef".to_owned();
 
         let (nodes, _) = project_awareness(AwarenessInput {
@@ -615,8 +625,8 @@ mod tests {
             grouping: AwarenessGrouping::Convoy,
             limit: AwarenessLimit { groups: 1, entries: 32 },
             convoys: vec![
-                convoy(Some("flotilla/platform"), "first", ConvoyPhase::Active),
-                convoy(Some("flotilla/platform"), "second", ConvoyPhase::Pending),
+                convoy("flotilla/platform", "first", ConvoyPhase::Active),
+                convoy("flotilla/platform", "second", ConvoyPhase::Pending),
             ],
             state: source_state.clone(),
             ..AwarenessInput::default()
@@ -625,8 +635,8 @@ mod tests {
             grouping: AwarenessGrouping::Project,
             limit: AwarenessLimit { groups: 1, entries: 1 },
             convoys: vec![
-                convoy(Some("flotilla/platform"), "first", ConvoyPhase::Active),
-                convoy(Some("flotilla/platform"), "second", ConvoyPhase::Pending),
+                convoy("flotilla/platform", "first", ConvoyPhase::Active),
+                convoy("flotilla/platform", "second", ConvoyPhase::Pending),
             ],
             state: source_state.clone(),
             ..AwarenessInput::default()
@@ -635,8 +645,8 @@ mod tests {
             grouping: AwarenessGrouping::Convoy,
             limit: AwarenessLimit { groups: 2, entries: 1 },
             convoys: vec![
-                convoy(Some("flotilla/platform"), "first", ConvoyPhase::Active),
-                convoy(Some("flotilla/platform"), "second", ConvoyPhase::Pending),
+                convoy("flotilla/platform", "first", ConvoyPhase::Active),
+                convoy("flotilla/platform", "second", ConvoyPhase::Pending),
             ],
             state: source_state,
             ..AwarenessInput::default()
@@ -655,11 +665,11 @@ mod tests {
         let terminal = [ConvoyPhase::Landed, ConvoyPhase::Abandoned, ConvoyPhase::Failed]
             .into_iter()
             .enumerate()
-            .map(|(index, phase)| convoy(Some("flotilla/platform"), &format!("terminal-{index}"), phase));
+            .map(|(index, phase)| convoy("flotilla/platform", &format!("terminal-{index}"), phase));
         let (nodes, state) = project_awareness(AwarenessInput {
             scope: Some(QueryScope::new("flotilla", "platform")),
             limit: AwarenessLimit { groups: 1, entries: 2 },
-            convoys: terminal.chain([convoy(Some("flotilla/platform"), "live", ConvoyPhase::Active)]).collect(),
+            convoys: terminal.chain([convoy("flotilla/platform", "live", ConvoyPhase::Active)]).collect(),
             ..AwarenessInput::default()
         });
 
@@ -673,7 +683,7 @@ mod tests {
         let base = Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).single().expect("timestamp");
         let demand_at = Utc.with_ymd_and_hms(2026, 7, 22, 12, 1, 0).single().expect("timestamp");
         let attention_at = Utc.with_ymd_and_hms(2026, 7, 22, 12, 2, 0).single().expect("timestamp");
-        let mut convoy = convoy(Some("flotilla/platform"), "ship-it", ConvoyPhase::Active);
+        let mut convoy = convoy("flotilla/platform", "ship-it", ConvoyPhase::Active);
         let vessel = convoy.resource.subresource("vessels/implement");
         convoy.vessels.push(
             flotilla_protocol::VesselRow::builder()
@@ -688,7 +698,11 @@ mod tests {
             convoys: vec![convoy.clone()],
             salience: SalienceFacts {
                 raised: vec![RaisedFact { target: vessel.clone(), escalated: true, as_of: demand_at }],
-                attention: vec![AttentionFact { target: vessel, state: TerminalAttentionState::NeedsInput, as_of: attention_at }],
+                attention: vec![AttentionFact {
+                    target: vessel,
+                    activity: flotilla_protocol::AgentActivity::NeedsInput,
+                    as_of: attention_at,
+                }],
             },
             state: ResultSetState {
                 demand: Some(flotilla_protocol::DemandBackedMetadata { as_of: base, has_more: false }),

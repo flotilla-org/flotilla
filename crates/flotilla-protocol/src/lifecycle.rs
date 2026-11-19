@@ -44,8 +44,8 @@ pub enum LifecycleReading {
     Exhausted { cause: String },
     /// Realised under `identity`.
     Ready { identity: String },
-    /// Gone, observed absent without a release.
-    Lost,
+    /// Gone, observed absent without a release; `reason` is why, when its home said.
+    Lost { reason: Option<String> },
     /// Ended after an observed failure.
     Failed { reason: String },
     /// Gone, torn down on purpose.
@@ -62,7 +62,7 @@ impl LifecycleReading {
             Self::Retrying { .. } => "Retrying",
             Self::Exhausted { .. } => "Exhausted",
             Self::Ready { .. } => "Ready",
-            Self::Lost => "Lost",
+            Self::Lost { .. } => "Lost",
             Self::Failed { .. } => "Failed",
             Self::Released => "Released",
             Self::GaveUp { .. } => "GaveUp",
@@ -76,7 +76,7 @@ impl LifecycleReading {
             Self::Retrying { failures, next, cause } => Some(format!("{cause} ({failures} failed; next try at {})", next.to_rfc3339())),
             Self::Exhausted { cause } => Some(format!("{cause} (attempts spent)")),
             Self::Ready { .. } => None,
-            Self::Lost => Some("observed absent".into()),
+            Self::Lost { reason } => Some(reason.clone().unwrap_or_else(|| "observed absent".into())),
             Self::Failed { reason } => Some(if reason.is_empty() { "failed (no reason recorded)".into() } else { reason.clone() }),
             Self::Released => Some("released".into()),
             Self::GaveUp { cause } => Some(cause.clone()),
@@ -97,7 +97,7 @@ mod reading_tests {
             (LifecycleReading::Retrying { failures: 1, next: at, cause: "c".into() }, "Retrying"),
             (LifecycleReading::Exhausted { cause: "c".into() }, "Exhausted"),
             (LifecycleReading::Ready { identity: "i".into() }, "Ready"),
-            (LifecycleReading::Lost, "Lost"),
+            (LifecycleReading::Lost { reason: None }, "Lost"),
             (LifecycleReading::Released, "Released"),
             (LifecycleReading::Failed { reason: "c".into() }, "Failed"),
             (LifecycleReading::GaveUp { cause: "c".into() }, "GaveUp"),

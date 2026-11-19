@@ -21,10 +21,9 @@ use flotilla_protocol::{
     table::{Message, Row},
     CallerProcess, CommandCaller, PrincipalRef,
 };
-use flotilla_resources::{Convoy, ConvoySpec, InputMeta, PROJECT_LABEL, ROLE_LABEL};
+use flotilla_resources::{ConvoySpec, PROJECT_LABEL, ROLE_LABEL};
 use flotilla_schema::Table;
-use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use flotilla_tracing::{SdkTracerProvider, TracerProvider as _};
 use flotilla_verbs::{Call, NativeVerb, Picks, Presentation, Verb, VerbRegistry};
 use serde::Deserialize;
@@ -42,6 +41,7 @@ use crate::server::{
         invoke::{FIELD_LIMIT, INVOCATION_LIMIT, SUBJECT_LIMIT},
     },
 };
+use crate::testkits::engine::admit_convoy;
 
 #[path = "../../../../../tests/support/span_exporter.rs"]
 mod span_exporter;
@@ -138,7 +138,7 @@ async fn fixture() -> Fixture {
     registry.register(Looked, Presentation::default()).unwrap();
     let verbs = verbs::serve(registry, subjects);
     let router = HttpRouter::builder()
-        .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .backend(engine_home_backend())
         .daemon(Arc::clone(&daemon))
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
         .verbs(Arc::new(verbs))
@@ -378,14 +378,9 @@ fn attribute(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<Str
 async fn the_invocation_span_records_the_intent_and_the_outcomes() {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
-    // While one dispatcher is registered, tracing-core caches a new callsite's interest from the
-    // registering thread's default; a test thread without a subscriber would then cache the
-    // invocation span as never enabled. A second registered dispatcher makes interest the union of
-    // all of them.
-    let _second = tracing::Dispatch::new(tracing_subscriber::registry());
-    let _subscriber = tracing::subscriber::set_default(
+    let _subscriber = tracing::dispatcher::set_default(&flotilla_log_testkit::dispatch(
         tracing_subscriber::registry().with(flotilla_tracing::layer().with_tracer(provider.tracer("verbs"))),
-    );
+    ));
     let Fixture { router, daemon, callers, .. } = fixture().await;
     let missing = "project:flotilla/convoy:missing";
     let request = json!({"invocation": "rec", "subjects": [RUNNING, missing], "params": {"note": "why"}});
@@ -483,18 +478,23 @@ async fn requests_that_do_not_fit_the_verb_are_refused_whole() {
 #[tokio::test]
 async fn convoy_explain_finds_a_convoy_by_its_record_name_or_role() {
     let (_dir, daemon) = super::super::tests::empty_daemon().await;
+    // An explanation reads the convoy's messages.
+    daemon.open_message_primitives().expect("the engine Message path");
     let namespace = daemon.provisioning_namespace().await;
-    let convoys = daemon.resource_backend().using::<Convoy>(&namespace);
     let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), "fix-3774".to_owned()), (PROJECT_LABEL.to_owned(), "flotilla".to_owned())]);
     let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role("fix-3774".into()).build();
-    convoys.create(&InputMeta::builder().name("convoy-0123".into()).labels(labels).build(), &spec).await.unwrap();
+    let mut convoy =
+        flotilla_engine_convoys_testkit::convoy(&namespace, "convoy-0123", spec, flotilla_engine_convoys_testkit::single_agent("coder"));
+    convoy.metadata.labels = labels;
+    let launch = admit_convoy(&daemon, convoy).await;
     let router =
         HttpRouter::for_daemon(Arc::clone(&daemon), Arc::new(LoginStore::new(daemon.clock_for_scenarios())), ListenerOrigin::default())
             .into_router();
     let verbs = rows(&router, "/tables/verbs/rows").await;
     let explain = verbs.iter().find(|verb| verb["name"] == "convoy.explain").expect("listed");
     assert_eq!((&explain["effect"], &explain["picks"], &explain["broken"]), (&json!("read"), &json!("each"), &Value::Null));
-    let subjects = ["convoy:convoy-0123", "project:flotilla/convoy:fix-3774", "project:other/convoy:fix-3774"];
+    let record = format!("convoy:{}", flotilla_address::encode(&launch));
+    let subjects = [record.as_str(), "project:flotilla/convoy:fix-3774", "project:other/convoy:fix-3774"];
     let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.explain", json!({"invocation": "r", "subjects": subjects})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     for outcome in &body["outcomes"].as_array().unwrap()[..2] {
@@ -529,21 +529,28 @@ impl NativeVerb for Records {
 // its `address`, and the verb sees that row's record.
 #[tokio::test]
 async fn a_convoy_rows_address_acts_on_that_rows_convoy() {
-    use flotilla_resources::{ConvoyPhase, ConvoyStatus};
     let (_dir, daemon) = super::super::tests::empty_daemon().await;
     let namespace = daemon.provisioning_namespace().await;
     let backend = daemon.resource_backend();
-    let convoys = backend.using::<Convoy>(&namespace);
-    for (record, role, phase) in
-        [("lander", "coder", None), ("convoy-1", "lander", Some(ConvoyPhase::Landed)), ("convoy-2", "lander", Some(ConvoyPhase::Active))]
-    {
+    let engine = Arc::clone(daemon.convoy_engine_path().get().expect("the engine Convoy path"));
+    let mut retired = None;
+    for (record, role, landed) in [("lander", "coder", false), ("convoy-1", "lander", true), ("convoy-2", "lander", false)] {
         let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), role.to_owned()), (PROJECT_LABEL.to_owned(), "flotilla".to_owned())]);
         let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role(role.into()).build();
-        let created = convoys.create(&InputMeta::builder().name(record.into()).labels(labels).build(), &spec).await.unwrap();
-        if let Some(phase) = phase {
-            convoys.update_status(record, &created.metadata.resource_version, &ConvoyStatus { phase, ..Default::default() }).await.unwrap();
+        let mut convoy =
+            flotilla_engine_convoys_testkit::convoy(&namespace, record, spec, flotilla_engine_convoys_testkit::single_agent("coder"));
+        convoy.metadata.labels = labels;
+        let launch = admit_convoy(&daemon, convoy).await;
+        if landed {
+            // An operator keeps its work and it is delivered: an ended holder of `lander`.
+            let convoy = backend.using::<flotilla_resources::Convoy>(&namespace).get(&launch).await.expect("convoy");
+            let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None };
+            engine.keep_by_verdict(&convoy, &scope, "operator", "landed").await.expect("keep the work");
+            engine.deliver(&convoy, "claim").await.expect("deliver");
+            retired = Some(launch);
         }
     }
+    let retired = retired.expect("the landed convoy");
     let mut registry = VerbRegistry::new();
     flotilla_store::register_subjects(&mut registry).unwrap();
     registry.register(Records, Presentation::default()).unwrap();
@@ -554,14 +561,21 @@ async fn a_convoy_rows_address_acts_on_that_rows_convoy() {
         .registry(registry)
         .build()
         .into_router();
+    // The landed convoy retired: the table lists the live two, as a listing does.
     let rows = rows(&router, &format!("/tables/convoys/rows?namespace={namespace}")).await;
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 2);
     for row in rows {
         let request = json!({"invocation": "r", "subjects": [row["address"]]});
         let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.record", request).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!((&body["outcomes"][0]["status"], &body["outcomes"][0]["result"]), (&json!("done"), &row["metadata.name"]), "{body}");
     }
+    // Its record address still acts on it, read by name.
+    let identity = flotilla_store::ConvoyIdentity { record: &retired, role: Some("lander"), project: Some("flotilla"), terminal: true };
+    let address = identity.address().expect("the retired convoy's record address").to_string();
+    let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.record", json!({"invocation": "r", "subjects": [address]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((&body["outcomes"][0]["status"], &body["outcomes"][0]["result"]), (&json!("done"), &json!(retired)), "{body}");
 }
 
 /// A read verb on an agent session, answering with its session's record name.
@@ -617,7 +631,7 @@ async fn an_engine_kinds_row_address_acts_on_that_rows_record() {
     registry.register_subject(sessions_of_coder()).unwrap();
     registry.register(SessionNames, Presentation::default()).unwrap();
     let router = HttpRouter::builder()
-        .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .backend(engine_home_backend())
         .daemon(Arc::clone(&daemon))
         .table_store(service)
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))

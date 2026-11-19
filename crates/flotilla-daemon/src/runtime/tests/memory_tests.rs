@@ -1,4 +1,6 @@
 use super::*;
+use crate::testkits::engine::{admit_convoy, engine, runtime_checkouts};
+use flotilla_provisioning::engine::controller::{Backing, BackingEvent};
 
 // Process boundary only: the actual Docker provider decodes the real incident
 // recording; this runner supplies its subprocess outputs without a live Docker.
@@ -51,103 +53,67 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     let daemon = in_memory_daemon(Vec::new(), config.clone()).await;
     let backend = daemon.resource_backend();
     let env_id = EnvironmentId::new("env-memory-incident");
-    create_ready_docker_environment(&daemon, env_id.as_str(), "container", BTreeSet::new()).await;
-    let convoy = backend
-        .using::<Convoy>(NAMESPACE)
-        .create(&empty_meta("memory-incident"), &ConvoySpec::builder().workflow_ref("scratch".into()).build())
-        .await
-        .expect("convoy");
-    backend
-        .using::<Convoy>(NAMESPACE)
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                observed_workflow_ref: Some("scratch".into()),
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".into())
-                        .crew(vec![CrewSpec::builder().role("shell".into()).source(CrewSource::Tool { command: "true".into() }).build()])
-                        .build()],
-                }),
-                work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([(
-                        "shell".into(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                    )]),
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("admitted convoy");
+    // The work's repository, whose retained checkout a loss names.
     let repo = RepositoryKey("test-repository".into());
-    let checkouts = backend.using::<ResourceCheckout>(NAMESPACE);
-    checkouts
-        .create(
-            &empty_meta("recoverable-work"),
-            &ResourceCheckoutSpec::Observed(
-                ResourceObservedCheckoutSpec::builder()
-                    .r#ref("fix/retained-work".into())
-                    .path("/hulls/work/flotilla".into())
-                    .repo_ref(repo.clone())
-                    .host_ref("host".into())
-                    .is_main(false)
-                    .build(),
-            ),
-        )
-        .await
-        .expect("checkout");
-    flotilla_store::apply_status_patch(
-        &checkouts,
+    let status = ConvoyStatus {
+        observed_workflow_ref: Some("scratch".into()),
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+            vessels: vec![VesselRequirement::builder()
+                .name("work".into())
+                .repository_refs(vec![repo.clone()])
+                .crew(vec![CrewSpec::builder()
+                    .role("shell".into())
+                    .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("shell")])
+                    .source(CrewSource::Tool { command: "true".into() })
+                    .build()])
+                .build()],
+        }),
+        ..Default::default()
+    };
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("scratch".into()).build();
+    let convoy = admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, "memory-incident", spec, status)).await;
+    // The work's adopted checkout, ready on the engine and held for its convoy.
+    let checkouts = runtime_checkouts(&daemon);
+    checkouts.put_ready(
         "recoverable-work",
-        &flotilla_resources::CheckoutStatusPatch::MarkReady {
-            path: "/hulls/work/flotilla".into(),
-            commit: None,
-            branch_provenance: Default::default(),
-        },
-    )
-    .await
-    .expect("checkout ready");
-    let vessels = backend.using::<Vessel>(NAMESPACE);
-    let vessel = vessels
-        .create(
-            &InputMeta::builder()
-                .name("memory-incident-work".into())
-                .labels(BTreeMap::from([(CONVOY_LABEL.into(), "memory-incident".into())]))
+        &ResourceCheckoutSpec::Observed(
+            ResourceObservedCheckoutSpec::builder()
+                .r#ref("fix/retained-work".into())
+                .path("/hulls/work/flotilla".into())
+                .repo_ref(repo.clone())
+                .host_ref("host".into())
+                .is_main(false)
                 .build(),
-            &VesselSpec {
-                convoy_ref: "memory-incident".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test-policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("vessel");
-    vessels
-        .update_status(
-            &vessel.metadata.name,
-            &vessel.metadata.resource_version,
-            &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some(env_id.to_string()),
-                checkout_refs: BTreeMap::from([(repo, "recoverable-work".into())]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("vessel ready");
+        ),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy.clone())),
+    );
+    // The work's launch, ready in its environment; the planner reads it as the old store's view.
+    let engine = engine(&daemon);
+    // Explain reads the launch's messages, which the engine's Message path serves.
+    daemon.open_message_primitives().expect("message path");
+    let launch = engine.vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
+    // Its container, requested for it and running.
+    let host_ref = daemon.local_host_id().expect("local host").to_string();
+    engine_environments(&daemon).put_ready(
+        env_id.as_str(),
+        &docker_environment_spec(&host_ref, BTreeSet::new()),
+        Some(&launch),
+        "container",
+        flotilla_resources::environment_records::LaunchFacts {
+            image_ref: Some("contained-image".to_string()),
+            local_image_id: Some("sha256:test-interior".to_string()),
+            ..Default::default()
+        },
+    );
+    engine.vessels.ready(&launch, env_id.as_str());
     let provider = flotilla_environment::environment::docker::DockerEnvironmentProvider::new(Arc::new(MemoryIncidentRunner::default()));
     let handles = provider.list().await.expect("list backing");
+    engine_environments(&daemon);
     let state = Arc::new(ControllerRuntimeState::new(
         daemon.clone(),
         config,
@@ -165,92 +131,62 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     };
     // Duplicate samples must be harmless; a dead cgroup cannot erase them.
     for _ in 0..2 {
-        record_environment_observation(&state, NAMESPACE, &env_id, &sample).await.expect("sample");
+        record_environment_observation(&state, &env_id, &sample).await.expect("sample");
     }
-    let environments = backend.using::<Environment>(NAMESPACE);
-    let before_environment = environments.get(env_id.as_str()).await.expect("environment");
-    let before_vessel = vessels.get("memory-incident-work").await.expect("vessel");
+    // The observation is held in this home's memory; a later sample of the same usage keeps the
+    // time it was first seen.
+    let held = || daemon.lifecycle_reads().environments().expect("environments").observations().get(env_id.as_str());
     let mut duplicate = sample.clone();
     duplicate.memory_observed_at = Some("2026-10-05T10:13:30Z".into());
-    record_environment_observation(&state, NAMESPACE, &env_id, &duplicate).await.expect("unchanged sample");
-    assert_eq!(
-        environments.get(env_id.as_str()).await.expect("environment").metadata.resource_version,
-        before_environment.metadata.resource_version
-    );
-    assert_eq!(
-        vessels.get("memory-incident-work").await.expect("vessel").metadata.resource_version,
-        before_vessel.metadata.resource_version
-    );
+    record_environment_observation(&state, &env_id, &duplicate).await.expect("unchanged sample");
+    assert_eq!(held().expect("held sample").memory_observed_at, sample.memory_observed_at);
     reconcile_provisioned_environments(&state, NAMESPACE).await.expect("observe death");
-    let environments = backend.using::<Environment>(NAMESPACE);
-    let environment = environments.get(env_id.as_str()).await.expect("environment");
-    let status = environment.status.expect("status");
-    assert_eq!(status.phase, EnvironmentPhase::Lost);
-    let message = status.message.expect("failure message");
-    assert!(message.contains("host oomd") && message.contains("exit code 137") && message.contains("/hulls/work/flotilla"), "{message}");
-    let observation = status.runtime_observation.expect("persisted evidence");
+    // The probe tells the Environment controller the backing is gone, and why; the controller
+    // ends the launch Lost with that reason, as the fixture steps it here.
+    let observed = observed_backings(&state);
+    let [BackingEvent { name, observed: Backing::Absent { reason: Some(reason) } }] = observed.as_slice() else {
+        panic!("the dead backing is reported absent with its cause: {observed:?}");
+    };
+    assert_eq!(name, env_id.as_str());
+    engine_environments(&daemon).lose(env_id.as_str(), reason);
+    let observation = held().expect("held evidence");
     assert_eq!(observation.memory_usage_bytes, sample.memory_usage_bytes);
     assert_eq!(observation.memory_observed_at, sample.memory_observed_at);
     assert_eq!(observation.termination.as_ref().expect("termination").cause, EnvironmentExitCause::HostOomd);
-    assert_eq!(
-        vessels.get("memory-incident-work").await.expect("vessel").status.expect("status").runtime_observation,
-        Some(observation.clone())
+    // The Vessel controller, the launch's single writer, adopts it and ends it Lost with the
+    // backing's cause and where the work is.
+    let _running = flotilla_orchestration_testkit::run_vessels(
+        &backend,
+        NAMESPACE,
+        VesselPlanning::new(backend.clone(), NAMESPACE, daemon.account_records()).with_lifecycle_reads(daemon.lifecycle_reads()),
+        Arc::clone(&engine.vessels.lifecycles),
+        daemon.lifecycle_reads(),
+        daemon.decided_store().expect("decided store"),
     );
-    let vessel_reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
-    let vessel = vessels.get("memory-incident-work").await.expect("vessel");
-    // A restart can encounter an already-interrupted vessel whose backing
-    // loss was persisted separately. Reconstruct its stored status before
-    // preparing with the new reconciler; loss must still propagate.
-    let mut vessel_status = vessel.status.expect("status");
-    vessel_status.phase = flotilla_resources::VesselPhase::Interrupted;
-    let vessel_status: VesselStatus =
-        serde_json::from_value(serde_json::to_value(vessel_status).expect("persist vessel")).expect("restart decode");
-    let vessel = vessels.update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &vessel_status).await.expect("restart");
-    let prepared = vessel_reconciler.prepare(&vessel).await.expect("prepare vessel");
-    let outcome = vessel_reconciler.reconcile(&vessel, &prepared, chrono::Utc::now());
-    flotilla_store::apply_status_patch(&vessels, &vessel.metadata.name, &outcome.patch.expect("mark vessel lost"))
-        .await
-        .expect("persist vessel loss");
-    let lost_status = vessels.get(&vessel.metadata.name).await.expect("vessel").status.expect("status");
-    assert_eq!(lost_status.phase, flotilla_resources::VesselPhase::Lost);
-    assert_eq!(lost_status.message.as_deref(), Some(message.as_str()));
-    let lost = vessels.get(&vessel.metadata.name).await.expect("lost vessel");
-    let prepared = vessel_reconciler.prepare(&lost).await.expect("lost vessel prepare");
-    let frozen = vessel_reconciler.reconcile(&lost, &prepared, chrono::Utc::now());
-    assert!(frozen.patch.is_none() && frozen.actuations.is_empty(), "lost backing must not reprovision");
+    let reading = || engine.vessels.vessels.get(&launch, None).expect("read").expect("launch").reading;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !matches!(reading(), LifecycleReading::Lost { .. }) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the launch ends lost: {:?}", reading()));
+    let LifecycleReading::Lost { reason: Some(message) } = reading() else {
+        panic!("the launch ends lost with its cause: {:?}", reading());
+    };
+    assert!(message.contains("host oomd") && message.contains("exit code 137") && message.contains("/hulls/work/flotilla"), "{message}");
+    // The convoy's work and crew read interrupted from the lost launch.
     let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE)).with_vessels(vessels.clone());
-    let convoy = convoys.get("memory-incident").await.expect("convoy");
-    let prepared = convoy_reconciler.prepare(&convoy).await.expect("prepare convoy");
-    let outcome = convoy_reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
-    flotilla_store::apply_status_patch(&convoys, "memory-incident", &outcome.patch.expect("copy runtime evidence"))
-        .await
-        .expect("persist convoy evidence");
-    assert_eq!(
-        backend.using::<Convoy>(NAMESPACE).get("memory-incident").await.expect("convoy").status.expect("status").environment_observations
-            ["work"],
-        observation
-    );
-    // Following reconciliations interrupt work and crew; copying diagnostic
-    // evidence must not swallow the recoverable phase transition.
-    for _ in 0..2 {
-        let convoy = convoys.get("memory-incident").await.expect("convoy");
-        let prepared = convoy_reconciler.prepare(&convoy).await.expect("prepare convoy");
-        let outcome = convoy_reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
-        flotilla_store::apply_status_patch(&convoys, "memory-incident", &outcome.patch.expect("roll up loss"))
-            .await
-            .expect("persist convoy interruption");
-    }
-    let interrupted = convoys.get("memory-incident").await.expect("convoy").status.expect("status");
+    let interrupted = convoys.get(&convoy).await.expect("convoy").status.expect("status");
     assert_eq!(interrupted.phase, ConvoyPhase::Interrupted);
     assert_eq!(interrupted.work["work"].message.as_deref(), Some(message.as_str()));
     assert_eq!(interrupted.crew_work["work"]["shell"].phase, flotilla_resources::CrewWorkPhase::Interrupted);
-    assert!(interrupted.crew_work["work"]["shell"].message.as_ref().expect("loss reason").contains("lost, recoverable"));
-    environments.delete(env_id.as_str()).await.expect("remove backing resource");
+    // The launch has already ended Lost, so nothing is left to release. The evidence is this
+    // home's, read for the work's launch.
     let result = daemon
         .execute_query(
             Command::builder()
-                .action(CommandAction::QueryExplainConvoy { namespace: Some(NAMESPACE.into()), name: "memory-incident".into() })
+                .action(CommandAction::QueryExplainConvoy { namespace: Some(NAMESPACE.into()), name: convoy.clone() })
                 .build(),
             uuid::Uuid::new_v4(),
         )
@@ -260,7 +196,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         panic!("expected explanation, got {result:?}");
     };
     assert_eq!(explanation.environment_observations["work"], observation);
-    assert!(checkouts.get("recoverable-work").await.is_ok(), "failure must retain work");
+    assert!(!checkouts.record("recoverable-work").ended(), "failure must retain work");
 }
 
 // A failed observation has no separate liveness authority: Unknown preserves
@@ -281,6 +217,7 @@ async fn observation_error_preserves_backing_and_retries() {
             inspect_error: true,
         }));
         let handles = provider.list().await.expect("list backing");
+        engine_environments(&daemon);
         let state = Arc::new(ControllerRuntimeState::new(
             daemon.clone(),
             config,
@@ -290,16 +227,12 @@ async fn observation_error_preserves_backing_and_retries() {
             "host-direct-test".into(),
         ));
         let result = reconcile_provisioned_environments(&state, NAMESPACE).await;
-        let status = daemon
-            .resource_backend()
-            .using::<Environment>(NAMESPACE)
-            .get(env_id.as_str())
-            .await
-            .expect("environment")
-            .status
-            .expect("status");
         assert!(result.expect_err("unknown inspection failure retries").contains("will retry"));
-        assert_eq!(status.phase, EnvironmentPhase::Ready);
-        assert!(status.runtime_observation.is_none(), "unavailable evidence stays unknown");
+        assert_eq!(observed_backings(&state), [], "an unknown inspection tells the Environment controller nothing");
+        let environment = engine_environments(&daemon).environments.find(env_id.as_str()).expect("read").expect("environment");
+        assert!(environment.is_ready());
+        // An unknown inspection observes nothing.
+        let reads = daemon.lifecycle_reads();
+        assert_eq!(reads.environments().expect("environments").observations().get(env_id.as_str()), None);
     }
 }

@@ -14,19 +14,19 @@ use flotilla_charter::ops_entry::DECLARATION_STALE_AFTER;
 use flotilla_config::ConfigStore;
 use flotilla_manifest::{
     keys::{
-        KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT, KEY_CHANGE_REQUEST_READINESS,
-        KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD, KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD_OBSERVED_AT,
-        KEY_CHANGE_REQUEST_REVIEW_DECISION, KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT, KEY_CHANGE_REQUEST_STATE,
-        KEY_CHANGE_REQUEST_STATE_OBSERVED_AT,
+        KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT, KEY_CHANGE_REQUEST_MERGEABLE,
+        KEY_CHANGE_REQUEST_MERGEABLE_OBSERVED_AT, KEY_CHANGE_REQUEST_READINESS, KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD,
+        KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD_OBSERVED_AT, KEY_CHANGE_REQUEST_REVIEW_DECISION,
+        KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT, KEY_CHANGE_REQUEST_STATE, KEY_CHANGE_REQUEST_STATE_OBSERVED_AT,
     },
     projection::{change_request_facts, evaluate_change_request_readiness},
     wire::MetadataValue,
 };
 use flotilla_protocol::{
-    commands::{ExplainedSubjectFact, ExplainedSubjectObservation},
+    commands::{ExplainedDischarge, ExplainedEndedVessel, ExplainedSubjectFact, ExplainedSubjectObservation},
     ConvoyExplanation, DeclarationAttentionKind, DeclarationAttentionRow, DispatchQueueResponse, DispatchQueueRow, EnvironmentId,
-    ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
-    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
+    ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedClone, ExplainedCrewDelivery, ExplainedDecisionLedger,
+    ExplainedHold, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness,
     FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProvidersResponse,
     HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse,
@@ -38,17 +38,17 @@ use flotilla_resources::resolve_project_issue_sources_from_inventory;
 use flotilla_resources::{
     address::{leaf_address, leaf_record_name, record_name},
     bound_change_request_address, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
-    repository_display_labels, ChangeRequestStatus, Checkout as ResourceCheckout, Clock, ConditionValue, Convoy as ResourceConvoy,
-    ConvoyStatus, CrewMessageSender, CrewWorkPhase, Forge, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, IssueSourceResolution, IssueSourceUnavailable, Project, ReadResourceObject, Repository,
-    RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
-    CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, ROLE_LABEL, VESSEL_LABEL,
+    repository_display_labels, ChangeRequestStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyStatus, CrewWorkPhase, Forge,
+    FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution,
+    IssueSourceUnavailable, Project, ReadResourceObject, Repository, RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode,
+    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, ROLE_LABEL,
+    VESSEL_LABEL,
 };
-use flotilla_store::{EventRecorder, ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
+use flotilla_store::{ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
 use tracing::warn;
 
-use crate::resource_explain::{explain_condition, explained_provenance, observed_freshness};
+use crate::resource_explain::{checkout_provenance, explain_judgement, explained_provenance, observed_freshness};
 use crate::{
     fleet::{
         accumulate_fleet_health_counts, fleet_observation_agreement, format_resource_replication_failures, host_credential_attention,
@@ -57,6 +57,7 @@ use crate::{
     },
     host_registry::HostCounts,
 };
+use flotilla_resources::checkout_records::latest_launches;
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{explain_unmet_expectation, LeafFiringRecord, LeafSubscriptionRow, LeafWatcher};
 use flotilla_store as project_ops;
@@ -83,6 +84,8 @@ pub trait MessageReceiverRead: Send + Sync {
 
 /// Resolve receiver evidence through the messaging resolver at the composition boundary.
 /// The supplied backend is the request snapshot: implementations must read only from it.
+/// On the engine path the evidence carries the messages to `receivers` (old addresses) and each
+/// `named` (receiver, record) message, read through the inboxes' indexes and by key.
 #[async_trait]
 pub trait MessageReceiverLoader: Send + Sync {
     async fn load(
@@ -91,6 +94,8 @@ pub trait MessageReceiverLoader: Send + Sync {
         namespace: &str,
         convoys: Vec<ReadResourceObject<ResourceConvoy>>,
         terminals: Vec<ReadResourceObject<ResourceTerminalSession>>,
+        receivers: &[String],
+        named: &[(String, String)],
     ) -> Result<Box<dyn MessageReceiverRead>, String>;
 }
 
@@ -120,6 +125,39 @@ pub struct ReadProjections<'a> {
 }
 
 impl ReadProjections<'_> {
+    /// What this home last observed of the runtime of each of `convoy`'s works, by work: of its
+    /// newest launch whose environment this home observed. A home holds what it observed in
+    /// memory, so another home's works show nothing here, and a lost launch's last observation
+    /// shows until its replacement is observed.
+    fn environment_observations(
+        &self,
+        convoy: &ResourceObject<ResourceConvoy>,
+    ) -> BTreeMap<String, flotilla_protocol::EnvironmentRuntimeObservation> {
+        let observed = || -> Result<_, String> {
+            let environments = self.lifecycles.environments()?;
+            let mut launches = self.lifecycles.vessels()?.of_convoy(&convoy.metadata.name)?;
+            launches.sort_by_key(|launch| std::cmp::Reverse((launch.requested_at, launch.launch_number())));
+            let mut observed = BTreeMap::new();
+            for launch in launches {
+                if observed.contains_key(launch.work()) {
+                    continue;
+                }
+                let held = match launch.environment() {
+                    Some(environment) => vec![environment.to_owned()],
+                    None => environments.held(&launch.name)?.into_iter().map(|environment| environment.name).collect(),
+                };
+                if let Some(observation) = held.iter().find_map(|environment| environments.observations().get(environment)) {
+                    observed.insert(launch.work().to_owned(), observation);
+                }
+            }
+            Ok(observed)
+        };
+        observed().unwrap_or_else(|error| {
+            tracing::debug!(convoy = %convoy.metadata.name, %error, "the convoy's environment observations could not be read");
+            BTreeMap::new()
+        })
+    }
+
     /// Read local and replicated convoy conditions across every stored namespace.
     pub async fn crew_stalls(
         backend: &ResourceBackend,
@@ -128,6 +166,22 @@ impl ReadProjections<'_> {
     ) -> Result<flotilla_protocol::CrewStallsResponse, String> {
         let mut rows = Vec::new();
         for namespace in backend.stored_namespaces::<ResourceConvoy>().await.map_err(|error| error.to_string())? {
+            // A home's stall note stays at its home (#3108). Another host sees an operator-rung
+            // stall as the stall judge's open attention about the convoy's role, and a lower rung
+            // as the seat's open stall record, which the replicated convoy reads as a stalled crew.
+            let mut raised: BTreeMap<String, BTreeMap<String, DateTime<Utc>>> = BTreeMap::new();
+            for attention in backend.attentions().open(&namespace, Some(Sender::StallJudge), None).await? {
+                if let attentions::Subject::ConvoyRole { convoy, role } = attention.subject {
+                    raised.entry(convoy).or_default().insert(role, attention.raised_at);
+                }
+            }
+            let mut stalled = vec![
+                StoreQuery { field_prefixes: BTreeMap::from([("status.stalled".into(), "{".into())]), ..Default::default() },
+                StoreQuery { fields: BTreeMap::from([("status.crew_work.*.*.phase".into(), "Stalled".into())]), ..Default::default() },
+            ];
+            if !raised.is_empty() {
+                stalled.push(StoreQuery::names(raised.keys().cloned(), false));
+            }
             let convoys = backend
                 .query_declared::<ResourceConvoy>(
                     &namespace,
@@ -136,13 +190,7 @@ impl ReadProjections<'_> {
                             "status.phase".into(),
                             ["Pending", "Active", "Interrupted", "Landing"].map(str::to_string).into(),
                         )]),
-                        any_of: Some(vec![
-                            StoreQuery { field_prefixes: BTreeMap::from([("status.stalled".into(), "{".into())]), ..Default::default() },
-                            StoreQuery {
-                                fields: BTreeMap::from([("status.crew_work.*.*.phase".into(), "Stalled".into())]),
-                                ..Default::default()
-                            },
-                        ]),
+                        any_of: Some(stalled),
                         include_replicas: true,
                         ..Default::default()
                     },
@@ -151,7 +199,7 @@ impl ReadProjections<'_> {
                 .map_err(|error| error.to_string())?;
             let projects = backend
                 .definitions::<Project>(&namespace)
-                .list_names(convoys.items.iter().filter_map(|source| source.object.spec.project_ref.clone()))
+                .list_names(convoys.items.iter().map(|source| source.object.spec.project_ref.clone()))
                 .await
                 .map_err(|error| error.to_string())?;
             let artifacts = backend
@@ -170,66 +218,86 @@ impl ReadProjections<'_> {
                 .map_err(|error| error.to_string())?;
             for source in convoys.items {
                 let convoy = source.object;
-                let Some(status) = convoy.status.as_ref().filter(|status| !status.phase.is_terminal()) else { continue };
+                let Some(status) = convoy.status.as_ref() else { continue };
                 let mut obligations = BTreeMap::new();
-                if let Some(stall) = &status.stalled {
-                    for leaf in &stall.leaves {
-                        if let flotilla_protocol::LeafAddress::Work { work, .. } = &leaf.address {
-                            if let Some(role) = leaf.field_path.strip_prefix(".crew.").and_then(|path| path.strip_suffix(".phase")) {
-                                obligations.insert((work.clone(), role.to_string()), Some(stall));
-                            }
-                        }
-                    }
-                    if obligations.is_empty() {
+                for stall in &status.stalls {
+                    let mut seats = stall
+                        .leaves
+                        .iter()
+                        .filter_map(|leaf| {
+                            let flotilla_protocol::LeafAddress::Work { work, .. } = &leaf.address else { return None };
+                            let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
+                            Some((Some(work.clone()), role.to_string()))
+                        })
+                        .collect::<Vec<_>>();
+                    if seats.is_empty() {
                         if let Some(flotilla_resources::LeafMaker::Actor { vessel, role }) = &stall.maker {
-                            obligations.insert((vessel.clone(), role.clone()), Some(stall));
+                            seats.push((Some(vessel.clone()), role.clone()));
                         }
                     }
-                }
-                // A visible stall must not disappear merely because its maker or
-                // leaves do not identify a crew actor (for example a controller wait).
-                if obligations.is_empty() {
-                    if let Some(stall) = &status.stalled {
-                        obligations.insert((String::new(), String::new()), Some(stall));
+                    // A visible stall must not disappear merely because its maker or
+                    // leaves do not identify a crew actor (for example a controller wait).
+                    if seats.is_empty() {
+                        seats.push((None, String::new()));
+                    }
+                    for seat in seats {
+                        obligations.insert(seat, Some(stall));
                     }
                 }
-                // A later crew declaration can replace the convoy's visible condition.
+                // A seat can read Stalled from its stall record with no condition noted here.
                 // Keep every stalled crew row; absent per-obligation metadata stays unknown.
                 for (vessel, crew) in &status.crew_work {
                     for (role, state) in crew {
                         if state.phase == CrewWorkPhase::Stalled {
-                            obligations.entry((vessel.clone(), role.clone())).or_insert(None);
+                            obligations.entry((Some(vessel.clone()), role.clone())).or_insert(None);
                         }
                     }
                 }
-                let project_display_name = convoy.spec.project_ref.as_ref().and_then(|name| {
-                    projects.iter().find(|project| &project.metadata.name == name).map(|project| project.spec.display_name.clone())
-                });
+                // An operator-rung attention names the convoy and role, not the vessel: it joins the
+                // role's stalled crews, or stands as its own row.
+                let operator = match source.provenance {
+                    ResourceProvenance::Replica { .. } => raised.remove(&convoy.metadata.name).unwrap_or_default(),
+                    ResourceProvenance::Local => BTreeMap::new(),
+                };
+                for role in operator.keys() {
+                    if !obligations.keys().any(|(_, held)| held == role) {
+                        obligations.insert((None, role.clone()), None);
+                    }
+                }
+                let project_display_name = projects
+                    .iter()
+                    .find(|project| project.metadata.name == convoy.spec.project_ref)
+                    .map(|project| project.spec.display_name.clone());
                 for ((vessel, role), stall) in obligations {
-                    let evidence = stall
-                        .map(|stall| stall.evidence.clone())
-                        .or_else(|| status.crew_work.get(&vessel).and_then(|crew| crew.get(&role)).and_then(|state| state.message.clone()))
-                        .unwrap_or_default();
+                    // With no stall noted here, the seat's view holds what its stall record carries.
+                    let crew = vessel.as_ref().and_then(|vessel| status.crew_work.get(vessel)).and_then(|crew| crew.get(&role));
+                    let evidence = stall.map(|stall| stall.evidence.clone()).or_else(|| crew.and_then(|state| state.message.clone()));
+                    let reason = stall.map_or(crew.and_then(|state| state.stall_reason), |stall| stall.reason);
+                    let proposed_disposition =
+                        stall.map_or(crew.and_then(|state| state.stall_proposed_disposition), |stall| stall.proposed_disposition);
                     let group = serde_json::to_string(&(
-                        stall.and_then(|stall| stall.reason),
+                        reason,
                         stall.and_then(|stall| stall.cause.as_ref()),
-                        evidence.split_whitespace().collect::<Vec<_>>().join(" "),
+                        evidence.as_ref().map(|evidence| evidence.split_whitespace().collect::<Vec<_>>().join(" ")),
                     ))
                     .map_err(|error| error.to_string())?;
+                    let rung = stall
+                        .map(|stall| stall.rung)
+                        .or_else(|| operator.contains_key(&role).then_some(flotilla_resources::StallRung::Operator));
+                    let raised_at = operator.get(&role).copied();
                     let supervisor = stall
                         .and_then(|stall| stall.supervisor.as_ref())
                         .map(|supervisor| format!("{}/{}/{}", supervisor.convoy, supervisor.vessel, supervisor.role));
-                    let absence = supervisor.is_none().then(|| {
-                        if stall.is_some() {
-                            evidence.clone()
-                        } else {
-                            "no current stall condition recorded for this obligation".into()
-                        }
-                    });
+                    let absence = match (&supervisor, stall) {
+                        (Some(_), _) => None,
+                        (None, Some(_)) => evidence.clone(),
+                        (None, None) if rung.is_some() => None,
+                        (None, None) => Some("no current stall condition recorded for this obligation".into()),
+                    };
                     rows.push(
                         flotilla_protocol::CrewStallRow::builder()
                             .namespace(namespace.clone())
-                            .maybe_project(convoy.spec.project_ref.clone())
+                            .project(convoy.spec.project_ref.clone())
                             .maybe_project_display_name(project_display_name.clone())
                             .convoy(convoy.metadata.name.clone())
                             .convoy_display_name(if convoy.spec.role.is_empty() {
@@ -237,15 +305,16 @@ impl ReadProjections<'_> {
                             } else {
                                 format!("{} #{}", convoy.spec.role, convoy.spec.generation)
                             })
-                            .vessel(vessel)
+                            .maybe_vessel(vessel)
                             .role(role)
-                            .maybe_rung(stall.map(|stall| stall.rung))
+                            .maybe_rung(rung)
                             .maybe_supervisor(supervisor)
                             .maybe_supervisor_absence_reason(absence)
                             .maybe_began_at(stall.map(|stall| stall.began_at))
                             .maybe_age_seconds(stall.map(|stall| now.signed_duration_since(stall.began_at).num_seconds().max(0) as u64))
-                            .maybe_proposed_disposition(stall.and_then(|stall| stall.proposed_disposition))
-                            .evidence(evidence)
+                            .maybe_raised_at(raised_at)
+                            .maybe_proposed_disposition(proposed_disposition)
+                            .maybe_evidence(evidence)
                             .cause_group(group)
                             .shared_cause_count(1)
                             .artifacts(
@@ -326,20 +395,11 @@ impl ReadProjections<'_> {
     }
 
     pub async fn fulfilment_list(&self, namespace: &str) -> Result<FulfilmentListResponse, String> {
+        // Every host is read: a kind joins its host by name below, and the decided store's Host
+        // records answer no query relating them to another kind.
         let hosts = self
             .backend
-            .query_declared::<ResourceHost>(
-                namespace,
-                &StoreQuery {
-                    include_replicas: true,
-                    ..StoreQuery::related_kind(
-                        "metadata.name",
-                        "FulfilmentKind",
-                        "spec.host_ref",
-                        StoreQuery { include_replicas: true, ..Default::default() },
-                    )
-                },
-            )
+            .query_declared::<ResourceHost>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
             .await
             .map_err(|error| error.to_string())?;
         let mut facts_by_host = BTreeMap::<String, ResourceHostStatus>::new();
@@ -363,6 +423,17 @@ impl ReadProjections<'_> {
             .query_declared::<FulfilmentKind>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
             .await
             .map_err(|error| error.to_string())?;
+        // Free slots are judged, not stored: a capped host's cap less what it holds, as admission
+        // counts it.
+        let capped = kinds
+            .items
+            .iter()
+            .filter(|kind| {
+                host_specs.get(&kind.object.spec.host_ref).is_some_and(|host| host.vessel_cap(&kind.object.spec.realisation).is_some())
+            })
+            .map(|kind| kind.object.spec.host_ref.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let occupancies = flotilla_store::occupancy::host_occupancies(self.backend, namespace, &capped).await?;
         let mut rows = BTreeMap::new();
         for kind in kinds.items {
             let kind = kind.object;
@@ -370,6 +441,11 @@ impl ReadProjections<'_> {
                 continue;
             }
             let facts = facts_by_host.get(&kind.spec.host_ref).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
+            let max_vessels = host_specs.get(&kind.spec.host_ref).and_then(|host| host.vessel_cap(&kind.spec.realisation));
+            let free_vessel_slots = match max_vessels {
+                Some(cap) => Some(occupancies.get(&kind.spec.host_ref).map_or(cap, |occupancy| occupancy.free_slots(cap))),
+                None => facts.and_then(|facts| facts.free_vessel_slots),
+            };
             let grants = kind.spec.grants.iter().map(|grant| grant.0.clone()).collect();
             let harnesses = facts
                 .map(|facts| {
@@ -416,8 +492,8 @@ impl ReadProjections<'_> {
                 harnesses,
                 toolchains: facts.map(|facts| facts.toolchains.clone()).unwrap_or_default(),
                 gui_session_logged_in: facts.map(|facts| facts.gui_session_logged_in),
-                free_vessel_slots: facts.and_then(|facts| facts.free_vessel_slots),
-                max_vessels: host_specs.get(&kind.spec.host_ref).and_then(|host| host.vessel_cap(&kind.spec.realisation)),
+                free_vessel_slots,
+                max_vessels,
                 image: facts.and_then(|facts| facts.image.as_ref().map(|image| image.image_ref.clone())),
             };
             rows.insert((row.host_ref.clone(), row.name.clone()), row);
@@ -485,10 +561,13 @@ impl ReadProjections<'_> {
                 }
             }
         }
-        // All fleet views select the freshest self-report when multiple origins name one host.
-        for (host, report) in replicated_host_reports(&resource_hosts.items, self.host_registry, &configured_by_node).await {
+        // All fleet views select the most recently followed self-report when multiple origins name one host.
+        let streams = self.fleet.change_streams(now);
+        for (host, report) in replicated_host_reports(&resource_hosts.items, self.host_registry, &configured_by_node, &streams).await {
             host_refs.insert(report.host_id, host.clone());
-            host_syncs.insert(host.clone(), report.last_synced_at);
+            if let Some(followed_at) = report.followed_at {
+                host_syncs.insert(host.clone(), followed_at);
+            }
             if let Some(status) = report.status {
                 statuses.entry(host).or_insert(status);
             }
@@ -596,19 +675,12 @@ impl ReadProjections<'_> {
                         .link(link)
                         .maybe_daemon_generation(daemon_generation)
                         .maybe_protocol_fingerprint(status.and_then(|status| status.protocol_fingerprint.clone()))
-                        .maybe_daemon_version(status.and_then(|status| status.daemon_version.clone()))
-                        .maybe_daemon_uptime_seconds(status.and_then(|status| {
-                            status.daemon_started_at.map(|started_at| now.signed_duration_since(started_at).num_seconds().max(0) as u64)
-                        }))
                         .maybe_heartbeat_at(heartbeat_at)
                         .maybe_replica_last_sync(if is_local { Some(now) } else { last_sync })
                         .maybe_replica_generation(replica_generation)
                         .crew_count(crew_count)
                         .convoy_count(convoys.len())
                         .surface_states(surface_states)
-                        .maybe_disk_free_bytes(status.and_then(|status| status.disk_free_bytes))
-                        .maybe_daemon_rss_bytes(status.and_then(|status| status.daemon_rss_bytes))
-                        .maybe_blob_sync(status.and_then(|status| status.blob_sync.clone()))
                         .sleep_inhibition(status.map(|status| status.sleep_inhibition.clone()).unwrap_or_default())
                         .staleness(staleness)
                         .observation_agreement(observation_agreement)
@@ -762,7 +834,11 @@ impl ReadProjections<'_> {
         if environment_id == &local_summary.environment_id && !self.host_registry.has_resource_description(environment_id).await {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
-        response.change_stream = self.fleet.change_streams().remove(&response.node.node_id);
+        response.change_stream = if &response.node.node_id == self.node_id {
+            self.fleet.serving()
+        } else {
+            self.fleet.change_streams(self.clock.now()).remove(&response.node.node_id)
+        };
         Ok(response)
     }
 
@@ -786,24 +862,20 @@ impl ReadProjections<'_> {
             .query_declared::<ResourceHost>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
             .await
             .map_err(|error| error.to_string())?;
-        let mut replicated_hosts = replicated_host_reports(&host_sources.items, self.host_registry, &HashMap::new())
+        let streams = self.fleet.change_streams(now);
+        let mut replicated_hosts = replicated_host_reports(&host_sources.items, self.host_registry, &HashMap::new(), &streams)
             .await
             .into_iter()
-            .map(|(host, report)| (host, (report.last_synced_at, report.status.and_then(|status| status.daemon_generation))))
+            .map(|(host, report)| (host, (report.followed_at, report.status.and_then(|status| status.daemon_generation))))
             .collect::<HashMap<_, _>>();
         let configured_hosts = self
             .config
             .load_hosts()
             .map(|hosts| hosts.hosts.into_iter().filter(|(_, host)| !host.ssh_host).collect::<HashMap<_, _>>())
             .unwrap_or_default();
-        let failures = self.fleet.replication_failures().await;
+        let failures = self.fleet.replication_failures(now);
         let mut replication_failures_by_host = HashMap::<HostName, Vec<ResourceReplicationFailure>>::new();
         for (peer, peer_failures) in failures {
-            // Source-local snapshot alarms belong to host status, not a remote
-            // replica row that would incorrectly mark this home's rows unreachable.
-            if &peer == self.node_id {
-                continue;
-            }
             let host = self.host_registry.host_name_for_node(&peer).await.unwrap_or_else(|| HostName::new(peer.as_str()));
             replication_failures_by_host
                 .entry(host)
@@ -814,14 +886,12 @@ impl ReadProjections<'_> {
             let host = HostName::new(remote.expected_host_name);
             let replication_failures = replication_failures_by_host.remove(&host).unwrap_or_default();
             let replication_error = format_resource_replication_failures(&replication_failures);
-            let source = replicated_hosts.remove(&host);
-            let (reachable, last_sync, generation, message) = match source {
-                Some((last_sync, generation)) => {
-                    (replica_sync_is_fresh(last_sync, now) && replication_error.is_none(), Some(last_sync), generation, replication_error)
-                }
+            let (last_sync, generation) = replicated_hosts.remove(&host).unwrap_or_default();
+            let (reachable, message) = match last_sync {
+                Some(last_sync) => (replica_sync_is_fresh(last_sync, now) && replication_error.is_none(), replication_error),
                 None => {
                     let unsynced = format!("replica source '{label}' has not synced yet");
-                    (false, None, None, join_replica_errors(Some(&unsynced), replication_error.as_deref()))
+                    (false, join_replica_errors(Some(&unsynced), replication_error.as_deref()))
                 }
             };
             replicas.push(FleetReplicaStatus { change_stream: None, host, reachable, last_sync, generation, message });
@@ -829,13 +899,17 @@ impl ReadProjections<'_> {
         for (host, (last_sync, generation)) in replicated_hosts {
             let replication_error =
                 replication_failures_by_host.remove(&host).and_then(|failures| format_resource_replication_failures(&failures));
+            let message = match last_sync {
+                Some(_) => replication_error,
+                None => join_replica_errors(Some("change stream not followed yet"), replication_error.as_deref()),
+            };
             replicas.push(FleetReplicaStatus {
                 change_stream: None,
                 host,
-                reachable: replica_sync_is_fresh(last_sync, now) && replication_error.is_none(),
-                last_sync: Some(last_sync),
+                reachable: last_sync.is_some_and(|last_sync| replica_sync_is_fresh(last_sync, now)) && message.is_none(),
+                last_sync,
                 generation,
-                message: replication_error,
+                message,
             });
         }
         for (host, failures) in replication_failures_by_host {
@@ -849,7 +923,7 @@ impl ReadProjections<'_> {
             });
         }
 
-        for (peer, state) in self.fleet.change_streams() {
+        for (peer, state) in streams {
             let host = self.host_registry.host_name_for_node(&peer).await.unwrap_or_else(|| HostName::new(peer.as_str()));
             // Health alone does not establish replica inventory or reachability.
             // Unmatched healthy homes retain resident health without creating a row.
@@ -919,7 +993,7 @@ impl ReadProjections<'_> {
         convoy: Option<&str>,
     ) -> Result<FleetListResponse, String> {
         let (reads, selected_project, matching) = self.fleet_inventory(namespace, project, crew_id, convoy).await?;
-        let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry).await?;
+        let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry, self.lifecycles).await?;
         let mut fleet = self.with_backend(&reads).fleet_list(namespace, rows, self.clock.now()).await?;
         if let Some(selected_project) = selected_project {
             fleet.rows.retain(|row| row.convoy_ref.as_ref().is_some_and(|reference| matching.contains(reference)));
@@ -982,24 +1056,28 @@ impl ReadProjections<'_> {
             .await
             .map_err(|error| error.to_string())?;
         let mut snapshot = project_ops::RequestSnapshot::new(&reads, namespace)?;
-        snapshot.copy::<ResourceTerminalSession>(&reads).await?;
-        snapshot.copy::<flotilla_resources::Environment>(&reads).await?;
+        let sessions = reads
+            .query_declared::<ResourceTerminalSession>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
+            .await
+            .map_err(|error| error.to_string())?;
+        // Only the crewed convoys, whose checkouts' authority the rows name: health reads no
+        // other Convoy body.
+        let crewed =
+            sessions.items.iter().filter_map(|session| session.object.metadata.labels.get(CONVOY_LABEL).cloned()).collect::<BTreeSet<_>>();
+        let convoys = if crewed.is_empty() {
+            flotilla_resources::ReadResourceList { items: Vec::new() }
+        } else {
+            reads.query_declared::<ResourceConvoy>(namespace, &StoreQuery::names(crewed, true)).await.map_err(|error| error.to_string())?
+        };
+        snapshot.insert::<ResourceTerminalSession>(sessions)?;
+        snapshot.insert::<ResourceConvoy>(convoys)?;
         snapshot.copy::<ResourceHost>(&reads).await?;
-        snapshot.copy::<ResourceCheckout>(&reads).await?;
         snapshot.copy::<Project>(&reads).await?;
         snapshot.copy::<flotilla_resources::FleetDesignation>(&reads).await?;
         snapshot.insert::<FulfilmentKind>(kinds)?;
         let reads = snapshot.finish();
-        let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry).await?;
-        let mut response = self.with_backend(&reads).fleet_health(namespace, host_list, rows, local_host_id, now).await?;
-        for host in hosts.items {
-            if let Some(value) = host.object.status.and_then(|status| status.capabilities.get("forge_budgets").cloned()) {
-                if let Ok(rows) = serde_json::from_value::<Vec<flotilla_protocol::ForgeBudgetRow>>(value) {
-                    response.forge_budgets.extend(rows);
-                }
-            }
-        }
-        Ok(response)
+        let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry, self.lifecycles).await?;
+        self.with_backend(&reads).fleet_health(namespace, host_list, rows, local_host_id, now).await
     }
 
     pub async fn fleet_inventory(
@@ -1009,7 +1087,7 @@ impl ReadProjections<'_> {
         crew_id: Option<&str>,
         convoy: Option<&str>,
     ) -> Result<(ResourceBackend, Option<String>, BTreeSet<String>), String> {
-        use flotilla_resources::{Environment, FleetDesignation, FLEET_DESIGNATION_NAME};
+        use flotilla_resources::{FleetDesignation, FLEET_DESIGNATION_NAME};
         let scoped = project.is_some() || crew_id.is_some() || convoy.is_some();
         let (scope, context) = if !scoped {
             // Every convoy participates in the full fleet address catalog.
@@ -1025,19 +1103,25 @@ impl ReadProjections<'_> {
             )
         } else {
             let context = if let Some(crew_id) = crew_id {
-                StoreQuery {
-                    include_replicas: true,
-                    ..StoreQuery::related_kind(
-                        "metadata.name",
-                        "TerminalSession",
-                        "spec.source.context.convoy",
-                        StoreQuery {
+                // The engine serves terminal sessions, so the crew's convoy is found from its
+                // session first: no store relation joins them.
+                let crew_sessions = self
+                    .backend
+                    .query_declared::<ResourceTerminalSession>(
+                        namespace,
+                        &StoreQuery {
                             fields: BTreeMap::from([("status.crew.id".into(), crew_id.into())]),
                             include_replicas: true,
                             ..Default::default()
                         },
                     )
-                }
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let convoys = crew_sessions.items.into_iter().filter_map(|source| match source.object.spec.source {
+                    TerminalSessionSource::Agent { context, .. } => Some(context.convoy),
+                    TerminalSessionSource::Tool { .. } => None,
+                });
+                StoreQuery::names(convoys, true)
             } else {
                 StoreQuery::names([convoy.ok_or("scope requires a convoy")?.to_string()], true)
             };
@@ -1052,9 +1136,20 @@ impl ReadProjections<'_> {
             }
             None => scope.clone(),
         };
-        let mut terminal_query = StoreQuery {
-            include_replicas: true,
-            ..StoreQuery::related_kind("metadata.labels.\"flotilla.work/convoy\"", "Convoy", "metadata.name", scope)
+        let convoys = self.backend.query_declared::<ResourceConvoy>(namespace, &convoy_query).await.map_err(|error| error.to_string())?;
+        let mut terminal_query = if scoped {
+            // The engine serves terminal sessions, so a session is selected by its convoy's name:
+            // no store relation joins them. Its scope's convoys are among those just read.
+            StoreQuery {
+                field_values: BTreeMap::from([(
+                    "metadata.labels.\"flotilla.work/convoy\"".into(),
+                    convoys.items.iter().map(|source| source.object.metadata.name.clone()).collect(),
+                )]),
+                include_replicas: true,
+                ..Default::default()
+            }
+        } else {
+            StoreQuery::default()
         };
         if !scoped {
             // A full fleet lists every local and replicated session.
@@ -1073,14 +1168,6 @@ impl ReadProjections<'_> {
         }
         let sessions =
             self.backend.query_declared::<ResourceTerminalSession>(namespace, &terminal_query).await.map_err(|error| error.to_string())?;
-        let sessions = flotilla_resources::ReadResourceList {
-            items: sessions
-                .items
-                .iter()
-                .map(|source| flotilla_resources::terminal_launches::read_source(self.lifecycles, source).map(|(source, _)| source))
-                .collect::<Result<_, _>>()?,
-        };
-        let convoys = self.backend.query_declared::<ResourceConvoy>(namespace, &convoy_query).await.map_err(|error| error.to_string())?;
         let context_convoy = if !scoped || project.is_some() {
             None
         } else if let Some(crew_id) = crew_id {
@@ -1110,38 +1197,20 @@ impl ReadProjections<'_> {
                         .object
                         .spec
                         .project_ref
-                        .clone()
-                        .ok_or_else(|| format!("crew convoy `{name}` has no project"))?,
+                        .clone(),
                 )
             }
         };
         let matching = convoys
             .items
             .iter()
-            .filter(|source| selected_project.as_deref().is_none_or(|project| source.object.spec.project_ref.as_deref() == Some(project)))
+            .filter(|source| selected_project.as_deref().is_none_or(|project| source.object.spec.project_ref == project))
             .map(|source| source.object.metadata.name.clone())
             .collect::<BTreeSet<_>>();
-        let environments = self
-            .backend
-            .query_declared::<Environment>(
-                namespace,
-                &StoreQuery::names(sessions.items.iter().map(|source| source.object.spec.env_ref.clone()), false),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut host_names = environments
-            .items
-            .iter()
-            .filter_map(|source| {
-                source
-                    .object
-                    .spec
-                    .host_direct
-                    .as_ref()
-                    .map(|spec| spec.host_ref.clone())
-                    .or_else(|| source.object.spec.docker.as_ref().map(|spec| spec.host_ref.clone()))
-            })
-            .collect::<BTreeSet<_>>();
+        let mut host_names =
+            crate::fleet::environment_hosts(self.lifecycles, sessions.items.iter().map(|source| source.object.spec.env_ref.as_str()))?
+                .into_values()
+                .collect::<BTreeSet<_>>();
         let summary = self.host_registry.local_host_summary().await;
         if let Some(host) = summary.environment_id.host_id() {
             host_names.insert(host.to_string());
@@ -1174,20 +1243,6 @@ impl ReadProjections<'_> {
             )
             .await
             .map_err(|error| error.to_string())?;
-        let checkouts = self
-            .backend
-            .query_declared::<ResourceCheckout>(
-                namespace,
-                &StoreQuery {
-                    field_values: BTreeMap::from([(
-                        "metadata.labels.\"flotilla.work/convoy\"".into(),
-                        matching.clone().into_iter().collect(),
-                    )]),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
         // The graph is also the fleet-designation projection's complete catalog.
         let projects = project_ops::read_definition_catalog::<Project>(self.backend, namespace).await?;
         let fleet = self
@@ -1199,9 +1254,7 @@ impl ReadProjections<'_> {
         let mut snapshot = project_ops::RequestSnapshot::new(self.backend, namespace)?;
         snapshot.insert::<ResourceTerminalSession>(sessions)?;
         snapshot.insert::<ResourceConvoy>(convoys)?;
-        snapshot.insert::<Environment>(environments)?;
         snapshot.insert::<ResourceHost>(hosts)?;
-        snapshot.insert::<ResourceCheckout>(checkouts)?;
         snapshot.insert_definitions::<Project>(projects)?;
         snapshot.insert_definitions::<FleetDesignation>(fleet)?;
         Ok((snapshot.finish(), selected_project, matching))
@@ -1217,8 +1270,11 @@ impl ReadProjections<'_> {
         namespace: &str,
         name: &str,
     ) -> Result<(ConvoyExplanation, ResourceObject<ResourceConvoy>), String> {
-        // The one convoy lookup (#4272): the address's role in its project, or its record.
-        let convoy_name = flotilla_store::ConvoyName::parse(name);
+        // The one convoy lookup (#4272): the address's role in its project, or its record. A plain
+        // name names its role in the one project holding it, a retired launch's included (run 3 F6).
+        let typed = flotilla_store::ConvoyName::parse(name);
+        let project = typed.placed(self.backend, namespace).await?;
+        let convoy_name = flotilla_store::ConvoyName { project: project.as_deref(), name: typed.name };
         let selected_query = convoy_name.query();
         let mut linked = Vec::new();
         for target in ["spec.subjects.*.subject", "status.subjects.*.subject"] {
@@ -1226,15 +1282,21 @@ impl ReadProjections<'_> {
                 linked.push(StoreQuery::related(target, source, selected_query.clone()));
             }
         }
-        // Select candidate identities and linked landed evidence in one indexed
-        // operation; `ConvoyName::select` owns the role, record and ambiguity rules.
-        let convoy_sources = self
+        // The live generations of the standing role a candidate was ensured from, so the receiver
+        // evidence can tell whether it is that role's current generation.
+        let ensured_from = format!("metadata.annotations.\"{}\"", flotilla_resources::ENSURED_FROM_ANNOTATION);
+        let mut generations = flotilla_store::live_convoys_query();
+        generations.field_matches_query = StoreQuery::related(&ensured_from, &ensured_from, selected_query.clone()).field_matches_query;
+        // Select candidate identities, their roles' live generations and linked landed evidence in
+        // one indexed operation; `ConvoyName::select` owns the role, record and ambiguity rules.
+        let mut convoy_sources = self
             .backend
             .query_declared::<ResourceConvoy>(
                 namespace,
                 &StoreQuery {
                     any_of: Some(vec![
                         selected_query,
+                        generations,
                         StoreQuery {
                             fields: BTreeMap::from([("status.phase".into(), "Landed".into())]),
                             any_of: (!linked.is_empty()).then_some(linked),
@@ -1247,10 +1309,35 @@ impl ReadProjections<'_> {
             )
             .await
             .map_err(|error| error.to_string())?;
+        // A retired record leaves the indexed selection; it still reads by name.
+        if convoy_name.select(&convoy_sources.items)?.is_none() {
+            let named = self
+                .backend
+                .including_replicas::<ResourceConvoy>(namespace)
+                .get_all(convoy_name.name)
+                .await
+                .map_err(|error| error.to_string())?;
+            convoy_sources.items.extend(named.items);
+        }
+        // A plain name whose launches have all retired names its newest one.
+        if convoy_name.select(&convoy_sources.items)?.is_none() {
+            convoy_sources.items.extend(convoy_name.newest_launch(self.backend, namespace).await?);
+        }
         let convoy_source = convoy_name.select(&convoy_sources.items)?.ok_or_else(|| format!("no convoy matches `{convoy_name}`"))?;
-        // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8).
-        let convoy = flotilla_resources::convoy::engine::viewed_read(self.convoy_engine, convoy_source)?;
-        let now = self.clock.now();
+        // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8),
+        // with what its log records of them.
+        let convoy = flotilla_resources::convoy::engine::recorded_read(self.convoy_engine, convoy_source)?;
+        // What holds the launch from retiring, read at its home where the engine holds it (#3108).
+        let held_by = match convoy.status.as_ref().and_then(|status| status.engine_launch.as_ref()) {
+            Some(launch) => {
+                let home = match &convoy_source.provenance {
+                    ResourceProvenance::Local => None,
+                    ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str()),
+                };
+                self.lifecycles.convoys()?.holds(launch, home)?.map(explained_holds)
+            }
+            None => None,
+        };
         let (receivers, project, receiver_aliases) =
             convoy_receiver_evidence(self.message_receivers, self.backend, namespace, &convoy_sources.items, &convoy).await?;
         let repositories = self
@@ -1287,7 +1374,7 @@ impl ReadProjections<'_> {
             repositories.items.iter().map(|record| (record.object.spec.key(), &record.object.spec)).collect::<HashMap<_, _>>();
         let reference_context = flotilla_resources::convoy_reference_context(
             &convoy.spec.repositories,
-            convoy.spec.project_ref.as_deref(),
+            Some(&convoy.spec.project_ref),
             project.as_ref().map(|project| &project.spec),
             &forges,
             |key| repository_specs.get(key).copied(),
@@ -1295,17 +1382,16 @@ impl ReadProjections<'_> {
         let subjects = convoy_subject_rows(&convoy, &reference_context);
         let change_request_stale_after = self.leaf_subscriptions.change_request_stale_after();
 
-        let checkout_sources = self
-            .backend
-            .query_declared::<ResourceCheckout>(
-                namespace,
-                &StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone())]), true, true),
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .items;
-        let selected_checkout_sources = flotilla_resources::select_convoy_child_sources(&convoy, &checkout_sources);
-        let selected_checkouts = selected_checkout_sources.iter().map(|(name, source)| (name.clone(), source.object.clone())).collect();
+        // The convoy's checkouts as the engine holds them, across homes (#3108).
+        let selected_checkouts = match flotilla_resources::convoy::engine::checkout_holder(&convoy) {
+            Some(holder) => self.lifecycles.checkouts()?.held(&holder).map(latest_launches)?,
+            None => BTreeMap::new(),
+        };
+        // Its vessel launches, ended or not: their ends discharge an unread checkout.
+        let launch_vessels = match &convoy.status {
+            Some(status) if status.engine_launch.is_some() => self.lifecycles.vessels()?.of_convoy(&convoy.metadata.name)?,
+            _ => Vec::new(),
+        };
         let vessel_sources = self
             .backend
             .query_declared::<Vessel>(
@@ -1316,34 +1402,17 @@ impl ReadProjections<'_> {
             .map_err(|error| error.to_string())?
             .items;
         let selected_vessels = flotilla_resources::select_convoy_children(&convoy, &vessel_sources);
-        let expected = expected_checkout_refs(&convoy).map_err(|error| format!("derive expected checkouts: {error}"))?;
-        let checkouts = expected
+        let expected = expected_checkout_refs(&convoy, selected_checkouts.keys().map(String::as_str));
+        // A worktree's clone is read at the checkout's home, which also holds the clone.
+        let checkout_clones = expected
             .iter()
-            .map(|checkout_name| {
-                let source = selected_checkout_sources.get(checkout_name);
-                let selected = source.map(|source| &source.object);
-                let provenance = source.map(|source| explained_provenance(&source.provenance, self.node_id));
-                // One keyed engine read per checkout, at the checkout's home.
-                let lifecycle = source
-                    .map(|source| {
-                        let origin = match &source.provenance {
-                            flotilla_resources::ResourceProvenance::Local => None,
-                            flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
-                        };
-                        self.lifecycles.try_reading(crate::ports::ProvisioningKind::Checkout, checkout_name, origin.as_deref())
-                    })
-                    .transpose()?
-                    .flatten();
-                let integration = selected.and_then(|checkout| checkout.status.as_ref()).map(|status| &status.integration);
-                Ok(ExplainedCheckout {
-                    name: checkout_name.clone(),
-                    observed: selected.is_some(),
-                    provenance,
-                    clean: integration.map(|status| explain_condition(&status.clean, now, LANDING_EVIDENCE_TTL)),
-                    pushed: integration.map(|status| explain_condition(&status.pushed, now, LANDING_EVIDENCE_TTL)),
-                    landed: integration.map(|status| explain_condition(&status.landed, now, LANDING_EVIDENCE_TTL)),
-                    lifecycle,
-                })
+            .map(|checkout_name| match selected_checkouts.get(checkout_name).map(|checkout| (&checkout.spec, checkout.home.as_str())) {
+                Some((flotilla_resources::CheckoutSpec::Worktree(spec), home)) => Ok(self
+                    .lifecycles
+                    .clones()?
+                    .get(&spec.clone_ref, Some(home))?
+                    .map(|clone| ExplainedClone { name: clone.name, reading: clone.reading })),
+                _ => Ok(None),
             })
             .collect::<Result<Vec<_>, String>>()?;
 
@@ -1380,6 +1449,48 @@ impl ReadProjections<'_> {
             .await
             .map_err(|error| error.to_string())?
             .items;
+        // Evidence is aged against a clock read after every read of it: a value confirmed as it
+        // is read must not appear to come from the future.
+        // A checkout's held release, as teardown's open attention about it at its home tells it.
+        let holds: BTreeMap<(String, String), ExplainedHold> = self
+            .attentions
+            .open(namespace, Some(Sender::Teardown), None)
+            .await?
+            .into_iter()
+            .filter_map(|open| match open.subject {
+                attentions::Subject::Checkout { host, checkout } => {
+                    Some(((host, checkout), ExplainedHold { reason: open.reason, since: open.raised_at }))
+                }
+                _ => None,
+            })
+            .collect();
+        let now = self.clock.now();
+        let checkouts = expected
+            .iter()
+            .zip(checkout_clones)
+            .map(|(checkout_name, clone)| {
+                let selected = selected_checkouts.get(checkout_name);
+                let held = selected.and_then(|checkout| holds.get(&(checkout.home.clone(), checkout_name.clone())).cloned());
+                let integration = selected.and_then(|checkout| checkout.integration.as_ref());
+                let explain = |value: fn(&flotilla_resources::checkout_records::Inspection) -> (Option<bool>, &Vec<String>)| {
+                    integration.map(|integration| {
+                        let (judged, details) = value(&integration.inspection);
+                        explain_judgement(judged, details, integration, now, LANDING_EVIDENCE_TTL)
+                    })
+                };
+                ExplainedCheckout {
+                    name: checkout_name.clone(),
+                    observed: selected.is_some(),
+                    provenance: selected.map(|checkout| checkout_provenance(checkout, self.node_id)),
+                    clean: explain(|inspection| (inspection.clean, &inspection.clean_details)),
+                    pushed: explain(|inspection| (inspection.pushed, &inspection.pushed_details)),
+                    landed: explain(|inspection| (inspection.landed, &inspection.landed_details)),
+                    lifecycle: selected.map(|checkout| checkout.reading.clone()),
+                    clone,
+                    held,
+                }
+            })
+            .collect::<Vec<_>>();
         let selected_change_requests =
             flotilla_resources::select_change_request_sources(change_request_sources.iter().map(|source| (&source.object, source)));
         let change_request_objects = selected_change_requests
@@ -1452,14 +1563,31 @@ impl ReadProjections<'_> {
 
         let evaluation = evaluate_landing_settlement(
             &convoy,
-            &selected_vessels,
             &selected_checkouts,
+            &launch_vessels,
             &change_request_objects,
             &forges,
             change_request_stale_after,
             LANDING_EVIDENCE_TTL,
             now,
         );
+        let discharged = evaluation
+            .discharged
+            .into_iter()
+            .map(|discharge| ExplainedDischarge {
+                expectation: explain_unmet_expectation(discharge.expectation),
+                ended_vessels: discharge
+                    .ended_vessels
+                    .into_iter()
+                    .map(|vessel| ExplainedEndedVessel {
+                        launch: vessel.launch,
+                        reading: vessel.reading,
+                        reason: vessel.reason,
+                        ended_at: vessel.ended_at.to_rfc3339(),
+                    })
+                    .collect(),
+            })
+            .collect();
         let mut unmet = evaluation.unmet.into_iter().map(explain_unmet_expectation).collect::<Vec<_>>();
         unmet.extend(observation_errors.iter().map(|(record, error)| ExplainedUnmetExpectation {
             reason: "observation_error".to_string(),
@@ -1475,7 +1603,9 @@ impl ReadProjections<'_> {
             }
             .to_string(),
             satisfied: evaluation.satisfied,
+            disposition: convoy.status.as_ref().and_then(|status| status.disposition.clone()),
             unmet,
+            discharged,
         };
 
         let subscriptions = self
@@ -1500,14 +1630,33 @@ impl ReadProjections<'_> {
             })
             .collect();
 
-        let selected_sessions_readings = receivers
-            .terminals()
-            .iter()
-            .map(|source| flotilla_resources::terminal_launches::read_source(self.lifecycles, source).map(|(source, _)| source))
-            .collect::<Result<Vec<_>, _>>()?;
-        let observed_sessions = selected_sessions_readings.as_slice();
+        let observed_sessions = receivers.terminals();
         let unclaimed_work = explained_unclaimed_work(convoy.status.as_ref(), observed_sessions, name);
         let selected_sessions = flotilla_resources::select_convoy_children(&convoy, observed_sessions);
+        // Each queued turn's Message: its delivery evidence says whether the turn arrived.
+        let mut queued_messages = BTreeMap::new();
+        for message_id in
+            convoy.status.iter().flat_map(|status| &status.turn_deliveries).flat_map(|(_, delivery)| &delivery.episodes).filter_map(
+                |episode| match &episode.outcome {
+                    flotilla_resources::TurnDeliveryOutcome::Queued { message_id, .. } => Some(message_id),
+                    _ => None,
+                },
+            )
+        {
+            let message = match receivers.messages() {
+                Some(messages) => {
+                    messages.iter().find(|message| message.object.metadata.name == *message_id).map(|message| message.object.clone())
+                }
+                None => match self.backend.including_replicas::<flotilla_resources::Message>(namespace).get(message_id).await {
+                    Ok(message) => Some(message.object),
+                    Err(flotilla_resources::ResourceError::NotFound { .. }) => None,
+                    Err(error) => return Err(error.to_string()),
+                },
+            };
+            if let Some(message) = message {
+                queued_messages.insert(message_id.clone(), message);
+            }
+        }
         let queued_turns = convoy
             .status
             .as_ref()
@@ -1521,7 +1670,7 @@ impl ReadProjections<'_> {
                         return None;
                     };
                     let session = flotilla_resources::queued_turn_session(&selected_sessions, vessel, role);
-                    let (confirmed, blocking_reason) = flotilla_resources::queued_turn_evidence(session, message_id);
+                    let (confirmed, blocking_reason) = flotilla_resources::queued_turn_evidence(queued_messages.get(message_id), session);
                     // A receipt can arrive between health ticks; explain must not call it blocked.
                     if confirmed {
                         return None;
@@ -1561,59 +1710,10 @@ impl ReadProjections<'_> {
                 // field explicit so recorded rungs appear without inventing
                 // one from session liveness or message delivery.
                 last_delivery_rung: None,
-                sender: match &source.object.spec.source {
-                    TerminalSessionSource::Agent { message: Some(message), .. } if message.sender != CrewMessageSender::Unknown => {
-                        Some(flotilla_resources::legacy_message_sender(&message.sender).0)
-                    }
-                    _ => None,
-                },
-                pending_briefs: match &source.object.spec.source {
-                    TerminalSessionSource::Agent { message: Some(message), .. } => message
-                        .pending_after(source.object.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()))
-                        .into_iter()
-                        .filter(|message| {
-                            matches!(message.sender, CrewMessageSender::OperatorResume { .. } | CrewMessageSender::OperatorFollowUp { .. })
-                        })
-                        .map(|message| message.text.clone())
-                        .collect(),
-                    _ => Vec::new(),
-                },
-                delivered_message_id: source.object.status.and_then(|status| status.delivered_message_id),
             })
             .collect::<Vec<_>>();
         crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));
 
-        let recent_events = match EventRecorder::new(self.backend.clone())
-            .recent_matching_label(namespace, CONVOY_LABEL, &convoy.metadata.name, Utc::now())
-            .await
-        {
-            Ok(events) => events
-                .into_iter()
-                .map(|event| ExplainedEvent {
-                    reason: event.spec.reason,
-                    message: event.spec.message,
-                    count: event.spec.count,
-                    first_seen: event.spec.first_seen.to_rfc3339(),
-                    last_seen: event.spec.last_seen.to_rfc3339(),
-                })
-                .collect(),
-            Err(error) => {
-                warn!(convoy = %name, %error, "failed to enrich convoy explanation with recent events");
-                Vec::new()
-            }
-        };
-
-        let lifecycle_mutations = convoy
-            .status
-            .as_ref()
-            .into_iter()
-            .flat_map(|status| &status.lifecycle_mutations)
-            .map(|mutation| flotilla_protocol::ExplainedLifecycleMutation {
-                action: mutation.action.clone(),
-                caller: mutation.caller.clone(),
-                at: mutation.at.to_rfc3339(),
-            })
-            .collect();
         let pinned_workflow = self
             .backend
             .definitions::<WorkflowTemplate>(namespace)
@@ -1658,7 +1758,7 @@ impl ReadProjections<'_> {
             .collect::<Vec<_>>();
         artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));
 
-        let (messages, held) = message_evidence(self.backend, namespace, receivers.as_ref(), Some(&convoy), &receiver_aliases).await?;
+        let messages = message_views(self.backend, namespace, receivers.as_ref(), Some(&convoy), &receiver_aliases).await?;
         let mut warnings: Vec<_> = convoy.spec.issues.iter().flat_map(|issue| issue.placement_needs().1).collect();
         let mut host_names = selected_vessels
             .values()
@@ -1678,19 +1778,10 @@ impl ReadProjections<'_> {
         }
         // Sessions can predate placement evidence. Include their realized
         // environment hosts, without attributing an unrelated host's failure.
-        let environments = self
-            .backend
-            .query_declared::<flotilla_resources::Environment>(
-                namespace,
-                &StoreQuery::names(selected_sessions.values().map(|session| session.spec.env_ref.clone()), true),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        for environment in environments.items {
-            if let Some(host) = crate::fleet::resource_environment_host_ref(&environment.object) {
-                host_names.insert(host.to_string());
-            }
-        }
+        host_names.extend(
+            crate::fleet::environment_hosts(self.lifecycles, selected_sessions.values().map(|session| session.spec.env_ref.as_str()))?
+                .into_values(),
+        );
         warnings.extend(message_controller_warnings(self.backend, namespace, host_names).await?);
         warnings.sort();
         warnings.dedup();
@@ -1746,18 +1837,7 @@ impl ReadProjections<'_> {
                 .map(|cascade| serde_json::to_value(cascade).expect("serialize cascade")),
 
             messages,
-            held_deliveries: held
-                .into_iter()
-                .map(|batch| flotilla_protocol::commands::ExplainedHeldDelivery {
-                    description: batch.describe(namespace),
-                    clear_command: batch.clear_command(namespace),
-                    batch: batch.batch,
-                    receiver: batch.receiver,
-                    members: batch.members,
-                    reason: batch.reason,
-                })
-                .collect(),
-            environment_observations: convoy.status.as_ref().map(|status| status.environment_observations.clone()).unwrap_or_default(),
+            environment_observations: self.environment_observations(&convoy),
             skills: convoy
                 .status
                 .as_ref()
@@ -1779,6 +1859,7 @@ impl ReadProjections<'_> {
                 .unwrap_or_default(),
             namespace: namespace.to_string(),
             convoy: name.to_string(),
+            role: convoy.spec.role.clone(),
             phase: convoy.status.as_ref().map_or_else(|| "Unknown".to_string(), |status| format!("{:?}", status.phase)),
             role_needs: role_vessels
                 .iter()
@@ -1806,12 +1887,14 @@ impl ReadProjections<'_> {
                 .into_iter()
                 .map(|(vessel, pin)| (vessel, pin.decision))
                 .collect(),
-            stalled: convoy
+            stalls: convoy
                 .status
-                .as_ref()
-                .and_then(|status| status.stalled.as_ref())
-                .and_then(|condition| serde_json::to_value(condition).ok()),
+                .iter()
+                .flat_map(|status| &status.stalls)
+                .filter_map(|condition| serde_json::to_value(condition).ok())
+                .collect(),
             message: convoy.status.as_ref().and_then(|status| status.message.clone()),
+            held_by,
             evidence_ttl_seconds: LANDING_EVIDENCE_TTL.as_secs(),
             change_request_stale_after_seconds: change_request_stale_after.as_secs(),
             checkouts,
@@ -1825,10 +1908,8 @@ impl ReadProjections<'_> {
             decision_ledgers,
             artifacts,
             settlement,
-            recent_events,
-            lifecycle_mutations,
             account_bindings: account_binding_evidence(self.accounts, namespace, &convoy.metadata.name).await?,
-            access_deliveries: access_delivery_evidence(self.backend, namespace, &convoy.metadata.name).await?,
+            access_deliveries: access_delivery_evidence(self.backend, self.lifecycles, namespace, &convoy.metadata.name).await?,
         };
         Ok((explanation, convoy))
     }
@@ -1898,7 +1979,6 @@ pub fn explained_decision_ledgers(
                         projection_error: None,
                         comment_url: superseded.decision_ledger_ref.clone(),
                         missing: superseded.decision_ledger_ref.is_none(),
-                        override_principal: superseded.completion_override.as_ref().map(|override_| override_.principal.clone()),
                         completed_while_crew_active: superseded.completed_while_crew_active,
                         message: superseded.message.clone(),
                         superseded: true,
@@ -1942,7 +2022,6 @@ pub fn explained_decision_ledgers(
                         projection_error,
                         comment_url,
                         missing: artifact.is_none(),
-                        override_principal: claim.completion_override.as_ref().map(|override_| override_.principal.clone()),
                         completed_while_crew_active: claim.completed_while_crew_active,
                         message: claim.message.clone(),
                         superseded: false,
@@ -1979,6 +2058,7 @@ pub fn explain_subject_observation(
         subject: subject.clone(),
         state: field(KEY_CHANGE_REQUEST_STATE, KEY_CHANGE_REQUEST_STATE_OBSERVED_AT),
         checks: field(KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT),
+        mergeable: field(KEY_CHANGE_REQUEST_MERGEABLE, KEY_CHANGE_REQUEST_MERGEABLE_OBSERVED_AT),
         review: field(KEY_CHANGE_REQUEST_REVIEW_DECISION, KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT),
         review_actionable_at_head: field(
             KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD,
@@ -2002,8 +2082,8 @@ pub async fn convoy_receiver_evidence(
     convoys: &[ReadResourceObject<ResourceConvoy>],
     convoy: &ResourceObject<ResourceConvoy>,
 ) -> Result<(Box<dyn MessageReceiverRead>, Option<ResourceObject<Project>>, BTreeSet<String>), String> {
-    use flotilla_resources::{ConvoyEnsure, CrewDefaults, FleetDesignation, FLEET_DESIGNATION_NAME, ROLE_ADDRESS_ANNOTATION};
-    let project_name = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+    use flotilla_resources::{CrewDefaults, FleetDesignation, FLEET_DESIGNATION_NAME, ROLE_ADDRESS_ANNOTATION};
+    let project_name = convoy.spec.project_ref.as_str();
     let target = StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone())]), true, true);
     let terminals = backend
         .query_declared::<ResourceTerminalSession>(
@@ -2023,34 +2103,14 @@ pub async fn convoy_receiver_evidence(
         )
         .await
         .map_err(|error| error.to_string())?;
-    let ensures = backend
-        .query_declared::<ConvoyEnsure>(
-            namespace,
-            &StoreQuery {
-                fields: BTreeMap::from([("spec.project_ref".into(), project_name.into())]),
-                include_replicas: true,
-                ..StoreQuery::related(
-                    "spec.role",
-                    "spec.role",
-                    StoreQuery {
-                        fields: BTreeMap::from([
-                            ("status.convoy_ref".into(), convoy.metadata.name.clone()),
-                            ("spec.project_ref".into(), project_name.into()),
-                        ]),
-                        include_replicas: true,
-                        ..Default::default()
-                    },
-                )
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut aliases = ensures
-        .items
-        .iter()
-        .filter(|ensure| ensure.object.status.as_ref().and_then(|status| status.convoy_ref.as_deref()) == Some(&convoy.metadata.name))
-        .map(|ensure| format!("{}/{}", ensure.object.spec.project_ref, ensure.object.spec.role))
-        .collect::<BTreeSet<_>>();
+    // The standing role this convoy is the current generation of: its project's role address is
+    // an alias. `convoys` holds the role's live generations.
+    let current = convoy.metadata.annotations.get(flotilla_resources::ENSURED_FROM_ANNOTATION).and_then(|ensure| {
+        flotilla_store::newest_live_generations(convoys.iter().map(|source| &source.object))
+            .remove(ensure)
+            .filter(|generation| generation.metadata.name == convoy.metadata.name)
+    });
+    let mut aliases = current.into_iter().map(|generation| format!("{project_name}/{}", generation.spec.role)).collect::<BTreeSet<_>>();
     aliases.extend(
         terminals
             .items
@@ -2064,14 +2124,10 @@ pub async fn convoy_receiver_evidence(
     let projects = if adopted {
         project_ops::read_definition_catalog::<Project>(backend, namespace).await?
     } else {
-        match &convoy.spec.project_ref {
-            Some(name) => backend.definitions::<Project>(namespace).list_names([name.clone()]).await.map_err(|error| error.to_string())?,
-            None => Vec::new(),
-        }
+        backend.definitions::<Project>(namespace).list_names([convoy.spec.project_ref.clone()]).await.map_err(|error| error.to_string())?
     };
     let project = projects.iter().find(|project| project.metadata.name == project_name).cloned();
     let mut snapshot = project_ops::RequestSnapshot::new(backend, namespace)?;
-    snapshot.insert(ensures)?;
     snapshot.insert_definitions(projects)?;
     if adopted {
         let fleet = backend
@@ -2084,26 +2140,19 @@ pub async fn convoy_receiver_evidence(
         let defaults = project_ops::read_definition_catalog::<CrewDefaults>(backend, namespace).await?;
         snapshot.insert_definitions(defaults)?;
     }
-    let receivers = loader.load(&snapshot.finish(), namespace, convoys.to_vec(), terminals.items).await?;
+    // The messages this convoy's view reads: those to its crew seats and aliases, and the turns
+    // its status names.
+    let seats = flotilla_resources::convoy_crew_seats(convoy).into_iter().chain(aliases.iter().cloned()).collect::<Vec<_>>();
+    let named = flotilla_resources::convoy_seat_turns(convoy);
+    let receivers = loader.load(&snapshot.finish(), namespace, convoys.to_vec(), terminals.items, &seats, &named).await?;
     Ok((receivers, project, aliases))
-}
-
-/// Select the active inbox and receiver candidates before decoding; resolve
-/// their holders purely against the request's shared evidence.
-pub async fn message_views(
-    backend: &flotilla_store::ResourceBackend,
-    namespace: &str,
-    receivers: &dyn MessageReceiverRead,
-    convoy: Option<&flotilla_resources::ResourceObject<ResourceConvoy>>,
-    aliases: &BTreeSet<String>,
-) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
-    Ok(message_evidence(backend, namespace, receivers, convoy, aliases).await?.0)
 }
 
 /// What the access layer delivered for a convoy's crews (#3964): per access and place, the
 /// home, each need's mechanism and digest, and a failed delivery's retry.
 pub async fn access_delivery_evidence(
     backend: &ResourceBackend,
+    lifecycles: &dyn crate::ports::LifecycleReads,
     namespace: &str,
     convoy: &str,
 ) -> Result<Vec<flotilla_protocol::ExplainedAccessDelivery>, String> {
@@ -2119,14 +2168,14 @@ pub async fn access_delivery_evidence(
         )
         .await
         .map_err(|error| format!("read access deliveries: {error}"))?;
-    let environments = backend.including_replicas::<flotilla_resources::Environment>(namespace);
+    let environments = lifecycles.environments().ok();
     let mut connections = BTreeMap::new();
     for record in &records.items {
         let place = &record.object.spec.place;
         if !connections.contains_key(place) {
             // A place whose Environment is gone or unreadable simply reports no connection.
-            let connection = environments.get(place).await.ok().and_then(|environment| {
-                environment.object.status.and_then(|status| status.provider_descriptor).and_then(|descriptor| descriptor.agent_connection)
+            let connection = environments.and_then(|environments| environments.find(place).ok().flatten()).and_then(|environment| {
+                environment.launch.and_then(|launch| launch.provider_descriptor).and_then(|descriptor| descriptor.agent_connection)
             });
             connections.insert(place.clone(), connection);
         }
@@ -2234,21 +2283,22 @@ pub async fn account_binding_evidence(
     Ok(explained)
 }
 
-/// [`message_views`], with the held batches among the same Messages (#3455).
-pub async fn message_evidence(
+/// Select the active inbox and receiver candidates before decoding; resolve
+/// their holders purely against the request's shared evidence.
+pub async fn message_views(
     backend: &flotilla_store::ResourceBackend,
     namespace: &str,
     receivers: &dyn MessageReceiverRead,
     convoy: Option<&flotilla_resources::ResourceObject<ResourceConvoy>>,
     aliases: &BTreeSet<String>,
-) -> Result<(Vec<flotilla_protocol::query::CrewMessageView>, Vec<flotilla_resources::HeldMessageBatch>), String> {
+) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
     let any_of = convoy
         .map(|convoy| {
             vec![
                 StoreQuery {
                     field_prefixes: BTreeMap::from([(
                         "spec.receiver".into(),
-                        format!("{}/{}/", convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy.metadata.name),
+                        flotilla_resources::crew_convoy_prefix(&convoy.spec.project_ref, &convoy.metadata.name),
                     )]),
                     ..Default::default()
                 },
@@ -2265,7 +2315,7 @@ pub async fn message_evidence(
             .filter(|record| record.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
             .filter(|record| {
                 convoy.is_none_or(|convoy| {
-                    let prefix = format!("{}/{}/", convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy.metadata.name);
+                    let prefix = flotilla_resources::crew_convoy_prefix(&convoy.spec.project_ref, &convoy.metadata.name);
                     record.object.spec.receiver.starts_with(&prefix) || aliases.contains(&record.object.spec.receiver)
                 })
             })
@@ -2288,19 +2338,13 @@ pub async fn message_evidence(
         }
     };
     if let Some(convoy) = convoy {
-        records.retain(|record| {
-            receivers.may_address_convoy(
-                &record.object.spec.receiver,
-                convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-                &convoy.metadata.name,
-            )
-        });
+        records
+            .retain(|record| receivers.may_address_convoy(&record.object.spec.receiver, &convoy.spec.project_ref, &convoy.metadata.name));
     }
     records.sort_by_key(|record| {
         (record.object.metadata.creation_timestamp, record.object.status.as_ref().and_then(|status| status.accepted_sequence))
     });
     let mut views = Vec::new();
-    let mut shown = Vec::new();
     for source in records {
         let message = source.object;
         // A diagnostic view shows an unresolvable receiver beside the Message
@@ -2313,23 +2357,23 @@ pub async fn message_evidence(
             let terminal = holder.object;
             let convoy = terminal.metadata.labels.get(flotilla_resources::CONVOY_LABEL)?;
             let vessel = terminal.metadata.labels.get(flotilla_resources::VESSEL_LABEL)?;
-            Some(format!("{}/{convoy}/{vessel}/{}", message.spec.receiver.split('/').next()?, terminal.spec.role))
+            Some(flotilla_resources::crew_role_address(message.spec.receiver.split('/').next()?, convoy, vessel, &terminal.spec.role))
         });
         if let Some(convoy) = convoy {
-            let direct = message.spec.receiver.split('/').collect::<Vec<_>>();
-            let is_direct = matches!(direct.as_slice(), [_, name, _, _] if *name == convoy.metadata.name);
+            let names_convoy = |address: &str| {
+                flotilla_resources::parse_crew_role_address(address).is_some_and(|(_, name, _, _)| name == convoy.metadata.name)
+            };
+            // A standing role's alias names this convoy while it is the role's current generation,
+            // which is how `aliases` was chosen; no terminal holds it.
+            let is_direct = names_convoy(&message.spec.receiver) || aliases.contains(&message.spec.receiver);
             // An unresolvable receiver has no holder to confirm the convoy, so
             // keep it on the evidence `may_address_convoy` already required: a
             // four-part address naming this convoy, or a role declaration or
             // terminal claim pointing at it. Hiding it would hide the ambiguity.
-            if !is_direct
-                && receiver_error.is_none()
-                && !current_receiver.as_deref().is_some_and(|receiver| receiver.split('/').nth(1) == Some(convoy.metadata.name.as_str()))
-            {
+            if !is_direct && receiver_error.is_none() && !current_receiver.as_deref().is_some_and(names_convoy) {
                 continue;
             }
         }
-        shown.push(message.clone());
         let status = message.status.unwrap_or_default();
         let receiver = status.resolved_receiver.as_ref();
         views.push(flotilla_protocol::query::CrewMessageView {
@@ -2348,11 +2392,21 @@ pub async fn message_evidence(
             session: receiver.map(|receiver| receiver.session.clone()),
         });
     }
-    Ok((views, flotilla_resources::HeldMessageBatch::collect(&shown)))
+    Ok(views)
 }
 
 /// The record name a change-request record's spec addresses, resolving a
 /// host-spelled service through `forges`.
+fn explained_holds(holds: flotilla_resources::convoy_records::LaunchHolds) -> flotilla_protocol::commands::ExplainedHolds {
+    use flotilla_protocol::commands::ExplainedHolds;
+    use flotilla_resources::convoy_records::LaunchHolds;
+    match holds {
+        LaunchHolds::Open(holds) => ExplainedHolds::Open { holds: holds.into_iter().collect() },
+        LaunchHolds::Ended(holds) => ExplainedHolds::Ended { holds: holds.into_iter().collect() },
+        LaunchHolds::Retired => ExplainedHolds::Retired,
+    }
+}
+
 fn spec_record_name(spec: &flotilla_resources::ChangeRequestSpec, forges: &[flotilla_resources::ForgeSpec]) -> Option<String> {
     spec.address(forges).ok().and_then(|address| record_name(&address))
 }

@@ -1,36 +1,27 @@
-//! Old Message shapes onto the engine's (#3317). One mapping serves the
-//! producers' sends behind the `[primitives]` switch and the import, so a
-//! sent message and an imported one name the same things the same way.
-//! Addresses go through the ADR 0066 normaliser with the vessel segment
-//! dropped; anything with no ADR 0066 form is refused, never guessed.
+//! The old store's Message records in the engine's terms (#3108), for the import alone. A record
+//! becomes the producer's [`Intent`] it would be sent as today, then the engine's spec through the
+//! mapping admission uses, so an imported message and a sent one are stored alike. Addresses go
+//! through the ADR 0066 normaliser with the vessel segment dropped; anything with no ADR 0066 form
+//! is refused, never guessed.
 //!
-//! A person (`principal:<name>`) has no address of their own: they send and
-//! receive as the role they hold in the context the message concerns (#3938,
-//! owner ruling on #3457). That is the project of the convoy or crew at the
-//! other end, or of a convoy the message refers to, and the fleet otherwise.
+//! A person (`principal:<name>`) has no address of their own: they send and receive as the role
+//! they hold in the context the message concerns (#3938, owner ruling on #3457). That is the
+//! project of the convoy or crew at the other end, or of a convoy the message refers to, and the
+//! fleet otherwise.
 
-use chrono::{DateTime, Utc};
-use flotilla_address::{Address, Condition, Kind};
-use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
+use flotilla_address::{Address, Condition, Kind, Revision};
+use flotilla_engine_messages::{admission::engine_spec, roles::FleetRoles, OldStoreRecords};
+use flotilla_messaging::{Intent, IntentExpectation, IntentReference};
+use flotilla_protocol::Leaf;
 use flotilla_resources::{
-    address::{leaf_address, stored_change_request_address, stored_issue_address, stored_repository_address},
-    ForgeSpec, MessageExpectation, MessageReference, MessageRelation, MessageSpec as OldSpec,
+    address::{leaf_condition, stored_change_request_address, stored_issue_address, stored_repository_address},
+    convoy::engine::ImportedLaunches,
+    ForgeSpec, MessageExpectation, MessageReference, MessageSpec as OldSpec,
 };
-use flotilla_state_machines::machines::message::{
-    Expectation, MessageBody, MessageRef, MessageReference as Reference, MessageSpec, Relation,
-};
+use flotilla_state_machines::machines::message::{MessageRef, MessageReference as Reference, MessageSpec};
 
-use super::roles::{FleetRoles, OPERATOR, PERSON_ROLES};
-
-/// How long an inbox may stay unbound before a message to it may be dropped
-/// as undeliverable: a crew's holder can take this long to provision or
-/// restart. A fleet role's inbox has no consumer yet, so replies to it drop
-/// once this runs out (owner ruling 4, 2026-10-19).
-pub const UNBOUND_AFTER: chrono::Duration = chrono::Duration::hours(24);
-
-/// Resolves the old references that name stored records, which have an
-/// ADR 0066 address only through those records, and the declarations a
-/// person's context is read from.
+/// Resolves the old references that name stored records, which have an ADR 0066 address only
+/// through those records, and the declarations a person's context is read from.
 pub trait ReferenceAddresses: Send + Sync {
     fn address(&self, reference: &MessageReference) -> Result<Address, String>;
 
@@ -56,6 +47,43 @@ pub trait ReferenceAddresses: Send + Sync {
     fn principal_roles(&self, _project: &str, _principal: &str) -> Vec<String> {
         Vec::new()
     }
+
+    /// `address` naming the launch its convoy imports as (#3108). With no launches to read, an
+    /// address naming a convoy is refused: an imported record names a convoy only by its launch.
+    fn launched(&self, address: Address) -> Result<Address, String> {
+        match address.get(Kind::Convoy) {
+            Some(convoy) => Err(format!("`{address}` names convoy `{convoy}`, and this mapping knows no launches")),
+            None => Ok(address),
+        }
+    }
+}
+
+/// `records`, with each convoy an address names read as the launch it imports as in `namespace`.
+pub struct AtLaunches<'a> {
+    pub records: &'a dyn ReferenceAddresses,
+    pub launches: &'a ImportedLaunches,
+    pub namespace: &'a str,
+}
+
+impl ReferenceAddresses for AtLaunches<'_> {
+    fn address(&self, reference: &MessageReference) -> Result<Address, String> {
+        self.records.address(reference)
+    }
+    fn missing(&self, reference: &MessageReference) -> Option<&'static str> {
+        self.records.missing(reference)
+    }
+    fn convoy_project(&self, convoy: &str) -> Option<String> {
+        self.records.convoy_project(convoy)
+    }
+    fn convoy_ended(&self, convoy: &str) -> bool {
+        self.records.convoy_ended(convoy)
+    }
+    fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
+        self.records.principal_roles(project, principal)
+    }
+    fn launched(&self, address: Address) -> Result<Address, String> {
+        self.launches.address(self.namespace, &address)
+    }
 }
 
 /// References whose records are not available: refused with their kind.
@@ -63,6 +91,24 @@ pub struct NoRecords;
 impl ReferenceAddresses for NoRecords {
     fn address(&self, reference: &MessageReference) -> Result<Address, String> {
         Err(format!("reference {reference:?} names a record this mapping cannot read"))
+    }
+}
+
+impl ReferenceAddresses for OldStoreRecords {
+    fn address(&self, reference: &MessageReference) -> Result<Address, String> {
+        self.reference_address(reference)
+    }
+    fn missing(&self, reference: &MessageReference) -> Option<&'static str> {
+        self.reference_missing(reference)
+    }
+    fn convoy_project(&self, convoy: &str) -> Option<String> {
+        OldStoreRecords::convoy_project(self, convoy)
+    }
+    fn convoy_ended(&self, convoy: &str) -> bool {
+        OldStoreRecords::convoy_ended(self, convoy)
+    }
+    fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
+        OldStoreRecords::principal_roles(self, project, principal)
     }
 }
 
@@ -74,56 +120,9 @@ pub struct Conversion<'a> {
 }
 
 impl Conversion<'_> {
-    /// A receiver's inbox: `P/C/V/R` is the convoy role `project:P/convoy:C/role:R`
-    /// (the vessel dropped), `P/R` the standing role `project:P/role:R`, and
-    /// `system:<name>` the fleet role it names.
+    /// A receiver's inbox, as [`FleetRoles::inbox`] reads it.
     pub fn inbox(&self, receiver: &str) -> Result<Address, String> {
-        if receiver.starts_with("system:") {
-            return self.roles.system_sender(receiver).ok_or_else(|| format!("`{receiver}` names no declared fleet role"));
-        }
-        if receiver.starts_with("principal:") {
-            return Err(format!("`{receiver}` is a person, whose role depends on the message's context"));
-        }
-        if receiver.starts_with("topic:") {
-            return Err(format!("`{receiver}` is a topic; resolve its subscriber's role first"));
-        }
-        let refused = |error: flotilla_address::Error| format!("`{receiver}`: {error}");
-        match receiver.split('/').collect::<Vec<_>>().as_slice() {
-            [project, convoy, _vessel, role] => Address::project(project)
-                .and_then(|project| project.child(Kind::Convoy, convoy))
-                .and_then(|convoy| convoy.child(Kind::Role, role))
-                .map_err(refused),
-            [project, role] => Address::project(project).and_then(|project| project.child(Kind::Role, role)).map_err(refused),
-            _ => Err(format!("`{receiver}` is not a role address")),
-        }
-    }
-
-    /// A person's role in `project`, or under the fleet with no project. A
-    /// project's charter may declare the roles a principal holds there; one
-    /// such role is theirs, and several are refused rather than guessed
-    /// between. With none declared, `principal:<role>` names that person role
-    /// and anyone else holds the operator role, as one person consumer holds
-    /// every person role at the roll.
-    pub fn person(&self, principal: &str, project: Option<&str>) -> Result<Address, String> {
-        let name =
-            principal.strip_prefix("principal:").filter(|name| !name.is_empty()).ok_or_else(|| format!("`{principal}` is no person"))?;
-        let default = PERSON_ROLES.iter().find(|role| role.name == name).unwrap_or(&OPERATOR).name;
-        let Some(project) = project else {
-            return Ok(self.roles.person(default).expect("a declared person role"));
-        };
-        let mut held = self.records.principal_roles(project, principal);
-        held.sort();
-        let role = match held.as_slice() {
-            [] => default,
-            [role] => role.as_str(),
-            several => {
-                return Err(format!(
-                    "`{principal}` holds roles {} in project `{project}`; the message names no one of them",
-                    several.iter().map(|role| format!("`{role}`")).collect::<Vec<_>>().join(", ")
-                ))
-            }
-        };
-        Address::project(project).and_then(|project| project.child(Kind::Role, role)).map_err(|error| format!("`{principal}`: {error}"))
+        self.roles.inbox(receiver)
     }
 
     /// The project an old message concerns, for a person at either end: the
@@ -151,67 +150,36 @@ impl Conversion<'_> {
         self.party(&old.sender, old)
     }
 
+    /// A person's role in `project`, or under the fleet with no project, as
+    /// [`FleetRoles::principal_role`] reads the roles the project's charter declares they hold.
+    pub fn person(&self, principal: &str, project: Option<&str>) -> Result<Address, String> {
+        let held = project.map(|project| self.records.principal_roles(project, principal)).unwrap_or_default();
+        self.roles.principal_role(principal, project, held)
+    }
+
     fn party(&self, party: &str, old: &OldSpec) -> Result<Address, String> {
         if party.starts_with("principal:") {
             return self.person(party, self.context(old).as_deref());
         }
-        self.inbox(party)
+        self.records.launched(self.inbox(party)?)
     }
 
-    /// A stall may concern a whole convoy rather than a role inbox.
-    pub fn stall_subject(&self, subject: &str) -> Result<Address, String> {
-        if subject.starts_with("project:") {
-            let address: Address = subject.parse().map_err(|error| format!("invalid stall subject: {error}"))?;
-            if address.kind() == Kind::Convoy {
-                return Ok(address);
-            }
-            return Err(format!("`{subject}` is not a convoy address"));
-        }
-        self.inbox(subject)
-    }
-
-    /// A sender's address: a role as [`Conversion::inbox`] maps it, and a
-    /// `system:` producer as the fleet role it sends as.
-    pub fn sender(&self, sender: &str) -> Result<Address, String> {
-        self.inbox(sender)
+    /// Why an old message's receiver or sender cannot be named: the convoy role it names is of a
+    /// convoy that imports as no launch. `None` when both name one, or no convoy.
+    pub fn unlaunched(&self, old: &OldSpec) -> Option<String> {
+        [&old.receiver, &old.sender]
+            .into_iter()
+            .filter_map(|party| self.inbox(party).ok().filter(|inbox| inbox.get(Kind::Convoy).is_some()))
+            .find_map(|inbox| self.records.launched(inbox).err())
     }
 
     /// A Leaf as an ADR 0066 condition. A crew's progress addresses its role
     /// (ADR 0066 §8): `work/C/V .crew.R.<path>` is `project:P/convoy:C/role:R .<path>`,
-    /// under `project` when the receiver's project is known.
+    /// under `project` when the receiver's project is known, with the convoy as its launch.
     pub fn condition(&self, leaf: &Leaf, project: Option<&str>) -> Result<Condition, String> {
-        let refused = |reason: String| format!("condition `{leaf}`: {reason}");
-        let (address, path) = match &leaf.address {
-            LeafAddress::Work { convoy, .. } => {
-                let path = leaf.field_path.strip_prefix(".crew.").ok_or_else(|| refused("a work leaf names a crew role's field".into()))?;
-                let (role, rest) = path.split_once('.').ok_or_else(|| refused("a crew field names a role and a field".into()))?;
-                let convoy = match project {
-                    Some(project) => Address::project(project).and_then(|project| project.child(Kind::Convoy, convoy)),
-                    None => Address::convoy(convoy),
-                };
-                let role = convoy.and_then(|convoy| convoy.child(Kind::Role, role)).map_err(|error| refused(error.to_string()))?;
-                (role, format!(".{rest}"))
-            }
-            other => {
-                let address = leaf_address(other, self.forges).map_err(refused)?;
-                (address, leaf.field_path.clone())
-            }
-        };
-        let path = if path.starts_with('.') { path } else { format!(".{path}") };
-        let operator = match leaf.operator {
-            LeafOperator::Equal => "==",
-            LeafOperator::NotEqual => "!=",
-            LeafOperator::LessThan => "<",
-            LeafOperator::LessThanOrEqual => "<=",
-            LeafOperator::GreaterThan => ">",
-            LeafOperator::GreaterThanOrEqual => ">=",
-        };
-        let literal = serde_json::to_string(&leaf.literal).expect("a string serializes");
-        let lenient = format!("{address} {path} {operator} {literal}");
-        let condition: Condition =
-            Condition::resolve(&lenient, &flotilla_address::BuiltinForges).map_err(|error| refused(error.to_string()))?;
-        // The canonical print is the stored identity; refuse anything the strict parser reads otherwise.
-        condition.to_string().parse::<Condition>().map_err(|error| refused(error.to_string()))
+        let mut condition = leaf_condition(leaf, project, self.forges)?;
+        condition.address = self.records.launched(condition.address)?;
+        Ok(condition)
     }
 
     /// An old reference as an ADR 0066 reference at its revision.
@@ -232,14 +200,13 @@ impl Conversion<'_> {
             MessageReference::Commit { revision, .. }
             | MessageReference::Ref { revision, .. }
             | MessageReference::Artifact { revision, .. }
-            | MessageReference::ControlRecord { revision, .. } => (self.records.address(reference)?, revision),
+            | MessageReference::ControlRecord { revision, .. } => (self.records.launched(self.records.address(reference)?)?, revision),
         };
         Ok(Reference { address, revision: revision.clone(), subject })
     }
 
-    /// The new spec of an old one. `message` maps an old message name (a
-    /// reply's original, a supersession's predecessor) to its reference.
-    pub fn spec(&self, old: &OldSpec, message: &dyn Fn(&str) -> Result<MessageRef, String>) -> Result<MessageSpec, String> {
+    /// An old record as the producer's intent it would be sent as.
+    pub fn intent(&self, old: &OldSpec) -> Result<Intent, String> {
         let inbox = self.receiver(old)?;
         let project = inbox.get(Kind::Project).map(str::to_owned);
         let mut references = Vec::with_capacity(old.references.len());
@@ -247,77 +214,60 @@ impl Conversion<'_> {
         for reference in &old.references {
             let subject = !subject_found && old.subject.as_ref() == Some(reference);
             subject_found |= subject;
-            references.push(self.reference(reference, subject)?);
+            let Reference { address, revision, subject } = self.reference(reference, subject)?;
+            let revision = Revision::new(revision).map_err(|error| format!("reference {address}: {error}"))?;
+            references.push(IntentReference { address, revision, subject });
         }
         if !subject_found {
             return Err("the subject is not one of the references".into());
         }
-        let body = body(&old.body, old.body_digest.as_deref())?;
         let expectation = match &old.expectation {
-            MessageExpectation::None => Expectation::Nothing,
-            MessageExpectation::Reply => Expectation::Reply,
-            MessageExpectation::Outcome { condition } => Expectation::Outcome { condition: self.condition(condition, project.as_deref())? },
+            MessageExpectation::None => IntentExpectation::Nothing,
+            MessageExpectation::Reply => IntentExpectation::Reply,
+            MessageExpectation::Outcome { condition } => {
+                IntentExpectation::Outcome { condition: self.condition(condition, project.as_deref())? }
+            }
         };
         let delivery_condition = old.delivery_condition.as_ref().map(|leaf| self.condition(leaf, project.as_deref())).transpose()?;
-        Ok(MessageSpec {
+        Ok(Intent {
+            sender: self.sender_of(old)?,
+            inbox,
+            relation: old.relation,
+            body: body_text(&old.body, old.body_digest.as_deref()),
             references,
-            in_reply_to: old.in_reply_to.as_deref().map(message).transpose()?,
-            supersedes: old.supersedes.as_deref().map(message).transpose()?,
+            in_reply_to: old.in_reply_to.clone(),
+            supersedes: old.supersedes.clone(),
             expectation,
-            deadline: old.deadline.as_ref().map(timestamp),
-            unbound_after: UNBOUND_AFTER.num_microseconds().expect("bounded"),
+            deadline: old.deadline,
             delivery_condition,
-            ..MessageSpec::new(self.sender_of(old)?, inbox, relation(old.relation), body)
+            principal: old.sender.strip_prefix("principal:").map(str::to_owned),
         })
     }
-}
 
-pub fn relation(relation: MessageRelation) -> Relation {
-    match relation {
-        MessageRelation::Supervisor => Relation::Supervisor,
-        MessageRelation::Peer => Relation::Peer,
-        MessageRelation::Dependency => Relation::Dependency,
-        MessageRelation::Dependee => Relation::Dependee,
-        MessageRelation::System => Relation::System,
+    /// The new spec of an old one. `message` maps an old message name (a
+    /// reply's original, a supersession's predecessor) to its reference.
+    pub fn spec(&self, old: &OldSpec, message: &dyn Fn(&str) -> Result<MessageRef, String>) -> Result<MessageSpec, String> {
+        let intent = self.intent(old)?;
+        let in_reply_to = intent.in_reply_to.as_deref().map(message).transpose()?;
+        let supersedes = intent.supersedes.as_deref().map(message).transpose()?;
+        engine_spec(&intent, in_reply_to, supersedes)
     }
 }
 
 /// The body as prose. A terminal body the old audit sweep compacted (empty,
 /// its digest kept) says exactly what was lost.
-pub fn body(text: &str, digest: Option<&str>) -> Result<flotilla_schema::Frozen<MessageBody>, String> {
-    let text = match digest {
+fn body_text(text: &str, digest: Option<&str>) -> String {
+    match digest {
         Some(digest) if text.is_empty() => format!("[compacted body sha256:{digest}]"),
         _ => text.to_owned(),
-    };
-    MessageBody::text(text).map_err(|error| format!("body: {error}"))
-}
-
-pub fn timestamp(at: &DateTime<Utc>) -> flotilla_schema::Timestamp {
-    flotilla_schema::Timestamp::from_datetime(at)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use flotilla_resources::MessageRelation;
+
     use super::*;
-
-    fn conversion(roles: &FleetRoles) -> Conversion<'_> {
-        Conversion { roles, forges: &[], records: &NoRecords }
-    }
-
-    // Behaviour: role addresses drop the vessel; system producers send as
-    // their fleet role; people need a message's context, and topics have no inbox here.
-    #[test]
-    fn receivers_and_senders_map_to_host_free_role_addresses() {
-        let roles = FleetRoles::declared("fleet").expect("roles");
-        let map = conversion(&roles);
-        assert_eq!(map.inbox("flotilla/demo/work/coder").expect("convoy role").as_str(), "project:flotilla/convoy:demo/role:coder");
-        assert_eq!(map.inbox("flotilla/gui-approver").expect("standing role").as_str(), "project:flotilla/role:gui-approver");
-        assert_eq!(map.sender("system:turn-rules").expect("fleet role").as_str(), "fleet:fleet/role:turn-rules");
-        assert_eq!(map.sender("system:hold").expect("held turns").as_str(), "fleet:fleet/role:turn-rules");
-        assert!(map.sender("principal:alice").is_err(), "a person has no address outside a message's context");
-        assert!(map.inbox("topic:flotilla/reviews").is_err());
-        assert!(map.inbox("system:unknown").is_err());
-    }
 
     /// Charter declarations of the roles principals hold, by project.
     struct Charter(Vec<(&'static str, &'static str, &'static str)>);
@@ -348,10 +298,12 @@ mod tests {
             ("flotilla", "principal:eve", "owner"),
             ("flotilla", "principal:eve", "lead"),
         ]);
-        let map = Conversion { roles: &roles, forges: &[], records: &charter };
+        let launches = demo_launch();
+        let launched = AtLaunches { records: &charter, launches: &launches, namespace: "flotilla" };
+        let map = Conversion { roles: &roles, forges: &[], records: &launched };
         let to_crew = message("principal:alice", "flotilla/demo/work/coder");
         assert_eq!(map.sender_of(&to_crew).expect("operator").as_str(), "project:flotilla/role:operator");
-        assert_eq!(map.receiver(&to_crew).expect("crew").as_str(), "project:flotilla/convoy:demo/role:coder");
+        assert_eq!(map.receiver(&to_crew).expect("crew").as_str(), "project:flotilla/convoy:demo%232/role:coder");
         let escalated = message("flotilla/demo/work/coder", "principal:operator");
         assert_eq!(map.receiver(&escalated).expect("operator").as_str(), "project:flotilla/role:operator");
         assert_eq!(
@@ -371,17 +323,29 @@ mod tests {
         assert_eq!(map.receiver(&about).expect("convoy's project").as_str(), "project:widgets/role:operator");
     }
 
-    // Behaviour: a crew-progress leaf addresses the role (ADR 0066 §8); a
-    // change request leaf keeps its address; the print is canonical.
+    /// Convoy `demo` imports as its second launch.
+    fn demo_launch() -> ImportedLaunches {
+        let launch =
+            flotilla_resources::convoy::engine::ImportedLaunch { home: "home".into(), project: "flotilla".into(), of: "demo".into(), n: 2 };
+        ImportedLaunches::default().with("flotilla", "demo", launch)
+    }
+
+    // Behaviour: a crew-progress leaf addresses the role (ADR 0066 §8) of the launch its convoy
+    // imports as (#3108), and without launches to read it is refused; a change request leaf keeps
+    // its address; the print is canonical.
     #[test]
     fn leaves_become_canonical_conditions() {
         let roles = FleetRoles::declared("fleet").expect("roles");
-        let map = conversion(&roles);
+        let launches = demo_launch();
+        let launched = AtLaunches { records: &NoRecords, launches: &launches, namespace: "flotilla" };
+        let map = Conversion { roles: &roles, forges: &[], records: &launched };
         let work: Leaf = "work/demo/work .crew.coder.phase == Done".parse().expect("leaf");
         assert_eq!(
             map.condition(&work, Some("flotilla")).expect("work").to_string(),
-            "project:flotilla/convoy:demo/role:coder .phase == Done"
+            "project:flotilla/convoy:demo%232/role:coder .phase == Done"
         );
+        let unlaunched = Conversion { roles: &roles, forges: &[], records: &NoRecords };
+        assert!(unlaunched.condition(&work, Some("flotilla")).expect_err("no launches").contains("knows no launches"));
         let cr: Leaf = "cr/github.com/flotilla-org/flotilla/42 .checks == passing".parse().expect("leaf");
         assert_eq!(map.condition(&cr, None).expect("cr").to_string(), "forge:github/repo:flotilla-org%2Fflotilla/cr:42 .checks == passing");
         let other_work: Leaf = "work/demo/work .status == Done".parse().expect("leaf");
@@ -391,7 +355,7 @@ mod tests {
     // Behaviour: an emptied terminal body imports as text naming its digest.
     #[test]
     fn a_compacted_body_names_its_digest() {
-        let body = body("", Some("abc")).expect("body");
-        assert_eq!(body.value(), &MessageBody::Text("[compacted body sha256:abc]".into()));
+        assert_eq!(body_text("", Some("abc")), "[compacted body sha256:abc]");
+        assert_eq!(body_text("kept", Some("abc")), "kept");
     }
 }

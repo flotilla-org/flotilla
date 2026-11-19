@@ -1,6 +1,7 @@
 use super::*;
+use crate::testkits::engine::request_session;
+use flotilla_engine_convoys_testkit::{single_agent, EngineHome};
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
-use flotilla_store_memory::InMemoryBackend;
 
 #[test]
 fn missing_tool_session_is_stopped_but_a_dead_generation_is_lost() {
@@ -14,7 +15,8 @@ fn missing_tool_session_is_stopped_but_a_dead_generation_is_lost() {
 
 #[tokio::test]
 async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let home = EngineHome::open_in("host", NAMESPACE);
+    let backend = home.backend().clone();
     let kinds = backend.using::<FulfilmentKind>(NAMESPACE);
     let broad = BTreeSet::from([flotilla_resources::FulfilmentGrant::host_account_reach()]);
     let restricted = BTreeSet::from([flotilla_resources::FulfilmentGrant::platform("linux".to_string())]);
@@ -46,46 +48,20 @@ async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
             flotilla_resources::VesselPlacementPin { kind_ref: "snapshot-ops".to_string(), decision: decision("restricted") },
         ),
     ]);
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(
-            &InputMeta::builder()
-                .name("demo".to_string())
-                .annotations(BTreeMap::from([(
-                    flotilla_resources::VESSEL_PLACEMENTS_ANNOTATION.to_string(),
-                    serde_json::to_string(&pins).expect("pins serialize"),
-                )]))
-                .build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            "demo",
-            &convoy.metadata.resource_version,
-            &ConvoyStatus { placement_decision: Some(decision("broad")), ..ConvoyStatus::default() },
-        )
-        .await
-        .expect("convoy status");
-    backend
-        .using::<Vessel>(NAMESPACE)
-        .create(
-            &empty_meta("demo-ops"),
-            &VesselSpec {
-                convoy_ref: "demo".to_string(),
-                vessel_name: "ops".to_string(),
-                fulfilment_kind_ref: "snapshot-ops".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("ops vessel");
-    let context = flotilla_resources::TerminalCrewContext {
-        namespace: NAMESPACE.to_string(),
-        convoy: "demo".to_string(),
-        vessel_ref: "demo-ops".to_string(),
-    };
+    // Admitted with each vessel's pin and the convoy's own placement, as admission freezes them.
+    let mut convoy = flotilla_engine_convoys_testkit::convoy(
+        NAMESPACE,
+        "demo",
+        ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("workflow".to_string()).build(),
+        ConvoyStatus { placement_decision: Some(decision("broad")), ..single_agent("coder") },
+    );
+    convoy
+        .metadata
+        .annotations
+        .insert(flotilla_resources::VESSEL_PLACEMENTS_ANNOTATION.to_string(), serde_json::to_string(&pins).expect("pins serialize"));
+    let launch = home.convoys.launch(convoy).await;
+    let vessel = home.engine.engine.vessels.request(&launch, "ops", "host");
+    let context = flotilla_resources::TerminalCrewContext { namespace: NAMESPACE.to_string(), convoy: launch.clone(), vessel_ref: vessel };
     assert_eq!(fulfilment_grants_for_terminal(&backend, &context).await, Some(restricted));
 }
 
@@ -116,6 +92,7 @@ async fn contained_terminal_session_never_falls_back_from_the_requested_interior
     daemon
         .register_provisioned_environment(env_id.clone(), handle, EnvironmentBag::new(), Some(passthrough_registry()))
         .expect("register contained environment");
+    engine_environments(&daemon);
     let runtime = TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             daemon,
@@ -136,144 +113,11 @@ async fn contained_terminal_session_never_falls_back_from_the_requested_interior
     };
 
     let error = runtime
-        .ensure_session("terminal-contained-work-coder", (&spec).into(), &[])
+        .ensure_session("terminal-contained-work-coder", &first_launch("terminal-contained-work-coder"), (&spec).into(), &[])
         .await
         .expect_err("a missing interior cleat must fail instead of launching through passthrough");
 
     assert_eq!(error, "terminal pool cleat unavailable for environment contained-work");
-}
-
-#[tokio::test(start_paused = true)]
-async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable_after_daemon_restart() {
-    let temp = TempDir::new().expect("tempdir");
-    let config_path = temp.path().join("config");
-    std::fs::create_dir_all(&config_path).expect("config dir");
-    std::fs::write(config_path.join("daemon.toml"), "machine_id = \"transient-pool-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(config_path));
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let pool = Arc::new(TransientTerminalPool::new());
-
-    let initial = daemon_with_transient_terminal_pool(Arc::clone(&config), backend.clone(), Arc::clone(&pool)).await;
-    let registry = probe_local_provider_registry(&initial, &config).await.expect("initial provider registry");
-    let profile = build_local_profile(&initial, &registry).await.expect("initial profile");
-    register_startup_resources(&initial, NAMESPACE, &profile).await.expect("initial startup resources");
-
-    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("transient-pool-convoy"), &ConvoySpec::builder().workflow_ref("transient-pool-workflow".to_string()).build())
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() },
-        )
-        .await
-        .expect("mark convoy active");
-
-    let session_name = "terminal-transient-pool-convoy-implement-coder";
-    pool.inner
-        .add_sessions(vec![ProviderTerminalSession::builder()
-            .session_name(session_name.to_string())
-            .status(TerminalStatus::Running)
-            .command("cargo test".to_string())
-            .working_directory(ExecutionEnvironmentPath::new("/workspace"))
-            .build()])
-        .await;
-    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name(session_name.to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "transient-pool-convoy".to_string())]))
-                .build(),
-            &TerminalSessionSpec {
-                env_ref: profile.host_direct_environment_name(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: profile.host_direct_pool.clone(),
-            },
-        )
-        .await
-        .expect("create running terminal resource");
-    let mut running = TerminalSessionStatus::default();
-    TerminalSessionStatusPatch::MarkRunning {
-        configured_limits: None,
-        session_id: session_name.to_string(),
-        pid: None,
-        started_at: Utc::now(),
-        crew: None,
-        launch_command: "cargo test".to_string(),
-        delivered_message_id: None,
-    }
-    .apply(&mut running);
-    sessions.update_status(session_name, &session.metadata.resource_version, &running).await.expect("mark terminal running");
-    drop(initial);
-
-    pool.set_available(false);
-    let restarted = daemon_with_transient_terminal_pool(Arc::clone(&config), backend.clone(), Arc::clone(&pool)).await;
-    let restarted_registry = probe_local_provider_registry(&restarted, &config).await.expect("restarted provider registry");
-    let state = Arc::new(ControllerRuntimeState::new(
-        Arc::clone(&restarted),
-        config,
-        restarted_registry,
-        None,
-        profile.host_id.clone(),
-        profile.host_direct_environment_name(),
-    ));
-    let loop_task = tokio::spawn(
-        ControllerLoop {
-            primary: sessions.clone(),
-            secondaries: Vec::new(),
-            reconciler: TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), NAMESPACE),
-            resync_interval: Duration::from_secs(3600),
-            backend,
-        }
-        .run(),
-    );
-
-    for delay in [0, 60, 120, 240, 480] {
-        if delay > 0 {
-            tokio::time::advance(Duration::from_secs(delay)).await;
-        }
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    let held = sessions.get(session_name).await.expect("held terminal").status.expect("held terminal status");
-    assert_eq!(held.phase, TerminalSessionPhase::Running);
-    assert!(held
-        .degraded
-        .as_ref()
-        .is_some_and(|condition| { condition.consecutive_failures == 5 && condition.message.contains("temporarily unavailable") }));
-    assert_eq!(
-        convoys.get("transient-pool-convoy").await.expect("held convoy").status.expect("held convoy status").phase,
-        ConvoyPhase::Active
-    );
-
-    pool.set_available(true);
-    tokio::time::advance(Duration::from_secs(15 * 60)).await;
-    for _ in 0..40 {
-        tokio::task::yield_now().await;
-        if sessions.get(session_name).await.ok().and_then(|session| session.status).is_some_and(|status| status.degraded.is_none()) {
-            break;
-        }
-    }
-
-    let recovered = sessions.get(session_name).await.expect("recovered terminal").status.expect("recovered terminal status");
-    assert_eq!(recovered.phase, TerminalSessionPhase::Running);
-    assert_eq!(recovered.degraded, None);
-    assert_eq!(
-        convoys.get("transient-pool-convoy").await.expect("recovered convoy").status.expect("recovered convoy status").phase,
-        ConvoyPhase::Active
-    );
-
-    loop_task.abort();
-    let _ = loop_task.await;
 }
 
 #[tokio::test]
@@ -307,6 +151,7 @@ async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtim
     daemon.set_daemon_socket_path(current_socket.clone()).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+    engine_environments(&daemon);
     let state = Arc::new(ControllerRuntimeState::new(
         Arc::clone(&daemon),
         config,
@@ -350,7 +195,6 @@ async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtim
                 convoy: "demo".to_string(),
                 vessel_ref: "demo-implement".to_string(),
             }),
-            message: None,
         },
         cwd: session_cwd.display().to_string(),
         env: BTreeMap::from([
@@ -360,11 +204,12 @@ async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtim
         pool: "fake-terminals".to_string(),
     };
 
-    let launched = runtime.ensure_session(session_name, (&spec).into(), &[]).await.expect("replace stale session");
+    let launched =
+        runtime.ensure_session(session_name, &first_launch(session_name), (&spec).into(), &[]).await.expect("replace stale session");
 
     assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
     assert_eq!(pool.ensured.lock().await.len(), 1, "the fresh agent command must actually be launched");
-    assert!(launched.crew.is_some(), "the replacement gets a fresh crew identity");
+    assert!(launched.facts.agent.is_some(), "the replacement launches its crew's harness afresh");
     // #2706: restored crews get the current daemon's declared socket and
     // session values, regardless of a stale inherited or supplied socket.
     let ensured = pool.ensured.lock().await;
@@ -398,6 +243,7 @@ async fn terminal_teardown_kills_a_persisted_session_after_runtime_restart() {
     let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+    engine_environments(&daemon);
     let runtime = TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -425,13 +271,18 @@ async fn terminal_teardown_kills_a_persisted_session_after_runtime_restart() {
         .build()])
         .await;
 
+    // Ending a running session is every convoy's routine teardown: nothing at WARN (d9).
+    let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
+    let _logging = tracing::dispatcher::set_default(&logging);
     runtime.kill_session(session_name, (&spec).into()).await.expect("teardown should resolve the persisted session pool");
 
     assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
+    assert!(!logs.text().contains("terminal session"), "routine teardown warned: {}", logs.text());
 }
 
 #[tokio::test]
 async fn codex_interactive_prompt_is_observed_as_needing_input() {
+    use flotilla_state_machines::machines::agent_session::Activity;
     use std::os::unix::fs::PermissionsExt;
 
     let temp = TempDir::new().expect("tempdir");
@@ -454,6 +305,7 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
         .prepare(&profile.host_direct_environment_name(), &BTreeSet::from(["codex".to_string()]), &BTreeMap::new())
         .await
         .expect("deliver the central credential");
+    engine_environments(&daemon);
     let runtime = TerminalControllerRuntime {
         state: Arc::new(
             ControllerRuntimeState::new(
@@ -497,35 +349,82 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
                 convoy: "demo".to_string(),
                 vessel_ref: "demo-work".to_string(),
             }),
-            message: None,
         },
         cwd: "/workspace".to_string(),
         env: Default::default(),
         pool: "fake-terminals".to_string(),
     };
+    // The adapter's screen reading is the agent's activity, recorded on the AgentSession the
+    // session's launch names; the pool's screen motion is not.
+    // The primitives share the daemon's decided store and home, where its Convoy path is.
+    let service = daemon.decided_store().unwrap();
+    let primitives = Arc::new(
+        flotilla_engine_messages::MessagePrimitives::open(
+            daemon.node_id().as_str(),
+            Arc::clone(&service),
+            daemon.resource_backend(),
+            Arc::new(flotilla_resources::SystemClock),
+        )
+        .unwrap(),
+    );
+    daemon.install_message_primitives(Arc::clone(&primitives)).unwrap();
+    let record = "codex-crew#1";
+    let agent_activity =
+        || primitives.sessions().get(record).and_then(|session| session.state().observation()).map(|observation| observation.activity);
+    let target = || {
+        let mut target = flotilla_resources::TerminalSessionTarget::from(&spec);
+        target.record = Some(record);
+        target
+    };
+    // Crew attention reads the agent from its AgentSession (#3108): the screen read that
+    // recorded it is what a reader of the running session sees.
+    let reads = flotilla_core::in_process::DecidedAgentSessions::new(
+        Arc::clone(&service),
+        Arc::new(flotilla_resources::SystemClock),
+        Arc::new(flotilla_resources::agent_activity::ProgressFacts::new(chrono::Utc::now())),
+    );
+    let crew_attention = |observation: &flotilla_provisioning::engine::terminal_actuator::ScreenReading| {
+        use flotilla_resources::agent_activity::AgentSessionReads as _;
+        let status = flotilla_resources::TerminalSessionStatus {
+            phase: flotilla_resources::TerminalSessionPhase::Running,
+            attention: observation.attention.clone(),
+            screen_obstruction: observation.obstruction.clone(),
+            ..Default::default()
+        };
+        flotilla_resources::crew_attention(Some(&status), reads.read(record, None).expect("read AgentSession").as_ref())
+    };
 
-    let observation =
-        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe prompt").expect("attention observation");
+    let observation = runtime.observe_attention(session_name, target()).await.expect("observe prompt").expect("attention observation");
+    assert_eq!(agent_activity(), Some(Activity::NeedsInput));
+    assert_eq!(crew_attention(&observation), Some(flotilla_protocol::CrewAttention::NeedsInput));
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::NeedsInput);
+
+    // #3724: a hook review is a prompt too, and Codex's hooks never report it.
+    pool.set_captured_screen(session_name, include_str!("../../../../flotilla-agent/src/fixtures/codex-3724/review-events.txt")).await;
+    let observation = runtime.observe_attention(session_name, target()).await.expect("observe hook review").expect("observation");
+    assert_eq!(observation.obstruction, Some(flotilla_resources::ScreenObstruction::HookReview));
+    assert_eq!(crew_attention(&observation), Some(flotilla_protocol::CrewAttention::NeedsInput));
 
     pool.set_captured_screen(session_name, "› Ask Codex to do anything\n\ngpt-5.6-sol high · /workspace").await;
     let observation =
-        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe normal composer").expect("attention observation");
+        runtime.observe_attention(session_name, target()).await.expect("observe normal composer").expect("attention observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Idle);
+    assert_eq!(agent_activity(), Some(Activity::Idle));
 
     // #2560: stable pixels alone do not end a Codex turn. An interrupt
     // returning to the composer is a boundary even without a notify hook.
     pool.set_captured_screen(session_name, "• Working (2h 12m • esc to interrupt)\n\n› Ask Codex to do anything").await;
-    let observation =
-        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe quiet working turn").expect("observation");
+    let observation = runtime.observe_attention(session_name, target()).await.expect("observe quiet working turn").expect("observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Working);
+    assert_eq!(agent_activity(), Some(Activity::Working));
     pool.set_captured_screen(session_name, "■ Conversation interrupted\n\n› Ask Codex to do anything").await;
-    let observation =
-        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe interrupted prompt").expect("observation");
+    let observation = runtime.observe_attention(session_name, target()).await.expect("observe interrupted prompt").expect("observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Idle);
+    assert_eq!(agent_activity(), Some(Activity::Idle));
     pool.set_captured_screen(session_name, "Loading unknown screen").await;
-    let observation = runtime.observe_attention(session_name, (&spec).into()).await.expect("observe unknown screen").expect("observation");
+    let observation = runtime.observe_attention(session_name, target()).await.expect("observe unknown screen").expect("observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Unobservable);
+    assert_eq!(agent_activity(), Some(Activity::Idle), "an unreadable screen shows no activity, so the last reading stands");
 
     pool.set_captured_screen(
         session_name,
@@ -551,6 +450,7 @@ async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
     let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+    engine_environments(&daemon);
     let runtime = TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -575,6 +475,49 @@ async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
     assert!(pool.killed.lock().await.is_empty(), "teardown must not invoke the pool for an already-gone session");
 }
 
+// Item 12: a convoy's end releases its checkout and its sessions together, so the checkout, and
+// the exit receipt inside it, can be removed before the session's release reaches the receipt.
+// Removing it then has nothing left to do; it is no error.
+#[tokio::test]
+async fn an_exit_receipt_whose_checkout_is_already_removed_is_removed() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = temp.path().join("config");
+    std::fs::create_dir_all(&config_path).expect("config dir");
+    std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(config_path));
+    let (daemon, _pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
+    let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+    let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+    engine_environments(&daemon);
+    let runtime = TerminalControllerRuntime {
+        state: Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            local_registry,
+            None,
+            profile.host_id.clone(),
+            profile.host_direct_environment_name(),
+        )),
+    };
+    let checkout = temp.path().join("checkout");
+    let receipt = checkout.join(flotilla_agent::process::exit_receipt("crew#1"));
+    std::fs::create_dir_all(receipt.parent().expect("receipt directory")).expect("receipt directory");
+    std::fs::write(&receipt, "0\n").expect("receipt");
+    let spec = flotilla_resources::TerminalSessionSpec {
+        env_ref: profile.host_direct_environment_name(),
+        role: "coder".to_string(),
+        source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+        cwd: checkout.display().to_string(),
+        env: Default::default(),
+        pool: "fake-terminals".to_string(),
+    };
+
+    runtime.remove_exit_receipt((&spec).into(), "crew#1").await.expect("a present receipt is removed");
+    assert!(!receipt.exists());
+    std::fs::remove_dir_all(&checkout).expect("the checkout's removal");
+    runtime.remove_exit_receipt((&spec).into(), "crew#1").await.expect("a receipt removed with its checkout is no error");
+}
+
 // #3894: teardown never strands a typed engine turn. Teardown stops a turn not
 // yet typed and waits, without blocking, while a typed one settles; the kill
 // leaves it reserved, so the engine delivery adapter still records its receipt.
@@ -596,6 +539,7 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
         let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
         let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
         let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+        engine_environments(&daemon);
         let runtime = TerminalControllerRuntime {
             state: Arc::new(ControllerRuntimeState::new(
                 Arc::clone(&daemon),
@@ -642,12 +586,7 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
         });
         runtime.state.terminal_deliveries.lock().expect("deliveries").insert(
             session_name.to_string(),
-            PendingTerminalDelivery {
-                message_batch: Some("engine-message-turn".into()),
-                message: "turn".into(),
-                task,
-                engine_turn: Some(super::terminal::EngineTurn::new(stop.clone())),
-            },
+            PendingTerminalDelivery { task, engine_turn: super::terminal::EngineTurn::new(stop.clone()) },
         );
 
         // The finalizer's pass: wait, without blocking, while the turn settles; then kill.
@@ -717,7 +656,7 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
             )
             .await
             .expect("Claude credential declaration");
-        bind_account(&daemon.resource_backend(), "demo", "coder", "claude-max", "test@example.com").await;
+        bind_account(&daemon, "demo", "coder", "claude-max", "test@example.com").await;
         let state_dir = temp.path().join("state");
         // The daemon's login has a runtime directory, as a Linux host's does.
         let runtime_dir = temp.path().join("runtime");
@@ -733,6 +672,7 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
             Arc::new(ProcessCommandRunner),
             state_dir.clone(),
         ));
+        engine_environments(&daemon);
         let state = Arc::new(
             ControllerRuntimeState::new(
                 Arc::clone(&daemon),
@@ -764,7 +704,6 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
                     convoy: "demo".to_string(),
                     vessel_ref: "demo-work".to_string(),
                 }),
-                message: None,
             },
             cwd: session_cwd.display().to_string(),
             // A declared environment claim never makes the daemon host's own session contained.
@@ -773,14 +712,9 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
         };
         let session_name = "terminal-demo-work-coder";
         let backend = daemon.resource_backend();
-        backend
-            .clone()
-            .using::<flotilla_resources::TerminalSession>(NAMESPACE)
-            .create(&flotilla_resources::InputMeta::builder().name(session_name.to_string()).build(), &spec)
-            .await
-            .expect("session");
+        let launch = request_session(&daemon, session_name, &spec);
         TerminalControllerRuntime { state }
-            .ensure_session(session_name, (&spec).into(), &[])
+            .ensure_session(session_name, &launch, (&spec).into(), &[])
             .await
             .expect("launch host-direct Claude Code");
 

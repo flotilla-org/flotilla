@@ -1,24 +1,32 @@
-//! The convoy reconciler behind `[primitives]` (#3587 layer 6): with the
-//! engine holding a convoy, an observation is the engine's edge and no old
-//! promise patch is written; without it, the old path is unchanged; and an
-//! engine refusal of admission fails the convoy with the refusal named.
+//! The engine convoy controller (#3108 C4'): what its home observes of a launch becomes the
+//! launch's edges and the home's notes, and the controller writes no status. The convoy here is
+//! a stored object standing in for the launch's view, read through an engine that records what
+//! it is asked.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, OnceLock},
 };
 
 use async_trait::async_trait;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_resources::{
-    address::{artifact_address, record_name},
-    convoy::engine::{Actor, Admission, EngineConvoyPath, EngineConvoys, OldPromises, SkipReason, VerdictScope},
-    promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState},
-    Artifact, ArtifactSpec, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec, CrewWorkPhase,
-    CrewWorkState, InputMeta, ResourceObject, StatusPatch, VesselRequirement, WorkflowSnapshot, WorkflowTemplate,
+    address::{artifact_address, record_name, stored_change_request_address},
+    artifact::blob_digest_of,
+    convoy::engine::{Actor, EngineConvoyPath, EngineConvoys, OldPromises, VerdictScope},
+    engine_records::{KindRecords, LogPosition, Record, Since},
+    promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
+    Artifact, ArtifactSpec, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Convoy, ConvoyPhase,
+    ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Forge, InputMeta, Observation,
+    ObservedChangeRequestState, ResourceObject, VesselRequirement, WorkflowSnapshot,
 };
-use flotilla_store::{controller::Reconciler, ResourceBackend};
+use flotilla_store::{
+    controller::Reconciler,
+    load_metrics::{attributed, measure, CallerReads},
+    ResourceBackend,
+};
 use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadOperation, ReadSnapshot, ReadTally};
 
 const NAMESPACE: &str = "flotilla";
 
@@ -26,13 +34,19 @@ const NAMESPACE: &str = "flotilla";
 #[derive(Default)]
 struct Recording {
     holds: bool,
-    admission: Option<Admission>,
     promises: Mutex<Vec<(String, String, PromiseOperation, Actor)>>,
     views: Mutex<usize>,
     /// The engine's change feed, when the test publishes on one.
     changes: Mutex<Option<tokio::sync::broadcast::Sender<String>>>,
     /// The promises the engine holds, once handed over from the stored status.
     held: Option<OldPromises>,
+    /// The disposition the engine delivered the convoy with, once it has.
+    delivered: Option<String>,
+    /// How many times the convoy was delivered.
+    deliveries: Mutex<usize>,
+    /// The reasons the convoy was ended as failed with.
+    failures: Mutex<Vec<String>>,
+    memory: flotilla_resources::convoy_records::ConvoyMemory,
 }
 
 #[async_trait]
@@ -40,8 +54,11 @@ impl EngineConvoys for Recording {
     fn holds(&self, _: &ResourceObject<Convoy>) -> bool {
         self.holds
     }
-    async fn admit(&self, _: &ResourceObject<Convoy>) -> Result<Admission, String> {
-        Ok(self.admission.clone().unwrap_or(Admission::Skipped(SkipReason::NotBootstrapped)))
+    async fn reserve(&self, launch_of: &str) -> Result<String, String> {
+        Ok(format!("{launch_of}#1"))
+    }
+    async fn admit_reserved(&self, _: &ResourceObject<Convoy>) -> Result<(), String> {
+        Ok(())
     }
     async fn promise(
         &self,
@@ -54,7 +71,7 @@ impl EngineConvoys for Recording {
         self.promises.lock().expect("promises").push((vessel.into(), role.into(), operation.clone(), actor));
         Ok(())
     }
-    async fn reassign(&self, _: &ResourceObject<Convoy>, _: &str, _: &str, _: &str) -> Result<(), String> {
+    async fn reassign(&self, _: &ResourceObject<Convoy>, _: (&str, &str), _: (&str, &str), _: &[String]) -> Result<(), String> {
         Ok(())
     }
     async fn keep_by_verdict(&self, _: &ResourceObject<Convoy>, _: &VerdictScope, _: &str, _: &str) -> Result<Vec<String>, String> {
@@ -63,10 +80,21 @@ impl EngineConvoys for Recording {
     async fn verdict(&self, _: &ResourceObject<Convoy>, _: &str, _: bool, _: &str, _: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn deliver(&self, _: &ResourceObject<Convoy>) -> Result<(), String> {
+    async fn deliver(&self, _: &ResourceObject<Convoy>, _: &str) -> Result<(), String> {
+        *self.deliveries.lock().expect("deliveries") += 1;
         Ok(())
     }
+    fn delivered(&self, _: &ResourceObject<Convoy>) -> Option<String> {
+        self.delivered.clone()
+    }
     async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn delete(&self, _: &ResourceObject<Convoy>, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn fail(&self, _: &ResourceObject<Convoy>, _: &str, reason: &str) -> Result<(), String> {
+        self.failures.lock().expect("failures").push(reason.to_owned());
         Ok(())
     }
     fn promises(&self, convoy: &ResourceObject<Convoy>, _: Option<&str>) -> Result<Option<OldPromises>, String> {
@@ -81,6 +109,24 @@ impl EngineConvoys for Recording {
             Some(sender) => sender.subscribe(),
             None => tokio::sync::broadcast::channel(1).1,
         }
+    }
+    fn memory(&self) -> &flotilla_resources::convoy_records::ConvoyMemory {
+        &self.memory
+    }
+    async fn fail_seat(&self, _: &ResourceObject<Convoy>, _: &str, _: &str, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn link(
+        &self,
+        _: &ResourceObject<Convoy>,
+        _: &flotilla_protocol::Subject,
+        _: flotilla_resources::SubjectDiscoverySource,
+        _: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    async fn unlink(&self, _: &ResourceObject<Convoy>, _: &flotilla_protocol::Subject, _: &str) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -112,21 +158,30 @@ async fn ledger_convoy(backend: &ResourceBackend) -> ResourceObject<Convoy> {
     promises::apply(&mut status, "work", "coder", &declare);
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let created = convoys
-        .create(&InputMeta::builder().name("c".to_string()).build(), &ConvoySpec::builder().workflow_ref("w".to_string()).build())
+        .create(
+            &InputMeta::builder().name("c".to_string()).build(),
+            &ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("w".to_string()).build(),
+        )
         .await
         .expect("convoy");
-    let name = record_name(&artifact_address("c", "coder", "decision-ledger", "c").expect("address")).expect("record name");
+    publish_ledger(backend, "c").await;
+    convoys.update_status("c", &created.metadata.resource_version, &status).await.expect("status")
+}
+
+/// Publishes convoy `convoy`'s coder's decision ledger artifact.
+async fn publish_ledger(backend: &ResourceBackend, convoy: &str) {
+    let name = record_name(&artifact_address(convoy, "coder", "decision-ledger", convoy).expect("address")).expect("record name");
     backend
         .clone()
         .using::<Artifact>(NAMESPACE)
         .create(
             &InputMeta::builder().name(name).build(),
             &ArtifactSpec::builder()
-                .convoy("c".to_string())
+                .convoy(convoy.to_string())
                 .producer("coder".to_string())
                 .kind("decision-ledger".to_string())
-                .subject("c".to_string())
-                .digest("sha256:test".to_string())
+                .subject(convoy.to_string())
+                .digest(blob_digest_of(b"ledger"))
                 .size(1)
                 .media_type("text/markdown".to_string())
                 .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
@@ -134,22 +189,169 @@ async fn ledger_convoy(backend: &ResourceBackend) -> ResourceObject<Convoy> {
         )
         .await
         .expect("artifact");
-    convoys.update_status("c", &created.metadata.resource_version, &status).await.expect("status")
+}
+
+/// The reads one pass over the ledger convoy makes, with `others` other convoys' ledgers held.
+async fn ledger_pass_reads(others: usize) -> ReadSnapshot {
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let convoy = ledger_convoy(&backend).await;
+    for n in 0..others {
+        publish_ledger(&backend, &format!("other-{n}")).await;
+    }
+    let reconciler = reconciler(&backend, Arc::new(Recording { holds: true, ..Default::default() }));
+    let before = backend.read_snapshot();
+    reconciler.prepare(&convoy).await.expect("prepare");
+    backend.read_snapshot().since(&before)
+}
+
+// Behaviour: a pass reads the artifacts its ledger promises name, each by its name, not every
+// convoy's artifacts.
+#[tokio::test]
+async fn a_pass_reads_only_its_ledgers_artifacts() {
+    let reads = assert_flat_reads([0, 40], ledger_pass_reads).await;
+    assert_eq!(reads.calls("Artifact", ReadOperation::List), 0, "{reads}");
+    assert_eq!(reads.objects("Artifact", ReadOperation::Get), 1, "{reads}");
+}
+
+/// Stores change request `number` of `github.com/org/repo`, merged, under its record name.
+async fn publish_merged_change_request(backend: &ResourceBackend, number: u64) {
+    let name = record_name(&stored_change_request_address("github.com", "org/repo", number, &[]).expect("address")).expect("record name");
+    let requests = backend.clone().using::<ChangeRequest>(NAMESPACE);
+    let spec = ChangeRequestSpec::builder()
+        .service("github.com".into())
+        .scope("org/repo".into())
+        .number(number)
+        .observing_authority("test".into())
+        .build();
+    let created = requests.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("change request");
+    let status = ChangeRequestStatus {
+        state: Observation::known(ObservedChangeRequestState::Merged, chrono::Utc::now()),
+        head_sha: Default::default(),
+        title: Default::default(),
+        author: Default::default(),
+        review_decision: Default::default(),
+        review_requested_from_owner: Default::default(),
+        checks: Default::default(),
+        mergeable: Default::default(),
+        review: ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+    };
+    requests.update_status(&name, &created.metadata.resource_version, &status).await.expect("status");
+}
+
+/// The reads one pass over a convoy whose coder submitted PR 1 makes, and the edges it asked
+/// for, with `others` other change requests held.
+async fn pr_pass_reads(others: usize) -> (ReadSnapshot, Vec<(bool, String, String)>) {
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let mut convoy = ledger_convoy(&backend).await;
+    let status = convoy.status.as_mut().expect("status");
+    status.promises.clear();
+    let submit = PromiseOperation::Submit {
+        id: "pr".into(),
+        kind: PromiseKind::Pr,
+        source: PromiseSource::Crew,
+        submission: Submission {
+            reference: "cr/github.com/org/repo/1".into(),
+            metadata: BTreeMap::new(),
+            submitted_at: Some(chrono::Utc::now()),
+            verdict: None,
+        },
+    };
+    promises::apply(status, "work", "coder", &submit);
+    publish_merged_change_request(&backend, 1).await;
+    for number in 0..others as u64 {
+        publish_merged_change_request(&backend, 100 + number).await;
+    }
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
+    let before = backend.read_snapshot();
+    reconciler.prepare(&convoy).await.expect("prepare");
+    let reads = backend.read_snapshot().since(&before);
+    // The verdicts asked for, without their times.
+    let verdicts = engine
+        .promises
+        .lock()
+        .expect("promises")
+        .iter()
+        .map(|(_, _, operation, _)| match operation {
+            PromiseOperation::Verdict { verdict, .. } => (verdict.accepted, verdict.who.clone(), verdict.why.clone()),
+            other => panic!("a verdict, not {other:?}"),
+        })
+        .collect();
+    (reads, verdicts)
+}
+
+// Behaviour: a pass reads the change requests its promises name, each by its record name, not
+// every change request held; the merged PR still becomes the observer's accepting verdict.
+#[tokio::test]
+async fn a_pass_reads_only_its_change_requests() {
+    let (reads, verdicts) = assert_flat_reads([0, 40], pr_pass_reads).await;
+    assert_eq!(reads.calls("ChangeRequest", ReadOperation::List), 0, "{reads}");
+    // Its one name's copies: this home's and the replicas', one of them held.
+    assert_eq!(reads.tally("ChangeRequest", ReadOperation::Get), ReadTally { calls: 2, objects: 1 }, "{reads}");
+    assert_eq!(verdicts, [(true, "forge".to_string(), "PR merged".to_string())]);
+}
+
+// Behaviour (#3108 ruling 1): an abandoned convoy's submitted PR still resolves by the world. Its
+// pass reads that change request, noting it so the change request's changes wake the convoy, and
+// the merge becomes the observer's accepting verdict.
+#[tokio::test]
+async fn an_abandoned_convoys_merged_pr_is_the_observers_verdict() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut convoy = ledger_convoy(&backend).await;
+    let status = convoy.status.as_mut().expect("status");
+    status.promises.clear();
+    let submit = PromiseOperation::Submit {
+        id: "pr".into(),
+        kind: PromiseKind::Pr,
+        source: PromiseSource::Crew,
+        submission: Submission {
+            reference: "cr/github.com/org/repo/1".into(),
+            metadata: BTreeMap::new(),
+            submitted_at: Some(chrono::Utc::now()),
+            verdict: None,
+        },
+    };
+    promises::apply(status, "work", "coder", &submit);
+    status.phase = ConvoyPhase::Abandoned;
+    status.finished_at = Some(chrono::Utc::now());
+    publish_merged_change_request(&backend, 1).await;
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
+    reconciler.prepare(&convoy).await.expect("prepare");
+    let name = record_name(&stored_change_request_address("github.com", "org/repo", 1, &[]).expect("address")).expect("record name");
+    assert_eq!(engine.memory.reading(<ChangeRequest as flotilla_resources::Resource>::API_PATHS.kind, &name), ["c"]);
+    let calls = engine.promises.lock().expect("promises").clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let (vessel, role, operation, actor) = &calls[0];
+    assert_eq!((vessel.as_str(), role.as_str(), actor), ("work", "coder", &Actor::Observer));
+    assert!(
+        matches!(operation, PromiseOperation::Verdict { id, verdict, .. } if id == "pr" && verdict.accepted && verdict.who == "forge"),
+        "{operation:?}"
+    );
 }
 
 fn reconciler(backend: &ResourceBackend, engine: Arc<Recording>) -> ConvoyReconciler {
+    reconciler_reading(backend, engine, flotilla_provisioning_testkit::CheckoutFixture::default().reads)
+}
+
+/// [`reconciler`], reading the engine's lifecycle readings through `reads`.
+fn reconciler_reading(
+    backend: &ResourceBackend,
+    engine: Arc<Recording>,
+    reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+) -> ConvoyReconciler {
     let path: EngineConvoyPath = Arc::new(OnceLock::new());
     let engine: Arc<dyn EngineConvoys> = engine;
     assert!(path.set(engine).is_ok());
-    ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
-        .with_artifacts(backend.including_replicas::<Artifact>(NAMESPACE))
-        .with_engine(path)
+    ConvoyReconciler::new(reads).with_artifacts(backend.including_replicas::<Artifact>(NAMESPACE)).with_engine(path)
 }
 
-// Behaviour: with the engine holding the convoy, the reconciler reads the engine's promises, the
-// observed ledger is the engine's Submit by an observer, and no old promise patch is written.
+// Behaviour: the observed ledger is the engine's Submit by an observer, and the controller writes
+// no status.
 #[tokio::test]
-async fn an_engine_held_convoy_observes_through_the_engine() {
+async fn an_observation_is_the_engines_edge() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoy = ledger_convoy(&backend).await;
     let engine = Arc::new(Recording { holds: true, ..Default::default() });
@@ -161,20 +363,39 @@ async fn an_engine_held_convoy_observes_through_the_engine() {
     let (vessel, role, operation, actor) = &calls[0];
     assert_eq!((vessel.as_str(), role.as_str(), actor), ("work", "coder", &Actor::Observer));
     assert!(matches!(operation, PromiseOperation::Submit { id, .. } if id == "template/decision-ledger"));
-    assert!(
-        !matches!(outcome.patch, Some(ConvoyStatusPatch::ObservePromise { .. } | ConvoyStatusPatch::Promise { .. })),
-        "no old promise write: {:?}",
-        outcome.patch
-    );
-    assert_eq!(*engine.views.lock().expect("views"), 1, "one keyed read of the engine's promises per pass");
-    // The stored status still holds bootstrap's seeds: the hand-over is retried.
-    assert_eq!(outcome.patch, Some(ConvoyStatusPatch::HandPromisesToEngine));
+    assert!(outcome.patch.is_none() && outcome.actuations.is_empty(), "no status write: {:?}", outcome.patch);
 }
 
-// Behaviour: a convoy the engine does not hold stays on the old path: the observation is the old
-// patch, and the engine is asked nothing about its promises.
+// Behaviour: an observer edge is written only when the observation changes what the engine
+// holds. Each recorded edge is applied as the engine applies it; once the launch's promise
+// stands where the evidence puts it, further passes over the same evidence write nothing.
 #[tokio::test]
-async fn a_convoy_the_engine_does_not_hold_keeps_the_old_path() {
+async fn an_unchanged_observation_writes_no_edge() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut convoy = ledger_convoy(&backend).await;
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine));
+    let mut written = Vec::new();
+    for _ in 0..4 {
+        reconciler.prepare(&convoy).await.expect("prepare");
+        let calls = std::mem::take(&mut *engine.promises.lock().expect("promises"));
+        for (vessel, role, operation, _) in calls {
+            promises::apply(convoy.status.as_mut().expect("status"), &vessel, &role, &operation);
+            written.push(operation);
+        }
+    }
+    assert!(
+        matches!(written.as_slice(), [PromiseOperation::Submit { .. }, PromiseOperation::Verdict { verdict, .. }] if verdict.accepted),
+        "{written:?}"
+    );
+    let held = &convoy.status.as_ref().expect("status").promises["work"]["coder"][0];
+    assert_eq!(held.state, PromiseState::Kept);
+}
+
+// Behaviour: a convoy held at another home is that home's to judge: this home asks its engine
+// nothing and notes nothing.
+#[tokio::test]
+async fn a_convoy_held_elsewhere_is_left_to_its_home() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoy = ledger_convoy(&backend).await;
     let engine = Arc::new(Recording::default());
@@ -182,38 +403,471 @@ async fn a_convoy_the_engine_does_not_hold_keeps_the_old_path() {
     let prepared = reconciler.prepare(&convoy).await.expect("prepare");
     let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
     assert!(engine.promises.lock().expect("promises").is_empty());
-    let Some(ConvoyStatusPatch::ObservePromise { operation, .. }) = outcome.patch else { panic!("old patch: {:?}", outcome.patch) };
-    let mut status = convoy.status.clone().expect("status");
-    ConvoyStatusPatch::ObservePromise { vessel: "work".into(), role: "coder".into(), operation }.apply(&mut status);
-    assert_eq!(promises::owned(&status, "work", "coder")[0].state, PromiseState::Submitted);
+    assert!(outcome.patch.is_none() && outcome.requeue_after.is_none());
+    assert_eq!(engine.memory.get("c"), Default::default());
 }
 
-// Behaviour: an engine refusal of admission fails the convoy, naming the refusal.
+// Behaviour: a convoy whose view reads Failed before its launch has ended (a work failed) ends
+// Failed on the engine, with the view's reason; once it has ended, its home's notes on it are
+// dropped, and it is not ended again.
 #[tokio::test]
-async fn an_engine_refusal_fails_the_convoy() {
+async fn a_failed_work_ends_the_launch_and_an_ended_launch_is_forgotten() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let convoy = ledger_convoy(&backend).await;
-    let engine = Arc::new(Recording { admission: Some(Admission::Refused("NoObligations".into())), ..Default::default() });
-    let reconciler = reconciler(&backend, engine);
-    let prepared = reconciler.prepare(&convoy).await.expect("prepare");
+    let mut convoy = ledger_convoy(&backend).await;
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine));
+    let status = convoy.status.as_mut().expect("status");
+    status.phase = ConvoyPhase::Failed;
+    status.message = Some("coder failed".into());
+    reconciler.prepare(&convoy).await.expect("prepare failed");
+    assert_eq!(*engine.failures.lock().expect("failures"), ["coder failed"]);
+
+    engine.memory.update("c", |notes| notes.branch_subject_scan_error = Some("held".into()));
+    convoy.status.as_mut().expect("status").finished_at = Some(chrono::Utc::now());
+    reconciler.prepare(&convoy).await.expect("prepare ended");
+    assert_eq!(engine.failures.lock().expect("failures").len(), 1, "an ended launch is not ended again");
+    assert_eq!(engine.memory.get("c"), Default::default(), "an ended launch's notes are dropped");
+}
+
+// Behaviour: a convoy whose placement chose a full host notes a capacity stall in its home's
+// memory and sets no timer: a change wakes it (a_host_change_wakes_only_the_convoys_waiting_on_it).
+// A sleeping host's wake is its one deadline. Once the host has room the stall is cleared.
+// Nothing is written to the convoy.
+#[tokio::test]
+async fn a_capacity_wait_is_a_note() {
+    use flotilla_protocol::{CanonicalHostId, FulfilmentAllocation, FulfilmentAllocationCandidate, PlacementDecision, PlacementTargetHost};
+    use flotilla_resources::{FulfilmentFacts, Host, HostSpec, HostStatus, StallCause};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let hosts = backend.clone().using::<Host>(NAMESPACE);
+    let host = hosts
+        .create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec { display_name: "feta".into(), ..HostSpec::default() })
+        .await
+        .expect("host");
+    let slots = |free| HostStatus {
+        ready: true,
+        heartbeat_at: Some(chrono::Utc::now()),
+        fulfilment_facts: BTreeMap::from([(
+            "docker".to_string(),
+            FulfilmentFacts { free_vessel_slots: Some(free), observed_at: chrono::Utc::now(), ..Default::default() },
+        )]),
+        ..Default::default()
+    };
+    let host = hosts.update_status("feta", &host.metadata.resource_version, &slots(0)).await.expect("full");
+    let mut convoy = ledger_convoy(&backend).await;
+    convoy.status.as_mut().expect("status").placement_decision = Some(PlacementDecision {
+        provider_instance: None,
+        provider_workspace_root: None,
+        kind: "docker".into(),
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("feta"), display_name: "feta".into() },
+        minimal_alternatives: Vec::new(),
+        escalation_reason: None,
+        refused_candidates: Vec::new(),
+        viable_not_selected: Vec::new(),
+        allocation: Some(FulfilmentAllocation {
+            chosen_kind: "docker".into(),
+            reservation_reason: None,
+            candidates: vec![FulfilmentAllocationCandidate {
+                kind: "docker".into(),
+                host: "feta".into(),
+                cost_class: "owned_idle".into(),
+                host_ready: true,
+                sleeping_until: None,
+                free_vessel_slots: Some(0),
+                max_vessels: None,
+                single_tenant: false,
+                reserved_for_platform: false,
+                minimal: true,
+                available: false,
+            }],
+        }),
+    });
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine)).with_hosts(backend.including_replicas::<Host>(NAMESPACE));
+    let prepared = reconciler.prepare(&convoy).await.expect("prepare full");
     let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
-    let Some(ConvoyStatusPatch::FailConvoy { message, .. }) = outcome.patch else { panic!("fail: {:?}", outcome.patch) };
-    assert_eq!(message.as_deref(), Some("the engine refused this convoy's admission: NoObligations"));
+    assert!(outcome.patch.is_none());
+    assert_eq!(outcome.requeue_after, None, "no timer: a change wakes it");
+    let stall = engine.memory.get("c").stalls.about(None).cloned().expect("a capacity stall is noted");
+    assert_eq!(stall.cause, Some(StallCause::Capacity));
+    assert!(stall.evidence.contains("no free vessel slots"), "{}", stall.evidence);
+    assert!(engine.promises.lock().expect("promises").is_empty(), "a waiting convoy observes nothing yet");
+
+    // The host sleeps for an hour: its wake is the deadline.
+    let asleep = HostStatus { sleeping_until: Some(chrono::Utc::now() + chrono::Duration::hours(1)), ..slots(1) };
+    let host = hosts.update_status("feta", &host.metadata.resource_version, &asleep).await.expect("asleep");
+    let prepared = reconciler.prepare(&convoy).await.expect("prepare asleep");
+    let requeue = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now()).requeue_after.expect("the host's wake");
+    assert!(requeue > std::time::Duration::from_secs(59 * 60) && requeue <= std::time::Duration::from_secs(3600), "{requeue:?}");
+
+    // The view shows the note; the host wakes with a free slot.
+    engine.memory.get("c").write_into(convoy.status.as_mut().expect("status"));
+    hosts.update_status("feta", &host.metadata.resource_version, &slots(1)).await.expect("free");
+    let prepared = reconciler.prepare(&convoy).await.expect("prepare free");
+    assert_eq!(reconciler.reconcile(&convoy, &prepared, chrono::Utc::now()).requeue_after, None);
+    assert_eq!(engine.memory.get("c").stalls.about(None), None, "the capacity stall is cleared");
+}
+
+// Behaviour: a change of what convoys wait on wakes the convoys their home notes as waiting on
+// it, and no other: a held delivery on a Message change (here any watched kind stands in;
+// secondary_watches names which kinds wake which wait). A capacity wait is woken by the host it
+// waits on (a_host_change_wakes_only_the_convoys_waiting_on_it). No timer is involved.
+#[tokio::test]
+async fn a_change_wakes_only_the_convoys_noted_as_waiting() {
+    use flotilla_crew::convoy::{NoteWake, WakeOn};
+    use flotilla_resources::{
+        convoy_records::ConvoyNotes, Host, HostSpec, HostStatus, StallCause, StallEvidenceSource, StallRung, StalledCondition,
+    };
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let stall = StalledCondition {
+        leaves: Vec::new(),
+        maker: None,
+        evidence: "no free vessel slots".into(),
+        source: StallEvidenceSource::LeafEngine,
+        cause: Some(StallCause::Capacity),
+        began_at: chrono::Utc::now(),
+        rung: StallRung::Operator,
+        supervisor: None,
+        supervision_message: None,
+        supervision_index: None,
+        supervision_exhausted: false,
+        reason: None,
+        proposed_disposition: None,
+        nudge_history: Vec::new(),
+    };
+    engine.memory.update("waits-for-capacity", |notes| notes.stalls.set(stall));
+    engine.memory.update("holds-delivery", |notes| notes.delivery_held_until = Some(chrono::Utc::now()));
+    engine.memory.update("neither", |notes| notes.branch_subject_scan_error = Some("noted".into()));
+    let path: EngineConvoyPath = Arc::new(OnceLock::new());
+    let shared: Arc<dyn EngineConvoys> = engine;
+    assert!(path.set(shared).is_ok());
+
+    let hosts = backend.clone().using::<Host>(NAMESPACE);
+    let mut host = hosts
+        .create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec { display_name: "feta".into(), ..HostSpec::default() })
+        .await
+        .expect("host");
+    let woken = "holds-delivery";
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(NoteWake {
+        changes: WakeOn::Replicas(backend.including_replicas::<Host>(NAMESPACE)),
+        engine: Arc::clone(&path),
+        waiting: ConvoyNotes::holds_delivery,
+    });
+    let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
+    // The wake opens its watch when it starts: change the host until it hears.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = HostStatus { heartbeat_at: Some(chrono::Utc::now()), ..Default::default() };
+            host = hosts.update_status("feta", &host.metadata.resource_version, &status).await.expect("host change");
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                return name;
+            }
+        }
+    })
+    .await
+    .expect("woken");
+    assert_eq!(first, woken);
+    while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+        assert_eq!(name, woken, "only the convoys noted as waiting on it are woken");
+    }
+    watch.abort();
+}
+
+/// A docker placement on `host`, as admission records it.
+fn placement_on(host: &str) -> flotilla_protocol::PlacementDecision {
+    use flotilla_protocol::{CanonicalHostId, FulfilmentAllocation, FulfilmentAllocationCandidate, PlacementDecision, PlacementTargetHost};
+    PlacementDecision {
+        provider_instance: None,
+        provider_workspace_root: None,
+        kind: "docker".into(),
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.into() },
+        minimal_alternatives: Vec::new(),
+        escalation_reason: None,
+        refused_candidates: Vec::new(),
+        viable_not_selected: Vec::new(),
+        allocation: Some(FulfilmentAllocation {
+            chosen_kind: "docker".into(),
+            reservation_reason: None,
+            candidates: vec![FulfilmentAllocationCandidate {
+                kind: "docker".into(),
+                host: host.into(),
+                cost_class: "owned_idle".into(),
+                host_ready: true,
+                sleeping_until: None,
+                free_vessel_slots: Some(0),
+                max_vessels: None,
+                single_tenant: false,
+                reserved_for_platform: false,
+                minimal: true,
+                available: false,
+            }],
+        }),
+    }
+}
+
+/// Stores host `name`, ready, with `free` docker vessel slots.
+async fn host_with_slots(backend: &ResourceBackend, name: &str, free: u32) -> ResourceObject<flotilla_resources::Host> {
+    use flotilla_resources::{FulfilmentFacts, Host, HostSpec, HostStatus};
+    let hosts = backend.clone().using::<Host>(NAMESPACE);
+    let status = HostStatus {
+        ready: true,
+        heartbeat_at: Some(chrono::Utc::now()),
+        fulfilment_facts: BTreeMap::from([(
+            "docker".to_string(),
+            FulfilmentFacts { free_vessel_slots: Some(free), observed_at: chrono::Utc::now(), ..Default::default() },
+        )]),
+        ..Default::default()
+    };
+    match hosts.get(name).await {
+        Ok(host) => hosts.update_status(name, &host.metadata.resource_version, &status).await.expect("host status"),
+        Err(_) => {
+            let host = hosts
+                .create(
+                    &InputMeta::builder().name(name.to_string()).build(),
+                    &HostSpec { display_name: name.into(), ..HostSpec::default() },
+                )
+                .await
+                .expect("host");
+            hosts.update_status(name, &host.metadata.resource_version, &status).await.expect("host status")
+        }
+    }
+}
+
+// Behaviour: a capacity wait notes in its home's memory the host it waits on, so that host's
+// changes wake it, and a pass that no longer waits notes none.
+#[tokio::test]
+async fn a_capacity_wait_notes_the_host_it_waits_on() {
+    use flotilla_resources::Host;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    host_with_slots(&backend, "feta", 0).await;
+    let mut convoy = ledger_convoy(&backend).await;
+    convoy.status.as_mut().expect("status").placement_decision = Some(placement_on("feta"));
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine)).with_hosts(backend.including_replicas::<Host>(NAMESPACE));
+
+    reconciler.prepare(&convoy).await.expect("prepare full");
+    assert!(engine.memory.get("c").waits_for_capacity());
+    assert_eq!(engine.memory.reading("Host", "feta"), ["c"]);
+
+    // The view shows the note; the host frees a slot.
+    engine.memory.get("c").write_into(convoy.status.as_mut().expect("status"));
+    host_with_slots(&backend, "feta", 1).await;
+    reconciler.prepare(&convoy).await.expect("prepare free");
+    assert!(!engine.memory.get("c").waits_for_capacity());
+    assert!(engine.memory.readers("Host").is_empty(), "a convoy with room waits on no host");
+}
+
+/// What hearing one change of host `feta` reads, from when the wake has started, and which
+/// convoys it wakes, with `others` convoys each waiting on a host of its own.
+async fn capacity_wake_reads(others: usize) -> (ReadSnapshot, BTreeSet<String>) {
+    use flotilla_crew::convoy::{host_references, CapacityWake, WakeOn};
+    use flotilla_resources::Host;
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    host_with_slots(&backend, "feta", 0).await;
+    for n in 0..others {
+        host_with_slots(&backend, &format!("host-{n}"), 0).await;
+    }
+    // A convoy waiting on the host the test changes until the wake hears.
+    engine.memory.note_evidence("probe", "Host", ["probe-host".to_string()].into());
+
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(CapacityWake {
+        changes: WakeOn::Replicas(backend.including_replicas::<Host>(NAMESPACE)),
+        engine: engine_path(&engine),
+        hosts: host_references,
+    });
+    let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
+    // The wake queues "probe" once its watch is open.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            host_with_slots(&backend, "probe-host", 0).await;
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                assert_eq!(name, "probe");
+                return;
+            }
+        }
+    })
+    .await
+    .expect("woken");
+    while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+        assert_eq!(name, "probe");
+    }
+    // Noted once the wake is open: a queue holds a name until a controller takes it.
+    engine.memory.note_evidence("c", "Host", ["feta".to_string()].into());
+    for n in 0..others {
+        engine.memory.note_evidence(&format!("other-{n}"), "Host", [format!("host-{n}")].into());
+    }
+
+    let hosts = backend.clone().using::<Host>(NAMESPACE);
+    let feta = hosts.get("feta").await.expect("feta");
+    // Only what the wake reads: the test's own get of the host it changes comes before.
+    let before = backend.read_snapshot();
+    let status = flotilla_resources::HostStatus { heartbeat_at: Some(chrono::Utc::now()), ..feta.status.clone().unwrap_or_default() };
+    hosts.update_status("feta", &feta.metadata.resource_version, &status).await.expect("feta change");
+    let woken = woken(&mut queue).await;
+    let reads = backend.read_snapshot().since(&before);
+    watch.abort();
+    (reads, woken)
+}
+
+// Behaviour: a change of a host wakes only the convoys waiting for capacity on it, reading
+// nothing to find them, at any number of other waiting convoys and hosts.
+#[tokio::test]
+async fn a_host_change_wakes_only_the_convoys_waiting_on_it() {
+    let (reads, woken) = assert_flat_reads([0, 40], capacity_wake_reads).await;
+    reads.assert_zero("hearing a host change");
+    assert_eq!(woken, BTreeSet::from(["c".to_string()]));
+}
+
+// Behaviour: what each capacity wake reads a changed record as standing on: a host by its name
+// and display name, a vessel or convoy by the host its placement targets, an environment by its
+// host; a convoy with no placement stands on none.
+#[tokio::test]
+async fn a_capacity_change_names_the_hosts_it_is_on() {
+    use flotilla_crew::convoy::{convoy_hosts, environment_hosts, host_references, vessel_hosts};
+    use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostSpec, Vessel, VesselSpec, VesselStatus};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut host = host_with_slots(&backend, "feta", 0).await;
+    host.spec = HostSpec { display_name: "Feta".into(), ..HostSpec::default() };
+    assert_eq!(host_references(&host), BTreeSet::from(["Feta".to_string(), "feta".to_string()]));
+
+    let mut convoy = ledger_convoy(&backend).await;
+    assert!(convoy_hosts(&convoy).is_empty(), "no placement, no host");
+    convoy.status.as_mut().expect("status").placement_decision = Some(placement_on("feta"));
+    let pin = flotilla_resources::convoy::VesselPlacementPin { kind_ref: "docker".into(), decision: placement_on("brie") };
+    convoy.metadata.annotations.insert(
+        flotilla_resources::convoy::VESSEL_PLACEMENTS_ANNOTATION.into(),
+        serde_json::to_string(&BTreeMap::from([("work".to_string(), pin)])).expect("pins"),
+    );
+    assert_eq!(convoy_hosts(&convoy), BTreeSet::from(["brie".to_string(), "feta".to_string()]));
+
+    // Any object's metadata will do: the hosts are read from spec and status.
+    let vessel = ResourceObject::<Vessel> {
+        metadata: convoy.metadata.clone(),
+        spec: VesselSpec {
+            convoy_ref: "c".into(),
+            vessel_name: "work".into(),
+            fulfilment_kind_ref: "docker".into(),
+            adopted_checkout_refs: BTreeMap::new(),
+        },
+        status: Some(VesselStatus { placement_decision: Some(placement_on("feta")), ..Default::default() }),
+    };
+    assert_eq!(vessel_hosts(&vessel), BTreeSet::from(["feta".to_string()]));
+
+    let environment = ResourceObject::<Environment> {
+        metadata: convoy.metadata.clone(),
+        spec: EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "feta".into(), repo_default_dir: "/repo".into() }),
+            ..Default::default()
+        },
+        status: None,
+    };
+    assert_eq!(environment_hosts(&environment), BTreeSet::from(["feta".to_string()]));
+}
+
+// Behaviour (#3108): a Message committed on the engine's Message path wakes the convoys noted as
+// holding delivery, and no other, through the wake secondary_watches builds; hearing it loads
+// and converts no message, where a listing of the kind would.
+#[tokio::test]
+async fn a_message_commit_wakes_the_convoys_holding_delivery_without_listing_messages() {
+    use flotilla_crew::ports::MessagePath;
+    use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+    use flotilla_messaging::EngineMessages;
+    use flotilla_resources::MessageRelation;
+    use flotilla_store::controller::WorkQueueSender;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    designate_fleet(&backend, NAMESPACE).await;
+    let home = EngineMessagesHome::open("home", NAMESPACE, &backend);
+    let primitives = Arc::clone(home.primitives());
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    engine.memory.update("holds-delivery", |notes| notes.delivery_held_until = Some(chrono::Utc::now()));
+    engine.memory.update("neither", |notes| notes.branch_subject_scan_error = Some("noted".into()));
+    let path: EngineConvoyPath = Arc::new(OnceLock::new());
+    let shared: Arc<dyn EngineConvoys> = engine;
+    assert!(path.set(shared).is_ok());
+    let messages: MessagePath = Arc::new(OnceLock::new());
+    let installed: Arc<dyn EngineMessages> = Arc::clone(&primitives) as Arc<dyn EngineMessages>;
+    assert!(messages.set(installed).is_ok());
+    let admit = |n: usize| {
+        let primitives = Arc::clone(&primitives);
+        async move {
+            let intent = flotilla_engine_messages_testkit::intent(
+                "system:turn-rules",
+                "flotilla/c/work/coder",
+                MessageRelation::System,
+                format!("turn {n}"),
+            );
+            primitives.admit(&format!("turn-{n}"), &intent).await.expect("admit");
+        }
+    };
+    // The test's reads and its watches' count for one caller, as a controller's watches do.
+    let reads = Arc::new(CallerReads::default());
+    let read = |reads: &CallerReads| reads.snapshot().get("Message").copied().unwrap_or_default();
+
+    // Admission reads back the message it admits: what an admission costs, with nothing listening.
+    let unheard = read(&reads);
+    attributed(Arc::clone(&reads), async {
+        for n in 0..4 {
+            admit(n).await;
+        }
+    })
+    .await;
+    let admitted = read(&reads);
+    let admission = ((admitted.decoded - unheard.decoded) / 4, (admitted.converted - unheard.converted) / 4);
+
+    // Every wake the convoy controller runs: only the delivery wake has a convoy to wake.
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let before = read(&reads);
+    let watches = ConvoyReconciler::secondary_watches(&backend, NAMESPACE, Arc::clone(&path), messages)
+        .into_iter()
+        .map(|wake| tokio::spawn(attributed(Arc::clone(&reads), wake.spawn(backend.clone(), NAMESPACE.into(), sender.clone()))))
+        .collect::<Vec<_>>();
+    // The wake subscribes when it starts: admit until it hears.
+    let mut n = 4;
+    let woken = attributed(
+        Arc::clone(&reads),
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                admit(n).await;
+                n += 1;
+                if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                    return name;
+                }
+            }
+        }),
+    )
+    .await
+    .expect("woken");
+    assert_eq!(woken, "holds-delivery");
+    while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+        assert_eq!(name, "holds-delivery", "only the convoys noted as holding delivery are woken");
+    }
+    watches.iter().for_each(tokio::task::JoinHandle::abort);
+    let heard = read(&reads);
+    let admissions = (n - 4) as u64;
+    assert_eq!(
+        (heard.decoded - before.decoded, heard.converted - before.converted),
+        (admission.0 * admissions, admission.1 * admissions),
+        "beyond its admissions, hearing a Message commit loads and converts no message"
+    );
+
+    // The meter sees a listing: opening the kind's generic watch lists every message.
+    let (listed, listing) = measure(backend.including_replicas::<flotilla_resources::Message>(NAMESPACE).watch()).await;
+    let _listed = listed.expect("listing watch");
+    assert!(listing.get("Message").is_some_and(|counts| counts.decoded > 0), "a listing of the kind loads the messages");
 }
 
 // Behaviour (#3732 review): each engine edit's convoy name wakes the convoy reconciler through
-// EngineConvoyWake; with the switch off, the watch has nothing to follow and stays idle.
+// EngineConvoyWake.
 #[tokio::test]
 async fn engine_changes_wake_the_convoy_reconciler() {
     use flotilla_crew::convoy::EngineConvoyWake;
     use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
     let backend = ResourceBackend::new(InMemoryBackend::default());
-
-    let (sender, mut queue) = WorkQueueSender::channel();
-    let off: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(EngineConvoyWake { engine: EngineConvoyPath::default() });
-    let idle = tokio::time::timeout(std::time::Duration::from_millis(100), off.spawn(backend.clone(), "flotilla".into(), sender)).await;
-    assert!(idle.is_err(), "switch off: the watch never completes");
-    assert!(queue.try_recv().is_err(), "nothing queued");
 
     let (feed, _) = tokio::sync::broadcast::channel(16);
     let engine = Arc::new(Recording { holds: true, ..Default::default() });
@@ -239,37 +893,525 @@ async fn engine_changes_wake_the_convoy_reconciler() {
     watch.abort();
 }
 
-/// The engine Message path's one answer the hold reads: whether the crew has
-/// an undelivered turn. The convoy reconciler asks it nothing else.
-struct Turns {
-    backend: ResourceBackend,
-    awaiting: bool,
+fn change_request_name(number: u64) -> String {
+    record_name(&stored_change_request_address("github.com", "org/repo", number, &[]).expect("address")).expect("record name")
+}
+
+/// The record name of convoy `convoy`'s coder's decision ledger slot.
+fn ledger_name(convoy: &str) -> String {
+    record_name(&artifact_address(convoy, "coder", "decision-ledger", convoy).expect("address")).expect("record name")
+}
+
+/// [`ledger_convoy`], whose coder has also submitted PR `number`.
+async fn pr_ledger_convoy(backend: &ResourceBackend, number: u64) -> ResourceObject<Convoy> {
+    let mut convoy = ledger_convoy(backend).await;
+    submit_pr(&mut convoy, number);
+    convoy
+}
+
+/// The coder of `convoy` submits PR `number`.
+fn submit_pr(convoy: &mut ResourceObject<Convoy>, number: u64) {
+    let submit = PromiseOperation::Submit {
+        id: "pr".into(),
+        kind: PromiseKind::Pr,
+        source: PromiseSource::Crew,
+        submission: Submission {
+            reference: format!("cr/github.com/org/repo/{number}"),
+            metadata: BTreeMap::new(),
+            submitted_at: Some(chrono::Utc::now()),
+            verdict: None,
+        },
+    };
+    promises::apply(convoy.status.as_mut().expect("status"), "work", "coder", &submit);
+}
+
+/// An engine path holding `engine`, for a wake beside the reconciler that reads through it.
+fn engine_path(engine: &Arc<Recording>) -> EngineConvoyPath {
+    let path: EngineConvoyPath = Arc::new(OnceLock::new());
+    let shared: Arc<dyn EngineConvoys> = Arc::clone(engine) as Arc<dyn EngineConvoys>;
+    assert!(path.set(shared).is_ok());
+    path
+}
+
+/// The names queued within 100 ms of the first, which comes within 5 s.
+async fn woken(queue: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> BTreeSet<String> {
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), queue.recv()).await.expect("woken").expect("queue");
+    let mut woken = BTreeSet::from([first]);
+    while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(100), queue.recv()).await {
+        woken.insert(name);
+    }
+    woken
+}
+
+// Behaviour: a pass notes in its home's memory the evidence records it reads, the change request
+// its PR promise names and the artifact its ledger promise names, and an ended convoy reads none.
+#[tokio::test]
+async fn a_pass_notes_the_evidence_it_reads() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut convoy = pr_ledger_convoy(&backend, 1).await;
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
+    reconciler.prepare(&convoy).await.expect("prepare");
+    assert_eq!(engine.memory.reading("ChangeRequest", &change_request_name(1)), ["c"]);
+    assert_eq!(engine.memory.reading("Artifact", &ledger_name("c")), ["c"]);
+
+    convoy.status.as_mut().expect("status").phase = ConvoyPhase::Failed;
+    reconciler.prepare(&convoy).await.expect("prepare");
+    assert!(engine.memory.reading("ChangeRequest", &change_request_name(1)).is_empty(), "an ended convoy reads no evidence");
+    assert!(engine.memory.reading("Artifact", &ledger_name("c")).is_empty(), "an ended convoy reads no evidence");
+}
+
+// Behaviour: a pass notes the names it looks up, found or not, so a change request or ledger
+// artifact created later under one of them wakes the convoy, and a convoy that read other records
+// is not woken. A ledger's artifact is looked up by its slot's record name (convoy, role, kind
+// and subject), so an artifact the convoy has never seen reaches it under that name.
+#[tokio::test]
+async fn a_record_created_after_the_pass_wakes_the_convoy_that_looked_for_it() {
+    use flotilla_crew::convoy::EvidenceWake;
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    // The convoy's view is built on a backend of its own, so neither its ledger nor its PR exists
+    // where the pass looks.
+    let convoy = pr_ledger_convoy(&ResourceBackend::new(InMemoryBackend::default()), 1).await;
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+
+    // Probes a convoy reads, written until each wake has started and heard one.
+    engine.memory.note_evidence("probe", "ChangeRequest", (10_000..10_500).map(change_request_name).collect());
+    engine.memory.note_evidence("probe", "Artifact", (0..500).map(|n| ledger_name(&format!("probe-{n}"))).collect());
+    // A queue holds a name until the controller takes it, which a test never does, so each wake
+    // has its own queue, and the convoys under test are noted only once the wakes are open: a
+    // wake queues every convoy already noted when it opens.
+    let (change_request_sender, mut change_request_queue) = WorkQueueSender::channel();
+    let (artifact_sender, mut artifact_queue) = WorkQueueSender::channel();
+    let wakes: Vec<(Box<dyn SecondaryWatch<Primary = Convoy>>, WorkQueueSender)> = vec![
+        (
+            Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(NAMESPACE), engine: engine_path(&engine) }),
+            change_request_sender,
+        ),
+        (
+            Box::new(EvidenceWake { evidence: backend.including_replicas::<Artifact>(NAMESPACE), engine: engine_path(&engine) }),
+            artifact_sender,
+        ),
+    ];
+    let watches =
+        wakes.into_iter().map(|(wake, sender)| tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender))).collect::<Vec<_>>();
+    let mut probe = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            publish_merged_change_request(&backend, 10_000 + probe).await;
+            probe += 1;
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), change_request_queue.recv()).await {
+                assert_eq!(name, "probe");
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the change request wake heard a probe");
+    let mut probe = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            publish_ledger(&backend, &format!("probe-{probe}")).await;
+            probe += 1;
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), artifact_queue.recv()).await {
+                assert_eq!(name, "probe");
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the artifact wake heard a probe");
+
+    engine.memory.note_evidence("unrelated", "ChangeRequest", [change_request_name(2)].into());
+    engine.memory.note_evidence("unrelated", "Artifact", [ledger_name("unrelated")].into());
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
+    reconciler.prepare(&convoy).await.expect("prepare");
+    assert!(engine.promises.lock().expect("promises").is_empty(), "the pass found nothing to observe");
+
+    publish_merged_change_request(&backend, 1).await;
+    assert_eq!(woken(&mut change_request_queue).await, BTreeSet::from(["c".to_string()]), "the PR the convoy looked for wakes it alone");
+    publish_ledger(&backend, "c").await;
+    assert_eq!(woken(&mut artifact_queue).await, BTreeSet::from(["c".to_string()]), "the ledger the convoy looked for wakes it alone");
+    watches.iter().for_each(tokio::task::JoinHandle::abort);
+}
+
+// Behaviour: after a restart the home's memory is empty, so a change before a convoy's first
+// pass wakes nothing; that pass, which the controller queues for every convoy from its initial
+// listing (store-testkit controller_loop_reconciles_existing_primary_objects_from_initial_list),
+// reads the change, and notes the record so the next change wakes it.
+#[tokio::test]
+async fn after_a_restart_the_first_pass_reads_what_changed_before_it() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    // Only the PR promise, so the pass's one observation is its verdict.
+    let mut convoy = ledger_convoy(&backend).await;
+    convoy.status.as_mut().expect("status").promises.clear();
+    submit_pr(&mut convoy, 1);
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    publish_merged_change_request(&backend, 1).await;
+    assert!(engine.memory.reading("ChangeRequest", &change_request_name(1)).is_empty(), "nothing is noted before the first pass");
+
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
+    reconciler.prepare(&convoy).await.expect("prepare");
+    let verdicts = engine
+        .promises
+        .lock()
+        .expect("promises")
+        .iter()
+        .filter_map(|(_, _, operation, _)| match operation {
+            PromiseOperation::Verdict { verdict, .. } => Some((verdict.accepted, verdict.why.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(verdicts, [(true, "PR merged".to_string())], "the first pass reads the merge that came before it");
+    assert_eq!(engine.memory.reading("ChangeRequest", &change_request_name(1)), ["c"]);
+}
+
+// Behaviour: after a restart, with the home's memory empty, the controller's start-up listing gives
+// an open convoy its first pass, which notes the change request its PR names though it is not yet
+// held, and that change request's later merge wakes the convoy with no other event.
+#[tokio::test]
+async fn after_a_restart_the_start_up_pass_lets_a_later_change_wake_the_convoy() {
+    use flotilla_crew::convoy::EvidenceWake;
+    use flotilla_store::controller::{ControllerLoop, SecondaryWatch};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut convoy = ledger_convoy(&backend).await;
+    // Only the PR promise, so the merge is the pass's one observation.
+    convoy.status.as_mut().expect("status").promises.clear();
+    submit_pr(&mut convoy, 1);
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    convoys.update_status("c", &convoy.metadata.resource_version, convoy.status.as_ref().expect("status")).await.expect("status");
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let verdicts = || {
+        engine
+            .promises
+            .lock()
+            .expect("promises")
+            .iter()
+            .filter_map(|(_, _, operation, _)| match operation {
+                PromiseOperation::Verdict { verdict, .. } => Some((verdict.accepted, verdict.why.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> =
+        Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(NAMESPACE), engine: engine_path(&engine) });
+    let mut harness = crate::common::ControllerLoopHarness::new(backend.clone());
+    harness.spawn(
+        ControllerLoop {
+            primary: convoys,
+            secondaries: vec![wake],
+            reconciler: reconciler(&backend, Arc::clone(&engine))
+                .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180)),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+    harness
+        .wait_until(std::time::Duration::from_secs(5), || async {
+            engine.memory.reading("ChangeRequest", &change_request_name(1)) == ["c"]
+        })
+        .await;
+    assert!(verdicts().is_empty(), "the first pass finds no change request to judge");
+
+    publish_merged_change_request(&backend, 1).await;
+    harness.wait_until(std::time::Duration::from_secs(5), || async { !verdicts().is_empty() }).await;
+    // The change request's creation and its status each wake the convoy, so it may judge twice.
+    assert!(verdicts().iter().all(|verdict| *verdict == (true, "PR merged".to_string())), "the merge woke the convoy: {:?}", verdicts());
+    harness.shutdown().await;
+}
+
+/// What hearing one change of convoy c's change request reads, from when the wake has started,
+/// and which convoys it wakes, with `others` convoys each reading another change request. Also
+/// the Convoy reads from before the wake starts.
+async fn evidence_wake_reads(others: usize) -> (ReadSnapshot, usize, BTreeSet<String>) {
+    use flotilla_crew::convoy::EvidenceWake;
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    for n in 0..others as u64 {
+        publish_merged_change_request(&backend, 100 + n).await;
+    }
+    // A convoy reading the probes the test writes until the wake hears.
+    engine.memory.note_evidence("probe", "ChangeRequest", (10_000..10_500).map(change_request_name).collect());
+
+    let started = backend.read_snapshot();
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> =
+        Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(NAMESPACE), engine: engine_path(&engine) });
+    let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
+    // The wake opens its watch when it starts: write probes until it hears one.
+    let mut probe = 10_000;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            publish_merged_change_request(&backend, probe).await;
+            probe += 1;
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                assert_eq!(name, "probe");
+                return;
+            }
+        }
+    })
+    .await
+    .expect("woken");
+    while let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+        assert_eq!(name, "probe");
+    }
+    // The convoys under test are noted once the wake is open, which queues every convoy noted
+    // when it opens, and a queue holds a name until a controller takes it.
+    engine.memory.note_evidence("c", "ChangeRequest", [change_request_name(1)].into());
+    for n in 0..others as u64 {
+        engine.memory.note_evidence(&format!("other-{n}"), "ChangeRequest", [change_request_name(100 + n)].into());
+    }
+    let convoy_reads = backend.read_snapshot().since(&started).calls_by_kind().get("Convoy").copied().unwrap_or_default();
+
+    let before = backend.read_snapshot();
+    publish_merged_change_request(&backend, 1).await;
+    // The queue holds a name once until it is taken, so its creation and status may wake it once.
+    let woken = woken(&mut queue).await;
+    let reads = backend.read_snapshot().since(&before);
+    watch.abort();
+    (reads, convoy_reads, woken)
+}
+
+// Behaviour: a change of a change request wakes only the convoys whose pass read it, reading
+// nothing to find them, at any number of other convoys and change requests.
+#[tokio::test]
+async fn an_evidence_change_wakes_only_the_convoys_that_read_it() {
+    let (reads, convoy_reads, woken) = assert_flat_reads([0, 40], evidence_wake_reads).await;
+    reads.assert_zero("hearing a change request change");
+    assert_eq!(convoy_reads, 0, "the wake reads no convoy");
+    assert_eq!(woken, BTreeSet::from(["c".to_string()]));
+}
+
+// Behaviour: a convoy whose pass read evidence before the wake opened its watch may have missed a
+// change in between, so the wake queues every convoy noted for its kind once its watch is open,
+// and none noted only for another kind, reading no convoy.
+#[tokio::test]
+async fn an_opening_wake_queues_the_convoys_already_reading_its_kind() {
+    use flotilla_crew::convoy::EvidenceWake;
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    engine.memory.note_evidence("c", "ChangeRequest", [change_request_name(1)].into());
+    engine.memory.note_evidence("d", "ChangeRequest", [change_request_name(2)].into());
+    engine.memory.note_evidence("ledger-only", "Artifact", [ledger_name("ledger-only")].into());
+
+    let before = backend.read_snapshot();
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> =
+        Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(NAMESPACE), engine: engine_path(&engine) });
+    let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
+    assert_eq!(woken(&mut queue).await, BTreeSet::from(["c".to_string(), "d".to_string()]));
+    let reads = backend.read_snapshot().since(&before);
+    watch.abort();
+    assert_eq!(reads.calls_by_kind().get("Convoy").copied().unwrap_or_default(), 0, "{reads}");
+}
+
+/// The Forges the engine serves, or a refusal to list them while `failing`.
+#[derive(Debug, Default)]
+struct Forges {
+    failing: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
-impl flotilla_crew::ports::EngineMessages for Turns {
-    async fn view(
+impl KindRecords<Forge> for Forges {
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+        Vec::new()
+    }
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        flotilla_resources::engine_records::Ticks::AtCommit
+    }
+    fn home(&self) -> String {
+        "kiwi".into()
+    }
+    async fn get(&self, _: &str) -> Result<Option<Record<Forge>>, String> {
+        self.list().await.map(|_| None)
+    }
+    async fn list(&self) -> Result<Vec<Record<Forge>>, String> {
+        self.sources().await
+    }
+    async fn sources(&self) -> Result<Vec<Record<Forge>>, String> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("the forges are unreadable".into());
+        }
+        Ok(Vec::new())
+    }
+    async fn positioned(&self) -> Result<(Vec<Record<Forge>>, LogPosition), String> {
+        Ok((self.sources().await?, LogPosition::default()))
+    }
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::default())
+    }
+    async fn changed_since(&self, _: &LogPosition) -> Result<Since, String> {
+        self.sources().await?;
+        Ok(Since::Changed { names: Default::default(), through: LogPosition::default() })
+    }
+    async fn copies(&self, _: &str) -> Result<Vec<Record<Forge>>, String> {
+        self.sources().await
+    }
+    async fn apply(
         &self,
         _: &str,
+        _: Option<u64>,
+        _: &BTreeMap<String, String>,
+        _: &BTreeMap<String, String>,
+        _: &flotilla_resources::ForgeSpec,
+    ) -> Result<Record<Forge>, flotilla_resources::engine_records::WriteError> {
+        Err("read only".to_owned().into())
+    }
+    async fn set_status(&self, _: &str, _: u64, _: &()) -> Result<Record<Forge>, flotilla_resources::engine_records::WriteError> {
+        Err(String::from("read only").into())
+    }
+    async fn delete(&self, _: &str) -> Result<(), String> {
+        Err("read only".into())
+    }
+    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
+        Ok(futures::StreamExt::boxed(futures::stream::pending()))
+    }
+}
+
+// Behaviour: a convoy whose pass fails before it has noted which change requests it reads, and
+// that no earlier pass noted, is woken by any change request, as every open convoy once was; a
+// pass that completes notes only the ones it reads, and a later failing pass keeps that note.
+#[tokio::test]
+async fn a_convoy_failing_before_its_first_note_is_woken_by_any_change_request() {
+    use flotilla_crew::convoy::EvidenceWake;
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let forges = Arc::new(Forges { failing: true.into() });
+    backend.install_engine_kind::<Forge>(Arc::clone(&forges) as Arc<dyn KindRecords<Forge>>);
+    let mut convoy = ledger_convoy(&backend).await;
+    convoy.status.as_mut().expect("status").promises.clear();
+    submit_pr(&mut convoy, 1);
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180))
+        .with_forges(backend.definitions::<flotilla_resources::Forge>(NAMESPACE));
+
+    // A probe convoy reads change requests, written until the wake has started and heard one.
+    engine.memory.note_evidence("probe", "ChangeRequest", (10_000..10_500).map(change_request_name).collect());
+    let (sender, mut queue) = WorkQueueSender::channel();
+    let wake: Box<dyn SecondaryWatch<Primary = Convoy>> =
+        Box::new(EvidenceWake { evidence: backend.including_replicas::<ChangeRequest>(NAMESPACE), engine: engine_path(&engine) });
+    let watch = tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender));
+    let mut probe = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            publish_merged_change_request(&backend, 10_000 + probe).await;
+            probe += 1;
+            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                assert_eq!(name, "probe");
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the wake heard a probe");
+
+    reconciler.prepare(&convoy).await.expect_err("the forges are unreadable");
+    publish_merged_change_request(&backend, 2).await;
+    assert_eq!(woken(&mut queue).await, BTreeSet::from(["c".to_string()]), "an unrelated change request wakes the failing convoy");
+    watch.abort();
+
+    // A queue holds "c" until a controller takes it, so what wakes it now is read from the notes
+    // each change is matched against.
+    forges.failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    reconciler.prepare(&convoy).await.expect("prepare");
+    assert!(engine.memory.reading("ChangeRequest", &change_request_name(3)).is_empty(), "a completed pass reads only its own");
+    assert_eq!(engine.memory.reading("ChangeRequest", &change_request_name(1)), ["c"]);
+
+    forges.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    reconciler.prepare(&convoy).await.expect_err("the forges are unreadable");
+    assert!(engine.memory.reading("ChangeRequest", &change_request_name(3)).is_empty(), "a failed pass keeps the last note");
+    assert_eq!(engine.memory.reading("ChangeRequest", &change_request_name(1)), ["c"]);
+}
+
+/// The engine Message path's one answer the hold reads: until when the crew's
+/// undelivered turn holds delivery. The convoy reconciler asks it nothing else.
+struct Turns {
+    held_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[async_trait]
+impl flotilla_messaging::EngineMessages for Turns {
+    async fn holds(&self, _: &flotilla_address::Address, _: &str) -> Result<bool, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message by name")
+    }
+    async fn admitted(
+        &self,
+        _: &flotilla_address::Address,
         _: &str,
-    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+    ) -> Result<Option<flotilla_messaging::AdmittedMessage>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
-    async fn views(
+    async fn open_superseded(&self, _: &flotilla_messaging::Intent) -> Result<Option<String>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn undelivered_from(
+        &self,
+        _: &flotilla_messaging::Intent,
+    ) -> Result<Option<flotilla_messaging::SentMessage>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn awaited_reply_from(
+        &self,
+        _: &flotilla_address::Address,
+        _: &flotilla_address::Address,
+        _: &[flotilla_address::Address],
+    ) -> Result<Option<String>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn fleet_role(&self, _: &str, _: &str) -> Result<flotilla_address::Address, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler sends nothing")
+    }
+    async fn person(&self, _: &str, _: &str, _: Option<&str>) -> Result<flotilla_address::Address, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler sends nothing")
+    }
+    async fn queued_briefs(
         &self,
         _: &str,
-    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+        _: &[String],
+    ) -> Result<Vec<flotilla_messaging::SentMessage>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn latest_guidance(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Option<flotilla_messaging::SeatMessage>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn seat_standings(
+        &self,
+        _: &str,
+        _: &[String],
+        _: &[(String, String)],
+    ) -> Result<Vec<flotilla_messaging::SeatMessage>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn sent_messages(
+        &self,
+        _: &str,
+        _: &[(String, String)],
+    ) -> Result<Vec<flotilla_messaging::SentMessage>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
     async fn admit(
         &self,
         _: &str,
-        _: &str,
-        _: &flotilla_resources::MessageSpec,
-    ) -> Result<ResourceObject<flotilla_resources::Message>, flotilla_resources::ResourceError> {
+        _: &flotilla_messaging::Intent,
+    ) -> Result<flotilla_messaging::Admitted, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler admits nothing")
     }
-    async fn withdraw(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+    async fn resolve_in_reply_to(&self, _: &flotilla_messaging::Intent) -> flotilla_messaging::MessageResolution {
+        unreachable!("the convoy reconciler links no replies")
+    }
+    async fn withdraw(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), String> {
         unreachable!("the convoy reconciler withdraws nothing")
     }
     fn home(&self) -> String {
@@ -279,98 +1421,184 @@ impl flotilla_crew::ports::EngineMessages for Turns {
         &self,
         _: &str,
         _: &str,
-        _: &flotilla_resources::MessageSpec,
+        _: &flotilla_messaging::Intent,
         _: &str,
         _: &str,
-        _: Option<&str>,
+        _: Option<&flotilla_messaging::StallOf>,
     ) -> Result<bool, String> {
         unreachable!("the convoy reconciler records no replies")
     }
-    async fn end_stalls(&self, _: &str, _: &[String], _: Option<&str>, _: &str) -> Result<Vec<String>, String> {
+    async fn end_stalls(&self, _: &str, _: &[String], _: &[String], _: &str) -> Result<Vec<String>, String> {
         unreachable!("the convoy reconciler ends no stalls")
     }
-    async fn awaits_delivery(&self, namespace: &str, receiver: &str) -> Result<bool, String> {
+    async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
         assert_eq!((namespace, receiver), (NAMESPACE, "flotilla/c/work/coder"));
-        Ok(self.awaiting)
+        Ok(self.held_until)
     }
     async fn delivery_wait(&self, _: &str) -> Result<Option<String>, String> {
         Ok(None)
     }
+    fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, flotilla_resources::ResourceError> {
+        Ok(Box::pin(futures::stream::pending()))
+    }
+    fn inbox_changes(
+        &self,
+    ) -> Result<futures::stream::BoxStream<'static, flotilla_messaging::InboxChange>, flotilla_resources::ResourceError> {
+        Ok(Box::pin(futures::stream::pending()))
+    }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
-        Box::new(flotilla_messaging::MessageInbox::new(self.backend.clone(), namespace))
+        Box::new(NoCharterNotices(namespace.to_owned()))
     }
 }
 
-// Behaviour (#3894): with the engine deciding, a crew whose promises are all kept
-// derives Done only once no turn to its live session is undelivered; while one
-// is, the reconciler holds the Done and rechecks soon, since no Message watch
-// wakes it when the turn is delivered. The engine's reading of the session's
-// launch decides whether it is live, whatever its stored phase says.
+/// These tests apply no charter revision, so no pass reaches a notice: one refuses.
+struct NoCharterNotices(String);
+
+#[async_trait::async_trait]
+impl flotilla_messaging::CharterNotices for NoCharterNotices {
+    fn namespace(&self) -> &str {
+        &self.0
+    }
+    fn pass(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::default()
+    }
+    fn admission(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::default()
+    }
+    async fn sender(&self) -> Result<Option<flotilla_address::Address>, flotilla_resources::ResourceError> {
+        Ok(Some("fleet:lab/role:fleet-store".parse().expect("the fleet-store role")))
+    }
+    async fn existing(&self, _: &flotilla_address::Address, _: &str) -> Result<bool, flotilla_resources::ResourceError> {
+        Err(flotilla_resources::ResourceError::invalid("these tests admit no charter notice"))
+    }
+    async fn open_charter_notice(
+        &self,
+        _: &flotilla_address::Address,
+        _: &flotilla_address::Address,
+        _: &str,
+    ) -> Result<Option<String>, flotilla_resources::ResourceError> {
+        Err(flotilla_resources::ResourceError::invalid("these tests admit no charter notice"))
+    }
+    async fn admit(&self, _: &str, _: &flotilla_messaging::Intent) -> Result<(), flotilla_resources::ResourceError> {
+        Err(flotilla_resources::ResourceError::invalid("these tests admit no charter notice"))
+    }
+}
+
+// Behaviour (#3894): a landing convoy is delivered only once no turn to a live crew session is
+// undelivered; while one is, delivery holds, noted in its home's memory so a Message change wakes
+// it, with the hold's end as its one deadline. The engine's reading of the session's launch
+// decides whether it is live.
 #[tokio::test]
-async fn an_undelivered_turn_holds_the_engines_derived_done() {
-    use flotilla_provisioning_testkit::{Ending, TerminalFixture};
-    use flotilla_resources::{TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, CONVOY_LABEL};
-    for (awaiting, ending, stored) in [
-        (true, Ending::Ready("sid"), TerminalSessionPhase::Stopped),
-        (false, Ending::Ready("sid"), TerminalSessionPhase::Stopped),
-        (true, Ending::Released, TerminalSessionPhase::Running),
-    ] {
-        let live = matches!(ending, Ending::Ready(_));
+async fn an_undelivered_turn_holds_delivery() {
+    use flotilla_provisioning_testkit::{EngineFixture, TerminalsFixture};
+    for (awaiting, live) in [(true, true), (false, true), (true, false)] {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut convoy = ledger_convoy(&backend).await;
-        // Handed over: the engine holds the kept promises; the stored status holds none.
         let status = convoy.status.as_mut().expect("status");
-        let mut held = std::mem::take(&mut status.promises);
-        for promise in held.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("promises") {
+        status.phase = ConvoyPhase::Landing;
+        // With no subject and no checkout, the standard exit settles as a claim exit.
+        status.workflow_snapshot.as_mut().expect("snapshot").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+        for promise in status.promises.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("promises") {
             promise.state = PromiseState::Kept;
         }
-        let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
-        let session = sessions
-            .create(
-                &InputMeta::builder()
-                    .name("coder-session".into())
-                    .labels(BTreeMap::from([
-                        (CONVOY_LABEL.into(), "c".into()),
-                        (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
-                        (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
-                    ]))
-                    .build(),
-                &flotilla_resources::TerminalSessionSpec {
-                    env_ref: "env".into(),
-                    role: "coder".into(),
-                    source: TerminalSessionSource::Tool { command: "test".into() },
-                    cwd: "/workspace".into(),
-                    env: Default::default(),
-                    pool: "cleat".into(),
-                },
-            )
-            .await
-            .expect("session");
-        let session = sessions
-            .update_status(
-                "coder-session",
-                &session.metadata.resource_version,
-                &TerminalSessionStatus { phase: stored, ..Default::default() },
-            )
-            .await
-            .expect("stored phase");
-        let fixture = TerminalFixture::new(false);
-        fixture.request(&session);
-        fixture.finish(&session, ending);
+        status.crew_work.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("coder").phase = CrewWorkPhase::Done;
+        // The session's holder is the work's engine launch, which names its convoy and work.
+        let engine = EngineFixture::default();
+        let holder = engine.vessels.request("c", "work", "home");
+        let fixture = engine.terminals;
+        let mut request = TerminalsFixture::agent(&holder, "coder", "env");
+        request.session = "coder-session".into();
+        let launch = fixture.request(&request);
+        fixture.ready(&launch, "sid", &Default::default());
+        if !live {
+            fixture.release(&launch);
+        }
         let messages: flotilla_crew::ports::MessagePath = Arc::new(OnceLock::new());
-        let turns: Arc<dyn flotilla_crew::ports::EngineMessages> = Arc::new(Turns { backend: backend.clone(), awaiting });
+        let held_until = awaiting.then(|| chrono::Utc::now() + chrono::Duration::minutes(5));
+        let turns: Arc<dyn flotilla_messaging::EngineMessages> = Arc::new(Turns { held_until });
         assert!(messages.set(turns).is_ok());
-        let engine = Arc::new(Recording { holds: true, held: Some(held), ..Default::default() });
-        let reconciler = reconciler(&backend, engine)
-            .with_terminal_sessions(sessions)
-            .with_messages(messages)
-            .with_lifecycle_reads(fixture.reads.clone());
+        let engine = Arc::new(Recording { holds: true, ..Default::default() });
+        let reconciler = reconciler_reading(&backend, Arc::clone(&engine), fixture.reads.clone()).with_messages(messages);
         let prepared = reconciler.prepare(&convoy).await.expect("prepare");
         let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
-        let derived = matches!(outcome.patch, Some(ConvoyStatusPatch::DeriveCrewDone { .. }));
-        assert_eq!(derived, !(awaiting && live), "awaiting {awaiting}, live {live}: {:?}", outcome.patch);
+        let delivered = *engine.deliveries.lock().expect("deliveries") == 1;
+        assert_eq!(delivered, !(awaiting && live), "awaiting {awaiting}, live {live}");
+        let noted = engine.memory.get("c").delivery_held_until;
         if awaiting && live {
-            assert_eq!(outcome.requeue_after, Some(std::time::Duration::from_secs(1)), "a held Done rechecks soon");
+            let requeue = outcome.requeue_after.expect("the hold's end");
+            assert!(requeue > std::time::Duration::from_secs(4 * 60) && requeue <= std::time::Duration::from_secs(5 * 60), "{requeue:?}");
+            assert_eq!(noted, held_until, "the hold is noted for a Message change to wake");
+        } else {
+            assert_eq!(outcome.requeue_after, None);
+            assert_eq!(noted, None);
         }
     }
+}
+
+/// A clock that moves a millisecond on with every reading, as a real one moves between reads.
+struct TickingClock(std::sync::atomic::AtomicI64);
+
+impl flotilla_resources::Clock for TickingClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::UNIX_EPOCH
+            + chrono::Duration::days(20_000)
+            + chrono::Duration::milliseconds(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+// Behaviour: a landing convoy whose change request this home observes settles on what it reads.
+// That observation is confirmed as it is read, so the pass ages it against a clock read after the
+// read: a request closed unmerged, whose state can still change and so can age, settles the
+// convoy, never reading as stale.
+#[tokio::test]
+async fn a_closed_change_request_this_home_observes_settles_landing() {
+    let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(TickingClock(Default::default()));
+    let observed = flotilla_provisioning_testkit::EngineBackend::open_with("home-a", NAMESPACE, Arc::clone(&clock));
+    let requests = observed.backend.clone().using::<ChangeRequest>(NAMESPACE);
+    let name = change_request_name(7);
+    let spec = ChangeRequestSpec::builder()
+        .service("github.com".into())
+        .scope("org/repo".into())
+        .number(7)
+        .observing_authority("home-a".into())
+        .build();
+    let created = requests.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("change request");
+    let status = ChangeRequestStatus {
+        state: Observation::known(ObservedChangeRequestState::Closed, clock.now()),
+        head_sha: Default::default(),
+        title: Default::default(),
+        author: Default::default(),
+        review_decision: Default::default(),
+        review_requested_from_owner: Default::default(),
+        checks: Default::default(),
+        mergeable: Default::default(),
+        review: ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+    };
+    requests.update_status(&name, &created.metadata.resource_version, &status).await.expect("closed");
+
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut convoy = ledger_convoy(&backend).await;
+    convoy.spec.subjects = vec![flotilla_resources::DeclaredSubject {
+        subject: flotilla_protocol::Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "org/repo".into() },
+            id: "7".into(),
+        },
+        relationship: flotilla_protocol::Relationship::Produces,
+        issue: None,
+        change_request: None,
+    }];
+    let status = convoy.status.as_mut().expect("status");
+    status.phase = ConvoyPhase::Landing;
+    status.workflow_snapshot.as_mut().expect("snapshot").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+    for promise in status.promises.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("promises") {
+        promise.state = PromiseState::Kept;
+    }
+    status.crew_work.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("coder").phase = CrewWorkPhase::Done;
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(observed.backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180))
+        .with_clock(clock);
+    reconciler.prepare(&convoy).await.expect("prepare");
+    assert_eq!(*engine.deliveries.lock().expect("deliveries"), 1, "the closed request settles the convoy");
 }

@@ -30,7 +30,7 @@ http.workspace = true
 reqwest = { workspace = true }
 hegeltest = "=0.48.1"
 libc.workspace = true
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+flotilla-log-testkit = { path = "../flotilla-log-testkit" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

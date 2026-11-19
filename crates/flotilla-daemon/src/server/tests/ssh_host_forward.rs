@@ -23,8 +23,9 @@ use flotilla_transport::message::{unix_message_session, MessageSession};
 use tokio::{net::UnixListener, task::JoinHandle};
 
 use super::super::DaemonServer;
-use super::{ok_response, place_crew, read_session_message, test_config_store, PlacedCrew};
+use super::{launch_of, ok_response, place_crew, read_session_message, test_config_store, PlacedCrew};
 use crate::server::environment_sockets::EnvironmentSocketService;
+use crate::testkits::engine::current_launch;
 use flotilla_discovery_testkit::fake_discovery;
 
 /// Where the vessel's daemon forward leads: the per-vessel environment socket
@@ -127,7 +128,6 @@ impl Fixture {
                 connection_role: Some(flotilla_protocol::ConnectionRole::Client),
                 surface: None,
                 crew_claims: claims.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect::<BTreeMap<_, _>>(),
-                primitives: false,
             })
             .await
             .expect("hello");
@@ -165,6 +165,7 @@ async fn promise(session: &MessageSession, id: u64, promise_id: &str) {
             session,
             id,
             Request::Execute {
+                request_key: None,
                 command: Command::builder()
                     .action(CommandAction::CrewPromise {
                         context: CrewCommandContext::default(),
@@ -182,16 +183,16 @@ async fn promise(session: &MessageSession, id: u64, promise_id: &str) {
         if matches!(event.as_ref(), DaemonEvent::CommandFinished { command_id: finished, result: CommandValue::Ok, .. } if *finished == command_id)));
 }
 
-async fn promised(daemon: &flotilla_core::in_process::InProcessDaemon, convoy: &str, promise_id: &str) -> bool {
-    let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get(convoy).await.expect("convoy");
+/// Whether convoy `of`'s launch holds the coder's promise `promise_id`.
+async fn promised(daemon: &flotilla_core::in_process::InProcessDaemon, of: &str, promise_id: &str) -> bool {
+    let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get(&current_launch(daemon, of)).await.expect("convoy");
     flotilla_resources::promises::owned(convoy.status.as_ref().expect("status"), "work", "coder")
         .iter()
         .any(|promise| promise.id == promise_id)
 }
 
-const OWN: PlacedCrew<'static> = PlacedCrew { convoy: "own", vessel: "own-vessel", session: "own-session", crew: "own-crew" };
-const SECOND: PlacedCrew<'static> =
-    PlacedCrew { convoy: "second", vessel: "second-vessel", session: "second-session", crew: "second-crew" };
+const OWN: PlacedCrew<'static> = PlacedCrew { convoy: "own", session: "own-session" };
+const SECOND: PlacedCrew<'static> = PlacedCrew { convoy: "second", session: "second-session" };
 
 /// The scenario the mutation check targets: nothing outside the crew
 /// allowlist crosses the forwarded socket.
@@ -243,7 +244,10 @@ async fn single_crew_acts_through_the_forward() {
     .await;
     assert!(matches!(ok_response(artifact, 3), Response::ArtifactPut { .. }));
     let artifacts = fixture.daemon.resource_backend().using::<flotilla_resources::Artifact>("flotilla").list().await.expect("artifacts");
-    assert!(artifacts.items.iter().any(|artifact| artifact.spec.convoy == OWN.convoy && artifact.spec.kind == "review-round"));
+    assert!(artifacts
+        .items
+        .iter()
+        .any(|artifact| artifact.spec.convoy == current_launch(&fixture.daemon, OWN.convoy) && artifact.spec.kind == "review-round"));
 
     non_crew_requests_refused(&fixture, &fixture.guest).await.expect("not crew-scoped requests are refused");
     drop(session);
@@ -261,7 +265,9 @@ async fn two_crews_on_one_host_are_distinguished_by_in_band_claims() {
     assert!(refusal(request(&anonymous, 1, Request::ArtifactList { convoy: None, kind: None, subject: None }).await)
         .starts_with("CallerIdentityAmbiguous:"));
 
-    let own = fixture.connect(&fixture.guest, &[("FLOTILLA_CREW_ID", OWN.crew), ("FLOTILLA_CONVOY", OWN.convoy)]).await;
+    let own_crew = launch_of(&fixture.daemon, OWN.session);
+    let own_convoy = current_launch(&fixture.daemon, OWN.convoy);
+    let own = fixture.connect(&fixture.guest, &[("FLOTILLA_CREW_ID", own_crew.as_str()), ("FLOTILLA_CONVOY", own_convoy.as_str())]).await;
     let second = fixture.connect(&fixture.guest, &[("FLOTILLA_TERMINAL_SESSION", SECOND.session)]).await;
     promise(&own, 2, "from-own").await;
     promise(&second, 3, "from-second").await;

@@ -42,6 +42,9 @@ struct ScriptedFleet {
     /// Samples fail from this long after the fleet starts.
     sample_outage_after: Option<Duration>,
     started: Instant,
+    /// Stands in for a daemon's stores when set: a dispatch holds it for its
+    /// `dispatch_delay`, and every sample, abandon and audit waits for it.
+    store: Option<tokio::sync::Mutex<()>>,
 }
 
 impl ScriptedFleet {
@@ -65,6 +68,14 @@ impl ScriptedFleet {
             refuse_dispatches: false,
             sample_outage_after: None,
             started: Instant::now(),
+            store: None,
+        }
+    }
+
+    async fn store(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        match &self.store {
+            Some(store) => Some(store.lock().await),
+            None => None,
         }
     }
 
@@ -97,6 +108,7 @@ impl FleetTarget for ScriptedFleet {
         if self.refuse_dispatches || attempt < self.failing_dispatches {
             return Err("admission refused".into());
         }
+        let _store = self.store().await;
         tokio::time::sleep(self.dispatch_delay).await;
         let mut convoys = self.convoys.lock().expect("convoys");
         assert!(convoys.insert(name.into(), (home, mix, Instant::now(), None)).is_none(), "names are unique");
@@ -123,6 +135,7 @@ impl FleetTarget for ScriptedFleet {
     }
 
     async fn abandon(&self, _home: usize, name: &str, _reason: &str) -> Result<(), String> {
+        let _store = self.store().await;
         if self.abandons.fetch_add(1, Ordering::SeqCst) < self.failing_abandons {
             return Err("transient abandon failure".into());
         }
@@ -133,6 +146,7 @@ impl FleetTarget for ScriptedFleet {
     }
 
     async fn audit(&self) -> Result<Vec<String>, String> {
+        let _store = self.store().await;
         let call = self.audits.fetch_add(1, Ordering::SeqCst) + 1;
         if self.failing_audits.contains(&call) {
             return Err("audit unavailable".into());
@@ -141,11 +155,12 @@ impl FleetTarget for ScriptedFleet {
     }
 
     async fn sample(&self) -> Result<TargetSample, String> {
+        let _store = self.store().await;
         self.observe_fault()?;
         if self.sample_outage_after.is_some_and(|after| self.started.elapsed() >= after) {
             return Err("sampling unavailable".into());
         }
-        Ok(TargetSample { homes: vec![Default::default(); self.homes], resident_bytes: Some(1 << 20) })
+        Ok(TargetSample { homes: vec![Default::default(); self.homes], resident_bytes: Some(1 << 20), reads: Default::default() })
     }
 }
 
@@ -322,6 +337,24 @@ async fn scheduled_latency_and_drain_include_queued_admissions() {
     assert!(report.unfinished.is_empty());
     assert!(!report.open_ages_at_end.is_empty());
     assert!(report.markdown().contains("age="));
+}
+
+// Behaviour: a dispatch in flight keeps running while the driver awaits its
+// other calls on the target. In a daemon a dispatch admits through the stores
+// that samples, abandons and audits read; one left unpolled while the driver
+// awaits such a call held what that call waited for, and the run never ended
+// (load_driver_smoke hung for 43 minutes).
+#[tokio::test(start_paused = true)]
+async fn a_dispatch_in_flight_runs_while_the_driver_awaits_the_target() {
+    let mut fleet = ScriptedFleet::new(1, |_| Some((ConvoyState::Delivered, Duration::from_secs(4))));
+    fleet.dispatch_delay = Duration::from_secs(2);
+    fleet.store = Some(tokio::sync::Mutex::new(()));
+    let mut plan = plan(3);
+    plan.window = Duration::from_secs(10);
+    let report = tokio::time::timeout(Duration::from_secs(3600), run(&fleet, &plan)).await.expect("the run ends").expect("report");
+    assert!(report.dispatch.admitted > 0, "{:?}", report.dispatch);
+    assert_eq!(report.total.delivered, report.dispatch.admitted);
+    assert!(report.correctness_errors.is_empty(), "{:?}", report.correctness_errors);
 }
 
 // Warm-up must end the requested number of convoys before measuring; window

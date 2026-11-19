@@ -7,7 +7,7 @@
 //! Two temp-file stores in WAL mode with `synchronous = NORMAL`: the local home and a remote one.
 //! 10,000 convoys, nine in ten homed remotely and replicated into the local store through its
 //! change stream, one in ten local. Each convoy is admitted with two seats, two template promises,
-//! a lifetime duty and two quota classes over one of 100 projects, and has one submission on
+//! and a lifetime duty over one of 100 projects, and has one submission on
 //! promise 0, a change request of its own.
 //!
 //! Per-event cost: each local convoy takes two engine edges through `Home::apply` over the store's
@@ -27,22 +27,16 @@
 //! store keeps one object for all 10,000 convoys. Per event, the `pr` kind's ready and kept rules
 //! are judged over in-memory observations.
 
-use std::{
-    env, fs,
-    path::PathBuf,
-    process,
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{env, fs, path::PathBuf, process, sync::Arc, time::Instant};
 
 use flotilla_engine_store::{convoy_registry, StoreLog};
 use flotilla_schema::{Address, Frozen, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     kinds::{stock, Catalog, KindDefinition, Observation, Observations, Rule, Template},
     machines::convoy::{
-        AdmittedPromise, Convoy, ConvoyRequest, ConvoySpec, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, PromiseId,
-        PromiseKinds, PromiseSource, Seat, SeatName, Submit, Terms, VesselClass,
+        AdmissionBytes, AdmittedPromise, Convoy, ConvoyRequest, ConvoySpec, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority,
+        PromiseId, PromiseKinds, PromiseSource, Seat, SeatName, Submit, Terms,
     },
     Home, Ref,
 };
@@ -130,11 +124,15 @@ fn request(n: usize) -> ConvoyRequest {
         owner: seat("coder"),
     };
     ConvoyRequest {
+        launch_of: format!("c{n}"),
+        workflow_ref: "w".into(),
+        admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project(n),
         promises: [(PromiseId(0), promise("template/pr")), (PromiseId(1), promise("l2-quint"))].into(),
         duties: [(DutyId(0), Duty { owner: seat("lead"), scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
         seats: vec![
             Seat {
+                failed: None,
                 retired: false,
                 replacements: 0,
                 role: "lead".into(),
@@ -143,6 +141,7 @@ fn request(n: usize) -> ConvoyRequest {
                 supervised_by: address("supervisor"),
             },
             Seat {
+                failed: None,
                 retired: false,
                 replacements: 0,
                 role: "coder".into(),
@@ -151,7 +150,6 @@ fn request(n: usize) -> ConvoyRequest {
                 supervised_by: address("lead"),
             },
         ],
-        quota: [(VesselClass::new("standard"), 2), (VesselClass::new("large"), 1)].into(),
         priority: Priority(1),
         kinds: frozen_kinds(),
     }
@@ -244,9 +242,9 @@ const PROMISE_BY_LABEL: &str = "SELECT p.id, p.progress FROM convoy_promises p \
 fn convoy_load() {
     let world = world();
     let (_remote_db, remote_conn) = connection("remote");
-    let remote = Arc::new(Mutex::new(Store::open(remote_conn, "remote", convoy_registry().expect("registry")).expect("store")));
+    let remote = Arc::new(StoreHandle::new(Store::open(remote_conn, "remote", convoy_registry().expect("registry")).expect("store")));
     let (local_db, local_conn) = connection("local");
-    let local = Arc::new(Mutex::new(Store::open(local_conn, "local", convoy_registry().expect("registry")).expect("store")));
+    let local = Arc::new(StoreHandle::new(Store::open(local_conn, "local", convoy_registry().expect("registry")).expect("store")));
 
     let started = Instant::now();
     let mut remote_home = Home::<Convoy, StoreLog>::with_log("remote", StoreLog::new(remote.clone())).expect("declaration");

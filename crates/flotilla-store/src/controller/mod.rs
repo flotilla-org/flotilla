@@ -3,22 +3,20 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
-    },
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{WatchEvent, WatchStart};
+use flotilla_schema::reads::attributed;
 use futures::StreamExt;
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinHandle,
     time::Instant,
 };
-use tracing::{info, warn};
+use tracing::{error, warn, Instrument};
 
 use crate::{
     apply_status_patch,
@@ -27,7 +25,6 @@ use crate::{
     labels::LifecycleAuthority,
     load_metrics::ControllerLoadMetrics,
     resource::{InputMeta, Resource, ResourceObject},
-    EventRecorder, ObjectEvent,
 };
 
 #[allow(async_fn_in_trait)]
@@ -49,15 +46,17 @@ pub trait Reconciler: Send + Sync + 'static {
 
     fn finalizer_name(&self) -> Option<&'static str>;
 
-    /// Opt an object reconciler into bounded retries for repeated identical
-    /// errors. Controllers without a policy retain the ordinary resync retry
-    /// behaviour.
+    /// Opt an object reconciler into a budget for repeated identical errors.
+    /// Controllers without a policy are retried at a backoff capped at a
+    /// minute, and parked after ten identical failures until a change wakes
+    /// the object (see [`WorkQueueSender::parked`]).
     fn reconcile_error_policy(&self) -> Option<ReconcileErrorPolicy> {
         None
     }
 
-    /// A durable retry wake can suppress watch/resync attempts until its due
-    /// time. Explicit reconcile-now clears the resource's retry record.
+    /// A durable retry wake suppresses attempts until its due time, when the
+    /// loop wakes the resource itself. Explicit reconcile-now clears the
+    /// resource's retry record.
     fn retry_disposition(&self, _obj: &ResourceObject<Self::Resource>) -> Option<crate::ControllerRetryDisposition> {
         None
     }
@@ -87,8 +86,8 @@ pub trait Reconciler: Send + Sync + 'static {
 
     /// Map a finalizer failure to a status update.
     ///
-    /// Other object-scoped errors remain isolated and are retried on a later
-    /// event or resync without forcing the resource into a terminal state.
+    /// Other object-scoped errors remain isolated and are retried with backoff
+    /// without forcing the resource into a terminal state.
     fn finalizer_error_patch(
         &self,
         _obj: &ResourceObject<Self::Resource>,
@@ -118,6 +117,17 @@ pub enum ReconcileErrorExhaustion {
 }
 
 impl ReconcileErrorPolicy {
+    /// What a reconciler without its own policy gets, and what a failed read of an object gets:
+    /// retried at a backoff capped at a minute, then parked after ten identical failures, with
+    /// the error told by [`WorkQueueSender::parked`]. Any change to the object wakes it at once
+    /// and starts its count again.
+    const UNBUDGETED: Self = Self {
+        max_consecutive_failures: 10,
+        initial_backoff: Duration::from_secs(1),
+        max_backoff: Duration::from_secs(60),
+        exhaustion: ReconcileErrorExhaustion::Park,
+    };
+
     fn backoff(&self, consecutive_failures: u32) -> Duration {
         let exponent = consecutive_failures.saturating_sub(1).min(31);
         self.initial_backoff.saturating_mul(1_u32 << exponent).min(self.max_backoff)
@@ -154,17 +164,16 @@ impl FinalizerFailure {
 pub struct ReconcileOutcome<T: Resource> {
     pub patch: Option<T::StatusPatch>,
     pub actuations: Vec<Actuation>,
-    pub events: Vec<ObjectEvent>,
     pub requeue_after: Option<Duration>,
 }
 
 impl<T: Resource> ReconcileOutcome<T> {
     pub fn new(patch: Option<T::StatusPatch>) -> Self {
-        Self { patch, actuations: Vec::new(), events: Vec::new(), requeue_after: None }
+        Self { patch, actuations: Vec::new(), requeue_after: None }
     }
 
     pub fn with_actuations(patch: Option<T::StatusPatch>, actuations: Vec<Actuation>) -> Self {
-        Self { patch, actuations, events: Vec::new(), requeue_after: None }
+        Self { patch, actuations, requeue_after: None }
     }
 }
 
@@ -183,12 +192,75 @@ pub trait SecondaryWatch: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>>;
 }
 
+/// Names a controller is asked to reconcile now (an operator's reconcile-now), as a secondary
+/// watch that queues each name sent once it has started. A wake writes nothing, so it serves
+/// records admitted on the engine, which no generic write may touch.
+pub struct NamedWakes<R> {
+    names: tokio::sync::broadcast::Sender<String>,
+    kind: PhantomData<fn() -> R>,
+}
+
+impl<R> Clone for NamedWakes<R> {
+    fn clone(&self) -> Self {
+        Self { names: self.names.clone(), kind: PhantomData }
+    }
+}
+
+impl<R> Default for NamedWakes<R> {
+    fn default() -> Self {
+        Self { names: tokio::sync::broadcast::channel(64).0, kind: PhantomData }
+    }
+}
+
+impl<R> NamedWakes<R> {
+    /// Queues `name` at every controller watching these wakes; false when none is.
+    pub fn wake(&self, name: &str) -> bool {
+        self.names.send(name.to_owned()).is_ok()
+    }
+}
+
+impl<R: Resource> SecondaryWatch for NamedWakes<R> {
+    type Primary = R;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        sender: WorkQueueSender,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
+        // Subscribed as the watch is spawned, so a wake sent after that is queued.
+        let mut names = self.names.subscribe();
+        Box::pin(async move {
+            loop {
+                match names.recv().await {
+                    Ok(name) => {
+                        if sender.send(name).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    // A missed wake is covered by the controller's resync.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(missed, kind = R::API_PATHS.kind, "a controller fell behind its reconcile-now wakes");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+        })
+    }
+}
+
 /// Nonblocking, deduplicating producer for a controller's work queue.
 /// A name remains queued until the controller starts processing it.
 #[derive(Clone)]
 pub struct WorkQueueSender {
     sender: mpsc::UnboundedSender<String>,
     progress: Arc<StdMutex<QueueProgress>>,
+    every: Arc<tokio::sync::Notify>,
+    metrics: Arc<ControllerLoadMetrics>,
 }
 
 #[derive(Default)]
@@ -196,6 +268,8 @@ struct QueueProgress {
     queued: BTreeMap<String, Instant>,
     processing: Option<String>,
     last_progress: Option<DateTime<Utc>>,
+    /// Objects that stopped being retried, with the error that parked them.
+    parked: BTreeMap<String, String>,
 }
 
 impl WorkQueueSender {
@@ -204,17 +278,25 @@ impl WorkQueueSender {
     /// instants (or advance relative to them); advancing only its clock does not
     /// simulate progress in the real controller loop.
     pub fn channel() -> (Self, mpsc::UnboundedReceiver<String>) {
+        Self::metered(Arc::default())
+    }
+
+    /// A queue whose sends are counted into `metrics`.
+    fn metered(metrics: Arc<ControllerLoadMetrics>) -> (Self, mpsc::UnboundedReceiver<String>) {
         let (sender, receiver) = mpsc::unbounded_channel();
-        (Self { sender, progress: Arc::default() }, receiver)
+        (Self { sender, progress: Arc::default(), every: Arc::default(), metrics }, receiver)
     }
 
     /// Enqueue completes without suspension; the async signature keeps watch producers uniform.
     pub async fn send(&self, name: String) -> Result<(), mpsc::error::SendError<String>> {
+        self.metrics.enqueued.increment();
         let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
         if progress.queued.is_empty() && progress.processing.is_none() {
             progress.last_progress = Some(Utc::now());
         }
-        if !progress.queued.contains_key(&name) {
+        if progress.queued.contains_key(&name) {
+            self.metrics.enqueued_coalesced.increment();
+        } else {
             progress.queued.insert(name.clone(), Instant::now());
             if let Err(error) = self.sender.send(name.clone()) {
                 progress.queued.remove(&name);
@@ -222,6 +304,12 @@ impl WorkQueueSender {
             }
         }
         Ok(())
+    }
+
+    /// Asks the controller to queue every resource it holds, for a change that names none of them.
+    /// Requests made before the controller lists coalesce into one listing.
+    pub fn send_every(&self) {
+        self.every.notify_one();
     }
 
     fn start(&self, name: &str) -> Duration {
@@ -236,6 +324,36 @@ impl WorkQueueSender {
         let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
         progress.processing = None;
         progress.last_progress = Some(Utc::now());
+    }
+
+    /// Why the controller stopped retrying `name`, if it has: its last error, repeated until the
+    /// retries ran out. A change to the object wakes it again.
+    pub fn parked(&self, name: &str) -> Option<String> {
+        self.progress.lock().expect("controller work queue lock poisoned").parked.get(name).cloned()
+    }
+
+    /// Returns how many objects are parked now.
+    fn park(&self, name: &str, error: String) -> usize {
+        let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
+        progress.parked.insert(name.to_owned(), error);
+        progress.parked.len()
+    }
+
+    /// Returns how many objects are parked now.
+    fn unpark(&self, name: &str) -> usize {
+        let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
+        progress.parked.remove(name);
+        progress.parked.len()
+    }
+
+    /// When outstanding work without loop progress reaches `bound`, unless the loop progresses
+    /// first; none while the queue is idle.
+    pub fn stall_due(&self, bound: Duration) -> Option<DateTime<Utc>> {
+        let progress = self.progress.lock().expect("controller work queue lock poisoned");
+        if progress.queued.is_empty() && progress.processing.is_none() {
+            return None;
+        }
+        Some(progress.last_progress? + chrono::Duration::from_std(bound).expect("controller bound fits"))
     }
 
     /// Queue age alone is not a failure: a busy loop making progress is able.
@@ -301,15 +419,12 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelMappedWatch<W, P> {
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let resolver = backend.using::<W>(&namespace);
-            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.list()).await?;
+            // Watch before listing (see `spawn_primary_watch`).
+            let mut watch = resolver.watch(WatchStart::Now).await?;
+            let listed = resolver.list().await?;
             for object in &listed.items {
                 Self::enqueue_from_object(self.label_key, &sender, object).await?;
             }
-
-            let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
-                resolver.watch(WatchStart::resuming_from(&listed))
-            })
-            .await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -344,14 +459,12 @@ impl<W: Resource, P: Resource> SecondaryWatch for ResolverLabelMappedWatch<W, P>
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.list()).await?;
+            // Watch before listing (see `spawn_primary_watch`).
+            let mut watch = self.resolver.watch(WatchStart::Now).await?;
+            let listed = self.resolver.list().await?;
             for object in &listed.items {
                 LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, object).await?;
             }
-            let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
-                self.resolver.watch(WatchStart::resuming_from(&listed))
-            })
-            .await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -386,9 +499,8 @@ impl<W: Resource, P: Resource> SecondaryWatch for ReplicaLabelMappedWatch<W, P> 
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let mut watch =
-                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.watch()).await?;
-            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.list()).await?;
+            let mut watch = self.resolver.watch().await?;
+            let listed = self.resolver.list().await?;
             for source in &listed.items {
                 LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, &source.object).await?;
             }
@@ -400,77 +512,6 @@ impl<W: Resource, P: Resource> SecondaryWatch for ReplicaLabelMappedWatch<W, P> 
                     crate::ReadWatchEvent::DeletedByName { .. } => continue,
                 };
                 LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, &source.object).await?;
-            }
-            Ok(())
-        })
-    }
-}
-
-/// Watch federated convoys and enqueue every checkout they currently claim.
-#[derive(Clone)]
-pub struct ReplicaConvoyCheckoutWatch {
-    pub resolver: ReplicaReadResolver<crate::Convoy>,
-}
-
-impl ReplicaConvoyCheckoutWatch {
-    async fn enqueue_checkouts(
-        sender: &WorkQueueSender,
-        checkouts: &TypedResolver<crate::Checkout>,
-        convoy: &ResourceObject<crate::Convoy>,
-    ) -> Result<(), ResourceError> {
-        for checkout_name in crate::expected_checkout_refs(convoy).unwrap_or_default() {
-            sender
-                .send(checkout_name)
-                .await
-                .map_err(|_| ResourceError::other("controller queue closed while forwarding federated convoy checkout event"))?;
-        }
-        // Older and adopted convoys may lack a frozen checkout reference.
-        // Listing locally labeled checkouts on each convoy event is acceptable
-        // at current scale and avoids another watch-side index to maintain.
-        let selector = BTreeMap::from([(crate::CONVOY_LABEL.to_string(), convoy.metadata.name.clone())]);
-        for checkout in
-            crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || checkouts.list_matching_labels(&selector))
-                .await?
-                .items
-        {
-            sender
-                .send(checkout.metadata.name)
-                .await
-                .map_err(|_| ResourceError::other("controller queue closed while forwarding federated convoy checkout event"))?;
-        }
-        Ok(())
-    }
-}
-
-impl SecondaryWatch for ReplicaConvoyCheckoutWatch {
-    type Primary = crate::Checkout;
-
-    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
-        Box::new(self.clone())
-    }
-
-    fn spawn(
-        self: Box<Self>,
-        backend: ResourceBackend,
-        namespace: String,
-        sender: WorkQueueSender,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
-        Box::pin(async move {
-            let checkouts = backend.using::<crate::Checkout>(&namespace);
-            let mut watch =
-                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.watch()).await?;
-            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.list()).await?;
-            for source in &listed.items {
-                Self::enqueue_checkouts(&sender, &checkouts, &source.object).await?;
-            }
-            while let Some(event) = watch.next().await {
-                let source = match event? {
-                    crate::ReadWatchEvent::Added(source)
-                    | crate::ReadWatchEvent::Modified(source)
-                    | crate::ReadWatchEvent::Deleted(source) => source,
-                    crate::ReadWatchEvent::DeletedByName { .. } => continue,
-                };
-                Self::enqueue_checkouts(&sender, &checkouts, &source.object).await?;
             }
             Ok(())
         })
@@ -494,9 +535,7 @@ impl<W: Resource, P: Resource> LabelJoinWatch<W, P> {
             return Ok(());
         };
         let selector = BTreeMap::from([(label_key.to_string(), value.clone())]);
-        let listed =
-            crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primaries.list_matching_labels(&selector))
-                .await?;
+        let listed = primaries.list_matching_labels(&selector).await?;
         for object in listed.items {
             sender
                 .send(object.metadata.name)
@@ -523,15 +562,12 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelJoinWatch<W, P> {
         Box::pin(async move {
             let watched = backend.clone().using::<W>(&namespace);
             let primaries = backend.using::<P>(&namespace);
-            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || watched.list()).await?;
+            // Watch before listing (see `spawn_primary_watch`).
+            let mut watch = watched.watch(WatchStart::Now).await?;
+            let listed = watched.list().await?;
             for object in &listed.items {
                 Self::enqueue_matching_primaries(self.label_key, &sender, object, &primaries).await?;
             }
-
-            let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
-                watched.watch(WatchStart::resuming_from(&listed))
-            })
-            .await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -569,7 +605,6 @@ pub struct ControllerLoop<R: Reconciler> {
     pub primary: TypedResolver<R::Resource>,
     pub secondaries: Vec<Box<dyn SecondaryWatch<Primary = R::Resource>>>,
     pub reconciler: R,
-    pub resync_interval: Duration,
     pub backend: ResourceBackend,
 }
 
@@ -600,119 +635,12 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let resolver = backend.using::<crate::Repository>(namespace);
                 crate::ensure_repository(&resolver, &key, &spec).await.map(|_| ())
             }
-            Actuation::CreateEnvironment { meta, spec } => {
-                let resolver = backend.using::<crate::Environment>(namespace);
-                Self::create_if_missing(&resolver, meta, spec).await
-            }
-            Actuation::CreateClone { meta, spec } => {
-                let resolver = backend.using::<crate::Clone>(namespace);
-                Self::create_if_missing(&resolver, meta, spec).await
-            }
-            Actuation::RetryClone { name, failed_at } => {
-                let resolver = backend.using::<crate::Clone>(namespace);
-                let clone =
-                    match crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.get(&name)).await {
-                        Ok(clone) => clone,
-                        Err(ResourceError::NotFound { .. }) => return Ok(()),
-                        Err(error) => return Err(error),
-                    };
-                let current_failed_at =
-                    clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
-                if clone.status.as_ref().map(|status| status.phase) != Some(crate::ClonePhase::Failed) || current_failed_at != failed_at {
-                    return Ok(());
-                }
-                crate::apply_status_patch(&resolver, &name, &crate::CloneStatusPatch::MarkCloning).await.map(|_| ())
-            }
-            Actuation::CreateCheckout { meta, spec } => {
-                let resolver = backend.using::<crate::Checkout>(namespace);
-                Self::create_if_missing(&resolver, meta, spec).await
-            }
-            Actuation::CreateTerminalSession { meta, spec } => {
-                let resolver = backend.using::<crate::TerminalSession>(namespace);
-                Self::create_if_missing(&resolver, meta, spec).await
-            }
             Actuation::RaiseAttention { attention } => {
                 backend.attentions().raise(namespace, &attention).await.map_err(ResourceError::other)
             }
             Actuation::ClearAttention { sender, subject } => {
                 backend.attentions().clear(namespace, sender, &subject).await.map_err(ResourceError::other)
             }
-            Actuation::PruneTerminalMessages { name } => {
-                let resolver = backend.using::<crate::TerminalSession>(namespace);
-                // Re-read the acknowledgment and pending queue together on every
-                // conflict: never erase a concurrently enqueued operator brief.
-                for _ in 0..8 {
-                    let current =
-                        crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.get(&name)).await?;
-                    let mut spec = current.spec.clone();
-                    let crate::TerminalSessionSource::Agent { message: Some(head), .. } = &mut spec.source else {
-                        return Ok(());
-                    };
-                    if !head.prune_acknowledged(current.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
-                        return Ok(());
-                    }
-                    match resolver.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await {
-                        Ok(_) => return Ok(()),
-                        Err(ResourceError::Conflict { .. }) => continue,
-                        Err(error) => return Err(error),
-                    }
-                }
-                Err(ResourceError::other("terminal message pruning contention persisted"))
-            }
-            Actuation::RestartTerminalSession { name, replaces } => {
-                let resolver = backend.using::<crate::TerminalSession>(namespace);
-                let obj = resolver.get(&name).await?;
-                backend.request_terminal_replacement(&obj, replaces.as_deref(), Utc::now()).await?;
-                crate::apply_status_patch(&resolver, &name, &crate::TerminalSessionStatusPatch::MarkStarting).await.map(|_| ())
-            }
-            Actuation::DeleteTerminalSession { name } => {
-                let resolver = backend.using::<crate::TerminalSession>(namespace);
-                Self::delete_if_lifecycle_owned(&resolver, &name).await
-            }
-            Actuation::CreateVessel { meta, spec } => {
-                let resolver = backend.using::<crate::Vessel>(namespace);
-                let mut meta = meta;
-                meta.set_lifecycle_authority(LifecycleAuthority::Managed);
-                match resolver.create(&meta, &spec).await {
-                    Ok(_) => {
-                        info!(convoy = %spec.convoy_ref, vessel = %meta.name, authoring_path = "convoy_reconciler", "created Vessel");
-                        Ok(())
-                    }
-                    Err(ResourceError::Conflict { .. }) => Ok(()),
-                    Err(error) => Err(error),
-                }
-            }
-            Actuation::DeleteVessel { name } => {
-                let resolver = backend.using::<crate::Vessel>(namespace);
-                Self::delete_if_lifecycle_owned(&resolver, &name).await
-            }
-            Actuation::DeleteCheckout { name } => {
-                let resolver = backend.using::<crate::Checkout>(namespace);
-                Self::delete_if_lifecycle_owned(&resolver, &name).await
-            }
-        }
-    }
-
-    async fn create_if_missing<T: Resource>(resolver: &TypedResolver<T>, mut meta: InputMeta, spec: T::Spec) -> Result<(), ResourceError> {
-        meta.set_lifecycle_authority(LifecycleAuthority::Managed);
-        match resolver.create(&meta, &spec).await {
-            Ok(_) | Err(ResourceError::Conflict { .. }) => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn delete_if_lifecycle_owned<T: Resource>(resolver: &TypedResolver<T>, name: &str) -> Result<(), ResourceError> {
-        let object = match crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.get(name)).await {
-            Ok(object) => object,
-            Err(ResourceError::NotFound { .. }) => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        if !is_lifecycle_owned(object.metadata.lifecycle_authority()?) {
-            return Ok(());
-        }
-        match resolver.delete(name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
-            Err(err) => Err(err),
         }
     }
 
@@ -722,23 +650,24 @@ impl<R: Reconciler> ControllerLoop<R> {
         watch_exited: mpsc::UnboundedSender<WatchExited>,
         restart_backoff: Option<Duration>,
     ) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        let reads = Arc::clone(&sender.metrics.watch_reads);
+        tokio::spawn(attributed(reads, async move {
             if let Some(backoff) = restart_backoff {
                 tokio::time::sleep(backoff).await;
             }
             let result = async {
-                let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.list()).await?;
+                // Watch before listing: an engine-served kind's watch cannot resume from a listing,
+                // so a change between the two is in the list, the watch or both. Every event only
+                // queues a name for a reconcile of its current state, so one seen twice costs a
+                // repeated reconcile, never a wrong one.
+                let mut watch = primary.watch(WatchStart::Now).await?;
+                let listed = primary.list().await?;
                 for object in &listed.items {
                     sender
                         .send(object.metadata.name.clone())
                         .await
                         .map_err(|_| ResourceError::other("controller queue closed while forwarding initial primary list"))?;
                 }
-
-                let mut watch = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || {
-                    primary.watch(WatchStart::resuming_from(&listed))
-                })
-                .await?;
                 while let Some(event) = watch.next().await {
                     match event? {
                         WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -760,7 +689,7 @@ impl<R: Reconciler> ControllerLoop<R> {
             .await;
 
             let _ = watch_exited.send(WatchExited::Primary(result));
-        })
+        }))
     }
 
     fn spawn_secondary_watch(
@@ -772,17 +701,40 @@ impl<R: Reconciler> ControllerLoop<R> {
         watch_exited: mpsc::UnboundedSender<WatchExited>,
         restart_backoff: Option<Duration>,
     ) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        let reads = Arc::clone(&sender.metrics.watch_reads);
+        tokio::spawn(attributed(reads, async move {
             if let Some(backoff) = restart_backoff {
                 tokio::time::sleep(backoff).await;
             }
             let result = watch.spawn(backend, namespace, sender).await;
             let _ = watch_exited.send(WatchExited::Secondary { index, result });
-        })
+        }))
+    }
+
+    /// Queues `name` again after `delay`, unless a requeue of it is already scheduled.
+    async fn requeue_after(
+        scheduled_requeues: &Arc<Mutex<HashSet<String>>>,
+        sender: &WorkQueueSender,
+        name: &str,
+        delay: Duration,
+    ) -> bool {
+        let mut scheduled = scheduled_requeues.lock().await;
+        if !scheduled.insert(name.to_owned()) {
+            return false;
+        }
+        let scheduled_requeues = Arc::clone(scheduled_requeues);
+        let sender = sender.clone();
+        let name = name.to_owned();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            scheduled_requeues.lock().await.remove(&name);
+            let _ = sender.send(name).await;
+        });
+        true
     }
 
     async fn resync_all(primary: &TypedResolver<R::Resource>, sender: &WorkQueueSender) -> Result<HashSet<String>, ResourceError> {
-        let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.list()).await?;
+        let listed = primary.list().await?;
         let mut live_names = HashSet::with_capacity(listed.items.len());
         for object in listed.items {
             live_names.insert(object.metadata.name.clone());
@@ -805,39 +757,33 @@ impl<R: Reconciler> ControllerLoop<R> {
     where
         <R::Resource as Resource>::Status: Default,
     {
-        self.run_with_optional_heartbeat(None).await
+        self.run_instrumented(Arc::default()).await
     }
 
-    /// Exposes progress of the loop itself to an independent watchdog.
-    pub async fn run_with_heartbeat(self, heartbeat: Arc<AtomicU64>) -> Result<(), ResourceError>
+    /// [`Self::run`], also recording wakes, reconcile latency, requeues,
+    /// resyncs and the engine reads of its passes and watches into `metrics`
+    /// for load measurement (#3206).
+    pub async fn run_observed(self, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
     where
         <R::Resource as Resource>::Status: Default,
     {
-        self.run_with_optional_heartbeat(Some(heartbeat)).await
+        self.run_instrumented(metrics).await
     }
 
-    /// [`Self::run_with_heartbeat`], also recording wakes, reconcile latency,
-    /// requeues and resyncs into `metrics` for load measurement (#3206).
-    pub async fn run_observed(self, heartbeat: Arc<AtomicU64>, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
+    async fn run_instrumented(self, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
     where
         <R::Resource as Resource>::Status: Default,
     {
-        self.run_instrumented(Some(heartbeat), metrics).await
+        attributed(Arc::clone(&metrics.reads), self.run_passes(metrics)).await
     }
 
-    async fn run_with_optional_heartbeat(self, heartbeat: Option<Arc<AtomicU64>>) -> Result<(), ResourceError>
+    async fn run_passes(self, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
     where
         <R::Resource as Resource>::Status: Default,
     {
-        self.run_instrumented(heartbeat, Arc::default()).await
-    }
-
-    async fn run_instrumented(self, heartbeat: Option<Arc<AtomicU64>>, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
-    where
-        <R::Resource as Resource>::Status: Default,
-    {
-        let ControllerLoop { primary, secondaries, reconciler, resync_interval, backend } = self;
-        let (sender, mut receiver) = WorkQueueSender::channel();
+        let ControllerLoop { primary, secondaries, reconciler, backend } = self;
+        let (sender, mut receiver) = WorkQueueSender::metered(Arc::clone(&metrics));
+        let every = Arc::clone(&sender.every);
         let (watch_exited_tx, mut watch_exited_rx) = mpsc::unbounded_channel();
         let primary_watch = Self::spawn_primary_watch(primary.clone(), sender.clone(), watch_exited_tx.clone(), None);
         let secondary_templates = secondaries;
@@ -859,47 +805,68 @@ impl<R: Reconciler> ControllerLoop<R> {
         let mut watches = ControllerWatches { primary: primary_watch, secondaries: secondary_watches };
         let mut secondary_started = vec![Instant::now(); secondary_templates.len()];
         let mut secondary_backoff = vec![WATCH_RESTART_BACKOFF / 2; secondary_templates.len()];
-        let mut resync = tokio::time::interval(resync_interval);
-        resync.tick().await;
         let mut pending: VecDeque<String> = VecDeque::new();
         let scheduled_requeues = Arc::new(Mutex::new(HashSet::new()));
         let mut object_failures = BTreeMap::<String, ObjectFailure>::new();
         let mut finalizer_failures = BTreeMap::<String, FinalizerFailure>::new();
+        let mut read_failures = BTreeMap::<String, u32>::new();
 
         loop {
             sender.made_progress();
-            if let Some(heartbeat) = &heartbeat {
-                heartbeat.fetch_add(1, Ordering::Relaxed);
-            }
             if let Some(name) = pending.pop_front() {
                 metrics.wakes.increment();
+                metrics.woke(&name);
                 metrics.queue_peak.observe(pending.len() as u64 + 1);
                 let woke_at = Instant::now();
                 metrics.queue_wait.record(sender.start(&name));
                 let _busy = metrics.busy();
-                let object =
-                    match crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || primary.get(&name)).await {
-                        Ok(object) => object,
-                        Err(ResourceError::NotFound { .. }) => {
-                            object_failures.remove(&name);
-                            finalizer_failures.remove(&name);
-                            continue;
-                        }
-                        Err(err) => {
-                            warn!(
+                let object = match primary.get(&name).await {
+                    Ok(object) => {
+                        read_failures.remove(&name);
+                        object
+                    }
+                    Err(ResourceError::NotFound { .. }) => {
+                        read_failures.remove(&name);
+                        object_failures.remove(&name);
+                        finalizer_failures.remove(&name);
+                        metrics.parked.set(sender.unpark(&name) as u64);
+                        continue;
+                    }
+                    Err(err) => {
+                        let limit = ReconcileErrorPolicy::UNBUDGETED.max_consecutive_failures;
+                        let failures = read_failures.entry(name.clone()).or_insert(0);
+                        // A parked object is read again only when a change wakes it: count afresh.
+                        *failures = if *failures >= limit { 1 } else { failures.saturating_add(1) };
+                        if *failures >= limit {
+                            error!(
                                 resource_kind = R::Resource::API_PATHS.kind,
                                 resource = %name,
                                 %err,
-                                "controller failed to read object; leaving it for a later resync",
+                                failures = *failures,
+                                "controller could not read object; parked until it changes",
                             );
+                            metrics.parked.set(sender.park(&name, format!("reading it failed {} times: {err}", *failures)) as u64);
                             continue;
                         }
-                    };
+                        let delay = ReconcileErrorPolicy::UNBUDGETED.backoff(*failures);
+                        warn!(
+                            resource_kind = R::Resource::API_PATHS.kind,
+                            resource = %name,
+                            %err,
+                            retry_in = ?delay,
+                            "controller failed to read object; retrying it",
+                        );
+                        Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await;
+                        continue;
+                    }
+                };
                 if finalizer_failures.get(&name).is_some_and(|failure| failure.creation_timestamp != object.metadata.creation_timestamp) {
                     finalizer_failures.remove(&name);
                 }
                 let mut attempted_reconcile = false;
                 let mut attempted_finalizer = false;
+                // One span per reconcile, named by kind: what it logs carries its trace.
+                let span = tracing::info_span!("reconcile", kind = R::Resource::API_PATHS.kind);
                 let result = async {
                     let lifecycle_owned = is_lifecycle_owned(object.metadata.lifecycle_authority()?);
                     if !lifecycle_owned
@@ -971,13 +938,17 @@ impl<R: Reconciler> ControllerLoop<R> {
                     if let Some(disposition) = reconciler.retry_disposition(&object) {
                         match disposition {
                             crate::ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at => {
+                                let delay = (next_attempt_at - Utc::now()).to_std().unwrap_or_default();
+                                Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await;
                                 return Ok(());
                             }
                             crate::ControllerRetryDisposition::Terminal { .. } => return Ok(()),
                             _ => {}
                         }
                     }
-                    if let Some(failure) = object_failures.get(&name) {
+                    // A budgeted failure holds the object until its retry; an unbudgeted one is only
+                    // retried, and any change still wakes it at once.
+                    if let Some(failure) = object_failures.get(&name).filter(|_| reconciler.reconcile_error_policy().is_some()) {
                         if !degraded_needs_reconcile && (failure.terminal || Instant::now() < failure.retry_at) {
                             return Ok(());
                         }
@@ -988,38 +959,18 @@ impl<R: Reconciler> ControllerLoop<R> {
                     for actuation in outcome.actuations {
                         Self::apply_actuation(&primary.backend, &primary.namespace, actuation).await?;
                     }
-                    let recorder = EventRecorder::new(primary.backend.clone());
-                    for event in outcome.events {
-                        if let Err(event_error) = recorder.record(event, Utc::now()).await {
-                            warn!(
-                                resource_kind = R::Resource::API_PATHS.kind,
-                                resource = %name,
-                                %event_error,
-                                "controller failed to record outcome event",
-                            );
-                        }
-                    }
                     if let Some(patch) = outcome.patch {
                         Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await?;
                     }
                     if let Some(delay) = outcome.requeue_after {
                         metrics.requeues.increment();
-                        let mut scheduled = scheduled_requeues.lock().await;
-                        if !scheduled.insert(name.clone()) {
+                        if !Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await {
                             metrics.requeues_coalesced.increment();
-                        } else {
-                            let scheduled_requeues = Arc::clone(&scheduled_requeues);
-                            let sender = sender.clone();
-                            let name = name.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(delay).await;
-                                scheduled_requeues.lock().await.remove(&name);
-                                let _ = sender.send(name).await;
-                            });
                         }
                     }
                     Ok(())
                 }
+                .instrument(span.clone())
                 .await;
                 if attempted_reconcile {
                     metrics.reconcile.record(woke_at.elapsed());
@@ -1029,19 +980,11 @@ impl<R: Reconciler> ControllerLoop<R> {
                 }
                 match result {
                     Err(ResourceError::FinalizerPending) => {
-                        let mut scheduled = scheduled_requeues.lock().await;
-                        if scheduled.insert(name.clone()) {
-                            let scheduled_requeues = Arc::clone(&scheduled_requeues);
-                            let sender = sender.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                scheduled_requeues.lock().await.remove(&name);
-                                let _ = sender.send(name).await;
-                            });
-                        }
+                        Self::requeue_after(&scheduled_requeues, &sender, &name, Duration::from_secs(1)).await;
                     }
                     Ok(()) if attempted_reconcile => {
                         object_failures.remove(&name);
+                        metrics.parked.set(sender.unpark(&name) as u64);
                     }
                     Ok(()) if attempted_finalizer => {
                         finalizer_failures.remove(&name);
@@ -1049,17 +992,15 @@ impl<R: Reconciler> ControllerLoop<R> {
                     Ok(()) => {}
                     Err(err) => {
                         if attempted_reconcile {
-                            let recorder = EventRecorder::new(primary.backend.clone());
-                            if let Err(event_error) =
-                                recorder.record(ObjectEvent::for_object(&object, "ReconcileFailed", err.to_string()), Utc::now()).await
-                            {
-                                warn!(resource_kind = R::Resource::API_PATHS.kind, resource = %name, %event_error, "controller failed to record reconcile event");
-                            }
+                            // Counted with the kind's controller failures (#3206); told here, not stored.
+                            span.in_scope(
+                                || warn!(resource_kind = R::Resource::API_PATHS.kind, resource = %name, error = %err, "reconcile failed"),
+                            );
                         }
                         let mut terminal = false;
                         // A finalizer or its removal write may fail without
                         // changing status. Retry it with bounded backoff instead
-                        // of waiting for resync or spinning on a watch event.
+                        // of spinning on a watch event.
                         let mut retry_after = attempted_finalizer.then(|| {
                             let consecutive_failures =
                                 finalizer_failures.get(&name).map_or(1, |failure| failure.consecutive_failures.saturating_add(1));
@@ -1075,71 +1016,78 @@ impl<R: Reconciler> ControllerLoop<R> {
                             delay
                         });
                         if attempted_reconcile {
-                            if let Some(policy) = reconciler.reconcile_error_policy() {
-                                let message = err.to_string();
-                                let previous = object_failures.get(&name);
-                                let consecutive_failures = previous
-                                    .filter(|previous| previous.failure.message == message)
-                                    .map_or(1, |previous| previous.failure.consecutive_failures.saturating_add(1));
-                                let failure = ReconcileFailure { message, consecutive_failures };
-                                let exhausted = consecutive_failures >= policy.max_consecutive_failures;
-                                terminal = exhausted && policy.exhaustion == ReconcileErrorExhaustion::Park;
-                                let delay = policy.backoff(consecutive_failures);
-                                if exhausted {
-                                    if let Some(patch) = reconciler.reconcile_degraded_patch(&object, &failure) {
-                                        match apply_status_patch(&primary, &name, &patch).await {
-                                            Ok(_) => {}
-                                            Err(ResourceError::NotFound { .. }) => {
-                                                object_failures.remove(&name);
-                                                continue;
-                                            }
-                                            Err(patch_error) => {
-                                                terminal = false;
-                                                warn!(
-                                                    resource_kind = R::Resource::API_PATHS.kind,
-                                                    resource = %name,
-                                                    %patch_error,
-                                                    "controller failed to record degraded reconcile condition; retrying",
-                                                );
-                                            }
+                            let unbudgeted = reconciler.reconcile_error_policy().is_none();
+                            let policy = reconciler.reconcile_error_policy().unwrap_or(ReconcileErrorPolicy::UNBUDGETED);
+                            let message = err.to_string();
+                            let previous = object_failures.get(&name);
+                            // A parked unbudgeted object is reconciled again only when a change
+                            // wakes it: count afresh.
+                            let consecutive_failures = previous
+                                .filter(|previous| previous.failure.message == message && !(unbudgeted && previous.terminal))
+                                .map_or(1, |previous| previous.failure.consecutive_failures.saturating_add(1));
+                            let failure = ReconcileFailure { message, consecutive_failures };
+                            let exhausted = consecutive_failures >= policy.max_consecutive_failures;
+                            terminal = exhausted && policy.exhaustion == ReconcileErrorExhaustion::Park;
+                            let delay = policy.backoff(consecutive_failures);
+                            if exhausted {
+                                if let Some(patch) = reconciler.reconcile_degraded_patch(&object, &failure) {
+                                    match apply_status_patch(&primary, &name, &patch).await {
+                                        Ok(_) => {}
+                                        Err(ResourceError::NotFound { .. }) => {
+                                            object_failures.remove(&name);
+                                            continue;
                                         }
-                                    } else {
-                                        terminal = false;
+                                        Err(patch_error) => {
+                                            terminal = false;
+                                            warn!(
+                                                resource_kind = R::Resource::API_PATHS.kind,
+                                                resource = %name,
+                                                %patch_error,
+                                                "controller failed to record degraded reconcile condition; retrying",
+                                            );
+                                        }
                                     }
+                                } else if !unbudgeted {
+                                    terminal = false;
                                 }
-                                if !terminal {
-                                    retry_after = Some(delay);
-                                }
-                                object_failures.insert(
-                                    name.clone(),
-                                    ObjectFailure {
-                                        failure,
-                                        creation_timestamp: object.metadata.creation_timestamp,
-                                        retry_at: Instant::now() + delay,
-                                        terminal,
-                                    },
+                            }
+                            if !terminal {
+                                retry_after = Some(delay);
+                            } else if unbudgeted {
+                                error!(
+                                    resource_kind = R::Resource::API_PATHS.kind,
+                                    resource = %name,
+                                    %err,
+                                    failures = failure.consecutive_failures,
+                                    "controller parked object until it changes",
                                 );
+                                let parked = sender.park(
+                                    &name,
+                                    format!("reconciling it failed {} times: {}", failure.consecutive_failures, failure.message),
+                                );
+                                metrics.parked.set(parked as u64);
                             }
+                            object_failures.insert(
+                                name.clone(),
+                                ObjectFailure {
+                                    failure,
+                                    creation_timestamp: object.metadata.creation_timestamp,
+                                    retry_at: Instant::now() + delay,
+                                    terminal,
+                                },
+                            );
                         }
-                        warn!(
-                            resource_kind = R::Resource::API_PATHS.kind,
-                            resource = %name,
-                            %err,
-                            terminal,
-                            "controller failed to reconcile object; other objects will continue",
-                        );
+                        span.in_scope(|| {
+                            warn!(
+                                resource_kind = R::Resource::API_PATHS.kind,
+                                resource = %name,
+                                %err,
+                                terminal,
+                                "controller failed to reconcile object; other objects will continue",
+                            )
+                        });
                         if let Some(delay) = retry_after {
-                            let mut scheduled = scheduled_requeues.lock().await;
-                            if scheduled.insert(name.clone()) {
-                                let scheduled_requeues = Arc::clone(&scheduled_requeues);
-                                let sender = sender.clone();
-                                let name = name.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(delay).await;
-                                    scheduled_requeues.lock().await.remove(&name);
-                                    let _ = sender.send(name).await;
-                                });
-                            }
+                            Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await;
                         }
                     }
                 }
@@ -1156,7 +1104,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                     pending.push_front(name);
                 }
-                _ = resync.tick() => {
+                _ = every.notified() => {
                     let _busy = metrics.busy();
                     let live_names = Self::resync_all(&primary, &sender).await?;
                     metrics.resyncs.increment();
@@ -1180,6 +1128,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                             // Relisting a secondary can enqueue objects that still exist, but
                             // cannot reveal a deletion missed while its watch was expired.
                             let live_names = Self::resync_all(&primary, &sender).await?;
+                            metrics.resyncs.increment();
+                            metrics.resync_enqueued.add(live_names.len() as u64);
                             finalizer_failures.retain(|name, _| live_names.contains(name));
                             let backoff = next_secondary_backoff(secondary_backoff[index], secondary_started[index].elapsed());
                             secondary_backoff[index] = backoff;
@@ -1215,8 +1165,7 @@ pub async fn delete_lifecycle_owned_matching<T: Resource>(
     resolver: &TypedResolver<T>,
     selector: &BTreeMap<String, String>,
 ) -> Result<(), ResourceError> {
-    let listed =
-        crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.list_matching_labels(selector)).await?;
+    let listed = resolver.list_matching_labels(selector).await?;
     for object in listed.items {
         if !is_lifecycle_owned(object.metadata.lifecycle_authority()?) {
             continue;

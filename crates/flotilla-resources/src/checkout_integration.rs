@@ -1,5 +1,5 @@
 //! Pure checkout integration identity and evidence helpers.
-use crate::{Checkout, CheckoutIntegrationStatus, Convoy, ResourceObject, CHANGE_REQUEST_ID_LABEL};
+use crate::{CheckoutIntegrationStatus, Convoy, ResourceObject};
 use std::collections::BTreeSet;
 
 /// Evidence detail used when the checkout cannot establish its convoy association.
@@ -12,19 +12,27 @@ pub fn checkout_observation_lacks_convoy_association(status: &CheckoutIntegratio
     status.landed.details.iter().any(|detail| detail == CONVOY_ASSOCIATION_UNAVAILABLE)
 }
 
-/// Resolve the change request associated with one of a convoy's checkouts.
-///
-/// A checkout can probe one change request only when the convoy's subject set
-/// identifies exactly one active request in its repository.
-pub fn convoy_change_request_id_for_checkout(
+/// The change request a convoy associates with its branch in repository `repo_ref`, as its
+/// checkout there was labelled with when it was made: the one it is bound to there, else the one
+/// active subject it has in that repository.
+pub fn convoy_change_request_id(
     convoy: &ResourceObject<Convoy>,
-    checkout: &ResourceObject<Checkout>,
+    repo_ref: &crate::RepositoryKey,
     forges: &[crate::ForgeSpec],
 ) -> Option<String> {
-    if let Some(id) = checkout.metadata.labels.get(CHANGE_REQUEST_ID_LABEL) {
-        return Some(id.clone());
+    if let Some(bound) = convoy.spec.change_request.as_ref().filter(|bound| bound.repository_ref == *repo_ref) {
+        return Some(bound.id.clone());
     }
-    let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref())?;
+    subject_change_request_id(convoy, repo_ref, forges)
+}
+
+/// The one active change request subject a convoy has in repository `repo_ref`.
+fn subject_change_request_id(
+    convoy: &ResourceObject<Convoy>,
+    repo_ref: &crate::RepositoryKey,
+    forges: &[crate::ForgeSpec],
+) -> Option<String> {
+    let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *repo_ref)?;
     let repository = crate::address::repository_address(&repository.url, forges).ok()?;
     // Subjects keep the spelling they were recorded with; compare the
     // repositories they name.
@@ -82,7 +90,7 @@ pub fn remote_ref_for_branch(branch: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CheckoutSpec, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ObservedCheckoutSpec};
+    use crate::{ConvoyRepositorySpec, ConvoySpec, ConvoyStatus};
     use chrono::Utc;
     fn lab_forge() -> crate::ForgeSpec {
         crate::ForgeSpec::builder()
@@ -147,7 +155,10 @@ mod tests {
             workspace_slug: "project-map".into(),
             subpaths: Vec::new(),
         };
-        let mut convoy = resource("convoy", ConvoySpec::builder().workflow_ref("work".into()).repositories(vec![repository]).build());
+        let mut convoy = resource(
+            "convoy",
+            ConvoySpec::builder().workflow_ref("work".into()).project_ref("project".into()).repositories(vec![repository]).build(),
+        );
         let mut status = ConvoyStatus::default();
         status.discover_subject(
             flotilla_protocol::Subject {
@@ -160,18 +171,8 @@ mod tests {
             Utc::now(),
         );
         convoy.status = Some(status);
-        let checkout = resource(
-            "checkout",
-            CheckoutSpec::Observed(ObservedCheckoutSpec {
-                r#ref: "feature".into(),
-                path: "/checkout".into(),
-                repo_ref,
-                host_ref: "host".into(),
-                is_main: false,
-            }),
-        );
         let forge = lab_forge();
-        assert_eq!(convoy_change_request_id_for_checkout(&convoy, &checkout, &[forge]), Some("12".into()));
-        assert_eq!(convoy_change_request_id_for_checkout(&convoy, &checkout, &[]), None);
+        assert_eq!(convoy_change_request_id(&convoy, &repo_ref, &[forge]), Some("12".into()));
+        assert_eq!(convoy_change_request_id(&convoy, &repo_ref, &[]), None);
     }
 }

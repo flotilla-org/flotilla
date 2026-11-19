@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use flotilla_protocol::{
-    BlobSyncStatus, DaemonEvent, EnvironmentId, EnvironmentInfo, HostIdentity, HostListEntry, HostListResponse, HostName,
-    HostProvidersResponse, HostSnapshot, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey, SystemInfo,
-    ToolInventory, TopologyResponse, TopologyRoute,
+    DaemonEvent, EnvironmentId, EnvironmentInfo, HostIdentity, HostListEntry, HostListResponse, HostName, HostProvidersResponse,
+    HostSnapshot, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey, SystemInfo, ToolInventory,
+    TopologyResponse, TopologyRoute,
 };
 use tokio::sync::RwLock;
 
@@ -25,7 +25,6 @@ struct HostState {
 #[derive(Debug, Clone, Default, bon::Builder)]
 pub struct HostQueryDetails {
     pub visible_environments: Option<Vec<EnvironmentInfo>>,
-    pub blob_sync: Option<BlobSyncStatus>,
 }
 
 /// Plane-A peer state supplied by the host; projections only join it to read models.
@@ -196,7 +195,6 @@ impl HostRegistry {
             HostStatusContext { local_node: &self.local_node, configured: &configured, node_connectivity: &node_connectivity, counts },
         );
         if let Some(details) = self.query_details.read().await.get(environment_id) {
-            response.blob_sync = details.blob_sync.clone();
             if let Some(environments) = &details.visible_environments {
                 response.visible_environments = environments.clone();
             }

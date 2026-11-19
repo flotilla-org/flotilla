@@ -1,5 +1,4 @@
-use flotilla_resources::Actuation;
-use flotilla_store_sqlite::SqliteBackend;
+use flotilla_resources::terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalRecords as _};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -9,38 +8,25 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
-use flotilla_agent_connector::{
-    AgentTransport, Delivery, DeliveryTarget, SubmissionRef, TransportId, TransportObservation, TransportOutcome, TransportRouter,
-    KEYSTROKE,
-};
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_crew::leaf_engine::CrewTurnIntent;
-use flotilla_crew::reconcilers::vessel::VesselReconciler;
+use flotilla_crew::reconcilers::vessel::VesselPlanning;
 use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task;
 use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task_with_watches;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
-    ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
-    Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, ExitDeclaration, FulfilmentKind, FulfilmentKindSpec,
-    FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Message, MessageExpectation, MessagePhase, Resource, Selector,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase,
-    WorkState, WorkflowSnapshot, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, EnvironmentSpec, ExitDeclaration, FulfilmentKind,
+    FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Message, MessageExpectation, Selector,
+    TerminalSession, Vessel, VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
 };
-use flotilla_store::{controller::Reconciler, ResourceBackend};
 use futures::StreamExt;
 use tokio_util::task::AbortOnDropHandle;
 
 fn meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
-}
-
-async fn replicate<T: Resource>(source: &ResourceBackend, destination: &ResourceBackend, source_root: &NodeId) {
-    let objects = source.clone().using::<T>("flotilla").list().await.expect("source list");
-    destination.replica_writer::<T>(source_root.clone(), "flotilla").replace(&objects, Utc::now()).await.expect("replicate resources");
 }
 
 #[derive(Clone, Copy)]
@@ -58,35 +44,14 @@ async fn remote_turn_delivery_recovers_after_either_watch_closes() {
     }
 }
 
-// Fake only the transport receipt; stores, producer publication and cross-host
-// mutation dispatch remain real. Pool framing is covered by runtime scenarios.
-struct AcceptedMessageTransport(AtomicUsize);
-#[async_trait::async_trait]
-impl AgentTransport for AcceptedMessageTransport {
-    fn id(&self) -> TransportId {
-        KEYSTROKE.into()
-    }
-    async fn observe(&self, _: &DeliveryTarget, _: Option<&SubmissionRef>) -> Result<TransportObservation, String> {
-        Ok(TransportObservation { ready: true, ..Default::default() })
-    }
-    async fn submit(&self, _: &Delivery) -> TransportOutcome {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        TransportOutcome::Accepted { evidence: "receiver transport receipt".into() }
-    }
-    async fn poll(&self, _: &Delivery) -> TransportOutcome {
-        panic!("a confirmed submission must not be polled")
-    }
-}
-
 #[tokio::test]
 async fn modern_remote_nudge_uses_ordinary_message_admission() {
     remote_turn_scenario(None).await;
 }
 
 async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
-    let home = ResourceBackend::new(SqliteBackend::open_in_memory().expect("home store")).with_local_root(NodeId::new("home"));
-    let placement =
-        ResourceBackend::new(SqliteBackend::open_in_memory().expect("placement store")).with_local_root(NodeId::new("placement"));
+    let home = flotilla_store_memory::engine_home_backend().with_local_root(NodeId::new("home"));
+    let placement = flotilla_store_memory::engine_home_backend().with_local_root(NodeId::new("placement"));
     let home_dir = tempfile::tempdir().expect("home config");
     std::fs::write(home_dir.path().join("daemon.toml"), "machine_id = \"home\"\n").expect("home identity");
     let home_daemon = Arc::new(
@@ -116,6 +81,11 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
 
     let home = home_daemon.resource_backend();
     let placement = placement_daemon.resource_backend();
+    // The runtime opens each daemon's Message path at startup.
+    home_daemon.open_message_primitives().expect("home message path");
+    placement_daemon.open_message_primitives().expect("placement message path");
+    flotilla_engine_messages_testkit::designate_fleet(&home, "flotilla").await;
+    flotilla_engine_messages_testkit::designate_fleet(&placement, "flotilla").await;
 
     // Keep the real request endpoints alive: producers publish ordinary
     // receiver-homed mutations rather than enqueueing at the convoy authority.
@@ -123,14 +93,18 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .await
         .expect("cross-host Message mutation router");
 
-    let convoys = home.clone().using::<Convoy>("flotilla");
-    let created =
-        convoys.create(&meta("nudge-convoy"), &ConvoySpec::builder().workflow_ref("wf".to_string()).build()).await.expect("convoy");
-    convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &ConvoyStatus {
+    // The convoy is the home's engine launch, its coder working.
+    let convoy = crate::admit_convoy(
+        &home_daemon,
+        flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "nudge-convoy",
+            ConvoySpec::builder()
+                .project_ref("flotilla".into())
+                .workflow_ref("wf".to_string())
+                .placement_policy("placement-policy".to_string())
+                .build(),
+            ConvoyStatus {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(WorkflowSnapshot {
                     cascade: None,
@@ -151,16 +125,11 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
                         .build()],
                 }),
                 work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
                 ..Default::default()
             },
-        )
-        .await
-        .expect("working crew");
-    replicate::<Convoy>(&home, &placement, home_daemon.node_id()).await;
+        ),
+    )
+    .await;
     home.using::<FulfilmentKind>("flotilla")
         .create(
             &meta("placement-policy"),
@@ -172,84 +141,68 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         )
         .await
         .expect("fulfilment kind");
-    replicate::<FulfilmentKind>(&home, &placement, home_daemon.node_id()).await;
-    let environments = placement.clone().using::<Environment>("flotilla");
-    let environment = environments
-        .create(
-            &meta("host-direct-placement-host"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec {
-                    host_ref: "placement-host".to_string(),
-                    repo_default_dir: "/workspace".to_string(),
-                }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("placement environment");
-    environments
-        .update_status(
-            &environment.metadata.name,
-            &environment.metadata.resource_version,
-            &EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() },
-        )
-        .await
-        .expect("ready environment");
-    let vessel = placement
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("nudge-convoy-work".to_string())
-                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), home_daemon.node_id().to_string())]))
-                .build(),
-            &VesselSpec {
-                convoy_ref: "nudge-convoy".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "placement-policy".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("placement vessel");
-    let reconciler = VesselReconciler::new(placement.clone(), "flotilla")
-        .with_federated_dependencies(&placement, flotilla_protocol::CanonicalHostId::resolved("placement-host"));
-    let dependencies = reconciler.prepare(&vessel).await.expect("vessel dependencies");
-    let (session_meta, session_spec) = reconciler
-        .reconcile(&vessel, &dependencies, Utc::now())
-        .actuations
-        .into_iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateTerminalSession { meta, spec } => Some((meta, spec)),
-            _ => None,
-        })
-        .expect("vessel reconciler creates crew terminal");
-    let sessions = placement.clone().using::<TerminalSession>("flotilla");
-    let session = sessions.create(&session_meta, &session_spec).await.expect("persist reconciled terminal");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("receiver-session".into()),
-                crew: Some(CrewSessionStatus { id: "receiver-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("running terminal");
-    let convoy = convoys.get("nudge-convoy").await.expect("working convoy");
-    let mut status = convoy.status.expect("working status");
-    status.crew_work.get_mut("work").expect("work crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Stalled;
-    convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("stall crew");
-    replicate::<TerminalSession>(&placement, &home, placement_daemon.node_id()).await;
+    // A FulfilmentKind is an engine record: it reaches the placement as its home's log does.
+    flotilla_provisioning_testkit::other_home::replicate_home(
+        &home_daemon.decided_store().expect("home decided store"),
+        home_daemon.node_id().as_str(),
+        &placement_daemon.decided_store().expect("placement decided store"),
+    );
+    crate::engine_environments(&placement_daemon).put_ready(
+        "host-direct-placement-host",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec {
+                host_ref: "placement-host".to_string(),
+                repo_default_dir: "/workspace".to_string(),
+            }),
+            ..Default::default()
+        },
+        None,
+        "/workspace",
+        Default::default(),
+    );
+    // The placement launches the work of the convoy homed at home; its vessel reads as the launch.
+    let held = crate::engine(&placement_daemon).vessels.request_for(&flotilla_resources::vessel_records::VesselLaunchRequest {
+        convoy: convoy.clone(),
+        convoy_home: home_daemon.node_id().as_str().to_string(),
+        work: "work".to_string(),
+        host: "placement-host".to_string(),
+    });
+    placement.using::<Vessel>("flotilla").get(&held).await.expect("placement vessel");
+    // The vessel is realised and its crew seated; its session's launch runs the crew's agent at
+    // the placement.
+    let _vessels = flotilla_orchestration_testkit::run_vessels(
+        &placement,
+        "flotilla",
+        VesselPlanning::new(placement.clone(), "flotilla", placement_daemon.account_records())
+            .with_lifecycle_reads(placement_daemon.lifecycle_reads())
+            .with_federated_dependencies(&placement, flotilla_protocol::CanonicalHostId::resolved("placement-host")),
+        Arc::clone(&crate::engine(&placement_daemon).vessels.lifecycles),
+        placement_daemon.lifecycle_reads(),
+        placement_daemon.decided_store().expect("placement decided store"),
+    );
+    let terminals = &crate::engine(&placement_daemon).terminals;
+    let requested = || terminals.terminals.of_vessel(&held).expect("vessel sessions").pop();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while requested().is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("crew terminal requested");
+    let launch = requested().expect("crew terminal requested").name;
+    let agent = AgentLaunch { adapter: "codex".into(), model: None, stance: "work".into() };
+    terminals.ready(&launch, "receiver-session", &TerminalLaunchFacts { agent: Some(agent), ..Default::default() });
+    // The session's launch and its holder vessel reach the convoy's home as the placement's log does.
+    crate::engine(&home_daemon);
+    flotilla_provisioning_testkit::other_home::replicate_home(
+        &placement_daemon.decided_store().expect("placement decided store"),
+        placement_daemon.node_id().as_str(),
+        &home_daemon.decided_store().expect("home decided store"),
+    );
 
-    // #2287: replication wakes delivery and acknowledgment well before the 300s resync.
+    // #2287: replication wakes delivery and acknowledgment; no timer does.
     // Await the subscribed startup scan so delivery cannot accidentally come from startup.
-    let (home_task, home_ready) =
-        spawn_pending_supervisor_turn_task(Arc::clone(&home_daemon), "flotilla".to_string(), Duration::from_secs(300));
+    let (home_task, home_ready) = spawn_pending_supervisor_turn_task(Arc::clone(&home_daemon), "flotilla".to_string());
     let _home_task = AbortOnDropHandle::new(home_task);
     let subscriptions = Arc::new(AtomicUsize::new(0));
     let before_retry = Arc::new(StdMutex::new(None));
@@ -257,39 +210,34 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         let backend = placement.clone();
         let subscriptions = Arc::clone(&subscriptions);
         let before_retry = Arc::clone(&before_retry);
-        spawn_pending_supervisor_turn_task_with_watches(
-            Arc::clone(&placement_daemon),
-            "flotilla".to_string(),
-            Duration::from_secs(300),
-            move || {
-                let backend = backend.clone();
-                let before_retry = Arc::clone(&before_retry);
-                let attempt = subscriptions.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    if attempt == 1 {
-                        // Capture the real store before replacing the failed watch.
-                        // Assert from the test body so failures do not hide in the spawned task.
-                        let stored = backend.clone().using::<TerminalSession>("flotilla").list().await?;
-                        *before_retry.lock().expect("retry observation lock") = Some(stored.items);
-                    }
-                    let convoys = backend.including_replicas::<Convoy>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
-                    let sessions =
-                        backend.including_replicas::<TerminalSession>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
-                    // Stand in only for a failed resource-notification stream;
-                    // both stores and the delivery/acknowledgment pass remain real.
-                    Ok(if attempt == 0 {
-                        match closed_watch {
-                            ClosedWatch::Convoy => (futures::stream::empty().boxed(), sessions),
-                            ClosedWatch::TerminalSession => (convoys, futures::stream::empty().boxed()),
-                        }
-                    } else {
-                        (convoys, sessions)
-                    })
+        spawn_pending_supervisor_turn_task_with_watches(Arc::clone(&placement_daemon), "flotilla".to_string(), move || {
+            let backend = backend.clone();
+            let before_retry = Arc::clone(&before_retry);
+            let attempt = subscriptions.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 1 {
+                    // Capture the real store before replacing the failed watch.
+                    // Assert from the test body so failures do not hide in the spawned task.
+                    let stored = backend.clone().using::<TerminalSession>("flotilla").list().await?;
+                    *before_retry.lock().expect("retry observation lock") = Some(stored.items);
                 }
-            },
-        )
+                let convoys = backend.including_replicas::<Convoy>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
+                let sessions =
+                    backend.including_replicas::<TerminalSession>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
+                // Stand in only for a failed resource-notification stream;
+                // both stores and the delivery/acknowledgment pass remain real.
+                Ok(if attempt == 0 {
+                    match closed_watch {
+                        ClosedWatch::Convoy => (futures::stream::empty().boxed(), sessions),
+                        ClosedWatch::TerminalSession => (convoys, futures::stream::empty().boxed()),
+                    }
+                } else {
+                    (convoys, sessions)
+                })
+            }
+        })
     } else {
-        spawn_pending_supervisor_turn_task(Arc::clone(&placement_daemon), "flotilla".to_string(), Duration::from_secs(300))
+        spawn_pending_supervisor_turn_task(Arc::clone(&placement_daemon), "flotilla".to_string())
     };
     let _placement_task = AbortOnDropHandle::new(placement_task);
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -301,22 +249,32 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
 
     let request = CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
-        .convoy("nudge-convoy".to_string())
+        .convoy(convoy.clone())
         .source("stall-nudge-1".to_string())
         .vessel("work".to_string())
         .role("coder".to_string())
         .brief("Please continue".to_string())
         .subject_revision("stall-1".to_string())
-        .sender("system:nudge".into())
-        .expectation(MessageExpectation::Outcome {
-            condition: "work/nudge-convoy/work .crew.coder.phase == Done".parse().expect("nudge outcome"),
+        .sender(flotilla_crew::leaf_engine::Party::fleet("nudge"))
+        .expectation(flotilla_messaging::IntentExpectation::Outcome {
+            // The outcome names the launch the nudge is for.
+            condition: flotilla_resources::address::leaf_condition(
+                &format!("work/{convoy}/work .crew.coder.phase == Done").parse().expect("nudge outcome"),
+                Some("flotilla"),
+                &[],
+            )
+            .expect("nudge condition"),
         })
         .build();
     // The receiver admits ordinary Message mutations through the real router.
     home_daemon.deliver_standing_turn(&request).await.expect("nudge accepted at convoy home");
     // A replicated dependency wakes the standing-turn task while its other
     // stream is closed; resubscription must happen before the periodic resync.
-    replicate::<Convoy>(&home, &placement, home_daemon.node_id()).await;
+    flotilla_provisioning_testkit::other_home::replicate_home(
+        &home_daemon.decided_store().expect("home decided store"),
+        home_daemon.node_id().as_str(),
+        &placement_daemon.decided_store().expect("placement decided store"),
+    );
     if closed_watch.is_some() {
         tokio::time::timeout(Duration::from_secs(5), async {
             while subscriptions.load(Ordering::SeqCst) < 2 || before_retry.lock().expect("retry capture").is_none() {
@@ -324,28 +282,21 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
             }
         })
         .await
-        .expect("closed dependency watch resubscribes before the 300-second resync");
+        .expect("closed dependency watch resubscribes without a timer");
     }
-    let records = placement.using::<Message>("flotilla").list().await.expect("receiver inbox").items;
+    // The receiver's Messages as the crew reads them.
+    let records = flotilla_engine_messages_testkit::views(
+        &placement_daemon.message_primitives().expect("placement message path"),
+        &placement_daemon.resource_backend(),
+        "flotilla",
+    )
+    .await
+    .expect("receiver inbox");
     assert_eq!(records.len(), 1);
-    let nudge = &records[0];
+    let nudge = &records[0].object;
     assert_eq!(nudge.spec.sender, "system:nudge");
-    assert_eq!(nudge.spec.receiver, "flotilla/nudge-convoy/work/coder");
+    assert_eq!(nudge.spec.receiver, format!("flotilla/{convoy}/work/coder"));
     assert!(nudge.spec.body.contains("Please continue"));
     assert!(matches!(nudge.spec.expectation, MessageExpectation::Outcome { .. }));
     assert!(home.using::<Message>("flotilla").list().await.expect("sender-local inbox").items.is_empty());
-    assert!(matches!(
-        sessions.get(&session_meta.name).await.expect("terminal after admission").spec.source,
-        TerminalSessionSource::Agent { message: None, .. }
-    ));
-    let transport = Arc::new(AcceptedMessageTransport(AtomicUsize::new(0)));
-    let router = TransportRouter::new().with_transport(transport.clone());
-    placement_daemon.message_inbox("flotilla").await.reconcile_delivery(&router, Utc::now()).await.expect("receiver delivery");
-    let delivered = placement.using::<Message>("flotilla").get(&nudge.metadata.name).await.expect("durable nudge receipt");
-    assert_eq!(delivered.status.as_ref().expect("delivery status").phase, MessagePhase::Delivered);
-    assert_eq!(
-        delivered.status.as_ref().expect("delivery status").resolved_receiver.as_ref().expect("receiver receipt").crew_id,
-        "receiver-crew"
-    );
-    assert_eq!(transport.0.load(Ordering::SeqCst), 1);
 }

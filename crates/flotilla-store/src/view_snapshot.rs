@@ -27,6 +27,10 @@ impl ViewSnapshot {
     pub fn new(root: Option<NodeId>) -> Self {
         Self { root, ..Self::default() }
     }
+    /// The backend serving what the snapshot holds, read-only.
+    pub fn into_backend(self) -> crate::ResourceBackend {
+        crate::ResourceBackend::new(self)
+    }
     pub fn insert<T: Resource>(&mut self, namespace: &str, listed: ReadResourceList<T>) -> Result<(), ResourceError> {
         let mut index = crate::QueryIndex::default();
         let mut items = BTreeMap::new();
@@ -141,7 +145,7 @@ impl Store for ViewSnapshot {
     }
     async fn query_raw(&self, kind: ResourceKind, namespace: &str, query: &crate::StoreQuery) -> Result<crate::QueryResult, ResourceError> {
         query.validate(kind)?;
-        if query.message.is_some() || query.replica_shadowing.is_some() {
+        if query.message.is_some() {
             return Err(ResourceError::invalid("snapshot queries support labels, declared fields and owners"));
         }
         let resolved = crate::resolve_semijoins(self, kind, namespace, query).await?;
@@ -157,13 +161,7 @@ impl Store for ViewSnapshot {
             .into_iter()
             .map(|identity| partition.items[&identity].as_ref().clone())
             .filter(|item| !query.suppress_self_origin || !self.shadowed(item, partition))
-            .filter(|item| {
-                if query.replicas_only {
-                    matches!(item.provenance, ResourceProvenance::Replica { .. })
-                } else {
-                    query.include_replicas || matches!(item.provenance, ResourceProvenance::Local)
-                }
-            })
+            .filter(|item| query.include_replicas || matches!(item.provenance, ResourceProvenance::Local))
             .collect();
         self.observe(kind, query.read_operation(), items.len());
         crate::sort_query_items(&mut items);
@@ -201,7 +199,6 @@ impl Store for ViewSnapshot {
                 let item = &partition.items[identity];
                 (!query.suppress_self_origin || !self.shadowed(item, partition))
                     && (query.include_replicas || matches!(item.provenance, ResourceProvenance::Local))
-                    && (!query.replicas_only || matches!(item.provenance, ResourceProvenance::Replica { .. }))
             })
             .collect();
         Ok(partition.index.values(field, &names))
@@ -223,14 +220,6 @@ impl Store for ViewSnapshot {
         self.named(resource_kind, namespace, name, true)?.map(|item| item.object).ok_or_else(|| ResourceError::not_found(name))
     }
     async fn current_position_raw(&self, _resource_kind: ResourceKind, _namespace: &str) -> Result<ResourcePosition, ResourceError> {
-        Err(self.unsupported_operation("mutating or watching view snapshots"))
-    }
-    async fn digest_raw(
-        &self,
-        _resource_kind: ResourceKind,
-        _namespace: &str,
-        _query: &DigestQuery,
-    ) -> Result<PartitionDigest, ResourceError> {
         Err(self.unsupported_operation("mutating or watching view snapshots"))
     }
     async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
@@ -387,7 +376,7 @@ mod tests {
             }
             let mut snapshot = ViewSnapshot::new(Some(NodeId::new("home")));
             snapshot.insert("test", ReadResourceList { items }).unwrap();
-            let backend = crate::ResourceBackend::new(snapshot);
+            let backend = snapshot.into_backend();
             let reads = backend.including_replicas::<Issue>("test");
             let copies = reads.get_all("subject").await.unwrap();
             assert_eq!(copies.items.len(), 2);

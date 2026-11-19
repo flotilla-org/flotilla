@@ -1,7 +1,7 @@
 // Pure typed rules, followed by this resource kind's store and named operations.
 module agent_session {
   type Channel = Detached | Attached
-  type Activity = Working | Idle | Interrupted
+  type Activity = Working | NeedsInput | Idle | Interrupted
   type Observation = Unobserved | Observed({ activity: Activity, since: int, cause: str })
   type State = Live({ channel: Channel, observation: Observation }) | Ended({ reason: EndReason, observation: Observation })
   type EndReason = Completed | Lost

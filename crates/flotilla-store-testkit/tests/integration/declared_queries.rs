@@ -655,7 +655,6 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
         (MessageQuery::Active { receiver: Some("flotilla/receiver".into()) }, 1),
         (MessageQuery::Active { receiver: Some("flotilla/other".into()) }, 0),
         (MessageQuery::ReplyTo { name: "parent".into() }, 2),
-        (MessageQuery::Batch { id: "batch".into() }, 1),
         (MessageQuery::AuditBefore { before: chrono::DateTime::from_timestamp(1, 0).unwrap() }, 0),
         (MessageQuery::AuditBefore { before: chrono::DateTime::from_timestamp(2, 0).unwrap() }, 1),
     ] {
@@ -844,14 +843,6 @@ async fn shared_query_contract() {
         seed(backend).await;
         contract(backend, backend).await;
     }
-    // Durable local names deliberately differ from the composing memory store:
-    // remote exists only durably; shadow exists only in the memory local set.
-    let durable = ResourceBackend::new(SqliteBackend::open_in_memory().unwrap());
-    durable.using::<Convoy>("flotilla").create(&convoy_meta("remote"), &convoy_spec("template")).await.unwrap();
-    durable.using::<Convoy>("flotilla").create(&convoy_meta("durable-only"), &convoy_spec("template")).await.unwrap();
-    let hybrid = ResourceBackend::new(InMemoryBackend::observed_with_durable_replicas(durable));
-    seed(&hybrid).await;
-    contract(&hybrid, &hybrid).await;
     let server = ResourceBackend::new(InMemoryBackend::default());
     seed(&server).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

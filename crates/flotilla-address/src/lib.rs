@@ -79,6 +79,8 @@ pub enum Error {
     OfNotLast,
     /// An `artifact:` segment with no `of:` subject.
     ArtifactWithoutSubject,
+    /// An `artifact:` segment under a host's role, which is an inbox with no artifact slots.
+    ArtifactUnderHostRole,
     /// A `repo` segment built without its forge's case rule.
     RepositoryNeedsForge,
     /// A forge id or host that no Forge resolves.
@@ -115,6 +117,7 @@ impl fmt::Display for Error {
             Error::OfNotAfterArtifact => f.write_str("`of:` is valid only directly after an `artifact:` segment"),
             Error::OfNotLast => f.write_str("an artifact's `of:` subject ends its address"),
             Error::ArtifactWithoutSubject => f.write_str("an artifact address ends with `of:<subject>`"),
+            Error::ArtifactUnderHostRole => f.write_str("a host's role has no artifact slots"),
             Error::RepositoryNeedsForge => f.write_str("a repository is built with its forge, which decides its case"),
             Error::UnresolvedForge(name) => write!(f, "`{name}` does not resolve to a Forge"),
             Error::Unrecognised(input) => write!(f, "`{input}` is not an address, short form or URL"),

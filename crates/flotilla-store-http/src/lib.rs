@@ -73,14 +73,6 @@ impl Store for HttpBackend {
     async fn current_position_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourcePosition, ResourceError> {
         HttpBackend::current_position_raw(self, resource_kind, namespace).await
     }
-    async fn digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        query: &DigestQuery,
-    ) -> Result<PartitionDigest, ResourceError> {
-        HttpBackend::digest_raw(self, resource_kind, namespace, query).await
-    }
     async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
         let result = HttpBackend::list_raw(self, resource_kind, namespace).await?;
         if let Some(observer) = self.read_observer() {
@@ -206,17 +198,6 @@ impl Store for HttpBackend {
         }
         Ok(result)
     }
-    async fn list_replica_sources_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-    ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
-        let result = HttpBackend::list_replica_sources_raw(self, resource_kind, namespace).await?;
-        if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, ReadOperation::List, result.items.len());
-        }
-        Ok(result)
-    }
     async fn list_read_view_raw(
         &self,
         resource_kind: ResourceKind,
@@ -235,13 +216,6 @@ impl Store for HttpBackend {
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
         HttpBackend::watch_including_replicas_raw(self, resource_kind, namespace).await
-    }
-    async fn watch_replica_sources_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
-        HttpBackend::watch_replica_sources_raw(self, resource_kind, namespace).await
     }
     async fn watch_read_view_raw(
         &self,

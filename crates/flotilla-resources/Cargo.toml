@@ -11,6 +11,7 @@ default = []
 [dependencies]
 uuid = { workspace = true, features = ["v4"] }
 flotilla-address = { path = "../flotilla-address" }
+flotilla-cbor = { path = "../flotilla-cbor" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-schema = { path = "../flotilla-schema" }
 serde = { workspace = true, features = ["derive"] }

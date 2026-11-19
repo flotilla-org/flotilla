@@ -1,9 +1,9 @@
 #[cfg(test)]
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::path::Path;
 
 use flotilla_discovery::generation_turnover::{AdvanceRequest, GenerationTurnovers, RecordedSession, RecordedSessions};
-use flotilla_resources::{Environment, HostCondition, TerminalSession, TerminalSessionPhase};
+use flotilla_resources::HostCondition;
 use flotilla_terminal::generation::{persist, RollReport};
 
 use super::InProcessDaemon;
@@ -13,49 +13,38 @@ impl InProcessDaemon {
         GenerationTurnovers::new(&self.environment_manager, &self.pool_turnovers)
     }
 
+    /// This home's running terminal launches, from the engine's records (#3108).
     async fn recorded_sessions(&self) -> Result<RecordedSessions, String> {
-        let namespaces = self.resource_backend.local_namespaces::<TerminalSession>().await.map_err(|error| error.to_string())?;
+        let reads = self.lifecycle_reads();
+        let terminals = reads.terminals()?;
         let mut recorded = RecordedSessions::default();
-        for namespace in namespaces {
-            let sessions = self.resource_backend.using::<TerminalSession>(&namespace).list().await.map_err(|error| error.to_string())?;
-            for session in sessions.items {
-                let (session, _) = flotilla_store::read_terminal_session(self.lifecycle_reads(), &session, None)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                // Stopped records are retained history, not live daemon inventory.
-                if session.status.as_ref().is_none_or(|status| status.phase != TerminalSessionPhase::Running) {
-                    continue;
+        // Ended launches are retained history, not live daemon inventory.
+        for record in terminals.live()?.into_iter().filter(|record| record.is_running()) {
+            let vessel = record.vessel.clone().unwrap_or_else(|| record.environment.clone());
+            let endpoint = record.cleat_endpoint();
+            let (pool, env_ref) = (record.pool, record.environment);
+            if let Some(environment) = self.resolve_environment_ref(&env_ref) {
+                recorded.running.push(RecordedSession { pool, environment: environment.id, vessel, endpoint });
+            } else if endpoint.is_some() {
+                let environment =
+                    self.lifecycle_reads().environments().ok().and_then(|environments| environments.find(&env_ref).ok().flatten());
+                if environment
+                    .as_ref()
+                    .and_then(|environment| environment.spec.docker.as_ref())
+                    .is_some_and(|docker| docker.host_ref == self.environment_manager.local_host_id().as_str())
+                {
+                    let message = format!("{vessel}: {pool} environment runner unavailable: {}", env_ref);
+                    recorded.unavailable.push((pool, message));
+                } else if environment
+                    .as_ref()
+                    .and_then(|environment| environment.spec.host_direct.as_ref())
+                    .is_some_and(|direct| direct.host_ref == self.environment_manager.local_host_id().as_str())
+                {
+                    let message = format!("host {pool} environment unavailable: {}", env_ref);
+                    recorded.unavailable.push((pool, message));
                 }
-                let vessel = session
-                    .metadata
-                    .labels
-                    .get(flotilla_resources::VESSEL_REF_LABEL)
-                    .cloned()
-                    .unwrap_or_else(|| session.spec.env_ref.clone());
-                let pool = session.spec.pool.clone();
-                let endpoint = session.status.and_then(|status| status.cleat_endpoint);
-                if let Some(environment) = self.resolve_environment_ref(&session.spec.env_ref) {
-                    recorded.running.push(RecordedSession { pool, environment: environment.id, vessel, endpoint });
-                } else if endpoint.is_some() {
-                    let environment = self.resource_backend.using::<Environment>(&namespace).get(&session.spec.env_ref).await.ok();
-                    if environment
-                        .as_ref()
-                        .and_then(|environment| environment.spec.docker.as_ref())
-                        .is_some_and(|docker| docker.host_ref == self.environment_manager.local_host_id().as_str())
-                    {
-                        let message = format!("{vessel}: {pool} environment runner unavailable: {}", session.spec.env_ref);
-                        recorded.unavailable.push((pool, message));
-                    } else if environment
-                        .as_ref()
-                        .and_then(|environment| environment.spec.host_direct.as_ref())
-                        .is_some_and(|direct| direct.host_ref == self.environment_manager.local_host_id().as_str())
-                    {
-                        let message = format!("host {pool} environment unavailable: {}", session.spec.env_ref);
-                        recorded.unavailable.push((pool, message));
-                    }
-                    // Missing or foreign environment evidence cannot establish
-                    // actionable local host skew.
-                }
+                // Missing or foreign environment evidence cannot establish
+                // actionable local host skew.
             }
         }
         Ok(recorded)
@@ -95,22 +84,23 @@ mod tests {
     use crate::testkits::in_process_ext::InProcessDiscoveryExt;
     use std::{collections::HashMap, sync::Arc};
 
-    use async_trait::async_trait;
-    use flotilla_protocol::{qualified_path::HostId, result_set::CleatEndpoint, EnvironmentId, HostName, ImageId};
-    use flotilla_resources::{ConditionValue, InputMeta, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus};
-    use flotilla_store::ResourceBackend;
-
     use super::*;
     use crate::testkits::discovery::fake_discovery;
     use crate::testkits::discovery::fake_discovery_with_runner;
     use crate::testkits::discovery::DiscoveryMockRunner;
     use crate::testkits::replay::testing::MockRunner;
+    use async_trait::async_trait;
     use flotilla_config::ConfigStore;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_environment::environment::ProvisionedEnvironment;
     use flotilla_environment::environment::ProvisionedMount;
+    use flotilla_protocol::{qualified_path::HostId, EnvironmentId, HostName, ImageId};
     use flotilla_provider_runtime::CommandRunner;
+    use flotilla_resources::{
+        terminal_records::{TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecords},
+        ConditionValue,
+    };
 
     struct Contained {
         id: EnvironmentId,
@@ -153,7 +143,7 @@ mod tests {
     async fn inventory_includes_contained_and_named_crew_roots_but_excludes_remote_hosts() {
         let directory = tempfile::tempdir().expect("config");
         std::fs::write(directory.path().join("daemon.toml"), "machine_id = \"cleat-roll-test\"\n").expect("daemon identity");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = engine_home_backend();
         let daemon = InProcessDaemon::new_with_resource_backend(
             vec![],
             Arc::new(ConfigStore::with_base(directory.path())),
@@ -182,84 +172,28 @@ mod tests {
                 Some(HostId::new("another-host")),
             )
             .expect("remote environment");
-        for (namespace, name, env_ref, daemon_name) in [
-            ("other-namespace", "first", "contained-work", "named@1"),
-            ("flotilla", "second", "contained-work", "named@2"),
-            ("other-namespace", "remote", "remote", "foreign@1"),
-        ] {
-            let resolver = backend.using::<TerminalSession>(namespace);
-            let session = resolver
-                .create(
-                    &InputMeta::builder().name(name.to_string()).build(),
-                    &TerminalSessionSpec::builder()
-                        .env_ref(env_ref.to_string())
-                        .role("coder".to_string())
-                        .source(TerminalSessionSource::Tool { command: "sh".into() })
-                        .cwd("/".to_string())
-                        .pool("cleat".to_string())
-                        .build(),
-                )
-                .await
-                .expect("crew session");
-            resolver
-                .update_status(
-                    name,
-                    &session.metadata.resource_version,
-                    &TerminalSessionStatus {
-                        cleat_endpoint: Some(CleatEndpoint {
-                            runtime_root: "/named/crew root".into(),
-                            daemon: daemon_name.into(),
-                            session: name.into(),
-                        }),
-                        phase: TerminalSessionPhase::Running,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("record crew endpoint");
+        let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
+        let terminals = flotilla_provisioning_testkit::TerminalsFixture::over("home", Arc::clone(&environments.store));
+        for (name, env_ref, daemon_name) in
+            [("first", "contained-work", "named@1"), ("second", "contained-work", "named@2"), ("remote", "remote", "foreign@1")]
+        {
+            running_session(&terminals, name, None, env_ref, "/named/crew root", daemon_name);
         }
         let environment_spec = serde_json::from_value(serde_json::json!({"docker": {
             "host_ref": daemon.environment_manager.local_host_id().as_str(), "image": "pinned-image"
         }}))
         .expect("stored Docker spec");
-        backend
-            .using::<Environment>("other-namespace")
-            .create(&InputMeta::builder().name("unregistered-vessel-env".into()).build(), &environment_spec)
-            .await
-            .expect("stored environment");
-        let sessions = backend.using::<TerminalSession>("other-namespace");
-        let missing = sessions
-            .create(
-                &InputMeta::builder()
-                    .name("missing-runner".into())
-                    .labels(std::collections::BTreeMap::from([(flotilla_resources::VESSEL_REF_LABEL.into(), "work-vessel".into())]))
-                    .build(),
-                &TerminalSessionSpec::builder()
-                    .env_ref("unregistered-vessel-env".into())
-                    .role("coder".into())
-                    .source(TerminalSessionSource::Tool { command: "sh".into() })
-                    .cwd("/".into())
-                    .pool("cleat".into())
-                    .build(),
-            )
-            .await
-            .expect("retained vessel session");
-        sessions
-            .update_status(
-                "missing-runner",
-                &missing.metadata.resource_version,
-                &TerminalSessionStatus {
-                    phase: TerminalSessionPhase::Running,
-                    cleat_endpoint: Some(CleatEndpoint {
-                        runtime_root: "/var/lib/flotilla/cleat".into(),
-                        daemon: "default@1".into(),
-                        session: "coder".into(),
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("retained endpoint");
+        environments.request("unregistered-vessel-env", &environment_spec, None);
+        running_session(
+            &terminals,
+            "missing-runner",
+            Some("work-vessel"),
+            "unregistered-vessel-env",
+            "/var/lib/flotilla/cleat",
+            "default@1",
+        );
+        let environments = environments.serving_terminals(Arc::clone(&terminals.terminals) as Arc<dyn TerminalRecords>);
+        daemon.install_lifecycle_reads(environments.reads.clone()).expect("engine reads");
         let report = daemon
             .post_install_cleat(
                 &directory.path().join("missing-release/bin/cleat"),
@@ -303,7 +237,7 @@ mod tests {
     async fn daemon_with_unadopted_vessel() -> (Arc<InProcessDaemon>, tempfile::TempDir) {
         let directory = tempfile::tempdir().expect("config");
         std::fs::write(directory.path().join("daemon.toml"), "machine_id = \"cleat-roll-test\"\n").expect("daemon identity");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = engine_home_backend();
         let daemon = InProcessDaemon::new_with_resource_backend(
             vec![],
             Arc::new(ConfigStore::with_base(directory.path())),
@@ -317,41 +251,37 @@ mod tests {
             "host_ref": daemon.environment_manager.local_host_id().as_str(), "image": "pinned-image"
         }}))
         .expect("stored Docker spec");
-        backend.using::<Environment>("flotilla").create(&InputMeta::builder().name("vessel-env".into()).build(), &spec).await.expect("env");
-        let sessions = backend.using::<TerminalSession>("flotilla");
-        let session = sessions
-            .create(
-                &InputMeta::builder()
-                    .name("coder".into())
-                    .labels(std::collections::BTreeMap::from([(flotilla_resources::VESSEL_REF_LABEL.into(), "work-vessel".into())]))
-                    .build(),
-                &TerminalSessionSpec::builder()
-                    .env_ref("vessel-env".into())
-                    .role("coder".into())
-                    .source(TerminalSessionSource::Tool { command: "sh".into() })
-                    .cwd("/".into())
-                    .pool("cleat".into())
-                    .build(),
-            )
-            .await
-            .expect("session");
-        sessions
-            .update_status(
-                "coder",
-                &session.metadata.resource_version,
-                &TerminalSessionStatus {
-                    phase: TerminalSessionPhase::Running,
-                    cleat_endpoint: Some(CleatEndpoint {
-                        runtime_root: "/var/lib/flotilla/cleat".into(),
-                        daemon: "default@1".into(),
-                        session: "coder".into(),
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("endpoint");
+        let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
+        environments.request("vessel-env", &spec, None);
+        let terminals = flotilla_provisioning_testkit::TerminalsFixture::over("home", Arc::clone(&environments.store));
+        running_session(&terminals, "coder", Some("work-vessel"), "vessel-env", "/var/lib/flotilla/cleat", "default@1");
+        let environments = environments.serving_terminals(Arc::clone(&terminals.terminals) as Arc<dyn TerminalRecords>);
+        daemon.install_lifecycle_reads(environments.reads.clone()).expect("engine reads");
         (daemon, directory)
+    }
+
+    /// A tool session `name` running in `env_ref` for `vessel`, its cleat daemon `daemon` under
+    /// `runtime_root`.
+    fn running_session(
+        terminals: &flotilla_provisioning_testkit::TerminalsFixture,
+        name: &str,
+        vessel: Option<&str>,
+        env_ref: &str,
+        runtime_root: &str,
+        daemon: &str,
+    ) {
+        let launch = terminals.request(&TerminalLaunchRequest {
+            session: name.into(),
+            environment: env_ref.into(),
+            vessel: vessel.map(str::to_owned),
+            role: "coder".into(),
+            pool: "cleat".into(),
+            cwd: "/".into(),
+            env: Default::default(),
+            source: TerminalLaunchSource::Tool { command: "sh".into() },
+        });
+        let facts = TerminalLaunchFacts { endpoint: Some((runtime_root.into(), daemon.into())), ..TerminalLaunchFacts::default() };
+        terminals.ready(&launch, name, &facts);
     }
 
     fn adopt_vessel_env(daemon: &InProcessDaemon) {
@@ -493,10 +423,12 @@ mod tests {
             Arc::new(ConfigStore::with_base(directory.path())),
             fake_discovery_with_runner(false, runner),
             HostName::new("host"),
-            ResourceBackend::new(InMemoryBackend::default()),
+            engine_home_backend(),
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
+        // The engine's readings, which a running daemon always has: no launches run here.
+        daemon.install_lifecycle_reads(flotilla_provisioning_testkit::EngineFixture::default().reads()).expect("engine reads");
         let bag = EnvironmentBag::new()
             .with(EnvironmentAssertion::binary("cleat", "/installed/cleat"))
             .with(EnvironmentAssertion::env_var("CLEAT_RUNTIME_DIR", "/crew/cleat"));

@@ -1,6 +1,6 @@
 //! Host on the engine, behind `[primitives]`.
 //!
-//! [`EngineHosts`] is the [`EngineRecords`] port of Host over the decided store. A Host is two plain
+//! [`EngineHosts`] is the [`KindRecords`] port of Host over the decided store. A Host is two plain
 //! records homed at the daemon that writes them: `Host`, the spec, and `HostObservation`, what that
 //! daemon last observed there. This home writes its own host's and each SSH host's it owns; every
 //! home's are read from a resident map kept current by following the log.
@@ -17,7 +17,6 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -31,8 +30,8 @@ use flotilla_protocol::{
     EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo,
 };
 use flotilla_resources::{
-    engine_records::{EngineObject, EngineRecords},
-    CredentialExpiry, FulfilmentFacts, HarnessFacts, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
+    engine_records::{CommitMark, KindRecords, LogPosition, PatchStatus, Record, Since, Ticks, UnloggedJournal, WriteError},
+    CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
     TRANSPORT_CAPABILITY,
@@ -43,14 +42,15 @@ use futures::stream::BoxStream;
 use serde_json::{json, Value};
 
 use super::host_import;
+use super::reads::created_at;
+use super::resume::followed_since;
+use super::watch::CommitsSeen;
+use super::watch::SharedChanges;
 use crate::stored::host::{Class, Condition, HostObservation, HostRecord, Readiness};
 
 const KIND: &str = <HostRecord as Kind>::KIND;
 const HOST: KindCode = <HostRecord as Kind>::CODE;
 const OBSERVATION: KindCode = <HostObservation as Kind>::CODE;
-
-/// How often a change stream looks for new entries in the log, as the other ports' do.
-const POLL: Duration = Duration::from_millis(500);
 
 /// How often a write that loses a race to another writer of its name reads and tries again.
 const WRITE_ATTEMPTS: usize = 3;
@@ -63,8 +63,29 @@ const OBSERVER: &str = "host-observer";
 /// One home's records of one Host, as the resident map holds them.
 #[derive(Clone, Debug)]
 struct Held {
-    host: Option<(HostRecord, u64)>,
+    /// The Host's spec, its record's version and when it was created.
+    host: Option<(HostSpec, u64, DateTime<Utc>)>,
     observation: Option<(HostObservation, u64)>,
+    /// The capability map the records rebuild, made once each time either is read.
+    capabilities: BTreeMap<String, Value>,
+}
+
+impl Held {
+    fn new(host: Option<(HostSpec, u64, DateTime<Utc>)>, observation: Option<(HostObservation, u64)>) -> Self {
+        let capabilities = match (&host, &observation) {
+            (Some((spec, _, _)), Some((observation, _))) => capabilities(&spec.connection, observation),
+            _ => BTreeMap::new(),
+        };
+        Self { host, observation, capabilities }
+    }
+
+    /// A change token for the writers' version checks, which read it back from this home: it
+    /// moves with each write of either record. Delete ends both, and a Host made again starts as
+    /// a new object.
+    fn version(&self) -> Option<u64> {
+        let (_, host_version, _) = self.host.as_ref()?;
+        Some(host_version + self.observation.as_ref().map_or(0, |(_, version)| *version))
+    }
 }
 
 /// Every home's records, by name and home.
@@ -81,7 +102,10 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
     let host = match read.resolve(HOST, name, home)? {
-        Some(id) => read.load::<HostRecord>(id)?.map(|loaded| (loaded.value, loaded.version)),
+        Some(id) => match read.load::<HostRecord>(id)? {
+            Some(loaded) => Some((loaded.value.spec(), loaded.version, created_at(read, id)?)),
+            None => None,
+        },
         None => None,
     };
     let observation = match read.resolve(OBSERVATION, name, home)? {
@@ -92,7 +116,7 @@ fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) ->
     if host.is_none() && observation.is_none() {
         records.remove(&key);
     } else {
-        records.insert(key, Held { host, observation });
+        records.insert(key, Held::new(host, observation));
     }
     Ok(())
 }
@@ -164,6 +188,19 @@ pub fn status(
     heard: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> HostStatus {
+    judged(name, home, spec, observation, capabilities(&spec.connection, observation), heard, now)
+}
+
+/// [`status`], with the capability map the observation rebuilds already made.
+fn judged(
+    name: &str,
+    home: &str,
+    spec: &HostSpec,
+    observation: &HostObservation,
+    capabilities: BTreeMap<String, Value>,
+    heard: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> HostStatus {
     let observed_at = heard.unwrap_or(DateTime::UNIX_EPOCH);
     let conditions: Vec<HostCondition> = observation
         .conditions
@@ -181,20 +218,18 @@ pub fn status(
     // The summary carries only the architecture, which image builds and their placement read.
     let description = observation.architecture.as_ref().map(|arch| HostSummary {
         environment_id: EnvironmentId::host(HostId::new(name)),
-        host_name: None,
+        // A daemon names its own Host with its host name, so the display name is the host name
+        // every view keys the host by.
+        host_name: Some(flotilla_protocol::HostName::new(spec.display_name.clone())),
         node: NodeInfo::new(NodeId::new(home), spec.display_name.clone()),
         system: SystemInfo { arch: Some(arch.clone()), ..SystemInfo::default() },
         inventory: Default::default(),
         providers: Vec::new(),
         environments: Vec::new(),
     });
-    // The figures stand in for the stored flag: below the floor reads as nothing free of one byte,
-    // else as no floor.
-    let (disk_free_bytes, admission_free_space_floor_bytes) =
-        if observation.below_free_space_floor { (Some(0), Some(1)) } else { (None, Some(0)) };
     let mut status = HostStatus {
         description,
-        capabilities: capabilities(&spec.connection, observation),
+        capabilities,
         fulfilment_facts: observation
             .facts
             .iter()
@@ -219,8 +254,8 @@ pub fn status(
         heartbeat_at: heard,
         ready: true,
         daemon_generation: observation.daemon_generation.clone(),
-        disk_free_bytes,
-        admission_free_space_floor_bytes,
+        protocol_fingerprint: observation.protocol_fingerprint.clone(),
+        below_free_space_floor: observation.below_free_space_floor,
         conditions,
         ..HostStatus::default()
     };
@@ -293,8 +328,15 @@ pub struct EngineHosts {
     own_host: String,
     log: PlainLog,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
+    // One follower for every watcher of these records on this daemon.
+    changes: SharedChanges,
     /// Held across a write's read and its edit, so the observers at this home write one at a time.
     writing: tokio::sync::Mutex<()>,
+    /// This run, which no change outside the log is counted in: a reading resumes only within it,
+    /// as when each home was last heard is this run's judgement.
+    unlogged: UnloggedJournal,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -312,12 +354,15 @@ impl EngineHosts {
         let home = log.home().to_owned();
         let follower = Follower::new([HOST, OBSERVATION]);
         let opened = Self {
+            changes: SharedChanges::new(Arc::clone(&service), [HOST, OBSERVATION], "hosts"),
+            commits: CommitsSeen::follow(&service, [HOST, OBSERVATION]),
             service,
             home,
             own_host,
             log,
             resident: Mutex::new(Resident { follower, records: Records::new() }),
             writing: tokio::sync::Mutex::new(()),
+            unlogged: UnloggedJournal::default(),
             clock,
         };
         let homes = opened.service.homes();
@@ -339,9 +384,17 @@ impl EngineHosts {
         Ok(opened)
     }
 
+    /// A reading through `homes`' sequences, in this run.
+    fn positioned_at(&self, homes: BTreeMap<String, u64>) -> LogPosition {
+        LogPosition { homes, unlogged: Some(self.unlogged.read()) }
+    }
+
     /// Brings the resident map up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         {
             let Resident { follower, records } = &mut *resident;
@@ -356,7 +409,8 @@ impl EngineHosts {
                     }
                     Ok(())
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .inspect_err(|_| self.commits.give_back())?;
         }
         Ok(resident)
     }
@@ -377,41 +431,48 @@ impl EngineHosts {
             .and_then(|watermark| watermark.applied_through.to_datetime())
     }
 
-    /// `held`, at `home`, as the old object; None for an observation whose Host is gone.
-    fn object(&self, name: &str, home: &str, held: &Held) -> Option<Result<EngineObject, String>> {
-        let (host, host_version) = held.host.as_ref()?;
-        let spec = host.spec();
-        let status = held.observation.as_ref().map(|(observation, _)| status(name, home, &spec, observation, self.heard(home), self.now()));
-        let encoded = serde_json::to_value(&spec)
-            .and_then(|spec| Ok((spec, status.map(serde_json::to_value).transpose()?)))
-            .map_err(|error| format!("{KIND} {name} at {home}: {error}"));
-        Some(encoded.map(|(spec, status)| EngineObject {
+    /// `held`, at `home`, as the resource; None for an observation whose Host is gone.
+    fn object(&self, name: &str, home: &str, held: &Held) -> Option<Record<Host>> {
+        let (spec, _, created_at) = held.host.as_ref()?;
+        let status = held
+            .observation
+            .as_ref()
+            .map(|(observation, _)| judged(name, home, spec, observation, held.capabilities.clone(), self.heard(home), self.now()));
+        Some(Record {
             name: name.to_owned(),
             home: home.to_owned(),
-            // A change token for the writers' version checks, which read it back from this home: it
-            // moves with each write of either record. Delete ends both, and a Host made again
-            // starts as a new object.
-            version: host_version + held.observation.as_ref().map_or(0, |(_, version)| *version),
+            version: held.version()?,
+            created_at: *created_at,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
-            spec,
+            spec: spec.clone(),
             status,
-        }))
+        })
     }
 
     /// This home's records of `name`, read from the store rather than the resident map.
     fn own(&self, name: &str) -> Result<Held, String> {
         let host = self.log.get::<HostRecord>(name, &self.home).map_err(|error| error.to_string())?;
         let observation = self.log.get::<HostObservation>(name, &self.home).map_err(|error| error.to_string())?;
-        Ok(Held {
-            host: host.map(|host| (host.spec, host.version)),
-            observation: observation.map(|observation| (observation.spec, observation.version)),
-        })
+        let host = match host {
+            Some(host) => {
+                let created = self.log.created::<HostRecord>(name, &self.home).map_err(|error| error.to_string())?;
+                Some((host.spec.spec(), host.version, created.to_datetime()))
+            }
+            None => None,
+        };
+        Ok(Held::new(host, observation.map(|observation| (observation.spec, observation.version))))
     }
 
-    fn own_object(&self, name: &str) -> Result<EngineObject, String> {
-        let held = self.own(name)?;
-        self.object(name, &self.home, &held).unwrap_or_else(|| Err(format!("{KIND} {name} is not held at {}", self.home)))
+    /// This home's Host `name`, from the resident map: it follows every commit, this home's own
+    /// writes among them, so it holds what the store holds once refreshed.
+    fn own_object(&self, name: &str) -> Result<Record<Host>, String> {
+        let resident = self.refresh()?;
+        resident
+            .records
+            .get(&(name.to_owned(), self.home.clone()))
+            .and_then(|held| self.object(name, &self.home, held))
+            .ok_or_else(|| format!("{KIND} {name} is not held at {}", self.home))
     }
 
     /// Refused unless a Host `spec` describes is homed here: this daemon's own, or an SSH host it owns.
@@ -446,57 +507,87 @@ impl EngineHosts {
         Err(format!("write {KIND} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers"))
     }
 
-    /// Writes this home's observation of `name` from `status`, only where a value changed.
-    fn write_observation(&self, name: &str, spec: &HostSpec, status: &HostStatus) -> Result<(), String> {
+    /// Writes this home's observation of `name` from the status `patch` makes of the one held,
+    /// only where the observation it maps to differs from the resident map's: an unchanged
+    /// status reads nothing from the store and writes nothing. Whether it wrote. Refused as stale
+    /// when an `expected` version is given and the Host has moved from it.
+    fn write_status(&self, name: &str, expected: Option<u64>, patch: &PatchStatus<'_, HostStatus>) -> Result<bool, WriteError> {
+        let key = (name.to_owned(), self.home.clone());
         for _ in 0..WRITE_ATTEMPTS {
-            let held = self.log.get::<HostObservation>(name, &self.home).map_err(|error| error.to_string())?;
-            let observation = observed(spec, status, held.as_ref().map(|held| &held.spec))?;
+            let (observation, version) = {
+                let resident = self.refresh()?;
+                let Some((held, spec)) = resident.records.get(&key).and_then(|held| Some((held, &held.host.as_ref()?.0))) else {
+                    return Err(format!("{KIND} {name} is not held at {}", self.home).into());
+                };
+                if expected.is_some_and(|expected| held.version() != Some(expected)) {
+                    return Err(WriteError::Stale);
+                }
+                let mut status = match &held.observation {
+                    Some((observation, _)) => {
+                        judged(name, &self.home, spec, observation, held.capabilities.clone(), self.heard(&self.home), self.now())
+                    }
+                    None => HostStatus::default(),
+                };
+                patch(&mut status);
+                let observation = observed(spec, &status, held.observation.as_ref().map(|(held, _)| held))?;
+                match &held.observation {
+                    Some((current, _)) if *current == observation => return Ok(false),
+                    current => (observation, current.as_ref().map(|(_, version)| *version)),
+                }
+            };
             let change = self.change(OBSERVER);
-            let written = match held {
-                // An edit that changes nothing logs nothing and opens no change.
-                Some(current) => self.log.edit(name, current.version, &observation, &change),
+            let written = match version {
+                Some(version) => self.log.edit(name, version, &observation, &change),
                 None => self.log.create(name, &observation, &change),
             };
             match written {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(true),
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
-                Err(error) => return Err(format!("write {KIND} {name} observation: {error}")),
+                Err(error) => return Err(format!("write {KIND} {name} observation: {error}").into()),
             }
         }
-        Err(format!("write {KIND} {name} observation: lost {WRITE_ATTEMPTS} races with concurrent writers"))
+        Err(format!("write {KIND} {name} observation: lost {WRITE_ATTEMPTS} races with concurrent writers").into())
     }
 }
 
-fn refuse_kind(kind: &str) -> Result<(), String> {
-    if kind == KIND {
-        Ok(())
-    } else {
-        Err(format!("{kind} is not served by the host records"))
+impl flotilla_store::EnginePort for EngineHosts {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<Host>(self);
     }
-}
-
-fn warn_skipped(held: Result<EngineObject, String>) -> Option<EngineObject> {
-    held.map_err(|error| tracing::warn!(%error, "skipping a Host that does not encode")).ok()
 }
 
 #[async_trait::async_trait]
-impl EngineRecords for EngineHosts {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[KIND]
+impl KindRecords<Host> for EngineHosts {
+    fn codes(&self) -> Vec<KindCode> {
+        vec![HOST, OBSERVATION]
+    }
+
+    /// From the shared follower of the log.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
+    }
+
+    /// Heard times move outside the log, but no read of what changed names them.
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, self.codes()))
+    }
+
+    /// None counted: what moves outside the log is when each home was last heard, from this
+    /// home's clock and the change streams' watermarks, which tick no change.
+    fn unlogged_changes(&self) -> Option<u64> {
+        Some(0)
     }
 
     fn home(&self) -> String {
         self.home.clone()
     }
 
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn get(&self, name: &str) -> Result<Option<Record<Host>>, String> {
         let resident = self.refresh()?;
-        resolve(&resident.records, &self.home, name).and_then(|(home, held)| self.object(name, home, held)).transpose()
+        Ok(resolve(&resident.records, &self.home, name).and_then(|(home, held)| self.object(name, home, held)))
     }
 
-    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn list(&self) -> Result<Vec<Record<Host>>, String> {
         let resident = self.refresh()?;
         let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
         // The map orders by name, then home, so one name's homes are adjacent.
@@ -504,45 +595,79 @@ impl EngineRecords for EngineHosts {
         Ok(names
             .into_iter()
             .filter_map(|name| resolve(&resident.records, &self.home, name).and_then(|(home, held)| self.object(name, home, held)))
-            .filter_map(warn_skipped)
             .collect())
     }
 
-    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn sources(&self) -> Result<Vec<Record<Host>>, String> {
         let resident = self.refresh()?;
-        Ok(resident.records.iter().filter_map(|((name, home), held)| self.object(name, home, held)).filter_map(warn_skipped).collect())
+        Ok(resident.records.iter().filter_map(|((name, home), held)| self.object(name, home, held)).collect())
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<Host>>, LogPosition), String> {
+        let resident = self.refresh()?;
+        let records = resident.records.iter().filter_map(|((name, home), held)| self.object(name, home, held)).collect();
+        Ok((records, self.positioned_at(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(self.positioned_at(self.refresh()?.follower.cursors().clone()))
+    }
+
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        if let Err(reason) = self.unlogged.since(position.unlogged.as_ref()) {
+            return Ok(Since::Expired(reason));
+        }
+        Ok(match followed_since(&self.service, [HOST, OBSERVATION], position)? {
+            Ok((changed, through)) => {
+                Since::Changed { names: changed.into_iter().map(|identity| identity.name).collect(), through: self.positioned_at(through) }
+            }
+            Err(reason) => Since::Expired(reason),
+        })
+    }
+
+    /// Every home's Host `name`, read from the resident map by name.
+    async fn copies(&self, name: &str) -> Result<Vec<Record<Host>>, String> {
+        let resident = self.refresh()?;
+        Ok(resident
+            .records
+            .range((name.to_owned(), String::new())..)
+            .take_while(|((held, _), _)| held == name)
+            .filter_map(|((name, home), held)| self.object(name, home, held))
+            .collect())
     }
 
     async fn apply(
         &self,
-        kind: &str,
         name: &str,
+        version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
-        spec: Value,
-    ) -> Result<EngineObject, String> {
-        refuse_kind(kind)?;
-        let spec: HostSpec = serde_json::from_value(spec).map_err(|error| format!("{KIND} spec: {error}"))?;
-        self.homed_here(name, &spec)?;
+        spec: &HostSpec,
+    ) -> Result<Record<Host>, WriteError> {
+        self.homed_here(name, spec)?;
         let _writing = self.writing.lock().await;
-        self.write_spec(name, &HostRecord::new(&spec))?;
-        self.own_object(name)
+        if version.is_some() {
+            let held = self.refresh()?.records.get(&(name.to_owned(), self.home.clone())).and_then(Held::version);
+            WriteError::unless_at(version, held)?;
+        }
+        self.write_spec(name, &HostRecord::new(spec))?;
+        Ok(self.own_object(name)?)
     }
 
-    async fn set_status(&self, kind: &str, name: &str, status: Value) -> Result<EngineObject, String> {
-        refuse_kind(kind)?;
-        let status: HostStatus = serde_json::from_value(status).map_err(|error| format!("{KIND} status: {error}"))?;
+    async fn set_status(&self, name: &str, version: u64, status: &HostStatus) -> Result<Record<Host>, WriteError> {
         let _writing = self.writing.lock().await;
-        let Some((host, _)) = self.own(name)?.host else {
-            return Err(format!("{KIND} {name} is not held at {}", self.home));
-        };
-        self.write_observation(name, &host.spec(), &status)?;
-        self.own_object(name)
+        self.write_status(name, Some(version), &|held: &mut HostStatus| held.clone_from(status))?;
+        Ok(self.own_object(name)?)
     }
 
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
-        refuse_kind(kind)?;
+    /// Patched under this port's write lock against the resident map, so an unchanged status
+    /// reads nothing from the store.
+    async fn patch_status(&self, name: &str, patch: &PatchStatus<'_, HostStatus>) -> Option<Result<bool, String>> {
+        let _writing = self.writing.lock().await;
+        Some(self.write_status(name, None, patch).map_err(|error| error.to_string()))
+    }
+
+    async fn delete(&self, name: &str) -> Result<(), String> {
         let _writing = self.writing.lock().await;
         let held = self.own(name)?;
         let change = self.change(SPEC_WRITER);
@@ -553,29 +678,14 @@ impl EngineRecords for EngineHosts {
         if let Some((_, version)) = held.observation {
             deleted(self.log.delete::<HostObservation>(name, version, &change))?;
         }
-        if let Some((_, version)) = held.host {
+        if let Some((_, version, _)) = held.host {
             deleted(self.log.delete::<HostRecord>(name, version, &change))?;
         }
         Ok(())
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let service = Arc::clone(&self.service);
-        let mut follower = Follower::new([HOST, OBSERVATION]);
-        let homes = service.homes();
-        service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(|error| error.to_string())?;
-        let stream = futures::stream::unfold((service, follower), |(service, mut follower)| async move {
-            loop {
-                tokio::time::sleep(POLL).await;
-                let homes = service.homes();
-                match service.with_store(|store| Ok(!follower.pass(&mut store.read()?, &homes)?.is_empty())) {
-                    Ok(true) => return Some(((), (service, follower))),
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(%error, "host change stream could not read the log; retrying"),
-                }
-            }
-        });
-        Ok(Box::pin(stream))
+        self.changes.subscribe().map_err(|error| error.to_string())
     }
 }
 
@@ -585,7 +695,7 @@ mod tests {
     use crate::stored::host;
 
     fn observed_at(version: u64) -> Held {
-        Held { host: None, observation: Some((HostObservation::default(), version)) }
+        Held::new(None, Some((HostObservation::default(), version)))
     }
 
     // Behaviour (#3824 layer 4d): a Host several homes hold reads as this home's records, else

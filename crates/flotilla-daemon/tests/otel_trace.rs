@@ -2,6 +2,7 @@
 //! router and blocking inbox workers use the same in-memory exporter.
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
+use flotilla_daemon_testkit::server::HomedDaemon;
 use flotilla_protocol::HostName;
 use flotilla_tracing::{QueueIdGenerator, SdkTracerProvider, TracerProvider as _};
 #[path = "../../../tests/support/span_exporter.rs"]
@@ -16,17 +17,20 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[path = "request_session_pair/message_homes.rs"]
 mod message_homes;
 
-async fn empty_daemon_named(name: &str) -> Arc<InProcessDaemon> {
-    let dir = tempfile::tempdir().expect("config").keep();
-    std::fs::write(dir.join("daemon.toml"), "machine_id = 'test-machine'\n").expect("config");
-    InProcessDaemon::new(
+/// A daemon whose Message path [`message_homes::engine`] opens once its mesh is up, in a
+/// temporary home removed when the daemon's harness drops it.
+async fn message_home_daemon(name: &str) -> HomedDaemon {
+    let home = tempfile::tempdir().expect("config");
+    std::fs::write(home.path().join("daemon.toml"), "machine_id = 'test-machine'\n").expect("config");
+    let daemon = InProcessDaemon::new(
         vec![],
-        Arc::new(ConfigStore::with_base(dir)),
+        Arc::new(ConfigStore::with_base(home.path().to_path_buf())),
         flotilla_discovery_testkit::fake_discovery(false),
         HostName::new(name),
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
-    .await
+    .await;
+    HomedDaemon::new(daemon, home)
 }
 
 #[derive(Clone, Default)]
@@ -54,10 +58,10 @@ async fn cross_host_message_has_connected_trace_and_correlated_logs() {
         .with(flotilla_tracing::layer().with_tracer(provider.tracer("proof")))
         .with(flotilla_tracing::json_layer(move || output.clone()))
         .init();
-    message_homes::messages_are_homed_at_the_receiver_and_replies_route_by_subject(&[]).await;
+    // The receiver is the crew's engine launch, so the scenario names the request it routed.
+    let identity = message_homes::messages_are_homed_at_the_receiver_and_replies_route_by_subject(&[]).await;
     provider.force_flush().expect("flush");
     let spans = exporter.get_finished_spans().expect("spans");
-    let identity = flotilla_resources::message_record_name("flotilla/crew-b/work/coder", "system:turn-rules", "rule:checks@1");
     let root = spans
         .iter()
         .find(|span| {

@@ -3,11 +3,8 @@ use flotilla_store_http::ensure_namespace;
 use flotilla_store_http::HttpBackend;
 use std::{env, path::PathBuf};
 
-use flotilla_resources::{
-    external_patches, reconcile, validate, Convoy, ConvoyPhase, ConvoySpec, InputMeta, InputValue, ResourceError, WorkflowTemplate,
-    WorkflowTemplateSpec,
-};
-use flotilla_store::{apply_status_patch, ResourceBackend};
+use flotilla_resources::{validate, Convoy, ConvoySpec, InputMeta, InputValue, ResourceError, WorkflowTemplate, WorkflowTemplateSpec};
+use flotilla_store::ResourceBackend;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -46,7 +43,7 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         placement_policy: Some("laptop-docker".to_string()),
         repositories: Vec::new(),
         r#ref: None,
-        project_ref: None,
+        project_ref: "flotilla".to_string(),
         adopted_checkout_refs: Default::default(),
         issues: Vec::new(),
         change_request: None,
@@ -55,30 +52,9 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
     }
 }
 
-async fn reconcile_once(
-    convoys: &flotilla_store::TypedResolver<Convoy>,
-    templates: &flotilla_store::TypedResolver<WorkflowTemplate>,
-    name: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<flotilla_resources::ConvoyStatusPatch>, ResourceError> {
-    let convoy = convoys.get(name).await?;
-    let template = if convoy.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_none() {
-        Some(templates.get(&convoy.spec.workflow_ref).await?)
-    } else {
-        None
-    };
-    let outcome = reconcile(&convoy, template.as_ref(), now);
-    if let Some(patch) = outcome.patch.clone() {
-        apply_status_patch(convoys, name, &patch).await?;
-        Ok(Some(patch))
-    } else {
-        Ok(None)
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires minikube or another Kubernetes cluster"]
-async fn convoy_controller_roundtrip_and_cel_validation() -> Result<(), Box<dyn std::error::Error>> {
+async fn convoy_crd_cel_validation() -> Result<(), Box<dyn std::error::Error>> {
     if env::var("FLOTILLA_RUN_K8S_TESTS").ok().as_deref() != Some("1") {
         return Ok(());
     }
@@ -132,28 +108,7 @@ async fn convoy_controller_roundtrip_and_cel_validation() -> Result<(), Box<dyn 
         .expect_err("inputs update should be rejected");
     assert!(matches!(inputs_err, ResourceError::Invalid { .. }));
 
-    reconcile_once(&convoys, &templates, &created.metadata.name, chrono::Utc::now()).await?;
-    reconcile_once(&convoys, &templates, &created.metadata.name, chrono::Utc::now()).await?;
-
-    apply_status_patch(
-        &convoys,
-        &created.metadata.name,
-        &external_patches::force_work_completed("implement".to_string(), chrono::Utc::now(), Some("implemented".to_string())),
-    )
-    .await?;
-    let ready_review = reconcile_once(&convoys, &templates, &created.metadata.name, chrono::Utc::now()).await?;
-    assert!(matches!(ready_review, Some(flotilla_resources::ConvoyStatusPatch::AdvanceWorkToReady { .. })));
-
-    apply_status_patch(
-        &convoys,
-        &created.metadata.name,
-        &external_patches::force_work_completed("review".to_string(), chrono::Utc::now(), Some("reviewed".to_string())),
-    )
-    .await?;
-    let completed = reconcile_once(&convoys, &templates, &created.metadata.name, chrono::Utc::now()).await?;
-    assert!(matches!(completed, Some(flotilla_resources::ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Landing, .. })));
-
-    let final_convoy = convoys.get(&created.metadata.name).await?;
-    assert_eq!(final_convoy.status.expect("status").phase, ConvoyPhase::Landing);
+    // The convoy controller's round trip went with the old reconciler: a convoy is an engine
+    // launch, which a cluster store does not serve (#3108).
     Ok(())
 }

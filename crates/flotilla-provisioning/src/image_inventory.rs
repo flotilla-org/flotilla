@@ -7,7 +7,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
-use flotilla_resources::{Host, LocalImageInventories, IMAGE_DIGESTS_CAPABILITY};
+use flotilla_resources::{Host, HostStatusPatch};
 use flotilla_store::ResourceBackend;
 
 /// The local image cache's held image IDs.
@@ -31,27 +31,14 @@ impl<I: ImageInventoryIo + 'static> ImageInventoryPublisher<I> {
     /// observations from instances that are no longer registered.
     pub async fn refresh(&self) -> Result<(), String> {
         let held = self.io.inventory().await?;
-        let hosts = self.backend.using::<Host>(&self.namespace);
-        let host = hosts.get(&self.host).await.map_err(|error| error.to_string())?;
-        let mut status = host.status.clone().unwrap_or_default();
-        let mut inventory = decode_inventory(status.capabilities.get(IMAGE_DIGESTS_CAPABILITY), &self.host);
-        inventory.0.retain(|instance, _| self.registered_instances.contains(instance));
-        inventory.0.insert(self.provider_instance.clone(), held);
-        status.capabilities.insert(IMAGE_DIGESTS_CAPABILITY.into(), serde_json::to_value(&inventory).map_err(|error| error.to_string())?);
-        if host.status.as_ref() != Some(&status) {
-            hosts.update_status(&self.host, &host.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    }
-}
-
-fn decode_inventory(value: Option<&serde_json::Value>, host: &str) -> LocalImageInventories {
-    match value.map(|value| serde_json::from_value(value.clone())).transpose() {
-        Ok(inventory) => inventory.unwrap_or_default(),
-        Err(error) => {
-            tracing::warn!(%host, %error, "invalid image inventory; replacing it with fresh cache observations");
-            LocalImageInventories::default()
-        }
+        let patch = HostStatusPatch::ImageInventory {
+            registered: self.registered_instances.clone(),
+            observed: Some((self.provider_instance.clone(), held)),
+        };
+        // Patched against the Host as its port holds it: only the inventory is this writer's.
+        flotilla_store::observe_status(&self.backend.using::<Host>(&self.namespace), &self.host, &patch)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -63,28 +50,15 @@ pub async fn prune_unregistered_caches(
     host: &str,
     registered: &BTreeSet<String>,
 ) -> Result<(), String> {
-    let hosts = backend.using::<Host>(namespace);
-    let object = hosts.get(host).await.map_err(|error| error.to_string())?;
-    if let Some(mut status) = object.status.clone() {
-        if status.capabilities.contains_key(IMAGE_DIGESTS_CAPABILITY) {
-            let mut inventory = decode_inventory(status.capabilities.get(IMAGE_DIGESTS_CAPABILITY), host);
-            inventory.0.retain(|instance, _| registered.contains(instance));
-            status
-                .capabilities
-                .insert(IMAGE_DIGESTS_CAPABILITY.into(), serde_json::to_value(inventory).map_err(|error| error.to_string())?);
-            if object.status.as_ref() != Some(&status) {
-                hosts.update_status(host, &object.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
-            }
-        }
-    }
-    Ok(())
+    let patch = HostStatusPatch::ImageInventory { registered: registered.clone(), observed: None };
+    flotilla_store::observe_status(&backend.using::<Host>(namespace), host, &patch).await.map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
-    use flotilla_resources::{HostSpec, InputMeta};
+    use flotilla_resources::{HostSpec, InputMeta, LocalImageInventories, IMAGE_DIGESTS_CAPABILITY};
     use flotilla_store_memory::InMemoryBackend;
 
     use super::*;

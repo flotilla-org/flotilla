@@ -40,6 +40,16 @@ impl ConvoyChangeRequestResolver for InProcessDaemon {
     ) -> Result<(), String> {
         self.discover_convoy_branch_subjects_with_resolution(namespace, convoy, branch, Some(&resolution)).await
     }
+
+    async fn change_request_changes(&self) -> Option<futures::stream::BoxStream<'static, ()>> {
+        match self.observation_records.get()?.changes().await {
+            Ok(changes) => Some(changes),
+            Err(error) => {
+                tracing::warn!(%error, "follow the change request records; convoys without a change request are not looked up again");
+                None
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -112,7 +122,7 @@ impl EnvironmentSummaries for InProcessDaemon {
 
 /// Receiver evidence, and the Messages on the engine path when the
 /// `[primitives]` switch is on.
-pub(super) struct MessageReceivers(pub(super) crate::primitives::MessagePath);
+pub(super) struct MessageReceivers(pub(super) flotilla_engine_messages::MessagePath);
 #[async_trait]
 impl flotilla_projections::read_projections::MessageReceiverLoader for MessageReceivers {
     async fn load(
@@ -121,11 +131,13 @@ impl flotilla_projections::read_projections::MessageReceiverLoader for MessageRe
         namespace: &str,
         convoys: Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>,
         terminals: Vec<flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>>,
+        receivers: &[String],
+        named: &[(String, String)],
     ) -> Result<Box<dyn flotilla_projections::read_projections::MessageReceiverRead>, String> {
         let messages = match self.0.get() {
             // No message reads in the old shape until the fleet is designated.
             Some(primitives) if primitives.delivery_wait(namespace).await?.is_some() => Some(Vec::new()),
-            Some(primitives) => Some(primitives.views(namespace).await.map_err(|e| e.to_string())?),
+            Some(primitives) => Some(primitives.seat_messages(namespace, receivers, named).await.map_err(|e| e.to_string())?),
             None => None,
         };
         Ok(Box::new(MessageReceiverEvidence(
@@ -155,5 +167,333 @@ impl flotilla_projections::read_projections::MessageReceiverRead for MessageRece
     }
     fn messages(&self) -> Option<&[flotilla_resources::ReadResourceObject<flotilla_resources::Message>]> {
         self.1.as_deref()
+    }
+}
+
+/// The decided store's AgentSessions (#3108): this home's and every followed home's replicas,
+/// followed through the store's commits.
+#[async_trait]
+impl flotilla_projections::ports::AgentSessions for InProcessDaemon {
+    async fn follow(&self) -> Result<flotilla_projections::ports::AgentSessionFollow, String> {
+        agent_sessions::follow(self.decided_store()?).await
+    }
+}
+
+/// Standing roles as the installed ConvoyEnsure controller derives them from their generations
+/// (#3108). Without the controller, or when the read fails, a role is unknown.
+#[async_trait]
+impl flotilla_projections::ports::StandingRoles for InProcessDaemon {
+    async fn reading(&self, namespace: &str, project: &str, role: &str) -> Option<flotilla_projections::ports::StandingRoleReading> {
+        let reconciler = self.convoy_ensure_reconciler().await.ok()?;
+        let standing = match reconciler.standing_role(namespace, project, role).await {
+            Ok(standing) => standing?,
+            Err(error) => {
+                tracing::debug!(%error, namespace, project, role, "standing role did not read");
+                return None;
+            }
+        };
+        Some(flotilla_projections::ports::StandingRoleReading {
+            convoy_ref: standing.convoy,
+            hold: standing.hold.map(|hold| match hold {
+                flotilla_admission::standing::StandingHold::BackingUnverified => flotilla_protocol::StandingRoleHold::BackingUnverified,
+                flotilla_admission::standing::StandingHold::RestartLimit => flotilla_protocol::StandingRoleHold::RestartLimit,
+            }),
+            strikes: standing.strikes,
+            next_attempt: standing.next_attempt,
+            last_failure: standing.last_failure,
+        })
+    }
+}
+
+pub use agent_sessions::DecidedAgentSessions;
+
+/// Provisioning readings whose AgentSessions and Convoys are the daemon's own.
+pub(super) struct DecidedReads {
+    pub(super) reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+    pub(super) agent_sessions: DecidedAgentSessions,
+    pub(super) convoys: Arc<flotilla_engine_convoys::convoy_records::EngineConvoyRecords>,
+}
+
+impl flotilla_resources::lifecycle_reads::LifecycleReads for DecidedReads {
+    fn home(&self) -> Result<&str, String> {
+        self.reads.home()
+    }
+
+    fn try_reading(
+        &self,
+        kind: flotilla_resources::lifecycle_reads::ProvisioningKind,
+        name: &str,
+        origin: Option<&str>,
+    ) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
+        self.reads.try_reading(kind, name, origin)
+    }
+
+    fn environments(&self) -> Result<&dyn flotilla_resources::environment_records::EnvironmentRecords, String> {
+        self.reads.environments()
+    }
+
+    fn clones(&self) -> Result<&dyn flotilla_resources::clone_records::CloneRecords, String> {
+        self.reads.clones()
+    }
+
+    fn image_builds(&self) -> Result<&dyn flotilla_resources::image_build_records::ImageBuildRecords, String> {
+        self.reads.image_builds()
+    }
+
+    fn checkouts(&self) -> Result<&dyn flotilla_resources::checkout_records::CheckoutRecords, String> {
+        self.reads.checkouts()
+    }
+
+    fn agent_sessions(&self) -> Result<&dyn flotilla_resources::agent_activity::AgentSessionReads, String> {
+        Ok(&self.agent_sessions)
+    }
+
+    fn terminals(&self) -> Result<&dyn flotilla_resources::terminal_records::TerminalRecords, String> {
+        self.reads.terminals()
+    }
+
+    fn vessels(&self) -> Result<&dyn flotilla_resources::vessel_records::VesselRecords, String> {
+        self.reads.vessels()
+    }
+
+    fn convoys(&self) -> Result<&dyn flotilla_resources::convoy_records::ConvoyRecords, String> {
+        Ok(&*self.convoys)
+    }
+
+    fn joins(&self) -> Result<&flotilla_resources::held_joins::HeldJoins, String> {
+        self.reads.joins()
+    }
+}
+
+mod agent_sessions {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use chrono::{DateTime, Utc};
+    use flotilla_engine_store::follow::Followed;
+    use flotilla_engine_store::watch::EngineWatch;
+    use flotilla_projections::ports::{AgentSessionFollow, AgentSessionKey, AgentSessionUpdate};
+    use flotilla_protocol::{AgentActivity, AgentSessionEnd, AgentSessionReading, NodeId};
+    use flotilla_resources::agent_activity::{
+        home_current, home_stale_at, AgentActivityView, AgentSessionChange, AgentSessionReads, ProgressFacts,
+    };
+    use flotilla_schema::Kind as StoredKind;
+    use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
+    use flotilla_state_machines::{
+        machines::agent_session::{Activity, AgentSession, EndReason},
+        Resource,
+    };
+    use futures::StreamExt;
+
+    const CODE: flotilla_schema::KindCode = <Resource<AgentSession> as StoredKind>::CODE;
+
+    pub(super) async fn follow(service: Arc<Service>) -> Result<AgentSessionFollow, String> {
+        let home = NodeId::new(service.home());
+        // Started first: a write landing before the read below still reaches the stream.
+        let watch = EngineWatch::start_hearing(Arc::clone(&service), [CODE]).map_err(|error| error.to_string())?;
+        let homes = service.homes();
+        let held = watch
+            .read(move |read| {
+                let mut held = Vec::new();
+                for home in homes {
+                    held.extend(
+                        scan(read, &home)?.into_iter().map(|(name, reading)| (AgentSessionKey { home: NodeId::new(&home), name }, reading)),
+                    );
+                }
+                Ok(held)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let heard = heard_from(&service);
+        let held_heard = heard.iter().map(|(home, at)| (home.clone(), *at)).collect();
+        // A commit that hears from another home wakes the watch, a keepalive-only round
+        // included, so each home's heard time is read again then: one wake per keepalive, and no
+        // timer.
+        let updates = futures::stream::unfold((watch, service, heard), |(mut watch, service, mut last)| async move {
+            loop {
+                // A pass that fails is tried again at the next commit.
+                let mut found = match watch.next(updates).await {
+                    Ok(found) => found,
+                    Err(error) => {
+                        tracing::warn!(%error, "the AgentSession follow could not read the log; retrying");
+                        Vec::new()
+                    }
+                };
+                for (home, at) in heard_from(&service) {
+                    if last.get(&home) != Some(&at) {
+                        last.insert(home.clone(), at);
+                        found.push(AgentSessionUpdate::Heard { home, at });
+                    }
+                }
+                if !found.is_empty() {
+                    return Some((futures::stream::iter(found), (watch, service, last)));
+                }
+            }
+        })
+        .flatten()
+        .boxed();
+        Ok(AgentSessionFollow { home, held, heard: held_heard, updates })
+    }
+
+    /// When this store last heard from each other home it follows: the home time its latest
+    /// applied keepalive carried. A home never heard from is left out.
+    fn heard_from(service: &Service) -> BTreeMap<NodeId, DateTime<Utc>> {
+        service
+            .homes()
+            .into_iter()
+            .filter(|home| home != service.home())
+            .filter_map(|home| {
+                let at = service.watermark(&home).ok()?.applied_through.to_datetime()?;
+                (at > DateTime::<Utc>::UNIX_EPOCH).then(|| (NodeId::new(&home), at))
+            })
+            .collect()
+    }
+
+    /// Keyed reads of the decided store's AgentSessions, with whether each one's home is current
+    /// by the daemon's clock.
+    pub struct DecidedAgentSessions {
+        service: Arc<Service>,
+        clock: Arc<dyn flotilla_resources::Clock>,
+        progress: Arc<ProgressFacts>,
+    }
+
+    impl DecidedAgentSessions {
+        /// Reads `service`'s AgentSessions, joined with what this daemon has seen of its own
+        /// sessions' progress.
+        pub fn new(service: Arc<Service>, clock: Arc<dyn flotilla_resources::Clock>, progress: Arc<ProgressFacts>) -> Self {
+            Self { service, clock, progress }
+        }
+    }
+
+    impl AgentSessionReads for DecidedAgentSessions {
+        fn read(&self, name: &str, origin: Option<&str>) -> Result<Option<AgentActivityView>, String> {
+            let own = self.service.home();
+            let home = origin.unwrap_or(own);
+            let reading = self
+                .service
+                .with_store(|store| load(&mut store.read()?, name, home))
+                .map_err(|error| format!("AgentSession/{name}: {error}"))?;
+            let (current, stale_at) = if home == own {
+                (true, None)
+            } else {
+                let heard = self.service.watermark(home).map_err(|error| error.to_string())?.applied_through.to_datetime();
+                let heard = heard.filter(|at| *at > DateTime::<Utc>::UNIX_EPOCH);
+                let current = home_current(heard, self.clock.now());
+                (current, heard.filter(|_| current).map(home_stale_at))
+            };
+            // Progress is kept by session as hooks name it; a launch reads its session's, which an
+            // earlier launch's can only precede.
+            let progress = (home == own).then(|| self.progress.get(flotilla_resources::terminal_records::launched(name)));
+            Ok(reading.map(|reading| AgentActivityView { reading, current, stale_at, progress }))
+        }
+
+        fn changes(&self) -> Result<futures::stream::BoxStream<'static, AgentSessionChange>, String> {
+            // Woken by keepalives too: a home heard from again is a change to its readings.
+            let watch = EngineWatch::start_hearing(Arc::clone(&self.service), [CODE]).map_err(|error| error.to_string())?;
+            let heard = heard_from(&self.service);
+            let changes = futures::stream::unfold((watch, Arc::clone(&self.service), heard), |(mut watch, service, mut last)| async move {
+                loop {
+                    let own = service.home().to_owned();
+                    // A pass that fails is tried again at the next commit.
+                    let mut found = match watch.next(move |_, followed| Ok(session_changes(&own, followed))).await {
+                        Ok(found) => found,
+                        Err(error) => {
+                            tracing::warn!(%error, "the AgentSession changes could not read the log; retrying");
+                            Vec::new()
+                        }
+                    };
+                    for (home, at) in heard_from(&service) {
+                        if last.get(&home) != Some(&at) {
+                            found.push(AgentSessionChange::Heard { origin: home.as_str().to_owned() });
+                            last.insert(home, at);
+                        }
+                    }
+                    if !found.is_empty() {
+                        return Some((futures::stream::iter(found), (watch, service, last)));
+                    }
+                }
+            });
+            Ok(changes.flatten().boxed())
+        }
+    }
+
+    /// What one pass over the log tells a reader of some sessions, without reading them.
+    fn session_changes(own: &str, followed: Vec<Followed>) -> Vec<AgentSessionChange> {
+        followed
+            .into_iter()
+            .map(|followed| match followed {
+                Followed::Changed(identity) => {
+                    AgentSessionChange::Changed { origin: (identity.home != own).then_some(identity.home), name: identity.name }
+                }
+                Followed::Rescan(_) => AgentSessionChange::Rescanned,
+            })
+            .collect()
+    }
+
+    /// What one pass over the log found, in log order: written sessions as they are now, and
+    /// a home's whole set where it must be reread.
+    fn updates(read: &mut Read<'_>, followed: Vec<Followed>) -> Result<Vec<AgentSessionUpdate>, StoreError> {
+        let mut updates = Vec::new();
+        let mut changed = Vec::new();
+        for followed in followed {
+            match followed {
+                Followed::Changed(identity) => {
+                    let reading = load(read, &identity.name, &identity.home)?;
+                    changed.push((AgentSessionKey { home: NodeId::new(&identity.home), name: identity.name }, reading));
+                }
+                Followed::Rescan(home) => {
+                    if !changed.is_empty() {
+                        updates.push(AgentSessionUpdate::Changed(std::mem::take(&mut changed)));
+                    }
+                    let sessions = scan(read, &home)?;
+                    updates.push(AgentSessionUpdate::Home { home: NodeId::new(&home), sessions });
+                }
+            }
+        }
+        if !changed.is_empty() {
+            updates.push(AgentSessionUpdate::Changed(changed));
+        }
+        Ok(updates)
+    }
+
+    fn load(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<AgentSessionReading>, StoreError> {
+        let Some(id) = read.resolve(CODE, name, home)? else { return Ok(None) };
+        Ok(read.load::<Resource<AgentSession>>(id)?.map(|loaded| reading(&loaded.value)))
+    }
+
+    fn scan(read: &mut Read<'_>, home: &str) -> Result<Vec<(String, AgentSessionReading)>, StoreError> {
+        let mut sessions = Vec::new();
+        let mut after = None;
+        loop {
+            let page = read.scan::<Resource<AgentSession>>(home, after, 64)?;
+            for id in page.ids {
+                if let Some(loaded) = read.load::<Resource<AgentSession>>(id)? {
+                    sessions.push((loaded.value.name().to_owned(), reading(&loaded.value)));
+                }
+            }
+            after = page.next;
+            if after.is_none() {
+                return Ok(sessions);
+            }
+        }
+    }
+
+    fn reading(session: &Resource<AgentSession>) -> AgentSessionReading {
+        let state = session.state();
+        let observation = state.observation();
+        AgentSessionReading {
+            ended: state.end_reason().map(|reason| match reason {
+                EndReason::Completed => AgentSessionEnd::Completed,
+                EndReason::Lost => AgentSessionEnd::Lost,
+            }),
+            activity: observation.as_ref().map(|observation| match observation.activity {
+                Activity::Working => AgentActivity::Working,
+                Activity::NeedsInput => AgentActivity::NeedsInput,
+                Activity::Idle => AgentActivity::Idle,
+                Activity::Interrupted => AgentActivity::Interrupted,
+            }),
+            activity_since: observation.as_ref().and_then(|observation| observation.activity_since.to_datetime()),
+            activity_cause: observation.map(|observation| observation.activity_cause),
+            stale: false,
+        }
     }
 }

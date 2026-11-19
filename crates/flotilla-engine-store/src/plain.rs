@@ -11,8 +11,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use flotilla_schema::{ChangeHeader, Kind, KindRegistry, NewChange, RegistryError};
-use flotilla_schema_sqlite::{ChangeId, Loaded, Store, StoreError, Write};
+use flotilla_schema::{ChangeHeader, CreatedAt, Kind, KindRegistry, NewChange, RegistryError};
+use flotilla_schema_sqlite::{ChangeId, Loaded, StoreError, StoreHandle, Write};
 
 use crate::lock_store;
 
@@ -98,6 +98,13 @@ impl PendingChange {
         &self.change
     }
 
+    /// When a resource this change creates was created, for its create entry to carry: the change's
+    /// `created` when set, and a joining change's own time, since a joined change keeps an earlier
+    /// write's time. None for a change of its own, whose time is the creation time.
+    pub fn created(&self) -> Option<CreatedAt> {
+        self.change.created.or_else(|| self.joins.then(|| CreatedAt::from(self.change.at)))
+    }
+
     /// The change, once a write has opened it.
     pub fn opened(&self) -> Option<ChangeId> {
         *self.opened.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -138,7 +145,7 @@ impl PendingChange {
 /// Runs `body` in one write naming `change`'s id, and commits; a change this write opened is
 /// forgotten again if the write does not commit.
 fn in_change<T>(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<StoreHandle>,
     change: &PendingChange,
     body: impl FnOnce(&mut Write<'_>, ChangeId) -> Result<T, PlainError>,
 ) -> Result<T, PlainError> {
@@ -158,16 +165,16 @@ pub fn register_plain<K: Kind>(kinds: &mut KindRegistry) -> Result<(), RegistryE
     kinds.register::<K>()
 }
 
-/// One home's writer and reader of plain kinds over a shared [`Store`], beside the machine kinds'
+/// One home's writer and reader of plain kinds over a shared [`StoreHandle`], beside the machine kinds'
 /// `StoreLog` on the same store.
 #[derive(Clone)]
 pub struct PlainLog {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreHandle>,
     home: String,
 }
 
 impl PlainLog {
-    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+    pub fn new(store: Arc<StoreHandle>) -> Self {
         let home = lock_store(&store).home().to_owned();
         Self { store, home }
     }
@@ -182,7 +189,11 @@ impl PlainLog {
             return Err(PlainError::Exists { kind: K::KIND, name: name.to_owned() });
         }
         in_change(&self.store, change, |write, id| {
-            let stamp = write.insert(name, spec, id).map_err(|error| match error {
+            let inserted = match change.created() {
+                Some(created) => write.insert_created(name, spec, id, created),
+                None => write.insert(name, spec, id),
+            };
+            let stamp = inserted.map_err(|error| match error {
                 StoreError::Exists { .. } => PlainError::Exists { kind: K::KIND, name: name.to_owned() },
                 error => PlainError::Store(error),
             })?;
@@ -241,6 +252,14 @@ impl PlainLog {
         let mut read = store.read()?;
         let Some(id) = read.resolve(K::CODE, name, home)? else { return Ok(None) };
         Ok(read.load::<K>(id)?.map(plain))
+    }
+
+    /// When `name` of `K` homed at `home` was last created.
+    pub fn created<K: Kind>(&self, name: &str, home: &str) -> Result<CreatedAt, PlainError> {
+        let mut store = lock_store(&self.store);
+        let mut read = store.read()?;
+        let id = read.resolve(K::CODE, name, home)?.ok_or_else(|| missing::<K>(name))?;
+        Ok(read.creation_time(id)?)
     }
 
     /// Every live resource of `K` homed at `home`, in id order.

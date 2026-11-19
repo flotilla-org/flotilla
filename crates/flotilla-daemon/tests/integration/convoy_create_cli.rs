@@ -1,8 +1,7 @@
 //! Integration tests for the `ConvoyCreate` + `WorkflowTemplateApply` daemon actions
 //! and the bundled WorkflowTemplates registered at startup.
 
-use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
+use flotilla_store_memory::engine_home_backend;
 use futures::StreamExt;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -17,6 +16,17 @@ use flotilla_resources::{
     WorkflowTemplate, MANAGED_BY_LABEL, ROLE_LABEL,
 };
 use flotilla_store::ResourceBackend;
+
+/// The project every convoy here is created in; scratch work needs no repository.
+const PROJECT: &str = "flotilla";
+
+/// What creation reports for `launch` in [`PROJECT`]: the launch's address.
+fn created(launch: &str) -> CommandValue {
+    let project = flotilla_address::Address::project(PROJECT).expect("project address");
+    CommandValue::ConvoyCreated {
+        name: flotilla_resources::convoy::engine::launch_address(&project, launch).expect("launch address").to_string(),
+    }
+}
 
 async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
     backend
@@ -39,7 +49,7 @@ fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
 }
 
 async fn start_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigStore>, DaemonRuntime, tempfile::TempDir) {
-    start_daemon_with_backend(ResourceBackend::new(InMemoryBackend::default())).await
+    start_daemon_with_backend(engine_home_backend()).await
 }
 
 async fn start_daemon_with_backend(
@@ -64,6 +74,7 @@ async fn start_daemon_with_backend(
         ..RuntimeOptions::default()
     };
     let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
+    flotilla_store_testkit::fixtures::project(&backend, "flotilla", PROJECT).await;
     (daemon, backend, config, runtime, tmp)
 }
 
@@ -72,7 +83,8 @@ async fn start_sqlite_daemon(
 ) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigStore>, DaemonRuntime, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::new(SqliteBackend::open(config.state_dir().as_path().join("resources.sqlite")).expect("sqlite open"));
+    // The engine's decided store is the daemon's SQLite file in its state directory.
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -90,6 +102,7 @@ async fn start_sqlite_daemon(
         ..RuntimeOptions::default()
     };
     let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
+    flotilla_store_testkit::fixtures::project(&backend, "flotilla", PROJECT).await;
     (daemon, backend, config, runtime, tmp)
 }
 
@@ -145,7 +158,7 @@ async fn builtin_workflow_templates_are_readable_at_startup() {
 
 #[tokio::test]
 async fn builtin_template_is_the_code_spec_at_dispatch() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let templates = backend.clone().definitions::<WorkflowTemplate>("flotilla");
 
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon_with_backend(backend).await;
@@ -171,9 +184,8 @@ async fn builtin_template_is_the_code_spec_at_dispatch() {
                     name: "explicit-host-direct".into(),
                     workflow_ref: "single-agent".into(),
                     inputs: Vec::new(),
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: None,
+                    project_ref: PROJECT.into(),
                     placement_policy: Some(host_direct_kind.clone()),
                     adopted_checkout: None,
                 })
@@ -199,9 +211,8 @@ async fn convoy_create_command_creates_convoy_resource() {
                     name: "my-scratch".into(),
                     workflow_ref: "scratch".into(),
                     inputs: vec![("topic".into(), "first-convoy".into())],
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: None,
+                    project_ref: PROJECT.into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -211,10 +222,11 @@ async fn convoy_create_command_creates_convoy_resource() {
         .expect("execute");
 
     let result = await_command_result(&mut rx, id).await;
-    assert_eq!(result, CommandValue::ConvoyCreated { name: "my-scratch".into() });
+    let launch = convoy_record_name(&backend, "my-scratch").await;
+    assert_eq!(result, created(&launch));
 
     let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys.get(&convoy_record_name(&backend, "my-scratch").await).await.expect("convoy should exist");
+    let convoy = convoys.get(&launch).await.expect("convoy should exist");
     assert_eq!(convoy.spec.workflow_ref, "scratch");
     assert_eq!(convoy.spec.dispatching_principal_ref, PrincipalRef::implicit_for_namespace("flotilla"));
     assert_eq!(convoy.spec.inputs.len(), 1);
@@ -231,9 +243,8 @@ async fn convoy_create_command_creates_convoy_resource() {
                     name: "bad@role".into(),
                     workflow_ref: "scratch".into(),
                     inputs: Vec::new(),
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: None,
+                    project_ref: PROJECT.into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -245,6 +256,47 @@ async fn convoy_create_command_creates_convoy_resource() {
         await_command_result(&mut rx, invalid_id).await,
         CommandValue::Error { message: "convoy name `bad@role` must be a lowercase DNS label of at most 63 characters".into() }
     );
+}
+
+// Admission freezes the placement before it admits the launch; a launch refused after that
+// releases what was frozen for it, since no convoy's teardown will.
+#[tokio::test]
+async fn a_refused_launch_releases_its_placement_snapshot() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+
+    let mut rx = daemon.subscribe();
+    let id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "no-topic".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: Vec::new(),
+                    r#ref: None,
+                    project_ref: PROJECT.into(),
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
+        .await
+        .expect("execute");
+    assert_eq!(
+        await_command_result(&mut rx, id).await,
+        CommandValue::Error { message: "workflow `scratch` input `topic` has no value".into() }
+    );
+
+    let snapshots: Vec<String> = backend
+        .using::<FulfilmentKind>("flotilla")
+        .list()
+        .await
+        .expect("fulfilment kinds should list")
+        .items
+        .into_iter()
+        .map(|kind| kind.metadata.name)
+        .filter(|name| name.starts_with("placement-snapshot-"))
+        .collect();
+    assert_eq!(snapshots, Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -353,9 +405,8 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
                     name: "sqlite-scratch".into(),
                     workflow_ref: "scratch".into(),
                     inputs: vec![("topic".into(), "embedded".into())],
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: None,
+                    project_ref: PROJECT.into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -363,7 +414,8 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
         )
         .await
         .expect("execute");
-    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "sqlite-scratch".into() });
+    let result = await_command_result(&mut rx, id).await;
+    assert_eq!(result, created(&convoy_record_name(&backend, "sqlite-scratch").await));
 
     // Admission must publish the placement decision with the convoy. Controllers
     // can act on Added immediately; a later status patch races their writes.

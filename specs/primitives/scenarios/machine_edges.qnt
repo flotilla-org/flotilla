@@ -9,12 +9,17 @@ module machine_edges {
   action attempt(outcome: L::AttemptOutcome): bool = all {
     tries.length() < maxTries, L::attempt(1, outcome), tries' = tries.append(outcome),
   }
+  // A try before its retry was due replaces the failure it followed.
+  action failEarly(early: { retryable: bool, cause: str }): bool = all {
+    L::failEarly(1, early), tries' = tries.replaceAt(tries.length() - 1, L::AttemptFailed(early)),
+  }
   action step = {
     nondet seen = Set(false, true).oneOf()
     nondet reason = Set(A::Completed, A::Lost).oneOf()
     nondet matches = Set(false, true).oneOf()
     nondet transport = Set("turn", "notify", "mute").oneOf()
     nondet cause = Set("failure", "other").oneOf()
+    nondet early = Set(true, false).map(r => Set("failure", "other").map(c => { retryable: r, cause: c })).flatten().oneOf()
     nondet outcome = Set(L::Succeeded).union(Set(true, false).map(r => L::AttemptFailed({ retryable: r, cause: "failure" }))).oneOf()
     any {
       all { L::request(1), A::unchanged, keepWorld },
@@ -23,6 +28,7 @@ module machine_edges {
       all { L::release(1, seen), A::unchanged, keepWorld },
       all { L::vanish(1, seen, L::Lost), A::unchanged, keepWorld },
       all { attempt(outcome), A::unchanged },
+      all { failEarly(early), A::unchanged },
       all { L::giveUp(1, cause), A::unchanged, keepWorld },
       all { A::attach(1, seen), L::unchanged, keepWorld },
       all { A::detach(1, seen), L::unchanged, keepWorld },

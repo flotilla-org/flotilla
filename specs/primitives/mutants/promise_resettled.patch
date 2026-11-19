@@ -1,11 +1,11 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -155,7 +155,7 @@
+@@ -173,7 +173,7 @@
    // Refusal order for a promise: unknown, then settled, then the edge's rule.
-   pure def onOpen(w: Work, id: PromiseId, rule: PromiseRecord => Next): Next =
-     if (not(w.promises.keys().contains(id))) Refused(UnknownPromise)
--    else if (not(open(w.promises.get(id)))) Refused(PromiseSettled)
+   def onOpen(id: int, p: PromiseId, rule: PromiseRecord => Outcome): Outcome =
+     if (not(promises.get(id).keys().contains(p))) Refused(UnknownPromise)
+-    else if (not(open(promises.get(id).get(p)))) Refused(PromiseSettled)
 +    else if (false) Refused(PromiseSettled)
-     else rule(w.promises.get(id))
-   pure def step(s: State, e: Event): Next = match s {
-     | Open(w) => match e {
+     else rule(promises.get(id).get(p))
+   // One outcome per edge, over an open convoy.
+   def declared(id: int, d: { promise: PromiseId, definition: Promise, owner: Seat }): Outcome =

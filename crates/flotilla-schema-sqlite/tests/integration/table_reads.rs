@@ -10,7 +10,7 @@ use hegel::TestCase;
 use rigging_condition::{CheckError, Checked, Condition, Field, Literal, Operand, Relop};
 
 use crate::fixtures::{
-    origin, store, AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource,
+    origin, store, AgentSession, AwaitingReply, Convoy, Dossier, Fixture, Message, Person, Pick, Referral, Resource, Service,
     TerminalSession, Ticket, Vessel, LOCAL,
 };
 
@@ -133,9 +133,10 @@ fn message_tables_read_enum_names(tc: TestCase) {
 }
 
 #[hegel::test(test_cases = 10)]
-fn agent_session_and_person_tables_read_enum_names(tc: TestCase) {
+fn agent_session_person_and_service_tables_read_enum_names(tc: TestCase) {
     enums_read_as_names::<Resource<AgentSession>>(&tc);
     enums_read_as_names::<Resource<Person>>(&tc);
+    enums_read_as_names::<Resource<Service>>(&tc);
 }
 
 #[hegel::test(test_cases = 10)]
@@ -149,8 +150,7 @@ fn convoy_tables_read_enum_names(tc: TestCase) {
 }
 
 #[hegel::test(test_cases = 10)]
-fn ensure_vessel_and_terminal_session_tables_read_enum_names(tc: TestCase) {
-    enums_read_as_names::<Resource<Ensure>>(&tc);
+fn vessel_and_terminal_session_tables_read_enum_names(tc: TestCase) {
     enums_read_as_names::<Resource<Vessel>>(&tc);
     enums_read_as_names::<TerminalSession>(&tc);
 }

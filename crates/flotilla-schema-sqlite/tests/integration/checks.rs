@@ -8,7 +8,7 @@ use hegel::TestCase;
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, ErrorCode};
 
 use crate::fixtures::{
-    origin, registry, store, AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource,
+    origin, registry, store, AgentSession, AwaitingReply, Convoy, Dossier, Fixture, Message, Person, Pick, Referral, Resource, Service,
     TerminalSession, Ticket, Vessel,
 };
 
@@ -82,9 +82,9 @@ fn insert_all(write: &mut Write<'_>, tc: &TestCase) {
     insert_covering::<Resource<Message>>(write, tc);
     insert_covering::<Resource<AgentSession>>(write, tc);
     insert_covering::<Resource<Person>>(write, tc);
+    insert_covering::<Resource<Service>>(write, tc);
     insert_covering::<Resource<AwaitingReply>>(write, tc);
     insert_covering::<Resource<Convoy>>(write, tc);
-    insert_covering::<Resource<Ensure>>(write, tc);
     insert_covering::<TerminalSession>(write, tc);
     insert_covering::<Resource<Vessel>>(write, tc);
     insert_covering::<Ticket>(write, tc);
@@ -129,6 +129,11 @@ fn raw_writes_breaking_a_variant_rule_are_refused_person(tc: TestCase) {
 }
 
 #[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_service(tc: TestCase) {
+    raw_writes_are_refused::<Resource<Service>>(&tc);
+}
+
+#[hegel::test]
 fn raw_writes_breaking_a_variant_rule_are_refused_awaiting_reply(tc: TestCase) {
     raw_writes_are_refused::<Resource<AwaitingReply>>(&tc);
 }
@@ -136,11 +141,6 @@ fn raw_writes_breaking_a_variant_rule_are_refused_awaiting_reply(tc: TestCase) {
 #[hegel::test]
 fn raw_writes_breaking_a_variant_rule_are_refused_convoy(tc: TestCase) {
     raw_writes_are_refused::<Resource<Convoy>>(&tc);
-}
-
-#[hegel::test]
-fn raw_writes_breaking_a_variant_rule_are_refused_ensure(tc: TestCase) {
-    raw_writes_are_refused::<Resource<Ensure>>(&tc);
 }
 
 #[hegel::test]
@@ -175,9 +175,9 @@ fn every_registered_kind_is_checked() {
         Resource::<Message>::CODE,
         Resource::<AgentSession>::CODE,
         Resource::<Person>::CODE,
+        Resource::<Service>::CODE,
         Resource::<AwaitingReply>::CODE,
         Resource::<Convoy>::CODE,
-        Resource::<Ensure>::CODE,
         TerminalSession::CODE,
         Resource::<Vessel>::CODE,
         Ticket::CODE,
@@ -272,6 +272,6 @@ fn record_stamps_are_never_null(tc: TestCase) {
         }
     }
     // Every engine kind's history is its log entries; the records are the dossier's deliverables
-    // and evidence, and the convoy's seats, promises and submissions.
-    assert_eq!(checked, 5);
+    // and evidence, and the convoy's subject links, seats, promises and submissions.
+    assert_eq!(checked, 6);
 }

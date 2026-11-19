@@ -74,13 +74,48 @@ pub async fn inspect_convoy_checkout_integration(
     let observe_remote_ref = convoy.status.as_ref().is_some_and(|status| {
         status.crew_work.values().flat_map(BTreeMap::values).any(|work| work.phase == CrewWorkPhase::Done && work.claim_evidence.is_some())
     });
+    inspect_recorded_checkout_integration(
+        runner,
+        vcs,
+        checkout_path,
+        spec,
+        RecordedAssociation {
+            change_request_id,
+            complete: convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_at.is_some()) || change_request_id.is_some(),
+            observe_remote_ref,
+        },
+        recorded,
+    )
+    .await
+}
+
+/// What a checkout's holder records of its branch's change request: the request, if one is
+/// associated; whether the association is complete, so that no request means none exists; and
+/// whether the branch's remote ref is observed too.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordedAssociation<'a> {
+    pub change_request_id: Option<&'a str>,
+    pub complete: bool,
+    pub observe_remote_ref: bool,
+}
+
+/// Inspect a checkout for settlement against the replicated observation of its associated change
+/// request, as its holder records the association.
+pub async fn inspect_recorded_checkout_integration(
+    runner: &dyn CommandRunner,
+    vcs: &dyn Vcs,
+    checkout_path: &Path,
+    spec: &CheckoutSpec,
+    association: RecordedAssociation<'_>,
+    recorded: ChangeRequestIntegrationInput<'_>,
+) -> CheckoutIntegrationStatus {
     inspect_checkout_integration_with_association(
         IntegrationProviders { runner, vcs },
         checkout_path,
         spec,
-        change_request_id,
-        convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_at.is_some()) || change_request_id.is_some(),
-        observe_remote_ref,
+        association.change_request_id,
+        association.complete,
+        association.observe_remote_ref,
         Some(recorded),
     )
     .await
@@ -228,12 +263,10 @@ async fn inspect_recorded_landed(
     if state == ChangeRequestState::Open {
         return (condition(ConditionValue::False, format!("PR #{id} OPEN, not merged")), None, Some(observation));
     }
+    // A change request closed unmerged did not land its work: the checkout is kept, not removed
+    // as landed, whatever the reason it was closed.
     if state == ChangeRequestState::Closed {
-        return (
-            condition(ConditionValue::True, format!("PR #{id} closed")),
-            Some(LandedEvidence::builder().change_request_id(id.to_string()).checkout_head_in_merged_head(false).build()),
-            Some(observation),
-        );
+        return (condition(ConditionValue::False, format!("PR #{id} closed, not merged")), None, Some(observation));
     }
     let mut evidence = recorded.landed_evidence.filter(|evidence| evidence.change_request_id == id).cloned();
     if evidence.is_none() {
@@ -324,7 +357,6 @@ async fn inspect_landed(
                             .observed_at(observed_at.to_string())
                             .build();
                         let landing = match state {
-                            ChangeRequestState::Closed => Some(("closed", ConditionValue::True, format!("PR #{number} closed"), false)),
                             ChangeRequestState::Merged => {
                                 let merged_head =
                                     item.get("headRefOid").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
@@ -347,11 +379,12 @@ async fn inspect_landed(
                                         false,
                                     ),
                                 };
-                                Some(("merged", value, detail, head_verified))
+                                Some((value, detail, head_verified))
                             }
-                            ChangeRequestState::Open => None,
+                            // Closed unmerged did not land the work, whatever the reason it was closed.
+                            ChangeRequestState::Closed | ChangeRequestState::Open => None,
                         };
-                        if let Some((outcome, value, detail, head_verified)) = landing {
+                        if let Some((value, detail, head_verified)) = landing {
                             (
                                 IntegrationCondition::builder()
                                     .value(value)
@@ -362,7 +395,7 @@ async fn inspect_landed(
                                     LandedEvidence::builder()
                                         .change_request_id(number)
                                         .maybe_merged_at(merged_at.map(str::to_string))
-                                        .maybe_target_ref(if outcome == "merged" { target_ref.map(str::to_string) } else { None })
+                                        .maybe_target_ref(target_ref.map(str::to_string))
                                         .checkout_head_in_merged_head(head_verified)
                                         .build(),
                                 ),
@@ -372,7 +405,11 @@ async fn inspect_landed(
                             (
                                 IntegrationCondition::builder()
                                     .value(ConditionValue::False)
-                                    .details(vec![format!("PR #{number} OPEN, not merged")])
+                                    .details(vec![if state == ChangeRequestState::Closed {
+                                        format!("PR #{number} closed, not merged")
+                                    } else {
+                                        format!("PR #{number} OPEN, not merged")
+                                    }])
                                     .observed_at(observed_at.to_string())
                                     .build(),
                                 None,
@@ -599,7 +636,7 @@ mod tests {
         );
         let convoy = ResourceObject::<Convoy> {
             metadata: serde_json::from_value(serde_json::json!({"name":"convoy", "namespace":"ops", "resource_version":"1", "labels":{}, "annotations":{}, "creation_timestamp":"2026-10-01T00:00:00Z"})).expect("metadata"),
-            spec: flotilla_resources::ConvoySpec::builder().workflow_ref("review".into()).build(), status: None,
+            spec: flotilla_resources::ConvoySpec::builder().workflow_ref("review".into()).project_ref("ops".into()).build(), status: None,
         };
         let mut status = merged_change_request("merged-head");
         status.state.value = Some(ObservedChangeRequestState::Open);
@@ -727,7 +764,8 @@ mod tests {
 
     #[tokio::test]
     async fn commit_after_squash_merged_head_remains_unpushed() {
-        let runner = Arc::new(MockRunner::new(vec![Err("not an ancestor".into()), Ok("origin/feature\n".into()), Ok("1\n".into())]));
+        let runner =
+            Arc::new(MockRunner::new(vec![Err("not an ancestor".into()), Ok("feature\n".into()), Ok(String::new()), Ok("1\n".into())]));
         let vcs = test_vcs(runner.clone());
         let change_request = merged_change_request("merged-head");
 
@@ -738,8 +776,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn squash_merged_branch_without_upstream_is_pushed_when_remote_ref_contains_head() {
-        let runner = Arc::new(MockRunner::new(vec![Err("no upstream configured".into()), Ok("  origin/feature\n".into())]));
+    async fn detached_head_is_pushed_when_a_remote_ref_contains_it() {
+        let runner = Arc::new(MockRunner::new(vec![Err("not a symbolic ref".into()), Ok("  origin/feature\n".into())]));
         let vcs = test_vcs(runner.clone());
 
         let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
@@ -749,8 +787,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_without_upstream_or_containing_remote_reports_unpushed_commit_count() {
-        let runner = Arc::new(MockRunner::new(vec![Err("no upstream configured".into()), Ok(String::new()), Ok("2\n".into())]));
+    async fn detached_head_without_containing_remote_reports_unpushed_commit_count() {
+        let runner = Arc::new(MockRunner::new(vec![Err("not a symbolic ref".into()), Ok(String::new()), Ok("2\n".into())]));
         let vcs = test_vcs(runner.clone());
 
         let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
@@ -761,8 +799,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_pushed_between_no_upstream_probes_reports_pushed() {
-        let runner = Arc::new(MockRunner::new(vec![Err("no upstream configured".into()), Ok(String::new()), Ok("0\n".into())]));
+    async fn detached_head_pushed_between_probes_reports_pushed() {
+        let runner = Arc::new(MockRunner::new(vec![Err("not a symbolic ref".into()), Ok(String::new()), Ok("0\n".into())]));
         let vcs = test_vcs(runner.clone());
 
         let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
@@ -770,15 +808,31 @@ mod tests {
         assert_eq!(pushed.value, ConditionValue::True);
     }
 
+    // A branch is pushed when its own name on origin holds HEAD, whatever upstream it tracks: a
+    // branch made from origin/main is not judged against main.
     #[tokio::test]
-    async fn checkout_without_change_request_keeps_upstream_pushed_probe() {
-        let runner = Arc::new(MockRunner::new(vec![Ok("origin/feature\n".into()), Ok("0\n".into())]));
+    async fn checkout_without_change_request_compares_head_with_its_branch_on_origin() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("feature\n".into()), Ok(String::new()), Ok("0\n".into())]));
         let vcs = test_vcs(runner.clone());
 
         let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
 
         assert_eq!(pushed.value, ConditionValue::True);
-        assert_eq!(runner.calls()[0].1, vec!["rev-parse", "--abbrev-ref", "@{upstream}"]);
+        assert_eq!(runner.calls()[0].1, vec!["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        assert_eq!(runner.calls()[1].1, vec!["show-ref", "--verify", "--quiet", "refs/remotes/origin/feature"]);
+        assert_eq!(runner.calls()[2].1, vec!["rev-list", "--count", "origin/feature..HEAD"]);
+    }
+
+    #[tokio::test]
+    async fn branch_absent_from_origin_is_not_pushed() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("feature\n".into()), Err("not a valid ref".into())]));
+        let vcs = test_vcs(runner.clone());
+
+        let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
+
+        assert_eq!(pushed.value, ConditionValue::False);
+        assert_eq!(pushed.details, vec!["origin/feature does not exist: the branch is not pushed"]);
+        assert_eq!(runner.calls().len(), 2);
     }
 
     #[tokio::test]
@@ -1039,7 +1093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_unmerged_change_request_keeps_landed_without_verified_head() {
+    async fn closed_unmerged_change_request_is_not_landed() {
         let runner = Arc::new(MockRunner::new(vec![
             Ok("2".into()),
             Ok(r#"[{"number": 1162, "state": "CLOSED", "mergedAt": null, "baseRefName": "main"}]"#.into()),
@@ -1054,8 +1108,8 @@ mod tests {
             "2026-07-27T00:00:00Z",
         )
         .await;
-        assert_eq!(landed.value, ConditionValue::True);
-        assert!(!evidence.expect("closed change request evidence").checkout_head_in_merged_head);
+        assert_eq!(landed.value, ConditionValue::False, "{:?}", landed.details);
+        assert!(evidence.is_none(), "a closed change request is no landing evidence");
         assert_eq!(runner.calls().len(), 2, "closed PR must not trigger a Git ancestry check");
     }
 

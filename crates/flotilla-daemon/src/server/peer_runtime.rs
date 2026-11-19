@@ -10,7 +10,6 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_executor::step::RemoteStepBatchRequest;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfigLabel, NodeId, NodeInfo, PeerConnectionState, PeerWireMessage, RepoIdentity};
-use flotilla_replication::{DigestScheduler, PeerReplicatorSupervisors, ReplicationOptions};
 use flotilla_store::load_metrics::ReplicationLoadMetrics;
 use tokio::{
     sync::{mpsc, Mutex},
@@ -18,12 +17,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn, Instrument};
 
-use super::{
-    remote_commands::RemoteCommandRouter,
-    replication::{peer_sources, replication_host},
-    shared::sync_peer_query_state,
-    PeerConnectedNotice, PeerConnectionEvent, SshTransport,
-};
+use super::{remote_commands::RemoteCommandRouter, shared::sync_peer_query_state, PeerConnectedNotice, PeerConnectionEvent, SshTransport};
 use crate::peer::{dispatch_pending_sends, peer_resource_socket_path, HandleResult, InboundPeerEnvelope, PeerManager, PeerSender};
 
 async fn handle_peer_envelope(
@@ -303,8 +297,8 @@ pub struct PeerRuntime {
     inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     remote_command_router: RemoteCommandRouter,
     resource_socket_dir: Option<PathBuf>,
-    replication_options: ReplicationOptions,
     replication_metrics: Arc<ReplicationLoadMetrics>,
+    stream_holds: super::change_stream::StreamHolds,
 }
 
 impl PeerRuntime {
@@ -323,8 +317,8 @@ impl PeerRuntime {
             inbound_peer_tx,
             remote_command_router,
             resource_socket_dir,
-            replication_options: ReplicationOptions::default(),
             replication_metrics: Arc::default(),
+            stream_holds: Default::default(),
         }
     }
 
@@ -334,13 +328,9 @@ impl PeerRuntime {
         self
     }
 
-    pub fn with_replication_kinds(mut self, kinds: Option<&'static [&'static str]>) -> Self {
-        self.replication_options = ReplicationOptions::new(kinds);
-        self
-    }
-
-    pub fn with_digest_driver(mut self, driver: Option<Arc<dyn DigestScheduler>>) -> Self {
-        self.replication_options = self.replication_options.with_digest_driver(driver);
+    /// Share the homes whose change streams this host holds back.
+    pub fn with_stream_holds(mut self, holds: super::change_stream::StreamHolds) -> Self {
+        self.stream_holds = holds;
         self
     }
 
@@ -569,20 +559,12 @@ impl PeerRuntime {
             }
         });
 
-        let replication_options = self.replication_options;
         let replication_metrics = self.replication_metrics;
+        let stream_holds = self.stream_holds;
         let outbound_daemon = Arc::clone(&self.daemon);
         let outbound_remote_command_router = self.remote_command_router.clone();
         let mut peer_connected_rx = peer_connected_rx;
         tasks.spawn(async move {
-            // Composition: the daemon's stores, identity and health, with
-            // direct peers over forwarded sockets and routed peers over the router.
-            let mut peer_replicators = PeerReplicatorSupervisors::new(
-                replication_host(&outbound_daemon).with_metrics(replication_metrics),
-                peer_sources(Arc::clone(&outbound_daemon), outbound_remote_command_router.clone()),
-                replication_options,
-            );
-
             let mut decided_followers: HashMap<NodeId, (u64, tokio_util::task::AbortOnDropHandle<()>)> = HashMap::new();
             // The engine path's replica misses read at the home that holds the record.
             let decided_peers = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
@@ -600,7 +582,7 @@ impl PeerRuntime {
             while let Some(event) = peer_connected_rx.recv().await {
                 match event {
                     PeerConnectionEvent::Connected(notice) => {
-                        debug!(peer = %notice.peer, generation = notice.generation, "starting peer resource replication");
+                        debug!(peer = %notice.peer, generation = notice.generation, "following peer change stream");
                         if decided_followers.get(&notice.peer).is_none_or(|(generation, _)| *generation < notice.generation)
                             && outbound_daemon.decided_store().is_ok()
                         {
@@ -611,11 +593,12 @@ impl PeerRuntime {
                                 home,
                                 notice.resource_socket_path.clone(),
                                 outbound_remote_command_router.clone(),
+                                stream_holds.clone(),
+                                Arc::clone(&replication_metrics),
                             );
                             decided_followers
                                 .insert(notice.peer.clone(), (notice.generation, tokio_util::task::AbortOnDropHandle::new(task)));
                         }
-                        peer_replicators.peer_connected(notice.peer.clone(), notice.generation, notice.resource_socket_path).await;
                         send_link_state(&outbound_daemon, &outbound_peer_manager, &notice.peer, notice.generation).await;
                     }
                     PeerConnectionEvent::Disconnected { peer, generation } => {
@@ -623,7 +606,6 @@ impl PeerRuntime {
                             decided_followers.remove(&peer);
                             decided_peers.lock().expect("decided peers").remove(peer.as_str());
                         }
-                        peer_replicators.peer_disconnected(&peer, generation);
                     }
                 }
             }

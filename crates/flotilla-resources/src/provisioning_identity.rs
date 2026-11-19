@@ -39,6 +39,25 @@ pub fn canonicalize_repo_url(url: &str) -> Result<String, String> {
     Ok(format!("{scheme}://{}/{}", host.to_ascii_lowercase(), path))
 }
 
+/// The host a Git transport URL reaches, without user, password or port: `github.com` for
+/// `git@github.com:o/r.git` and `https://user@GitHub.com:443/o/r`. None for a local path or a
+/// `file://` URL, which reach no remote.
+pub fn remote_host(url: &str) -> Option<String> {
+    let canonical = canonicalize_repo_url(url).ok()?;
+    let (scheme, rest) = canonical.split_once("://")?;
+    if scheme == "file" {
+        return None;
+    }
+    let authority = rest.split('/').next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = match host.strip_prefix('[') {
+        // An IPv6 literal keeps its brackets' content; its port follows the bracket.
+        Some(literal) => literal.split_once(']').map_or(literal, |(address, _)| address),
+        None => host.split_once(':').map_or(host, |(host, _)| host),
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
 pub fn repo_key(canonical_url: &str) -> String {
     keyed_hash("repo-v1", &[canonical_url])
 }
@@ -103,7 +122,7 @@ fn encode_base32hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
+    use super::{canonicalize_repo_url, clone_key, descriptive_repo_slug, remote_host, repo_key};
 
     #[test]
     fn canonicalizes_supported_repo_url_forms() {
@@ -137,6 +156,15 @@ mod tests {
     fn deterministic_keys_are_fixed_width() {
         assert_eq!(repo_key("https://github.com/flotilla-org/flotilla").len(), 52);
         assert_eq!(clone_key("https://github.com/flotilla-org/flotilla", "host-direct-01HXYZ").len(), 52);
+    }
+
+    #[test]
+    fn a_transport_url_names_the_host_it_reaches() {
+        assert_eq!(remote_host("git@github.com:flotilla-org/flotilla.git").as_deref(), Some("github.com"));
+        assert_eq!(remote_host("https://user:token@GitHub.com:443/o/r").as_deref(), Some("github.com"));
+        assert_eq!(remote_host("ssh://git@forge.lab:2222/o/r.git").as_deref(), Some("forge.lab"));
+        assert_eq!(remote_host("file:///srv/git/r.git"), None);
+        assert_eq!(remote_host("/srv/git/r.git"), None);
     }
 
     #[test]

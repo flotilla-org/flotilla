@@ -430,8 +430,12 @@ pub fn fake_discovery_with_runner(_legacy_mode: bool, runner: std::sync::Arc<dyn
 
 /// Build a `DiscoveryRuntime` that allows real git commands while still
 /// avoiding ambient host-tool probes like gh, Codex, Claude, or cmux.
+/// The simulated host owns its blocking-probe budget, so concurrent tests in one
+/// process cannot exhaust each other's.
 pub fn git_process_discovery(_legacy_mode: bool) -> flotilla_discovery::DiscoveryRuntime {
-    minimal_discovery_runtime(std::sync::Arc::new(flotilla_provider_runtime::ProcessCommandRunner))
+    let mut discovery = minimal_discovery_runtime(std::sync::Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
+    discovery.blocking_probe = flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated();
+    discovery
 }
 
 // Process boundary: ordinary discovery fixtures model a controller with valid forge credentials.
@@ -444,9 +448,10 @@ impl flotilla_discovery::observation_credentials::ObservationCredentialProbe for
 }
 
 fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> flotilla_discovery::DiscoveryRuntime {
-    // One client for the runtime and its factories: each client build loads the TLS root store
-    // (~20ms), and tests build many daemons.
-    let http: Arc<dyn flotilla_provider_runtime::HttpClient> = Arc::new(flotilla_provider_runtime::ReqwestHttpClient::new());
+    // One client for the runtime and its factories, built on its first request: a build loads the
+    // TLS root store (~20ms on Linux, seconds the first time in a process on macOS), and most test
+    // daemons send no request at all.
+    let http: Arc<dyn flotilla_provider_runtime::HttpClient> = Arc::new(flotilla_provider_runtime::LazyHttpClient::default());
     DiscoveryRuntime::builder()
         .http(Arc::clone(&http))
         .observation_credentials(flotilla_discovery::observation_credentials::ObservationCredentials::new(Arc::new(
@@ -455,7 +460,7 @@ fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> floti
         .runner(runner)
         .env(std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")])))
         .available_space_probe(fixed_available_space_probe())
-        .admission_probe(flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated())
+        .blocking_probe(flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated())
         .host_detectors(std::sync::Arc::new(vec![Box::new(flotilla_discovery_api::detectors::CommandDetector::new(
             "git",
             &["--version"],
@@ -1371,7 +1376,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         .runner(runner)
         .env(Arc::new(TestEnvVars::default()))
         .available_space_probe(fixed_available_space_probe())
-        .admission_probe(flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated())
+        .blocking_probe(flotilla_provider_runtime::blocking_probe::BlockingProbe::isolated())
         .host_detectors(std::sync::Arc::new(vec![]))
         .repo_detectors(vec![])
         .factories(FactoryRegistry {

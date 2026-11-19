@@ -10,11 +10,14 @@ flotilla-cbor = { path = "../flotilla-cbor" }
 flotilla-schema = { path = "../flotilla-schema" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
+futures = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 serde = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
 hegeltest = { workspace = true }
 serde_json = { workspace = true }
@@ -26,6 +29,7 @@ workspace = true
 # anchors of flotilla-schema-sqlite, which this crate wraps.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
 flotilla-build-features-base = { path = "../flotilla-build-features-base" }
 flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
 flotilla-build-features-os = { path = "../flotilla-build-features-os" }

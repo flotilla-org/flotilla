@@ -93,6 +93,20 @@ pub enum CheckState {
     Error,
 }
 
+/// Forgejo's merge check of a pull request (`PullRequestStatus`), set by
+/// scenario drivers. The API shows only whether it is `Mergeable`: as in
+/// Forgejo 16's `PullRequest.Mergeable()` (models/issues/pull.go), every other
+/// status, and a draft, renders `mergeable: false`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeStatus {
+    Checking,
+    Conflict,
+    #[default]
+    Mergeable,
+    Error,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Comment {
     pub id: u64,
@@ -128,6 +142,7 @@ pub struct PullFacts {
     pub merge_style: Option<String>,
     pub merge_commit_sha: Option<String>,
     pub checks: Option<CheckState>,
+    pub merge_status: MergeStatus,
     pub reviews: Vec<Review>,
     pub requested_reviewers: Vec<String>,
 }
@@ -471,6 +486,7 @@ impl FakeForge {
                 merge_style: None,
                 merge_commit_sha: None,
                 checks: None,
+                merge_status: MergeStatus::default(),
                 reviews: Vec::new(),
                 requested_reviewers: Vec::new(),
             }),
@@ -584,8 +600,24 @@ impl FakeForge {
         Ok(Page::of(item.pull.expect("pull").reviews, page, limit))
     }
 
+    /// The commit status set on the pull request whose head is commit `sha`, and when it was
+    /// set; none for any other commit, as Forgejo reports a commit no CI has reported on.
+    pub fn commit_status(&self, repo: &RepoRef, sha: &str) -> Result<Option<(CheckState, DateTime<Utc>)>, ForgeError> {
+        let mut inner = self.lock();
+        let repository = inner.repository(repo)?;
+        Ok(repository.items.values().find_map(|item| {
+            let pull = item.pull.as_ref().filter(|pull| pull.head_sha == sha)?;
+            Some((pull.checks?, item.updated_at))
+        }))
+    }
+
     pub fn set_checks(&self, repo: &RepoRef, number: u64, checks: CheckState) -> Result<Item, ForgeError> {
         self.change_pull(repo, number, |pull| pull.checks = Some(checks))
+    }
+
+    /// Set the pull request's merge check, as Forgejo's conflict checker does.
+    pub fn set_merge_status(&self, repo: &RepoRef, number: u64, status: MergeStatus) -> Result<Item, ForgeError> {
+        self.change_pull(repo, number, |pull| pull.merge_status = status)
     }
 
     /// Record a new head commit. Earlier reviews become stale, as Forgejo

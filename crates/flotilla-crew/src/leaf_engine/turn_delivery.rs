@@ -5,14 +5,21 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
 use flotilla_resources::{
-    address::leaf_record_name, evaluate_leaf, expected_change_request_leaves, external_patches, Artifact, ArtifactLeafSubject,
-    ChangeRequest, Convoy, ConvoyAttention, ConvoyPhase, HoldAct, Issue, ObservedChecks, ResourceError, ResourceObject, StatusPatch,
-    TerminalSession, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    address::{artifact_address, leaf_address, leaf_condition, leaf_record_name},
+    evaluate_leaf, expected_change_request_leaves, external_patches, template_leaf, Artifact, ArtifactLeafSubject, ChangeRequest,
+    ChangeRequestLeafSubject, Convoy, ConvoyAttention, HoldAct, Issue, IssueLeafSubject, LeafSubject, ObservedChecks, ResourceError,
+    ResourceObject, StatusPatch, TerminalSession, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome,
+    TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
-use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe};
-use super::{CrewTurnAdmission, CrewTurnIntent, LeafSubscriptionTable, TurnDeliveryActuator};
+use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe, launch_underway};
+use super::{CrewTurnAdmission, CrewTurnIntent, LeafSubscriptionTable, Party, TurnDeliveryActuator};
+
+/// A turn's subject: `address` at `revision`.
+fn subject_reference(address: flotilla_address::Address, revision: String) -> Result<flotilla_messaging::IntentReference, String> {
+    let revision = flotilla_address::Revision::new(revision).map_err(|error| format!("subject {address}: {error}"))?;
+    Ok(flotilla_messaging::IntentReference::subject(address, revision))
+}
 
 /// Immutable producer key shared by escalation publication and pre-replication replies.
 pub(crate) fn turn_message_producer_key(source: &str, subject_revision: &str) -> String {
@@ -214,7 +221,10 @@ impl LeafSubscriptionTable {
         failures: BTreeMap<String, DeliveryError>,
     ) -> Result<(), ResourceError> {
         let patch = FailTurnDeliveries { failures, now: Utc::now(), changed: Default::default() };
-        let written = flotilla_store::apply_status_patch_checked(convoys, convoy, &patch, |_| Ok(())).await?;
+        // Read here, not in the note, so a missing convoy stays NotFound and its batch is pruned.
+        let current = convoys.get(convoy).await?;
+        let written =
+            flotilla_resources::convoy::engine::note(&self.inner.convoy_engine, &current, &patch).map_err(ResourceError::other)?;
         let status = written.status.unwrap_or_default();
         for source in patch.changed.lock().expect("changed turn-delivery failures").iter() {
             let (Some(error), Some(failure)) =
@@ -246,8 +256,6 @@ impl LeafSubscriptionTable {
             .ok_or_else(|| "turn-delivery subscription disappeared".to_string())?;
         let convoys = self.inner.backend.clone().using::<Convoy>(&namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
-        // With the engine holding the convoy, its promises are the engine's (#3587 layer 8).
-        let convoy = flotilla_resources::convoy::engine::viewed(&self.inner.convoy_engine, &convoy)?.into_owned();
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{convoy_name}` has no status"))?;
         if status
             .turn_deliveries
@@ -261,9 +269,6 @@ impl LeafSubscriptionTable {
         if status.phase.is_terminal() {
             return Ok(());
         }
-        if status.phase == ConvoyPhase::Pending {
-            return Err(DeliveryError::from("wrong convoy kind or phase for turn delivery".to_string()));
-        }
         if !status.crew_work.get(&rule.to.vessel).is_some_and(|crew| crew.contains_key(&rule.to.role)) {
             return Err(DeliveryError::from("turn-delivery target crew is absent".to_string()));
         }
@@ -273,15 +278,15 @@ impl LeafSubscriptionTable {
         let active_probe = is_active_change_request_probe(status, rule, leaf, &forges);
         // A cached row can fire after its target stalls or settles, before the
         // reconciler removes it. Judge eligibility against the current status.
-        if (status.phase == ConvoyPhase::Active || is_merged_settlement_probe(leaf)) && !active_probe {
+        if (launch_underway(status.phase) || is_merged_settlement_probe(leaf)) && !active_probe {
             return Ok(());
         }
         let active_conflict = active_probe && is_conflict_probe(leaf);
         // `progress` is the revision the crew can advance (a PR head, an issue
         // update, an artifact's subject); `subject_revision` also names what
         // distinguishes repeat firings at it (an artifact digest).
-        let (subject_revision, progress, evidence_at, brief, message_subject) = match &leaf.address {
-            LeafAddress::ChangeRequest { service, scope, number } => {
+        let (subject_revision, progress, evidence_at, brief, message_subject, owes) = match &leaf.address {
+            LeafAddress::ChangeRequest { number, .. } => {
                 let record_name = leaf_record_name(&leaf.address, &forges)?;
                 let record = self
                     .inner
@@ -321,7 +326,7 @@ impl LeafSubscriptionTable {
                     }
                 };
                 let mut brief = if active_conflict {
-                    format!("{}\n\nPR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, and continue shepherding the PR.", rule.brief.trim())
+                    format!("{}\n\nPR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, and continue shepherding the PR. Stage only the files you resolved (`git add <path>`), never `git add -A` or `git add .` during a rebase.", rule.brief.trim())
                 } else if active_probe {
                     let checks = match cr.checks.value {
                         Some(ObservedChecks::Pass) => "pass",
@@ -369,31 +374,23 @@ impl LeafSubscriptionTable {
                 // later head observations (including a previously unknown head).
                 let revision = if merged_settlement {
                     format!("{}@merged", leaf.address)
-                } else if leaf.field_path == ".checks" {
-                    match cr.checks.value {
-                        Some(ObservedChecks::Pass) => format!("{head_sha}@pass"),
-                        Some(ObservedChecks::Fail) => format!("{head_sha}@fail"),
-                        Some(ObservedChecks::Pending) => format!("{head_sha}@pending"),
+                } else {
+                    match change_request_turn_revision(leaf, cr) {
+                        Some(revision) => revision,
                         None => return Ok(()),
                     }
-                } else {
-                    head_sha
                 };
-                let subject = cr.head_sha.value.as_ref().map_or_else(
-                    || flotilla_resources::MessageReference::ControlRecord {
-                        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "ChangeRequest", &namespace, &record_name),
-                        revision: record.object.metadata.resource_version.clone(),
-                    },
-                    |head| flotilla_resources::MessageReference::ChangeRequest {
-                        service: service.clone(),
-                        scope: scope.clone(),
-                        number: *number,
-                        revision: head.clone(),
-                    },
-                );
-                (revision.clone(), revision, evidence_at, brief, Some(subject))
+                // The change request at its head; at its observation's revision while the head is unknown.
+                let at = cr.head_sha.value.clone().unwrap_or_else(|| record.object.metadata.resource_version.clone());
+                let subject = subject_reference(leaf_address(&leaf.address, &forges)?, at)?;
+                let owes = asks_to_act(
+                    rule,
+                    &leaf.address,
+                    &ChangeRequestLeafSubject { change_request: &record.object, now: Utc::now(), stale_after: std::time::Duration::MAX },
+                )?;
+                (revision.clone(), revision, evidence_at, brief, Some(subject), owes)
             }
-            LeafAddress::Issue { service, scope, number } => {
+            LeafAddress::Issue { .. } => {
                 let record_name = leaf_record_name(&leaf.address, &forges)?;
                 let record = self
                     .inner
@@ -436,17 +433,18 @@ impl LeafSubscriptionTable {
                     })
                     .unwrap_or_default();
                 let revision = format!("{}@{}", leaf.address, updated_at.to_rfc3339());
+                let owes = asks_to_act(
+                    rule,
+                    &leaf.address,
+                    &IssueLeafSubject { issue: &record.object, now: Utc::now(), stale_after: std::time::Duration::MAX },
+                )?;
                 (
                     revision.clone(),
                     revision,
                     evidence_at,
                     brief,
-                    Some(flotilla_resources::MessageReference::Issue {
-                        service: service.clone(),
-                        scope: scope.clone(),
-                        number: *number,
-                        revision: updated_at.to_rfc3339(),
-                    }),
+                    Some(subject_reference(leaf_address(&leaf.address, &forges)?, updated_at.to_rfc3339())?),
+                    owes,
                 )
             }
             LeafAddress::Artifact { convoy: artifact_convoy, producer, kind, subject } => {
@@ -517,15 +515,17 @@ impl LeafSubscriptionTable {
                         )
                     })
                     .unwrap_or_default();
+                let owes = asks_to_act(rule, &bound_leaf.address, &ArtifactLeafSubject(&artifact))?;
                 (
                     format!("{subject}@{}", artifact.spec.digest),
                     subject.clone(),
                     evidence_at,
                     brief,
-                    Some(flotilla_resources::MessageReference::Artifact {
-                        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Artifact", &namespace, &name),
-                        revision: artifact.spec.digest.clone(),
-                    }),
+                    Some(subject_reference(
+                        artifact_address(&artifact.spec.convoy, &artifact.spec.producer, &artifact.spec.kind, &artifact.spec.subject)?,
+                        artifact.spec.digest.clone(),
+                    )?),
+                    owes,
                 )
             }
             _ => return Err(DeliveryError::permanent("turn-delivery leaf is not externally observed")),
@@ -575,10 +575,9 @@ impl LeafSubscriptionTable {
                 }),
                 _ => None,
             })
-            .sender("system:turn-rules".into())
-            .references(message_subject.clone().into_iter().collect())
-            .maybe_message_subject(message_subject)
-            .delivery_condition(leaf.clone())
+            .sender(Party::fleet("turn-rules"))
+            .references(message_subject.into_iter().collect())
+            .delivery_condition(leaf_condition(leaf, Some(&convoy.spec.project_ref), &forges)?)
             .build();
         let run = status.turn_deliveries.get(source).map_or(0, |delivery| unprogressed_run(&delivery.episodes, &progress));
         let now = Utc::now();
@@ -596,7 +595,7 @@ impl LeafSubscriptionTable {
                     evidence_at,
                     judged_claim_at: judged_at,
                     outcome: TurnDeliveryOutcome::Refused { reason: reason.clone(), refused_at: now, hold_executed: true },
-                    sender: flotilla_resources::CrewMessageSender::Unknown,
+                    owes,
                 },
                 ConvoyAttention { source: source.to_string(), reason, raised_at: now },
             )
@@ -629,7 +628,7 @@ impl LeafSubscriptionTable {
                         message: admission.message,
                         accepted_at: Utc::now(),
                     },
-                    sender: flotilla_resources::CrewMessageSender::Unknown,
+                    owes,
                 },
                 rule.to.vessel.clone(),
                 rule.to.role.clone(),
@@ -639,23 +638,53 @@ impl LeafSubscriptionTable {
         // The actuator may reopen the work before publishing the session message.
         // Apply the delivery record to that newer status rather than restoring
         // the pre-delivery snapshot (which would revoke credentials again).
-        let current = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
-        let mut next = current.status.clone().ok_or_else(|| format!("convoy {convoy_name} has no status"))?;
-        patch.apply(&mut next);
-        convoys.update_status(convoy_name, &current.metadata.resource_version, &next).await.map_err(|error| error.to_string())?;
+        flotilla_store::note_convoy(&self.inner.convoy_engine, &convoys, convoy_name, &patch).await?;
         if let Some(row) = self.inner.rows.lock().await.get_mut(&subscription_id) {
             row.episode_key.subject_revision = Some(subject_revision);
         }
         Ok(())
     }
 }
+/// Whether a turn of `rule` firing on the subject at `address`, observed as `subject`, asks its
+/// target to act: its [`owes`](TurnDeliveryRule::owes) condition, read from the observation the
+/// turn fired on. A rule without one always asks; an observation that cannot answer may ask, so
+/// it counts as asking.
+pub(super) fn asks_to_act(rule: &TurnDeliveryRule, address: &LeafAddress, subject: &dyn LeafSubject) -> Result<bool, String> {
+    let Some(owes) = &rule.owes else { return Ok(true) };
+    Ok(evaluate_leaf(&template_leaf(owes, address.clone()), Some(subject), None)?.result != ThreeValue::False)
+}
+
+/// Whether rule `rule`, firing on `leaf`, asks its target to act at observation `subject`: its
+/// leaf still holds there and its turn there asks to act. One that no longer does (the review
+/// approved, the checks passed, the conflict resolved) asks nothing; an observation that cannot
+/// answer may ask, so it counts as asking.
+pub(super) fn asks_now(rule: &TurnDeliveryRule, leaf: &Leaf, subject: &dyn LeafSubject) -> bool {
+    let fires = evaluate_leaf(leaf, Some(subject), None).map_or(true, |evaluation| evaluation.result != ThreeValue::False);
+    fires && asks_to_act(rule, &leaf.address, subject).unwrap_or(true)
+}
+
+/// The subject revision a turn on change-request leaf `leaf` (not a merged settlement) fires at
+/// while the change request is observed as `cr`: its head, with the checks' state for a checks
+/// leaf. `None` while the head, or a checks leaf's checks, is unknown.
+pub(super) fn change_request_turn_revision(leaf: &Leaf, cr: &flotilla_resources::ChangeRequestStatus) -> Option<String> {
+    let head = cr.head_sha.value.clone()?;
+    if leaf.field_path != ".checks" {
+        return Some(head);
+    }
+    Some(match cr.checks.value? {
+        ObservedChecks::Pass => format!("{head}@pass"),
+        ObservedChecks::Fail => format!("{head}@fail"),
+        ObservedChecks::Pending => format!("{head}@pending"),
+    })
+}
+
 /// True when an episode's recorded revision is `progress` itself or a repeat
 /// firing at it (`{progress}@{discriminator}`). Progress values never contain
 /// `@` themselves where a discriminator follows: PR heads are SHAs, and
 /// artifact turn rules bind their subject to the convoy name or the PR head
 /// (`ArtifactSubjectBinding`). An issue's `address@updated-at` key is its own
 /// progress and carries no discriminator.
-fn same_progress(subject_revision: &str, progress: &str) -> bool {
+pub(super) fn same_progress(subject_revision: &str, progress: &str) -> bool {
     subject_revision.strip_prefix(progress).is_some_and(|rest| rest.is_empty() || rest.starts_with('@'))
 }
 
@@ -719,14 +748,4 @@ pub(super) fn compose_subject_turn_brief(
         rule.to.role,
         repositories,
     )
-}
-
-pub(crate) fn durable_message_evidence(message: &ResourceObject<flotilla_resources::Message>) -> (bool, String) {
-    match &message.status {
-        Some(status) if status.phase.has_delivery_evidence() => (true, String::new()),
-        Some(status) => {
-            (false, format!("message {:?}: {}", status.phase, status.reason.as_deref().unwrap_or("waiting for receiver evidence")))
-        }
-        None => (false, "message Accepted: waiting for receiver resolution".into()),
-    }
 }

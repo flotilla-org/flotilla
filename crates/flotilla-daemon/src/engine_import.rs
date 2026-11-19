@@ -13,6 +13,7 @@
 mod attentions;
 mod convoys;
 mod definitions;
+mod first_start;
 mod lifecycle;
 mod messages;
 mod observations;
@@ -24,17 +25,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 use flotilla_engine_store::{Import, ImportTarget};
-use flotilla_provisioning::engine::import::ImportReport;
-use flotilla_resources::{K8sResourceObject, Resource, ResourceObject};
+use flotilla_provisioning::engine::import::{ImportReport, RowCounts};
+use flotilla_resources::{
+    convoy::engine::{ImportedLaunches, NoLaunch},
+    K8sResourceObject, Resource, ResourceObject,
+};
 use flotilla_store::REGISTERED_RESOURCE_KINDS;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use self::plan::Plan;
 
-/// The engine store a daemon with `[primitives]` on opens.
-pub const ENGINE_STORE: &str = "decided.sqlite";
+/// The engine store every daemon opens.
+pub use flotilla_core::in_process::decided::ENGINE_STORE;
 /// The old store the import reads.
 pub const OLD_STORE: &str = "resources.sqlite";
 /// The engine store while the import fills it.
@@ -112,6 +117,25 @@ impl Source {
         ))
     }
 
+    /// Every record read, own first and then each other home's, as [`Self::read`] lists them.
+    pub fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
+    /// The host id of the daemon that wrote this store, read from its records: the one Host
+    /// homed at `home` that describes a daemon, if exactly one does.
+    pub fn own_daemon_host(&self, home: &str) -> Option<String> {
+        let mut daemons = self
+            .rows
+            .iter()
+            .filter(|row| row.plural == "hosts" && row.home == home)
+            .filter_map(|row| decode::<flotilla_resources::Host>(&row.document).ok())
+            .filter(|host| host.spec.connection.is_daemon())
+            .map(|host| host.metadata.name);
+        let own = daemons.next();
+        own.filter(|_| daemons.next().is_none())
+    }
+
     fn namespaces(&self, plurals: &[&str]) -> BTreeSet<&str> {
         self.rows.iter().filter(|row| plurals.contains(&row.plural.as_str())).map(|row| row.namespace.as_str()).collect()
     }
@@ -180,10 +204,43 @@ impl Source {
 /// What the import read beside each record, carried from one step to a later one.
 #[derive(Default)]
 struct Carried {
+    /// The launch each old convoy record imports as, every home's: what a record naming the
+    /// convoy names.
+    convoy_launches: ImportedLaunches,
     /// Each imported message's engine reference and inbox, by namespace and old record name.
     messages: BTreeMap<(String, String), (flotilla_state_machines::machines::message::MessageRef, flotilla_address::Address)>,
+    /// Each attention imported from a demand, by its engine reference, with the record it is
+    /// about: one about a tombstone is settled with it.
+    attentions: Vec<(flotilla_state_machines::machines::message::MessageRef, flotilla_address::Address)>,
     /// The last admission sequence the imported messages took, by home.
     admitted: BTreeMap<String, u64>,
+    /// The launch each imported live old Convoy became, and its version as written, by home and
+    /// old record name: the checkouts held for the old record are held for that launch, created
+    /// under that version.
+    convoys: BTreeMap<(String, String), (String, u64)>,
+    /// Each imported convoy that ended, as ended, with its end's time, by home and old record
+    /// name: once its dependents are imported, one nothing holds retires then. What was held for
+    /// it is not held for its launch: nothing on the engine reacts to an imported end.
+    ended: BTreeMap<
+        (String, String),
+        (flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy>, flotilla_schema::Timestamp),
+    >,
+    /// The ended convoys the import retired, by home and old record name.
+    retired: BTreeSet<(String, String)>,
+    /// The launch each imported TerminalSession became, by home and old name: a message delivered
+    /// to the session names that launch's consumer.
+    launches: BTreeMap<(String, String), String>,
+    /// The launch each imported Vessel became, by home and old name: what was held for the
+    /// vessel is held for that launch.
+    vessels: flotilla_provisioning::engine::import::VesselLaunches,
+}
+
+impl Carried {
+    /// The launch old convoy `convoy`, homed at `home`, imported as: what releases the records
+    /// held for it.
+    fn launch(&self, home: &str, convoy: &str) -> Option<String> {
+        self.convoys.get(&(home.to_owned(), convoy.to_owned())).map(|(launch, _)| launch.clone())
+    }
 }
 
 /// One importer: the old kinds it imports, by plural, and its writes.
@@ -200,15 +257,26 @@ pub const STEPS: &[Step] = &[
     Step { name: "definitions", kinds: &definitions::KINDS, run: definitions::definitions },
     Step { name: "repositories", kinds: &["repositories"], run: records::repositories },
     Step { name: "hosts", kinds: &["hosts"], run: records::hosts },
-    Step { name: "fulfilment kinds", kinds: &records::PLACEMENT_KINDS, run: records::placement },
     Step { name: "artifacts", kinds: &["artifacts"], run: records::artifacts },
     Step { name: "forge observations", kinds: &observations::KINDS, run: observations::observations },
-    Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },
     Step { name: "accounts", kinds: &records::ACCOUNT_KINDS, run: records::accounts },
+    Step { name: "vessels", kinds: &["vessels"], run: lifecycle::vessels },
+    Step { name: "terminal sessions", kinds: &["terminalsessions"], run: lifecycle::terminal_sessions },
     Step { name: "messages", kinds: &["messages"], run: messages::messages },
     Step { name: "attentions", kinds: &["demands"], run: attentions::attentions },
     Step { name: "convoys", kinds: &["convoys"], run: convoys::convoys },
+    // After the convoys: a placement snapshot is labelled with the launch that releases it.
+    Step { name: "fulfilment kinds", kinds: &records::PLACEMENT_KINDS, run: records::placement },
+    Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },
     Step { name: "lifecycles", kinds: &lifecycle::KINDS, run: lifecycle::lifecycles },
+    // After every dependent: a convoy records name that the old store no longer holds.
+    Step { name: "tombstones", kinds: &[], run: convoys::tombstones },
+    // Last: an ended convoy retires once every record that could hold it is imported.
+    Step { name: "retirements", kinds: &[], run: convoys::retirements },
+    // After every write: a launch made here next numbers above every imported one.
+    Step { name: "launch numbers", kinds: &[], run: convoys::launch_numbers },
+    // Writes nothing: counts what the first start would do to the history imported.
+    Step { name: "first start", kinds: &[], run: first_start::first_start },
 ];
 
 /// One kind's counts in the report.
@@ -227,17 +295,58 @@ pub struct Refusal {
     pub reason: String,
 }
 
+/// One old kind's rows, every home's, by what became of them. When none of them is refused,
+/// imported, dropped and other-home add up to its rows; `unaccounted` is what they miss by.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct Rows {
+    pub rows: usize,
+    pub imported: usize,
+    pub dropped: usize,
+    /// Rows another home imports: its own records, and the copies held here of them.
+    pub other_home: usize,
+    pub unaccounted: i64,
+    /// The dropped rows by the reason they were dropped for, adding up to `dropped`.
+    pub drops: BTreeMap<String, usize>,
+}
+
 /// What an import did with the records homed at its store's home.
 #[derive(Debug, Default)]
 pub struct Summary {
+    /// Records written and dropped, by the kind the importer counts them under.
     pub kinds: BTreeMap<String, Counts>,
+    /// Every old row, by its old kind.
+    pub rows: BTreeMap<String, Rows>,
     pub refusals: Vec<Refusal>,
     /// Imported, but on an assumption worth reading, or kept in the old store by design.
     pub notes: Vec<String>,
+    /// Counts beside the rows, by kind and what they count: never a name.
+    pub tallies: BTreeMap<String, BTreeMap<String, usize>>,
+    ledger: BTreeMap<String, RowCounts>,
+    /// The ledger's dropped rows by old kind and reason.
+    drops: BTreeMap<String, BTreeMap<String, usize>>,
+    /// The lost convoys no record names a project for: a record refused for naming one is
+    /// dropped instead, tallied (owner ruling, #3108).
+    unaddressed: BTreeSet<String>,
 }
+
+/// Why a lost convoy no record names a project for is not imported.
+const UNADDRESSED: &str = "a lost convoy whose records name no project: not imported, its records dropped";
+/// Why a record naming such a convoy is dropped.
+const NAMES_UNADDRESSED: &str = "names a lost convoy whose records name no project";
 
 impl Summary {
     fn absorb(&mut self, report: ImportReport) {
+        for (kind, counts) in report.rows {
+            let ledger = self.ledger.entry(kind.to_owned()).or_default();
+            ledger.imported += counts.imported;
+            ledger.dropped += counts.dropped;
+            ledger.other_home += counts.other_home;
+            ledger.copies_imported += counts.copies_imported;
+            ledger.copies_dropped += counts.copies_dropped;
+        }
+        for ((kind, reason), count) in report.row_drops {
+            *self.drops.entry(kind.to_owned()).or_default().entry(reason.to_owned()).or_default() += count;
+        }
         for ((kind, _), count) in report.imported {
             self.kinds.entry(kind.to_owned()).or_default().imported += count;
         }
@@ -245,7 +354,20 @@ impl Summary {
             self.kinds.entry(kind.to_owned()).or_default().dropped += count;
         }
         for refusal in report.refused {
+            if NoLaunch::not_held_in(&refusal.reason).is_some_and(|record| self.unaddressed.contains(record)) {
+                self.ledger.entry(refusal.kind.to_owned()).or_default().dropped += 1;
+                *self.drops.entry(refusal.kind.to_owned()).or_default().entry(NAMES_UNADDRESSED.to_owned()).or_default() += 1;
+                self.kinds.entry(refusal.kind.to_owned()).or_default().dropped += 1;
+                continue;
+            }
+            // A record naming a convoy that imports as no launch, counted by why: the work list.
+            if let Some(class) = NoLaunch::class_in(&refusal.reason) {
+                *self.tallies.entry(refusal.kind.to_owned()).or_default().entry(format!("refused: {class}")).or_default() += 1;
+            }
             self.refuse(refusal.kind, refusal.record, refusal.reason);
+        }
+        for ((kind, what), count) in report.tallies {
+            *self.tallies.entry(kind.to_owned()).or_default().entry(what).or_default() += count;
         }
         self.notes.extend(report.notes);
     }
@@ -258,6 +380,39 @@ impl Summary {
     pub fn refused(&self) -> bool {
         !self.refusals.is_empty()
     }
+
+    /// Accounts for every row of `source` by its old kind: a row homed where `target` imports is
+    /// as its importer counted it, and one homed elsewhere is that home's unless the import
+    /// consumed it here.
+    fn account(&mut self, source: &Source, target: &impl ImportTarget) {
+        let mut held = BTreeMap::<String, (usize, usize)>::new();
+        for row in &source.rows {
+            let kind = plan::plan(&row.plural).map_or_else(|| row.plural.clone(), |(kind, _)| kind.to_owned());
+            let (here, elsewhere) = held.entry(kind).or_default();
+            if target.imports(&row.home) {
+                *here += 1;
+            } else {
+                *elsewhere += 1;
+            }
+        }
+        for (kind, (here, elsewhere)) in held {
+            let ledger = self.ledger.get(&kind).copied().unwrap_or_default();
+            let consumed = ledger.copies_imported + ledger.copies_dropped;
+            let rows = Rows {
+                rows: here + elsewhere,
+                imported: ledger.imported + ledger.copies_imported,
+                dropped: ledger.dropped + ledger.copies_dropped,
+                other_home: ledger.other_home + elsewhere.saturating_sub(consumed),
+                unaccounted: 0,
+                drops: self.drops.get(&kind).cloned().unwrap_or_default(),
+            };
+            let carried = rows.imported + rows.dropped + rows.other_home;
+            self.rows.insert(kind, Rows { unaccounted: rows.rows as i64 - carried as i64, ..rows });
+        }
+        for kind in self.ledger.keys().filter(|kind| !self.rows.contains_key(*kind)) {
+            self.notes.push(format!("the ledger counts rows of `{kind}`, which the old store does not hold"));
+        }
+    }
 }
 
 /// Counts the rows of kinds no importer reads, homed where `target` imports: a retired kind's are
@@ -266,7 +421,11 @@ fn plan_rows(source: &Source, target: &impl ImportTarget, summary: &mut Summary)
     for row in source.rows.iter().filter(|row| target.imports(&row.home)) {
         match plan::plan(&row.plural) {
             Some((_, Plan::Imported(_))) => {}
-            Some((kind, Plan::Retired(_))) => summary.kinds.entry(kind.to_owned()).or_default().dropped += 1,
+            Some((kind, Plan::Retired(ruling))) => {
+                summary.kinds.entry(kind.to_owned()).or_default().dropped += 1;
+                summary.ledger.entry(kind.to_owned()).or_default().dropped += 1;
+                *summary.drops.entry(kind.to_owned()).or_default().entry(format!("retired: {ruling}")).or_default() += 1;
+            }
             None => {
                 let unreadable =
                     row.document.get(UNREADABLE).and_then(Value::as_str).map(|error| format!("; its stored body is not JSON: {error}"));
@@ -280,17 +439,135 @@ fn plan_rows(source: &Source, target: &impl ImportTarget, summary: &mut Summary)
     }
 }
 
+/// Refuses each namespace other than the engine's that the old store holds rows in, every home's,
+/// naming its row count by kind. The engine has one namespace and identifies a record by kind,
+/// name and home, so a namespace's records would collide with the engine's same-named ones.
+fn namespace_rows(source: &Source, summary: &mut Summary) {
+    let mut outside = BTreeMap::<&str, BTreeMap<&str, usize>>::new();
+    for row in source.rows.iter().filter(|row| row.namespace != DEFAULT_PROVISIONING_NAMESPACE) {
+        *outside.entry(row.namespace.as_str()).or_default().entry(row.plural.as_str()).or_default() += 1;
+    }
+    for (namespace, kinds) in outside {
+        let total: usize = kinds.values().sum();
+        let counts = kinds.iter().map(|(plural, count)| format!("{count} {plural}")).collect::<Vec<_>>().join(", ");
+        summary.refuse(
+            "namespace",
+            namespace.to_owned(),
+            format!(
+                "{total} {} outside the engine's namespace `{DEFAULT_PROVISIONING_NAMESPACE}` ({counts}); the engine has one \
+                 namespace, so they would collide with its records of the same names",
+                if total == 1 { "record" } else { "records" }
+            ),
+        );
+    }
+}
+
 /// Imports `source` into `target`: every record homed at the target's home, step by step.
 pub fn import(source: &Source, target: &mut Import) -> Summary {
     let mut summary = Summary::default();
+    namespace_rows(source, &mut summary);
     plan_rows(source, target, &mut summary);
-    let mut carried = Carried::default();
+    let convoys = source.context::<flotilla_resources::Convoy>("convoys", None);
+    let launches = ImportedLaunches::number(convoys.iter().map(|convoy| (convoy.home.as_str(), &convoy.object)));
+    let (launches, lost) = tombstoned(source, launches);
+    // Each counted once fleet-wide: at the home its tombstone would have been homed at.
+    let home = target.store().home().to_owned();
+    for (record, reason) in lost.refused.into_iter().filter_map(|(record, at, reason)| (at == home).then_some((record, reason))) {
+        summary.refuse("Convoy", record, reason);
+    }
+    let unaddressed = lost.unaddressed.values().filter(|at| **at == home).count();
+    if unaddressed > 0 {
+        *summary.tallies.entry("Convoy".to_owned()).or_default().entry(UNADDRESSED.to_owned()).or_default() += unaddressed;
+    }
+    summary.unaddressed = lost.unaddressed.into_keys().collect();
+    steps(source, target, launches, &mut summary);
+    summary.account(source, target);
+    summary
+}
+
+/// Runs every importer over `source` into `target`, with each convoy record naming `launches`.
+fn steps(source: &Source, target: &mut Import, launches: ImportedLaunches, summary: &mut Summary) {
+    let mut carried = Carried { convoy_launches: launches, ..Carried::default() };
     for step in STEPS {
         let mut report = ImportReport::default();
         (step.run)(source, target, &mut carried, &mut report);
         summary.absorb(report);
     }
-    summary
+}
+
+/// `launches`, with a tombstone for each convoy that records name and the old store no longer
+/// holds, its garbage collection having removed it (#3108 import ruling (a)): every record naming
+/// it then imports against the tombstone rather than being refused. Every host must make the same
+/// tombstones, though each imports only its own home's records, so each home's records are
+/// imported first into a scratch store of that home, and each record that would be refused for
+/// naming a convoy the old store does not hold names one. A tombstone is homed at the lowest home
+/// whose records name it, and made at the earliest of their creation times, in the one project
+/// its records address it under. With none, or several, it is not made ([`Lost`]).
+fn tombstoned(source: &Source, launches: ImportedLaunches) -> (ImportedLaunches, Lost) {
+    let Ok(registry) = crate::runtime::decided_registry() else { return (launches, Lost::default()) };
+    let created: BTreeMap<(&str, &str, String), chrono::DateTime<chrono::Utc>> = source
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let kind = plan::plan(&row.plural).map(|(kind, _)| kind)?;
+            let at = row.document.pointer("/metadata/creationTimestamp").cloned()?;
+            Some(((kind, row.home.as_str(), record_name(&row.document)), serde_json::from_value(at).ok()?))
+        })
+        .collect();
+    let homes: BTreeSet<&str> = source.rows.iter().map(|row| row.home.as_str()).collect();
+    // By record: the homes whose records name it, the projects they address it under, and the
+    // earliest of their creation times.
+    type Named<'a> = (BTreeSet<&'a str>, BTreeSet<String>, Option<chrono::DateTime<chrono::Utc>>);
+    let mut named = BTreeMap::<String, Named<'_>>::new();
+    for home in homes {
+        let Ok(mut scratch) = Import::in_memory(home, registry.clone()) else { continue };
+        let mut summary = Summary::default();
+        steps(source, &mut scratch, launches.clone(), &mut summary);
+        for refusal in &summary.refusals {
+            let Some(record) = NoLaunch::not_held_in(&refusal.reason) else { continue };
+            let (homes, projects, earliest) = named.entry(record.to_owned()).or_default();
+            homes.insert(home);
+            projects.extend(NoLaunch::not_held_under(&refusal.reason));
+            if let Some(at) = created.get(&(refusal.kind.as_str(), home, refusal.name.clone())) {
+                *earliest = Some(earliest.map_or(*at, |earliest| earliest.min(*at)));
+            }
+        }
+    }
+    let mut lost = Lost::default();
+    let launches = named.into_iter().fold(launches, |launches, (record, (homes, projects, earliest))| match (homes.first(), earliest) {
+        // Under the one project its records address it under, in any spelling: the old store's
+        // namespace spelling is the project its fallback put the convoy in (governor ruling,
+        // #3108). With none there is no fallback to the namespace.
+        (Some(home), Some(earliest)) => {
+            let named: Vec<&String> = projects.iter().collect();
+            match named.as_slice() {
+                [project] => launches.with_tombstone(DEFAULT_PROVISIONING_NAMESPACE, &record, project, home, earliest),
+                [] => {
+                    lost.unaddressed.insert(record, (*home).to_owned());
+                    launches
+                }
+                several => {
+                    let several = several.iter().map(|project| format!("`{project}`")).collect::<Vec<_>>().join(", ");
+                    let reason = format!("a lost convoy its records name under several projects ({several}): no tombstone");
+                    lost.refused.push((record, (*home).to_owned(), reason));
+                    launches
+                }
+            }
+        }
+        // With no dependent's time it is not made, and its dependents are refused as before.
+        _ => launches,
+    });
+    (launches, lost)
+}
+
+/// The lost convoys [`tombstoned`] makes no tombstone for, each by the home it would have had.
+#[derive(Default)]
+struct Lost {
+    /// Records name it under several projects: it is refused, by name, with why.
+    refused: Vec<(String, String, String)>,
+    /// No record names a project for it: it and every record naming it are dropped, tallied
+    /// (owner ruling, #3108), the old stores staying as their backup.
+    unaddressed: BTreeMap<String, String>,
 }
 
 /// [`import`] into a store in memory homed at `home`: what an import there would write.
@@ -324,17 +601,26 @@ pub struct Report {
     pub source: String,
     pub outcome: Outcome,
     pub kinds: BTreeMap<String, Counts>,
+    /// Every old row, by its old kind.
+    pub rows: BTreeMap<String, Rows>,
     pub refusals: Vec<Refusal>,
+    /// Counts beside the rows, by kind and what they count.
+    pub tallies: BTreeMap<String, BTreeMap<String, usize>>,
+    /// The home sequence of the import's last write: every log entry after it is the daemon's own.
+    pub last_sequence: u64,
 }
 
 impl Report {
-    pub fn new(summary: &Summary) -> Self {
+    pub fn new(summary: &Summary, last_sequence: u64) -> Self {
         Self {
             build: flotilla_daemon_api::build_info::build_id().to_owned(),
             source: OLD_STORE.to_owned(),
             outcome: if summary.refused() { Outcome::Refused } else { Outcome::Imported },
             kinds: summary.kinds.clone(),
+            rows: summary.rows.clone(),
+            last_sequence,
             refusals: summary.refusals.clone(),
+            tallies: summary.tallies.clone(),
         }
     }
 }
@@ -366,6 +652,11 @@ fn log_summary(summary: &Summary, report: &Path) {
     for (kind, counts) in &summary.kinds {
         tracing::info!(kind, imported = counts.imported, dropped = counts.dropped, refused = counts.refused, "engine import");
     }
+    for (kind, tallies) in &summary.tallies {
+        for (what, count) in tallies {
+            tracing::info!(kind, what, count, "engine import tally");
+        }
+    }
     for note in &summary.notes {
         tracing::info!(%note, "engine import note");
     }
@@ -394,11 +685,13 @@ pub fn first_start(state_dir: &Path, home: &str, own_host: Option<&str>) -> Resu
     tracing::info!(source = %old.display(), target = %importing.display(), home, "engine import: first start with [primitives]");
     let source = Source::read(&old, home)?.with_own_host(own_host.map(str::to_owned));
     let registry = crate::runtime::decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
-    let summary = {
+    let (summary, last_sequence) = {
         let mut target = Import::create(&importing, home, registry)?;
-        import(&source, &mut target)
+        let summary = import(&source, &mut target);
+        let last = target.store().read().and_then(|mut read| read.last_sequence(home)).map_err(|error| error.to_string())?;
+        (summary, last)
     };
-    let report = write_report(state_dir, &Report::new(&summary))?;
+    let report = write_report(state_dir, &Report::new(&summary, last_sequence))?;
     log_summary(&summary, &report);
     if summary.refused() {
         return Err(format!(

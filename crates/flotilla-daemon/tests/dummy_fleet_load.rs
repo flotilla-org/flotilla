@@ -23,11 +23,9 @@
 //! `FLOTILLA_LOAD_TRACE=1` records controller errors/restarts and slow Message
 //! receipt timestamps, including the durable submission instant, to stderr.
 //!
-//! `FLOTILLA_LOAD_PRIMITIVES=true` adds `[primitives]` to each home's
-//! `daemon.toml`, so Message runs on the ADR 0064 engine (#3317), and seeds the
-//! designated fleet project its roles live under. Turn delivery is then timed
-//! from each engine Message's creation entry to the AgentSession receipt edge
-//! about it, followed on the decided store's log.
+//! Each home seeds the designated fleet project its roles live under. Turn
+//! delivery is timed from each engine Message's creation entry to the
+//! AgentSession receipt edge about it, followed on the decided store's log.
 //!
 //! `FLOTILLA_LOAD_MAX_RESIDENT_GIB` stops admitting convoys once the process
 //! holds that much memory, so a plan the host cannot hold reports how far it
@@ -40,7 +38,7 @@
 //! other tests in a shared binary would distort.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -54,32 +52,31 @@ use chrono::Utc;
 use flotilla_config::{ConfigStore, DaemonConfig};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::{
-    dummy_fleet::{attach_dummy_fleet, install_dummy_fleet},
+    dummy_fleet::install_dummy_fleet,
     runtime::{DaemonRuntime, RuntimeOptions},
+    server::{EnvironmentFrontDoor, HookEndpoint},
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_daemon_testkit::server::{spawn_in_memory_request_mesh_with_replication_metrics, InMemoryRequestMesh};
 use flotilla_discovery_testkit::fake_discovery_with_host_directories;
 use flotilla_dummy_fleet::{
     catalog::{self, CrewMix, DUMMY_FULFILMENT_KIND},
-    CrewCommandPort, DaemonCommandPort, DummyFleet, DUMMY_AGENT_ADAPTER,
+    DummyFleet, DUMMY_AGENT_ADAPTER,
 };
 use flotilla_load_driver::{ConvoyObservation, ConvoyState, FleetTarget, HomeSample, LoadPlan, TargetSample};
 use flotilla_observation::forge_observation::NO_READY_FORGE_OBSERVER;
 use flotilla_protocol::{commands::CommandValue, CommandAction, HostName};
 use flotilla_resources::{
-    Checkout, Convoy, ConvoyPhase, FleetDesignation, FleetDesignationSpec, Forge, Host, InputMeta, Message, Project, ProjectSpec,
-    ReadWatchEvent, Repository, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
-    FLEET_DESIGNATION_NAME,
+    Checkout, Convoy, ConvoyPhase, Host, Message, ReadWatchEvent, Repository, ResourceProvenance, TerminalSession, Vessel, WatchEvent,
+    WatchStart,
 };
 use flotilla_schema::{Cause, CodeEnum, KindCode, KindSpec};
 use flotilla_schema_sqlite::stream::{Frame, Service};
 use flotilla_state_machines::machines::{agent_session::AgentSessionEdgeKind, message::MessageSpec};
 use flotilla_store::{
-    load_metrics::{LatencyHistogram, ReplicationLoadMetrics},
+    load_metrics::{attributed, caller, callers, inherit, LatencyHistogram, ReplicationLoadMetrics},
     ResourceBackend,
 };
-use flotilla_store_sqlite::SqliteBackend;
 use futures::StreamExt;
 
 const NAMESPACE: &str = "flotilla";
@@ -105,9 +102,10 @@ struct Home {
     daemon: Arc<InProcessDaemon>,
     fleet: Arc<DummyFleet>,
     runtime: DaemonRuntime,
-    store: SqliteBackend,
     database: PathBuf,
-    port: Arc<DaemonCommandPort>,
+    operator: Operator,
+    /// Ends the environment sockets' connections when the home goes.
+    _front_door: tokio::sync::watch::Sender<bool>,
     replication: Arc<ReplicationLoadMetrics>,
     view: Arc<HomeView>,
 }
@@ -116,9 +114,73 @@ struct InProcessFleet {
     homes: Vec<Home>,
     /// Refuse dispatches once the process holds this much resident memory.
     memory_limit: Option<u64>,
+    calls: Calls,
     _mesh: Option<InMemoryRequestMesh>,
     _dir: tempfile::TempDir,
 }
+
+/// The driver's calls into the target that have not returned, so a run past its
+/// deadline names the call it waits on.
+#[derive(Default)]
+struct Calls {
+    next: AtomicU64,
+    open: Mutex<BTreeMap<u64, (String, std::time::Instant)>>,
+}
+
+struct Call<'a>(&'a Calls, u64);
+
+impl Calls {
+    fn begin(&self, what: String) -> Call<'_> {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.open.lock().expect("calls").insert(id, (what, std::time::Instant::now()));
+        Call(self, id)
+    }
+
+    fn describe(&self) -> Vec<String> {
+        self.open.lock().expect("calls").values().map(|(what, at)| format!("{what} for {:.1}s", at.elapsed().as_secs_f64())).collect()
+    }
+}
+
+impl Drop for Call<'_> {
+    fn drop(&mut self) {
+        self.0.open.lock().expect("calls").remove(&self.1);
+    }
+}
+
+/// Fails a run that hangs where the driver's deadline cannot reach it (start-up,
+/// or dropping the fleet and the runtime), naming the phase it hangs in.
+struct Watchdog {
+    phase: Arc<Mutex<&'static str>>,
+    _running: std::sync::mpsc::Sender<()>,
+}
+
+impl Watchdog {
+    fn start(limit: Duration) -> Self {
+        let phase = Arc::new(Mutex::new("start"));
+        let (running, stopped) = std::sync::mpsc::channel::<()>();
+        let watched = Arc::clone(&phase);
+        std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(limit) {
+                eprintln!("still running after {limit:?}, in phase: {}", watched.lock().expect("phase"));
+                std::process::abort();
+            }
+        });
+        Self { phase, _running: running }
+    }
+
+    fn enter(&self, phase: &'static str) {
+        *self.phase.lock().expect("phase") = phase;
+    }
+
+    /// Keeps watching past the test body, through the drops that follow it.
+    fn outlive(self, phase: &'static str) {
+        self.enter(phase);
+        std::mem::forget(self);
+    }
+}
+
+/// How long the report waits on each read it makes of a home.
+const REPORT_READ: Duration = Duration::from_secs(10);
 
 fn state_of(phase: ConvoyPhase) -> ConvoyState {
     match phase {
@@ -132,92 +194,82 @@ fn state_of(phase: ConvoyPhase) -> ConvoyState {
 async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, options: RuntimeOptions, admissions: Admissions) -> Home {
     let config_dir = root.join(format!("home-{index}"));
     std::fs::create_dir_all(&config_dir).expect("config dir");
-    let switch = if load_primitives() { "[primitives]\n" } else { "" };
-    std::fs::write(config_dir.join("daemon.toml"), format!("machine_id = \"load-{index}\"\n\n{switch}[dummy_fleet]\n{dummy_fleet}"))
+    std::fs::write(config_dir.join("daemon.toml"), format!("machine_id = \"load-{index}\"\n\n[dummy_fleet]\n{dummy_fleet}"))
         .expect("daemon.toml");
     let config = Arc::new(ConfigStore::with_base(config_dir.clone()));
     let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
     let mut discovery = fake_discovery_with_host_directories(&config_dir);
-    let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet configured");
-    // The daemon's own store, opened where flotillad opens it.
-    let database = config.state_dir().as_path().join("resources.sqlite");
-    std::fs::create_dir_all(database.parent().expect("state dir")).expect("state dir");
-    let store = SqliteBackend::open_async(&database).await.expect("sqlite store");
+    let fleet = install_dummy_fleet(&daemon_config, config.state_dir().as_path(), &mut discovery)
+        .expect("dummy fleet state")
+        .expect("dummy fleet configured");
+    // The engine's decided store, which the daemon opens where flotillad opens it.
+    let database = config.state_dir().as_path().join(flotilla_core::in_process::decided::ENGINE_STORE);
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
         discovery,
         HostName::new(format!("load-{index}")),
-        ResourceBackend::new(store.clone()),
+        flotilla_store_memory::engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
-    let options = RuntimeOptions { namespace: NAMESPACE.into(), ..options };
+    fleet.resume();
+    // The crews reach the daemon through their environments' sockets and hook routes, as
+    // flotillad's server serves them.
+    let hooks = HookEndpoint::load(config.state_dir().as_path()).expect("hook key");
+    let (front_door, shutdown) = tokio::sync::watch::channel(false);
+    let directory = flotilla_protocol::DaemonHostPath::new(config_dir.join("env"));
+    let environments = EnvironmentFrontDoor::for_daemon(&daemon, hooks.clone(), directory, shutdown);
+    let options = RuntimeOptions {
+        namespace: NAMESPACE.into(),
+        environment_sockets: Some(environments.socket_service()),
+        hook_endpoint: Some(hooks),
+        ..options
+    };
     let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
+    environments.install_blob_store(Arc::clone(&runtime.blob_store)).expect("blob store");
     let backend = daemon.resource_backend();
-    seed(&backend, fleet.config(), daemon.message_primitives().is_some()).await;
+    let operator = Operator(Arc::clone(&daemon) as Arc<dyn DaemonHandle>);
     let view = Arc::new(HomeView::default());
-    watch_convoys(&backend, Arc::clone(&view), admissions).await;
-    watch_messages(&backend, Arc::clone(&view)).await;
-    if let Some(primitives) = daemon.message_primitives() {
-        watch_engine_messages(Arc::clone(primitives.service()), Arc::clone(&view));
-    }
-    let port = DaemonCommandPort::new(&(Arc::clone(&daemon) as Arc<dyn DaemonHandle>));
-    Home { daemon, fleet, runtime, store, database, port, replication: Arc::default(), view }
+    // What the harness reads to seed and observe the fleet counts for it, apart from the fleet's own work.
+    attributed(caller("load harness"), async {
+        seed(&backend, &operator, fleet.config()).await;
+        watch_convoys(&backend, Arc::clone(&view), admissions).await;
+        watch_messages(&backend, Arc::clone(&view)).await;
+    })
+    .await;
+    let primitives = daemon.message_primitives().expect("the Message path is composed");
+    watch_engine_messages(Arc::clone(primitives.service()), Arc::clone(&view));
+    Home { daemon, fleet, runtime, database, operator, _front_door: front_door, replication: Arc::default(), view }
 }
 
-async fn seed(backend: &ResourceBackend, config: &flotilla_config::dummy_fleet::DummyFleetConfig, primitives: bool) {
-    if primitives {
-        // The engine path resolves fleet roles from the replicated fleet identity.
-        backend
-            .clone()
-            .using::<Project>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name("fleet".to_string()).build(),
-                &ProjectSpec::builder()
-                    .display_name("Fleet".to_string())
-                    .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
-                    .repositories(Vec::new())
-                    .build(),
-            )
-            .await
-            .expect("fleet project");
-        backend
-            .clone()
-            .definitions::<FleetDesignation>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
-                &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
-            )
-            .await
-            .expect("fleet designation");
+/// The driver's commands, sent as an operator's `flotilla` sends them: a query answers at once,
+/// a command once it has finished.
+struct Operator(Arc<dyn DaemonHandle>);
+
+impl Operator {
+    async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
+        let command = flotilla_protocol::Command::builder().action(action).build();
+        if command.action.is_query() {
+            return self.0.execute_query(command, uuid::Uuid::new_v4()).await;
+        }
+        flotilla_client::wait_for_command(&*self.0, command, |_| {}).await
     }
+}
+
+/// Apply the dummy catalog as an operator applies it to a real daemon: the
+/// documents `dummy-fleet-catalog` writes, through the resource-apply command.
+async fn seed(backend: &ResourceBackend, port: &Operator, config: &flotilla_config::dummy_fleet::DummyFleetConfig) {
     let host = backend.clone().using::<Host>(NAMESPACE).list().await.expect("hosts").items.into_iter().next().expect("local host");
-    let forge = catalog::forge(&config.forge_service_url);
-    backend
-        .clone()
-        .using::<Forge>(NAMESPACE)
-        .create(&InputMeta::builder().name(forge.forge_id.clone()).build(), &forge)
-        .await
-        .expect("dummy forge");
-    let repository = catalog::repository(&forge).expect("dummy repository");
-    let repositories = backend.clone().using::<Repository>(NAMESPACE);
-    repositories.create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository).await.expect("repository");
-    backend
-        .clone()
-        .using::<flotilla_resources::FulfilmentKind>(NAMESPACE)
-        .create(&InputMeta::builder().name(DUMMY_FULFILMENT_KIND.to_string()).build(), &catalog::fulfilment_kind(&host.metadata.name))
-        .await
-        .expect("dummy fulfilment kind");
-    for mix in CrewMix::ALL {
-        backend
-            .clone()
-            .using::<WorkflowTemplate>(NAMESPACE)
-            .create(&InputMeta::builder().name(mix.workflow_name().to_string()).build(), &mix.workflow(config.agent.long_runner_turns))
-            .await
-            .expect("dummy workflow");
+    let mut documents =
+        catalog::documents(&config.forge_service_url, &host.metadata.name, config.agent.long_runner_turns).expect("dummy catalog");
+    documents.extend(catalog::standing_governor_documents(&config.forge_service_url).expect("standing governor"));
+    for catalog::CatalogDocument { kind, name, document } in documents {
+        let applied = port.execute(CommandAction::ResourceApply { namespace: NAMESPACE.into(), document }).await;
+        assert!(matches!(applied, Ok(CommandValue::ResourceObject(_))), "apply {kind} {name}: {applied:?}");
     }
+    let repository = catalog::repository(&catalog::forge(&config.forge_service_url)).expect("dummy repository");
+    let repositories = backend.clone().using::<Repository>(NAMESPACE);
     tokio::time::timeout(Duration::from_secs(60), async {
         while repositories.get(&repository.key().to_string()).await.ok().and_then(|repository| repository.status?.default_branch).is_none()
         {
@@ -242,7 +294,7 @@ async fn seed(backend: &ResourceBackend, config: &flotilla_config::dummy_fleet::
 /// Track the driver's local convoys, and time replicas arriving from other homes.
 async fn watch_convoys(backend: &ResourceBackend, view: Arc<HomeView>, admissions: Admissions) {
     let mut events = backend.including_replicas::<Convoy>(NAMESPACE).watch().await.expect("convoy watch");
-    tokio::spawn(async move {
+    tokio::spawn(inherit(async move {
         let mut replicated = HashSet::new();
         while let Some(event) = events.next().await {
             let Ok(ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source)) = event else { continue };
@@ -257,14 +309,25 @@ async fn watch_convoys(backend: &ResourceBackend, view: Arc<HomeView>, admission
                     }
                     admissions.lock().expect("admissions").entry(convoy.metadata.name.clone()).or_insert_with(tokio::time::Instant::now);
                     let state = convoy.status.as_ref().map_or(ConvoyState::Open, |status| state_of(status.phase));
+                    // An ended convoy's progress says why it ended, for an unexpected end's report.
+                    let ending = match convoy.status.as_ref().filter(|_| state.ended()) {
+                        Some(status) => format!(
+                            " message={:?} disposition={:?} work={:?} crew={:?}",
+                            status.message, status.disposition, status.work, status.crew_work
+                        ),
+                        None => String::new(),
+                    };
                     let observation = ConvoyObservation {
                         name: convoy.spec.role.clone(),
                         state,
-                        progress: format!("resource={} {}", convoy.metadata.name, place_of(&convoy)),
+                        progress: format!("resource={} {}{ending}", convoy.metadata.name, place_of(&convoy)),
                         stall: convoy.status.as_ref().and_then(|status| status.stalled.as_ref()).map(|stall| stall.evidence.clone()),
                         expects_stall: false,
                         expected_end: ConvoyState::Delivered,
                     };
+                    if state == ConvoyState::Failed {
+                        println!("convoy_failed {} {}", observation.name, observation.progress);
+                    }
                     {
                         let mut convoys = view.convoys.lock().expect("convoys");
                         if convoys.get(&convoy.spec.role).is_none_or(|(_, previous)| *previous != observation) {
@@ -288,13 +351,13 @@ async fn watch_convoys(backend: &ResourceBackend, view: Arc<HomeView>, admission
                 }
             }
         }
-    });
+    }));
 }
 
 /// Time each Message from creation until its receipt is recorded.
 async fn watch_messages(backend: &ResourceBackend, view: Arc<HomeView>) {
     let mut events = backend.clone().using::<Message>(NAMESPACE).watch(WatchStart::Now).await.expect("message watch");
-    tokio::spawn(async move {
+    tokio::spawn(inherit(async move {
         let mut delivered = HashSet::new();
         while let Some(event) = events.next().await {
             let Ok(WatchEvent::Added(message) | WatchEvent::Modified(message)) = event else { continue };
@@ -309,10 +372,10 @@ async fn watch_messages(backend: &ResourceBackend, view: Arc<HomeView>) {
                 }
             }
         }
-    });
+    }));
 }
 
-/// Time each engine Message (`[primitives]`) from its creation entry to the
+/// Time each engine Message from its creation entry to the
 /// AgentSession receipt edge about it, following the decided store's log as a
 /// peer does, so the measurement never lists the replica.
 fn watch_engine_messages(service: Arc<Service>, view: Arc<HomeView>) {
@@ -430,7 +493,65 @@ impl InProcessFleet {
             .ok()
             .and_then(|gib| gib.parse::<u64>().ok())
             .map(|gib| gib * 1024 * 1024 * 1024);
-        Self { homes: started, memory_limit, _mesh: mesh, _dir: dir }
+        Self { homes: started, memory_limit, calls: Calls::default(), _mesh: mesh, _dir: dir }
+    }
+
+    /// What is still open when a run outlives its deadline: the target calls in
+    /// flight, each unsettled convoy's place and the provider artifacts it holds,
+    /// the messages not yet received and what each controller loop is doing.
+    async fn stuck_report(&self) -> String {
+        let mut lines = vec![format!("target calls in flight: {:?}", self.calls.describe())];
+        for (index, home) in self.homes.iter().enumerate() {
+            lines.push(format!("home {index}: {:?}", home.fleet.snapshot()));
+            let open = home
+                .view
+                .convoys
+                .lock()
+                .expect("convoys")
+                .iter()
+                .filter(|(_, (_, observation))| !observation.state.ended())
+                .map(|(role, (resource, observation))| (role.clone(), resource.clone(), observation.clone()))
+                .collect::<Vec<_>>();
+            for (role, resource, observation) in open {
+                lines.push(format!(
+                    "  open {role}: {} stall={:?} holds {:?}",
+                    observation.progress,
+                    observation.stall,
+                    home.fleet.remaining_for(&resource)
+                ));
+            }
+            let messages = home.daemon.resource_backend().using::<Message>(NAMESPACE);
+            match tokio::time::timeout(REPORT_READ, messages.list()).await {
+                Ok(Ok(list)) => {
+                    let mut unreceived = BTreeMap::<String, u64>::new();
+                    for message in &list.items {
+                        if message.status.as_ref().is_none_or(|status| status.resolved_receiver.is_none()) {
+                            *unreceived.entry(message.spec.receiver.to_string()).or_default() += 1;
+                        }
+                    }
+                    lines.push(format!("  messages: {} listed; not received, by receiver: {unreceived:?}", list.items.len()));
+                }
+                Ok(Err(error)) => lines.push(format!("  messages unreadable: {error}")),
+                Err(_) => lines.push(format!("  messages: the list did not answer within {REPORT_READ:?}")),
+            }
+            let snapshots = home.runtime.controller_metrics.snapshot();
+            for (kind, activity) in home.runtime.controller_metrics.activity() {
+                let Some(loop_) = snapshots.get(&kind) else { continue };
+                lines.push(format!(
+                    "  controller {kind}: wakes={} enqueued={} coalesced={} requeues={} failures={} parked={} queue_peak={} last_wake={:?} busy_for={:?}",
+                    loop_.wakes,
+                    loop_.enqueued,
+                    loop_.enqueued_coalesced,
+                    loop_.requeues,
+                    loop_.failures,
+                    loop_.parked,
+                    loop_.queue_peak,
+                    activity.last_wake,
+                    activity.busy_for
+                ));
+            }
+        }
+        lines.join("\n")
     }
 }
 
@@ -448,21 +569,10 @@ impl FleetTarget for InProcessFleet {
                 return Err(format!("resident memory limit reached ({} MiB)", limit / (1024 * 1024)));
             }
         }
+        let _call = self.calls.begin(format!("dispatch {name}"));
         let home = &self.homes[home];
-        let forge = catalog::forge(&catalog_forge_url());
-        let action = CommandAction::ConvoyCreate {
-            name: name.into(),
-            workflow_ref: mix.workflow_name().into(),
-            inputs: Vec::new(),
-            repository_url: Some(catalog::repository_url(&forge)),
-            // Each convoy's worktree on the host reserves its own branch.
-            r#ref: Some(format!("dummy/{name}")),
-            project_ref: None,
-            placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
-            adopted_checkout: None,
-        };
-        match home.port.execute(action).await? {
-            CommandValue::ConvoyCreated { .. } => Ok(()),
+        match home.operator.execute(catalog::dispatch(name, mix.workflow_name(), DUMMY_FULFILMENT_KIND)).await? {
+            CommandValue::ConvoyStarted { .. } => Ok(()),
             CommandValue::Error { message } => Err(message),
             other => Err(format!("unexpected admission result {other:?}")),
         }
@@ -476,11 +586,12 @@ impl FleetTarget for InProcessFleet {
     }
 
     async fn abandon(&self, home: usize, name: &str, reason: &str) -> Result<(), String> {
+        let _call = self.calls.begin(format!("abandon {name}"));
         let home = &self.homes[home];
         let resource = home.view.convoys.lock().expect("convoys").get(name).map(|(resource, _)| resource.clone());
         let resource = resource.ok_or_else(|| format!("convoy {name} is not known"))?;
         let action = CommandAction::ConvoyAbandon { namespace: Some(NAMESPACE.into()), name: resource, reason: reason.into() };
-        match home.port.execute(action).await? {
+        match home.operator.execute(action).await? {
             CommandValue::Error { message } => Err(message),
             _ => Ok(()),
         }
@@ -497,6 +608,7 @@ impl FleetTarget for InProcessFleet {
     }
 
     async fn audit(&self) -> Result<Vec<String>, String> {
+        let _call = self.calls.begin("audit".into());
         let mut errors = Vec::new();
         for home in &self.homes {
             let snapshot = home.fleet.snapshot();
@@ -530,7 +642,16 @@ impl FleetTarget for InProcessFleet {
             }
             for terminal in backend.clone().using::<TerminalSession>(NAMESPACE).list().await.map_err(|e| e.to_string())?.items {
                 if let Some(convoy) = terminal.metadata.labels.get("flotilla.work/convoy").filter(|c| ended.contains(*c)) {
-                    errors.push(format!("{convoy}: session {} remains", terminal.metadata.name));
+                    errors.push(format!(
+                        "{convoy}: session {} remains: phase={:?} message={:?} started={:?} stopped={:?} env={} labels={:?}",
+                        terminal.metadata.name,
+                        terminal.status.as_ref().map(|status| status.phase),
+                        terminal.status.as_ref().and_then(|status| status.message.clone()),
+                        terminal.status.as_ref().and_then(|status| status.started_at),
+                        terminal.status.as_ref().and_then(|status| status.stopped_at),
+                        terminal.spec.env_ref,
+                        terminal.metadata.labels
+                    ));
                 }
             }
             for checkout in backend.using::<Checkout>(NAMESPACE).list().await.map_err(|e| e.to_string())?.items {
@@ -550,7 +671,7 @@ impl FleetTarget for InProcessFleet {
             .homes
             .iter()
             .map(|home| HomeSample {
-                store: Some(home.store.load_metrics().snapshot()),
+                decided_store: Some(home.daemon.decided_store_metrics().snapshot()),
                 controllers: home.runtime.controller_metrics.snapshot(),
                 replication: home.replication.snapshot(),
                 replication_lag: home.view.replication_lag.snapshot(),
@@ -558,7 +679,7 @@ impl FleetTarget for InProcessFleet {
                 database_bytes: database_bytes(&home.database),
             })
             .collect();
-        Ok(TargetSample { homes, resident_bytes: resident_bytes() })
+        Ok(TargetSample { homes, resident_bytes: resident_bytes(), reads: callers() })
     }
 }
 
@@ -568,10 +689,6 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 fn load_long_runner_turns() -> u32 {
     env_or("FLOTILLA_LOAD_LONG_RUNNER_TURNS", 5)
-}
-
-fn load_primitives() -> bool {
-    env_or("FLOTILLA_LOAD_PRIMITIVES", false)
 }
 
 fn catalog_forge_url() -> String {
@@ -596,10 +713,11 @@ fn smoke_plan() -> LoadPlan {
         drain: Duration::from_secs(180),
         ramp_per_second: 20.0,
         dispatch_concurrency: 6,
-        // The first `running` dispatches cover every mix, and the window's
-        // replacements are coders. A turn takes its 1.5s delay plus the 1s
-        // delivery confirmation, so a window opened after warm-up holds
-        // receipted turns.
+        // The first `running` dispatches cover every mix, and the first
+        // replacement (dispatch 10, slot 2 of 4) is a coder-reviewer, whose
+        // handoff turns flow through the window wherever it opens. A turn takes
+        // its 1.5s delay plus the 1s delivery confirmation.
+        mix: vec![(CrewMix::Coder, 1), (CrewMix::LongRunner, 1), (CrewMix::CoderReviewer, 1), (CrewMix::CoderSupervisor, 1)],
         window: Duration::from_secs(6),
         max_ramp: Duration::from_secs(60),
         convoy_deadline: Duration::from_secs(120),
@@ -616,11 +734,28 @@ async fn load_driver_smoke() {
     // One long-runner task; the integration scenarios exchange several.
     // Production heartbeat and controller resync; the dummy kind, seeded after
     // startup, is probed on the next short pass rather than the production one.
+    let watchdog = Watchdog::start(Duration::from_secs(600));
     let options = RuntimeOptions { fulfilment_probe_interval: Duration::from_millis(200), ..RuntimeOptions::default() };
     let fleet = InProcessFleet::start(1, &dummy_fleet_settings(1), options).await;
     let plan = smoke_plan();
-    let report = flotilla_load_driver::run(&fleet, &plan).await.expect("load report");
+    watchdog.enter("run");
+    // The plan bounds the run (ramp, window, drain); past that, report what is still open.
+    let deadline = plan.max_ramp + plan.window + plan.drain + Duration::from_secs(90);
+    // The run stays alive while the report is taken: dropping it would release what it holds.
+    let run = flotilla_load_driver::run(&fleet, &plan);
+    tokio::pin!(run);
+    let report = match tokio::time::timeout(deadline, &mut run).await {
+        Ok(report) => report.expect("load report"),
+        Err(_) => panic!("the load run outlived {deadline:?}:\n{}", fleet.stuck_report().await),
+    };
+    watchdog.outlive("assertions, then dropping the fleet and the runtime");
     eprintln!("{}", report.markdown());
+    // Every engine read the fleet made counts for the caller that made it: none is left unnamed.
+    let unattributed = callers().remove(flotilla_schema::reads::UNATTRIBUTED).unwrap_or_default();
+    assert!(unattributed.values().all(|counts| *counts == Default::default()), "reads no caller named: {unattributed:?}");
+    if !report.unfinished.is_empty() {
+        eprintln!("convoys unfinished after the drain:\n{}", fleet.stuck_report().await);
+    }
     assert!(report.ramp.reached, "{:?}", report.ramp);
     assert_eq!(report.dispatch.errors, 0, "{:?}", report.dispatch.error_samples);
     assert!(report.correctness_errors.is_empty(), "{:?}", report.correctness_errors);
@@ -630,7 +765,8 @@ async fn load_driver_smoke() {
     }
     assert_eq!((report.window.failed, report.window.abandoned), (0, 0), "{:?}", report.window);
     let home = &report.home_metrics[0];
-    assert!(home.store.as_ref().is_some_and(|store| store.write_execution.count > 0), "the store records writes");
+    // Convoys, their launches and their crews' sessions are written to the decided store (#3108).
+    assert!(home.decided_store.as_ref().is_some_and(|store| store.write_execution.count > 0), "the store records writes");
     assert!(home.controllers.contains_key("Convoy"), "controller loops report: {:?}", home.controllers.keys().collect::<Vec<_>>());
     assert!(home.turn_delivery.count > 0, "turns are delivered and receipted");
 }
@@ -724,15 +860,9 @@ async fn load_baseline() {
     report.metadata.insert("source_status".into(), source_status);
     report.metadata.insert("source_diff".into(), source_diff);
     report.metadata.insert("dummy_fleet".into(), dummy_fleet_settings(load_long_runner_turns()));
-    report.metadata.insert("primitives".into(), load_primitives().to_string());
     report.metadata.insert(
         "turn_delivery_definition".into(),
-        if load_primitives() {
-            "engine Message creation entry -> AgentSession Receive edge about it (decided store log)"
-        } else {
-            "old-store Message creation_timestamp -> status.resolved_receiver.delivered_at"
-        }
-        .into(),
+        "engine Message creation entry -> AgentSession Receive edge about it (decided store log)".into(),
     );
     report.metadata.insert("effective_dummy_config".into(), format!("{:?}", fleet.homes[0].fleet.config()));
     report.metadata.insert("host_load_start".into(), load_start.trim().into());
@@ -754,38 +884,31 @@ async fn load_baseline() {
     assert_eq!(report.total.delivered, report.dispatch.admitted, "every admitted convoy delivers");
     assert_eq!(report.dispatch.errors, 0, "{:?}", report.dispatch);
     assert_eq!(report.total.failed + report.total.abandoned, 0, "all load scripts should deliver: {:?}", report.total);
-    if load_primitives() {
-        for home in &report.home_metrics {
-            assert!(home.turn_delivery.count > 0, "switch on, the engine log reader recorded no turn delivery");
-        }
+    for home in &report.home_metrics {
+        assert!(home.turn_delivery.count > 0, "the engine log reader recorded no turn delivery");
     }
     assert_eq!(observer_failures, 0, "load produced no-ready-forge-observer stall evidence; see observer_failure lines");
 }
 
-// Compare the receiver stage of a pass on one frozen, production dummy-fleet
-// database. A single explicit address should cost only its convoy and crew,
-// regardless of retained fleet history. Ignored because this starts a full fleet.
+// Compare the receiver stage of a pass on one production dummy-fleet home. A
+// single explicit address should cost only its convoy and crew, regardless of
+// retained fleet history. Ignored because this starts a full fleet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "receiver decode measurement: starts the dummy fleet"]
 async fn receiver_snapshot_decode_measurement() {
     use flotilla_messaging::MessageReceiverSnapshot;
     use flotilla_resources::TerminalSession;
-    use flotilla_store_testkit::ReadCountsBackendExt;
+    use flotilla_store::load_metrics::CallerReads;
 
     let fleet = InProcessFleet::start(1, &dummy_fleet_settings(load_long_runner_turns()), RuntimeOptions::default()).await;
-    // This probe freezes active crew records for decoder comparisons. Reuse
-    // the small fleet settings while deliberately leaving its tail open.
+    // This probe reads active crew records. Reuse the small fleet settings
+    // while deliberately leaving its tail open.
     let plan = LoadPlan { drain: Duration::ZERO, window: Duration::from_secs(25), ..smoke_plan() };
     let report = flotilla_load_driver::run(&fleet, &plan).await.expect("load report");
     assert!(report.ramp.reached, "{:?}", report.ramp);
     assert!(report.window.delivered >= 3, "{:?}", report.window);
-    // VACUUM INTO captures a consistent database while the fleet is running;
-    // receiver reads below use an isolated copy without controller traffic.
-    let frozen = fleet._dir.path().join("receiver-measurement.sqlite");
-    let live = rusqlite::Connection::open(&fleet.homes[0].database).expect("live database");
-    live.execute("VACUUM INTO ?1", [frozen.to_str().expect("path")]).expect("freeze database");
-    let store = SqliteBackend::open(&frozen).expect("frozen store");
-    let backend = ResourceBackend::new(store).with_read_counts();
+    // The receiver reads count under their own caller, apart from controller traffic.
+    let backend = fleet.homes[0].daemon.resource_backend();
     let terminal = backend
         .including_replicas::<TerminalSession>(NAMESPACE)
         .list()
@@ -798,33 +921,20 @@ async fn receiver_snapshot_decode_measurement() {
     let labels = &terminal.object.metadata.labels;
     let convoy = &labels["flotilla.work/convoy"];
     let address = format!("{NAMESPACE}/{convoy}/{}/{}", labels["flotilla.work/vessel"], labels["flotilla.work/role"]);
-    let before = backend.read_snapshot();
-    MessageReceiverSnapshot::load(&backend, NAMESPACE).await.expect("full snapshot");
-    let full = backend.read_snapshot().since(&before);
-    let before = backend.read_snapshot();
-    let scoped = MessageReceiverSnapshot::load_for_addresses(&backend, NAMESPACE, &[address]).await.expect("scoped snapshot");
-    let targeted = backend.read_snapshot().since(&before);
-    let db = rusqlite::Connection::open(&frozen).expect("frozen database");
-    // body_json is the exact UTF-8 input passed to the SQLite typed decoder.
-    let bytes = |kind: &str, name: Option<&str>| -> u64 {
-        db.query_row("SELECT COALESCE(SUM(length(CAST(body_json AS BLOB))),0) FROM resource_objects WHERE namespace=?1 AND kind=?2 AND (?3 IS NULL OR name=?3)",
-            rusqlite::params![NAMESPACE, kind, name], |row| row.get(0)).expect("stored bytes")
-    };
-    let full_bytes: u64 = ["Convoy", "TerminalSession", "ConvoyEnsure"].into_iter().map(|kind| bytes(kind, None)).sum();
-    let scoped_bytes = bytes("Convoy", Some(convoy))
-        + scoped.terminals().iter().map(|source| bytes("TerminalSession", Some(&source.object.metadata.name))).sum::<u64>();
-    let rows = |reads: &flotilla_store_testkit::ReadSnapshot| -> usize {
-        ["Convoy", "TerminalSession", "ConvoyEnsure"]
+    let full = Arc::new(CallerReads::default());
+    attributed(Arc::clone(&full), MessageReceiverSnapshot::load(&backend, NAMESPACE)).await.expect("full snapshot");
+    let targeted = Arc::new(CallerReads::default());
+    attributed(Arc::clone(&targeted), MessageReceiverSnapshot::load_for_addresses(&backend, NAMESPACE, &[address]))
+        .await
+        .expect("scoped snapshot");
+    let rows = |reads: &CallerReads| -> u64 {
+        let reads = reads.snapshot();
+        ["Convoy port", "TerminalSession port", "ConvoyEnsure port"]
             .into_iter()
-            .map(|kind| reads.objects_by_kind().get(kind).copied().unwrap_or_default())
+            .map(|kind| reads.get(kind).map_or(0, |counts| counts.rows))
             .sum()
     };
-    eprintln!(
-        "receiver stage per pass: before rows={} bytes={full_bytes}; after rows={} bytes={scoped_bytes}",
-        rows(&full),
-        rows(&targeted)
-    );
-    assert_eq!(rows(&targeted), 2, "one convoy and one crew terminal: {targeted}");
+    eprintln!("receiver stage per pass: before rows={}; after rows={}", rows(&full), rows(&targeted));
+    assert_eq!(rows(&targeted), 2, "one convoy and one crew terminal: {:?}", targeted.snapshot());
     assert!(rows(&full) > rows(&targeted));
-    assert!(full_bytes > scoped_bytes);
 }

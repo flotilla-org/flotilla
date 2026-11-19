@@ -20,9 +20,7 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provisioning::reconcilers::{EnvironmentProvisioning, EnvironmentRuntime, LocalProvisioning};
-use flotilla_resources::{
-    Environment, EnvironmentSpec, ResourceError, Vessel, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV,
-};
+use flotilla_resources::{EnvironmentSpec, ResourceError, Vessel, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV};
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
@@ -58,9 +56,9 @@ pub(super) async fn docker_vessel_hooks(
 ) -> Option<crate::server::HookLaunch> {
     let endpoint = state.hook_endpoint.as_ref()?;
     let backend = state.daemon.resource_backend();
-    match backend.clone().using::<Environment>(&state.namespace).get(env_ref).await {
-        Ok(environment) if environment.spec.docker.is_some() => {}
-        Ok(_) | Err(ResourceError::NotFound { .. }) => return None,
+    match state.environment(env_ref).await {
+        Ok(Some(environment)) if environment.spec.docker.is_some() => {}
+        Ok(_) => return None,
         Err(error) => {
             warn!(environment = %env_ref, %error, "cannot read the vessel's environment; Claude Code keeps command hooks");
             return None;
@@ -160,19 +158,12 @@ impl DockerControllerRuntime {
         name: &str,
         spec: &flotilla_resources::DockerEnvironmentSpec,
     ) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
-        let (mut environment_spec, instance) =
-            match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
-                Ok(environment) => (
-                    environment.spec,
-                    environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned(),
-                ),
-                Err(ResourceError::NotFound { .. }) => {
-                    (EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) }, None)
-                }
-                Err(error) => return Err(error.to_string().into()),
-            };
+        let mut environment_spec = match self.state.environment(name).await? {
+            Some(environment) => environment.spec,
+            None => EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(spec.clone()) },
+        };
         environment_spec.docker = Some(spec.clone());
-        let address = self.state.provider_address(name, &environment_spec, instance.as_deref()).await?;
+        let address = self.state.provider_address(name, &environment_spec, None).await?;
         let provider = self.state.environment_providers.get(&address)?;
         let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
         let mut tools = if provider.receives_host_tools() {
@@ -635,13 +626,9 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         if let Some(sockets) = &self.state.environment_sockets {
             sockets.remove(&EnvironmentId::new(environment_ref)).await?;
         }
-        let resource = self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(environment_ref).await;
-        match resource {
-            Ok(environment) if environment.spec.host_direct.is_some() => {
-                self.provider_for_environment(environment_ref).await?.destroy(environment_ref).await?;
-            }
-            Ok(_) | Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error.to_string()),
+        let environment = self.state.environment(environment_ref).await?;
+        if environment.as_ref().is_some_and(|environment| environment.spec.host_direct.is_some()) {
+            self.provider_for_environment(environment_ref).await?.destroy(environment_ref).await?;
         }
         let mut components = Path::new(environment_ref).components();
         if !matches!(components.next(), Some(std::path::Component::Normal(_))) || components.next().is_some() {
@@ -655,7 +642,6 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         if let Some(registry) = self.state.agent_material.as_deref() {
             let namespace = self.state.daemon.provisioning_namespace().await;
             let backend = self.state.daemon.resource_backend();
-            let environment = backend.using::<Environment>(&namespace).get(environment_ref).await;
             // Forced deletion may already have removed the resource owners.
             // Admission names environments env-convoy-<32 hex UUID>-<vessel>.
             let mut convoy_ref = environment_ref
@@ -669,18 +655,13 @@ impl EnvironmentRuntime for DockerControllerRuntime {
                 .unwrap_or_else(|| "unowned".to_string());
             // A failed owner lookup may archive under this fallback rather than
             // the later-resolved convoy. Preserve the logs and continue cleanup.
-            match environment {
-                Ok(environment) => {
-                    if let Some(owner) = environment.metadata.owner_references.iter().find(|owner| owner.kind == "Vessel") {
-                        match backend.using::<Vessel>(&namespace).get(&owner.name).await {
-                            Ok(vessel) => convoy_ref = vessel.spec.convoy_ref,
-                            Err(ResourceError::NotFound { .. }) => {}
-                            Err(error) => cleanup_errors.push(error.to_string()),
-                        }
-                    }
+            // The environment's holder is its vessel, whose convoy archives it.
+            if let Some(vessel) = environment.as_ref().and_then(|environment| environment.vessel.as_ref()) {
+                match backend.using::<Vessel>(&namespace).get(vessel).await {
+                    Ok(vessel) => convoy_ref = vessel.spec.convoy_ref,
+                    Err(ResourceError::NotFound { .. }) => {}
+                    Err(error) => cleanup_errors.push(error.to_string()),
                 }
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => cleanup_errors.push(error.to_string()),
             }
             if !matches!(Path::new(&convoy_ref).components().collect::<Vec<_>>().as_slice(), [std::path::Component::Normal(_)]) {
                 cleanup_errors.push("archive convoy identity must name one directory".to_string());

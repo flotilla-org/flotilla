@@ -7,8 +7,15 @@ use flotilla_admission::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureRecon
 use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_orchestration_testkit as ensure_scenarios;
 use flotilla_orchestration_testkit::EnsureScenarioController;
+use flotilla_resources::manifest_roots::ManifestRoots;
 use flotilla_resources::{Clock, ConvoyEnsure, ResourceObject};
 use flotilla_store::ResourceBackend;
+use flotilla_store_testkit::MemoryStandingRoles;
+
+/// The scenarios' manifest roots, over the backend each scenario gives.
+fn roots(backend: &ResourceBackend) -> Arc<dyn ManifestRoots> {
+    Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone()))
+}
 
 struct Controller;
 #[async_trait]
@@ -19,7 +26,15 @@ impl EnsureScenarioController for Controller {
         backend: ResourceBackend,
         clock: Arc<dyn Clock>,
     ) -> Arc<dyn ConvoyEnsureReconciler> {
-        Arc::new(EnsureReconciler::builder().teardown(teardown).resource_backend(backend).clock(clock).build())
+        Arc::new(
+            EnsureReconciler::builder()
+                .teardown(teardown)
+                .manifest_roots(roots(&backend))
+                .standing_roles(Arc::new(MemoryStandingRoles::default()))
+                .resource_backend(backend)
+                .clock(clock)
+                .build(),
+        )
     }
     async fn dependency_hash(
         &self,
@@ -32,6 +47,8 @@ impl EnsureScenarioController for Controller {
     ) -> Result<String, String> {
         EnsureReconciler::builder()
             .teardown(teardown)
+            .manifest_roots(roots(&backend))
+            .standing_roles(Arc::new(MemoryStandingRoles::default()))
             .resource_backend(backend)
             .clock(clock)
             .build()
@@ -49,6 +66,8 @@ impl EnsureScenarioController for Controller {
     ) -> Result<String, String> {
         EnsureReconciler::builder()
             .teardown(teardown)
+            .manifest_roots(roots(&backend))
+            .standing_roles(Arc::new(MemoryStandingRoles::default()))
             .resource_backend(backend)
             .clock(clock)
             .build()
@@ -103,8 +122,13 @@ async fn convoy_explain_refuses_multiple_terminal_generations() {
 }
 
 #[tokio::test]
-async fn convoy_explain_names_a_bare_role_only_without_a_project() {
-    ensure_scenarios::convoy_explain_names_a_bare_role_only_without_a_project(&Controller).await;
+async fn convoy_explain_names_retired_generations_by_record_only() {
+    ensure_scenarios::convoy_explain_names_retired_generations_by_record_only(&Controller).await;
+}
+
+#[tokio::test]
+async fn convoy_explain_places_a_bare_role_in_its_one_project() {
+    ensure_scenarios::convoy_explain_places_a_bare_role_in_its_one_project(&Controller).await;
 }
 
 #[tokio::test]
@@ -178,8 +202,8 @@ async fn explicit_ensure_roll_readmits_current_config_and_retains_the_previous_g
 }
 
 #[tokio::test]
-async fn forced_convoy_delete_retains_force_intent_until_checkout_finalizes() {
-    ensure_scenarios::forced_convoy_delete_retains_force_intent_until_checkout_finalizes(&Controller).await;
+async fn forced_convoy_delete_ends_a_convoy_whose_checkout_is_at_risk() {
+    ensure_scenarios::forced_convoy_delete_ends_a_convoy_whose_checkout_is_at_risk(&Controller).await;
 }
 
 #[tokio::test]
@@ -326,6 +350,12 @@ async fn unavailable_declared_driver_surfaces_named_admission_conditions_without
 #[tokio::test]
 async fn declared_driverless_ensure_has_one_acting_home() {
     ensure_scenarios::driverless_ensure_has_one_acting_home(&Controller, true, &[2, 0, 1, 0, 2, 1]).await;
+}
+
+// A declared copy owns a driverless ensure beside an undeclared original, until it is deleted.
+#[tokio::test]
+async fn a_declared_copy_owns_a_driverless_ensure_until_deleted() {
+    ensure_scenarios::a_declared_copy_owns_a_driverless_ensure_until_deleted(&Controller).await;
 }
 
 // Undeclared driverless ensures act only where they were created.

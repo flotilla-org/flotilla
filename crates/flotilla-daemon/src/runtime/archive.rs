@@ -1,10 +1,12 @@
 //! Ships ended engine resources to the object store, then removes them locally (#3939, ADR 0064
 //! Archive).
 //!
-//! Each pass brings the [`Archiver`] up to date with the decided store and works what is due:
-//! a resource a week past its end is bundled and uploaded to every `[[blob_stores]]` store, each
-//! upload confirmed by reading the bundle back, and only then deleted; a pass later it is
-//! expunged. A failed upload leaves the resource in place for the next pass. A bundle still
+//! A pass runs at each commit of an archived kind and at the next time work falls due, never on a
+//! timer. Each pass brings the [`Archiver`] up to date with the decided store and works what is
+//! due: a resource a week past its end is bundled and uploaded to every `[[blob_stores]]` store,
+//! each upload confirmed by reading the bundle back, and only then deleted; [`EXPUNGE_GRACE`]
+//! later it is expunged. A failed upload leaves the resource in place, retried at a backoff for
+//! [`RETRY_LIMIT`] consecutive failed passes and then at the next commit. A bundle still
 //! unshipped a day after it was due raises the `Archive` host condition, which fleet health
 //! shows to the `infra` role (ADR 0054), and is logged for that role.
 
@@ -18,7 +20,7 @@ use async_trait::async_trait;
 use flotilla_engine_store::archive::{bundle_key, ArchiveError, ArchiveKinds, Archiver, Bundle, Due, Prepared, Stage, BUNDLE_MEDIA_TYPE};
 use flotilla_resources::{Clock, ConditionValue, HostCondition};
 use flotilla_schema::{Identity, KindRegistry, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -27,11 +29,14 @@ use crate::blob_store::S3BlobStore;
 #[cfg(test)]
 mod tests;
 
-/// How often the shipper looks for due work.
-pub(crate) const PASS_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// How long a delete stands before its expunge, so followers tail both (see
 /// `flotilla_engine_store::archive`).
-pub(crate) const EXPUNGE_GRACE: Duration = PASS_INTERVAL;
+pub(crate) const EXPUNGE_GRACE: Duration = Duration::from_secs(10 * 60);
+/// The wait before retrying a pass that left due work undone.
+const RETRY: flotilla_resources::RetryBackoff =
+    flotilla_resources::RetryBackoff { initial: Duration::from_secs(60), maximum: Duration::from_secs(10 * 60) };
+/// Consecutive failed passes retried at [`RETRY`]; past it, a failed pass waits for the next commit.
+pub(crate) const RETRY_LIMIT: u32 = 10;
 /// How long past due a bundle may stay unshipped before the `infra` role is alerted.
 pub(crate) const ALERT_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 /// The host condition a stuck bundle raises.
@@ -66,11 +71,17 @@ impl ArchiveTarget for S3BlobStore {
 /// The decided store's kinds whose ended resources archive: every machine it holds.
 pub(crate) fn archive_kinds() -> ArchiveKinds {
     use flotilla_provisioning::stored::{
-        account::AccountBinding, checkout::Checkout, clone::Clone, environment::Environment, image_build::ImageBuild,
-        manifest_root::ManifestRoot, terminal_session::TerminalSession,
+        account::AccountBinding,
+        checkout::{Checkout, CheckoutFacts, CheckoutIntegration},
+        clone::{Clone, CloneFacts},
+        environment::Environment,
+        image_build::ImageBuild,
+        launch_facts::EnvironmentLaunchFacts,
+        manifest_root::ManifestRoot,
+        terminal_session::TerminalSession,
     };
     use flotilla_state_machines::machines::{
-        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
+        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, message::Message, person::Person, service::Service,
         vessel::Vessel,
     };
     ArchiveKinds::new()
@@ -79,16 +90,24 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         .with::<Convoy>()
         .with::<AwaitingReply>()
         .with::<Environment>()
+        // A launch's facts end with the launch.
+        .companion::<Environment, EnvironmentLaunchFacts>()
         .with::<ImageBuild>()
         .with::<Clone>()
+        // The facts a clone launch found end with it.
+        .companion::<Clone, CloneFacts>()
         .with::<Checkout>()
+        // A checkout launch's facts and its last inspection end with it.
+        .companion::<Checkout, CheckoutFacts>()
+        .companion::<Checkout, CheckoutIntegration>()
         .with::<TerminalSession>()
         .with::<Vessel>()
-        .with::<Ensure>()
         .with::<AccountBinding>()
         .with::<ManifestRoot>()
         // A person consumer has no end, so it stays live and is never shipped (#3938).
         .with::<Person>()
+        // A service's record ends when the service retires.
+        .with::<Service>()
 }
 
 /// What one pass did.
@@ -120,7 +139,9 @@ impl ShipError {
 }
 
 pub(crate) struct ArchiveShipper {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreHandle>,
+    /// The archived kinds, whose commits wake a pass.
+    codes: std::collections::BTreeSet<flotilla_schema::KindCode>,
     archiver: Arc<Mutex<Archiver>>,
     targets: Vec<Arc<dyn ArchiveTarget>>,
     clock: Arc<dyn Clock>,
@@ -134,7 +155,7 @@ impl ArchiveShipper {
     /// `report` receives the `Archive` condition after every pass: present while a bundle is
     /// overdue, absent otherwise.
     pub(crate) fn new(
-        store: Arc<Mutex<Store>>,
+        store: Arc<StoreHandle>,
         kinds: ArchiveKinds,
         targets: Vec<Arc<dyn ArchiveTarget>>,
         clock: Arc<dyn Clock>,
@@ -143,6 +164,7 @@ impl ArchiveShipper {
         let home = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).home().to_owned();
         Self {
             store,
+            codes: kinds.codes().collect(),
             archiver: Arc::new(Mutex::new(Archiver::new(home, kinds))),
             targets,
             clock,
@@ -152,15 +174,70 @@ impl ArchiveShipper {
         }
     }
 
-    pub(crate) async fn run(mut self, interval: Duration) {
-        let mut ticks = tokio::time::interval(interval);
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    /// Runs a pass at once, then at each commit of an archived kind to `service` and at the next
+    /// time work falls due.
+    pub(crate) async fn run(self, service: Arc<flotilla_schema_sqlite::stream::Service>) {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let listener: Arc<flotilla_schema_sqlite::stream::CommitListener> = {
+            let (wake, codes) = (Arc::clone(&wake), self.codes.clone());
+            Arc::new(move |committed: &flotilla_schema_sqlite::stream::Committed<'_>| {
+                if committed.touches(&codes) {
+                    wake.notify_one();
+                }
+            })
+        };
+        // The store holds the listener weakly; it lives as long as this loop.
+        service.on_commit(Arc::downgrade(&listener));
+        self.run_woken(wake).await
+    }
+
+    /// [`ArchiveShipper::run`], woken by `wake` in place of the store's commits.
+    pub(crate) async fn run_woken(mut self, wake: Arc<tokio::sync::Notify>) {
+        let mut failures = 0_u32;
         loop {
-            ticks.tick().await;
-            if let Err(error) = self.pass().await {
-                tracing::warn!(%error, "archive pass failed");
+            let result = self.pass().await;
+            let now = Timestamp::from_datetime(&self.clock.now());
+            let retry = match &result {
+                Ok(report) if report.failed.is_empty() && report.deferred.is_empty() => {
+                    failures = 0;
+                    None
+                }
+                outcome => {
+                    failures = failures.saturating_add(1);
+                    if let Err(error) = outcome {
+                        tracing::warn!(%error, failures, "archive pass failed");
+                    }
+                    if failures == RETRY_LIMIT + 1 {
+                        tracing::warn!(failures, "archive passes keep failing; the next commit retries");
+                    }
+                    (failures <= RETRY_LIMIT).then(|| now.saturating_add(micros(RETRY.delay(failures))))
+                }
+            };
+            let next = self.next_due(now).into_iter().chain(retry).min();
+            let wait = next.map(|at| Duration::from_micros(u64::try_from(at.since(now)).unwrap_or(0)));
+            tokio::select! {
+                () = wake.notified() => {}
+                () = async {
+                    match wait {
+                        Some(wait) => tokio::time::sleep(wait).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
             }
         }
+    }
+
+    /// The earliest time after `now` that a candidate falls due to ship, expunge or alert.
+    fn next_due(&self, now: Timestamp) -> Option<Timestamp> {
+        let archiver = self.archiver.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        archiver
+            .candidates()
+            .flat_map(|candidate| match &candidate.stage {
+                Stage::Ended => vec![candidate.due(), candidate.due().saturating_add(micros(ALERT_AFTER))],
+                Stage::Deleted { at } => vec![at.saturating_add(micros(EXPUNGE_GRACE))],
+            })
+            .filter(|at| *at > now)
+            .min()
     }
 
     async fn blocking<T: Send + 'static>(
@@ -232,15 +309,18 @@ impl ArchiveShipper {
     async fn ship(&self, identity: &Identity, now: Timestamp) -> Result<bool, ShipError> {
         let target = identity.clone();
         let prepared = self.blocking(move |archiver, store| archiver.prepare(store, &target)).await.map_err(ShipError::Local)?;
-        let Prepared::Ready { bundle, version } = prepared else { return Ok(false) };
-        let bytes = bundle.encode().map_err(|error| ShipError::Local(error.to_string()))?;
-        let key = bundle_key(identity);
-        let digest = Sha256::digest(&bytes);
-        for store in &self.targets {
-            store.put(&key, &bytes).await.map_err(|error| ShipError::Store(format!("{}: upload: {error}", store.location())))?;
-            let held = store.get(&key).await.map_err(|error| ShipError::Store(format!("{}: confirm: {error}", store.location())))?;
-            if held.map(|held| Sha256::digest(&held)) != Some(digest) {
-                return Err(ShipError::Store(format!("{}: confirm: the store does not hold the uploaded bundle", store.location())));
+        let Prepared::Ready { bundle, version, companions } = prepared else { return Ok(false) };
+        // The resource's bundle and each companion's, every one confirmed before anything is deleted.
+        for bundle in std::iter::once(bundle.as_ref()).chain(&companions) {
+            let bytes = bundle.encode().map_err(|error| ShipError::Local(error.to_string()))?;
+            let key = bundle_key(&bundle.identity());
+            let digest = Sha256::digest(&bytes);
+            for store in &self.targets {
+                store.put(&key, &bytes).await.map_err(|error| ShipError::Store(format!("{}: upload: {error}", store.location())))?;
+                let held = store.get(&key).await.map_err(|error| ShipError::Store(format!("{}: confirm: {error}", store.location())))?;
+                if held.map(|held| Sha256::digest(&held)) != Some(digest) {
+                    return Err(ShipError::Store(format!("{}: confirm: the store does not hold the uploaded bundle", store.location())));
+                }
             }
         }
         let target = identity.clone();
@@ -367,7 +447,7 @@ pub(crate) fn readable(bundle: &Bundle, kinds: &KindRegistry) -> Result<Value, S
             Cell::Text(value) | Cell::Str(value) => json!(value),
             Cell::Blob(bytes) => match column.map(|column| &column.ty) {
                 Some(flotilla_schema::ColumnType::Cbor) => {
-                    flotilla_cbor::from_slice::<Value>(bytes, &Default::default()).unwrap_or_else(|_| {
+                    crate::cbor_json::cbor_to_json(bytes, &Default::default()).unwrap_or_else(|_| {
                         use base64::Engine;
                         json!({ "undecodable_cbor": base64::engine::general_purpose::STANDARD.encode(bytes) })
                     })
@@ -382,7 +462,7 @@ pub(crate) fn readable(bundle: &Bundle, kinds: &KindRegistry) -> Result<Value, S
                 .rows
                 .objects
                 .get(hash)
-                .and_then(|bytes| flotilla_cbor::from_slice::<Value>(bytes, &Default::default()).ok())
+                .and_then(|bytes| crate::cbor_json::cbor_to_json(bytes, &Default::default()).ok())
                 .unwrap_or_else(|| json!(hash.0.iter().map(|byte| format!("{byte:02x}")).collect::<String>())),
         }
     };

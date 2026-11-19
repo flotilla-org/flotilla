@@ -6,9 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_schema::{Edge, Frozen, Records, State, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        Abandon, AddSeat, Authority, Convoy, ConvoySpec, ConvoyState, ConvoyWorld, Declare, Deliver, Duty, DutyId, DutyScope, Keep,
-        MemoryConvoyWorld, Priority, Progress, Promise, PromiseId, PromiseKind, PromiseKinds, PromiseSource, Readmit, Reassign, Reject,
-        ReplaceSeat, Resupervise, RetireDuty, RetireSeat, Retract, Rollover, Seat, SeatName, Submission, Submit, Terms, VesselClass,
+        Abandon, AbandonCause, AddSeat, AdmissionBytes, Authority, Convoy, ConvoySpec, ConvoyState, ConvoyWorld, Declare, Deliver, Duty,
+        DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress, Promise, PromiseId, PromiseKind,
+        PromiseKinds, PromiseSource, Reassign, Reject, ReplaceSeat, Resupervise, Retire, RetireDuty, RetireSeat, Retract, Seat, SeatName,
+        SubjectLink, Submission, Submit, Terms, Unlink,
     },
     Ref, Resource,
 };
@@ -20,7 +21,7 @@ use super::{
     name, records, stamp, stamp_flat, text, timestamp, version, Fixture, Pick, SHAPES,
 };
 
-/// Covering indexes: every shape of [`SHAPES`] in each round, and the label by round (base 3), so
+/// Covering indexes: every shape of [`SHAPES`] in each round, and the label by round (base 4), so
 /// every label meets every shape; four rounds give every code enum every code.
 pub const COVERING: usize = SHAPES * 4;
 
@@ -42,7 +43,17 @@ fn seat_name(tc: &TestCase) -> SeatName {
 
 fn seat(tc: &TestCase, pick: Pick) -> Seat {
     let parent = pick.some(tc, SHAPES / 2).then(|| seat_name(tc));
-    Seat { retired: false, replacements: 0, role: name(tc), seat: name(tc), parent, supervised_by: address(tc) }
+    let failed = pick.some(tc, SHAPES / 3).then(|| text(tc));
+    Seat { failed, retired: false, replacements: 0, role: name(tc), seat: name(tc), parent, supervised_by: address(tc) }
+}
+
+fn subject(tc: &TestCase, pick: Pick) -> SubjectLink {
+    use LinkSource::*;
+    SubjectLink {
+        subject: address(tc),
+        source: code_enum(tc, pick, &[Claim, Operator, Relay, Branch]),
+        unlinked: pick.some(tc, SHAPES / 2),
+    }
 }
 
 fn submission(tc: &TestCase) -> Submission {
@@ -81,8 +92,9 @@ fn duty(tc: &TestCase, pick: Pick) -> Duty {
     Duty { owner: seat_name(tc), scope, terms }
 }
 
-/// The fixed fields and records, drawn or covered: seats with and without a parent, promises of
-/// every source and progress with zero to two submissions, and duties of both scopes.
+/// The fixed fields and records, drawn or covered: subject links of every source, linked and
+/// unlinked; seats with and without a parent or a Fail verdict; promises of every source and
+/// progress with zero to two submissions; and duties of both scopes.
 pub fn spec(tc: &TestCase, pick: Pick) -> ConvoySpec {
     let kinds = PromiseKinds { kinds: map(tc, pick.nth(3), 1, |_, _| (name(tc), PromiseKind::default())) };
     // Promise ids and labels are unique within a convoy.
@@ -96,18 +108,18 @@ pub fn spec(tc: &TestCase, pick: Pick) -> ConvoySpec {
         }
     }
     ConvoySpec {
-        promise_floor: 0,
+        launch_of: name(tc),
+        launch: version(tc),
+        workflow_ref: name(tc),
+        admission: Frozen::new(AdmissionBytes::new(name(tc).into_bytes())).expect("freeze"),
         project: address(tc),
         priority: Priority(tc.draw(gs::integers::<u32>())),
         kinds: Frozen::new(kinds).expect("freeze"),
+        subjects: records(tc, pick.nth(6), 2, |pick| subject(tc, pick)),
         duties: map(tc, pick.nth(4), 2, |pick, n| (DutyId(small(tc, pick, n)), duty(tc, pick))),
         seats: records(tc, pick.nth(5), 2, |pick| seat(tc, pick)),
         promises,
     }
-}
-
-pub fn quota(tc: &TestCase, pick: Pick) -> BTreeMap<VesselClass, u32> {
-    map(tc, pick.nth(1), 2, |_, n| (VesselClass::new(format!("{}{n}", name(tc))), tc.draw(gs::integers::<u32>())))
 }
 
 fn retired(tc: &TestCase, pick: Pick) -> BTreeSet<DutyId> {
@@ -116,11 +128,16 @@ fn retired(tc: &TestCase, pick: Pick) -> BTreeSet<DutyId> {
 
 /// A state of every label in turn when covering, its collections of every size.
 pub fn state_value(tc: &TestCase, pick: Pick) -> ConvoyState {
-    let (quota, retired) = (quota(tc, pick), retired(tc, pick));
-    match pick.digit(tc, 3, SHAPES) {
-        0 => ConvoyState::Open { quota, retired },
-        1 => ConvoyState::Delivered { quota, retired },
-        _ => ConvoyState::Abandoned { quota, retired, reason: text(tc) },
+    let retired = retired(tc, pick);
+    match pick.digit(tc, 4, SHAPES) {
+        0 => ConvoyState::Open { retired_duties: retired },
+        1 => ConvoyState::Delivered { retired_duties: retired, disposition: text(tc) },
+        3 => ConvoyState::Retired,
+        _ => ConvoyState::Abandoned {
+            retired_duties: retired,
+            cause: code_enum(tc, pick.nth(3), &[AbandonCause::Failed, AbandonCause::Operator]),
+            reason: text(tc),
+        },
     }
 }
 
@@ -128,8 +145,7 @@ pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Convoy> {
     resource(spec(tc, pick), State::new(state_value(tc, pick), timestamp(tc)))
 }
 
-/// A fixed open convoy for example tests: one pending template promise owned by its one seat,
-/// under a quota of one.
+/// A fixed open convoy for example tests: one pending template promise owned by its one seat.
 pub fn sample() -> Resource<Convoy> {
     let owner = SeatName::new("coder", "");
     let mut seats = Records::new();
@@ -137,6 +153,7 @@ pub fn sample() -> Resource<Convoy> {
         .append(
             0,
             Seat {
+                failed: None,
                 retired: false,
                 replacements: 0,
                 role: "coder".into(),
@@ -159,29 +176,36 @@ pub fn sample() -> Resource<Convoy> {
     };
     promises.append(0, promise).expect("room");
     let spec = ConvoySpec {
-        promise_floor: 0,
+        launch_of: "c".into(),
+        launch: 1,
+        workflow_ref: "w".into(),
+        admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: "project:p".parse().expect("address"),
         priority: Priority(1),
         kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
+        subjects: Records::new(),
         duties: BTreeMap::new(),
         seats,
         promises,
     };
-    let open = ConvoyState::Open { quota: [(VesselClass::new("standard"), 1)].into(), retired: BTreeSet::new() };
+    let open = ConvoyState::Open { retired_duties: BTreeSet::new() };
     resource(spec, State::new(open, Timestamp(0)))
 }
 
-/// A world in which every authority and every reference is authorised and durable.
+/// A world in which every authority and every reference is authorised and durable, and nothing
+/// holds the convoy.
 fn yes(authority: &str) -> Box<dyn ConvoyWorld> {
     let mut world = MemoryConvoyWorld::default();
     world.authority.put(&Ref::new(authority), true);
     world.durable.put(&Ref::new(authority), true);
+    world.holds.put(&Ref::new(authority), BTreeSet::new());
     Box::new(world)
 }
 
 /// Every edge an open convoy may take: declaring a promise, each promise edge on an open
-/// promise (by its owner, or an operator's verdict), the seat edges, retiring a holding duty,
-/// delivering, abandoning, and readmitting with every count raised or kept.
+/// promise (by its owner, or an operator's verdict), the seat edges, linking a subject and
+/// unlinking a linked one, retiring a holding duty, delivering and abandoning; and the edge an
+/// ended one takes, retiring.
 pub fn candidates(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Vec<Candidate<Convoy>> {
     // One draw of each value, shared by the candidates: draws are what generation spends.
     let now = timestamp(tc);
@@ -192,10 +216,7 @@ pub fn candidates(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Vec<C
     let mut candidates: Vec<Candidate<Convoy>> = Vec::new();
     let seats: Vec<SeatName> = spec.seats.iter().map(|row| row.record.name()).collect();
     if let Some(owner) = seats.first() {
-        let unused = (u32::try_from(spec.promise_floor).expect("small floor")..)
-            .map(PromiseId)
-            .find(|id| spec.promise(*id).is_none())
-            .expect("an unused id");
+        let unused = (0..).map(PromiseId).find(|id| spec.promise(*id).is_none()).expect("an unused id");
         let label = (0..)
             .map(|n| format!("p{n}"))
             .find(|label| spec.promises.iter().all(|row| row.record.label != *label))
@@ -243,21 +264,26 @@ pub fn candidates(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Vec<C
             now,
         ));
         candidates.push((ReplaceSeat(parent.clone()).into(), yes(&authority), now));
+        if spec.seat(parent).is_some_and(|(_, seat)| seat.failed.is_none()) {
+            let fail = FailSeat { seat: parent.clone(), reason: prose.clone(), by: by.clone(), authority: Ref::new(authority.as_str()) };
+            candidates.push((fail.into(), yes(&authority), now));
+        }
+    }
+    if !spec.linked().contains(&place) {
+        let link = Link { subject: place.clone(), source: LinkSource::Claim, by: by.clone(), authority: Ref::new(authority.as_str()) };
+        candidates.push((link.into(), yes(&authority), now));
+    }
+    if let Some(linked) = spec.linked().into_iter().next() {
+        let unlink = Unlink { subject: linked.clone(), by: by.clone(), authority: Ref::new(authority.as_str()) };
+        candidates.push((unlink.into(), yes(&authority), now));
     }
     if let Some(duty) = spec.holding(convoy.state().retired()).into_iter().next() {
         candidates.push((RetireDuty { duty, by: by.clone(), authority: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
     }
-    candidates.push((Rollover { by: by.clone(), authority: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
-    candidates.push((Deliver.into(), yes(&authority), now));
-    let reason = prose;
-    candidates.push((Abandon { by: by.clone(), reason, authority: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
-    let raised = convoy
-        .state()
-        .quota()
-        .iter()
-        .map(|(class, count)| (class.clone(), count.saturating_add(tc.draw(gs::integers::<u32>().max_value(2)))))
-        .collect();
-    candidates.push((Readmit { quota: raised, by, authority: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
+    candidates.push((Deliver { disposition: word.clone() }.into(), yes(&authority), now));
+    let abandon = Abandon { by: by.clone(), cause: AbandonCause::Operator, reason: prose, authority: Ref::new(authority.as_str()) };
+    candidates.push((abandon.into(), yes(&authority), now));
+    candidates.push((Retire { holds: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
     candidates
 }
 
@@ -276,7 +302,7 @@ impl Fixture for Resource<Convoy> {
     fn evolve(&self, tc: &TestCase, pick: Pick) -> Resource<Convoy> {
         let drawn = spec(tc, pick);
         let spec = ConvoySpec {
-            promise_floor: self.spec().promise_floor,
+            subjects: self.spec().subjects.clone(),
             seats: self.spec().seats.clone(),
             promises: self.spec().promises.clone(),
             ..drawn
@@ -288,17 +314,17 @@ impl Fixture for Resource<Convoy> {
         edge(tc, pick, self)
     }
 
-    /// Seats, promises and each promise's submissions that `before` lacks are stamped `version`.
+    /// Subject links, seats, promises and each promise's submissions that `before` lacks are
+    /// stamped `version`.
     fn stamped(&self, before: Option<&Resource<Convoy>>, version: u64) -> Resource<Convoy> {
         let spec = self.spec();
         let before_spec = before.map(Resource::spec);
-        let compacted =
-            before_spec.is_some_and(|before| spec.seats.len() < before.seats.len() || spec.promise_floor > before.promise_floor);
-        let seats = stamp_flat(&spec.seats, before_spec.filter(|_| !compacted).map(|before| &before.seats), version);
+        let subjects = stamp_flat(&spec.subjects, before_spec.map(|before| &before.subjects), version);
+        let seats = stamp_flat(&spec.seats, before_spec.map(|before| &before.seats), version);
         let promises = stamp(&spec.promises, before_spec.map(|before| &before.promises), version, |promise, before| Promise {
             submissions: stamp_flat(&promise.submissions, before.map(|before| &before.submissions), version),
             ..promise.clone()
         });
-        self.clone().with_spec(ConvoySpec { seats, promises, ..spec.clone() })
+        self.clone().with_spec(ConvoySpec { subjects, seats, promises, ..spec.clone() })
     }
 }

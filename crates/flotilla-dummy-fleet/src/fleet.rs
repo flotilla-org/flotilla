@@ -1,37 +1,36 @@
 //! The fleet hub shared by every dummy provider a daemon installs.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashSet},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Mutex, Weak,
     },
     time::Duration,
 };
 
-use async_trait::async_trait;
 use flotilla_config::dummy_fleet::DummyFleetConfig;
-use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_environment::{environment::dummy::DummyEnvironmentCounts, factories::dummy::DummyEnvironmentFactory};
-use flotilla_protocol::{commands::CommandValue, Command, CommandAction, DaemonEvent};
-use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
-use tokio::sync::{broadcast::error::RecvError, oneshot};
+use flotilla_environment::{
+    environment::dummy::{
+        DummyEnvironmentBehaviour, DummyEnvironmentCleanup, DummyEnvironmentCounts, DummyVendorJournal, DUMMY_CLOUD_ENVIRONMENT_INSTANCE,
+        DUMMY_ENVIRONMENT_INSTANCE,
+    },
+    factories::dummy::DummyEnvironmentFactory,
+};
+use flotilla_protocol::{commands::CommandValue, CommandAction};
+use flotilla_provider_runtime::{CommandRunner, HttpClient, ReqwestHttpClient};
+use serde::{Deserialize, Serialize};
 
-use crate::{catalog::CrewMix, forge::DummyForge, shared_forge::SharedForge, terminal::DummySessions, vcs::DummyCheckouts};
-
-/// How a dummy crew reaches its daemon: the same commands a real crew sends
-/// through `flotilla crew …`, without a socket or a process.
-#[async_trait]
-pub trait CrewCommandPort: Send + Sync {
-    async fn execute(&self, action: CommandAction) -> Result<CommandValue, String>;
-
-    /// Report the crew working or idle in its terminal session, as a real
-    /// harness's hooks do. Ports without a hook path ignore it; the session's
-    /// screen still shows the same state.
-    async fn report_attention(&self, _namespace: &str, _session: &str, _working: bool) -> Result<(), String> {
-        Ok(())
-    }
-}
+use crate::{
+    catalog::CrewMix,
+    forge::DummyForge,
+    link::CrewLink,
+    shared_forge::SharedForge,
+    state::{self, Event, Journal},
+    terminal::DummySessions,
+    vcs::DummyCheckouts,
+};
 
 /// One daemon's dummy fleet: its settings, the forge its crews open change
 /// requests on, the sessions its terminal pool hosts and its counters.
@@ -43,17 +42,34 @@ pub struct DummyFleet {
     pub(crate) sessions: DummySessions,
     pub(crate) vendor: DummyVendor,
     pub(crate) checkouts: DummyCheckouts,
-    port: OnceLock<Arc<dyn CrewCommandPort>>,
+    /// The state file this fleet appends its changes to, once restored from it.
+    journal: Journal,
     counters: Counters,
     vessel_names: BTreeSet<String>,
     command_error_samples: Mutex<Vec<String>>,
+    /// Submissions the pools were asked for, numbering each attempt's refusal draw.
+    pub(crate) submissions: AtomicU64,
 }
 
 impl DummyFleet {
-    /// A fleet whose shared forge, if configured, is reached over HTTPS.
+    /// A fleet whose shared forge, if configured, is reached over HTTPS. Nothing it holds
+    /// outlives it.
     pub fn new(config: DummyFleetConfig) -> Arc<Self> {
         let http = config.shared_forge.is_some().then(|| Arc::new(ReqwestHttpClient::new()) as Arc<dyn HttpClient>);
         Self::build(config, http)
+    }
+
+    /// The fleet whose state file is in `state_dir`: it holds what the fleet there held when
+    /// its process ended, and records its changes there. Its crews resume once it is attached.
+    pub fn open(config: DummyFleetConfig, state_dir: &Path) -> Result<Arc<Self>, String> {
+        let fleet = Self::new(config);
+        std::fs::create_dir_all(state_dir).map_err(|error| format!("create {}: {error}", state_dir.display()))?;
+        let path = state_dir.join(state::STATE_FILE);
+        for event in state::load(&path)? {
+            fleet.restore(event);
+        }
+        fleet.journal.open(&path, &fleet.events())?;
+        Ok(fleet)
     }
 
     /// A fleet whose shared forge, if configured, is reached through `http`.
@@ -63,22 +79,50 @@ impl DummyFleet {
 
     fn build(config: DummyFleetConfig, http: Option<Arc<dyn HttpClient>>) -> Arc<Self> {
         let shared_forge = config.shared_forge.clone().zip(http).map(|(shared, http)| Arc::new(SharedForge::new(shared, http)));
-        let vessel_names = CrewMix::ALL
-            .into_iter()
-            .flat_map(|mix| mix.workflow(config.agent.long_runner_turns).vessels)
-            .map(|vessel| vessel.name)
-            .collect();
-        Arc::new(Self {
-            vessel_names,
-            forge: DummyForge::new(&config),
-            shared_forge,
-            sessions: DummySessions::default(),
-            vendor: DummyVendor::default(),
-            checkouts: DummyCheckouts::default(),
-            config,
-            port: OnceLock::new(),
-            counters: Counters::default(),
-            command_error_samples: Mutex::default(),
+        // Allocation names each vessel after a role it holds.
+        let vessel_names =
+            CrewMix::ALL.into_iter().flat_map(|mix| mix.workflow(config.agent.long_runner_turns).roles).map(|crew| crew.role).collect();
+        Arc::new_cyclic(|fleet: &Weak<Self>| {
+            let behaviour = DummyEnvironmentBehaviour {
+                seed: config.seed,
+                realise_delay: Duration::from_millis(config.environment.realise_delay_ms),
+                failure_rate: config.environment.failure_rate,
+            };
+            // A backing's destruction ends the sessions and checkouts inside it.
+            let cleanup: DummyEnvironmentCleanup = {
+                let fleet = Weak::clone(fleet);
+                Arc::new(move |id| {
+                    if let Some(fleet) = fleet.upgrade() {
+                        fleet.sessions.destroy_environment(&fleet, id);
+                        fleet.checkouts.destroy_environment(&fleet, id);
+                    }
+                })
+            };
+            let journal = |instance: &'static str| -> DummyVendorJournal {
+                let fleet = Weak::clone(fleet);
+                Arc::new(move |change| {
+                    if let Some(fleet) = fleet.upgrade() {
+                        fleet.record(&Event::Vendor { instance: instance.into(), change });
+                    }
+                })
+            };
+            let factories = [
+                DummyEnvironmentFactory::new(behaviour.clone(), Arc::clone(&cleanup), journal(DUMMY_ENVIRONMENT_INSTANCE)),
+                DummyEnvironmentFactory::cloud(behaviour, cleanup, journal(DUMMY_CLOUD_ENVIRONMENT_INSTANCE)),
+            ];
+            Self {
+                vessel_names,
+                forge: DummyForge::new(&config),
+                shared_forge,
+                sessions: DummySessions::default(),
+                vendor: DummyVendor { factories },
+                checkouts: DummyCheckouts::default(),
+                journal: Journal::default(),
+                config,
+                counters: Counters::default(),
+                command_error_samples: Mutex::default(),
+                submissions: AtomicU64::new(0),
+            }
         })
     }
 
@@ -86,25 +130,127 @@ impl DummyFleet {
         &self.config
     }
 
-    /// Connect crews to their daemon. The composition root calls this once,
-    /// after constructing the daemon whose discovery installed this fleet.
-    pub fn attach(&self, port: Arc<dyn CrewCommandPort>) -> Result<(), String> {
-        self.port.set(port).map_err(|_| "dummy fleet is already attached to a daemon".to_string())
+    /// Resume the crews a previous process's fleet hosted. They reach their daemon as they
+    /// always do, through their vessels' forwards, waiting while it does not answer. The
+    /// composition root calls this once, after constructing the daemon whose discovery
+    /// installed this fleet.
+    pub fn resume(self: &Arc<Self>) {
+        self.sessions.resume(self);
     }
 
-    pub(crate) async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
-        let port = self.port.get().ok_or("dummy fleet is not attached to a daemon")?;
+    /// End this fleet as its process's end does: its crews stop where they are, and nothing
+    /// more is recorded. The fleet [opened](Self::open) from its state file next takes over.
+    pub fn stop(&self) {
+        drop(self.sessions.stop_all());
+        self.journal.close();
+    }
+
+    /// [Stop](Self::stop), returning once every crew has stopped and every change the fleet
+    /// recorded is in its state file: the end of a graceful process stop.
+    pub async fn shutdown(&self) {
+        for crew in self.sessions.stop_all() {
+            // An aborted crew ends cancelled; one that had already finished ends as it did.
+            let _ = crew.await;
+        }
+        self.journal.close();
+    }
+
+    pub(crate) fn record(&self, event: &Event) {
+        self.journal.record(event);
+    }
+
+    /// Apply an event a previous process's fleet recorded.
+    fn restore(&self, event: Event) {
+        match event {
+            Event::Vendor { instance, change } => match self.vendor.factories.iter().find(|vendor| vendor.instance() == instance) {
+                Some(vendor) => vendor.restore(change),
+                None => tracing::warn!(%instance, "dummy fleet state names an unknown vendor"),
+            },
+            Event::ChangeRequest { repository, number, branch, title, opened_at, head_sha } => {
+                self.forge.restore(repository, number, branch, title, opened_at, head_sha)
+            }
+            Event::Checkout { environment, path, branch } => {
+                self.checkouts.lock().insert((environment, path), branch);
+            }
+            Event::CheckoutRemoved { environment, path } => {
+                self.checkouts.lock().remove(&(environment, path));
+            }
+            Event::CheckoutsDestroyed { environment } => self.checkouts.lock().retain(|(owner, _), _| *owner != environment),
+            Event::Launched { session, environment, command, cwd, crew } => self.sessions.restore(session, environment, command, cwd, crew),
+            Event::Killed { session } => {
+                self.sessions.lock().remove(&session);
+            }
+            Event::SessionsDestroyed { environment } => self.sessions.restore_destroyed(environment),
+            Event::Turn { session, text, key, at_unix_ms } => match self.sessions.get(&session) {
+                Some(session) => session.restore_turn(crate::terminal::DeliveredTurn { text, key, at_unix_ms }),
+                None => tracing::warn!(%session, "dummy fleet state delivers a turn to an unknown session"),
+            },
+            Event::Acted { session, outcome } => {
+                if let Some(session) = self.sessions.get(&session) {
+                    session.record().outcomes.push(outcome);
+                }
+            }
+            Event::Counted { counter } => {
+                self.counters.get(counter).fetch_add(1, Ordering::Relaxed);
+            }
+            Event::Counts { counts } => {
+                for (counter, count) in counts {
+                    self.counters.get(counter).fetch_add(count, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// The fewest events that restore what this fleet holds now.
+    fn events(&self) -> Vec<Event> {
+        let counts = Counter::ALL.into_iter().map(|counter| (counter, self.counters.get(counter).load(Ordering::Relaxed))).collect();
+        let mut events = vec![Event::Counts { counts }];
+        for vendor in &self.vendor.factories {
+            events.extend(vendor.snapshot().into_iter().map(|change| Event::Vendor { instance: vendor.instance().into(), change }));
+        }
+        events.extend(self.forge.snapshot());
+        let checkouts = self
+            .checkouts
+            .lock()
+            .iter()
+            .map(|((environment, path), branch)| (environment.clone(), path.clone(), branch.clone()))
+            .collect::<BTreeSet<(String, PathBuf, String)>>();
+        events.extend(checkouts.into_iter().map(|(environment, path, branch)| Event::Checkout { environment, path, branch }));
+        events.extend(self.sessions.snapshot());
+        events
+    }
+
+    /// Send a crew's command over its link, counting a refusal.
+    pub(crate) async fn execute(&self, link: &CrewLink<'_>, action: CommandAction) -> Result<CommandValue, String> {
         // Keep only a static command kind across the ownership boundary. Format
         // diagnostics only for retained failures; successful commands allocate no diagnostic strings.
         let command = match &action {
             CommandAction::CrewPromise { .. } => "CrewPromise",
-            CommandAction::CrewComplete { .. } => "CrewComplete",
             CommandAction::CrewHandoff { .. } => "CrewHandoff",
             CommandAction::CrewStall { .. } => "CrewStall",
-            CommandAction::CrewFail { .. } => "CrewFail",
+            CommandAction::CrewSupervise { .. } => "CrewSupervise",
+            CommandAction::QueryExplainConvoy { .. } => "QueryExplainConvoy",
             _ => "dummy crew command",
         };
-        let result = port.execute(action).await;
+        self.counted(command, link.execute(action).await)
+    }
+
+    /// Publish a crew's decision ledger over its link, counting a refusal.
+    pub(crate) async fn publish_ledger(&self, link: &CrewLink<'_>, body: &str) -> Result<CommandValue, String> {
+        self.counted("ArtifactPut", link.put_ledger(body).await.map(|_| CommandValue::Ok))
+    }
+
+    /// Deliver a crew's Claude Code hook over its link, counting a failure. A hook is not a crew
+    /// command: Claude Code goes on when one fails, and so does the crew.
+    pub(crate) async fn hook(&self, link: &CrewLink<'_>, event: &str) -> Result<(), String> {
+        let result = link.hook(event).await;
+        if result.is_err() {
+            self.count(Counter::HookFailures);
+        }
+        result
+    }
+
+    fn counted(&self, command: &'static str, result: Result<CommandValue, String>) -> Result<CommandValue, String> {
         match &result {
             Ok(CommandValue::Error { .. }) | Err(_) => {
                 self.count(Counter::CommandErrors);
@@ -121,15 +267,9 @@ impl DummyFleet {
         }
     }
 
-    pub(crate) async fn report_attention(&self, namespace: &str, session: &str, working: bool) {
-        let Some(port) = self.port.get() else { return };
-        if let Err(error) = port.report_attention(namespace, session, working).await {
-            tracing::debug!(%session, %error, "dummy crew attention report failed");
-        }
-    }
-
     pub(crate) fn count(&self, counter: Counter) {
         self.counters.get(counter).fetch_add(1, Ordering::Relaxed);
+        self.record(&Event::Counted { counter });
     }
 
     /// Provider-side artifacts survive resource deletion if teardown is broken.
@@ -148,6 +288,14 @@ impl DummyFleet {
     }
 
     /// The environment vendors, as a test acts as them.
+    /// End the process of `role`'s crew in convoy `convoy`, as a harness that exits or crashes
+    /// does: its session is gone from the pool. False when no such crew runs.
+    pub fn end_crew(&self, convoy: &str, role: &str) -> bool {
+        let Some(name) = self.sessions.end_crew(convoy, role) else { return false };
+        self.record(&Event::Killed { session: name });
+        true
+    }
+
     pub fn vendor(&self) -> &DummyVendor {
         &self.vendor
     }
@@ -167,12 +315,15 @@ impl DummyFleet {
             crews_stalled: read(Counter::CrewsStalled),
             change_requests_opened: read(Counter::ChangeRequestsOpened),
             command_errors: read(Counter::CommandErrors),
+            submissions_refused: read(Counter::SubmissionsRefused),
+            hook_failures: read(Counter::HookFailures),
             live_sessions: self.sessions.len() as u64,
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Counter {
     SessionsLaunched,
     TurnsReceived,
@@ -181,10 +332,26 @@ pub(crate) enum Counter {
     CrewsStalled,
     ChangeRequestsOpened,
     CommandErrors,
+    SubmissionsRefused,
+    HookFailures,
+}
+
+impl Counter {
+    const ALL: [Self; 9] = [
+        Self::SessionsLaunched,
+        Self::TurnsReceived,
+        Self::CrewsCompleted,
+        Self::CrewsFailed,
+        Self::CrewsStalled,
+        Self::ChangeRequestsOpened,
+        Self::CommandErrors,
+        Self::SubmissionsRefused,
+        Self::HookFailures,
+    ];
 }
 
 #[derive(Default)]
-struct Counters([AtomicU64; 7]);
+struct Counters([AtomicU64; 9]);
 
 impl Counters {
     fn get(&self, counter: Counter) -> &AtomicU64 {
@@ -202,6 +369,10 @@ pub struct DummyFleetSnapshot {
     pub crews_stalled: u64,
     pub change_requests_opened: u64,
     pub command_errors: u64,
+    /// Submissions the pools refused before writing, as cleat refuses one.
+    pub submissions_refused: u64,
+    /// Claude Code hook events that did not reach the daemon.
+    pub hook_failures: u64,
     pub live_sessions: u64,
     /// Backings the environment vendors realised.
     pub environments_provisioned: u64,
@@ -213,18 +384,17 @@ pub struct DummyFleetSnapshot {
     pub live_environments: u64,
 }
 
-/// The container and cloud-sandbox environment vendors. They are created on
-/// the fleet's first install and kept across daemon restarts, as a vendor's
-/// backings outlive a daemon. Acting as the vendor changes only what its
-/// provider reports.
-#[derive(Default)]
+/// The container and cloud-sandbox environment vendors. Every install of the
+/// fleet installs them, and the state file carries their backings to the next
+/// process's fleet, as a vendor's backings outlive a daemon. Acting as the
+/// vendor changes only what its provider reports.
 pub struct DummyVendor {
-    pub(crate) factories: OnceLock<[DummyEnvironmentFactory; 2]>,
+    pub(crate) factories: [DummyEnvironmentFactory; 2],
 }
 
 impl DummyVendor {
     fn each(&self) -> impl Iterator<Item = &DummyEnvironmentFactory> {
-        self.factories.get().into_iter().flatten()
+        self.factories.iter()
     }
 
     /// Delete `environment`'s backing, by Environment name or backing ID; its
@@ -243,6 +413,17 @@ impl DummyVendor {
         self.each().for_each(|vendor| vendor.refuse_provisioning(refuse));
     }
 
+    /// The controller socket `environment`'s agent forwards its daemon endpoint to, once the
+    /// daemon has asked for the forward.
+    pub fn forward_target(&self, environment: &str) -> Option<PathBuf> {
+        self.each().find_map(|vendor| vendor.forward_target(environment))
+    }
+
+    /// The commands and files inside `environment`'s backing.
+    pub(crate) fn runner(&self, environment: &str) -> Option<Arc<dyn CommandRunner>> {
+        self.each().find_map(|vendor| vendor.runner(environment))
+    }
+
     fn counts(&self) -> DummyEnvironmentCounts {
         self.each().map(DummyEnvironmentFactory::counts).fold(DummyEnvironmentCounts::default(), |sum, counts| DummyEnvironmentCounts {
             provisioned: sum.provisioned + counts.provisioned,
@@ -250,90 +431,5 @@ impl DummyVendor {
             vanished: sum.vanished + counts.vanished,
             live: sum.live + counts.live,
         })
-    }
-}
-
-/// Results unclaimed for this long belong to other callers and are dropped.
-const UNCLAIMED_RESULT_TTL: Duration = Duration::from_secs(60);
-
-/// A command that finishes later than this is reported to the crew as lost.
-const COMMAND_RESULT_TIMEOUT: Duration = Duration::from_secs(120);
-
-enum Slot {
-    Waiting(oneshot::Sender<CommandValue>),
-    Finished(Box<CommandValue>, tokio::time::Instant),
-}
-
-/// [`CrewCommandPort`] over a daemon handle. One listener routes every
-/// `CommandFinished` event to its waiting crew, so a thousand crews share one
-/// event subscription. It holds the daemon weakly: the daemon owns this port
-/// through its discovery factories.
-pub struct DaemonCommandPort {
-    daemon: Weak<dyn DaemonHandle>,
-    slots: Arc<Mutex<HashMap<u64, Slot>>>,
-}
-
-impl DaemonCommandPort {
-    pub fn new(daemon: &Arc<dyn DaemonHandle>) -> Arc<Self> {
-        let slots = Arc::new(Mutex::new(HashMap::new()));
-        let mut events = daemon.subscribe();
-        let routed = Arc::downgrade(&slots);
-        tokio::spawn(async move {
-            loop {
-                let event = events.recv().await;
-                let Some(slots) = routed.upgrade() else { return };
-                match event {
-                    Ok(DaemonEvent::CommandFinished { command_id, result, .. }) => {
-                        let mut slots = lock(&slots);
-                        let now = tokio::time::Instant::now();
-                        slots.retain(|_, slot| !matches!(slot, Slot::Finished(_, at) if now.duration_since(*at) > UNCLAIMED_RESULT_TTL));
-                        match slots.remove(&command_id) {
-                            Some(Slot::Waiting(waiter)) => {
-                                let _ = waiter.send(result);
-                            }
-                            _ => {
-                                slots.insert(command_id, Slot::Finished(Box::new(result), now));
-                            }
-                        }
-                    }
-                    Ok(_) => {}
-                    // A lagged listener loses results; their crews time out
-                    // and report the command as lost rather than hanging.
-                    Err(RecvError::Lagged(skipped)) => tracing::warn!(skipped, "dummy fleet command listener lagged"),
-                    Err(RecvError::Closed) => return,
-                }
-            }
-        });
-        Arc::new(Self { daemon: Arc::downgrade(daemon), slots })
-    }
-}
-
-fn lock(slots: &Mutex<HashMap<u64, Slot>>) -> std::sync::MutexGuard<'_, HashMap<u64, Slot>> {
-    slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-#[async_trait]
-impl CrewCommandPort for DaemonCommandPort {
-    async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
-        let daemon = self.daemon.upgrade().ok_or("daemon has stopped")?;
-        let command_id = daemon.execute(Command::builder().action(action).build()).await?;
-        drop(daemon);
-        let (sender, receiver) = oneshot::channel();
-        {
-            let mut slots = lock(&self.slots);
-            match slots.remove(&command_id) {
-                Some(Slot::Finished(result, _)) => return Ok(*result),
-                _ => {
-                    slots.insert(command_id, Slot::Waiting(sender));
-                }
-            }
-        }
-        match tokio::time::timeout(COMMAND_RESULT_TIMEOUT, receiver).await {
-            Ok(Ok(result)) => Ok(result),
-            _ => {
-                lock(&self.slots).remove(&command_id);
-                Err(format!("result of command {command_id} was lost"))
-            }
-        }
     }
 }

@@ -1,6 +1,5 @@
 use super::*;
-use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
+use crate::testkits::engine::{admit_convoy, engine};
 
 #[test]
 fn live_github_scope_expands_only_project_grants_without_explicit_repositories() {
@@ -54,45 +53,66 @@ fn live_github_scope_expands_only_project_grants_without_explicit_repositories()
     assert_eq!(pinned.fixed_repositories, repositories);
 }
 
+/// Clones nothing: the clone requested below waits for its environment, which is never ready.
+struct UnusedCloneRuntime;
+
+#[async_trait]
+impl CloneRuntime for UnusedCloneRuntime {
+    async fn clone_and_inspect(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+        Err("no environment is ready, so nothing is cloned".into())
+    }
+
+    async fn inspect_existing(&self, _: &str) -> Result<Option<String>, String> {
+        Err("no environment is ready, so nothing is inspected".into())
+    }
+}
+
+// Behaviour (#3108): a clone requested of the engine (renewed demand for it) wakes standing
+// ensure admission through the engine's clone changes, not an old Clone watch.
+#[tokio::test]
+async fn a_requested_clone_wakes_standing_ensure_admission() {
+    let backend = flotilla_store_memory::engine_home_backend();
+    let engine = flotilla_provisioning_testkit::clones::RunningClones::start("home", Arc::new(UnusedCloneRuntime));
+    let mut wakes = super::super::tasks::convoy_ensure_dependency_watches(&backend, NAMESPACE, &engine.reads).await;
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+    flotilla_resources::clone_records::CloneRecords::request(
+        engine.clones.as_ref(),
+        &repository,
+        &CloneSpec {
+            repo_ref: repository.key(),
+            url: "https://github.com/flotilla-org/flotilla".to_string(),
+            env_ref: "host-direct".to_string(),
+            path: "/workspace".to_string(),
+        },
+        false,
+    )
+    .expect("request the clone");
+    tokio::time::timeout(Duration::from_secs(1), wakes.next())
+        .await
+        .expect("a clone request should wake promptly")
+        .expect("the wakes stay open")
+        .expect("a wake");
+}
+
 #[tokio::test]
 async fn standing_ensure_dependency_changes_emit_wakes() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    for kind in ["Clone", "Convoy", "ConvoyEnsure", "WorkflowTemplate"] {
-        let mut watch = if kind == "Clone" {
-            watch_resource_kind(&backend, NAMESPACE, kind).await
-        } else {
-            watch_resource_kind_including_replicas(&backend, NAMESPACE, kind).await
-        }
-        .expect("dependency watch")
-        .stream;
+    let home = flotilla_engine_convoys_testkit::EngineHome::open_in("home", NAMESPACE);
+    let backend = home.backend().clone();
+    for kind in ["Convoy", "ConvoyEnsure", "WorkflowTemplate"] {
+        let mut watch = watch_resource_kind_including_replicas(&backend, NAMESPACE, kind).await.expect("dependency watch").stream;
         match kind {
-            "Clone" => {
-                let clones = backend.clone().using::<Clone>(NAMESPACE);
-                clones
-                    .create(
-                        &empty_meta("renewed-demand"),
-                        &CloneSpec {
-                            repo_ref: RepositoryKey("github.com/flotilla-org/flotilla".to_string()),
-                            url: "https://github.com/flotilla-org/flotilla".to_string(),
-                            env_ref: "host-direct".to_string(),
-                            path: "/workspace".to_string(),
-                        },
-                    )
-                    .await
-                    .expect("create renewed clone demand");
-                watch.next().await.expect("watch should remain open").expect("clone create event");
-                flotilla_store::apply_status_patch(&clones, "renewed-demand", &flotilla_resources::CloneStatusPatch::MarkCloning)
-                    .await
-                    .expect("renew clone demand");
-            }
             "Convoy" => {
-                let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-                convoys
-                    .create(&empty_meta("standing"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
-                    .await
-                    .expect("create convoy");
-                watch.next().await.expect("watch should remain open").expect("convoy create event");
-                convoys.delete("standing").await.expect("delete convoy");
+                // Admitted, then ended: a launch is never deleted.
+                let launch = home
+                    .admit(
+                        "standing",
+                        ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref(NAMESPACE.into()).build(),
+                        flotilla_engine_convoys_testkit::single_agent("coder"),
+                    )
+                    .await;
+                watch.next().await.expect("watch should remain open").expect("convoy admit event");
+                let view = home.convoy(&launch).await;
+                home.convoys.path().get().expect("the Convoy path").abandon(&view, "operator", "abandoned").await.expect("end the launch");
             }
             "ConvoyEnsure" => {
                 backend
@@ -116,139 +136,27 @@ async fn standing_ensure_dependency_changes_emit_wakes() {
                     .await
                     .expect("create workflow template");
                 watch.next().await.expect("watch should remain open").expect("template create event");
-                let mut updated_meta = InputMeta::from(&created.metadata);
-                updated_meta.annotations.insert("example.com/revision".to_string(), "2".to_string());
-                templates.update(&updated_meta, &created.metadata.resource_version, &created.spec).await.expect("update workflow template");
+                // A spec edit: the engine keeps a definition's typed origin, not free annotations.
+                let mut edited = created.spec.clone();
+                edited.repository_refs = Some(vec![RepositoryKey("github.com/flotilla-org/flotilla".to_string())]);
+                templates
+                    .update(&InputMeta::from(&created.metadata), &created.metadata.resource_version, &edited)
+                    .await
+                    .expect("update workflow template");
             }
             _ => unreachable!(),
         }
         tokio::time::timeout(Duration::from_secs(1), watch.next())
             .await
-            .expect("dependency change should wake promptly")
+            .unwrap_or_else(|_| panic!("a {kind} change should wake promptly"))
             .expect("watch should remain open")
             .expect("dependency event");
     }
 }
 
-#[tokio::test]
-async fn repeated_reclaim_refusal_with_changing_reason_raises_demand() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_base = temp.path().join("config");
-    fs::create_dir_all(&config_base).expect("config directory");
-    fs::write(config_base.join("daemon.toml"), "machine_id = \"reclaim-refusal-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(config_base));
-    let daemon = InProcessDaemon::new(
-        vec![],
-        config,
-        git_process_discovery(false),
-        HostName::local(),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-    let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name("stuck-reclaim".to_string()).build(),
-            &ConvoySpec::builder()
-                .workflow_ref("scratch".to_string())
-                .adopted_checkout_refs(BTreeMap::from([(
-                    flotilla_resources::RepositoryKey("repo".to_string()),
-                    "checkout-orphan".to_string(),
-                )]))
-                .build(),
-        )
-        .await
-        .expect("create terminal convoy");
-    let runtime = DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon));
-
-    runtime.verify_reclaim(&convoy, &[]).await.expect_err("missing checkout must refuse reclaim");
-    let mut changed_reason_convoy = convoy.clone();
-    changed_reason_convoy
-        .spec
-        .adopted_checkout_refs
-        .insert(flotilla_resources::RepositoryKey("repo".to_string()), "checkout-still-orphaned".to_string());
-    runtime.verify_reclaim(&changed_reason_convoy, &[]).await.expect_err("changed missing checkout must still refuse reclaim");
-    assert!(daemon.resource_backend().using::<Demand>(NAMESPACE).list().await.expect("list demands").items.is_empty());
-
-    runtime.verify_reclaim(&changed_reason_convoy, &[]).await.expect_err("persistent missing checkout must refuse reclaim");
-
-    let open = daemon.attentions().open(NAMESPACE, None, None).await.expect("open attentions");
-    assert_eq!(open.len(), 1);
-    assert!(
-        open[0].reason.contains("checkout-still-orphaned") && open[0].reason.contains("missing checkout integration evidence"),
-        "the attention must keep the checkout-specific refusal: {:?}",
-        open[0].reason
-    );
-}
-
-/// #1413 leg 1: once the convoy is Landed, the checkout authority's
-/// `OwnerTerminal` cascade may collect the managed checkout before the
-/// convoy's own reclaim pass runs. That sanctioned absence is evidence of
-/// completed reclaim, never "missing checkout integration evidence" —
-/// outside the sanction (Failed) absence must keep refusing.
-#[tokio::test]
-async fn landed_convoy_reclaim_accepts_sanctioned_checkout_absence() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_base = temp.path().join("config");
-    fs::create_dir_all(&config_base).expect("config directory");
-    fs::write(config_base.join("daemon.toml"), "machine_id = \"landed-reclaim-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(config_base));
-    let daemon = InProcessDaemon::new(
-        vec![],
-        config,
-        git_process_discovery(false),
-        HostName::local(),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-    let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
-    let created = convoys
-        .create(&InputMeta::builder().name("raced".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf-a".to_string()).build())
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status("raced", &created.metadata.resource_version, &landed_status_with_placed_checkout("checkout-raced"))
-        .await
-        .expect("mark convoy Landed");
-    let convoy = convoys.get("raced").await.expect("get convoy");
-    let runtime = DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon));
-
-    runtime.verify_reclaim(&convoy, &[]).await.expect("absence of a collected checkout must pass the Landed reclaim gate");
-
-    let checkouts = daemon.resource_backend().using::<ResourceCheckout>(NAMESPACE);
-    checkouts
-        .create(
-            &InputMeta::builder()
-                .name("checkout-raced".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "raced".to_string())]))
-                .finalizers(vec!["checkout".to_string()])
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Managed),
-            &ResourceCheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                repo_ref: RepositoryKey("repo-a".to_string()),
-                env_ref: "host-direct-test".to_string(),
-                r#ref: "feature/raced".to_string(),
-                base_ref: Some("main".to_string()),
-                target_path: "/checkouts/raced".to_string(),
-                clone_ref: "clone-a".to_string(),
-            }),
-        )
-        .await
-        .expect("create managed checkout");
-    checkouts.delete("checkout-raced").await.expect("request checkout deletion");
-    let deleting = checkouts.get("checkout-raced").await.expect("deleting checkout persists under its finalizer");
-    assert!(deleting.metadata.deletion_timestamp.is_some(), "finalizer must hold the deleting checkout");
-    runtime.verify_reclaim(&convoy, &[deleting]).await.expect("a checkout already being collected must not refuse reclaim");
-
-    let mut failed = convoy.clone();
-    failed.status.as_mut().expect("status").phase = ConvoyPhase::Failed;
-    let refusal = runtime.verify_reclaim(&failed, &[]).await.expect_err("unsanctioned absence must still refuse reclaim");
-    assert!(refusal.contains("missing checkout integration evidence"), "refusal must keep naming the missing evidence: {refusal}");
-}
-
 /// #1413: pins the cross-controller race itself — the checkout is gone
-/// before the convoy's reclaim pass, and the convoy must still reclaim its
-/// vessels instead of wedging forever on the deleted evidence.
+/// before the convoy's vessels are released, and the vessel requester must
+/// still release them instead of wedging forever on the deleted evidence.
 #[tokio::test]
 async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout_first() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -256,57 +164,38 @@ async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout
     fs::create_dir_all(&config_base).expect("config directory");
     fs::write(config_base.join("daemon.toml"), "machine_id = \"checkout-authority-collected-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
-    let daemon = InProcessDaemon::new(
-        vec![],
-        config,
-        git_process_discovery(false),
-        HostName::local(),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    let daemon = in_memory_daemon(Vec::new(), config).await;
+    let backend = daemon.resource_backend();
+    let engine = engine(&daemon);
+    // The convoy, admitted and landed.
+    let convoy = admit_convoy(
+        &daemon,
+        flotilla_engine_convoys_testkit::convoy(
+            NAMESPACE,
+            "raced",
+            ConvoySpec::builder().workflow_ref("wf-a".to_string()).project_ref(NAMESPACE.into()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        ),
     )
     .await;
-    let backend = daemon.resource_backend();
-    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
-    let created = convoys
-        .create(&InputMeta::builder().name("raced".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf-a".to_string()).build())
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status("raced", &created.metadata.resource_version, &landed_status_with_placed_checkout("checkout-raced"))
-        .await
-        .expect("mark convoy Landed");
-    vessels
-        .create(
-            &InputMeta::builder()
-                .name("raced-implement".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "raced".to_string())]))
-                .build(),
-            &VesselSpec {
-                convoy_ref: "raced".to_string(),
-                vessel_name: "implement".to_string(),
-                fulfilment_kind_ref: "host-direct-test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create vessel");
+    let admitted = backend.clone().using::<Convoy>(NAMESPACE).get(&convoy).await.expect("admitted convoy");
+    flotilla_engine_convoys_testkit::land(&daemon.convoy_engine_path(), &admitted).await;
+    let host = daemon.local_host_id().expect("local host");
+    let launch = engine.vessels.request(&convoy, "implement", host.as_str());
 
     // The checkout authority's `OwnerTerminal` cascade already collected
-    // the managed checkout: no checkout record exists for this pass.
-    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
-        .with_vessels(vessels)
-        .with_checkouts(backend.clone().using::<ResourceCheckout>(NAMESPACE))
-        .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon))));
-    let convoy = convoys.get("raced").await.expect("get convoy");
-    let deps = reconciler.prepare(&convoy).await.expect("fetch dependencies");
-    let outcome = reconciler.reconcile(&convoy, &deps, Utc::now());
-
-    assert!(
-        outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "raced-implement")),
-        "convoy must still reclaim its vessels after the checkout was collected first: {:?}",
-        outcome.actuations
+    // the managed checkout: the engine holds no checkout for this convoy.
+    let requests = flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), NAMESPACE)),
+        daemon.lifecycle_reads(),
+        Arc::new(super::super::ports::DaemonVesselReleaseGate { daemon: Arc::clone(&daemon), namespace: NAMESPACE.to_owned() }),
+        flotilla_protocol::CanonicalHostId::resolved(host.as_str()),
+        [],
     );
-    assert_eq!(outcome.requeue_after, None, "a successful reclaim pass must not keep requeueing");
+    let pass = requests.sync_once(Utc::now()).await.expect("vessel requests");
+
+    assert_eq!(pass.released, vec![launch.clone()], "the convoy's vessels must still be released after the checkout was collected first");
+    assert_eq!(engine.vessels.vessels.get(&launch, None).expect("read").expect("launch").reading, LifecycleReading::Released);
 }
 
 #[tokio::test]
@@ -338,6 +227,8 @@ async fn checkout_removals_queue_across_environments_and_release_capacity() {
         fs::write(temp.path().join("daemon.toml"), "machine_id = \"removal-queue-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        // The engine's readings, which a running daemon always has: a removal reads its clones.
+        engine_environments(&daemon);
         let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let runner = Arc::new(GatedRemovalRunner { started, release: tokio::sync::Semaphore::new(0) });
         for env in ["teardown-a", "teardown-b"] {
@@ -463,19 +354,15 @@ async fn archive_sweep_continues_to_the_next_remote_root_after_a_timeout() {
     daemon
         .register_direct_environment_for_test(EnvironmentId::new("remote"), runner.clone(), EnvironmentBag::new(), None)
         .expect("register remote sweep runner");
-    let task = tokio::spawn(run_checkout_archive_gc(
-        daemon.resource_backend(),
-        NAMESPACE.into(),
-        CheckoutArchiveSweep {
-            daemon,
-            catalog_path: temp.path().join("missing-catalog"),
-            roots: vec![
-                CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/a".into() },
-                CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/b".into() },
-            ],
-            retention_days: 14,
-        },
-    ));
+    let task = tokio::spawn(run_checkout_archive_gc(CheckoutArchiveSweep {
+        daemon,
+        catalog_path: temp.path().join("missing-catalog"),
+        roots: vec![
+            CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/a".into() },
+            CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/b".into() },
+        ],
+        retention_days: 14,
+    }));
     tokio::time::timeout(Duration::from_secs(5), runner.finished.notified()).await.expect("later root swept");
     assert_eq!(*runner.roots.lock().expect("roots"), ["/archives/a", "/archives/b"]);
     task.abort();
@@ -525,17 +412,9 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
     let runtime_health = RuntimeHealth::default();
     let second_health =
         DaemonHealthIdentity { generation: Some("generation-2".to_string()), version: "1.0.0".to_string(), started_at: Utc::now() };
-    let log_output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
     {
-        let writer = LogCaptureWriter(Arc::clone(&log_output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = tracing::dispatcher::set_default(&logging);
         apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &restarted_profile, None, &second_health, &runtime_health)
             .await
             .expect("restarted generation heartbeat");
@@ -556,44 +435,27 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
     assert!(status.conditions[0].message.contains("claude-code"));
     assert_eq!(status.agent_adapter_baseline, Some(first_profile.available_agent_adapters.clone()));
 
-    let logs = String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+    let logs = logs.text();
     assert!(logs.contains("host capabilities regressed across daemon restart"), "missing capability regression warning: {logs}");
     assert!(logs.contains("claude-code"), "warning should name the missing adapter: {logs}");
 
-    log_output.lock().expect("log output lock should be healthy").clear();
+    let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
     {
-        let writer = LogCaptureWriter(Arc::clone(&log_output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = tracing::dispatcher::set_default(&logging);
         apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &restarted_profile, None, &second_health, &runtime_health)
             .await
             .expect("same generation heartbeat");
     }
-    let same_generation_logs =
-        String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+    let same_generation_logs = logs.text();
     assert!(
         !same_generation_logs.contains("host capabilities regressed across daemon restart"),
         "same generation heartbeat should not repeat the warning: {same_generation_logs}"
     );
 
     let third_runtime_health = RuntimeHealth::default();
-    log_output.lock().expect("log output lock should be healthy").clear();
+    let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
     {
-        let writer = LogCaptureWriter(Arc::clone(&log_output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = tracing::dispatcher::set_default(&logging);
         apply_host_heartbeat_with_credentials(
             &daemon,
             NAMESPACE,
@@ -622,8 +484,7 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
     assert_eq!(third_status.conditions[0].reason, "AgentAdaptersMissing");
     assert!(third_status.conditions[0].message.contains("claude-code"));
     assert_eq!(third_status.agent_adapter_baseline, Some(first_profile.available_agent_adapters));
-    let third_logs =
-        String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+    let third_logs = logs.text();
     assert!(
         third_logs.contains("host capabilities regressed across daemon restart"),
         "each regressed daemon generation should warn: {third_logs}"
@@ -634,9 +495,10 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
 async fn checkout_authority_observes_replicated_landing_and_convoy_authority_settles_from_evidence() {
     let temp = TempDir::new().expect("tempdir");
     let authority_root = flotilla_protocol::NodeId::new("authority-root");
-    let checkout_root = flotilla_protocol::NodeId::new("checkout-root");
-    let authority = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(authority_root.clone());
-    let checkout_host = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(checkout_root.clone());
+    let authority = flotilla_store_memory::engine_home_backend().with_local_root(authority_root);
+    // Checkout host B is another home, its engine serving its own records.
+    let checkout_home = flotilla_provisioning_testkit::EngineBackend::open_in("checkout-root", NAMESPACE);
+    let checkout_host = checkout_home.backend.clone();
     let authority_config_base = temp.path().join("authority-config");
     fs::create_dir_all(&authority_config_base).expect("config directory");
     fs::write(authority_config_base.join("daemon.toml"), "machine_id = \"checkout-authority-evidence-test\"\n").expect("daemon config");
@@ -644,103 +506,103 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     let authority_daemon = daemon_with_backend(Vec::new(), config, authority.clone()).await;
     let repository_key = flotilla_resources::RepositoryKey("repo-a".to_string());
 
-    let convoys = authority.clone().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(
-            &flotilla_resources::InputMeta::builder().name("cross-host".to_string()).build(),
-            &ConvoySpec::builder()
-                .workflow_ref("review-and-fix".to_string())
-                .repositories(vec![ConvoyRepositorySpec::builder()
-                    .url("https://github.com/flotilla-org/flotilla".to_string())
-                    .repo_ref(repository_key.clone())
-                    .source_ref("feature/cross-host".to_string())
-                    .target_ref("main".to_string())
-                    .workspace_slug("flotilla".to_string())
-                    .subpaths(Vec::new())
-                    .build()])
-                .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "checkout-b".to_string())]))
-                .build(),
-        )
-        .await
-        .expect("create authority convoy");
-    let mut landing_status = ConvoyStatus {
-        phase: ConvoyPhase::Landing,
+    // A's engine readings, which read every home's records in its decided store.
+    engine(&authority_daemon);
+    // Checkout host B's log reaches A's decided store.
+    let decided = authority_daemon.decided_store().expect("authority decided store");
+    let at_checkout_host = flotilla_provisioning_testkit::CheckoutFixture::over("checkout-root", checkout_home.service.store());
+
+    // The convoy, admitted at authority A, its coder owing a decision ledger.
+    let status = ConvoyStatus {
         workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
             cascade: None,
             stall_nudges: Default::default(),
             supervision: None,
             exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
             turn_delivery: Default::default(),
-            vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
+            vessels: vec![VesselRequirement::builder()
+                .name("work".to_string())
+                .crew(vec![CrewSpec::builder()
+                    .role("coder".to_string())
+                    .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("coder")])
+                    .source(CrewSource::Tool { command: "true".to_string() })
+                    .build()])
+                .build()],
         }),
-        work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),
         observed_workflow_ref: Some("review-and-fix".to_string()),
         ..Default::default()
     };
-    landing_status.branch_subject_scan_at = Some(chrono::Utc::now());
-    landing_status.discover_subject(
-        flotilla_protocol::Subject {
-            kind: flotilla_protocol::SubjectKind::ChangeRequest,
-            source: flotilla_protocol::provider_data::IssueSource {
-                service: "github.com".to_string(),
-                scope: "flotilla-org/flotilla".to_string(),
+    let spec = ConvoySpec::builder()
+        .workflow_ref("review-and-fix".to_string())
+        .project_ref(NAMESPACE.into())
+        .repositories(vec![ConvoyRepositorySpec::builder()
+            .url("https://github.com/flotilla-org/flotilla".to_string())
+            .repo_ref(repository_key.clone())
+            .source_ref("feature/cross-host".to_string())
+            .target_ref("main".to_string())
+            .workspace_slug("flotilla".to_string())
+            .subpaths(Vec::new())
+            .build()])
+        .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "checkout-b".to_string())]))
+        .build();
+    let convoy_name = admit_convoy(&authority_daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, "cross-host", spec, status)).await;
+    // Its branch's change request is linked and its work done: it lands once evidence settles it.
+    let convoys = authority_daemon.resource_backend().using::<Convoy>(NAMESPACE);
+    let engine_path = authority_daemon.convoy_engine_path();
+    let engine = engine_path.get().expect("the authority's engine convoys");
+    let admitted = convoys.get(&convoy_name).await.expect("admitted convoy");
+
+    engine
+        .link(
+            &admitted,
+            &flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: flotilla_protocol::provider_data::IssueSource {
+                    service: "github.com".to_string(),
+                    scope: "flotilla-org/flotilla".to_string(),
+                },
+                id: "1367".to_string(),
             },
-            id: "1367".to_string(),
-        },
-        flotilla_protocol::Relationship::Produces,
-        flotilla_resources::SubjectDiscoverySource::Branch,
-        chrono::Utc::now(),
-    );
-    convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &landing_status)
+            flotilla_resources::SubjectDiscoverySource::Branch,
+            "operator",
+        )
         .await
-        .expect("mark authority convoy Landing");
-    checkout_host
-        .replica_writer::<Convoy>(authority_root, NAMESPACE)
-        .replace(&convoys.list().await.expect("list authority convoys"), chrono::Utc::now())
+        .expect("link the branch's change request");
+    engine
+        .keep_by_verdict(
+            &admitted,
+            &flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None },
+            "operator",
+            "done",
+        )
         .await
-        .expect("replicate Landing convoy to checkout host");
+        .expect("work done");
+    flotilla_store::note_convoy(
+        &engine_path,
+        &convoys,
+        &convoy_name,
+        &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: chrono::Utc::now() },
+    )
+    .await
+    .expect("branch scanned");
+    assert_eq!(convoys.get(&convoy_name).await.expect("landing convoy").status.expect("status").phase, ConvoyPhase::Landing);
+    // A's launch reaches B, which holds its adopted checkout for it.
+    flotilla_provisioning_testkit::replicate_home(&decided, decided.home(), &checkout_home.service);
 
     let git_repo = TestGitRepo::init(temp.path().join("checkout")).with_initial_commit();
-    let checkouts = checkout_host.clone().using::<Checkout>(NAMESPACE);
-    let checkout = checkouts
-        .create(
-            &flotilla_resources::InputMeta::builder()
-                .name("checkout-b".to_string())
-                .labels(BTreeMap::from([
-                    (flotilla_resources::CONVOY_LABEL.to_string(), "cross-host".to_string()),
-                    (flotilla_resources::CHANGE_REQUEST_ID_LABEL.to_string(), "1367".to_string()),
-                ]))
-                .annotations(BTreeMap::from([(
-                    flotilla_resources::ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(),
-                    "authority-root".to_string(),
-                )]))
-                .build(),
-            &CheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                r#ref: "feature/cross-host".to_string(),
-                path: git_repo.path().display().to_string(),
-                repo_ref: repository_key,
-                host_ref: "checkout-host".to_string(),
-                is_main: false,
-            }),
-        )
-        .await
-        .expect("create checkout on authority host B");
-    checkouts
-        .update_status(
-            &checkout.metadata.name,
-            &checkout.metadata.resource_version,
-            &ResourceCheckoutStatus {
-                phase: ResourceCheckoutPhase::Ready,
-                path: Some(git_repo.path().display().to_string()),
-                integration: CheckoutIntegrationStatus::default(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark checkout ready");
+    let spec = CheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+        r#ref: "feature/cross-host".to_string(),
+        path: git_repo.path().display().to_string(),
+        repo_ref: repository_key,
+        host_ref: "checkout-host".to_string(),
+        is_main: false,
+    });
+    let launch = at_checkout_host.put_ready(
+        "checkout-b",
+        &spec,
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy_name.clone())),
+    );
 
-    let checkout = checkouts.get("checkout-b").await.expect("get checkout on authority host B");
     // #3710: the PR observation is replicated before checkout inspection; gh
     // supplies only merge time/base metadata, never the landing state or SHA.
     publish_merged_change_request(&checkout_host, 1367, "checkout-root").await;
@@ -752,232 +614,72 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     status.head_sha.value =
         Some(vcs.read_repository(git_repo.path(), flotilla_vcs::vcs::RepositoryRead::HeadRevision).await.expect("HEAD").trim().to_string());
     records.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("replicated head");
-    let observer = CheckoutReconciler::new(
-        Arc::new(CheckoutControllerRuntime::new(
-            runner,
-            Some(vcs),
-            Some(checkout_host.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE)),
-            Vec::new(),
-        )),
-        checkout_host.clone(),
-        NAMESPACE,
-    )
-    .with_federated_convoys(&checkout_host, NAMESPACE);
-    let dependencies = observer.prepare(&checkout).await.expect("observe integration on checkout authority");
-    let observation = observer.reconcile(&checkout, &dependencies, chrono::Utc::now());
-    let patch = observation.patch.expect("Landing observation should update checkout evidence");
-    flotilla_store::apply_status_patch(&checkouts, "checkout-b", &patch).await.expect("persist authority-local observation");
-    assert_eq!(
-        checkouts.get("checkout-b").await.expect("observed checkout").status.expect("checkout status").integration.landed.value,
-        ConditionValue::True,
-        "checkout authority B must observe the merged change request",
-    );
-
-    authority
-        .replica_writer::<Checkout>(checkout_root, NAMESPACE)
-        .replace(&checkouts.list().await.expect("list checkout authority resources"), chrono::Utc::now())
-        .await
-        .expect("replicate fresh evidence to convoy authority A");
-    authority
-        .replica_writer::<flotilla_resources::ChangeRequest>(flotilla_protocol::NodeId::new("checkout-root"), NAMESPACE)
-        .replace(
-            &checkout_host
-                .using::<flotilla_resources::ChangeRequest>(NAMESPACE)
-                .list()
-                .await
-                .expect("list checkout authority CR observations"),
-            chrono::Utc::now(),
-        )
-        .await
-        .expect("replicate fresh CR evidence to convoy authority A");
-    let current = convoys.get("cross-host").await.expect("get Landing convoy");
-    let reconciler = ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>(NAMESPACE))
-        .with_federated_checkouts(authority.including_replicas::<Checkout>(NAMESPACE))
-        .with_change_requests(
-            authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
-            authority_daemon.change_request_stale_after(),
-        )
-        .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(authority_daemon)));
-    let dependencies = reconciler.prepare(&current).await.expect("consume replicated checkout evidence");
-    let outcome = reconciler.reconcile(&current, &dependencies, chrono::Utc::now());
-    let patch = outcome.patch.expect("fresh replicated evidence should settle the convoy");
-    flotilla_store::apply_status_patch(&convoys, "cross-host", &patch).await.expect("persist Landed phase");
-
-    assert_eq!(convoys.get("cross-host").await.expect("settled convoy").status.expect("convoy status").phase, ConvoyPhase::Landed,);
-    assert!(
-        authority.clone().using::<Checkout>(NAMESPACE).list().await.expect("list authority-local checkouts").items.is_empty(),
-        "convoy authority A must not re-author or write the replicated checkout",
-    );
-}
-
-// A Landed convoy and its running orphan predate daemon startup. The
-// convoy is a replica here: startup must reap the local session through
-// the real reclaim gate, without any convoy or session change event.
-#[tokio::test(start_paused = true)]
-async fn daemon_startup_reaps_retained_landed_convoy_orphan() {
-    let temp = TempDir::new().expect("tempdir");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"orphan-startup-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(temp.path()));
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let (initial, _) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
-    let registry = probe_local_provider_registry(&initial, &config).await.expect("registry");
-    let profile = build_local_profile(&initial, &registry).await.expect("profile");
-    let coordinator = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let convoys = coordinator.using::<Convoy>(NAMESPACE);
-    let created =
-        convoys.create(&empty_meta("old-landed"), &ConvoySpec::builder().workflow_ref("wf".to_string()).build()).await.expect("convoy");
-    convoys
-        .update_status("old-landed", &created.metadata.resource_version, &landed_status_with_placed_checkout("collected-checkout"))
-        .await
-        .expect("landed");
-    backend
-        .replica_writer::<Convoy>(flotilla_protocol::NodeId::new("coordinator"), NAMESPACE)
-        .replace(&convoys.list().await.expect("convoys"), Utc::now())
-        .await
-        .expect("replicate convoy");
-    let sessions = backend.using::<TerminalSession>(NAMESPACE);
-    let created = sessions
-        .create(
-            &InputMeta::builder()
-                .name("old-orphan".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "old-landed".to_string())]))
-                .annotations(BTreeMap::from([(flotilla_resources::ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "coordinator".to_string())]))
-                .finalizers(vec!["flotilla.work/terminal-teardown".to_string()])
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Managed),
-            &TerminalSessionSpec {
-                env_ref: profile.host_direct_environment_name(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: profile.host_direct_pool.clone(),
+    // Checkout host B inspects its checkout against the change request the convoy binds, as its
+    // Checkout controller does, and records what it found.
+    let inspector =
+        CheckoutControllerRuntime::new(runner, Some(vcs), Some(ChangeRequestObservations::new(checkout_host.clone(), NAMESPACE)));
+    let observed = inspector
+        .inspect_at(
+            &git_repo.path().display().to_string(),
+            &spec,
+            Some("https://github.com/flotilla-org/flotilla"),
+            flotilla_vcs::checkout_integration::RecordedAssociation {
+                change_request_id: Some("1367"),
+                complete: true,
+                observe_remote_ref: false,
             },
+            None,
         )
         .await
-        .expect("session");
-    sessions
-        .update_status(
-            "old-orphan",
-            &created.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("old-process".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("running orphan");
-    drop(initial);
-    let (restarted, pool) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
-    pool.add_sessions(vec![ProviderTerminalSession::builder()
-        .session_name("old-process".to_string())
-        .status(TerminalStatus::Running)
-        .command("cargo test".to_string())
-        .working_directory(ExecutionEnvironmentPath::new("/workspace"))
-        .build()])
-        .await;
-    let runtime = DaemonRuntime::start_with_options(
-        Arc::clone(&restarted),
-        config,
-        None,
-        RuntimeOptions { controller_resync_interval: Duration::from_secs(3600), ..RuntimeOptions::default() },
-    )
-    .await
-    .expect("daemon startup");
-    for _ in 0..1000 {
-        tokio::task::yield_now().await;
-        if matches!(sessions.get("old-orphan").await, Err(ResourceError::NotFound { .. })) {
+        .expect("observe integration on checkout authority");
+    assert_eq!(observed.landed.value, ConditionValue::True, "checkout authority B must observe the merged change request");
+    {
+        use flotilla_resources::checkout_records::CheckoutRecords as _;
+        at_checkout_host
+            .checkouts
+            .inspected(&launch, flotilla_resources::checkout_records::Inspection::of_status(&observed))
+            .expect("record authority-local observation");
+    }
+
+    // B's checkout and its CR observations, decided records homed at B, reach A as B's log does.
+    flotilla_provisioning_testkit::replicate_home(&checkout_home.service, "checkout-root", &decided);
+    let reconciler = ConvoyReconciler::new(authority_daemon.lifecycle_reads()).with_engine(Arc::clone(&engine_path)).with_change_requests(
+        authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
+        authority_daemon.change_request_stale_after(),
+    );
+    // Fresh replicated evidence settles it: the reconciler observes the branch's change request,
+    // one edge a pass as the controller runs it, then delivers the launch.
+    let mut current = convoys.get(&convoy_name).await.expect("get Landing convoy");
+    for _ in 0..4 {
+        reconciler.prepare(&current).await.expect("consume replicated checkout evidence");
+        current = convoys.get(&convoy_name).await.expect("get convoy");
+        if engine.delivered(&current).is_some() {
             break;
         }
     }
-    runtime.shutdown();
-    assert!(matches!(sessions.get("old-orphan").await, Err(ResourceError::NotFound { .. })), "startup must reap the old orphan");
-    assert!(pool.list_sessions().await.expect("pool").is_empty(), "terminal finalizer must kill the old process");
-    assert_eq!(*pool.killed.lock().await, vec!["old-process"]);
-    assert!(
-        backend.using::<Environment>(NAMESPACE).get(&profile.host_direct_environment_name()).await.is_ok(),
-        "the gate, rather than a missing environment shortcut, must authorize cleanup"
-    );
-    assert!(backend.using::<Convoy>(NAMESPACE).list().await.expect("local convoys").items.is_empty());
-    assert_eq!(convoys.get("old-landed").await.expect("retained convoy").status.expect("status").phase, ConvoyPhase::Landed);
-}
-
-#[tokio::test(start_paused = true)]
-async fn adopted_checkout_reconciliation_task_runs_after_interval() {
-    let temp = TempDir::new().expect("tempdir");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"adopted-checkout-reconciliation-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(temp.path()));
-    let daemon = in_memory_daemon(Vec::new(), config).await;
-    let durable = daemon.resource_backend().using::<ResourceCheckout>(NAMESPACE);
-    let created = durable
-        .create(
-            &InputMeta::builder()
-                .name("adopted-checkout-periodic".to_string())
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Adopted),
-            &ResourceCheckoutSpec::Observed(
-                ResourceObservedCheckoutSpec::builder()
-                    .r#ref("feature/periodic".to_string())
-                    .path("/work/periodic".to_string())
-                    .repo_ref(flotilla_resources::RepositoryKey("widgets-api".to_string()))
-                    .host_ref("host-01".to_string())
-                    .is_main(false)
+    if engine.delivered(&current).is_none() {
+        let explained = authority_daemon
+            .execute_query(
+                Command::builder()
+                    .action(CommandAction::QueryExplainConvoy { namespace: Some(NAMESPACE.to_string()), name: convoy_name.clone() })
                     .build(),
-            ),
-        )
-        .await
-        .expect("durable adopted checkout should be created");
-    durable
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).path("/work/periodic".to_string()).build(),
-        )
-        .await
-        .expect("durable checkout status should be stored");
-    let interval = Duration::from_secs(60);
-    let reconciliation = spawn_adopted_checkout_reconciliation_task(Arc::clone(&daemon), NAMESPACE.to_string(), interval);
-    tokio::task::yield_now().await;
-    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>(NAMESPACE);
-    assert!(
-        matches!(observed.get("adopted-checkout-periodic").await, Err(ResourceError::NotFound { .. })),
-        "the periodic task should wait for its first interval"
-    );
-
-    tokio::time::advance(interval).await;
-    tokio::task::yield_now().await;
-
-    observed.get("adopted-checkout-periodic").await.expect("periodic reconciliation should restore the observed checkout");
-    reconciliation.abort();
-}
-
-#[tokio::test(start_paused = true)]
-async fn codex_central_refresh_task_survives_repeated_local_failures_without_panicking() {
-    struct FixedHomeEnv(PathBuf);
-    impl EnvVars for FixedHomeEnv {
-        fn get(&self, key: &str) -> Option<String> {
-            (key == "HOME").then(|| self.0.to_string_lossy().into_owned())
-        }
+                uuid::Uuid::new_v4(),
+            )
+            .await;
+        panic!("fresh replicated evidence should deliver the convoy: {explained:?}");
     }
-
-    let home = TempDir::new().expect("tempdir");
-    // Deliberately leave the central auth.json unprovisioned, mirroring a
-    // host before an operator has dedicated a pool slot as the central
-    // source. This must never reach the network: the task should fail
-    // locally and keep ticking, not panic the daemon.
-    let env: Arc<dyn EnvVars> = Arc::new(FixedHomeEnv(home.path().to_path_buf()));
-    let interval = Duration::from_secs(60);
-    let task = spawn_codex_central_refresh_task(env, interval);
-
-    for _ in 0..3 {
-        tokio::time::advance(interval).await;
-        tokio::task::yield_now().await;
-        assert!(!task.is_finished(), "a missing central auth.json must log a warning and retry, never panic the daemon");
+    assert_eq!(convoys.get(&convoy_name).await.expect("settled convoy").status.expect("convoy status").phase, ConvoyPhase::Landed);
+    {
+        assert!(
+            authority_daemon
+                .lifecycle_reads()
+                .checkouts()
+                .and_then(|checkouts| checkouts.here())
+                .expect("authority-local checkouts")
+                .is_empty(),
+            "convoy authority A must not re-author or write the replicated checkout",
+        );
     }
-
-    task.abort();
-    let _ = task.await;
 }
 
 #[tokio::test]
@@ -997,7 +699,7 @@ async fn in_memory_stage4a_flow_reaches_running_and_completes_convoy() {
     let daemon = daemon_with_backend_runner_and_change_requests(
         vec![repo.clone()],
         Arc::clone(&config),
-        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        flotilla_store_memory::engine_home_backend(),
         runner,
         Some(Arc::new(FakeChangeRequest::new())),
     )
@@ -1006,7 +708,7 @@ async fn in_memory_stage4a_flow_reaches_running_and_completes_convoy() {
 }
 
 #[tokio::test]
-async fn sqlite_stage4a_flow_reaches_running_and_completes_convoy() {
+async fn deleting_a_live_convoy_ends_it_and_releases_its_vessel_checkout_and_sessions() {
     let temp = TempDir::new().expect("tempdir");
     let repo_default_dir = temp.path().join("flotilla-repos");
     let git_repo =
@@ -1014,20 +716,18 @@ async fn sqlite_stage4a_flow_reaches_running_and_completes_convoy() {
     let repo = git_repo.path().to_path_buf();
     let config_base = temp.path().join("config");
     fs::create_dir_all(&config_base).expect("config directory");
-    fs::write(config_base.join("daemon.toml"), "machine_id = \"sqlite-stage4a-test\"\n").expect("daemon config");
+    fs::write(config_base.join("daemon.toml"), "machine_id = \"delete-live-convoy-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
-    std::fs::create_dir_all(config.state_dir()).expect("state dir");
-    let runner = Arc::new(Stage4aGitRunner { inner: Arc::new(NoPrProcessRunner), upstream: repo.clone() });
     let daemon = daemon_with_backend_runner_and_change_requests(
         vec![repo.clone()],
         Arc::clone(&config),
-        ResourceBackend::new(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend")),
-        runner,
+        flotilla_store_memory::engine_home_backend(),
+        Arc::new(Stage4aGitRunner { inner: Arc::new(NoPrProcessRunner), upstream: repo.clone() }),
         Some(Arc::new(FakeChangeRequest::new())),
     )
     .await;
-    run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::Retain).await;
+    run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::DeleteLive).await;
 }
 
 #[tokio::test]
@@ -1059,13 +759,154 @@ async fn passing_teardown_gate_removes_the_managed_worktree_path() {
     let daemon = daemon_with_backend_runner_and_change_requests(
         vec![repo.clone()],
         Arc::clone(&config),
-        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        flotilla_store_memory::engine_home_backend(),
         Arc::new(Stage4aGitRunner { inner: Arc::new(MergedPrProcessRunner::new(884)), upstream: repo.clone() }),
         Some(requests),
     )
     .await;
 
     run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::Delete).await;
+}
+
+/// A convoy whose work completes naming change request 884, read by the forge observer in
+/// `state`, its branch pushed when `pushed`: what became of its checkout.
+async fn checkout_release_after_change_request(
+    state: flotilla_resources::ObservedChangeRequestState,
+    pushed: bool,
+    untracked: bool,
+    then: OnHold,
+) -> ReleaseSeen {
+    checkout_released(state, pushed, untracked, then, Release::Prompt).await
+}
+
+/// As [`checkout_release_after_change_request`], its release reaching the checkout as `release`.
+async fn checkout_released(
+    state: flotilla_resources::ObservedChangeRequestState,
+    pushed: bool,
+    untracked: bool,
+    then: OnHold,
+    release: Release,
+) -> ReleaseSeen {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_default_dir = temp.path().join("flotilla-repos");
+    let git_repo =
+        TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
+    let repo = git_repo.path().to_path_buf();
+    let config_base = temp.path().join("config");
+    fs::create_dir_all(&config_base).expect("config directory");
+    fs::write(config_base.join("daemon.toml"), "machine_id = \"change-request-release-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(config_base));
+    config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
+    let daemon = daemon_with_backend_runner_and_change_requests(
+        vec![repo.clone()],
+        Arc::clone(&config),
+        flotilla_store_memory::engine_home_backend(),
+        Arc::new(Stage4aGitRunner { inner: Arc::new(MergedPrProcessRunner::new(884)), upstream: repo.clone() }),
+        Some(Arc::new(FakeChangeRequest::new())),
+    )
+    .await;
+    run_stage4a_flow_reaches_running_and_completes_convoy(
+        daemon,
+        config,
+        repo_default_dir,
+        CompletionAction::ChangeRequest { state, pushed, untracked, then, release },
+    )
+    .await
+    .expect("what became of the checkout")
+}
+
+// F5 (run 3): the checkout is held for the convoy's launch, `<name>#<n>`, and its change request
+// is found through that launch's convoy, so a merged one lands it. Its commits were never pushed,
+// so without the change request it would be archived as forced removal.
+#[tokio::test]
+async fn a_merged_change_request_releases_its_checkout_as_landed() {
+    let seen =
+        checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false, false, OnHold::Nothing).await;
+    assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
+    assert_eq!(seen.landed, Some(true), "{seen:?}");
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
+    assert_eq!(seen.archives, 0, "a landed checkout is removed, not archived: {seen:?}");
+}
+
+// The convoy ends, its change request's observer has its chance to collect the observation, and
+// only then is the checkout released: the convoy's demand is held until the checkout it holds is
+// released, so the merged change request is still observed and the checkout is removed as landed.
+#[tokio::test]
+async fn a_checkout_released_after_its_convoy_ended_is_still_judged_against_its_merged_change_request() {
+    let seen =
+        checkout_released(flotilla_resources::ObservedChangeRequestState::Merged, false, false, OnHold::Nothing, Release::AfterCollection)
+            .await;
+    assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
+    assert_eq!(seen.landed, Some(true), "{seen:?}");
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
+    assert_eq!(seen.archives, 0, "a landed checkout is removed, not archived: {seen:?}");
+}
+
+// A change request closed unmerged did not land the work: its checkout is kept as an archive,
+// never removed as landed.
+#[tokio::test]
+async fn a_change_request_closed_unmerged_archives_its_checkout() {
+    let seen =
+        checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, false, false, OnHold::Nothing).await;
+    assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
+    assert_eq!(seen.landed, Some(false), "{seen:?}");
+    assert!(seen.landed_details.iter().any(|detail| detail.contains("#884")), "the change request was read: {seen:?}");
+    assert_eq!(seen.pushed, Some(false), "{seen:?}");
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
+    assert_eq!(seen.archives, 1, "{seen:?}");
+}
+
+// An unmerged branch pushed to origin under its own name is pushed, though it is ahead of the
+// origin/main it was made from: its clean checkout is removed as clean and pushed, keeping the
+// branch, and nothing is archived.
+#[tokio::test]
+async fn an_unmerged_pushed_clean_branch_is_removed_as_pushed_not_archived() {
+    let seen =
+        checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, true, false, OnHold::Nothing).await;
+    assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
+    assert_eq!(seen.landed, Some(false), "{seen:?}");
+    assert_eq!(seen.pushed, Some(true), "{seen:?}");
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
+    assert!(seen.branch_kept, "{seen:?}");
+    assert_eq!(seen.archives, 0, "a pushed checkout is not archived: {seen:?}");
+}
+
+/// A merged change request's checkout left with an untracked file is landed, but its landed
+/// removal refuses a checkout that is not clean: a person is told, naming the file, and the
+/// convoy's explanation shows the hold. Then `then` acts.
+async fn held_landed_checkout(then: OnHold) -> ReleaseSeen {
+    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false, true, then).await;
+    assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
+    assert_eq!(seen.landed, Some(true), "{seen:?}");
+    let told = seen.told.as_deref().unwrap_or_else(|| panic!("a person is told the release is held: {seen:?}"));
+    assert!(told.contains("left-over.pyc"), "the reason names the file: {seen:?}");
+    assert_eq!(seen.explained.as_deref(), Some(told), "the explanation shows the hold: {seen:?}");
+    seen
+}
+
+// Cleaned up and rechecked, the held checkout is released as landed: removed, nothing archived,
+// and the person's attention withdrawn.
+#[tokio::test]
+async fn a_held_landed_checkout_cleaned_and_rechecked_is_released() {
+    let seen = held_landed_checkout(OnHold::CleanAndRecheck).await;
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
+    assert_eq!(seen.archives, 0, "{seen:?}");
+    assert_eq!(seen.still_told, 0, "the attention is withdrawn: {seen:?}");
+}
+
+// Ruled archived, the held checkout is archived and removed, and the person's attention withdrawn.
+#[tokio::test]
+async fn a_held_landed_checkout_ruled_archived_is_archived_and_released() {
+    let seen = held_landed_checkout(OnHold::Archive).await;
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
+    assert_eq!(seen.archives, 1, "{seen:?}");
+    assert_eq!(seen.still_told, 0, "the attention is withdrawn: {seen:?}");
 }
 
 #[test]
@@ -1084,6 +925,90 @@ fn crew_provisioning_recovers_lost_session_after_in_process_daemon_restart_and_r
         .expect("test thread")
         .join()
         .expect("test thread completed");
+}
+
+// The daemon's Checkout controller judges a released checkout landed against its change request's
+// replicated observation. On a Forgejo forge that record is stored under the forge's id, which the
+// checkout's repository URL reaches only through the declared Forge.
+#[tokio::test]
+async fn the_checkout_controller_finds_a_forgejo_change_request_landed() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"forgejo-landing-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(temp.path()));
+    let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+    engine_environments(&daemon);
+    daemon
+        .register_direct_environment_for_test(
+            EnvironmentId::new("landing-env"),
+            Arc::new(MergedPrProcessRunner::new(4)),
+            EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
+            None,
+        )
+        .expect("register environment");
+    let backend = daemon.resource_backend();
+    declare_mapping_forge(&backend, NAMESPACE).await;
+    let git_repo = TestGitRepo::init(temp.path().join("checkout")).with_initial_commit();
+    let head = ProcessCommand::new("git").arg("-C").arg(git_repo.path()).args(["rev-parse", "HEAD"]).output().expect("HEAD");
+    let head = String::from_utf8(head.stdout).expect("utf-8 HEAD").trim().to_owned();
+
+    // The merged change request, as the forge observer records it: under the forge id `lab`.
+    let forges =
+        backend.using::<Forge>(NAMESPACE).list().await.expect("forges").items.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("lab", "robert/engine-trial", 4, &forges).expect("address"),
+    )
+    .expect("record name");
+    let records = backend.using::<flotilla_resources::ChangeRequest>(NAMESPACE);
+    let spec = flotilla_resources::ChangeRequestSpec::builder()
+        .service("lab".to_string())
+        .scope("robert/engine-trial".to_string())
+        .number(4)
+        .observing_authority("test-host".to_string())
+        .build();
+    let created = records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("change request");
+    let observed_at = Utc::now();
+    let status = flotilla_resources::ChangeRequestStatus {
+        title: Default::default(),
+        author: Default::default(),
+        review_decision: Default::default(),
+        review_requested_from_owner: Default::default(),
+        state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
+        head_sha: flotilla_resources::Observation::known(head, observed_at),
+        checks: flotilla_resources::Observation::unknown(observed_at),
+        review: flotilla_resources::ChangeRequestReviewObservation {
+            actionable_at_head: flotilla_resources::Observation::unknown(observed_at),
+        },
+        mergeable: flotilla_resources::Observation::unknown(observed_at),
+    };
+    records.update_status(&name, &created.metadata.resource_version, &status).await.expect("merged");
+
+    let state = Arc::new(ControllerRuntimeState::new(daemon, config, passthrough_registry(), None, "local".into(), "local-env".into()));
+    let path = git_repo.path().display().to_string();
+    let checkout = CheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+        r#ref: "main".to_string(),
+        path: path.clone(),
+        repo_ref: RepositoryKey(flotilla_resources::repo_key("https://lab.example/robert/engine-trial")),
+        host_ref: "local".to_string(),
+        is_main: false,
+    });
+    let integration = checkout_routing(&state)
+        .runtime_for("landing-env", &path)
+        .await
+        .expect("checkout runtime")
+        .inspect_at(
+            &path,
+            &checkout,
+            Some("https://lab.example/robert/engine-trial"),
+            flotilla_vcs::checkout_integration::RecordedAssociation {
+                change_request_id: Some("4"),
+                complete: true,
+                observe_remote_ref: false,
+            },
+            None,
+        )
+        .await
+        .expect("inspect");
+    assert_eq!(integration.landed.value, ConditionValue::True, "{:?}", integration.landed);
 }
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;

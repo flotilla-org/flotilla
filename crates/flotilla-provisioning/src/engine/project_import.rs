@@ -20,9 +20,10 @@
 
 use std::collections::BTreeSet;
 
+use chrono::{DateTime, Utc};
 use flotilla_engine_store::{ImportTarget, IMPORT_WRITER};
 use flotilla_resources::{Project, ProjectSpec};
-use flotilla_schema::{Kind, NewChange, Timestamp};
+use flotilla_schema::{CreatedAt, Kind, NewChange, Timestamp};
 
 use super::{
     definition_import::{DefinitionCopy, DefinitionKind, Mapped},
@@ -43,8 +44,8 @@ pub struct ImportedOps {
     pub name: String,
     pub home: String,
     pub record: ProjectOpsRecord,
-    /// When its copy was created.
-    pub created: Timestamp,
+    /// When its copy was created, as the old store stamped it.
+    pub created: DateTime<Utc>,
 }
 
 /// The ProjectOps records the copies' statuses import to, beside the Projects `imported` names by
@@ -67,7 +68,7 @@ pub fn import_ops<'a>(
             *report.dropped.entry((kind, "its Project does not import")).or_default() += 1;
             continue;
         }
-        let created = Timestamp::from_datetime(&copy.object.metadata.creation_timestamp);
+        let created = copy.object.metadata.creation_timestamp;
         records.push(ImportedOps { name: name.clone(), home: copy.home.clone(), record, created });
     }
     records
@@ -84,7 +85,8 @@ pub(super) fn write_project_ops(
     let kind = <ProjectOpsRecord as Kind>::KIND;
     let ours: Vec<_> = copies.iter().filter(|copy| target.imports(&copy.home)).collect();
     for ops in import_ops(ours, projects, report) {
-        let change = NewChange::new(IMPORT_WRITER, ops.created);
+        let change =
+            NewChange::new(IMPORT_WRITER, Timestamp::from_datetime(&ops.created)).created_at(CreatedAt::from_datetime(&ops.created));
         match target.write(&ops.home, &ops.name, &change, &ops.record) {
             Ok(()) => *report.imported.entry((kind, "observed")).or_default() += 1,
             Err(reason) => report.refused.push(ImportRefusal { kind, record: ops.name, reason: format!("at `{}`: {reason}", ops.home) }),

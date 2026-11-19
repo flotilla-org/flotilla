@@ -2,33 +2,36 @@
 //! admitted at the demand's home after the messages imported there.
 
 use flotilla_core::primitives::{
-    convert::Conversion,
-    demand_import::{import_demands, DemandRecords, OldDemand},
+    convert::{AtLaunches, Conversion},
+    demand_import::{
+        import_demands,
+        retired::{RetiredDemand, KIND, PLURAL},
+        DemandRecords, OldDemand,
+    },
     import::{write_messages, ImportRefusal as MessageRefusal, ImportReport as MessageReport, Imported},
 };
 use flotilla_engine_store::{Import, ImportTarget};
-use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport};
-use flotilla_resources::{Convoy, ConvoyEnsure, Demand, TerminalSession, Vessel};
+use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport, RowOutcome};
+use flotilla_resources::{Convoy, ConvoyEnsure, TerminalSession, Vessel};
+use flotilla_state_machines::machines::message::MessageRef;
 
 use super::{
     messages::{fleet_roles, old_store_records},
     Carried, Source,
 };
 
-const KIND: &str = "Demand";
-
 pub(super) fn attentions(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
-    for namespace in source.namespaces(&["demands"]) {
+    for namespace in source.namespaces(&[PLURAL]) {
         namespace_attentions(source, namespace, target, carried, report);
     }
 }
 
 fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
     let demands: Vec<_> = source
-        .owned::<Demand>("demands", Some(namespace), KIND, target, report)
+        .owned_as(PLURAL, Some(namespace), KIND, target, report, RetiredDemand::decode)
         .into_iter()
-        .filter(|demand| target.imports(&demand.home))
-        .map(|demand| (demand.object, demand.home))
+        .filter(|(_, _, home)| target.imports(home))
+        .map(|(_, demand, home)| (demand, home))
         .collect();
     if demands.is_empty() {
         return;
@@ -44,13 +47,22 @@ fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, c
     let ensures = source.context::<ConvoyEnsure>("convoyensures", Some(namespace));
     let vessels = source.context::<Vessel>("vessels", Some(namespace));
     let terminals = source.context::<TerminalSession>("terminalsessions", Some(namespace));
-    let records = old_store_records(source, namespace, terminals.iter().map(|terminal| terminal.object.clone()).collect());
-    let conversion = Conversion { roles: &roles, forges: &records.forges, records: &records };
+    let records =
+        old_store_records(source, namespace, terminals.iter().map(|terminal| terminal.object.clone()).collect(), &carried.convoy_launches);
+    let launched = AtLaunches { records: &records, launches: &carried.convoy_launches, namespace };
+    let conversion = Conversion { roles: &roles, forges: &records.forges, records: &launched };
     let named = DemandRecords {
         convoys: convoys.iter().map(|convoy| (convoy.object.metadata.name.clone(), &convoy.object)).collect(),
         ensures: ensures.iter().map(|ensure| (ensure.object.metadata.name.clone(), &ensure.object)).collect(),
         vessels: vessels.iter().map(|vessel| &vessel.object).collect(),
         terminals: terminals.iter().map(|terminal| (terminal.object.metadata.name.clone(), &terminal.object)).collect(),
+        tombstones: carried
+            .convoy_launches
+            .tombstones()
+            .iter()
+            .filter(|((held_in, _), _)| held_in == namespace)
+            .map(|((_, record), tombstone)| (record.clone(), &tombstone.launch))
+            .collect(),
     };
     let old: Vec<_> = demands.iter().map(|(record, home)| OldDemand { record, home: home.clone() }).collect();
     let next = |home: &str| carried.admitted.get(home).copied().unwrap_or_default() + 1;
@@ -67,6 +79,9 @@ fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, c
     for message in imported.iter().filter(|message| failure(&message.record).is_none()) {
         let admitted = carried.admitted.entry(message.home.clone()).or_default();
         *admitted = (*admitted).max(message.resource.version().0);
+        if let Some(subject) = message.resource.spec().subject() {
+            carried.attentions.push((MessageRef::new(message.resource.name(), &message.home), subject.address.clone()));
+        }
     }
     let mut counted = MessageReport::default();
     for import in &results {
@@ -81,9 +96,10 @@ fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, c
     counted.refused.extend(failed.iter().cloned());
     for (label, count) in counted.imported {
         *report.imported.entry((KIND, label)).or_default() += count;
+        report.rows(KIND, RowOutcome::Imported, count);
     }
     for (reason, count) in counted.dropped {
-        *report.dropped.entry((KIND, reason)).or_default() += count;
+        report.drop_rows(KIND, reason, count);
     }
     report.refused.extend(counted.refused.into_iter().map(|refusal| ImportRefusal {
         kind: KIND,

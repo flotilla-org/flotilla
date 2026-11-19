@@ -1,224 +1,27 @@
 use flotilla_resources::*;
-use tracing::Instrument;
 
 use std::collections::BTreeMap;
 
-// Admission and supersession share one receiver-side seam. Producers never
-// manipulate delivery state or choose a session holder.
-use std::sync::Arc;
+use crate::{Message, ResourceBackend, ResourceError, ResourceObject};
 
-use chrono::{DateTime, Utc};
-use tokio::sync::Mutex;
-
-use crate::{
-    apply_status_patch, InputMeta, Message, MessagePhase, MessageQuery, MessageSpec, MessageStatusPatch, Resource, ResourceBackend,
-    ResourceError, ResourceObject, TypedResolver,
-};
-
-/// Adoption controllers claim a live terminal for an adoptable Project role.
-/// Removing the claim or stopping the terminal retires that local presence.
+/// What admitting a message answers: the message admitted, or the delivered message about the
+/// same subject that suppresses it (ADR 0055).
 #[derive(Debug, Clone)]
 pub enum MessageAdmission {
     Accepted(ResourceObject<Message>),
     Suppressed { predecessor: ResourceObject<Message> },
 }
 
-/// Clones share the admission lock. The host keeps one inbox per namespace;
-/// cross-host senders call that home's ordinary resource mutation path. The
-/// routing authority must have a single writer; this lock is process-local.
-/// Namespace inboxes live for the daemon lifetime and are reused by mutations.
-#[derive(Debug, Clone)]
-pub struct MessageInbox {
-    pub(crate) backend: ResourceBackend,
-    pub(crate) namespace: String,
-    pub(crate) audit_retention_days: u64,
-    pub(crate) change_request_stale_after: std::time::Duration,
-    pub(crate) issue_stale_after: std::time::Duration,
-    pub(crate) messages: TypedResolver<Message>,
-    pub(crate) admission: Arc<Mutex<()>>,
-    pub(crate) delivery: Arc<Mutex<()>>,
-    pub(crate) charter_notifications: Arc<Mutex<()>>,
-}
-
-impl MessageInbox {
-    pub fn new(backend: ResourceBackend, namespace: &str) -> Self {
-        Self {
-            messages: backend.using::<Message>(namespace),
-            backend,
-            namespace: namespace.into(),
-            audit_retention_days: 30,
-            admission: Arc::new(Mutex::new(())),
-            delivery: Arc::new(Mutex::new(())),
-            charter_notifications: Arc::new(Mutex::new(())),
-            change_request_stale_after: std::time::Duration::from_secs(300),
-            issue_stale_after: std::time::Duration::from_secs(300),
-        }
+/// Each standing role's current generations among `convoys`, by project and role: the newest live
+/// convoy of each ensure the role is ensured from. Derived from the generations alone (#3108).
+fn standing_generations<'a>(
+    convoys: impl IntoIterator<Item = &'a crate::ResourceObject<Convoy>>,
+) -> BTreeMap<(String, String), Vec<String>> {
+    let mut standing = BTreeMap::<_, Vec<String>>::new();
+    for convoy in crate::newest_live_generations(convoys).into_values() {
+        standing.entry((convoy.spec.project_ref.clone(), convoy.spec.role.clone())).or_default().push(convoy.metadata.name.clone());
     }
-
-    pub fn with_audit_retention_days(mut self, days: u64) -> Self {
-        self.audit_retention_days = days;
-        self
-    }
-
-    pub fn with_observation_staleness(mut self, change_request: std::time::Duration, issue: std::time::Duration) -> Self {
-        self.change_request_stale_after = change_request;
-        self.issue_stale_after = issue;
-        self
-    }
-
-    /// Qualify relative addresses with the sender's explicit creation context.
-    pub async fn accept_in_context(
-        &self,
-        meta: &InputMeta,
-        spec: &MessageSpec,
-        context: &MessageAddressContext,
-        now: DateTime<Utc>,
-    ) -> Result<MessageAdmission, ResourceError> {
-        let mut qualified = spec.clone();
-        qualified.sender = qualify_message_address(&qualified.sender, context)?;
-        qualified.receiver = qualify_message_address(&qualified.receiver, context)?;
-        self.accept(meta, &qualified, now).await
-    }
-
-    /// Admit an immutable intent. Bare senders require `accept_in_context`; a fully
-    /// qualified sender supplies context for a relative receiver.
-    pub async fn accept(&self, meta: &InputMeta, spec: &MessageSpec, now: DateTime<Utc>) -> Result<MessageAdmission, ResourceError> {
-        let _guard = self.admission.lock().await;
-        self.accept_locked(meta, spec, now).await
-    }
-
-    // Recovery during reconciliation already owns the shared admission lock.
-    pub(crate) async fn accept_locked(
-        &self,
-        meta: &InputMeta,
-        spec: &MessageSpec,
-        now: DateTime<Utc>,
-    ) -> Result<MessageAdmission, ResourceError> {
-        self.accept_locked_traced(meta, spec, now).instrument(flotilla_tracing::queued_span(&meta.name, "admission")).await
-    }
-
-    async fn accept_locked_traced(
-        &self,
-        meta: &InputMeta,
-        spec: &MessageSpec,
-        now: DateTime<Utc>,
-    ) -> Result<MessageAdmission, ResourceError> {
-        tracing::info!("message admission");
-        Message::validate_spec(meta, spec)?;
-        let partial = match self.messages.get(&meta.name).await {
-            Ok(existing) if existing.spec.same_intent(spec) => {
-                // Status is written only after predecessor cleanup. A missing
-                // status is an unfinished admission, so replay must repair it.
-                if let Some(reference) = existing.status.as_ref().and_then(|status| status.canonical_predecessor.as_ref()) {
-                    if reference.namespace != self.namespace {
-                        return Err(ResourceError::invalid("canonical predecessor is outside the receiver inbox"));
-                    }
-                    let predecessor = self.messages.get(&reference.name).await?;
-                    return Ok(MessageAdmission::Suppressed { predecessor });
-                }
-                if existing.status.is_some() {
-                    return Ok(MessageAdmission::Accepted(existing));
-                }
-                Some(existing)
-            }
-            Ok(_) => return Err(ResourceError::conflict(&meta.name, "message ID already names different intent")),
-            Err(ResourceError::NotFound { .. }) => None,
-            Err(error) => return Err(error),
-        };
-        let mut existing = self.messages.query(&MessageQuery::Active { receiver: Some(spec.receiver.clone()) }).await?;
-        if let Some(id) = &spec.supersedes {
-            if !existing.iter().any(|message| message.metadata.name == *id) {
-                existing.push(self.messages.get(id).await.map_err(|error| match error {
-                    ResourceError::NotFound { .. } => {
-                        ResourceError::invalid(format!("superseded message `{id}` is absent from the receiver's store"))
-                    }
-                    error => error,
-                })?);
-            }
-        }
-        let predecessors: Vec<_> = existing
-            .iter()
-            .filter(|message| {
-                message.metadata.name != meta.name
-                    && message_supersedes(spec, message)
-                    && partial.as_ref().is_none_or(|partial| message.metadata.creation_timestamp <= partial.metadata.creation_timestamp)
-            })
-            .collect();
-        if let Some(predecessor) = predecessors.iter().find(|message| spec.supersedes.is_none() && message_expectation_open(message)) {
-            if let Some(partial) = &partial {
-                apply_status_patch(
-                    &self.messages,
-                    &partial.metadata.name,
-                    &MessageStatusPatch::Suppressed {
-                        predecessor: flotilla_protocol::ResourceRef::new(
-                            "flotilla.work/v1",
-                            "Message",
-                            &self.namespace,
-                            &predecessor.metadata.name,
-                        ),
-                        at: now,
-                    },
-                )
-                .await?;
-            }
-            return Ok(MessageAdmission::Suppressed { predecessor: (*predecessor).clone() });
-        }
-        let message = match partial {
-            Some(message) => message,
-            None => self.messages.create(meta, spec).await?,
-        };
-        for predecessor in predecessors {
-            let phase = predecessor.status.as_ref().map_or(MessagePhase::Accepted, |status| status.phase);
-            if !phase.is_terminal()
-                && (spec.supersedes.as_deref() == Some(predecessor.metadata.name.as_str())
-                    || (!phase.has_delivery_evidence() && predecessor.status.as_ref().is_none_or(|status| status.submission.is_none())))
-            {
-                apply_status_patch(
-                    &self.messages,
-                    &predecessor.metadata.name,
-                    &MessageStatusPatch::Finish {
-                        phase: MessagePhase::Superseded,
-                        reason: format!("replaced by {}", message.metadata.name),
-                        at: now,
-                    },
-                )
-                .await?;
-            }
-        }
-        // Separate inbox handles can finish the same interrupted admission.
-        // Re-read after conflicts and keep the winner's immutable order/status.
-        let mut message = message;
-        for _ in 0..3 {
-            if let Some(reference) = message.status.as_ref().and_then(|status| status.canonical_predecessor.as_ref()) {
-                if reference.namespace != self.namespace {
-                    return Err(ResourceError::invalid("canonical predecessor is outside the receiver inbox"));
-                }
-                let predecessor = self.messages.get(&reference.name).await?;
-                return Ok(MessageAdmission::Suppressed { predecessor });
-            }
-            if message.status.is_some() {
-                return Ok(MessageAdmission::Accepted(message));
-            }
-            let status = crate::MessageStatus::builder()
-                .phase(MessagePhase::Accepted)
-                .since(message.metadata.creation_timestamp)
-                // Kubernetes resource versions are opaque; preserve the existing
-                // timestamp/name fallback on backends serving read views.
-                .maybe_accepted_sequence(if self.backend.serves_read_views() {
-                    None
-                } else {
-                    message.metadata.resource_version.parse().ok()
-                })
-                .reason("waiting for receiver resolution".into())
-                .build();
-            match self.messages.update_status(&meta.name, &message.metadata.resource_version, &status).await {
-                Ok(message) => return Ok(MessageAdmission::Accepted(message)),
-                Err(ResourceError::Conflict { .. }) => message = self.messages.get(&meta.name).await?,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(ResourceError::conflict(&meta.name, "admission retry budget exhausted"))
-    }
+    standing
 }
 
 /// Receiver evidence frozen for one batch. Shared view generations avoid
@@ -226,10 +29,11 @@ impl MessageInbox {
 /// Resolution after loading is pure, including adopted-role validation.
 #[derive(Debug)]
 pub struct MessageReceiverSnapshot {
-    namespace: String,
     convoys: std::sync::Arc<crate::ReadResourceList<Convoy>>,
     terminals: std::sync::Arc<crate::ReadResourceList<TerminalSession>>,
-    ensures: std::sync::Arc<crate::ReadResourceList<ConvoyEnsure>>,
+    /// Each standing role's current generations in this batch, by project and role: the newest
+    /// live convoy of each ensure holding it. More than one is an ambiguous holder.
+    standing: BTreeMap<(String, String), Vec<String>>,
     projects: BTreeMap<String, ProjectSpec>,
     hierarchy: ProjectHierarchy,
     defaults: Vec<(String, CrewDefaultsSpec)>,
@@ -239,29 +43,34 @@ impl MessageReceiverSnapshot {
     /// Load exactly the receivers named by a request, reading each holder kind once.
     pub async fn load_for_addresses(backend: &ResourceBackend, namespace: &str, addresses: &[String]) -> Result<Self, ResourceError> {
         let mut convoy_names = std::collections::BTreeSet::new();
-        let mut ensure_queries = Vec::new();
+        let mut standing_queries = Vec::new();
+        let mut standing_roles = std::collections::BTreeSet::new();
         let mut adopted_queries = Vec::new();
         for address in addresses {
             validate_message_address(address)?;
             let parts: Vec<_> = address.split('/').collect();
             match parts.as_slice() {
-                [_, convoy, vessel, role] => {
+                [_, segment, vessel, role] => {
+                    let convoy = flotilla_resources::convoy_of_segment(segment);
                     adopted_queries.push(crate::StoreQuery::labels(
                         &BTreeMap::from([
-                            (CONVOY_LABEL.into(), (*convoy).into()),
+                            (CONVOY_LABEL.into(), convoy.clone()),
                             (VESSEL_LABEL.into(), (*vessel).into()),
                             (ROLE_LABEL.into(), (*role).into()),
                         ]),
                         false,
                         true,
                     ));
-                    convoy_names.insert((*convoy).to_string());
+                    convoy_names.insert(convoy);
                 }
                 [project, role] => {
-                    ensure_queries.push(crate::StoreQuery {
+                    // The role's live ensured convoys; the newest per ensure is its holder.
+                    standing_queries.push(crate::StoreQuery {
+                        present: vec![format!("metadata.annotations.\"{}\"", crate::ENSURED_FROM_ANNOTATION)],
                         fields: BTreeMap::from([("spec.project_ref".into(), (*project).into()), ("spec.role".into(), (*role).into())]),
-                        ..Default::default()
+                        ..crate::live_convoys_query()
                     });
+                    standing_roles.insert(((*project).to_string(), (*role).to_string()));
                     adopted_queries.push(crate::StoreQuery {
                         fields: BTreeMap::from([("metadata.annotations.\"flotilla.work/role-address\"".into(), address.clone())]),
                         ..Default::default()
@@ -270,37 +79,32 @@ impl MessageReceiverSnapshot {
                 _ => {}
             }
         }
-        let ensures = if ensure_queries.is_empty() {
-            Vec::new()
-        } else {
-            backend
-                .query_declared::<ConvoyEnsure>(
-                    namespace,
-                    &crate::StoreQuery { any_of: Some(ensure_queries), include_replicas: true, ..Default::default() },
-                )
-                .await?
-                .items
-        };
-        let standing_convoys = ensures
-            .iter()
-            .filter_map(|ensure| ensure.object.status.as_ref()?.convoy_ref.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        convoy_names.extend(standing_convoys.iter().cloned());
-        let convoys = if convoy_names.is_empty() {
+        // One Convoy read: the named convoys and the standing roles' live generations.
+        let mut convoy_queries = standing_queries;
+        if !convoy_names.is_empty() {
+            convoy_queries.push(crate::StoreQuery {
+                field_values: BTreeMap::from([("metadata.name".into(), convoy_names.iter().cloned().collect())]),
+                ..Default::default()
+            });
+        }
+        let convoys = if convoy_queries.is_empty() {
             Vec::new()
         } else {
             backend
                 .query_declared::<Convoy>(
                     namespace,
-                    &crate::StoreQuery {
-                        field_values: BTreeMap::from([("metadata.name".into(), convoy_names.iter().cloned().collect())]),
-                        include_replicas: true,
-                        ..Default::default()
-                    },
+                    &crate::StoreQuery { any_of: Some(convoy_queries), include_replicas: true, ..Default::default() },
                 )
                 .await?
                 .items
         };
+        // Only the requested roles' generations: a named convoy may itself be one, but a
+        // four-part address needs no standing-role holders.
+        let standing_convoys = standing_generations(convoys.iter().map(|row| &row.object))
+            .into_iter()
+            .filter(|(key, _)| standing_roles.contains(key))
+            .flat_map(|(_, names)| names)
+            .collect::<std::collections::BTreeSet<_>>();
         adopted_queries.extend(
             standing_convoys
                 .into_iter()
@@ -317,7 +121,7 @@ impl MessageReceiverSnapshot {
                 .await?
                 .items
         };
-        Self::load_with_ensures(backend, namespace, convoys, terminals, ensures).await
+        Self::load_from_observations(backend, namespace, convoys, terminals).await
     }
 
     pub async fn load(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
@@ -334,24 +138,11 @@ impl MessageReceiverSnapshot {
         convoys: Vec<crate::ReadResourceObject<Convoy>>,
         terminals: Vec<crate::ReadResourceObject<TerminalSession>>,
     ) -> Result<Self, ResourceError> {
-        // A full observation batch resolves every standing-role declaration.
-        let ensures = backend.including_replicas::<ConvoyEnsure>(namespace).list().await?.items;
-        Self::load_with_ensures(backend, namespace, convoys, terminals, ensures).await
-    }
-
-    async fn load_with_ensures(
-        backend: &ResourceBackend,
-        namespace: &str,
-        convoys: Vec<crate::ReadResourceObject<Convoy>>,
-        terminals: Vec<crate::ReadResourceObject<TerminalSession>>,
-        ensures: Vec<crate::ReadResourceObject<ConvoyEnsure>>,
-    ) -> Result<Self, ResourceError> {
         Self::load_from_shared_observations(
             backend,
             namespace,
             std::sync::Arc::new(crate::ReadResourceList { items: convoys }),
             std::sync::Arc::new(crate::ReadResourceList { items: terminals }),
-            std::sync::Arc::new(crate::ReadResourceList { items: ensures }),
         )
         .await
     }
@@ -362,15 +153,7 @@ impl MessageReceiverSnapshot {
         namespace: &str,
         convoys: std::sync::Arc<crate::ReadResourceList<Convoy>>,
         terminals: std::sync::Arc<crate::ReadResourceList<TerminalSession>>,
-        ensures: std::sync::Arc<crate::ReadResourceList<ConvoyEnsure>>,
     ) -> Result<Self, ResourceError> {
-        let terminals = if let Some(reads) = backend.terminal_readings() {
-            std::sync::Arc::new(crate::ReadResourceList {
-                items: flotilla_store::read_terminal_sources(reads, terminals.items.clone()).await?,
-            })
-        } else {
-            terminals
-        };
         let mut projects = BTreeMap::new();
         let mut fleet = None;
         let mut defaults = Vec::new();
@@ -399,7 +182,8 @@ impl MessageReceiverSnapshot {
         }
         let hierarchy =
             ProjectHierarchy::from_declared(projects.iter().map(|(name, spec)| (name.clone(), spec.parent.clone())).collect(), fleet);
-        Ok(Self { namespace: namespace.into(), convoys, terminals, ensures, projects, hierarchy, defaults })
+        let standing = standing_generations(convoys.items.iter().map(|source| &source.object));
+        Ok(Self { convoys, terminals, standing, projects, hierarchy, defaults })
     }
 
     /// Cheap candidate filter before resolving message addresses. Two-part roles
@@ -407,17 +191,15 @@ impl MessageReceiverSnapshot {
     pub fn may_address_convoy(&self, address: &str, project: &str, convoy: &str) -> bool {
         let parts = address.split('/').collect::<Vec<_>>();
         match parts.as_slice() {
-            [p, c, _, _] => *p == project && *c == convoy,
+            [p, c, _, _] => *p == project && flotilla_resources::convoy_of_segment(c) == convoy,
             [p, role] if *p == project => {
-                self.ensures.items.iter().any(|source| {
-                    let declaration = &source.object;
-                    declaration.spec.project_ref == project
-                        && declaration.spec.role == *role
-                        && declaration.status.as_ref().and_then(|status| status.convoy_ref.as_deref()) == Some(convoy)
-                }) || self.terminals.items.iter().any(|holder| {
-                    holder.object.metadata.annotations.get(ROLE_ADDRESS_ANNOTATION).is_some_and(|claim| claim == address)
-                        && holder.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|name| name == convoy)
-                })
+                self.standing
+                    .get(&(project.to_string(), (*role).to_string()))
+                    .is_some_and(|generations| generations.iter().any(|name| name == convoy))
+                    || self.terminals.items.iter().any(|holder| {
+                        holder.object.metadata.annotations.get(ROLE_ADDRESS_ANNOTATION).is_some_and(|claim| claim == address)
+                            && holder.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|name| name == convoy)
+                    })
             }
             _ => false,
         }
@@ -453,8 +235,12 @@ impl MessageReceiverSnapshot {
         use crate::{TerminalSessionSource, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
         let parts: Vec<_> = address.split('/').collect();
         let convoys = &self.convoys.items;
+        let launch = match parts.as_slice() {
+            [_, segment, _, _] => Some(flotilla_resources::convoy_of_segment(segment)),
+            _ => None,
+        };
         let (project, convoy, vessel, role) = match parts.as_slice() {
-            [project, convoy, vessel, role] => (*project, Some(*convoy), Some(*vessel), *role),
+            [project, _, vessel, role] => (*project, launch.as_deref(), Some(*vessel), *role),
             [project, role] => (*project, None, None, *role),
             // Principal and system addresses never guess an agent terminal.
             _ => return Ok(None),
@@ -483,16 +269,12 @@ impl MessageReceiverSnapshot {
             }
         }
         let declared_convoy = if convoy.is_none() {
-            let declarations = &self.ensures.items;
-            let mut holders = declarations
-                .iter()
-                .filter(|declaration| declaration.object.spec.project_ref == project && declaration.object.spec.role == role);
-            let Some(declaration) = holders.next() else { return Ok(None) };
-            if holders.next().is_some() {
+            // A role with no live generation has no holder.
+            let Some(generations) = self.standing.get(&(project.to_string(), role.to_string())) else { return Ok(None) };
+            let [name] = generations.as_slice() else {
                 return Err(ResourceError::invalid("project role has multiple holder declarations"));
-            }
-            let Some(name) = declaration.object.status.as_ref().and_then(|status| status.convoy_ref.clone()) else { return Ok(None) };
-            Some(name)
+            };
+            Some(name.clone())
         } else {
             None
         };
@@ -500,7 +282,7 @@ impl MessageReceiverSnapshot {
             .iter()
             .filter(|source| {
                 let object = &source.object;
-                object.spec.project_ref.as_deref().unwrap_or(&self.namespace) == project
+                object.spec.project_ref == project
                     && object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
                     && convoy.map_or_else(|| declared_convoy.as_ref() == Some(&object.metadata.name), |name| object.metadata.name == name)
             })
@@ -525,6 +307,37 @@ impl MessageReceiverSnapshot {
                 && matches!(object.spec.source, TerminalSessionSource::Agent { .. })
             })
             .collect::<Vec<_>>();
+        // Each vessel launch has its own session, and an ended one stays listed: a
+        // relaunched vessel's earlier session, Failed or Lost, sits beside its
+        // successor's. A live launch holds the role; with none live, the newest
+        // vessel launch's session does, as the vessel's single session did before
+        // launches, so a refusal can still name why it ended.
+        if holders.len() > 1 {
+            let ended = |holder: &&crate::ReadResourceObject<TerminalSession>| {
+                holder.object.status.as_ref().is_some_and(|status| {
+                    matches!(
+                        status.phase,
+                        crate::TerminalSessionPhase::Lost | crate::TerminalSessionPhase::Stopped | crate::TerminalSessionPhase::Failed
+                    )
+                })
+            };
+            if holders.iter().any(|holder| !ended(holder)) {
+                holders.retain(|holder| !ended(holder));
+            } else {
+                let launch = |holder: &&crate::ReadResourceObject<TerminalSession>| {
+                    holder
+                        .object
+                        .metadata
+                        .labels
+                        .get(VESSEL_REF_LABEL)
+                        .and_then(|vessel| flotilla_resources::convoy::engine::split_launch(vessel))
+                        .map(|(_, number)| number)
+                };
+                if let Some(newest) = holders.iter().map(launch).max().flatten() {
+                    holders.retain(|holder| launch(holder) == Some(newest));
+                }
+            }
+        }
         // Local authority shadows a self-origin replica; the read resolver already
         // deduplicates that pair. Multiple independent holders are not a guess.
         match holders.len() {
@@ -543,4 +356,47 @@ pub async fn resolve_message_receiver(
 ) -> Result<Option<crate::ReadResourceObject<TerminalSession>>, ResourceError> {
     validate_message_address(address)?;
     MessageReceiverSnapshot::load_for_addresses(backend, namespace, &[address.to_string()]).await?.resolve_validated(address)
+}
+
+/// The receiver spelling an inbox's holder records are read by: `P/R` for a project's role, and
+/// `P/C/V/R` for a convoy's crew member, read on the convoy record by its name and the vessel its
+/// workflow seats the role on. `None` for an inbox no crew or project role holds, or whose convoy
+/// is not held. Goes when terminal sessions name their holders by inbox (#3108).
+pub async fn inbox_receiver(
+    backend: &ResourceBackend,
+    namespace: &str,
+    inbox: &flotilla_address::Address,
+) -> Result<Option<String>, ResourceError> {
+    use flotilla_address::Kind;
+    let (Some(project), Kind::Role) = (inbox.get(Kind::Project), inbox.kind()) else { return Ok(None) };
+    let role = inbox.name();
+    if inbox.get(Kind::Convoy).is_none() {
+        return Ok(Some(format!("{project}/{role}")));
+    }
+    let Some(convoy) = inbox_convoy(backend, namespace, inbox).await? else { return Ok(None) };
+    Ok(seated_vessel(&convoy.object, role).map(|vessel| crew_role_address(project, &convoy.object.metadata.name, &vessel, role)))
+}
+
+/// The convoy record a crew member's inbox is under, local or replicated, read by its name; `None`
+/// when no such convoy is held.
+pub async fn inbox_convoy(
+    backend: &ResourceBackend,
+    namespace: &str,
+    inbox: &flotilla_address::Address,
+) -> Result<Option<crate::ReadResourceObject<Convoy>>, ResourceError> {
+    let convoys = backend.including_replicas::<Convoy>(namespace);
+    for name in flotilla_resources::convoy::engine::convoy_records(inbox) {
+        match convoys.get(&name).await {
+            Ok(convoy) => return Ok(Some(convoy)),
+            Err(ResourceError::NotFound { .. }) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+/// The vessel `convoy`'s workflow seats `role` on, once its workflow is frozen.
+pub fn seated_vessel(convoy: &ResourceObject<Convoy>, role: &str) -> Option<String> {
+    let workflow = convoy.status.as_ref()?.workflow_snapshot.as_ref()?;
+    workflow.vessels.iter().find(|vessel| vessel.crew.iter().any(|member| member.role == role)).map(|vessel| vessel.name.clone())
 }

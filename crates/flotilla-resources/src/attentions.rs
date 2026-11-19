@@ -21,10 +21,11 @@ pub enum Sender {
     Teardown,
     Capabilities,
     TurnRules,
+    StallJudge,
 }
 
 impl Sender {
-    pub const ALL: [Sender; 4] = [Sender::Standing, Sender::Teardown, Sender::Capabilities, Sender::TurnRules];
+    pub const ALL: [Sender; 5] = [Sender::Standing, Sender::Teardown, Sender::Capabilities, Sender::TurnRules, Sender::StallJudge];
 
     /// The fleet role's name.
     pub fn role(self) -> &'static str {
@@ -33,6 +34,7 @@ impl Sender {
             Sender::Teardown => "teardown",
             Sender::Capabilities => "capabilities",
             Sender::TurnRules => "turn-rules",
+            Sender::StallJudge => "stall-judge",
         }
     }
 
@@ -60,6 +62,11 @@ pub enum Subject {
         convoy: String,
         role: String,
     },
+    /// A checkout, by its record name at the host that holds it.
+    Checkout {
+        host: String,
+        checkout: String,
+    },
 }
 
 impl Subject {
@@ -83,41 +90,65 @@ pub enum Fact {
     Hold { ensure: String, convoy: String },
     /// A standing role's declaration differs from what its running convoy was admitted with.
     Drift { ensure: String, project: String, role: String, convoy: String },
+    /// A standing role's admission was refused [`LOCAL_RETRY_LIMIT`](crate::LOCAL_RETRY_LIMIT)
+    /// times in a row with the same declaration and dependencies; it waits for an event.
+    Refused { ensure: String, project: String, role: String },
     /// Reclaiming a finished convoy's resources is refused.
     ReclaimRefused { convoy: String },
     /// A vessel's credentials stop refreshing: each failing credential, with why.
     CredentialRefresh { convoy: String, vessel: String, failures: BTreeMap<String, String> },
     /// Turns to a crew session's convoy role are held until a person rules.
     DeliveryHeld { session: String, convoy: String, role: String },
+    /// A convoy role's stall reached the operator with no person named to supervise it.
+    Stalled { convoy: String, role: String },
+    /// A vessel's session was released though its release kept failing, and nothing else ends
+    /// its process: it may still run.
+    SessionLeftRunning { convoy: String, vessel: String, session: String },
+    /// A finished convoy's checkout at `host` is not released: its work is not clean, so its
+    /// removal is refused until it is cleaned up and rechecked, or a person rules it archived.
+    CheckoutHeld { convoy: String, host: String, checkout: String },
 }
 
 impl Fact {
     pub fn sender(&self) -> Sender {
         match self {
-            Fact::Hold { .. } | Fact::Drift { .. } => Sender::Standing,
-            Fact::ReclaimRefused { .. } => Sender::Teardown,
+            Fact::Hold { .. } | Fact::Drift { .. } | Fact::Refused { .. } => Sender::Standing,
+            Fact::ReclaimRefused { .. } | Fact::SessionLeftRunning { .. } | Fact::CheckoutHeld { .. } => Sender::Teardown,
             Fact::CredentialRefresh { .. } => Sender::Capabilities,
             Fact::DeliveryHeld { .. } => Sender::TurnRules,
+            Fact::Stalled { .. } => Sender::StallJudge,
         }
     }
 
     pub fn subject(&self) -> Subject {
         match self {
             Fact::Hold { convoy, .. } | Fact::ReclaimRefused { convoy } => Subject::convoy(convoy.clone()),
-            Fact::Drift { project, role, .. } => Subject::StandingRole { project: project.clone(), role: role.clone() },
-            Fact::CredentialRefresh { convoy, vessel, .. } => Subject::Vessel { convoy: convoy.clone(), vessel: vessel.clone() },
-            Fact::DeliveryHeld { convoy, role, .. } => Subject::ConvoyRole { convoy: convoy.clone(), role: role.clone() },
+            Fact::Drift { project, role, .. } | Fact::Refused { project, role, .. } => {
+                Subject::StandingRole { project: project.clone(), role: role.clone() }
+            }
+            Fact::CredentialRefresh { convoy, vessel, .. } | Fact::SessionLeftRunning { convoy, vessel, .. } => {
+                Subject::Vessel { convoy: convoy.clone(), vessel: vessel.clone() }
+            }
+            Fact::DeliveryHeld { convoy, role, .. } | Fact::Stalled { convoy, role } => {
+                Subject::ConvoyRole { convoy: convoy.clone(), role: role.clone() }
+            }
+            Fact::CheckoutHeld { host, checkout, .. } => Subject::Checkout { host: host.clone(), checkout: checkout.clone() },
         }
     }
 
-    /// The convoy whose dispatching principal hears it.
-    pub fn convoy(&self) -> &str {
+    /// The convoy whose dispatching principal hears it. A refused admission has none: the
+    /// principal admission would have stamped hears it.
+    pub fn convoy(&self) -> Option<&str> {
         match self {
             Fact::Hold { convoy, .. }
             | Fact::Drift { convoy, .. }
             | Fact::ReclaimRefused { convoy }
             | Fact::CredentialRefresh { convoy, .. }
-            | Fact::DeliveryHeld { convoy, .. } => convoy,
+            | Fact::DeliveryHeld { convoy, .. }
+            | Fact::Stalled { convoy, .. }
+            | Fact::SessionLeftRunning { convoy, .. }
+            | Fact::CheckoutHeld { convoy, .. } => Some(convoy),
+            Fact::Refused { .. } => None,
         }
     }
 }

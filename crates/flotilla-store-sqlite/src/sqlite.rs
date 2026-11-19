@@ -6,7 +6,7 @@ use crate::Store;
 #[cfg(test)]
 use crate::StoreExt;
 use crate::{convert_read, ReadObserver, ReadOperation, ResourceKind, SerializedResource};
-use crate::{watch, DigestQuery, MessageQuery, PartitionDigest, ResourcePosition};
+use crate::{watch, MessageQuery, ResourcePosition};
 use crate::{DecodedList, DecodedObject, DecodedReadObject};
 use crate::{SerializedReadWatchEvent, SerializedWatchEvent, SerializedWatchStream, WatchAction, WatchObject, WatchPayload};
 use std::{
@@ -83,8 +83,6 @@ type StoreKey = (String, String, String, String);
 type WatchersByStore = HashMap<StoreKey, WatchChannel<StoredEvent>>;
 type ReplicaWatchersByStore = HashMap<StoreKey, WatchChannel<StoredReplicaEvent>>;
 type CleanupKey = (StoreKey, &'static str);
-
-const REPLICA_DELETIONS_SELECT_SQL: &str = "SELECT origin_root, name, last_synced_at FROM replica_tombstones WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 ORDER BY origin_root, name";
 
 const READER_COUNT: usize = 4;
 // Bump when metadata or declared-field extraction semantics change.
@@ -1223,26 +1221,14 @@ impl SqliteBackend {
         }
         for (path, selection) in &query.field_matches_query {
             let source_kind = selection.kind(kind).expect("validated source kind");
-            let mut source = (*selection.query).clone();
-            if let Some(scope) = query.replica_shadowing.as_ref().filter(|_| source_kind.paths.kind == kind.paths.kind) {
-                source.replica_shadowing = Some(scope.clone());
-                source.replicas_only = query.replicas_only;
-            }
+            let source = &*selection.query;
             let mut projections = Vec::new();
             for source_replicas in [false, true] {
-                if (!source_replicas && source.replicas_only)
-                    || (source_replicas && (!source.include_replicas || source_kind.replication == crate::ReplicationClass::None))
-                {
+                if source_replicas && (!source.include_replicas || source_kind.replication == crate::ReplicationClass::None) {
                     continue;
                 }
-                let (sql, values) = Self::declared_sql(
-                    source_kind,
-                    namespace,
-                    &source,
-                    source_replicas,
-                    root,
-                    QueryColumns::Field(selection.field.clone()),
-                );
+                let (sql, values) =
+                    Self::declared_sql(source_kind, namespace, source, source_replicas, root, QueryColumns::Field(selection.field.clone()));
                 projections.push(format!("SELECT * FROM ({})", Self::shift_binds(&sql, args.len())));
                 args.extend(values);
             }
@@ -1253,7 +1239,6 @@ impl SqliteBackend {
             let mut alternatives = Vec::new();
             for alternative in queries {
                 let mut alternative = alternative.clone();
-                alternative.replica_shadowing = query.replica_shadowing.clone();
                 alternative.suppress_self_origin = query.suppress_self_origin;
                 let (sql, values) = Self::declared_sql(kind, namespace, &alternative, replicas, root, QueryColumns::Identity);
                 let shifted = Self::shift_binds(&sql, args.len());
@@ -1274,15 +1259,8 @@ impl SqliteBackend {
             predicates.push(format!("{candidate} IN (SELECT {columns} FROM {table}_owners l INDEXED BY {table}_owners_lookup WHERE l.group_name=?1 AND l.version=?2 AND l.kind=?3 AND l.namespace=?4 AND l.owner_key=?{}{origin})",args.len()));
         }
         if replicas && query.suppress_self_origin {
-            if let Some(scope) = &query.replica_shadowing {
-                args.push(SqlValue::Text(scope.origin_root.to_string()));
-                let root_arg = args.len();
-                args.push(SqlValue::Text(serde_json::json!(scope.local_names).to_string()));
-                predicates.push(format!("NOT (o.origin_root=?{root_arg} AND o.name IN (SELECT value FROM json_each(?{})))", args.len()));
-            } else {
-                args.push(SqlValue::Text(root.into()));
-                predicates.push(format!("NOT (o.origin_root=?{} AND EXISTS(SELECT 1 FROM resource_objects local WHERE local.group_name=o.group_name AND local.version=o.version AND local.kind=o.kind AND local.namespace=o.namespace AND local.name=o.name))",args.len()));
-            }
+            args.push(SqlValue::Text(root.into()));
+            predicates.push(format!("NOT (o.origin_root=?{} AND EXISTS(SELECT 1 FROM resource_objects local WHERE local.group_name=o.group_name AND local.version=o.version AND local.kind=o.kind AND local.namespace=o.namespace AND local.name=o.name))",args.len()));
         }
         // Specialized Message indexes are kept as the established exemplar.
         let index = if let Some(message) = &query.message {
@@ -3227,6 +3205,7 @@ impl SqliteBackend {
             return Err(ResourceError::WatchExpired {
                 requested_version: "quarantined event leaves a sequence gap; snapshot required".to_string(),
                 compacted_through: None,
+                reason: "a quarantined event leaves a gap in the sequence".to_string(),
             });
         }
 
@@ -3258,9 +3237,6 @@ impl SqliteBackend {
                 let tx = connection.transaction().map_err(|e| Self::map_sqlite(e, "begin query snapshot"))?;
                 let mut items = Vec::new();
                 for replicas in [false, true] {
-                    if !replicas && query.replicas_only {
-                        continue;
-                    }
                     if replicas && (!query.include_replicas || kind.replication == crate::ReplicationClass::None) {
                         continue;
                     }
@@ -3393,6 +3369,7 @@ impl SqliteBackend {
             return Err(ResourceError::WatchExpired {
                 requested_version: replay_from.to_string(),
                 compacted_through: Some(compacted_through.to_string()),
+                reason: format!("events through {compacted_through} were compacted"),
             });
         }
         Ok(())
@@ -3558,9 +3535,7 @@ impl Store for SqliteBackend {
         self.read_call("indexed field projection", move |connection| {
             let mut values = std::collections::BTreeSet::new();
             for replicas in [false, true] {
-                if (!replicas && query.replicas_only)
-                    || (replicas && (!query.include_replicas || kind.replication == crate::ReplicationClass::None))
-                {
+                if replicas && (!query.include_replicas || kind.replication == crate::ReplicationClass::None) {
                     continue;
                 }
                 let (sql, args) = Self::declared_sql(kind, &namespace, &query, replicas, &root, QueryColumns::Field(field.clone()));
@@ -3686,32 +3661,6 @@ impl Store for SqliteBackend {
     ) -> Result<(), ResourceError> {
         SqliteBackend::apply_replica_raw(self, resource_kind, origin_root, namespace, kind, object, synced_at).await
     }
-    async fn list_replica_deletions_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-    ) -> Result<Vec<crate::replica::ReplicaDeletion>, ResourceError> {
-        let key = Self::store_key(resource_kind, namespace);
-        self.read_call("list replica deletions", move |connection| {
-            let mut statement = connection
-                .prepare_cached(REPLICA_DELETIONS_SELECT_SQL)
-                .map_err(|error| Self::map_sqlite(error, "prepare replica deletions"))?;
-            let rows = statement
-                .query_map(params![key.0, key.1, key.2, key.3], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-                })
-                .map_err(|error| Self::map_sqlite(error, "query replica deletions"))?;
-            rows.map(|row| {
-                let (origin, name, synced_at) = row.map_err(|error| Self::map_sqlite(error, "read replica deletion"))?;
-                let last_synced_at = DateTime::parse_from_rfc3339(&synced_at)
-                    .map_err(|error| ResourceError::decode(format!("decode replica deletion timestamp: {error}")))?
-                    .with_timezone(&Utc);
-                Ok(crate::replica::ReplicaDeletion { origin_root: NodeId::new(origin), name, last_synced_at })
-            })
-            .collect()
-        })
-        .await
-    }
     async fn apply_replica_tombstone_raw(
         &self,
         resource_kind: ResourceKind,
@@ -3764,33 +3713,6 @@ impl Store for SqliteBackend {
     }
     async fn current_position_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourcePosition, ResourceError> {
         SqliteBackend::current_position_raw(self, resource_kind, namespace).await
-    }
-    async fn digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        query: &DigestQuery,
-    ) -> Result<PartitionDigest, ResourceError> {
-        SqliteBackend::digest_raw(self, resource_kind, namespace, query).await
-    }
-    async fn confirm_replica_digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        proof: &PartitionDigest,
-        previous: &ReplicaCursor,
-    ) -> Result<(), ResourceError> {
-        SqliteBackend::confirm_replica_digest_raw(self, resource_kind, origin, namespace, proof, previous).await
-    }
-    async fn replica_digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        generation: Option<String>,
-    ) -> Result<PartitionDigest, ResourceError> {
-        SqliteBackend::replica_digest_raw(self, resource_kind, origin, namespace, generation).await
     }
     async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
         let result = SqliteBackend::list_raw(self, resource_kind, namespace).await?;
@@ -4368,6 +4290,7 @@ mod tests {
                 &meta,
                 &crate::ConvoySpec::builder()
                     .workflow_ref("workflow".into())
+                    .project_ref("flotilla".into())
                     .repositories(vec![crate::ConvoyRepositorySpec::builder()
                         .url("https://example.com/repo".into())
                         .repo_ref(crate::RepositoryKey("repository".into()))
@@ -4622,7 +4545,6 @@ mod tests {
                                 crate::MessageQuery::active(),
                                 crate::MessageQuery::Active { receiver: Some("r".into()) },
                                 crate::MessageQuery::ReplyTo { name: "n".into() },
-                                crate::MessageQuery::Batch { id: "b".into() },
                                 crate::MessageQuery::AuditBefore { before: Utc::now() },
                             ] {
                                 let index = message.sql_index(replicas).to_string();
@@ -4707,7 +4629,6 @@ mod tests {
                                         crate::MessageQuery::active(),
                                         crate::MessageQuery::Active { receiver: Some("r".into()) },
                                         crate::MessageQuery::ReplyTo { name: "n".into() },
-                                        crate::MessageQuery::Batch { id: "b".into() },
                                         crate::MessageQuery::AuditBefore { before: Utc::now() },
                                     ] {
                                         let index = message.sql_index(replicas).to_string();
@@ -4747,30 +4668,6 @@ mod tests {
             })
             .await
             .unwrap();
-    }
-
-    // WORKLOAD.md: relay catch-up reads only the requested kind/namespace's
-    // deletion metadata. One case covers this SQL shape for all bound keys.
-    #[tokio::test]
-    async fn relay_deletion_snapshot_searches_covering_partition_index() {
-        let backend = SqliteBackend::open_in_memory().expect("open relay store");
-        let plans = backend
-            .read_call("explain relay deletion snapshot", |connection| {
-                let mut statement = connection
-                    .prepare(&format!("EXPLAIN QUERY PLAN {REPLICA_DELETIONS_SELECT_SQL}"))
-                    .map_err(|error| SqliteBackend::map_sqlite(error, "explain relay deletion snapshot"))?;
-                let rows = statement
-                    .query_map(params!["flotilla.work", "v1", "Convoy", "flotilla"], |row| row.get::<_, String>(3))
-                    .map_err(|error| SqliteBackend::map_sqlite(error, "query relay deletion plan"))?;
-                rows.collect::<Result<Vec<_>, _>>().map_err(|error| SqliteBackend::map_sqlite(error, "read relay deletion plan"))
-            })
-            .await
-            .expect("relay deletion query plan");
-        assert!(
-            plans.iter().any(|plan| plan.contains("SEARCH replica_tombstones USING COVERING INDEX replica_tombstones_relay_snapshot")),
-            "{plans:?}"
-        );
-        assert!(!plans.iter().any(|plan| plan.contains("USE TEMP B-TREE")), "partition index also supplies relay ordering: {plans:?}");
     }
 
     #[tokio::test]
@@ -4863,7 +4760,6 @@ mod message_query_plan_tests {
                 (crate::MessageQuery::active(), "resource_objects_message_inbox"),
                 (crate::MessageQuery::Active { receiver: Some("project/role".into()) }, "resource_objects_message_active"),
                 (crate::MessageQuery::ReplyTo { name: "request".into() }, "resource_objects_message_reply"),
-                (crate::MessageQuery::Batch { id: "batch".into() }, "resource_objects_message_batch"),
                 (crate::MessageQuery::AuditBefore { before: Utc::now() }, "message_audit_age"),
             ] {
                 let (predicate, argument) = query.sql();

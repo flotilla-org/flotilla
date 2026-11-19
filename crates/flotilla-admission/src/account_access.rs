@@ -470,7 +470,7 @@ pub async fn reconcile_convoy_bindings(
     }
     let Some(workflow) = admitted_workflow(backend, namespace, convoy).await? else { return Ok((changes, Vec::new())) };
     let alternatives =
-        current_alternatives(backend, namespace, convoy.spec.project_ref.as_deref(), &convoy.spec.repositories, &workflow).await?;
+        current_alternatives(backend, namespace, Some(&convoy.spec.project_ref), &convoy.spec.repositories, &workflow).await?;
     for binding in bindings.iter().filter(|binding| binding.spec.state.value.is_open()) {
         if let Some(change) = reconcile_open_binding(accounts, namespace, binding, &alternatives, now).await? {
             changes.push((binding.name.clone(), change));
@@ -579,7 +579,7 @@ pub async fn bind_unbound(
     let mut pending = Vec::new();
     for Unbound { alternatives, carried } in unbound {
         let selected = select(&alternatives, carried.as_deref().map(|credential| (credential, SNAPSHOT_PIN)), random)?;
-        pending.push(binding_record(convoy.spec.project_ref.as_deref(), &convoy.metadata.name, &alternatives, selected, now)?);
+        pending.push(binding_record(Some(&convoy.spec.project_ref), &convoy.metadata.name, &alternatives, selected, now)?);
     }
     let changes = pending.iter().map(|binding| (binding.name.clone(), BindingChange::Opened)).collect();
     accounts.open(namespace, pending).await?;
@@ -605,7 +605,7 @@ pub async fn rebind(
     let workflow = admitted_workflow(backend, namespace, &convoy)
         .await?
         .ok_or_else(|| format!("convoy `{convoy_name}` has no admitted workflow yet"))?;
-    let project = convoy.spec.project_ref.as_deref();
+    let project = Some(convoy.spec.project_ref.as_str());
     let alternatives = current_alternatives(backend, namespace, project, &convoy.spec.repositories, &workflow).await?;
     let alternative = alternatives
         .iter()

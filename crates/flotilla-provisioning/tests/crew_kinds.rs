@@ -1,5 +1,5 @@
-//! The crew kinds' stored shape (#3629 Track B layer 5): Vessel and Ensure, declared by the
-//! engine, and TerminalSession. Deterministic DDL and a readable view, checked in for the owner's
+//! The crew kinds' stored shape (#3629 Track B layer 5): Vessel, declared by the engine, and
+//! TerminalSession. Deterministic DDL and a readable view, checked in for the owner's
 //! schema look-over, the plans of their statements, and a session through the schema codec.
 
 use std::collections::BTreeMap;
@@ -58,7 +58,8 @@ fn crew_statements_and_identity_removal_search_by_key() {
     assert!(failures.is_empty(), "{failures:#?}");
     let sql = &statements.iter().find(|(label, _)| label == "identity_delete").expect("shared statement").1;
     let rows = plan(&conn, sql);
-    for index in ["vessel_by_convoy", "terminal_session_by_environment"] {
+    // A vessel's convoy leads its `by_launch` index.
+    for index in ["vessel_by_launch", "terminal_session_by_environment"] {
         assert!(rows.iter().any(|row| row.contains(index)), "{index}: {rows:?}");
     }
 }
@@ -84,6 +85,8 @@ fn a_terminal_session_survives_the_codec() {
             LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Failed { reason: "failed".into() } },
         ] {
             let spec = TerminalSessionRequest {
+                launch_of: "s".into(),
+                launch: 4,
                 environment: Ref::<Resource<Environment>>::new("env", "feta"),
                 holder: holder.clone(),
                 role: "coder".into(),

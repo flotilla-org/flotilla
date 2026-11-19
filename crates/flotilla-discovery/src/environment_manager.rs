@@ -202,24 +202,25 @@ impl EnvironmentManager {
     }
 
     pub fn environment_runner(&self, env_id: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
-        match self.managed_environment(env_id)? {
-            ManagedEnvironmentKind::Direct(state) => Some(state.runner),
-            ManagedEnvironmentKind::Provisioned(state) => Some(state.handle.runner()),
-        }
+        self.managed_environment(env_id, |managed| match managed {
+            ManagedEnvironmentKind::Direct(state) => Arc::clone(&state.runner),
+            ManagedEnvironmentKind::Provisioned(state) => state.handle.runner(),
+        })
     }
 
     pub fn environment_bag(&self, env_id: &EnvironmentId) -> Option<EnvironmentBag> {
-        match self.managed_environment(env_id)? {
-            ManagedEnvironmentKind::Direct(state) => Some(state.env_bag),
-            ManagedEnvironmentKind::Provisioned(state) => Some(state.env_bag),
-        }
+        self.managed_environment(env_id, |managed| match managed {
+            ManagedEnvironmentKind::Direct(state) => state.env_bag.clone(),
+            ManagedEnvironmentKind::Provisioned(state) => state.env_bag.clone(),
+        })
     }
 
     pub fn environment_registry(&self, env_id: &EnvironmentId) -> Option<Arc<ProviderRegistry>> {
-        match self.managed_environment(env_id)? {
-            ManagedEnvironmentKind::Direct(state) => state.registry,
-            ManagedEnvironmentKind::Provisioned(state) => state.registry,
-        }
+        self.managed_environment(env_id, |managed| match managed {
+            ManagedEnvironmentKind::Direct(state) => state.registry.clone(),
+            ManagedEnvironmentKind::Provisioned(state) => state.registry.clone(),
+        })
+        .flatten()
     }
 
     pub fn set_direct_environment_registry(&self, env_id: &EnvironmentId, registry: Arc<ProviderRegistry>) -> Result<(), String> {
@@ -276,38 +277,34 @@ impl EnvironmentManager {
     }
 
     pub fn environment_container_name(&self, env_id: &EnvironmentId) -> Option<String> {
-        match self.managed_environment(env_id)? {
+        self.managed_environment(env_id, |managed| match managed {
             ManagedEnvironmentKind::Direct(_) => None,
             ManagedEnvironmentKind::Provisioned(state) => state.handle.container_name().map(ToString::to_string),
-        }
+        })
+        .flatten()
     }
 
     pub fn provisioned_mounts(&self, env_id: &EnvironmentId) -> Option<Vec<ProvisionedMount>> {
-        match self.managed_environment(env_id)? {
+        self.managed_environment(env_id, |managed| match managed {
             ManagedEnvironmentKind::Direct(_) => None,
             ManagedEnvironmentKind::Provisioned(state) => Some(state.provisioned_mounts.clone()),
-        }
+        })
+        .flatten()
     }
 
     pub fn resolve_environment_path_to_host_path(&self, env_id: &EnvironmentId, path: &ExecutionEnvironmentPath) -> Option<QualifiedPath> {
-        let state = match self.managed_environment(env_id)? {
-            ManagedEnvironmentKind::Direct(_) => return None,
-            ManagedEnvironmentKind::Provisioned(state) => state,
-        };
+        let mounts = self.provisioned_mounts(env_id)?;
         if !Self::is_clean_absolute_path(path.as_path()) {
             return None;
         }
         let host_id = self.host_id_for_environment(env_id)?;
-        let mount = Self::best_matching_mount(&state.provisioned_mounts, path.as_path(), MountDomain::Environment)?;
+        let mount = Self::best_matching_mount(&mounts, path.as_path(), MountDomain::Environment)?;
         let suffix = path.as_path().strip_prefix(mount.environment_path.as_path()).ok()?;
         Some(QualifiedPath::host(host_id, mount.host_path.as_path().join(suffix)))
     }
 
     pub fn resolve_host_path_to_environment_path(&self, env_id: &EnvironmentId, path: &QualifiedPath) -> Option<ExecutionEnvironmentPath> {
-        let state = match self.managed_environment(env_id)? {
-            ManagedEnvironmentKind::Direct(_) => return None,
-            ManagedEnvironmentKind::Provisioned(state) => state,
-        };
+        let mounts = self.provisioned_mounts(env_id)?;
         let host_id = self.host_id_for_environment(env_id)?;
         if !path.is_owned_by_host_id(&host_id) {
             return None;
@@ -315,7 +312,7 @@ impl EnvironmentManager {
         if !Self::is_clean_absolute_path(path.path.as_path()) {
             return None;
         }
-        let mount = Self::best_matching_mount(&state.provisioned_mounts, path.path.as_path(), MountDomain::Host)?;
+        let mount = Self::best_matching_mount(&mounts, path.path.as_path(), MountDomain::Host)?;
         let suffix = path.path.strip_prefix(mount.host_path.as_path()).ok()?;
         Some(ExecutionEnvironmentPath::new(mount.environment_path.as_path().join(suffix)))
     }
@@ -495,8 +492,10 @@ impl EnvironmentManager {
         }
     }
 
-    fn managed_environment(&self, env_id: &EnvironmentId) -> Option<ManagedEnvironmentKind> {
-        self.managed.lock().expect("environment manager lock poisoned").get(env_id).cloned()
+    /// What `read` takes from `env_id`'s state, under the lock: a caller copies only the part it
+    /// needs, never the environment's whole discovery bag.
+    fn managed_environment<T>(&self, env_id: &EnvironmentId, read: impl FnOnce(&ManagedEnvironmentKind) -> T) -> Option<T> {
+        self.managed.lock().expect("environment manager lock poisoned").get(env_id).map(read)
     }
 
     pub fn managed_environments(&self) -> Vec<(EnvironmentId, ManagedEnvironmentKind)> {
@@ -535,9 +534,12 @@ impl EnvironmentManager {
     }
 
     fn provisioned_environment(&self, env_id: &EnvironmentId) -> Result<ProvisionedEnvironmentState, String> {
-        match self.managed_environment(env_id) {
-            Some(ManagedEnvironmentKind::Provisioned(state)) => Ok(state),
-            Some(ManagedEnvironmentKind::Direct(_)) | None => Err(format!("environment handle not found: {env_id}")),
+        match self.managed_environment(env_id, |managed| match managed {
+            ManagedEnvironmentKind::Provisioned(state) => Some(state.clone()),
+            ManagedEnvironmentKind::Direct(_) => None,
+        }) {
+            Some(Some(state)) => Ok(state),
+            _ => Err(format!("environment handle not found: {env_id}")),
         }
     }
 
@@ -581,10 +583,11 @@ impl EnvironmentManager {
     }
 
     pub fn host_id_for_environment(&self, env_id: &EnvironmentId) -> Option<HostId> {
-        match self.managed_environment(env_id)? {
+        self.managed_environment(env_id, |managed| match managed {
             ManagedEnvironmentKind::Direct(state) => state.host_id.clone(),
             ManagedEnvironmentKind::Provisioned(state) => Some(state.owning_host_id.clone()),
-        }
+        })
+        .flatten()
     }
 
     fn best_matching_mount<'a>(mounts: &'a [ProvisionedMount], path: &Path, domain: MountDomain) -> Option<&'a ProvisionedMount> {

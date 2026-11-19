@@ -617,10 +617,7 @@ fn project_at(address: &ViewAddress, data: &TableRows<'_>, now: Timestamp) -> Re
                 .filter(|convoy| &convoy.namespace == namespace)
                 .filter(|convoy| {
                     scope.as_ref().is_none_or(|scope| {
-                        convoy
-                            .project_ref
-                            .as_deref()
-                            .is_some_and(|project| project == scope.name || project == format!("{}/{}", scope.namespace, scope.name))
+                        convoy.project_ref == scope.name || convoy.project_ref == format!("{}/{}", scope.namespace, scope.name)
                     })
                 })
                 .cloned()
@@ -892,7 +889,7 @@ fn stable_topological_vessels(vessels: &[VesselSummary]) -> Vec<&VesselSummary> 
 // on terminal rows. Missing timestamps stay visible rather than guessing age.
 fn project_convoy_rows(title: String, mut rows: Vec<ConvoySummary>, now: Timestamp) -> TableView {
     fn rank(row: &ConvoySummary) -> u8 {
-        if row.phase.is_terminal() {
+        if row.is_ended() {
             return 4;
         }
         match row.surface_state {
@@ -907,7 +904,7 @@ fn project_convoy_rows(title: String, mut rows: Vec<ConvoySummary>, now: Timesta
         .iter()
         .enumerate()
         .filter_map(|(index, row)| {
-            (row.phase.is_terminal() && convoy_recency(row).is_some_and(|at| now.signed_duration_since(at) > chrono::Duration::hours(24)))
+            (row.is_ended() && convoy_recency(row).is_some_and(|at| now.signed_duration_since(at) > chrono::Duration::hours(24)))
                 .then_some(index)
         })
         .collect();
@@ -926,7 +923,7 @@ fn convoy_recency(row: &ConvoySummary) -> Option<Timestamp> {
         .into_iter()
         .chain(row.vessels.iter().flat_map(|vessel| [vessel.ready_at, vessel.started_at, vessel.finished_at].into_iter().flatten()))
         .max();
-    if row.phase.is_terminal() {
+    if row.is_ended() {
         row.finished_at.or(latest)
     } else {
         latest.into_iter().chain(row.finished_at).max()
@@ -1003,7 +1000,10 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 8] = [
         width: WidthHint::Fixed(12),
         alignment: Alignment::Left,
         extract: |row| {
-            if row.initializing && !row.phase.is_terminal() && row.readiness.state == flotilla_protocol::result_set::ReadinessState::Unknown
+            // An unreadable launch (no phase) is not initializing either.
+            if row.initializing
+                && row.phase.is_some_and(|phase| !phase.is_terminal())
+                && row.readiness.state == flotilla_protocol::result_set::ReadinessState::Unknown
             {
                 CellValue::toned("provisioning", CellTone::Warning)
             } else {
@@ -1210,19 +1210,27 @@ fn convoy_drill(row: &ConvoySummary) -> Option<ViewAddress> {
 
 fn convoy_phase(row: &ConvoySummary) -> CellValue {
     let tone = match row.phase {
-        ConvoyPhase::Pending => CellTone::Muted,
-        ConvoyPhase::Active => CellTone::Plain,
-        ConvoyPhase::Interrupted => CellTone::Warning,
-        ConvoyPhase::Landed => CellTone::Success,
-        ConvoyPhase::Landing => CellTone::Plain,
-        ConvoyPhase::Failed => CellTone::Error,
-        ConvoyPhase::Abandoned => CellTone::Muted,
+        Some(ConvoyPhase::Pending) => CellTone::Muted,
+        Some(ConvoyPhase::Active) => CellTone::Plain,
+        Some(ConvoyPhase::Interrupted) | None => CellTone::Warning,
+        Some(ConvoyPhase::Landed) => CellTone::Success,
+        Some(ConvoyPhase::Landing) => CellTone::Plain,
+        Some(ConvoyPhase::Failed) => CellTone::Error,
+        Some(ConvoyPhase::Abandoned) => CellTone::Muted,
     };
     let label = match (row.phase, row.disposition.as_deref()) {
-        (ConvoyPhase::Landed, Some(disposition)) => format!("landed · {disposition}"),
-        _ => row.phase.label().to_string(),
+        (Some(ConvoyPhase::Landed), Some(disposition)) => format!("landed · {disposition}"),
+        _ => row.phase_label().to_string(),
     };
     CellValue::toned(label, tone)
+}
+
+/// The convoy detail's phase: an unreadable launch's phase is unknown, with why.
+fn convoy_phase_detail(row: &ConvoySummary) -> String {
+    match (&row.phase, &row.unreadable) {
+        (None, Some(reason)) => format!("unknown: {reason}"),
+        _ => convoy_phase(row).text,
+    }
 }
 
 fn readiness_cell(readiness: &flotilla_protocol::result_set::Readiness) -> CellValue {
@@ -1277,7 +1285,7 @@ fn convoy_subjects_label(subjects: &[flotilla_protocol::result_set::ConvoySubjec
 }
 
 fn convoy_scope(row: &ConvoySummary) -> CellValue {
-    CellValue::plain(row.project_ref.as_deref().or_else(|| row.repo_hint.as_ref().map(|repo| repo.0.as_str())).unwrap_or_default())
+    CellValue::plain(row.project_ref.as_str())
 }
 
 fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
@@ -1289,7 +1297,7 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
             label: "Dispatcher",
             value: format!("{}/{}", row.dispatching_principal_ref.namespace, row.dispatching_principal_ref.name),
         },
-        DetailField { label: "Phase", value: convoy_phase(row).text },
+        DetailField { label: "Phase", value: convoy_phase_detail(row) },
         DetailField { label: "Message", value: row.message.clone().unwrap_or_default() },
         DetailField { label: "Vessels", value: convoy_progress(row).text },
     ];
@@ -1612,11 +1620,12 @@ mod tests {
             origin_host: None,
             workflow_ref: "implement-review".into(),
             dispatching_principal_ref: Default::default(),
-            phase: ConvoyPhase::Active,
+            phase: Some(ConvoyPhase::Active),
+            unreadable: None,
             message: None,
             disposition: None,
             repo_hint: None,
-            project_ref: Some("flotilla".into()),
+            project_ref: "flotilla".into(),
             issues: Vec::new(),
             subjects: Vec::new(),
             vessels,
@@ -1664,7 +1673,7 @@ mod tests {
         for (age, phase) in [(1, ConvoyPhase::Landed), (2, ConvoyPhase::Failed), (3, ConvoyPhase::Abandoned)] {
             let mut row = convoy(vec![]);
             row.id = ConvoyId::new("dev", format!("terminal-{age}"));
-            row.phase = phase;
+            row.phase = Some(phase);
             row.surface_state = SurfaceState::NeedsYou;
             row.finished_at = Some(now - chrono::Duration::hours(age));
             rows.push(row);
@@ -1690,9 +1699,9 @@ mod tests {
         second.id = ConvoyId::new("dev", "second");
         second.started_at = Some(now - chrono::Duration::days(1));
         assert_eq!(project_convoy_rows("".into(), vec![second.clone(), first.clone()], now).rows[0].id, convoy_id(&first));
-        first.phase = ConvoyPhase::Landed;
+        first.phase = Some(ConvoyPhase::Landed);
         first.finished_at = Some(now - chrono::Duration::days(2));
-        second.phase = ConvoyPhase::Failed;
+        second.phase = Some(ConvoyPhase::Failed);
         second.started_at = None;
         let view = project_convoy_rows("".into(), vec![second.clone(), first.clone()], now);
         assert_eq!(view.rows[0].id, convoy_id(&second));
@@ -1718,7 +1727,7 @@ mod tests {
         for phase in [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned] {
             for seconds in [86399, 86400, 86401] {
                 let mut row = convoy(vec![]);
-                row.phase = phase;
+                row.phase = Some(phase);
                 row.name = "old-needle".into();
                 row.finished_at = Some(now - chrono::Duration::seconds(seconds));
                 let data = TableRows { convoys: vec![&row], ..Default::default() };
@@ -1728,9 +1737,9 @@ mod tests {
                 assert_eq!(view.clone().filtered("needle").rows.len(), 1);
                 assert!(view.clone().filtered("no match").rows.is_empty());
                 assert_eq!(view.filtered("  ").rows.len(), usize::from(seconds <= 86400));
-                row.phase = ConvoyPhase::Active;
+                row.phase = Some(ConvoyPhase::Active);
                 assert_eq!(project_convoy_rows("".into(), vec![row.clone()], now).rows.len(), 1);
-                row.phase = phase;
+                row.phase = Some(phase);
                 row.finished_at = None;
                 assert_eq!(project_convoy_rows("".into(), vec![row.clone()], now).rows.len(), 1);
                 row.started_at = Some(now - chrono::Duration::days(2));
@@ -1792,6 +1801,7 @@ mod tests {
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "capacity"))
             .name("governor")
             .workflow_ref("governor")
+            .project_ref("dev")
             .phase(WirePhase::Active)
             .initializing(true)
             .admission_blockers(vec![ReadinessBlocker {
@@ -1826,7 +1836,7 @@ mod tests {
     #[test]
     fn convoy_projection_exposes_honest_phase_message_and_drill_target() {
         let mut row = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
-        row.phase = ConvoyPhase::Failed;
+        row.phase = Some(ConvoyPhase::Failed);
         row.message = Some("workspace launch failed: disk full".into());
         let view = project_convoys("convoys/dev", &[&row]).expect("project table");
 
@@ -1855,12 +1865,12 @@ mod tests {
         let mut first = convoy(vec![vessel("first-vessel", &[], WorkPhase::Running)]);
         first.resource_name = "convoy-first".into();
         first.name = "coder".into();
-        first.project_ref = Some("first-project".into());
+        first.project_ref = "first-project".into();
 
         let mut second = convoy(vec![vessel("second-vessel", &[], WorkPhase::Running)]);
         second.resource_name = "convoy-second".into();
         second.name = "coder".into();
-        second.project_ref = Some("second-project".into());
+        second.project_ref = "second-project".into();
 
         let first_address = ViewAddress::Convoys { namespace: "dev".into(), scope: Some(QueryScope::new("dev", "first-project")) };
         let first_table =
@@ -1938,17 +1948,38 @@ mod tests {
     #[test]
     fn terminal_convoy_phases_have_distinct_row_tones() {
         let mut completed = convoy(vec![]);
-        completed.phase = ConvoyPhase::Landed;
+        completed.phase = Some(ConvoyPhase::Landed);
         completed.disposition = Some("shipped".to_string());
         let mut failed = convoy(vec![]);
         failed.id = ConvoyId::new("dev", "failed");
         failed.name = "failed".into();
-        failed.phase = ConvoyPhase::Failed;
+        failed.phase = Some(ConvoyPhase::Failed);
 
         let view = project_convoys("convoys/dev", &[&completed, &failed]).expect("convoy table");
 
         assert_eq!(view.rows[0].cells[2], CellValue::toned("landed · shipped", CellTone::Success));
         assert_eq!(view.rows[1].cells[2], CellValue::toned("failed", CellTone::Error));
+    }
+
+    #[test]
+    fn an_unreadable_convoy_shows_unreadable_and_never_initializing() {
+        use flotilla_protocol::result_set::ConvoyRow;
+        let row = ConvoyRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "broken"))
+            .name("broken")
+            .workflow_ref("implement")
+            .project_ref("dev")
+            .unreadable("admission document does not decode")
+            .initializing(true)
+            .build();
+        let summary = ConvoySummary::from(&row);
+        let view = project_convoys("convoys/dev", &[&summary]).expect("convoy table");
+
+        assert_eq!(view.rows[0].cells[2], CellValue::toned("unreadable", CellTone::Warning));
+        assert_ne!(view.rows[0].cells[3].text, "provisioning");
+        assert!(view.rows[0]
+            .describe
+            .contains(&DetailField { label: "Phase", value: "unknown: admission document does not decode".into() }));
     }
 
     #[test]
@@ -2078,7 +2109,7 @@ mod tests {
         let mut elsewhere = convoy(vec![]);
         elsewhere.id = ConvoyId::new("dev", "elsewhere");
         elsewhere.name = "elsewhere".into();
-        elsewhere.project_ref = Some("other".into());
+        elsewhere.project_ref = "other".into();
 
         let vessel = project_convoys("vessel/dev/tables/review", &[&in_project, &elsewhere]).expect("vessel table");
         assert_eq!(vessel.rows.len(), 1);
@@ -2138,7 +2169,7 @@ mod tests {
         let mut convoy = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
         convoy.id = ConvoyId::new("flotilla", "tables");
         convoy.namespace = "flotilla".into();
-        convoy.project_ref = Some("roadmap".into());
+        convoy.project_ref = "roadmap".into();
         let checkout = CheckoutRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "roadmap"))
             .repo(RepositoryKey("repo_flotilla".into()))
@@ -2252,7 +2283,7 @@ mod tests {
         let mut convoy = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
         convoy.id = ConvoyId::new("flotilla", "tables");
         convoy.namespace = "flotilla".into();
-        convoy.project_ref = Some("roadmap".into());
+        convoy.project_ref = "roadmap".into();
         let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
 
         let panels = project_panels(&address, &TableRows { convoys: vec![&convoy], ..TableRows::default() }).expect("project panels");
@@ -2474,7 +2505,7 @@ mod tests {
     #[test]
     fn table_filter_matches_any_projected_cell() {
         let mut failed = convoy(vec![]);
-        failed.phase = ConvoyPhase::Failed;
+        failed.phase = Some(ConvoyPhase::Failed);
         failed.message = Some("disk full".into());
         let mut active = convoy(vec![]);
         active.id = ConvoyId::new("dev", "other");

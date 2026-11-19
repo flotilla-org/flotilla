@@ -13,12 +13,8 @@
 //!   Reaching Gone frees the lease at the ledger.
 //! - Anything on Gone, and anything but `Place` on Waiting, is `WrongState`.
 //!
-//! The placements for a placement on host `h` hold `h` with capacity `available`, the convoy's
-//! cap for the class `cap`, one waiting request per entry of `waiting`, and, when `live` is 1, a
-//! vessel of the same convoy and class leased on a spare host. The ledger derives admission as a
-//! positive cap, so evidence with `admitted != (cap > 0)` has no placements: those probes call the
-//! pure [`place`] rule the ledger calls, over the probe's evidence. Every such probe is refused
-//! (not admitted, or no cap), so the vessel stays Waiting.
+//! The placements for a placement on host `h` hold `h` with capacity `available` and one waiting
+//! request per entry of `waiting`.
 //!
 //! State mapping: Waiting is the request before any grant; Leased is the stored vessel's lease
 //! (its spec, the spec's `Placement = {request, host}`), which must equal the ledger's, with the
@@ -34,7 +30,7 @@ use flotilla_state_machines::{
         lifecycle::{LifecycleEdge, LifecycleState, MemoryLifecycleWorld, Observed, Realise, Release, Vanish},
         vessel::Vessel,
     },
-    placement::{place, Dimension, Evidence, Host, Lease, Placements, Request, Units, Vessel as Placed, VesselId},
+    placement::{Dimension, Evidence, Host, Lease, Placements, Request, Units, Vessel as Placed, VesselId},
     Home, Log, Ref,
 };
 use serde_json::{json, Value};
@@ -46,10 +42,6 @@ use crate::{
 
 const NAME: &str = "v";
 const IDENTITY: &str = "vessel";
-/// The host the `live` vessel is leased on; no probe places there.
-fn spare() -> Host {
-    spec_host(99)
-}
 
 /// The spec's host `n`: its id is the number's text. The spec numbers its hosts, so this adaptor
 /// names them by number and parses a lease's host back as one; production hosts are fleet ids.
@@ -99,8 +91,6 @@ fn refusal_name(r: flotilla_state_machines::placement::PlacementRefusal) -> &'st
     use flotilla_state_machines::placement::PlacementRefusal;
     match r {
         PlacementRefusal::WrongState => "WrongState",
-        PlacementRefusal::NotAdmitted => "NotAdmitted",
-        PlacementRefusal::QuotaExceeded => "QuotaExceeded",
         PlacementRefusal::DoesNotFit => "DoesNotFit",
         PlacementRefusal::HigherPriorityWaiting => "HigherPriorityWaiting",
         PlacementRefusal::MissingEvidence => "MissingEvidence",
@@ -120,7 +110,8 @@ fn lifecycle_value(state: &LifecycleState) -> Value {
     }
 }
 
-/// One vessel: its request until a grant, then the placements holding its lease and resource.
+/// One vessel: its request until a grant, then the placements holding its lease and resource,
+/// named by the launch the grant created.
 pub struct Composed<F: VesselLogs> {
     id: VesselId,
     request: Request,
@@ -132,30 +123,11 @@ impl<F: VesselLogs> Composed<F> {
         self.placements.as_ref().and_then(|placements| placements.get(&self.id))
     }
 
-    /// Placements whose snapshot for placing the vessel on `evidence.host` is `evidence`, or
-    /// `None` when no ledger can present it.
-    fn placements_for(&self, evidence: &Evidence) -> Option<Placements<F::Log>> {
-        if evidence.admitted != (evidence.cap > 0) || evidence.live > 1 {
-            return None;
-        }
-        let mut hosts = vec![(evidence.host.clone(), evidence.available.clone())];
-        if evidence.live == 1 {
-            // Room to spare, so the live vessel's own fit is never in question.
-            hosts.push((
-                spare(),
-                self.request.shape.iter().map(|(dimension, units)| (*dimension, units.saturating_mul(2).max(1))).collect(),
-            ));
-        }
+    /// Placements whose snapshot for placing the vessel on `evidence.host` is `evidence`.
+    fn placements_for(&self, evidence: &Evidence) -> Placements<F::Log> {
         let home = Home::with_log("home", F::log()).expect("valid declaration");
-        let (mut placements, unplaced) = Placements::new(home, hosts).expect("new hosts");
+        let (mut placements, unplaced) = Placements::new(home, [(evidence.host.clone(), evidence.available.clone())]).expect("new hosts");
         assert!(unplaced.is_empty());
-        placements.set_caps(self.request.convoy.clone(), [(self.request.class.clone(), evidence.cap)].into());
-        if evidence.live == 1 {
-            // Leased before anything else waits, so nothing outranks it.
-            let live = VesselId::new("live");
-            placements.request(live.clone(), self.request.clone()).expect("a new vessel");
-            placements.place(&live, spare(), Timestamp(0)).expect("the live vessel fits the spare host under its cap");
-        }
         for (index, waiting) in evidence.waiting.iter().enumerate() {
             placements.request(VesselId::new(format!("waiting{index}")), waiting.clone()).expect("a new vessel");
         }
@@ -165,18 +137,15 @@ impl<F: VesselLogs> Composed<F> {
             Ok(evidence),
             "the ledger presents the probe's evidence"
         );
-        Some(placements)
+        placements
     }
 
     fn place(&mut self, evidence: Evidence) -> Step {
-        let Some(mut placements) = self.placements_for(&evidence) else {
-            return match place(&self.request, &evidence) {
-                Err(r) => refusal(refusal_name(r)),
-                Ok(_) => panic!("evidence without a ledger cannot place"),
-            };
-        };
+        let mut placements = self.placements_for(&evidence);
         match placements.place(&self.id, evidence.host.clone(), Timestamp(0)) {
-            Ok(_) => {
+            Ok(vessel) => {
+                // The ledger holds the lease under the launch's name from here on.
+                self.id = VesselId::new(vessel.name());
                 F::check(placements.home());
                 self.placements = Some(placements);
                 Step::Accepted
@@ -222,9 +191,6 @@ impl<F: VesselLogs> Conformance for VesselConformance<F> {
                 host: spec_host(count(&o["host"])),
                 available: units(&o["available"]),
                 waiting: set(&o["waiting"]).iter().map(request_of).collect(),
-                live: count(&o["live"]),
-                cap: count(&o["cap"]),
-                admitted: boolean(&o["admitted"]),
             }),
             (None, _) => refusal("WrongState"),
             (Some(_), "Place") => refusal("MissingEvidence"),

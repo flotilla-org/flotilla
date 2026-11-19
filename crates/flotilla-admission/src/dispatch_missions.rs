@@ -518,13 +518,7 @@ mod tests {
     // while its Project has two crews total. Duplicate tickets in a tier add none.
     #[tokio::test]
     async fn mixed_tier_convoy_counts_once_in_each_served_tier() {
-        use flotilla_resources::{
-            Convoy, ConvoyIssue, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, IssueSnapshot,
-        };
-        use flotilla_store::ResourceBackend;
-        use flotilla_store_memory::InMemoryBackend;
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let convoys = backend.using::<Convoy>("ns");
+        use flotilla_resources::{ConvoyIssue, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, IssueSnapshot};
         let board = board(vec![board_issue("1", None, &[], &[]), board_issue("2", None, &[], &[])]);
         let mut urgent = issue("1");
         urgent.labels = vec!["priority:urgent".into()];
@@ -543,31 +537,22 @@ mod tests {
                 },
             })
             .collect();
-        let convoy = convoys
-            .create(
-                &InputMeta::builder().name("mixed".into()).build(),
-                &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("p".into()).issues(served).build(),
-            )
-            .await
-            .expect("convoy");
-        convoys
-            .update_status(
-                &convoy.metadata.name,
-                &convoy.metadata.resource_version,
-                &ConvoyStatus {
-                    crew_work: BTreeMap::from([(
-                        "work".into(),
-                        ["coder", "reviewer"]
-                            .into_iter()
-                            .map(|role| (role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()))
-                            .collect(),
-                    )]),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("crew state");
-        let convoy = convoys.get("mixed").await.expect("live convoy");
+        // A live convoy as the engine reads it: both its crews working.
+        let convoy = flotilla_engine_convoys_testkit::convoy(
+            "ns",
+            "mixed",
+            ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("p".into()).issues(served).build(),
+            ConvoyStatus {
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    ["coder", "reviewer"]
+                        .into_iter()
+                        .map(|role| (role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()))
+                        .collect(),
+                )]),
+                ..Default::default()
+            },
+        );
         let policy = DispatchPolicy::builder().build();
         let occupancy = MissionOccupancy::collect(&board, &policy, [&convoy]).expect("live counts");
         assert_eq!(occupancy.project_active, 2);

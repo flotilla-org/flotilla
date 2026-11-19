@@ -5,7 +5,7 @@ use flotilla_schema::{Address, Edge, Frozen, State, Timestamp};
 use flotilla_state_machines::{
     machines::{
         consumer::ConsumerKind,
-        convoy::{AdmittedPromise, ConvoyRequest, Priority, PromiseId, PromiseKinds, PromiseSource, SeatName, VesselClass},
+        convoy::{AdmissionBytes, AdmittedPromise, ConvoyRequest, Priority, PromiseId, PromiseKinds, PromiseSource, SeatName},
         message::{
             Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageBody, MessageReference, MessageSpec,
             MessageState, MessageWorld, Receiver, Relation, RequestBody, Settle, Settlement, Supersedes,
@@ -27,7 +27,7 @@ use super::{
 pub const COVERING: usize = 80;
 
 pub fn receiver(tc: &TestCase) -> Receiver {
-    let kind = code_enum(tc, Pick::Draw, &[ConsumerKind::AgentSession, ConsumerKind::Controller]);
+    let kind = code_enum(tc, Pick::Draw, &[ConsumerKind::AgentSession, ConsumerKind::Service]);
     Receiver { kind, id: name(tc), host: name(tc) }
 }
 
@@ -41,6 +41,9 @@ pub fn body(tc: &TestCase, pick: Pick) -> Frozen<MessageBody> {
     let body = match pick.variant(tc, 2, |index| index) {
         0 => MessageBody::Text(text(tc)),
         _ => MessageBody::Request(RequestBody::Convoy(Box::new(ConvoyRequest {
+            launch_of: name(tc),
+            workflow_ref: name(tc),
+            admission: Frozen::new(AdmissionBytes::new(name(tc).into_bytes())).expect("freeze"),
             project: address(tc),
             promises: [(
                 PromiseId(0),
@@ -55,7 +58,6 @@ pub fn body(tc: &TestCase, pick: Pick) -> Frozen<MessageBody> {
             .into(),
             duties: Default::default(),
             seats: Vec::new(),
-            quota: [(VesselClass::new(name(tc)), 2)].into(),
             priority: Priority(3),
             kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
         }))),
@@ -94,17 +96,28 @@ pub fn reason(tc: &TestCase, pick: Pick) -> DropReason {
     }
 }
 
+/// A kept delivery, or none: the receiver and its receipt time travel together.
+fn delivery(tc: &TestCase, pick: Pick) -> (Option<Receiver>, Option<Timestamp>) {
+    match pick.digit(tc, 2, 20) {
+        0 => (Some(receiver(tc)), Some(timestamp(tc))),
+        _ => (None, None),
+    }
+}
+
 /// A state of every label in turn when covering, its data drawn.
 pub fn state_value(tc: &TestCase, pick: Pick) -> MessageState {
     match pick.digit(tc, 4, 1) {
         0 => MessageState::Pending,
-        1 => MessageState::Awaiting { receiver: receiver(tc) },
-        2 => MessageState::Settled { receiver: (pick.digit(tc, 2, 20) == 0).then(|| receiver(tc)) },
-        _ => MessageState::Dropped {
-            reason: reason(tc, pick),
-            receiver: (pick.digit(tc, 2, 20) == 0).then(|| receiver(tc)),
-            watermark: tc.draw(gs::booleans()).then(|| timestamp(tc)),
-        },
+        1 => MessageState::Awaiting { receiver: receiver(tc), delivered_at: timestamp(tc) },
+        2 => {
+            let (receiver, delivered_at) = delivery(tc, pick);
+            MessageState::Settled { receiver, delivered_at }
+        }
+        _ => {
+            let reason = reason(tc, pick);
+            let (receiver, delivered_at) = delivery(tc, pick);
+            MessageState::Dropped { reason, receiver, delivered_at, watermark: tc.draw(gs::booleans()).then(|| timestamp(tc)) }
+        }
     }
 }
 

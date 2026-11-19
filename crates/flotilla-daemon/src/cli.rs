@@ -77,7 +77,7 @@ pub async fn run(
         let mut discovery = DiscoveryRuntime::for_process();
         #[cfg(unix)]
         discovery.factories.link_vessel_agents(flotilla_drydock::agent::link());
-        let dummy_fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, &mut discovery);
+        let dummy_fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, state_dir, &mut discovery)?;
         let repo_root_paths = repo_roots.into_iter().map(|p| p.into_path_buf()).collect();
         let server = DaemonServer::new_with_socket_discovery_path(
             repo_root_paths,
@@ -94,9 +94,9 @@ pub async fn run(
         };
         let daemon = server.daemon();
         if let Some(fleet) = &dummy_fleet {
-            crate::dummy_fleet::attach_dummy_fleet(fleet, &daemon)?;
+            fleet.resume();
         }
-        let runtime = DaemonRuntime::start_with_options(
+        let mut runtime = DaemonRuntime::start_with_options(
             daemon,
             Arc::clone(&config),
             Some(socket_path.to_path_buf()),
@@ -108,6 +108,9 @@ pub async fn run(
             },
         )
         .await?;
+        if let Some(fleet) = &dummy_fleet {
+            runtime.stop_with_runtime(crate::dummy_fleet::dummy_fleet_component(fleet));
+        }
         server.install_controller_metrics(Arc::clone(&runtime.controller_metrics));
         server.install_blob_store(Arc::clone(&runtime.blob_store))?;
 
@@ -115,7 +118,7 @@ pub async fn run(
         // Stop background tasks after the accept loop ends. SIGTERM, SIGINT, idle
         // timeout, and explicit shutdown return Ok and clear the lifecycle marker;
         // a server error deliberately leaves it behind as an abnormal exit.
-        runtime.shutdown();
+        runtime.shutdown().await;
         if result.is_ok() {
             lifecycle.finish()?;
         }
@@ -267,7 +270,9 @@ mod tests {
         let file_layer = tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(writer);
         let subscriber = Registry::default().with(file_layer);
 
-        tracing::subscriber::with_default(subscriber, || tracing::info!(repo_count = 0, "starting daemon"));
+        tracing::dispatcher::with_default(&flotilla_log_testkit::dispatch(subscriber), || {
+            tracing::info!(repo_count = 0, "starting daemon")
+        });
 
         let contents = fs::read_to_string(log_dir.path().join(DAEMON_LOG_FILE)).expect("structured daemon log");
         let record: serde_json::Value = serde_json::from_str(contents.trim()).expect("JSON log record");
@@ -290,7 +295,7 @@ mod tests {
         let provider = super::trace_provider(Some(&config), "test-host").expect("valid exporter inside Tokio");
         use flotilla_tracing::TracerProvider as _;
         let subscriber = tracing_subscriber::registry().with(flotilla_tracing::layer().with_tracer(provider.tracer("startup")));
-        tracing::subscriber::with_default(subscriber, || {
+        tracing::dispatcher::with_default(&flotilla_log_testkit::dispatch(subscriber), || {
             drop(tracing::info_span!("startup.failure"));
         });
         let result = tokio::time::timeout(

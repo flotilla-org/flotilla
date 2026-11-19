@@ -20,7 +20,7 @@ pub enum NounCommand {
     Checkout(CheckoutNoun),
     Convoy(ConvoyNoun),
     Dispatch(DispatchNoun),
-    Crew(CrewNoun),
+    Crew(Box<CrewNoun>),
     Cr(CrNoun),
     Issue(IssueNoun),
     Agent(AgentNoun),

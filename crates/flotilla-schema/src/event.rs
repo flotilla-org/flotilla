@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     code::Code,
     inline::{Cbor, INLINE_LIMITS},
-    time::Timestamp,
+    time::{CreatedAt, Timestamp},
     value::{Hash, Identity, KindCode, Value},
 };
 
@@ -121,11 +121,21 @@ pub struct NewChange {
     pub writer: String,
     pub at: Timestamp,
     pub items: Vec<ChangeItem>,
+    /// The creation time of each record a write naming this change as new creates, when it is not
+    /// `at` widened: an import's, the old record's to the nanosecond. Each create entry carries
+    /// it; the change does not.
+    pub created: Option<CreatedAt>,
 }
 
 impl NewChange {
     pub fn new(writer: impl Into<String>, at: Timestamp) -> NewChange {
-        NewChange { writer: writer.into(), at, items: Vec::new() }
+        NewChange { writer: writer.into(), at, items: Vec::new(), created: None }
+    }
+
+    /// `self` creating its records at `created`.
+    pub fn created_at(mut self, created: CreatedAt) -> NewChange {
+        self.created = Some(created);
+        self
     }
 
     /// `self` with `items` as its inputs.
@@ -229,6 +239,9 @@ pub struct Effect {
     pub objects: BTreeMap<Hash, Vec<u8>>,
     #[serde(rename = "x", default, skip_serializing_if = "Option::is_none")]
     pub expunged: Option<Identity>,
+    /// A create's creation time when it is not its change's `at` widened: only an import's.
+    #[serde(rename = "t", default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<CreatedAt>,
 }
 
 impl Effect {

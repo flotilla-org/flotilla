@@ -27,7 +27,7 @@ impl<'a> RequestSnapshot<'a> {
         )
     }
     pub fn finish(self) -> ResourceBackend {
-        ResourceBackend::new(self.snapshot)
+        self.snapshot.into_backend()
     }
 }
 

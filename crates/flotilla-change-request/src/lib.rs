@@ -1,5 +1,4 @@
 //! Forge-neutral change-request trackers, observation sources and branch lookup.
-pub mod branch_lookup_observer;
 pub mod observation;
 
 use std::collections::{BTreeMap, HashMap};
@@ -8,7 +7,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::ChangeRequest;
 use flotilla_provider_runtime::ObservationError;
-use flotilla_resources::{ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState};
+use flotilla_resources::{
+    ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState, ObservedMergeability,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeRequestAdmission {
@@ -19,6 +20,35 @@ pub struct ChangeRequestAdmission {
 
 pub type BoundObservations = HashMap<u64, Result<ChangeRequestStatus, ObservationError>>;
 pub type CrewGithubLoginsByRequest = BTreeMap<u64, Vec<String>>;
+
+/// A change request's head and base commits, as its forge reported them, each with the full ref
+/// the forge serves it under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeCandidate {
+    pub head: String,
+    pub head_ref: String,
+    pub base: String,
+    pub base_ref: String,
+}
+
+/// Whether a change request's head merges cleanly into its base, judged by Git from the commits
+/// themselves. For forges whose own report cannot tell a conflict from other states.
+#[async_trait]
+pub trait MergeCheck: Send + Sync {
+    /// Mergeable or Conflicting; `None` when it cannot be judged, such as with no clone to judge
+    /// in, a failed fetch, or a commit its ref has moved past.
+    async fn mergeability(&self, candidate: &MergeCandidate) -> Option<ObservedMergeability>;
+}
+
+/// A host with nowhere to judge merges: every merge is unknown.
+pub struct NoMergeCheck;
+
+#[async_trait]
+impl MergeCheck for NoMergeCheck {
+    async fn mergeability(&self, _candidate: &MergeCandidate) -> Option<ObservedMergeability> {
+        None
+    }
+}
 
 #[async_trait]
 pub trait ChangeRequestTracker: Send + Sync {
@@ -31,8 +61,15 @@ pub trait ChangeRequestTracker: Send + Sync {
     /// feedback until an explicit response or a newer head is observed.
     /// Crew identities are GraphQL App logins, scoped by PR number and derived
     /// from bound convoys' credential declarations. Other forges can ignore them.
-    async fn observe_bound(&self, numbers: &[u64], crew_logins: &CrewGithubLoginsByRequest) -> Result<BoundObservations, ObservationError> {
-        let _ = crew_logins;
+    /// `merge_check`, where this host can judge merges, settles mergeability a
+    /// forge leaves ambiguous; forges that report conflicts plainly ignore it.
+    async fn observe_bound(
+        &self,
+        numbers: &[u64],
+        crew_logins: &CrewGithubLoginsByRequest,
+        merge_check: Option<&dyn MergeCheck>,
+    ) -> Result<BoundObservations, ObservationError> {
+        let _ = (crew_logins, merge_check);
         let mut statuses = HashMap::new();
         for number in numbers {
             let (_, request) = match self.get_change_request(&number.to_string()).await {
@@ -145,7 +182,7 @@ mod tests {
                 provider_display_name: "Fake".to_string(),
             },
         )]);
-        let observed = provider.observe_bound(&[1, 2], &Default::default()).await.expect("independent reads");
+        let observed = provider.observe_bound(&[1, 2], &Default::default(), None).await.expect("independent reads");
         assert!(observed.get(&1).expect("missing PR result").as_ref().is_err());
         assert_eq!(
             observed.get(&2).expect("healthy PR result").as_ref().expect("healthy PR").state.value,

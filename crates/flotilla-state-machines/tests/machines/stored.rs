@@ -17,17 +17,16 @@ use flotilla_state_machines::{
             AdmittedPromise, Authority, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyRequest, Deliver, Duty, DutyId, DutyScope, Keep,
             MemoryConvoyWorld, Priority, PromiseId, PromiseKinds, PromiseSource, RetireDuty, Seat, SeatName, Submit, Terms, VesselClass,
         },
-        ensure::{Attempted, Ensure, EnsureSpec, MemoryEnsureWorld, Record},
         lifecycle::{self, LifecycleLabel, LifecycleState, MemoryLifecycleWorld, Observed, Realisation, Realise, Vanish},
         message::{
             Expectation, MemoryMessageWorld, Message, MessageBody, MessageEdgeKind, MessageRef, MessageReference, MessageSpec, Relation,
             RequestBody,
         },
         person::Person,
-        vessel::{live_leases, Vessel},
+        vessel::{live_leases, Vessel, VesselSpec},
     },
     placement::{Dimension, Host, Lease, Ledger, LedgerError, Request, VesselId},
-    AttemptPolicy, EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
+    EdgePayload, Home, Label, Machine, Outcome, Ref, Resource, Version,
 };
 
 // Kind codes are stored with every identity and change, so the production registry pins them,
@@ -41,18 +40,21 @@ fn kind_codes_are_pinned() {
         (Resource::<AgentSession>::KIND, Resource::<AgentSession>::CODE),
         (Resource::<AwaitingReply>::KIND, Resource::<AwaitingReply>::CODE),
         (Resource::<Convoy>::KIND, Resource::<Convoy>::CODE),
-        (Resource::<Ensure>::KIND, Resource::<Ensure>::CODE),
         (Resource::<Message>::KIND, Resource::<Message>::CODE),
         (Resource::<Person>::KIND, Resource::<Person>::CODE),
+        (
+            Resource::<flotilla_state_machines::machines::service::Service>::KIND,
+            Resource::<flotilla_state_machines::machines::service::Service>::CODE,
+        ),
         (Resource::<Vessel>::KIND, Resource::<Vessel>::CODE),
     ];
     let expected = [
         ("AgentSession", KindCode::new("as")),
         ("AwaitingReply", KindCode::new("ar")),
         ("Convoy", KindCode::new("cv")),
-        ("Ensure", KindCode::new("en")),
         ("Message", KindCode::new("ms")),
         ("Person", KindCode::new("pn")),
+        ("Service", KindCode::new("sv")),
         ("Vessel", KindCode::new("ve")),
     ];
     assert_eq!(declared, expected);
@@ -76,10 +78,14 @@ fn promise() -> AdmittedPromise {
 /// A convoy whose seat `coder` owns promise 0 and a lifetime duty.
 fn convoy_request() -> ConvoyRequest {
     ConvoyRequest {
+        launch_of: "c".into(),
+        workflow_ref: "w".into(),
+        admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project(),
         promises: [(PromiseId(0), promise())].into(),
         duties: [(DutyId(0), Duty { owner: SeatName::new("coder", ""), scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
         seats: vec![Seat {
+            failed: None,
             retired: false,
             replacements: 0,
             role: "coder".into(),
@@ -87,7 +93,6 @@ fn convoy_request() -> ConvoyRequest {
             parent: None,
             supervised_by: project(),
         }],
-        quota: [(VesselClass::new("standard"), 2)].into(),
         priority: Priority(4),
         kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
     }
@@ -158,7 +163,7 @@ fn resources_survive_the_codec() {
     round_trip(&sessions, "s");
 
     let mut convoys = Home::<Convoy>::new("home").expect("valid");
-    convoys.create("c", convoy_request(), &convoy_world(), Timestamp(2)).expect("created");
+    let c = convoys.create("c", convoy_request(), &convoy_world(), Timestamp(2)).expect("created").resource.name().to_owned();
     let submit = Submit {
         promise: PromiseId(0),
         by: SeatName::new("coder", ""),
@@ -166,41 +171,27 @@ fn resources_survive_the_codec() {
         revision: "abc".into(),
         durable: Ref::new("yes"),
     };
-    convoys.apply("c", submit, &convoy_world(), Timestamp(3)).expect("submitted");
+    convoys.apply(&c, submit, &convoy_world(), Timestamp(3)).expect("submitted");
     let keep =
         Keep::Verdict { promise: PromiseId(0), by: SeatName::new("operator", ""), authority: Authority::Operator, reason: "r".into() };
-    convoys.apply("c", keep, &convoy_world(), Timestamp(4)).expect("kept");
-    let convoy = round_trip(&convoys, "c");
+    convoys.apply(&c, keep, &convoy_world(), Timestamp(4)).expect("kept");
+    let convoy = round_trip(&convoys, &c);
     assert_eq!((convoy.version(), convoy.since()), (Version(3), Timestamp(2)), "a records edge keeps since");
     assert_eq!(convoy.spec().promises.get(flotilla_schema::Position(0)).expect("row").record.submissions.len(), 1);
-
-    let mut ensures = Home::<Ensure>::new("home").expect("valid");
-    ensures
-        .create(
-            "e",
-            EnsureSpec { inbox: Address::project("i").expect("inbox"), policy: AttemptPolicy::immediate(2) },
-            &MemoryEnsureWorld::default(),
-            Timestamp(0),
-        )
-        .expect("created");
-    ensures.apply("e", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(4)).expect("recorded");
-    let attempt = Attempted { fulfiller: Ref::new("f"), outcome: Outcome::Succeeded };
-    ensures.apply("e", attempt, &MemoryEnsureWorld::default(), Timestamp(5)).expect("attempted");
-    let ensure = round_trip(&ensures, "e");
-    assert_eq!(ensures.log().history("e", Version(0), usize::MAX).len(), 2, "the attempt is an edge: a log entry, not a row");
-    assert_eq!(ensure.state().recorded(), &BTreeSet::from([Ref::new("f")]));
 
     // A vessel's convoy is homed elsewhere: its reference keeps the convoy's home (#3392 G3).
     let mut vessels = Home::<Vessel>::new("capacity-host").expect("valid");
     let vessel = lease_of("c", 4);
-    vessels.create("v", vessel.clone().into(), &MemoryLifecycleWorld::default(), Timestamp(0)).expect("created");
+    let created = vessels.create("v", VesselSpec::of("c-w", vessel.clone()), &MemoryLifecycleWorld::default(), Timestamp(0));
+    let v = created.expect("created").resource.name().to_owned();
+    assert_eq!(v, "c-w#1", "a vessel is a numbered launch of its work");
     let attempted = lifecycle::Attempted { outcome: Outcome::Succeeded };
-    vessels.apply("v", attempted, &MemoryLifecycleWorld::default(), Timestamp(5)).expect("attempt while requested");
+    vessels.apply(&v, attempted, &MemoryLifecycleWorld::default(), Timestamp(5)).expect("attempt while requested");
     let mut world = MemoryLifecycleWorld::default();
     let observed = Ref::<Realisation>::new("probe");
     world.realisations.put(&observed, Observed { identity: "vm-1".into() });
-    vessels.apply("v", Realise { identity: "vm-1".into(), observed }, &world, Timestamp(6)).expect("realised");
-    let stored = round_trip(&vessels, "v");
+    vessels.apply(&v, Realise { identity: "vm-1".into(), observed }, &world, Timestamp(6)).expect("realised");
+    let stored = round_trip(&vessels, &v);
     let spec = stored.spec();
     assert_eq!((spec.lease(), spec.convoy.home.as_str()), (vessel, "admitting-host"));
     assert_eq!(stored.state(), &LifecycleState::Realised { identity: "vm-1".into() });
@@ -216,34 +207,38 @@ fn lease_of(convoy: &str, units: u32) -> Lease {
 }
 
 // The host ledger is a view over the live vessels' leases (#3392 ruling D5): a ledger rebuilt from
-// stored vessels after a restart holds exactly the live leases, so capacity and quota counts come
-// back unchanged, and a Gone vessel's lease is not restored.
+// stored vessels after a restart holds exactly the live leases, so capacity comes back unchanged,
+// and a Gone vessel's lease is not restored.
 #[test]
 fn the_host_ledger_is_rebuilt_from_live_vessels() {
     let mut before = Ledger::new();
     before.add_host(Host::new("3"), [(Dimension(0), 10)].into()).expect("host");
     let mut vessels = Home::<Vessel>::new("capacity-host").expect("valid");
+    let mut launches = Vec::new();
     for (name, units) in [("a", 4), ("b", 3), ("gone", 2)] {
         let lease = lease_of("c", units);
-        before.set_caps(lease.request.convoy.clone(), [(VesselClass::new("1"), 5)].into());
         before.request(VesselId::new(name), lease.request.clone()).expect("requested");
         let placed = before.place(&VesselId::new(name), Host::new("3")).expect("placed").clone();
-        vessels.create(name, placed.into(), &MemoryLifecycleWorld::default(), Timestamp(0)).expect("created");
+        let created = vessels.create(name, VesselSpec::of(name, placed), &MemoryLifecycleWorld::default(), Timestamp(0));
+        let launch = created.expect("created").resource.name().to_owned();
+        before.rename(&VesselId::new(name), VesselId::new(launch.as_str())).expect("renamed");
+        launches.push(launch);
     }
+    let gone = launches[2].clone();
     let mut world = MemoryLifecycleWorld::default();
     let (observed, absent) = (Ref::new("probe"), Ref::new("probe"));
     world.realisations.put(&observed, Observed { identity: "vm-1".into() });
     world.absences.put(&absent, true);
-    vessels.apply("gone", Realise { identity: "vm-1".into(), observed }, &world, Timestamp(1)).expect("realised");
+    vessels.apply(&gone, Realise { identity: "vm-1".into(), observed }, &world, Timestamp(1)).expect("realised");
     vessels
         .apply(
-            "gone",
-            Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: absent },
+            &gone,
+            Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost(), observed: absent },
             &world,
             Timestamp(2),
         )
         .expect("gone");
-    before.release(&VesselId::new("gone")).expect("released when Gone");
+    before.release(&VesselId::new(gone.as_str())).expect("released when Gone");
 
     let stored: Vec<Resource<Vessel>> = vessels
         .resources()
@@ -259,9 +254,10 @@ fn the_host_ledger_is_rebuilt_from_live_vessels() {
     }
     assert_eq!(after.leases().collect::<Vec<_>>(), before.leases().collect::<Vec<_>>());
     assert_eq!(after.available(Host::new("3")), Ok([(Dimension(0), 3)].into()));
-    let convoy = lease_of("c", 0).request.convoy;
-    assert_eq!(after.live(&convoy, &VesselClass::new("1")), before.live(&convoy, &VesselClass::new("1")));
-    assert_eq!(after.restore(VesselId::new("a"), lease_of("c", 1)), Err(LedgerError::DuplicateRequest(VesselId::new("a"))));
+    assert_eq!(
+        after.restore(VesselId::new(launches[0].as_str()), lease_of("c", 1)),
+        Err(LedgerError::DuplicateRequest(VesselId::new(launches[0].as_str())))
+    );
     assert_eq!(
         after.restore(VesselId::new("big"), lease_of("c", 4)),
         Err(LedgerError::CapacityUnderflow { host: Host::new("3"), dimension: Dimension(0) })
@@ -277,7 +273,6 @@ fn the_log_is_the_only_history() {
     assert_eq!(tables(Resource::<Message>::table_set()), ["message", "message_references"]);
     assert_eq!(tables(Resource::<AgentSession>::table_set()), ["agent_session"]);
     assert_eq!(tables(Resource::<Person>::table_set()), ["person"]);
-    assert_eq!(tables(Resource::<Ensure>::table_set()), ["ensure", "ensure_recorded", "ensure_created"]);
     assert_eq!(tables(Resource::<Vessel>::table_set()), ["vessel", "vessel_shape"]);
     assert_eq!(Resource::<Message>::table_set().edges, <MessageEdgeKind as CodeEnum>::CODES);
     assert_eq!(Resource::<Convoy>::table_set().edges, <ConvoyEdgeKind as CodeEnum>::CODES);
@@ -296,19 +291,19 @@ fn a_resources_edge_moves_since_only_with_the_label() {
     let mut request = convoy_request();
     request.promises.clear();
     let world = convoy_world();
-    home.create("c", request, &world, Timestamp(1)).expect("created");
-    let created = home.get("c").expect("exists").stored_state().clone();
+    let c = home.create("c", request, &world, Timestamp(1)).expect("created").resource.name().to_owned();
+    let created = home.get(&c).expect("exists").stored_state().clone();
 
     let retire = RetireDuty { duty: DutyId(0), by: SeatName::new("coder", ""), authority: Ref::new("yes") };
-    let event = home.apply("c", retire, &world, Timestamp(5)).expect("retired");
-    let resource = home.get("c").expect("exists");
+    let event = home.apply(&c, retire, &world, Timestamp(5)).expect("retired");
+    let resource = home.get(&c).expect("exists");
     let edge = resource.stored_edge(&created, &event).expect("edge");
     assert_eq!(resource.since(), Timestamp(1), "a data-only edge keeps since");
     let kept = resource.stored_state().clone();
     let parts = edge.into_parts();
     assert_eq!(
         (root_sets(&parts), parts.rows.len(), parts.from.code),
-        (vec!["state", "reason"], 1, Code::new("op")),
+        (vec!["state", "disposition", "cause", "reason"], 1, Code::new("op")),
         "the whole state, one retired row"
     );
     assert_eq!(parts.sets[0].values[1], flotilla_schema::Value::Int(1), "the stored since");
@@ -320,12 +315,16 @@ fn a_resources_edge_moves_since_only_with_the_label() {
     );
     assert_eq!(parts.event.arguments::<ConvoyEdge>().expect("arguments"), event.arguments.edge);
 
-    let event = home.apply("c", Deliver, &world, Timestamp(8)).expect("delivered");
-    let resource = home.get("c").expect("exists");
+    let event = home.apply(&c, Deliver { disposition: "merged".into() }, &world, Timestamp(8)).expect("delivered");
+    let resource = home.get(&c).expect("exists");
     let edge = resource.stored_edge(&kept, &event).expect("edge");
     assert_eq!(resource.stored_state(), &State::new(resource.state().clone(), Timestamp(8)), "a label change moves since");
     let parts = edge.into_parts();
-    assert_eq!((root_sets(&parts), parts.rows.len()), (vec!["state", "reason"], 0), "the whole state, no row changed");
+    assert_eq!(
+        (root_sets(&parts), parts.rows.len()),
+        (vec!["state", "disposition", "cause", "reason"], 0),
+        "the whole state, no row changed"
+    );
 }
 
 // `live_leases` and the `live_by_host` index agree on which vessels are live:
@@ -353,13 +352,13 @@ fn live_leases_and_the_live_by_host_index_agree() {
 
 // Behaviour (#3587 layers 3 and 4): Convoy and AwaitingReply round-trip through their row codec
 // with every table filled (seats, promises with nested submissions, duties with a WhileOpen scope
-// and terms, the frozen kinds, quota and retired duties).
+// and terms, the frozen kinds and retired duties).
 #[test]
 fn convoy_and_awaiting_reply_round_trip() {
     use flotilla_schema::Records;
     use flotilla_state_machines::machines::{
-        awaiting_reply::{Awaited, AwaitingReply, AwaitingReplySpec, AwaitingReplyState},
-        convoy::{ConvoySpec, ConvoyState, Progress, Promise, PromiseKind, Submission},
+        awaiting_reply::{Awaited, AwaitingReply, AwaitingReplySpec, AwaitingReplyState, ProposedDisposition, StallReason},
+        convoy::{AbandonCause, ConvoySpec, ConvoyState, LinkSource, Progress, Promise, PromiseKind, SubjectLink, Submission},
     };
 
     let seat = |role: &str, seat: &str| SeatName { role: role.into(), seat: seat.into() };
@@ -385,13 +384,22 @@ fn convoy_and_awaiting_reply_round_trip() {
     seats
         .append(
             1,
-            Seat { retired: false, replacements: 0, role: "lead".into(), seat: String::new(), parent: None, supervised_by: project() },
+            Seat {
+                failed: None,
+                retired: false,
+                replacements: 0,
+                role: "lead".into(),
+                seat: String::new(),
+                parent: None,
+                supervised_by: project(),
+            },
         )
         .expect("room");
     seats
         .append(
             1,
             Seat {
+                failed: Some("crashed".into()),
                 retired: false,
                 replacements: 0,
                 role: "coder".into(),
@@ -414,21 +422,24 @@ fn convoy_and_awaiting_reply_round_trip() {
     ]
     .into();
     let kinds = PromiseKinds { kinds: [("pr".to_owned(), PromiseKind::default())].into() };
+    let mut subjects = Records::new();
+    subjects.append(1, SubjectLink { subject: project(), source: LinkSource::Claim, unlinked: true }).expect("room");
+    subjects.append(2, SubjectLink { subject: project(), source: LinkSource::Relay, unlinked: false }).expect("room");
     let spec = ConvoySpec {
-        promise_floor: 0,
+        launch_of: "c".into(),
+        launch: 1,
+        workflow_ref: "w".into(),
+        admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project(),
         priority: Priority(3),
         kinds: Frozen::new(kinds).expect("frozen"),
+        subjects,
         duties,
         seats,
         promises,
     };
     let state = State::new(
-        ConvoyState::Abandoned {
-            quota: [(VesselClass::new("standard"), 2)].into(),
-            retired: BTreeSet::from([DutyId(0)]),
-            reason: "decision".into(),
-        },
+        ConvoyState::Abandoned { retired_duties: BTreeSet::from([DutyId(0)]), cause: AbandonCause::Operator, reason: "decision".into() },
         Timestamp(5),
     );
     let convoy = Resource::<Convoy>::stored("", spec, state, Version(0));
@@ -443,6 +454,9 @@ fn convoy_and_awaiting_reply_round_trip() {
         kind: "stall".into(),
         awaited: Awaited::Reply,
         deadline: Some(Timestamp(9)),
+        report: Some("the build host is out of disk".into()),
+        stall_reason: Some(StallReason::Infra),
+        proposed_disposition: Some(ProposedDisposition::ReduceScope),
     };
     let record = Resource::<AwaitingReply>::stored(
         "",

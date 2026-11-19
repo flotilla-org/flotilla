@@ -56,7 +56,6 @@ pub struct TransportObservation {
     pub ready: bool,
     pub working: bool,
     pub evidence: Option<String>,
-    pub output_digest: Option<String>,
     pub waiting_reason: Option<String>,
 }
 

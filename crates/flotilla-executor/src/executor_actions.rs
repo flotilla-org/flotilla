@@ -26,11 +26,9 @@ use flotilla_protocol::ProviderData;
 use flotilla_protocol::RepoIdentity;
 use flotilla_protocol::RepoSelector;
 use flotilla_protocol::ResourceJsonResponse;
-use flotilla_resources::Checkout as ResourceCheckout;
 use flotilla_resources::InputMeta;
 use flotilla_resources::Repository;
 use flotilla_resources::RepositoryKey;
-use flotilla_resources::Resource;
 use flotilla_resources::ResourceError;
 use flotilla_resources::ResourceObject;
 use flotilla_store::DynamicResourceObject;
@@ -73,7 +71,6 @@ pub trait ExecutorActionPort: Send + Sync {
     async fn detect_repo_identity(&self, repo_path: &Path) -> RepoIdentity;
     async fn local_checkout_for_repository(&self, key: &RepositoryKey) -> Result<Option<PathBuf>, String>;
     async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String>;
-    async fn delete_stale_adopted_checkouts(&self, namespace: &str) -> Result<(), ResourceError>;
     async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState;
     async fn refresh(&self, repo: &RepoSelector) -> Result<Option<RepositoryIdentityChange>, String>;
     async fn remove_repo(&self, path: &Path) -> Result<(), String>;
@@ -102,15 +99,6 @@ pub struct ExecutorActions<'a> {
     pub events: flotilla_daemon_api::action_events::ActionEvents<'a>,
 }
 
-/// Behind `[primitives]` a Demand is an attention Message: the resource verbs refuse it.
-fn demand_refusal(backend: &ResourceBackend, kind: &str) -> Option<CommandValue> {
-    (backend.attentions_on_engine() && ["demand", "demands"].iter().any(|demand| kind.eq_ignore_ascii_case(demand))).then(|| {
-        CommandValue::Error {
-            message: "Demand is not on the engine; use `flotilla message inbox` and `flotilla message acknowledge`".to_string(),
-        }
-    })
-}
-
 impl ExecutorActions<'_> {
     async fn provisioning_namespace(&self) -> String {
         flotilla_daemon_api::action_namespace::provisioning_namespace(self.namespace)
@@ -121,10 +109,6 @@ impl ExecutorActions<'_> {
             // Artifact reservations and Message admission can race status writers.
             // Both mutations are replay-safe; retain a bounded conflict budget.
             let kind = document.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
-            if let Some(refused) = demand_refusal(self.resource_backend, kind) {
-                self.events.finish(id, empty_identity, refused);
-                return Ok(id);
-            }
             let applied = retry_resource_apply(kind, || self.port.apply_intent_document(namespace, document.clone())).await;
             let result = match applied {
                 Ok(applied) => CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
@@ -198,19 +182,9 @@ impl ExecutorActions<'_> {
     }
 
     pub async fn execute_action_resource_status_patch(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let CommandAction::ResourceStatusPatch { namespace, kind, name, status, expected_resource_version } = &command.action {
+        if let CommandAction::ResourceStatusPatch { namespace, kind, name, status } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
-            if let Some(refused) = demand_refusal(self.resource_backend, kind) {
-                self.events.finish(id, empty_identity, refused);
-                return Ok(id);
-            }
-            let patched = match expected_resource_version {
-                Some(expected) => {
-                    flotilla_store::patch_resource_status_if_version(self.resource_backend, namespace, kind, name, status.clone(), expected)
-                        .await
-                }
-                None => flotilla_store::patch_resource_status(self.resource_backend, namespace, kind, name, status.clone()).await,
-            };
+            let patched = flotilla_store::patch_resource_status(self.resource_backend, namespace, kind, name, status.clone()).await;
             let result = match patched {
                 Ok(patched) => CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
                     kind: patched.kind,
@@ -230,10 +204,6 @@ impl ExecutorActions<'_> {
     pub async fn execute_action_resource_delete(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceDelete { namespace, kind, name, replica_origin } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
-            if let Some(refused) = demand_refusal(self.resource_backend, kind) {
-                self.events.finish(id, empty_identity, refused);
-                return Ok(id);
-            }
             let result = if let Some(origin_root) = replica_origin {
                 let deleted = if self.port.peer_connection_status(origin_root).await == PeerConnectionState::Connected {
                     Err(ResourceError::invalid(format!(
@@ -257,9 +227,6 @@ impl ExecutorActions<'_> {
                 let _reconciliation = self.observed_checkout_reconciliation.lock().await;
                 let deleted = async {
                     let deleted = flotilla_store::delete_resource_kind(self.resource_backend, namespace, kind, name).await?;
-                    if deleted.object.kind == ResourceCheckout::API_PATHS.kind {
-                        self.port.delete_stale_adopted_checkouts(namespace).await?;
-                    }
                     Ok::<_, ResourceError>(deleted)
                 }
                 .await;
@@ -476,7 +443,7 @@ impl ExecutorActions<'_> {
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
         let environment_lifecycle = Arc::clone(&self.environment_lifecycle);
         let vcs_resolver = self.port.vcs_resolver()?;
-        tokio::spawn(async move {
+        tokio::spawn(flotilla_store::load_metrics::inherit(async move {
             let resolver_registry = Arc::clone(&registry);
             let resolver_providers_data = Arc::clone(&providers_data);
             let resolver_runner = Arc::clone(&runner);
@@ -542,7 +509,7 @@ impl ExecutorActions<'_> {
                     });
                 }
             }
-        });
+        }));
 
         Ok(id)
     }

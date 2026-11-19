@@ -110,10 +110,10 @@ pub fn import_repositories(copies: &[RepositoryCopy], target: &mut impl ImportTa
         match import_repository(&copy.object) {
             // Each record starts at its home as a fresh write; its old versions are not carried.
             Ok(Imported::Record(record)) => match target.write(&copy.home, name, &created(&copy.object), &*record) {
-                Ok(()) => *report.imported.entry((KIND, "observed")).or_default() += 1,
+                Ok(()) => report.import_row(KIND, "observed"),
                 Err(reason) => report.refused.push(refuse(reason)),
             },
-            Ok(Imported::Dropped(reason)) => *report.dropped.entry((KIND, reason)).or_default() += 1,
+            Ok(Imported::Dropped(reason)) => report.drop_rows(KIND, reason, 1),
             Err(reason) => report.refused.push(refuse(reason)),
         }
     }

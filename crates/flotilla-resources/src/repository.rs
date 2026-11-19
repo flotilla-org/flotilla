@@ -13,8 +13,53 @@ define_resource!(
     RepositoryStatusPatch,
     replication = crate::ReplicationClass::ConvergentFacts,
     validate_spec_update = validate_repository_spec_update,
-    queryable = &["metadata.name", "metadata.annotations.\"flotilla.work/verification-command-project\"", "spec.catalog_targets.*"]
+    queryable = &[
+        "metadata.name",
+        "metadata.annotations.\"flotilla.work/verification-command-project\"",
+        "spec.catalog_targets.*",
+        FORGE_SERVICE_URL_FIELD
+    ],
+    indexed_values = indexed_values
 );
+
+/// The declared field selecting the Repositories on a forge, by the forge's service URL as
+/// [`forge_service_url_key`] writes it.
+pub const FORGE_SERVICE_URL_FIELD: &str = "spec.forge.service_url";
+
+/// A forge service URL as [`FORGE_SERVICE_URL_FIELD`] holds it: without a trailing slash, so a
+/// Forge's `https_url` and a Repository's service URL meet whichever of them carries one.
+pub fn forge_service_url_key(url: &str) -> &str {
+    url.trim_end_matches('/')
+}
+
+fn indexed_values(spec: &RepositorySpec, path: &str) -> Option<Vec<String>> {
+    match path {
+        "spec.catalog_targets.*" => Some(catalog_targets(spec)),
+        FORGE_SERVICE_URL_FIELD => {
+            Some(spec.forge().map(|forge| forge_service_url_key(&forge.service_url).to_owned()).into_iter().collect())
+        }
+        _ => None,
+    }
+}
+
+/// Catalog aliases are a virtual indexed projection of the immutable repository identity; the
+/// spec keeps its stored shape.
+fn catalog_targets(spec: &RepositorySpec) -> Vec<String> {
+    let mut targets = BTreeSet::from([spec.leaf_slug(), spec.catalog_slug()]);
+    match spec.identity() {
+        RepositoryIdentity::Forge { owner, repo_name, .. } => {
+            targets.insert(format!("{owner}/{repo_name}"));
+        }
+        RepositoryIdentity::Remote { canonical_remote } => {
+            targets.insert(crate::descriptive_repo_slug(canonical_remote));
+            if let Some(forge) = spec.forge() {
+                targets.insert(forge.repository.clone());
+            }
+        }
+        RepositoryIdentity::Local { .. } => {}
+    }
+    targets.into_iter().collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

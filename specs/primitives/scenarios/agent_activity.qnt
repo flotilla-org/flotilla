@@ -2,8 +2,8 @@ module agent_activity {
   import agent_session(IDS = Set(1)) as A from "../machines/agent_session"
   action init = A::initLive
   action step = {
-    nondet activity = Set(A::Working, A::Idle, A::Interrupted).oneOf()
-    nondet cause = Set("prompt", "tool", "stop", "interrupt").oneOf()
+    nondet activity = Set(A::Working, A::NeedsInput, A::Idle, A::Interrupted).oneOf()
+    nondet cause = Set("prompt", "tool", "permission_prompt", "stop", "interrupt").oneOf()
     any {
       A::observe(1, activity, 1, cause),
       A::attach(1, true),

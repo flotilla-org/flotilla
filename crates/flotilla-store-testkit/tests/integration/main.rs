@@ -2,8 +2,8 @@
 // Tests share a process: isolate state and keep process-wide mutations in separate targets.
 mod controller_loop;
 mod convoy_status_patch;
+mod convoy_views;
 mod decode_once;
-mod digest;
 mod forge_identity;
 mod fulfilment_kind;
 mod host_status_coalescing;
@@ -14,10 +14,9 @@ mod k8s_integration;
 mod lifecycle_hygiene;
 mod lifecycle_status_patch;
 mod manifest_root;
-mod owner_gc;
+mod object_index;
 mod platform_vocabulary;
 mod prepared_snapshot_gc;
-mod principal_attention_status_patch;
 mod provisioning_http_wire;
 mod provisioning_resources_in_memory;
 mod provisioning_status_patch;
@@ -31,7 +30,6 @@ mod test_module_registration;
 mod workflow_template_in_memory;
 mod workflow_template_validation;
 
-mod image_builds;
 mod image_layers;
 mod project_hierarchy;
 
@@ -40,8 +38,6 @@ mod backend_contract;
 mod change_request_tests;
 
 mod crew_defaults_tests;
-
-mod digest_tests;
 
 mod registry_watch_tests;
 

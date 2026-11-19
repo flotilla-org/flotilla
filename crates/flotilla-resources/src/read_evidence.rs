@@ -1,5 +1,5 @@
 use crate::{
-    ResourceObject, TerminalSession, TerminalSessionPhase, TerminalSessionSource, UnmetSettlementExpectation, ROLE_LABEL, VESSEL_LABEL,
+    Message, MessagePhase, ResourceObject, TerminalSession, TerminalSessionPhase, UnmetSettlementExpectation, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_protocol::ExplainedUnmetExpectation;
 use std::collections::BTreeMap;
@@ -13,24 +13,36 @@ pub fn queued_turn_session<'a>(
             && session.metadata.labels.get(ROLE_LABEL).is_some_and(|label| label == role)
     })
 }
-pub fn queued_turn_evidence(session: Option<&ResourceObject<TerminalSession>>, message_id: &str) -> (bool, String) {
-    let Some(session) = session else { return (false, "terminal session unavailable".into()) };
-    let status = session.status.as_ref();
-    if status.and_then(|status| status.delivered_message_id.as_deref()) == Some(message_id) {
+/// Whether a queued turn's message reached its receiver, and if not, what holds it: the
+/// Message's own delivery evidence when its record is held, else what the receiving session shows.
+pub fn queued_turn_evidence(
+    message: Option<&ResourceObject<Message>>,
+    session: Option<&ResourceObject<TerminalSession>>,
+) -> (bool, String) {
+    match message {
+        Some(message) => match &message.status {
+            Some(status) => queued_message_evidence(status.phase, status.reason.as_deref()),
+            None => (false, "message Accepted: waiting for receiver resolution".into()),
+        },
+        None => queued_session_evidence(session),
+    }
+}
+
+/// Whether a queued turn's message, standing at `phase` for `reason`, arrived; and why not.
+pub fn queued_message_evidence(phase: MessagePhase, reason: Option<&str>) -> (bool, String) {
+    if phase.has_delivery_evidence() {
         return (true, String::new());
     }
-    if let TerminalSessionSource::Agent { message: Some(message), .. } = &session.spec.source {
-        if message.delivered_through(status.and_then(|status| status.delivered_message_id.as_deref()), message_id) {
-            return (true, String::new());
+    (false, format!("message {phase:?}: {}", reason.unwrap_or("waiting for receiver evidence")))
+}
+
+/// Whether a queued turn with no message arrived, as its session says; and why not.
+pub fn queued_session_evidence(session: Option<&ResourceObject<TerminalSession>>) -> (bool, String) {
+    let Some(session) = session else { return (false, "terminal session unavailable".into()) };
+    match session.status.as_ref() {
+        Some(status) if status.delivery_unconfirmed_since.is_some() => {
+            (false, "a turn typed into the session is held unconfirmed; waiting for the agent's record to confirm it".into())
         }
-        if message.next_after(status.and_then(|status| status.delivered_message_id.as_deref())).is_some_and(|next| next.id != message_id) {
-            return (false, "waiting behind an earlier terminal message".into());
-        }
-    }
-    if let Some(condition) = status.and_then(|status| status.degraded.as_ref()) {
-        return (false, format!("{}: {}", condition.reason, condition.message));
-    }
-    match status {
         Some(status) if status.phase == TerminalSessionPhase::Running => match &status.attention {
             Some(attention) => (false, format!("attention {:?}; waiting for turn readiness or submission evidence", attention.state)),
             None => (false, "waiting for startup readiness or submission evidence".into()),
@@ -75,7 +87,7 @@ pub fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> Exp
         UnmetSettlementExpectation::MissingCheckoutStatus { checkout } => ExplainedUnmetExpectation {
             reason: "missing_status".to_string(),
             subject: format!("checkout/{checkout}"),
-            detail: "observed checkout has no status".to_string(),
+            detail: "no inspection of the checkout has been read".to_string(),
         },
         UnmetSettlementExpectation::CheckoutConditionFalse { checkout, condition } => ExplainedUnmetExpectation {
             reason: "false_condition".to_string(),
@@ -127,33 +139,5 @@ pub fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> Exp
         },
     }
 }
-use crate::{TerminalAttentionState, TerminalSessionStatus};
-pub fn crew_attention(
-    status: Option<&TerminalSessionStatus>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<flotilla_protocol::CrewAttention> {
-    let status = status.filter(|status| status.phase == TerminalSessionPhase::Running)?;
-    if status.degraded.as_ref().is_some_and(|condition| condition.is_controller_fence_unverifiable()) {
-        return Some(flotilla_protocol::CrewAttention::ControllerFenceUnverifiable);
-    }
-    if status.degraded.as_ref().is_some_and(|condition| condition.is_delivery()) {
-        return Some(flotilla_protocol::CrewAttention::DeliveryUnconfirmed);
-    }
-    let attention = status.attention.as_ref()?;
-    if attention.is_stale_at(now) {
-        return Some(flotilla_protocol::CrewAttention::Unobservable);
-    }
-    Some(match attention.state {
-        TerminalAttentionState::Working => flotilla_protocol::CrewAttention::Working,
-        TerminalAttentionState::NeedsInput => flotilla_protocol::CrewAttention::NeedsInput,
-        TerminalAttentionState::Idle => flotilla_protocol::CrewAttention::Idle,
-        TerminalAttentionState::Unobservable => match status.idle_obstruction() {
-            Some(crate::ScreenObstruction::ComposerText { .. }) => flotilla_protocol::CrewAttention::IdleComposerText,
-            Some(crate::ScreenObstruction::ScrolledBack) => flotilla_protocol::CrewAttention::IdleScrolledBack,
-            Some(crate::ScreenObstruction::HookReview) | None => flotilla_protocol::CrewAttention::Unobservable,
-        },
-    })
-}
-
 /// Maximum age of checkout evidence used to settle or tear down a convoy.
 pub const LANDING_EVIDENCE_TTL: std::time::Duration = std::time::Duration::from_secs(30);

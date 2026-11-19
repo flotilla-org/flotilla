@@ -1,7 +1,7 @@
 //! State values, stable codes and typed edge dispatch.
 //!
 //! A machine's state is a value: a label plus the data that label carries, as
-//! in the Quint specs (`Open { promises, quota }`). [`states!`](crate::states)
+//! in the Quint specs (`Open { retired_duties }`). [`states!`](crate::states)
 //! declares the state enum with named data on each variant and derives the
 //! fieldless label enum with strum's `EnumDiscriminants`. The label is what
 //! listings, indexes and diagrams use; the data is what gates read and edges

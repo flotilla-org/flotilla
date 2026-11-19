@@ -11,7 +11,7 @@ use crate::{
         FulfilmentListResponse, HostListResponse, HostProvidersResponse, HostStatusResponse, PersonInboxResponse, ProjectListResponse,
         RepoProvidersResponse,
     },
-    IssueRef, PlacementDecision, PrincipalRef, RepoIdentity,
+    IssueRef, PlacementDecision, RepoIdentity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,15 +252,26 @@ pub struct ExplainedCheckout {
     /// The engine's judgement of the checkout, when `[primitives]` is on and the engine holds it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<crate::LifecycleReading>,
+    /// The clone launch a worktree checkout is made from, as the engine reads it (#3108).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<ExplainedClone>,
+    /// Its release held on its work, as the open attention telling a person says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<ExplainedHold>,
 }
 
+/// A checkout's release held until a person acts: why, and since when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExplainedEvent {
+pub struct ExplainedHold {
     pub reason: String,
-    pub message: String,
-    pub count: u64,
-    pub first_seen: String,
-    pub last_seen: String,
+    pub since: chrono::DateTime<chrono::Utc>,
+}
+
+/// One clone launch (`<clone>#<n>`) and the engine's reading of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedClone {
+    pub name: String,
+    pub reading: crate::LifecycleReading,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +303,8 @@ pub struct ExplainedSubjectObservation {
     pub subject: crate::Subject,
     pub state: ExplainedSubjectFact,
     pub checks: ExplainedSubjectFact,
+    /// Whether it merges cleanly: absent while the forge has not said (run 4 R4-4).
+    pub mergeable: ExplainedSubjectFact,
     pub review: ExplainedSubjectFact,
     pub review_actionable_at_head: ExplainedSubjectFact,
     pub readiness: ExplainedSubjectFact,
@@ -316,32 +329,33 @@ pub struct ExplainedSubscription {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExplainedTerminalCondition {
-    StashedDrafts { drafts: Vec<String> },
-    ProviderUnavailable { message: String },
-    SessionLost { message: String },
-    ProcessExited { exit_code: Option<i32> },
-    ProcessFailed { message: String },
-    DeliveryUnconfirmed { message: String },
-    ControllerFenceUnverifiable { message: String },
+    ProviderUnavailable {
+        message: String,
+    },
+    SessionLost {
+        message: String,
+    },
+    /// The process ended; `message` is the ending's reason, as the session's home recorded it.
+    ProcessExited {
+        message: String,
+    },
+    ProcessFailed {
+        message: String,
+    },
+    DeliveryUnconfirmed {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for ExplainedTerminalCondition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::StashedDrafts { drafts } => write!(f, "abandoned composer drafts saved before delivery: {drafts:?}"),
             Self::ProviderUnavailable { message } => {
                 write!(f, "terminal provider unavailable: {message}; retrying without failing the crew")
             }
             Self::SessionLost { message } => write!(f, "terminal session lost: {message}; recovering from the durable brief"),
-            Self::ProcessExited { exit_code } => {
-                f.write_str("crew process exited")?;
-                if let Some(code) = exit_code {
-                    write!(f, " with code {code}")?;
-                }
-                f.write_str("; resume relaunches it in the existing checkout")
-            }
+            Self::ProcessExited { message } => write!(f, "crew {message}"),
             Self::ProcessFailed { message } => write!(f, "crew process failed: {message}"),
-            Self::ControllerFenceUnverifiable { message } => f.write_str(message),
             Self::DeliveryUnconfirmed { message } => write!(f, "terminal message delivery unconfirmed: {message}"),
         }
     }
@@ -358,12 +372,6 @@ pub struct ExplainedCrewDelivery {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_delivery_rung: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivered_message_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_briefs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -385,8 +393,6 @@ pub struct ExplainedDecisionLedger {
     /// Historical ledger comment only; remove at the next wire-format change.
     pub comment_url: Option<String>,
     pub missing: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub override_principal: Option<PrincipalRef>,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub completed_while_crew_active: bool,
@@ -403,6 +409,24 @@ pub struct ExplainedUnmetExpectation {
     pub detail: String,
 }
 
+/// An unread checkout expectation settlement dropped rather than met, and the ended vessels that
+/// let it: no vessel left could read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedDischarge {
+    pub expectation: ExplainedUnmetExpectation,
+    pub ended_vessels: Vec<ExplainedEndedVessel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedEndedVessel {
+    pub launch: String,
+    pub reading: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// RFC 3339.
+    pub ended_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainedUnclaimedWork {
     pub vessel: String,
@@ -416,8 +440,14 @@ pub const SETTLEMENT_MODE_STANDING: &str = "standing";
 pub struct ExplainedSettlement {
     pub mode: String,
     pub satisfied: bool,
+    /// The exit the convoy was delivered by (`merged`, `closed-unmerged`, a workflow's own),
+    /// once it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmet: Vec<ExplainedUnmetExpectation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discharged: Vec<ExplainedDischarge>,
 }
 
 /// Provenance of the admitted convoy name only. Branch generation is independent.
@@ -463,9 +493,13 @@ pub struct ConvoyExplanation {
     pub environment_observations: std::collections::BTreeMap<String, crate::environment::EnvironmentRuntimeObservation>,
     pub namespace: String,
     pub convoy: String,
+    /// The convoy's role: the name its dispatcher or ensure gave it.
+    #[serde(default)]
+    pub role: String,
     pub phase: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stalled: Option<serde_json::Value>,
+    /// Each open stall, one about each stalled seat and one about no seat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stalls: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -496,9 +530,6 @@ pub struct ConvoyExplanation {
     pub crew_deliveries: Vec<ExplainedCrewDelivery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<crate::query::CrewMessageView>,
-    /// Message batches held for an operator; later Messages wait behind them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub held_deliveries: Vec<ExplainedHeldDelivery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_turns: Vec<ExplainedQueuedTurn>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -507,10 +538,25 @@ pub struct ConvoyExplanation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ExplainedArtifact>,
     pub settlement: ExplainedSettlement,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub recent_events: Vec<ExplainedEvent>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lifecycle_mutations: Vec<ExplainedLifecycleMutation>,
+    /// What holds the launch from retiring; none where its holds are not read (#3108).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<ExplainedHolds>,
+}
+
+/// What holds a convoy's launch from retiring (#3108 retirement): each dependent as
+/// `kind:name`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ExplainedHolds {
+    /// It is open: it retires once it ends and these release.
+    Open {
+        holds: Vec<String>,
+    },
+    /// It ended: it retires once these release; none when nothing holds it.
+    Ended {
+        holds: Vec<String>,
+    },
+    Retired,
 }
 
 /// One requester's account binding (#3907): which managed credential and account it selected,
@@ -588,19 +634,6 @@ pub struct ExplainedAccountProvision {
     pub delivered_generation: Option<String>,
 }
 
-/// One held Message batch (#3455): what it is, why it is held, and the
-/// operator command that closes it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExplainedHeldDelivery {
-    pub batch: String,
-    pub receiver: String,
-    pub members: Vec<String>,
-    pub reason: String,
-    pub clear_command: String,
-    /// The plain sentence attention also shows.
-    pub description: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainedQueuedTurn {
     pub source: String,
@@ -629,13 +662,6 @@ pub struct ExplainedArtifact {
     pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view_url: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExplainedLifecycleMutation {
-    pub action: String,
-    pub caller: crate::CommandCaller,
-    pub at: String,
 }
 
 /// Filters for reading a daemon's host-local structured log.
@@ -922,30 +948,6 @@ impl std::fmt::Display for StallProposedDisposition {
     }
 }
 
-/// Authoritative key/version anti-entropy reads; roots bind child and snapshot
-/// requests to the same complete collection cut.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "query", rename_all = "snake_case")]
-pub enum ResourceDigestQuery {
-    Root,
-    Children { expected_root: String },
-    Snapshot { expected_root: String, bucket: u8 },
-}
-
-/// A generation-stamped authoritative digest or complete bucket snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct ResourceDigest {
-    pub origin: crate::NodeId,
-    pub kind: String,
-    pub namespace: String,
-    pub generation: Option<String>,
-    pub resource_version: String,
-    pub root: String,
-    pub children: Option<Vec<String>>,
-    pub bucket: Option<u8>,
-    pub items: Option<Vec<serde_json::Value>>,
-}
-
 /// Internal attach target used by `environment <id> shell`. It is resolved at
 /// each host hop, so no guest socket path is executed on a different host.
 pub const ENVIRONMENT_SHELL_REFERENCE_PREFIX: &str = "environment-shell/";
@@ -984,6 +986,16 @@ pub enum CommandAction {
         branch: String,
         checkout_path: Option<PathBuf>,
         change_request_id: Option<String>,
+    },
+    /// Inspect checkout `checkout` (its record name) afresh at its home, so a release held on its
+    /// work is tried again (`flotilla checkout <name> recheck`).
+    CheckoutRecheck {
+        checkout: String,
+    },
+    /// Rule checkout `checkout` archived at its home: its release archives it and removes it,
+    /// whatever its integration says (`flotilla checkout <name> archive`).
+    CheckoutArchive {
+        checkout: String,
     },
     OpenChangeRequest {
         id: String,
@@ -1036,7 +1048,6 @@ pub enum CommandAction {
         namespace: Option<String>,
         name: String,
         reference: String,
-        relationship: crate::Relationship,
     },
     ConvoyUnlink {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1081,23 +1092,24 @@ pub enum CommandAction {
         context: CrewCommandContext,
         target: String,
         message: String,
+        /// What the handoff refers to, each at its revision.
         #[serde(default)]
-        carries: Vec<crate::MessageReference>,
+        carries: Vec<flotilla_address::Reference>,
+        /// The ids of open promises the sender owns, each moved to the target with the work.
+        #[serde(default)]
+        reassign: Vec<String>,
     },
     CrewPromise {
         context: CrewCommandContext,
         operation: CrewPromiseOperation,
     },
+    /// An operator's forced completion of a crew member's part: a verdict on its open promises.
     CrewComplete {
         context: CrewCommandContext,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disposition: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        decision_ledger_ref: Option<String>,
-        #[serde(default)]
-        force: bool,
     },
     CrewFail {
         context: CrewCommandContext,
@@ -1126,12 +1138,9 @@ pub enum CommandAction {
         workflow_ref: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         inputs: Vec<(String, String)>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        repository_url: Option<String>,
         #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
         r#ref: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        project_ref: Option<String>,
+        project_ref: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placement_policy: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1163,10 +1172,14 @@ pub enum CommandAction {
     ProjectRefresh {
         name: String,
     },
-    /// Resolve a branch's composed image and get-or-create its ImageBuild
+    /// Resolve a branch's composed image and demand its image build
     /// (`flotilla image check`).
     ImageCheck {
         request: crate::image_check::ImageCheckRequest,
+    },
+    /// Launch a given-up image build again, at its builder (`flotilla image retry`).
+    ImageBuildRetry {
+        name: String,
     },
 
     TrackRepoPath {
@@ -1262,16 +1275,14 @@ pub enum CommandAction {
         name: String,
     },
     /// Peer-only pull of a whole-home stream frame; interactive query dispatch refuses it.
-    /// `after` selects a new round's cut. With `session`, the saved cut takes precedence
-    /// and `after` is ignored. Idle consumers lose the session.
+    /// `home` names the log: the target's own when absent, or another home the target holds
+    /// and passes on (relay). `after` selects a new round's cut. With `session`, the saved cut
+    /// takes precedence and `after` is ignored. Idle consumers lose the session.
     QueryChangeStream {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home: Option<String>,
         after: Option<u64>,
         session: Option<String>,
-    },
-    QueryResourceDigest {
-        namespace: String,
-        kind: String,
-        query: ResourceDigestQuery,
     },
     QueryResourceList {
         namespace: String,
@@ -1310,16 +1321,6 @@ pub enum CommandAction {
         kind: String,
         name: String,
     },
-    MessageDeliverBatch {
-        namespace: String,
-        name: String,
-        reason: String,
-    },
-    MessageFailBatch {
-        namespace: String,
-        name: String,
-        reason: String,
-    },
     /// The person consumer's pending messages across its role inboxes (#3938).
     PersonInbox {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1340,8 +1341,6 @@ pub enum CommandAction {
         body: String,
     },
     ResourceStatusPatch {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_resource_version: Option<String>,
         namespace: String,
         kind: String,
         name: String,
@@ -1361,8 +1360,6 @@ pub enum CommandAction {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         include_replicas: bool,
-        #[serde(default, skip_serializing_if = "is_false")]
-        replica_sources: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<ResourceCursor>,
     },
@@ -1394,7 +1391,6 @@ impl CommandAction {
                 | CommandAction::QueryDaemonLogs { .. }
                 | CommandAction::QueryExplainConvoy { .. }
                 | CommandAction::QueryChangeStream { .. }
-                | CommandAction::QueryResourceDigest { .. }
                 | CommandAction::QueryResourceList { .. }
                 | CommandAction::QueryManifestRoots { .. }
                 | CommandAction::QueryResourceGet { .. }
@@ -1419,6 +1415,8 @@ impl Command {
             },
             CommandAction::RemoveCheckout { .. } => "Removing checkout...",
             CommandAction::FetchCheckoutStatus { .. } => "Fetching checkout status...",
+            CommandAction::CheckoutRecheck { .. } => "Rechecking checkout...",
+            CommandAction::CheckoutArchive { .. } => "Ruling checkout archived...",
             CommandAction::OpenChangeRequest { .. } => "Opening in browser...",
             CommandAction::CloseChangeRequest { .. } => "Closing PR...",
             CommandAction::MergeChangeRequest { .. } => "Merging change request...",
@@ -1438,7 +1436,7 @@ impl Command {
             CommandAction::ConvoyWithdrawPendingBrief { .. } => "Withdrawing pending convoy brief...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
             CommandAction::CrewPromise { .. } => "Updating crew promises...",
-            CommandAction::CrewComplete { .. } => "Inspecting crew promises...",
+            CommandAction::CrewComplete { .. } => "Forcing crew completion...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
             CommandAction::CrewStall { .. } => "Stalling crew work...",
             CommandAction::CrewSupervise { .. } => "Supervising crew work...",
@@ -1472,6 +1470,7 @@ impl Command {
             CommandAction::QueryFulfilmentList {} => "query fulfilment list",
             CommandAction::QueryImageBuild { .. } => "query image build",
             CommandAction::ImageCheck { .. } => "Checking composed image...",
+            CommandAction::ImageBuildRetry { .. } => "Retrying image build...",
             CommandAction::QueryFleetList { .. } => "query fleet list",
             CommandAction::QueryCrewStalls { .. } => "query crew stalls",
             CommandAction::QueryCrewCapabilities { .. } => "query crew capabilities",
@@ -1480,7 +1479,6 @@ impl Command {
             CommandAction::QueryDaemonLogs { .. } => "query daemon logs",
             CommandAction::QueryExplainConvoy { .. } => "explain convoy",
             CommandAction::QueryChangeStream { .. } => "read change stream",
-            CommandAction::QueryResourceDigest { .. } => "query resource digest",
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryManifestRoots { .. } => "query manifest roots",
             CommandAction::QueryResourceGet { .. } => "query resource get",
@@ -1491,8 +1489,6 @@ impl Command {
             },
             CommandAction::ConvoyEnsureRoll { .. } => "roll changed ensure configuration",
             CommandAction::ResourceReconcileNow { .. } => "reconcile resource now",
-            CommandAction::MessageDeliverBatch { .. } => "deliver held Message batch",
-            CommandAction::MessageFailBatch { .. } => "fail held Message batch",
             CommandAction::PersonInbox { .. } => "list the person's inbox",
             CommandAction::PersonAcknowledge { .. } => "acknowledge a message",
             CommandAction::PersonAnswer { .. } => "answer a message",
@@ -1567,10 +1563,6 @@ pub enum CommandValue {
     },
     Ok,
     CrewFollowUpDelivered,
-    /// Advisory only: promise settlement is reconciled independently.
-    CrewCompletionAdvisory {
-        pending: Vec<String>,
-    },
     /// The named receiver admitted the next supervision obligation.
     CrewEscalated {
         receiver: String,
@@ -1579,11 +1571,6 @@ pub enum CommandValue {
     CrewEscalationRefused {
         rung: crate::StallRung,
         reason: String,
-    },
-    /// The claim is still unmet; a CLI caller waits and retries at this deadline.
-    CrewCompletionWaiting {
-        reason: String,
-        retry_at: chrono::DateTime<chrono::Utc>,
     },
     ResourceReconciled {
         resource_kind: String,
@@ -1600,13 +1587,6 @@ pub enum CommandValue {
     ConvoyBriefQueued {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         displaced: Option<String>,
-    },
-    /// Queued while a held Message batch is ahead of it for the same crew
-    /// (#3455); `held` names the batch and what happens to it.
-    ConvoyBriefHeld {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        displaced: Option<String>,
-        held: String,
     },
     ConvoyBriefWithdrawn {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1673,6 +1653,10 @@ pub enum CommandValue {
     FulfilmentList(Box<FulfilmentListResponse>),
     ImageCheck(Box<crate::image_check::ImageCheckReport>),
     ImageBuild(Box<crate::image_check::ImageBuildReport>),
+    /// The launch an image build retry made.
+    ImageBuildRetried {
+        launch: String,
+    },
     FleetList(Box<FleetListResponse>),
     CrewStalls(Box<CrewStallsResponse>),
     CrewCapabilities {
@@ -1695,7 +1679,6 @@ pub enum CommandValue {
     ResourceDeleted(Box<ResourceJsonResponse>),
     ResourceAlreadyDeleted(Box<ResourceJsonResponse>),
     ResourceWatchEvent(Box<ResourceReadEnvelope>),
-    ResourceDigest(Box<ResourceDigest>),
     EnvironmentSpecRead {
         spec: crate::EnvironmentSpec,
     },
@@ -1830,8 +1813,10 @@ mod tests {
     #[test]
     fn command_roundtrip_covers_all_variants() {
         let cases = vec![
-            Command::builder().action(CommandAction::QueryChangeStream { after: None, session: None }).build(),
-            Command::builder().action(CommandAction::QueryChangeStream { after: Some(7), session: Some("round".into()) }).build(),
+            Command::builder().action(CommandAction::QueryChangeStream { home: None, after: None, session: None }).build(),
+            Command::builder()
+                .action(CommandAction::QueryChangeStream { home: Some("relayed".into()), after: Some(7), session: Some("round".into()) })
+                .build(),
             Command::builder()
                 .action(CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) })
                 .node_id(NodeId::new("feta"))
@@ -1854,6 +1839,8 @@ mod tests {
                 })
                 .context_repo(RepoSelector::Path(PathBuf::from("/repo")))
                 .build(),
+            Command::builder().action(CommandAction::CheckoutRecheck { checkout: "repo-feat-x".into() }).build(),
+            Command::builder().action(CommandAction::CheckoutArchive { checkout: "repo-feat-x".into() }).build(),
             Command::builder()
                 .action(CommandAction::Attach { reference: "convoy-a".into(), host: None, mode: AttachMode::Default })
                 .build(),
@@ -1929,6 +1916,7 @@ mod tests {
             Command::builder()
                 .action(CommandAction::CrewHandoff {
                     carries: Vec::new(),
+                    reassign: Vec::new(),
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     target: "reviewer".into(),
                     message: "review this".into(),
@@ -1939,8 +1927,6 @@ mod tests {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     message: Some("ready for review".into()),
                     disposition: Some("changes-pushed".into()),
-                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1#issuecomment-2".into()),
-                    force: false,
                 })
                 .build(),
             Command::builder()
@@ -1955,9 +1941,8 @@ mod tests {
                     name: "my-convoy".into(),
                     workflow_ref: "scratch".into(),
                     inputs: vec![("topic".into(), "convoy-create-cli".into())],
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
                     r#ref: Some("main".into()),
-                    project_ref: Some("my-project".into()),
+                    project_ref: "my-project".into(),
                     placement_policy: Some("host-direct-local".into()),
                     adopted_checkout: None,
                 })
@@ -2018,7 +2003,6 @@ mod tests {
                 .build(),
             Command::builder()
                 .action(CommandAction::ResourceStatusPatch {
-                    expected_resource_version: None,
                     namespace: "flotilla".into(),
                     kind: "usages".into(),
                     name: "usage-account".into(),
@@ -2031,7 +2015,6 @@ mod tests {
                     kind: "convoys".into(),
                     name: None,
                     include_replicas: false,
-                    replica_sources: false,
                     cursor: None,
                 })
                 .node_id(NodeId::new("feta"))
@@ -2072,14 +2055,8 @@ mod tests {
             CommandValue::ChangeStreamFrame { session: "round".into(), frame: vec![0, 127, 128, 255] },
             CommandValue::Ok,
             CommandValue::CrewFollowUpDelivered,
-            CommandValue::CrewCompletionAdvisory { pending: vec!["template/pr: waiting on PR merge".into()] },
-            CommandValue::CrewCompletionWaiting {
-                reason: "GitHub secondary limit".into(),
-                retry_at: "2026-10-03T09:21:59Z".parse().expect("retry deadline"),
-            },
             CommandValue::ConvoyBriefDelivered { displaced: Some("older instruction".into()) },
             CommandValue::ConvoyBriefQueued { displaced: Some("older instruction".into()) },
-            CommandValue::ConvoyBriefHeld { displaced: None, held: "message batch `b` is held".into() },
             CommandValue::ConvoyBriefWithdrawn { withdrawn: Some("latest instruction".into()) },
             CommandValue::RepoTracked {
                 path: PathBuf::from("/new/repo"),
@@ -2222,6 +2199,7 @@ mod tests {
                     role: "coder".into(),
                     kind: "agent".into(),
                     state: "active".into(),
+                    vessel: None,
                     reason: None,
                     attention: None,
                     adapter: Some("codex".into()),
@@ -2406,6 +2384,8 @@ mod tests {
             Command::builder()
                 .action(CommandAction::FetchCheckoutStatus { branch: "b".into(), checkout_path: None, change_request_id: None })
                 .build(),
+            Command::builder().action(CommandAction::CheckoutRecheck { checkout: "b".into() }).build(),
+            Command::builder().action(CommandAction::CheckoutArchive { checkout: "b".into() }).build(),
             Command::builder()
                 .action(CommandAction::OpenChangeRequest { id: "1".into() })
                 .context_repo(RepoSelector::Path(PathBuf::from("/tmp")))

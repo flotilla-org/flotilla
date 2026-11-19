@@ -1,11 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_inbox::{
     sqlite::{MessageLog, SqliteInbox, StoreLog},
     EngineInbox, MemoryInbox, MemoryInboxLog,
 };
 use flotilla_inbox_testkit::{consumer, Evidence, Factory, Harness, SessionPort, Supervisors};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{machines::agent_session::AgentSession, MemoryLog};
 use rusqlite::Connection;
 
@@ -41,7 +41,7 @@ impl Factory for Sqlite {
         backend.get_blocking(message).expect("message")
     }
     fn create(&self) -> Harness<Self::Backend> {
-        let store = Arc::new(Mutex::new(
+        let store = Arc::new(StoreHandle::new(
             Store::open(Connection::open_in_memory().expect("SQLite"), "test", flotilla_state_machines::kinds().expect("registry"))
                 .expect("store"),
         ));
@@ -73,7 +73,7 @@ async fn sqlite_recovers_receipts_and_resumes_log_cursors() {
     use flotilla_inbox_testkit::{inbox, spec};
     use flotilla_state_machines::{machines::message::Deliver, Transport};
     use futures::StreamExt;
-    let store = Arc::new(Mutex::new(
+    let store = Arc::new(StoreHandle::new(
         Store::open(Connection::open_in_memory().expect("SQLite"), "test", flotilla_state_machines::kinds().expect("registry"))
             .expect("store"),
     ));
@@ -185,7 +185,7 @@ async fn sqlite_rejects_consumer_in_another_store() {
     use flotilla_inbox::{Error, InboxBackend};
     use flotilla_inbox_testkit::spec;
     let make_store = || {
-        Arc::new(Mutex::new(
+        Arc::new(StoreHandle::new(
             Store::open(Connection::open_in_memory().expect("SQLite"), "test", flotilla_state_machines::kinds().expect("registry"))
                 .expect("store"),
         ))
@@ -215,7 +215,8 @@ async fn sqlite_rejects_consumer_in_another_store() {
 
 // Behaviour (ADR 0066 §4): a message's identity is `<inbox>/message:<id>`; a
 // keyed send's id is the digest of inbox, sender and key, so a repeated key
-// returns the existing message and admits nothing, on both stores.
+// returns the existing message and admits nothing, and another intent under the
+// key is refused, on both stores.
 #[tokio::test]
 async fn keyed_sends_name_one_message_under_their_inbox() {
     use flotilla_inbox::InboxBackend;
@@ -230,6 +231,11 @@ async fn keyed_sends_name_one_message_under_their_inbox() {
         let version = factory.inspect(&backend, &first).version();
         assert_eq!(backend.enqueue_as(spec(), &flotilla_inbox::keyed_id(&inbox(), &spec().sender, "hold")).await.expect("repeat"), first);
         assert_eq!(factory.inspect(&backend, &first).version(), version, "a repeated key writes nothing");
+        let mut changed = spec();
+        changed.body = flotilla_state_machines::machines::message::MessageBody::text("another intent").expect("body");
+        let refused = backend.enqueue_as(changed, &flotilla_inbox::keyed_id(&inbox(), &spec().sender, "hold")).await;
+        assert!(matches!(refused, Err(flotilla_inbox::Error::DifferentIntent(ref name)) if *name == first), "{refused:?}");
+        assert_eq!(factory.inspect(&backend, &first).version(), version, "a refused intent writes nothing");
         let other = backend.enqueue_as(spec(), &flotilla_inbox::keyed_id(&inbox(), &spec().sender, "other")).await.expect("other key");
         let unkeyed = backend.enqueue(spec()).await.expect("unkeyed");
         assert!(first != other && other != unkeyed);

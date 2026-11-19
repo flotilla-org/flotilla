@@ -4,11 +4,11 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    canonicalize_repo_url, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Clone, ClonePhase, CloneSpec, CloneStatus,
-    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, Environment, EnvironmentPhase,
-    EnvironmentSpec, EnvironmentStatus, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta,
-    Repository, RepositorySpec, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel,
-    VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    canonicalize_repo_url, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CloneSpec, Convoy, ConvoyRepositorySpec,
+    ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, EnvironmentSpec, FulfilmentKind, FulfilmentKindSpec,
+    FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Repository, RepositorySpec, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot,
 };
 use flotilla_store::{ensure_repository, ResourceBackend};
 use tokio::{
@@ -57,16 +57,7 @@ pub fn work_state(
     message: Option<String>,
     placement: Option<flotilla_resources::PlacementStatus>,
 ) -> WorkState {
-    WorkState {
-        provisioning_retry: None,
-        phase,
-        completion_authority: WorkCompletionAuthority::CrewRollup,
-        ready_at,
-        started_at,
-        finished_at,
-        message,
-        placement,
-    }
+    WorkState { phase, completion_authority: WorkCompletionAuthority::CrewRollup, ready_at, started_at, finished_at, message, placement }
 }
 
 pub async fn create_convoy_with_single_task(
@@ -105,7 +96,7 @@ pub async fn create_convoy_with_single_task(
                     subpaths: Vec::new(),
                 }],
                 r#ref: Some(git_ref.to_string()),
-                project_ref: None,
+                project_ref: namespace.to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
                 issues: Vec::new(),
                 change_request: None,
@@ -216,130 +207,60 @@ pub async fn create_docker_kind(backend: &ResourceBackend, namespace: &str, fixt
     .await;
 }
 
-pub async fn create_ready_host_direct_environment(
-    backend: &ResourceBackend,
-    namespace: &str,
+/// This host's direct environment, ready under its root, held by the engine `environments` serve.
+pub fn create_ready_host_direct_environment(
+    environments: &flotilla_provisioning_testkit::EnvironmentFixture,
     host_ref: &str,
     repo_default_dir: &str,
-) -> flotilla_resources::ResourceObject<Environment> {
-    let environments = backend.clone().using::<Environment>(namespace);
+) -> flotilla_resources::environment_records::EnvironmentRecord {
     let name = format!("host-direct-{host_ref}");
-    let created = environments
-        .create(
-            &meta(&name),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec {
-                    host_ref: host_ref.to_string(),
-                    repo_default_dir: repo_default_dir.to_string(),
-                }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("environment create should succeed");
-    environments
-        .update_status(
-            &name,
-            &created.metadata.resource_version,
-            &EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                configured_limits: None,
-                runtime_observation: None,
-                phase: EnvironmentPhase::Ready,
-                ready: true,
-                docker_container_id: None,
-                image_ref: None,
-                local_image_id: None,
-                registry_digest: None,
-                message: None,
-                credential_delivery_retry: None,
-                credential_refresh_retry: None,
-            },
-        )
-        .await
-        .expect("environment status update should succeed");
-    environments.get(&name).await.expect("environment get should succeed")
+    let spec = EnvironmentSpec {
+        cloud_sandbox: None,
+        provider_address: None,
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.to_string(), repo_default_dir: repo_default_dir.to_string() }),
+        docker: None,
+    };
+    environments.put_ready(&name, &spec, None, repo_default_dir, Default::default());
+    flotilla_resources::environment_records::EnvironmentRecords::find(environments.environments.as_ref(), &name)
+        .expect("environment read")
+        .expect("environment held")
 }
 
-pub async fn create_ready_docker_environment(
-    backend: &ResourceBackend,
-    namespace: &str,
+/// A ready container environment `name`, launched from `docker`'s image, held by the engine
+/// `environments` serve.
+pub fn create_ready_docker_environment(
+    environments: &flotilla_provisioning_testkit::EnvironmentFixture,
     name: &str,
     docker: DockerEnvironmentSpec,
-) -> flotilla_resources::ResourceObject<Environment> {
-    let environments = backend.clone().using::<Environment>(namespace);
-    let image_ref = docker.image.clone();
-    let created = environments
-        .create(&meta(name), &EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(docker) })
-        .await
-        .expect("docker env create should succeed");
-    environments
-        .update_status(
-            name,
-            &created.metadata.resource_version,
-            &EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                configured_limits: None,
-                runtime_observation: None,
-                phase: EnvironmentPhase::Ready,
-                ready: true,
-                docker_container_id: Some(format!("container-{name}")),
-                image_ref: Some(image_ref),
-                local_image_id: Some("sha256:test-image".to_string()),
-                registry_digest: None,
-                message: None,
-                credential_delivery_retry: None,
-                credential_refresh_retry: None,
-            },
-        )
-        .await
-        .expect("docker env status update should succeed");
-    environments.get(name).await.expect("docker env get should succeed")
+) -> flotilla_resources::environment_records::EnvironmentRecord {
+    let facts = flotilla_resources::environment_records::LaunchFacts {
+        image_ref: Some(docker.image.clone()),
+        local_image_id: Some("sha256:test-image".to_string()),
+        ..Default::default()
+    };
+    let spec = EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(docker) };
+    environments.put_ready(name, &spec, None, &format!("container-{name}"), facts);
+    flotilla_resources::environment_records::EnvironmentRecords::find(environments.environments.as_ref(), name)
+        .expect("environment read")
+        .expect("environment held")
 }
 
-pub async fn create_ready_clone(
-    backend: &ResourceBackend,
-    namespace: &str,
+/// Puts clone `name` ready in `clones`, as the engine holds it: launch 1, realised at `path`,
+/// having found `main`. Returns the launch.
+pub fn create_ready_clone(
+    clones: &flotilla_provisioning_testkit::CloneFixture,
     name: &str,
     repo_url: &str,
     env_ref: &str,
     path: &str,
-) -> flotilla_resources::ResourceObject<Clone> {
-    let clones = backend.clone().using::<Clone>(namespace);
-    let created = clones
-        .create(
-            &meta(name),
-            &CloneSpec {
-                repo_ref: flotilla_resources::RepositoryKey(repo_key(
-                    &canonicalize_repo_url(repo_url).expect("repo URL should canonicalize"),
-                )),
-                url: repo_url.to_string(),
-                env_ref: env_ref.to_string(),
-                path: path.to_string(),
-            },
-        )
-        .await
-        .expect("clone create should succeed");
-    clones
-        .update_status(
-            name,
-            &created.metadata.resource_version,
-            &CloneStatus {
-                phase: ClonePhase::Ready,
-                default_branch: Some("main".to_string()),
-                message: None,
-                failed_at: None,
-                failure_policy: None,
-                retry: None,
-            },
-        )
-        .await
-        .expect("clone status update should succeed");
-    clones.get(name).await.expect("clone get should succeed")
+) -> String {
+    let spec = CloneSpec {
+        repo_ref: flotilla_resources::RepositoryKey(repo_key(&canonicalize_repo_url(repo_url).expect("repo URL should canonicalize"))),
+        url: repo_url.to_string(),
+        env_ref: env_ref.to_string(),
+        path: path.to_string(),
+    };
+    clones.put_named_ready(name, &spec, Some("main"))
 }
 
 #[derive(bon::Builder)]
@@ -371,7 +292,6 @@ pub async fn create_ready_checkout(
             &created.metadata.resource_version,
             &CheckoutStatus {
                 degraded: None,
-                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some(fixture.path.clone()),
                 commit: Some("44982740".to_string()),
@@ -422,32 +342,22 @@ pub async fn create_stopped_terminal(
             &created.metadata.resource_version,
             &TerminalSessionStatus {
                 codex_native_hooks: false,
-                last_hook_working_at: None,
                 configured_limits: None,
                 phase: TerminalSessionPhase::Stopped,
                 session_id: Some(format!("session-{}", fixture.name)),
                 cleat_endpoint: None,
-                pid: Some(42),
                 started_at: Some(Utc::now()),
                 stopped_at: Some(Utc::now()),
                 inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
-                inner_exit_code: Some(1),
                 message: Some(fixture.message),
                 crew: None,
-                retired_launches: Default::default(),
                 launch_command: Some(fixture.command),
-                delivered_message_id: None,
                 attention: None,
                 screen_obstruction: None,
-                turn_delivery_hold: None,
-                last_tool_activity_at: None,
-                last_output_digest: None,
-                last_output_activity_at: None,
                 occupancy: Default::default(),
-                completion_pending: None,
-                degraded: None,
                 daemon_unreachable: None,
-                stashed_drafts: Vec::new(),
+                delivery_unconfirmed_since: None,
+                environment_unavailable: None,
             },
         )
         .await

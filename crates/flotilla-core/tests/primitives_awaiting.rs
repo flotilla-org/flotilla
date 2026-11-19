@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use flotilla_core::primitives::awaiting::{AwaitingReplies, STALL};
+use flotilla_engine_messages::awaiting::{record_name, AwaitingReplies, OpenAwaiting, STALL};
 use flotilla_schema::{Address, Timestamp};
-use flotilla_schema_sqlite::stream::Service;
+use flotilla_schema_sqlite::stream::{Follower, Service};
 use flotilla_state_machines::machines::{
     awaiting_reply::{Awaited, AwaitingReplyLabel, AwaitingReplySpec},
     message::MessageRef,
@@ -35,6 +35,9 @@ fn stall(id: &str, deadline: Option<i64>) -> AwaitingReplySpec {
         kind: STALL.into(),
         awaited: Awaited::Reply,
         deadline: deadline.map(Timestamp),
+        report: None,
+        stall_reason: None,
+        proposed_disposition: None,
     }
 }
 
@@ -97,4 +100,55 @@ fn a_repeated_send_is_the_first_and_a_different_one_is_refused() {
     other.kind = "reply".into();
     let refused = records.record(other, Timestamp(3)).expect_err("another record for the same message");
     assert!(refused.contains("is recorded as"), "{refused}");
+}
+
+/// Replays `home`'s entries into `replica`, as a follower of it receives them.
+fn replicate(home: &Service, replica: &Service) {
+    let mut frames = Vec::new();
+    home.serve(Some(0), Timestamp(1), |frame| {
+        frames.push(frame.to_vec());
+        Ok(())
+    })
+    .expect("serve");
+    replica
+        .with_store(|store| {
+            Follower::new(store).receive(home.home(), |sink| {
+                for frame in &frames {
+                    sink(frame)?;
+                }
+                Ok(())
+            })
+        })
+        .expect("follow");
+}
+
+// Behaviour (#3108 open-stall set): another home's stall, applied here, stalls its seat for the
+// open records held from before it arrived and for those opened after; ended at its home, it
+// leaves both once applied, and no store is read to say so.
+#[test]
+fn another_homes_stall_is_held_here_until_it_ends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = service(&dir);
+    let replica = Arc::new(
+        Service::open(&dir.path().join("replica.sqlite"), "home-b", flotilla_engine_store::registry().expect("registry")).expect("replica"),
+    );
+    let before = OpenAwaiting::open(&replica).expect("open before");
+    let records = AwaitingReplies::open("home-a", &home).expect("open");
+    let spec = stall("s1", None);
+    records.record(spec.clone(), Timestamp(1)).expect("recorded");
+
+    replicate(&home, &replica);
+    let after = OpenAwaiting::open(&replica).expect("open after");
+    for (which, open) in [("before", &before), ("after", &after)] {
+        assert!(open.stalled(&address(SEAT)), "{which}: the seat is stalled");
+        assert_eq!(open.about(&address(SEAT)).len(), 1, "{which}");
+        assert!(open.get("home-a", &record_name(&spec.message)).is_some(), "{which}: held under its home");
+    }
+
+    assert!(records.withdraw(&spec.message, &address(SEAT), "superseded", Timestamp(2)).expect("withdrawn"));
+    replicate(&home, &replica);
+    for (which, open) in [("before", &before), ("after", &after)] {
+        assert!(!open.stalled(&address(SEAT)), "{which}: no longer stalled");
+        assert_eq!(open.about(&address(SEAT)).len(), 0, "{which}");
+    }
 }

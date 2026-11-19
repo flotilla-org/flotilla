@@ -46,6 +46,32 @@ pub enum Awaited {
     Outcome,
 }
 
+/// Why a crew declared its stall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
+pub enum StallReason {
+    #[store(code = "in")]
+    Infra,
+    #[store(code = "sc")]
+    Scope,
+    #[store(code = "de")]
+    Decision,
+    #[store(code = "ac")]
+    Access,
+    #[store(code = "ot")]
+    Other,
+}
+
+/// What a crew proposed should become of its stalled work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
+pub enum ProposedDisposition {
+    #[store(code = "rs")]
+    Resume,
+    #[store(code = "re")]
+    ReduceScope,
+    #[store(code = "fa")]
+    Fail,
+}
+
 /// What the send recorded; it never changes. It declares the stored
 /// AwaitingReply (kind code `ar`), indexed by sender and by subject for the
 /// open records (the agent board's and "stalled" reads), by the message
@@ -76,6 +102,12 @@ pub struct AwaitingReplySpec {
     pub kind: String,
     pub awaited: Awaited,
     pub deadline: Option<Timestamp>,
+    /// A stall's evidence, so another home can show it: what the stalled crew
+    /// reported when it declared, why, and what it proposed. None for an
+    /// inferred stall, where no crew declared anything, and for other kinds.
+    pub report: Option<String>,
+    pub stall_reason: Option<StallReason>,
+    pub proposed_disposition: Option<ProposedDisposition>,
 }
 
 states! {

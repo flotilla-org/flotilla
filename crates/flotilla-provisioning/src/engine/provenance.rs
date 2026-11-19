@@ -26,10 +26,15 @@ use flotilla_resources::{
     DocumentKey, RepositorySpec,
 };
 use flotilla_schema::{ChangeHeader, ChangeItem, Identity, Kind, KindCode, NewChange, Timestamp};
-use flotilla_schema_sqlite::{Read, StoreError};
+use flotilla_schema_sqlite::{stream::Service, Loaded, Read, StoreError};
 use flotilla_state_machines::Resource;
 
-use crate::stored::{manifest_root::ManifestRoot, project::ProjectDefinition, repository::RepositoryRecord};
+use super::manifest_root::{base, generation_name};
+use crate::stored::{
+    manifest_root::{ManifestRoot, RootState},
+    project::ProjectDefinition,
+    repository::RepositoryRecord,
+};
 
 pub(crate) const MANIFEST: &str = "manifest-reconciler";
 pub(crate) const PROJECT_OPERATIONS: &str = "project-operations";
@@ -114,6 +119,116 @@ pub(crate) fn change_of(origin: &DefinitionOrigin, home: &str, at: Timestamp) ->
         DefinitionOrigin::Snapshot => (ADMISSION, Vec::new()),
     };
     NewChange::new(writer, at).with_items(items)
+}
+
+/// A live root a previous-generation stamp may name by its host: its name, host and source.
+pub(crate) struct DeclaringRoot {
+    pub name: String,
+    pub host: String,
+    pub source: String,
+}
+
+/// The root a manifest `origin` names, when it names one.
+pub(crate) fn stamped_root(origin: &DefinitionOrigin) -> Option<&str> {
+    match origin {
+        DefinitionOrigin::Manifest { root, .. } => Some(root),
+        _ => None,
+    }
+}
+
+/// ADR 0047 N→N+1: previous-generation provenance named the declaring host, not its ManifestRoot.
+/// For a manifest `origin` whose root names no root at any home, the stamp is read as such a host:
+/// the root becomes the one among `here`, the live roots of the record's home, with that host and
+/// the origin's source, as the convoy-ensure reconciler's fallback matches it. No such root, or
+/// several, is refused with which. Remove after one roll, with that fallback.
+pub(crate) fn legacy_root(mut origin: DefinitionOrigin, here: &[DeclaringRoot]) -> Result<DefinitionOrigin, String> {
+    let DefinitionOrigin::Manifest { root, source, .. } = &mut origin else { return Ok(origin) };
+    let source = source.as_deref().unwrap_or_default();
+    let matching: Vec<&str> =
+        here.iter().filter(|held| held.host == *root && held.source == source).map(|held| held.name.as_str()).collect();
+    match matching.as_slice() {
+        [name] => {
+            *root = (*name).to_owned();
+            Ok(origin)
+        }
+        [] => Err(format!(
+            "its manifest stamp names `{root}`, no root: as a previous-generation host stamp, no live root at its home declares host `{root}` with source `{source}`"
+        )),
+        several => Err(format!(
+            "its manifest stamp names `{root}`, no root: as a previous-generation host stamp, {} live roots at its home declare host `{root}` with source `{source}`: {}",
+            several.len(),
+            several.join(", ")
+        )),
+    }
+}
+
+/// Why a record stamped with `root` is refused at a home that does not hold that root, which
+/// `homes` hold: manifest stamps belong to the manifest reconciler at the root's home.
+pub(crate) fn declared_elsewhere(root: &str, homes: &[&str]) -> String {
+    format!(
+        "its manifest stamp names root `{root}`, which this home does not hold: the record is declared at the root's home ({})",
+        homes.join(", ")
+    )
+}
+
+/// What a record's manifest stamp names, read at the home writing it.
+enum Stamped {
+    /// A root this home holds.
+    Here,
+    /// A root only these other homes hold.
+    Elsewhere(Vec<String>),
+    /// No root: a previous-generation host stamp, with this home's bound roots.
+    Legacy(Vec<DeclaringRoot>),
+}
+
+/// The manifest root `origin` names, against `service`'s store, for a record written at `home`.
+/// A root this home holds leaves `origin` as it is; a root only other homes hold is refused,
+/// since the record is declared there; a name no home holds as a root is read as a
+/// previous-generation host stamp ([`legacy_root`]) against this home's bound roots.
+pub(crate) fn resolve_stamped_root(service: &Service, home: &str, origin: DefinitionOrigin) -> Result<DefinitionOrigin, String> {
+    let Some(root) = stamped_root(&origin) else { return Ok(origin) };
+    let stamped = service
+        .with_store(|store| {
+            let mut read = store.read()?;
+            if read.resolve(ROOT, root, home)?.is_some() {
+                return Ok(Stamped::Here);
+            }
+            let mut elsewhere = Vec::new();
+            for id in read.resolve_named(ROOT, root)? {
+                if let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? {
+                    elsewhere.push(loaded.home);
+                }
+            }
+            if !elsewhere.is_empty() {
+                return Ok(Stamped::Elsewhere(elsewhere));
+            }
+            let mut here = Vec::new();
+            let mut after = None;
+            loop {
+                let page = read.scan::<Resource<ManifestRoot>>(home, after, 64)?;
+                for id in page.ids {
+                    let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? else { continue };
+                    if matches!(loaded.value.state(), RootState::Bound { .. }) {
+                        let spec = loaded.value.spec();
+                        here.push(DeclaringRoot {
+                            name: base(&loaded.name).to_owned(),
+                            host: spec.host.clone(),
+                            source: spec.source.clone(),
+                        });
+                    }
+                }
+                after = page.next;
+                if after.is_none() {
+                    return Ok(Stamped::Legacy(here));
+                }
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    match stamped {
+        Stamped::Here => Ok(origin),
+        Stamped::Elsewhere(homes) => Err(declared_elsewhere(root, &homes.iter().map(String::as_str).collect::<Vec<_>>())),
+        Stamped::Legacy(here) => legacy_root(origin, &here),
+    }
 }
 
 /// The project a workflow template written with `origin` is materialised for: its `project` column.
@@ -208,8 +323,7 @@ pub(crate) fn origin_of(
 /// The source of `root`, and the path of each document it declares: the root's baselines list
 /// every one. None while this store does not hold the root.
 fn load_root(read: &mut Read<'_>, root: &Identity) -> Result<Option<Root>, StoreError> {
-    let Some(id) = read.resolve(root.kind, &root.name, &root.home)? else { return Ok(None) };
-    let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? else { return Ok(None) };
+    let Some(loaded) = live_generation(read, root)? else { return Ok(None) };
     let spec = loaded.value.spec();
     let paths = spec
         .baselines
@@ -218,6 +332,26 @@ fn load_root(read: &mut Read<'_>, root: &Identity) -> Result<Option<Root>, Store
         .map(|key| ((key.kind, key.name), key.path))
         .collect();
     Ok(Some(Root { source: spec.source.clone(), paths }))
+}
+
+/// The generation of `root` that reads for it at its home: a change names a root by the name it
+/// was declared under, and a root declared again after it retired is that name's next generation.
+/// The newest bound generation, else the newest. Generations are numbered from the declared name
+/// up and none is deleted, so each is a keyed read.
+fn live_generation(read: &mut Read<'_>, root: &Identity) -> Result<Option<Loaded<Resource<ManifestRoot>>>, StoreError> {
+    let mut generations = Vec::new();
+    while let Some(id) = read.resolve(root.kind, &generation_name(&root.name, generations.len() as u64), &root.home)? {
+        generations.push(id);
+    }
+    let mut newest = None;
+    for id in generations.into_iter().rev() {
+        let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? else { continue };
+        if matches!(loaded.value.state(), RootState::Bound { .. }) {
+            return Ok(Some(loaded));
+        }
+        newest.get_or_insert(loaded);
+    }
+    Ok(newest)
 }
 
 #[cfg(test)]

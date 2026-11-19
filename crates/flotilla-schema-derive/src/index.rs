@@ -9,8 +9,25 @@
 //! ```
 //!
 //! `eq` and `order` name top-level single-column fields: unattributed fields whose type (inside
-//! `Option`) is a `KeyColumn`, or `intern` fields. `order` refuses `intern` fields and references
-//! (`Ref`, `Identity`): their columns hold local surrogate ids, whose order is insertion order in one
+//! `Option`) is a `KeyColumn`, or `intern` fields. They may also name a state's two columns: the
+//! state field itself (on a spec, the holder's `state`) for its label, whose constructor argument
+//! is the state's label enum, and `<state field>_since` for the time the label was entered.
+//!
+//! ```text
+//! index(name = "by_inbox", eq(inbox, state), order(admitted_seq))   // MessageSpec::by_inbox(&inbox, &MessageStateLabel::Pending)
+//! index(name = "settled", eq(inbox), order(state_since), when(state in [Settled]))
+//! ```
+//!
+//! On a spec, any other name is a single-column datum of the holder's state, which this derive
+//! cannot see: it may `order` (with `is_some`) or filter an index, never key `eq`, and the kind's
+//! descriptor refuses a name its state does not declare.
+//!
+//! ```text
+//! index(name = "delivered", eq(inbox), order(delivered_at), when(delivered_at is_some))
+//! ```
+//!
+//! `order` refuses `intern` fields and references (`Ref`, `Identity`): their columns hold local
+//! surrogate ids, whose order is insertion order in one
 //! store and differs between stores, so it is no order a caller could mean. `when` conjoins `<state field> in [Variant, ...]`,
 //! whose codes come from the state's label enum (`Labelled::Label`), and `<optional field> is_some`. An optional
 //! `order` field must be required by `is_some`, so keyset paging never compares a null.
@@ -24,6 +41,7 @@ use syn::{
     ext::IdentExt,
     parenthesized,
     parse::{ParseStream, Parser},
+    parse_quote,
     punctuated::Punctuated,
     DeriveInput, Ident, LitStr, Token, Type,
 };
@@ -47,18 +65,25 @@ enum Condition {
     IsSome { field: Ident },
 }
 
-/// A field an index names, resolved against the kind's fields.
-struct Column<'f, 'a> {
-    field: &'f Field<'a>,
-    /// The argument and key type: the field type, inside `Option` when the field is optional.
-    inner: &'a Type,
+/// A column an index names, resolved against the kind's fields and state.
+struct Column {
+    /// The column on the root row.
+    name: LitStr,
+    /// The constructor argument: the field, or the name the index gives a state column.
+    ident: Ident,
+    /// The argument and key type: the field type, inside `Option` when the field is optional; a
+    /// state's label enum; or `Timestamp` for its `_since`.
+    inner: Type,
     optional: bool,
     interned: bool,
+    /// A datum of a spec holder's state: named, not typed here, so it orders or filters an index
+    /// but takes no constructor argument.
+    datum: bool,
 }
 
 /// Parses every `index(...)` body and checks it against the kind's fields.
 pub(crate) struct Indexes<'f, 'a> {
-    indexes: Vec<(IndexAttr, Key<'f, 'a>)>,
+    indexes: Vec<(IndexAttr, Key)>,
     fields: &'f [Field<'a>],
     /// A kind spec's `state = S`: `state in [...]` names the holder's state field, `State<S>`.
     holder_state: Option<&'f Type>,
@@ -86,7 +111,7 @@ impl<'f, 'a> Indexes<'f, 'a> {
                     "a unique index belongs on a part struct, unique within the row's owner, with `eq` fields only and no `order` or `when`",
                 ));
             }
-            let key = check(&index, fields, holder_state.is_some())?;
+            let key = check(&index, fields, holder_state)?;
             indexes.push((index, key));
         }
         Ok(Indexes { indexes, fields, holder_state })
@@ -98,8 +123,8 @@ impl<'f, 'a> Indexes<'f, 'a> {
         let indexes = self.indexes.iter().map(|(index, (eq, order))| {
             let name = &index.name;
             let unique = index.unique;
-            let eq = eq.iter().map(|column| &column.field.name);
-            let order = order.iter().map(|column| &column.field.name);
+            let eq = eq.iter().map(|column| &column.name);
+            let order = order.iter().map(|column| &column.name);
             let predicate = index.when.iter().map(|condition| match condition {
                 Condition::In { field, variants } => {
                     // `check` resolved this field and refused it unless it is a `State<E>` field,
@@ -128,8 +153,9 @@ impl<'f, 'a> Indexes<'f, 'a> {
                     }
                 }
                 Condition::IsSome { field } => {
-                    // `check` resolved this field as an optional single column.
-                    let column = &find(self.fields, field).expect("checked").name;
+                    // `check` resolved this field as an optional single column, or a state datum.
+                    let column = &find(self.fields, field)
+                        .map_or_else(|| LitStr::new(&field.unraw().to_string(), field.span()), |field| field.name.clone());
                     quote!(#schema::Condition::NotNull { column: ::std::string::String::from(#column) })
                 }
             });
@@ -163,18 +189,18 @@ impl<'f, 'a> Indexes<'f, 'a> {
         let mut bounds = vec![quote!(#ident #ty_generics: #declares)];
         let mut functions = Vec::new();
         for (index, (eq, order)) in &self.indexes {
-            for column in eq.iter().chain(order).filter(|column| !column.interned) {
-                let inner = column.inner;
+            for column in eq.iter().chain(order).filter(|column| !column.interned && !column.datum) {
+                let inner = &column.inner;
                 bounds.push(quote!(#inner: #schema::KeyColumn + #schema::Element));
             }
             let function = format_ident!("{}", index.name.value(), span = index.name.span());
             let name = &index.name;
             let args = eq.iter().map(|column| {
-                let (arg, inner) = (column.field.ident, column.inner);
+                let (arg, inner) = (&column.ident, &column.inner);
                 quote!(#arg: &#inner)
             });
             let values = eq.iter().map(|column| {
-                let (arg, inner) = (column.field.ident, column.inner);
+                let (arg, inner) = (&column.ident, &column.inner);
                 if column.interned {
                     quote!(#schema::interned_value::<#inner>(#arg))
                 } else {
@@ -207,8 +233,8 @@ impl<'f, 'a> Indexes<'f, 'a> {
     }
 }
 
-fn names(columns: &[Column<'_, '_>]) -> String {
-    columns.iter().map(|column| format!("`{}`", column.field.name.value())).collect::<Vec<_>>().join(", ")
+fn names(columns: &[Column]) -> String {
+    columns.iter().map(|column| format!("`{}`", column.name.value())).collect::<Vec<_>>().join(", ")
 }
 
 fn parse_body(input: ParseStream<'_>) -> syn::Result<IndexAttr> {
@@ -301,22 +327,94 @@ fn field<'f, 'a>(fields: &'f [Field<'a>], ident: &Ident) -> syn::Result<&'f Fiel
     })
 }
 
-/// A field usable as an index column: one column of the root row.
-fn column<'f, 'a>(fields: &'f [Field<'a>], ident: &Ident) -> syn::Result<Column<'f, 'a>> {
+/// A name usable as an index column: one column of the root row. That is a single-column field,
+/// a state's label (the state field, or on a spec the holder's `state`), the time it was
+/// entered (`<state field>_since`, unless a field takes that name), or on a spec any other name:
+/// a single-column datum of the holder's state.
+fn column(fields: &[Field<'_>], holder_state: Option<&Type>, ident: &Ident) -> syn::Result<Column> {
+    let schema = schema();
+    let unraw = ident.unraw().to_string();
+    let label = |name: LitStr, ident: Ident, state: &Type| Column {
+        name,
+        ident,
+        inner: parse_quote!(<#state as #schema::Labelled>::Label),
+        optional: false,
+        interned: false,
+        datum: false,
+    };
+    let since = |name: String| Column {
+        name: LitStr::new(&name, ident.span()),
+        ident: ident.clone(),
+        inner: parse_quote!(#schema::Timestamp),
+        optional: false,
+        interned: false,
+        datum: false,
+    };
+    if let Some(state) = holder_state {
+        if unraw == HOLDER_STATE {
+            return Ok(label(LitStr::new(HOLDER_STATE, ident.span()), ident.clone(), state));
+        }
+        if unraw == format!("{HOLDER_STATE}_since") {
+            return Ok(since(unraw));
+        }
+        if find(fields, ident).is_none() {
+            // The state's own declaration lists its data, out of this derive's sight: the kind's
+            // descriptor checks the column exists, is not a surrogate, and is nullable only where
+            // `is_some` requires it. Every state datum is nullable, as other labels lack it.
+            return Ok(Column {
+                name: LitStr::new(&unraw, ident.span()),
+                ident: ident.clone(),
+                inner: parse_quote!(()),
+                optional: true,
+                interned: false,
+                datum: true,
+            });
+        }
+    }
+    if find(fields, ident).is_none() {
+        let state = unraw
+            .strip_suffix("_since")
+            .and_then(|prefix| fields.iter().find(|field| field.ident.unraw() == prefix && field.shape == FieldShape::State));
+        if let Some(state) = state {
+            return Ok(since(format!("{}_since", state.name.value())));
+        }
+    }
     let field = field(fields, ident)?;
     let column = match field.shape {
         FieldShape::Column => match shape::option_inner(field.ty) {
-            Some(inner) => Column { field, inner, optional: true, interned: false },
-            None => Column { field, inner: field.ty, optional: false, interned: false },
+            Some(inner) => Column {
+                name: field.name.clone(),
+                ident: field.ident.clone(),
+                inner: inner.clone(),
+                optional: true,
+                interned: false,
+                datum: false,
+            },
+            None => Column {
+                name: field.name.clone(),
+                ident: field.ident.clone(),
+                inner: field.ty.clone(),
+                optional: false,
+                interned: false,
+                datum: false,
+            },
         },
         FieldShape::Intern { optional } => {
             let inner = if optional { shape::option_inner(field.ty).unwrap_or(field.ty) } else { field.ty };
-            Column { field, inner, optional, interned: true }
+            Column { name: field.name.clone(), ident: field.ident.clone(), inner: inner.clone(), optional, interned: true, datum: false }
+        }
+        FieldShape::State => {
+            let state =
+                shape::first_arg(field.ty).ok_or_else(|| refuse(ident, format_args!("state field `{ident}` must be `State<E>`")))?;
+            label(field.name.clone(), field.ident.clone(), state)
         }
         _ => {
             return Err(refuse(
                 ident,
-                format_args!("index column `{ident}` must be a single-column field: an unattributed key column or an `intern` field"),
+                format_args!(
+                    "index column `{ident}` must be a single-column field: an unattributed key column, an `intern` field, \
+                     a state field (its label) or `<state field>_since`"
+                ),
             ))
         }
     };
@@ -324,20 +422,27 @@ fn column<'f, 'a>(fields: &'f [Field<'a>], ident: &Ident) -> syn::Result<Column<
 }
 
 /// An index's `eq` and `order` columns.
-type Key<'f, 'a> = (Vec<Column<'f, 'a>>, Vec<Column<'f, 'a>>);
+type Key = (Vec<Column>, Vec<Column>);
 
 /// The name a kind spec's indexes give the holder's state field.
 const HOLDER_STATE: &str = "state";
 
-fn check<'f, 'a>(index: &IndexAttr, fields: &'f [Field<'a>], holder_state: bool) -> syn::Result<Key<'f, 'a>> {
+fn check(index: &IndexAttr, fields: &[Field<'_>], holder_state: Option<&Type>) -> syn::Result<Key> {
     if index.eq.is_empty() && index.order.is_empty() {
         return Err(refuse(&index.name, "an index needs at least one `eq` or `order` field"));
     }
-    let eq = index.eq.iter().map(|ident| column(fields, ident)).collect::<syn::Result<Vec<_>>>()?;
-    let order = index.order.iter().map(|ident| column(fields, ident)).collect::<syn::Result<Vec<_>>>()?;
+    let eq = index.eq.iter().map(|ident| column(fields, holder_state, ident)).collect::<syn::Result<Vec<_>>>()?;
+    let order = index.order.iter().map(|ident| column(fields, holder_state, ident)).collect::<syn::Result<Vec<_>>>()?;
+    if let Some(column) = eq.iter().find(|column| column.datum) {
+        let ident = &column.ident;
+        return Err(refuse(
+            ident,
+            format_args!("`{ident}` is no field of this spec; a state datum can order or filter an index, not key `eq`"),
+        ));
+    }
     // Spans point at the name inside `order(...)`, where the fix is made.
     for (ident, column) in index.order.iter().zip(&order) {
-        let reference = shape::head_name(column.inner).is_some_and(|name| name == "Ref" || name == "Identity");
+        let reference = shape::head_name(&column.inner).is_some_and(|name| name == "Ref" || name == "Identity");
         if column.interned || reference {
             return Err(refuse(
                 ident,
@@ -358,7 +463,7 @@ fn check<'f, 'a>(index: &IndexAttr, fields: &'f [Field<'a>], holder_state: bool)
     for condition in &index.when {
         match condition {
             Condition::In { field: ident, variants } => {
-                if !(holder_state && ident.unraw() == HOLDER_STATE) {
+                if !(holder_state.is_some() && ident.unraw() == HOLDER_STATE) {
                     let field = field(fields, ident)?;
                     if field.shape != FieldShape::State {
                         return Err(refuse(ident, format_args!("`{ident} in [...]` needs a `#[store(state)]` field")));
@@ -370,15 +475,15 @@ fn check<'f, 'a>(index: &IndexAttr, fields: &'f [Field<'a>], holder_state: bool)
                 }
             }
             Condition::IsSome { field: ident } => {
-                if !column(fields, ident)?.optional {
+                if !column(fields, holder_state, ident)?.optional {
                     return Err(refuse(ident, format_args!("`{ident} is_some` needs an optional single-column field")));
                 }
                 required.insert(ident.unraw().to_string());
             }
         }
     }
-    if let Some(column) = order.iter().find(|column| column.optional && !required.contains(&column.field.ident.unraw().to_string())) {
-        let ident = column.field.ident;
+    if let Some(column) = order.iter().find(|column| column.optional && !required.contains(&column.ident.unraw().to_string())) {
+        let ident = &column.ident;
         return Err(refuse(
             ident,
             format_args!("optional order field `{ident}` needs `when({ident} is_some)`: paging cannot compare a null"),

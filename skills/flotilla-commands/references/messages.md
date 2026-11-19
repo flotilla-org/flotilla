@@ -17,9 +17,10 @@ handoff message. Pass an absolute file path:
 flotilla artifact put --kind brief --about SUBJECT /tmp/handoff.md
 ```
 
-Use `--carry` on handoff when typed resource/revision references are needed;
-obtain the JSON shape from the actual Message reference rather than inventing
-an address encoding. Read the command's help for the current argument shape:
+Use `--carry ADDRESS@REVISION` on handoff when typed references are needed,
+for example `--carry project:flotilla/convoy:demo@rv-1`; take the address and
+revision from the record you carry rather than inventing them. Read the
+command's help for the current argument shape:
 
 ```sh
 flotilla crew RECIPIENT handoff --help

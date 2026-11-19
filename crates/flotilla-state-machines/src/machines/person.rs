@@ -8,8 +8,8 @@
 //! A person's receipt is their acknowledgement or answer, never a surface
 //! loading the message: the [`Receive`] edge, Active to the same Active, whose
 //! master is the message. An answer is a receipt followed by a reply message,
-//! which settles the original as answered. The shape follows the controller
-//! consumer's (`specs/primitives/machines/controller.qnt`) without its
+//! which settles the original as answered. The shape follows the service
+//! consumer's (`specs/primitives/machines/service.qnt`) without its
 //! retirement, which comes with the principals model (#3457).
 //!
 //! The stored kind is `Resource<Person>` (code `pn`), declared by

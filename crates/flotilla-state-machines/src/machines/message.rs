@@ -109,6 +109,18 @@ pub enum RequestBody {
     /// boxed for its size: the stored body is the request itself.
     #[serde(rename = "cv")]
     Convoy(Box<ConvoyRequest>),
+    /// A request to the checkout inspector at a checkout's home (#3108): inspect the checkout the
+    /// message's subject reference names, now, and write what changed. `remote` asks for the
+    /// branch's ref on its remote too. The inspector's receipt answers it; an undeliverable
+    /// request is a failed inspection to the gate that sent it.
+    #[serde(rename = "ci")]
+    CheckoutInspection { remote: bool },
+    /// A request to the forge observer at a host (#3108): look for a change request from
+    /// `branch` of the repository the message's subject reference names, and record what it finds
+    /// on its record's head branch. Only the repository's own branch counts, never a fork's of the
+    /// same name. Its receipt answers it; a lookup that failed is an undeliverable request.
+    #[serde(rename = "cb")]
+    ChangeRequestBranch { branch: String },
 }
 
 /// A thing the message refers to, at a revision (ADR 0066 §4). At most one
@@ -137,16 +149,21 @@ pub fn sent(message: &MessageRef) -> Ref<Sent> {
 }
 
 /// The message as sent: the spec's envelope. Immutable. It declares the stored
-/// Message (kind code `ms`), indexed for an inbox's pending messages in admission order, for open
-/// messages by deadline (the expiry sweep's read), and by the message each
-/// replies to or supersedes, which also keeps an expunge's foreign-key checks
-/// off a table scan.
+/// Message (kind code `ms`), indexed for an inbox's messages in one state in admission order
+/// (pending to claim, open, and a seat's latest; unfiltered, since a `state in [..]` filter beside
+/// `state = ?` makes SQLite sort instead of walking the index), for
+/// an inbox's delivered messages by their receipt time (the latest delivery), for its settled
+/// messages by when they settled (answers since a time), for open messages by deadline (the expiry sweep's read), and by the
+/// message each replies to or supersedes, which also keeps an expunge's foreign-key checks off a
+/// table scan.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(
     kind = "Message",
     code = "ms",
     state = MessageState,
-    index(name = "pending_by_inbox", eq(inbox), order(admitted_seq), when(state in [Pending])),
+    index(name = "by_inbox", eq(inbox, state), order(admitted_seq)),
+    index(name = "delivered_by_inbox", eq(inbox), order(delivered_at), when(delivered_at is_some)),
+    index(name = "settled_by_inbox", eq(inbox), order(state_since), when(state in [Settled])),
     index(name = "deadline", order(deadline), when(state in [Pending, Awaiting], deadline is_some)),
     index(name = "by_reply", eq(in_reply_to), when(in_reply_to is_some)),
     index(name = "by_supersedes", eq(supersedes), when(supersedes is_some))
@@ -273,14 +290,18 @@ states! {
     /// settlement or a drop kept, if any. `watermark` is the consumer stream's
     /// applied watermark that an expiry with a consumer bound relied on, and
     /// `None` for every other drop. A drop's time is the state's `since`
-    /// (ruling G4), so Dropped records no time of its own.
+    /// (ruling G4), so Dropped records no time of its own. `delivered_at` is
+    /// the receipt's time, shared the same way: set once by Deliver and kept
+    /// beside the receiver when the message settles or drops, so a later
+    /// state's `since` never stands in for it.
     pub enum MessageState => MessageLabel {
         Pending = "pe",
-        Awaiting { #[store(flatten)] receiver: Receiver } = "aw",
-        Settled { #[store(flatten)] receiver: Option<Receiver> } = "se",
+        Awaiting { #[store(flatten)] receiver: Receiver, delivered_at: Timestamp } = "aw",
+        Settled { #[store(flatten)] receiver: Option<Receiver>, delivered_at: Option<Timestamp> } = "se",
         Dropped {
             reason: DropReason,
             #[store(flatten)] receiver: Option<Receiver>,
+            delivered_at: Option<Timestamp>,
             watermark: Option<Timestamp>,
         } = "dr",
     }
@@ -290,8 +311,17 @@ impl MessageState {
     /// The one receiver, once delivered: kept when the message settles or drops.
     pub fn receiver(&self) -> Option<&Receiver> {
         match self {
-            MessageState::Awaiting { receiver } => Some(receiver),
-            MessageState::Settled { receiver } | MessageState::Dropped { receiver, .. } => receiver.as_ref(),
+            MessageState::Awaiting { receiver, .. } => Some(receiver),
+            MessageState::Settled { receiver, .. } | MessageState::Dropped { receiver, .. } => receiver.as_ref(),
+            MessageState::Pending => None,
+        }
+    }
+
+    /// When the receipt was observed, once delivered: kept when the message settles or drops.
+    pub fn delivered_at(&self) -> Option<Timestamp> {
+        match self {
+            MessageState::Awaiting { delivered_at, .. } => Some(*delivered_at),
+            MessageState::Settled { delivered_at, .. } | MessageState::Dropped { delivered_at, .. } => *delivered_at,
             MessageState::Pending => None,
         }
     }
@@ -333,8 +363,8 @@ type DecodeReceipt = fn(&Event) -> Result<Option<(String, Transport)>, EventErro
 /// [`Receipts`] served from the store's log (#3392 G11, D1): the entries
 /// about each message, as a store's `about` read pages them, give the
 /// receipts a message's gates read. Any consumer kind's `Receive` is a
-/// receipt (#3424 ruling 2): an agent session's and a person's are accepted
-/// from the start, and [`ReceiptLog::consumer`] adds a controller's kind. An entry of another
+/// receipt (#3424 ruling 2): an agent session's, a person's and a service's
+/// are accepted from the start, and [`ReceiptLog::consumer`] adds another kind. An entry of another
 /// kind, or of another edge, is no receipt and is skipped without decoding
 /// its arguments; a `Receive` entry whose arguments do not decode is refused. A
 /// message's version is the number of receipts about it: entries are only
@@ -348,7 +378,10 @@ pub struct ReceiptLog {
 
 impl Default for ReceiptLog {
     fn default() -> Self {
-        ReceiptLog { consumers: BTreeMap::new(), messages: BTreeMap::new() }.consumer::<AgentSession>().consumer::<Person>()
+        ReceiptLog { consumers: BTreeMap::new(), messages: BTreeMap::new() }
+            .consumer::<AgentSession>()
+            .consumer::<Person>()
+            .consumer::<super::service::Service>()
     }
 }
 
@@ -625,7 +658,7 @@ impl Machine for Message {
                 EdgeDef::<Self, Deliver>::new()
                     .from([Pending])
                     .to([Settled, Awaiting])
-                    .changes(["receiver"])
+                    .changes(["receiver", "delivered_at"])
                     .gate("the receiver's receipt was observed with this transport", gate_deliver)
                     .effect(deliver),
             )
@@ -633,15 +666,18 @@ impl Machine for Message {
                 EdgeDef::<Self, Settle>::new()
                     .from([Pending, Awaiting])
                     .to([Settled])
-                    .changes(["receiver"])
+                    .changes(["receiver", "delivered_at"])
                     .gate("the expectation's evidence was observed (a reply only after delivery)", gate_settle)
-                    .effect(|_, state, _| MessageState::Settled { receiver: state.receiver().cloned() }),
+                    .effect(|_, state, _| MessageState::Settled {
+                        receiver: state.receiver().cloned(),
+                        delivered_at: state.delivered_at(),
+                    }),
             )
             .edge(
                 EdgeDef::<Self, DropMessage>::new()
                     .from([Pending, Awaiting])
                     .to([Dropped])
-                    .changes(["reason", "receiver", "watermark"])
+                    .changes(["reason", "receiver", "delivered_at", "watermark"])
                     .gate("the drop reason's evidence holds", gate_drop)
                     .effect(drop_message),
             )
@@ -701,8 +737,8 @@ fn gate_deliver(h: &mut Handle<'_, Message>, deliver: &Deliver) -> Result<(), Me
 // its evidence with the one receiver.
 fn deliver(h: &mut Handle<'_, Message>, _: MessageState, deliver: &Deliver) -> MessageState {
     match h.spec().expectation {
-        Expectation::Nothing => MessageState::Settled { receiver: Some(deliver.receiver.clone()) },
-        _ => MessageState::Awaiting { receiver: deliver.receiver.clone() },
+        Expectation::Nothing => MessageState::Settled { receiver: Some(deliver.receiver.clone()), delivered_at: Some(h.now()) },
+        _ => MessageState::Awaiting { receiver: deliver.receiver.clone(), delivered_at: h.now() },
     }
 }
 
@@ -841,5 +877,10 @@ fn drop_message(h: &mut Handle<'_, Message>, state: MessageState, drop: &DropMes
         DropReason::Expired if consumer_bound(h) => applied_through(h).copied(),
         _ => None,
     };
-    MessageState::Dropped { reason: drop.reason.clone(), receiver: state.receiver().cloned(), watermark }
+    MessageState::Dropped {
+        reason: drop.reason.clone(),
+        receiver: state.receiver().cloned(),
+        delivered_at: state.delivered_at(),
+        watermark,
+    }
 }

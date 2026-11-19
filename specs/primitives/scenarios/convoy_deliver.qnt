@@ -1,7 +1,7 @@
 module convoy_deliver {
-  import convoy(IDS = Set(1), SEAT_LIMIT = 3, REPLACEMENT_LIMIT = 1) as C from "../machines/convoy"
+  import convoy(SEAT_LIMIT = 3, REPLACEMENT_LIMIT = 1) as C from "../machines/convoy"
   var now: int
-  // The replacements granted to seat "a", which its record must carry, across a rollover too.
+  // The replacements granted to seat "a", which its record must carry.
   var replacedA: int
   action keepWorld = all { now' = now, replacedA' = replacedA }
   action tick = all { now < 1, now' = now + 1, replacedA' = replacedA }
@@ -10,11 +10,10 @@ module convoy_deliver {
   // and admission_placement keeps two. Promise 0 is admitted from any source;
   // promise 1 is declared by the crew. At most one submission per promise
   // keeps the graph finite while reaching Submitted, Reject and both Keeps.
-  def unsubmitted(id: int, p: int): bool = match C::convoys.get(id) {
+  def unsubmitted(id: int, p: int): bool =
     // An if, not `or`: TLC splits a disjunction in an action into branches.
-    | Present(s) => if (C::work(s).promises.keys().contains(p)) C::work(s).promises.get(p).submissions.length() == 0 else true
-    | Absent => true
-  }
+    if (C::phase.keys().contains(id) and C::promises.get(id).keys().contains(p)) C::promiseRecord(id, p).submissions.length() == 0
+    else true
   pure val definition = { kind: "opaque", target: "target" }
   pure val sources = Set(C::Template, C::Dispatch, C::Crew)
   pure val authorities = Set(C::Operator, C::ConvoySupervisor, C::Dispatcher, C::Owner, C::OwnerSupervisor)
@@ -32,12 +31,15 @@ module convoy_deliver {
       C::admitRequest(1, { project: "project", projectKnown: true,
         promises: promises.mapBy(_ => { promise: definition, source: source, owner: owner }),
         duties: if (lifetimeDuty) Map(0 -> { owner: "a", scope: C::Lifetime, terms: "terms" }) else Map(),
-        seats: if (crowded) Map("a" -> { parent: C::Root, supervisedBy: "op", replacements: 0 }, "c" -> { parent: C::Under("a"), supervisedBy: "a", replacements: 0 },
-            "d" -> { parent: C::Under("a"), supervisedBy: "a", replacements: 0 })
-          else Map("a" -> { parent: C::Root, supervisedBy: "op", replacements: 0 }), quota: Map(0 -> 1, 1 -> 1), priority: 1 }),
+        seats: if (crowded) Map("a" -> { parent: C::Root, supervisedBy: "op" }, "c" -> { parent: C::Under("a"), supervisedBy: "a" },
+            "d" -> { parent: C::Under("a"), supervisedBy: "a" })
+          else Map("a" -> { parent: C::Root, supervisedBy: "op" }), priority: 1 }),
       keepWorld,
     }
   }
+  // FailSeat, Link, Unlink and Abandon's cause read and write nothing any other
+  // edge reads, so they would multiply this graph without reaching a new
+  // interleaving; the full-graph conformance harness covers them.
   action step = {
     nondet p = Set(0, 1).oneOf()
     nondet seat = Set("a", "b").oneOf()
@@ -56,83 +58,92 @@ module convoy_deliver {
       { nondet parent = Set("a", "b", "z").oneOf() all { C::addSeat(1, "b", parent, "a", auth), keepWorld } },
       all { C::resupervise(1, "b", "op", auth), keepWorld },
       all { C::retireSeat(1, seat, auth), keepWorld },
-      all { C::rollover(1, auth), keepWorld },
       all { C::replaceSeat(1, "a"), now' = now, replacedA' = replacedA + 1 },
-      all { C::deliver(1), keepWorld },
-      all { C::abandon(1, auth, reason), keepWorld },
-      all { C::readmit(1, Map(0 -> 2, 1 -> 1), auth), keepWorld },
+      all { C::deliver(1, "merged"), keepWorld },
+      all { C::abandon(1, auth, C::OperatorDecision, reason), keepWorld },
+      { nondet holds = Set(C::Unread, C::Read(Set()), C::Read(Set("message:m"))).oneOf() all { C::retire(1, holds), keepWorld } },
       all { C::unchanged, tick },
     }
   }
-  def everyState(f: C::State => bool): bool = C::convoys.keys().map(i => C::convoys.get(i)).forall(slot => match slot {
-    | Absent => true | Present(s) => f(s)
-  })
+  def everyConvoy(f: int => bool): bool = C::phase.keys().forall(id => f(id))
   // Every convoy holds an obligation: a promise or a convoy-lifetime duty.
-  val everyConvoyObliged = everyState(s => C::work(s).promises.keys().size() > 0 or C::work(s).spec.duties.keys().exists(d => C::lifetime(C::work(s).spec.duties.get(d))))
+  val everyConvoyObliged = everyConvoy(id => C::promises.get(id).keys().size() > 0
+    or C::duties.get(id).keys().exists(d => C::lifetime(C::duties.get(id).get(d))))
   // Delivered: no promise open, and no lifetime duty holding.
-  val deliveredSettled = everyState(s => match s {
-    | Delivered(w) => C::openPromises(w).size() == 0 and C::holdingDuties(w).size() == 0
+  val deliveredSettled = everyConvoy(id => match C::phase.get(id) {
+    | Delivered(_) => C::openPromises(id).size() == 0 and C::holdingDuties(id).size() == 0
     | _ => true
   })
-  // Finality is checked through the rule interface: an operator, who may
+  // Finality is checked through the machine's outcomes: an operator, who may
   // settle anything open, can neither submit, reject, keep, retract nor
-  // reassign a settled promise. It lives here, not in the machine, to keep
-  // other compositions' IR under Apalache's limit.
-  def settledFinal(s: C::State): bool = C::work(s).promises.keys().forall(p => {
-    val r = C::work(s).promises.get(p)
+  // reassign a settled promise, and the crew cannot declare its id again.
+  def settledFinal(id: int): bool = C::promises.get(id).keys().forall(p => {
+    val r = C::promiseRecord(id, p)
     C::open(r) or Set(
       C::Submit({ promise: p, by: r.owner, reference: "ref", durable: true }),
       C::Reject({ promise: p }),
       C::Keep(C::Observed({ promise: p, submission: r.submissions.length() })),
       C::Keep(C::Verdict({ promise: p, by: "operator", authority: C::Operator, reason: "decision" })),
       C::Retract({ promise: p, by: "operator", authority: C::Operator, reason: "decision" }),
-      C::Reassign({ promise: p, to: r.owner, by: "operator", authority: C::Operator })
-    ).forall(e => not(C::moved(C::step(s, e))))
+      C::Reassign({ promise: p, to: r.owner, by: "operator", authority: C::Operator }),
+      C::Declare({ promise: p, definition: definition, owner: r.owner })
+    ).forall(e => not(C::accepts(id, e)))
   })
-  val settledPromisesFinal = everyState(s => settledFinal(s))
+  val settledPromisesFinal = everyConvoy(id => settledFinal(id))
+  // A retired convoy holds no retired duties, and takes no edge, Retire included.
+  val retiredFinal = everyConvoy(id => C::phase.get(id) != C::Retired or and {
+    C::retired.get(id) == Set(),
+    Set(C::Retire(C::Read(Set())), C::Deliver({ disposition: "merged" }), C::Abandon({ authorised: true, cause: C::OperatorDecision, reason: "decision" }))
+      .forall(e => not(C::accepts(id, e))),
+  })
+  // An ended convoy takes no decision on a promise, and only an abandoned one
+  // takes the world's resolution of a submission (#3108 ruling 1), which
+  // writes only the promise.
+  val endedDecidesNothing = everyConvoy(id => C::isOpen(id) or C::promises.get(id).keys().forall(p => {
+    val r = C::promiseRecord(id, p)
+    Set(
+      C::Submit({ promise: p, by: r.owner, reference: "ref", durable: true }),
+      C::Keep(C::Verdict({ promise: p, by: "operator", authority: C::Operator, reason: "decision" })),
+      C::Retract({ promise: p, by: "operator", authority: C::Operator, reason: "decision" }),
+      C::Reassign({ promise: p, to: r.owner, by: "operator", authority: C::Operator })
+    ).forall(e => not(C::accepts(id, e))) and (C::isAbandoned(id) or
+      Set(C::Reject({ promise: p }), C::Keep(C::Observed({ promise: p, submission: r.submissions.length() })))
+        .forall(e => not(C::accepts(id, e))))
+  }))
   // A Submitted promise has a current submission.
-  val submittedHasSubmission = everyState(s => C::work(s).promises.keys().forall(p =>
-    C::work(s).promises.get(p).state != C::Submitted or C::work(s).promises.get(p).submissions.length() > 0))
+  val submittedHasSubmission = everyConvoy(id => C::promises.get(id).keys().forall(p =>
+    C::promiseRecord(id, p).state != C::Submitted or C::promiseRecord(id, p).submissions.length() > 0))
   // A crew-declared promise retracted by its owner had no submission: the
   // owner's unilateral retraction closes once anything is submitted.
-  val ownerRetractsOnlyUnsubmitted = everyState(s => match s {
-    | Open(w) => w.promises.keys().forall(p => {
-        val r = w.promises.get(p)
-        not(C::open(r)) or r.submissions.length() == 0 or
-          not(C::moved(C::step(s, C::Retract({ promise: p, by: r.owner, authority: C::Owner, reason: "decision" }))))
-      })
-    | _ => true
-  })
-  // Every promise and duty owner is a seat, and every seat's parent is a seat.
-  val ownersAreSeats = everyState(s => C::work(s).promises.keys().forall(p => C::work(s).seats.keys().contains(C::work(s).promises.get(p).owner))
-    and C::work(s).spec.duties.keys().forall(d => C::work(s).seats.keys().contains(C::work(s).spec.duties.get(d).owner)))
-  val seatTreeClosed = everyState(s => C::work(s).seats.keys().forall(seat => match C::work(s).seats.get(seat).parent {
-    | Root => true | Under(q) => C::work(s).seats.keys().contains(q)
+  val ownerRetractsOnlyUnsubmitted = everyConvoy(id => not(C::isOpen(id)) or C::promises.get(id).keys().forall(p => {
+    val r = C::promiseRecord(id, p)
+    not(C::open(r)) or r.submissions.length() == 0 or
+      not(C::accepts(id, C::Retract({ promise: p, by: r.owner, authority: C::Owner, reason: "decision" })))
   }))
-  val seatTreeAcyclic = everyState(s => C::acyclic(C::work(s).seats))
+  // Every promise and duty owner is a seat, and every seat's parent is a seat.
+  val ownersAreSeats = everyConvoy(id => C::promises.get(id).keys().forall(p => C::known(id, C::promiseRecord(id, p).owner))
+    and C::duties.get(id).keys().forall(d => C::known(id, C::duties.get(id).get(d).owner)))
+  val seatTreeClosed = everyConvoy(id => C::seats.get(id).keys().forall(seat => match C::seatRecord(id, seat).parent {
+    | Root => true | Under(q) => C::known(id, q)
+  }))
+  val seatTreeAcyclic = everyConvoy(id => C::acyclic(C::parentsOf(C::seats.get(id))))
   // A generation's seats, retired ones included, stay within the cap.
-  val seatsWithinLimit = everyState(s => C::work(s).seats.keys().size() <= C::SEAT_LIMIT)
-  // A retired seat is a seat that owns no open promise and holds no duty.
-  val retiredSeatsHoldNothing = everyState(s => C::work(s).retiredSeats.forall(seat =>
-    C::work(s).seats.keys().contains(seat) and C::seatPromises(C::work(s), seat).size() == 0 and C::seatDuties(C::work(s), seat).size() == 0))
+  val seatsWithinLimit = everyConvoy(id => C::seats.get(id).keys().size() <= C::SEAT_LIMIT)
+  // A retired seat owns no open promise and holds no duty. A retired convoy
+  // keeps no retired duties: its duties all ended with it.
+  val retiredSeatsHoldNothing = everyConvoy(id => C::phase.get(id) == C::Retired or C::seats.get(id).keys().forall(seat =>
+    not(C::seatRetired(id, seat)) or (C::seatPromises(id, seat).size() == 0 and C::seatDuties(id, seat).size() == 0)))
   // Replacement counts stay within the limit, and seat "a" carries every replacement granted to it.
-  val replacementsWithinLimit = everyState(s => C::work(s).seats.keys().forall(seat => C::work(s).seats.get(seat).replacements <= C::REPLACEMENT_LIMIT))
-  val replacementsCarried = everyState(s => not(C::work(s).seats.keys().contains("a")) or C::work(s).seats.get("a").replacements == replacedA)
-  // Promise ids of an ended generation are never reused.
-  val promisesAboveFloor = everyState(s => C::work(s).promises.keys().forall(p => p >= C::work(s).promiseFloor))
-  val safety = replacementsWithinLimit and replacementsCarried and seatsWithinLimit and retiredSeatsHoldNothing and promisesAboveFloor and ownersAreSeats and seatTreeClosed and seatTreeAcyclic and everyConvoyObliged and deliveredSettled and settledPromisesFinal and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
+  val replacementsWithinLimit = everyConvoy(id => C::seats.get(id).keys().forall(seat => C::seatRecord(id, seat).replacements <= C::REPLACEMENT_LIMIT))
+  val replacementsCarried = everyConvoy(id => not(C::known(id, "a")) or C::seatRecord(id, "a").replacements == replacedA)
+  val safety = replacementsWithinLimit and replacementsCarried and seatsWithinLimit and retiredSeatsHoldNothing and ownersAreSeats and seatTreeClosed and seatTreeAcyclic and everyConvoyObliged and deliveredSettled and settledPromisesFinal and retiredFinal and endedDecidesNothing and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
   // No inductive invariant: a universe of every owned-promise shape is beyond
   // Apalache in a crew's memory, and the fast tier exhausts this scenario's
   // complete finite graph, which covers every depth at its bounds.
-  val view = (C::convoys, now, replacedA)
-  action deliverReady(id: int): bool = all { C::deliver(id), keepWorld }
+  val view = (C::phase, C::project, C::priority, C::duties, C::retired, C::promises, C::seats, C::subjects, now, replacedA)
+  action deliverReady(id: int): bool = all { C::deliver(id, "merged"), keepWorld }
   // Once nothing is open and no lifetime duty holds, fair delivery ends the convoy.
   temporal liveness = Set(1).forall(id => weakFair(deliverReady(id), view) implies always(
-    (match C::convoys.get(id) {
-      | Present(s) => match s {
-          | Open(w) => C::openPromises(w).size() == 0 and C::holdingDuties(w).size() == 0
-          | _ => false
-        }
-      | Absent => false
-    }) implies eventually(match C::convoys.get(id) { | Present(s) => match s { | Open(_) => false | _ => true } | Absent => false })))
+    (C::phase.keys().contains(id) and C::isOpen(id) and C::openPromises(id).size() == 0 and C::holdingDuties(id).size() == 0)
+      implies eventually(C::phase.keys().contains(id) and not(C::isOpen(id)))))
 }

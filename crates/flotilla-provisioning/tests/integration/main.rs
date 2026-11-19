@@ -1,10 +1,8 @@
-mod checkout_reconciler;
-mod clone_reconciler;
 #[path = "../common/mod.rs"]
 mod common;
-mod environment_reconciler;
+mod engine_kind_resume;
+mod engine_watch;
 mod image_build;
-mod image_check;
 mod lifecycle_read_contract;
 mod repository_reconciler;
 #[path = "../../../../tests/support/integration_modules.rs"]

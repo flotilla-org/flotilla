@@ -3,17 +3,17 @@
 //! delivered on host B, the reply reaches A's role inbox by its subject, and
 //! `convoy explain` on A shows B's messages from A's replica.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use chrono::Utc;
-use flotilla_core::{in_process::InProcessDaemon, primitives::MessagePrimitives};
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_engine_messages::MessagePrimitives;
 use flotilla_inbox::InboxBackend;
+use flotilla_messaging::{IntentExpectation, IntentReference};
 use flotilla_resources::{
-    Convoy, ConvoySpec, CrewSessionStatus, FleetDesignation, FleetDesignationSpec, Host, InputMeta, MessageExpectation, MessageReference,
-    MessageRelation, MessageSpec, Project, ProjectSpec, Resource, ResourceProvenance, Selector, SystemClock, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, CONVOY_LABEL,
-    FLEET_DESIGNATION_NAME, ROLE_LABEL, VESSEL_LABEL,
+    ConvoySpec, MessageRelation, ResourceProvenance, Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSource,
+    TerminalSessionSpec,
 };
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::{Follower, Service};
@@ -25,38 +25,32 @@ use flotilla_state_machines::{
 const NS: &str = "flotilla";
 
 /// The engine path at one daemon: its decided store homed at its node id.
-async fn engine(daemon: &Arc<InProcessDaemon>, dir: &tempfile::TempDir) -> (Arc<Service>, Arc<MessagePrimitives>) {
-    let backend = daemon.resource_backend();
-    backend
-        .clone()
-        .using::<Project>(NS)
-        .create(
-            &InputMeta::builder().name("fleet".to_string()).build(),
-            &ProjectSpec::builder()
-                .display_name("Fleet".to_string())
-                .default_workflow_ref("w".to_string())
-                .repositories(Vec::new())
-                .build(),
-        )
-        .await
-        .expect("fleet project");
-    backend
-        .definitions::<FleetDesignation>(NS)
-        .create(
-            &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
-            &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
-        )
-        .await
-        .expect("fleet designation");
-    let home = daemon.node_id().as_str().to_owned();
-    let service = Arc::new(
-        Service::open(&dir.path().join("decided.sqlite"), &home, flotilla_engine_store::registry().expect("registry")).expect("store"),
-    );
-    daemon.install_decided_store(Arc::clone(&service)).expect("decided store");
-    let primitives =
-        Arc::new(MessagePrimitives::open(&home, Arc::clone(&service), backend, Arc::new(SystemClock)).expect("message primitives"));
-    daemon.install_message_primitives(Arc::clone(&primitives)).expect("message path");
+pub(super) async fn engine(daemon: &Arc<InProcessDaemon>) -> (Arc<Service>, Arc<MessagePrimitives>) {
+    seed_fleet(&daemon.resource_backend()).await;
+    // The daemon's Message path, opened over its decided store as its runtime opens it.
+    let service = daemon.decided_store().expect("decided store");
+    let primitives = match daemon.message_primitives() {
+        Some(primitives) => primitives,
+        None => daemon.open_message_primitives().expect("message path"),
+    };
     (service, primitives)
+}
+
+/// The message `record` sent to `receiver` (an old address) that `engine` holds, with its home:
+/// read in the receiver's inbox.
+async fn homed(
+    engine: &MessagePrimitives,
+    receiver: &str,
+    record: &str,
+) -> Option<(String, flotilla_state_machines::Resource<flotilla_state_machines::machines::message::Message>)> {
+    let inbox = engine.inbox_for(NS, receiver).await.expect("the receiver's inbox");
+    let (id, _) = engine.locate_in(&inbox, record).expect("locate")?;
+    engine.inbox_messages(&inbox).expect("messages").into_iter().find(|(_, message)| message.name() == id)
+}
+
+/// The fleet the engine's Message delivery reads its roles from: Project `fleet`, designated.
+pub(super) async fn seed_fleet(backend: &flotilla_store::ResourceBackend) {
+    flotilla_engine_messages_testkit::designate_fleet(backend, NS).await;
 }
 
 /// A home read served by another home's store, as its record socket serves one.
@@ -66,7 +60,7 @@ struct StoreReads {
 }
 
 #[async_trait::async_trait]
-impl flotilla_core::primitives::ports::HomeReads for StoreReads {
+impl flotilla_engine_messages::ports::HomeReads for StoreReads {
     async fn find(
         &self,
         kind: flotilla_schema::KindCode,
@@ -106,7 +100,7 @@ fn pump(from: &Service, from_home: &str, to: &Service, cursor: &mut Option<u64>)
     *cursor = Some(next);
 }
 
-fn crew_session(convoy: &str) -> TerminalSessionSpec {
+fn crew_session(convoy: &str, vessel: &str) -> TerminalSessionSpec {
     TerminalSessionSpec {
         env_ref: "test-env".into(),
         role: "coder".into(),
@@ -116,17 +110,15 @@ fn crew_session(convoy: &str) -> TerminalSessionSpec {
         source: TerminalSessionSource::Agent {
             selector: Selector::for_capability("coding"),
             brief: TerminalBrief { path: "brief.md".into(), content: "brief".into(), artifact_digest: None, copies: Vec::new() },
-            context: Box::new(TerminalCrewContext { namespace: NS.into(), convoy: convoy.into(), vessel_ref: "work".into() }),
-            message: None,
+            context: Box::new(TerminalCrewContext { namespace: NS.into(), convoy: convoy.into(), vessel_ref: vessel.into() }),
         },
     }
 }
 
-fn convoy_ref(name: &str) -> MessageReference {
-    MessageReference::ControlRecord {
-        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NS, name),
-        revision: "1".into(),
-    }
+/// Convoy `name` of project NS, as the message's subject at revision 1.
+fn convoy_ref(name: &str) -> IntentReference {
+    let address = flotilla_resources::convoy::engine::convoy_reference_address(name, NS).expect("the convoy's address");
+    IntentReference::subject(address, flotilla_address::Revision::new("1".to_owned()).expect("revision"))
 }
 
 // The tracing proof includes this fixture with no cancellation steps.
@@ -146,87 +138,70 @@ pub(super) struct DropStep {
 
 // Behaviour (#3317): the receiver's home holds the message; the other home
 // reads it from its replica, or at its home on a miss, marked remote with its
-// age; a reply to a fleet role is routed by subject.
-pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject(operations: &[DropStep]) {
+// age; a reply to a fleet role is routed by subject. Returns the routed request's identity.
+pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject(operations: &[DropStep]) -> String {
     // Both homes' Convoy and session replicas are written by hand below, so the
-    // router replicates only Host identity.
-    let topology = flotilla_daemon_testkit::server::spawn_in_memory_request_topology_with_replication_kinds(
-        super::empty_daemon_named("home-a").await,
-        super::empty_daemon_named("home-b").await,
-        &[Host::API_PATHS.kind],
+    // router replicates only Host identity. The decided stores' change streams are
+    // pumped by hand too: each home's request to follow the other is dropped.
+    let drop_change_streams: flotilla_daemon_testkit::server::EnvelopeFilter = Arc::new(|message| match &message {
+        flotilla_protocol::PeerWireMessage::Routed(flotilla_protocol::RoutedPeerMessage::CommandRequest { command, .. })
+            if matches!(command.action, flotilla_protocol::CommandAction::QueryChangeStream { .. }) =>
+        {
+            None
+        }
+        _ => Some(message),
+    });
+    let mesh = flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_filter(
+        vec![super::message_home_daemon("home-a").await, super::message_home_daemon("home-b").await],
+        drop_change_streams,
     )
     .await
     .expect("two-home router");
-    let (a, b) = (&topology.leader, &topology.follower);
-    let (dir_a, dir_b) = (tempfile::tempdir().expect("dir"), tempfile::tempdir().expect("dir"));
-    let ((store_a, engine_a), (store_b, engine_b)) = (engine(a, &dir_a).await, engine(b, &dir_b).await);
+    let (a, b) = (&mesh.hosts[0], &mesh.hosts[1]);
+    // Each daemon reads the engine's environments, as its runtime installs them.
+    engine_environments(a);
+    engine_environments(b);
+    let ((store_a, engine_a), (store_b, engine_b)) = (engine(a).await, engine(b).await);
     let (home_a, home_b) = (a.node_id().as_str().to_owned(), b.node_id().as_str().to_owned());
 
-    // Convoy X, the subject, is homed at A; the crew it asks about lives at B.
-    let convoy = |project: &str| ConvoySpec::builder().workflow_ref("w".into()).project_ref(project.into()).build();
-    a.resource_backend().using::<Convoy>(NS).create(&InputMeta::builder().name("subject-x".into()).build(), &convoy(NS)).await.expect("X");
-    b.resource_backend().using::<Convoy>(NS).create(&InputMeta::builder().name("crew-b".into()).build(), &convoy(NS)).await.expect("crew");
-    let sessions = b.resource_backend().using::<TerminalSession>(NS);
-    let labels =
-        BTreeMap::from([(CONVOY_LABEL.into(), "crew-b".into()), (VESSEL_LABEL.into(), "work".into()), (ROLE_LABEL.into(), "coder".into())]);
-    let session = sessions
-        .create(&InputMeta::builder().name("crew-b-session".into()).labels(labels).build(), &crew_session("crew-b"))
-        .await
-        .expect("crew session");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus {
-                phase: flotilla_resources::TerminalSessionPhase::Running,
-                session_id: Some("sess-b".into()),
-                crew: Some(CrewSessionStatus { id: "crew-b-id".into(), adapter: "codex".into(), model: None, stance: "coder".into() }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("running");
-    // The old-store replicas each router reads to find a home.
-    let replicate = |from: &Arc<InProcessDaemon>, to: &Arc<InProcessDaemon>| {
-        let (from, to) = (Arc::clone(from), Arc::clone(to));
-        async move {
-            to.resource_backend()
-                .replica_writer::<Convoy>(from.node_id().clone(), NS)
-                .replace(&from.resource_backend().using::<Convoy>(NS).list().await.expect("convoys"), Utc::now())
-                .await
-                .expect("convoy replica");
-            to.resource_backend()
-                .replica_writer::<TerminalSession>(from.node_id().clone(), NS)
-                .replace(&from.resource_backend().using::<TerminalSession>(NS).list().await.expect("sessions"), Utc::now())
-                .await
-                .expect("session replica");
-        }
+    // Convoy X, the subject, is homed at A; the crew it asks about lives at B. Each is its home's
+    // engine launch, its work crewed by an agent seat for `coder`.
+    let convoy =
+        |project: &str, role: &str| ConvoySpec::builder().workflow_ref("w".into()).project_ref(project.into()).role(role.into()).build();
+    let held = |name: &str| {
+        flotilla_engine_convoys_testkit::convoy(NS, name, convoy(NS, name), flotilla_engine_convoys_testkit::single_agent("coder"))
     };
-    replicate(b, a).await;
-    replicate(a, b).await;
+    let subject_x = flotilla_daemon_testkit::engine::admit_convoy(a, held("subject-x")).await;
+    let crew = flotilla_daemon_testkit::engine::admit_convoy(b, held("crew-b")).await;
+    // The crew's session is B's engine launch, held for its vessel's launch at B.
+    let vessel = flotilla_daemon_testkit::engine::engine(b).vessels.request(&crew, "work", &home_b);
+    let terminals = &flotilla_daemon_testkit::engine::engine(b).terminals;
+    let launch = terminals.request(&flotilla_daemon_testkit::engine::session_request("crew-b-session", &crew_session(&crew, &vessel)));
+    let facts = flotilla_resources::terminal_records::TerminalLaunchFacts {
+        agent: Some(flotilla_resources::terminal_records::AgentLaunch { adapter: "codex".into(), model: None, stance: "coder".into() }),
+        ..Default::default()
+    };
+    terminals.ready(&launch, "sess-b", &facts);
+    // Each router reads the other home's convoys to find a home, as each follows the other's log.
+    let (mut b_to_a, mut a_to_b) = (None, None);
+    pump(&store_b, &home_b, &store_a, &mut b_to_a);
+    pump(&store_a, &home_a, &store_b, &mut a_to_b);
 
-    // A sends as turn-rules to B's crew, about convoy X.
-    let request = flotilla_resources::message_record_name("flotilla/crew-b/work/coder", "system:turn-rules", "rule:checks@1");
-    let intent = MessageSpec::builder()
-        .sender("system:turn-rules".into())
-        .receiver("flotilla/crew-b/work/coder".into())
-        .relation(MessageRelation::System)
-        .body("checks settled; please review".into())
-        .references(vec![convoy_ref("subject-x")])
-        .subject(convoy_ref("subject-x"))
-        .expectation(MessageExpectation::Reply)
-        .build();
+    // A sends as turn-rules to B's crew, about convoy X. The crew's receiver names its launch.
+    let receiver = format!("flotilla/{crew}/work/coder");
+    let request = flotilla_resources::message_record_name(&receiver, "system:turn-rules", "rule:checks@1");
+    let mut intent =
+        flotilla_engine_messages_testkit::intent("system:turn-rules", &receiver, MessageRelation::System, "checks settled; please review");
+    intent.references = vec![convoy_ref(&subject_x)];
+    intent.expectation = IntentExpectation::Reply;
     a.publish_message(NS, &request, &intent).await.expect("routed send");
-    let homed = |engine: &MessagePrimitives, record: &str| {
-        engine.messages().expect("messages").into_iter().find(|(_, message)| message.name().ends_with(&format!("/message:{record}")))
-    };
-    let (home, sent) = homed(&engine_b, &request).expect("the message is created at the receiver's home");
+    let (home, sent) = homed(&engine_b, &receiver, &request).await.expect("the message is created at the receiver's home");
     assert_eq!(home, home_b);
     assert_eq!(sent.spec().sender.as_str(), "fleet:lab/role:turn-rules");
-    assert!(homed(&engine_a, &request).is_none(), "the sender's home authors nothing");
+    assert!(homed(&engine_a, &receiver, &request).await.is_none(), "the sender's home authors nothing");
 
     // B delivers it to the crew's AgentSession, receipt first.
-    let consumer = engine_b.register("crew-b-session", Timestamp(1)).await.expect("consumer");
+    let consumer = engine_b.register(&launch, Timestamp(1)).await.expect("consumer");
     let inbox_b = engine_b.inbox();
     inbox_b.bind(sent.spec().inbox.clone(), consumer.clone()).await.expect("bind");
     use futures::StreamExt;
@@ -236,69 +211,70 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     }
     inbox_b.receive(&consumer, sent.name(), Transport::Turn).await.expect("receipt");
     inbox_b.deliver(sent.name(), Deliver { receiver: consumer.clone(), transport: Transport::Turn }).await.expect("deliver");
-    assert!(matches!(homed(&engine_b, &request).expect("sent").1.state(), MessageState::Awaiting { .. }));
+    assert!(matches!(homed(&engine_b, &receiver, &request).await.expect("sent").1.state(), MessageState::Awaiting { .. }));
     // A's replica has not caught up: the reply's admission at A reads the
     // original at B, its home, marked remote with its age.
     let reads = Arc::new(StoreReads { home: Arc::clone(&store_b), served: Default::default() });
     engine_a.install_home_reads(reads.clone()).expect("home reads");
-    let reply = flotilla_resources::message_record_name("system:turn-rules", "flotilla/crew-b/work/coder", "reply@1");
-    let answer = MessageSpec::builder()
-        .sender("flotilla/crew-b/work/coder".into())
-        .receiver("system:turn-rules".into())
-        .relation(MessageRelation::Peer)
-        .body("reviewed".into())
-        .in_reply_to(request.clone())
-        .build();
+    let reply = flotilla_resources::message_record_name("system:turn-rules", &receiver, "reply@1");
+    let mut answer = flotilla_engine_messages_testkit::intent(&receiver, "system:turn-rules", MessageRelation::Peer, "reviewed");
+    answer.in_reply_to = Some(request.clone());
     b.publish_message(NS, &reply, &answer).await.expect("routed reply");
     // Routing by subject and the admission each read the original at B.
     let served = reads.served.lock().expect("served").clone();
     assert!(!served.is_empty() && served.iter().all(|name| name == sent.name()), "the misses were read at B: {served:?}");
-    let (reply_home, replied) = homed(&engine_a, &reply).expect("the reply is homed at X's home");
+    let (reply_home, replied) = homed(&engine_a, "system:turn-rules", &reply).await.expect("the reply is homed at X's home");
     assert_eq!(reply_home, home_a);
     assert_eq!(replied.spec().inbox.as_str(), "fleet:lab/role:turn-rules");
     assert_eq!(replied.spec().in_reply_to.as_ref().map(|original| original.home.as_str()), Some(home_b.as_str()));
     assert_eq!(*replied.state(), MessageState::Pending, "nobody is bound to turn-rules yet");
-    let read = engine_a.read_message(&request, Some(sent.spec().inbox.clone())).await.expect("routed read");
+    let read = engine_a.read_message(&request, sent.spec().inbox.clone()).await.expect("routed read");
     assert!(read.remote && read.age_micros >= 0 && read.home == home_b, "{read:?}");
+    // A reply link resolves at the original's home; a name no home holds is absent, not unknown.
+    assert_eq!(engine_a.resolve_in_reply_to(&answer).await, flotilla_messaging::MessageResolution::Found);
+    let mut unsent = answer;
+    unsent.in_reply_to = Some(flotilla_resources::message_record_name(&receiver, "system:turn-rules", "never"));
+    assert_eq!(engine_a.resolve_in_reply_to(&unsent).await, flotilla_messaging::MessageResolution::Absent);
 
-    let (mut b_to_a, mut a_to_b) = (None, None);
     pump(&store_b, &home_b, &store_a, &mut b_to_a);
 
     // A reads B's message from its replica, delivered, in convoy explain.
-    let (replica_home, replica) = homed(&engine_a, &request).expect("A's replica holds B's message");
-    assert_eq!((replica_home.as_str(), replica.state()), (home_b.as_str(), &MessageState::Awaiting { receiver: consumer.clone() }));
-    let view = engine_a.view(NS, &request).await.expect("view").expect("present");
+    let (replica_home, replica) = homed(&engine_a, &receiver, &request).await.expect("A's replica holds B's message");
+    assert_eq!(replica_home, home_b);
+    assert!(matches!(replica.state(), MessageState::Awaiting { receiver, .. } if *receiver == consumer), "{:?}", replica.state());
+    let view = engine_a.view_to(NS, &receiver, &request).await.expect("view").expect("present");
     assert!(matches!(view.provenance, ResourceProvenance::Replica { ref origin_root, .. } if origin_root.as_str() == home_b));
-    let explained = a.explain_convoy_internal(Some(NS), "crew-b").await.expect("explain on A");
+    let explained = a.explain_convoy_internal(Some(NS), &crew).await.expect("explain on A");
     let shown = explained.messages.iter().find(|message| message.name == request).expect("convoy explain shows B's message");
     assert_eq!((shown.phase.as_str(), shown.session.as_deref()), ("delivered", Some("sess-b")));
 
-    let local = engine_a.read_message(&request, None).await.expect("replica read");
+    let local = engine_a.read_message(&request, sent.spec().inbox.clone()).await.expect("replica read");
     assert!(!local.remote && local.home == home_b, "after following B, A reads its replica: {local:?}");
 
     // B observes the reply through its replica and settles its message.
     pump(&store_a, &home_a, &store_b, &mut a_to_b);
-    assert!(homed(&engine_b, &reply).is_some(), "B follows A's log");
+    assert!(homed(&engine_b, "system:turn-rules", &reply).await.is_some(), "B follows A's log");
     engine_b.world().update(|world| world.reply.put(&flotilla_state_machines::Ref::new(sent.name()), ()));
     inbox_b.settle(sent.name(), Settle { by: Settlement::Answered }).await.expect("answered");
-    assert!(matches!(homed(&engine_b, &request).expect("sent").1.state(), MessageState::Settled { .. }));
-    use flotilla_core::primitives::sweep::OpenMessages;
+    assert!(matches!(homed(&engine_b, &receiver, &request).await.expect("sent").1.state(), MessageState::Settled { .. }));
+    use flotilla_engine_messages::sweep::OpenMessages;
     use flotilla_state_machines::machines::{awaiting_reply::AwaitingReplyLabel, message::MessageRef};
     let mut observer = OpenMessages::default();
     for (step, DropStep { action, late_record, restart }) in operations.iter().enumerate() {
-        let name = flotilla_resources::message_record_name(&intent.receiver, &intent.sender, &format!("cancel-{step}"));
+        let name = flotilla_resources::message_record_name(&receiver, "system:turn-rules", &format!("cancel-{step}"));
         let mut cancel = intent.clone();
         cancel.deadline = matches!(action, DropAction::Expire).then(|| Utc::now() - chrono::Duration::seconds(1));
+        let routed = &cancel;
         // Exercise receiver admission through the router, then resume the sender's
         // record write separately to model a delayed or retried send continuation.
         let mut events = a.subscribe();
         let command = flotilla_protocol::Command::builder()
             .action(flotilla_protocol::CommandAction::ResourceApply {
                 namespace: NS.into(),
-                document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name}, "spec":cancel}),
+                document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name}, "spec":routed}),
             })
             .build();
-        let id = topology.client.execute(command).await.expect("routed cancellable admission");
+        let id = mesh.clients[0].execute(command).await.expect("routed cancellable admission");
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let flotilla_protocol::DaemonEvent::CommandFinished { command_id, node_id, result, .. } =
@@ -315,7 +291,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         .expect("receiver admission finishes");
         assert!(matches!(result, flotilla_protocol::CommandValue::ResourceObject(_)), "{result:?}");
 
-        let (_, message) = homed(&engine_b, &name).expect("receiver admitted");
+        let (_, message) = homed(&engine_b, &receiver, &name).await.expect("receiver admitted");
         let reference = MessageRef::new(message.name(), &home_b);
         assert!(engine_a.awaiting().get(&reference).is_none(), "sender continuation has not written its record yet");
         if !*late_record {
@@ -327,16 +303,16 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
             DropAction::Supersede => {
                 let next = format!("{name}-successor");
                 let mut successor = cancel.clone();
-                successor.expectation = MessageExpectation::None;
+                successor.expectation = IntentExpectation::Nothing;
                 successor.supersedes = Some(name.clone());
                 a.publish_message(NS, &next, &successor).await.expect("routed supersession");
             }
-            DropAction::Withdraw => engine_b.withdraw(NS, &name, "crew-b").await.expect("receiver withdrawal"),
+            DropAction::Withdraw => engine_b.withdraw(NS, &receiver, &name, &crew).await.expect("receiver withdrawal"),
             DropAction::Expire => {
                 engine_b.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut OpenMessages::default()).await.expect("receiver expiry");
             }
         }
-        assert!(matches!(homed(&engine_b, &name).expect("receiver message").1.state(), MessageState::Dropped { .. }));
+        assert!(matches!(homed(&engine_b, &receiver, &name).await.expect("receiver message").1.state(), MessageState::Dropped { .. }));
         if !*late_record {
             assert_eq!(
                 engine_a.awaiting().get(&reference).expect("sender record").label(),
@@ -368,4 +344,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
             );
         }
     }
+    request
 }
+
+pub(super) use flotilla_daemon_testkit::engine::engine_environments;

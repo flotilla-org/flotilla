@@ -28,28 +28,23 @@ use std::{
     env, fs,
     path::PathBuf,
     process,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Instant,
 };
 
 use flotilla_engine_store::StoreLog;
-use flotilla_provisioning::engine::{
-    checkout::CheckoutBinding,
-    decide,
-    reads::{Judgement, ProvisioningReads, StoreReads},
-    LifecycleHome, Lifecycles,
-};
+use flotilla_provisioning::engine::reads::{Judgement, ProvisioningReads, StoreReads};
 use flotilla_provisioning::stored::{
     self,
-    checkout::{Checkout, CheckoutKind, CheckoutRequest, Source},
+    checkout::{Checkout, CheckoutRequest, Source},
     clone::{Clone, CloneRequest},
     environment::{Environment, EnvironmentRequest, Recipe},
     image_build::{Architecture, Delivery, ImageBuild, ImageBuildRequest, Reservation},
     Holder,
 };
-use flotilla_resources::{CheckoutStatusPatch, ImageLayerSource, ImageLayerSpec, ImageLayerTier};
+use flotilla_resources::{ImageLayerSource, ImageLayerSpec, ImageLayerTier};
 use flotilla_schema::{Address, Frozen, KindRegistry, Ref as StoredRef, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     machines::lifecycle::{Attempted, LifecycleKind, MemoryLifecycleWorld, Observed, Realise, Release},
     Cause, CauseCategory, Home, Outcome, Ref,
@@ -141,6 +136,8 @@ fn docker_recipe(n: usize) -> flotilla_provisioning::stored::environment::Docker
 
 fn checkout(n: usize, which: &str, home: &str) -> CheckoutRequest {
     CheckoutRequest {
+        launch_of: format!("checkout-{n}-{which}"),
+        launch: 0,
         repository: repository(n),
         environment: StoredRef::new(format!("env-{n}"), home),
         branch: format!("convoy-{n}-{which}"),
@@ -149,33 +146,6 @@ fn checkout(n: usize, which: &str, home: &str) -> CheckoutRequest {
         source: Source::Worktree,
         clone: Some(StoredRef::new(format!("clone-{n}"), home)),
         holder: Some(Holder::convoy(&format!("convoy-{n}"))),
-    }
-}
-
-/// Convoy `n`'s fourth checkout as the old store holds it, owned by its convoy.
-fn old_checkout(n: usize) -> flotilla_resources::ResourceObject<flotilla_resources::Checkout> {
-    flotilla_resources::ResourceObject {
-        metadata: flotilla_resources::ObjectMeta {
-            name: format!("checkout-{n}-d"),
-            namespace: "flotilla".into(),
-            resource_version: "1".into(),
-            labels: BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_owned(), format!("convoy-{n}"))]),
-            annotations: BTreeMap::new(),
-            owner_references: vec![],
-            finalizers: vec![],
-            deletion_timestamp: None,
-            creation_timestamp: chrono::DateTime::UNIX_EPOCH,
-            merge: None,
-        },
-        spec: flotilla_resources::CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
-            repo_ref: flotilla_protocol::RepositoryKey(repository(n)),
-            env_ref: format!("env-{n}"),
-            r#ref: format!("convoy-{n}-d"),
-            base_ref: Some("main".into()),
-            target_path: format!("/workspace/checkout-{n}-d"),
-            clone_ref: format!("clone-{n}"),
-        }),
-        status: None,
     }
 }
 
@@ -188,7 +158,7 @@ struct Homes {
 }
 
 impl Homes {
-    fn new(home: &str, store: &Arc<Mutex<Store>>) -> Self {
+    fn new(home: &str, store: &Arc<StoreHandle>) -> Self {
         let log = || StoreLog::new(store.clone());
         Homes {
             environments: Home::with_log(home, log()).expect("declaration"),
@@ -199,7 +169,7 @@ impl Homes {
     }
 }
 
-/// Creates `name` and realises it under `name`.
+/// Creates `name` (a launch of it, for a launch kind) and realises it under its name.
 fn realised<K: LifecycleKind>(
     home: &mut Home<flotilla_state_machines::machines::lifecycle::Lifecycle<K>, StoreLog>,
     name: &str,
@@ -207,16 +177,18 @@ fn realised<K: LifecycleKind>(
 ) where
     StoreLog: flotilla_state_machines::Log<flotilla_state_machines::machines::lifecycle::Lifecycle<K>>,
 {
+    let name = home.create(name, spec, &MemoryLifecycleWorld::default(), Timestamp(1)).expect("created").resource.name().to_owned();
     let mut world = MemoryLifecycleWorld::default();
-    world.realisations.put(&Ref::new(name), Observed { identity: name.into() });
-    home.create(name, spec, &world, Timestamp(1)).expect("created");
-    home.apply(name, Realise { identity: name.into(), observed: Ref::new(name) }, &world, Timestamp(2)).expect("realised");
+    world.realisations.put(&Ref::new(name.as_str()), Observed { identity: name.clone() });
+    home.apply(&name, Realise { identity: name.clone(), observed: Ref::new(name.as_str()) }, &world, Timestamp(2)).expect("realised");
 }
 
 /// Seeds the image builds, then each convoy's environment, clone and two checkouts, all realised.
 fn seed(homes: &mut Homes, home: &str, convoys: impl Iterator<Item = usize>) {
     for k in 0..BUILDS {
         let build = ImageBuildRequest {
+            launch_of: "image-feed-arm64".into(),
+            launch: 0,
             composition: format!("sha256:{k}"),
             architecture: Architecture::Amd64,
             layers: layers(),
@@ -228,10 +200,13 @@ fn seed(homes: &mut Homes, home: &str, convoys: impl Iterator<Item = usize>) {
     for n in convoys {
         realised(&mut homes.environments, &format!("env-{n}"), environment(n, home));
         let clone = CloneRequest {
+            launch_of: format!("clone-{n}"),
+            launch: 0,
             repository: repository(n),
             url: format!("https://example/{}", repository(n)),
             environment: StoredRef::new(format!("env-{n}"), home),
             path: format!("/clones/{}", repository(n)),
+            discovered: false,
         };
         realised(&mut homes.clones, &format!("clone-{n}"), clone);
         for which in ["a", "b"] {
@@ -292,9 +267,9 @@ fn per_event(what: &str, count: usize, started: Instant, writes: &str) {
 fn provisioning_load() {
     let convoys = convoys();
     let (_remote_db, remote_conn) = connection("remote");
-    let remote = Arc::new(Mutex::new(Store::open(remote_conn, "remote", registry()).expect("store")));
+    let remote = Arc::new(StoreHandle::new(Store::open(remote_conn, "remote", registry()).expect("store")));
     let (local_db, local_conn) = connection("local");
-    let local = Arc::new(Mutex::new(Store::open(local_conn, "local", registry()).expect("store")));
+    let local = Arc::new(StoreHandle::new(Store::open(local_conn, "local", registry()).expect("store")));
 
     let started = Instant::now();
     let mut remote_homes = Homes::new("remote", &remote);
@@ -330,11 +305,20 @@ fn provisioning_load() {
         world.teardowns.put(&Ref::new(name), true);
         world
     };
-    let names: Vec<String> = locals.iter().map(|n| format!("checkout-{n}-c")).collect();
     let started = Instant::now();
-    for (n, name) in locals.iter().zip(&names) {
-        homes.checkouts.create(name, checkout(*n, "c", "local"), &world(name), Timestamp(3)).expect("created");
-    }
+    let names: Vec<String> = locals
+        .iter()
+        .map(|n| {
+            let name = format!("checkout-{n}-c");
+            homes
+                .checkouts
+                .create(&name, checkout(*n, "c", "local"), &world(&name), Timestamp(3))
+                .expect("created")
+                .resource
+                .name()
+                .to_owned()
+        })
+        .collect();
     per_event("checkout create, one transaction", names.len(), started, "the row, its identity and the log entry");
     let failure = Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "worktree add failed"), retryable: true };
     let started = Instant::now();
@@ -356,30 +340,6 @@ fn provisioning_load() {
     }
     per_event("release, one transaction", names.len(), started, "the state and the log entry");
 
-    // The reconcilers' write path (#3629 layer 3): a Checkout reconciler's patches decided by the
-    // engine, as `Engine` decides them, over its own home on the local store.
-    let decided: Arc<dyn Lifecycles<CheckoutKind>> =
-        Arc::new(LifecycleHome::new("local", Home::with_log("local", StoreLog::new(local.clone())).expect("declaration")));
-    let objects: Vec<_> = locals.iter().map(|n| old_checkout(*n)).collect();
-    let started = Instant::now();
-    for obj in &objects {
-        let ready = CheckoutStatusPatch::MarkReady {
-            path: format!("/workspace/{}", obj.metadata.name),
-            commit: None,
-            branch_provenance: Default::default(),
-        };
-        assert!(decide::<CheckoutBinding>(decided.as_ref(), obj, Some(ready), chrono::Utc::now()).patch.is_some());
-    }
-    per_event("reconciled Ready through the engine", objects.len(), started, "the request and the realise, two transactions");
-    let started = Instant::now();
-    for obj in &objects {
-        let mut obj =
-            flotilla_resources::ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
-        obj.status = Some(flotilla_resources::CheckoutStatus { phase: flotilla_resources::CheckoutPhase::Ready, ..Default::default() });
-        assert!(decide::<CheckoutBinding>(decided.as_ref(), &obj, Some(CheckoutStatusPatch::MarkGone), chrono::Utc::now()).ended);
-    }
-    per_event("reconciled Gone through the engine", objects.len(), started, "the vanish, one transaction");
-
     // The read port (#3629 layer 4): views judged per key, as explain, readiness and attach read them.
     let reads = StoreReads::new(local.clone());
     let started = Instant::now();
@@ -397,7 +357,7 @@ fn provisioning_load() {
     let started = Instant::now();
     for n in &locals {
         let view = reads.checkout(&format!("checkout-{n}-d"), "local").expect("read").expect("held");
-        assert_eq!(view.judgement, Judgement::Lost, "told from its last log entry");
+        assert_eq!(view.judgement, Judgement::Lost { reason: None }, "told from its last log entry");
     }
     eprintln!("{:>40}: {:>8.1} µs/query", "port: one Gone checkout, judged", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
     let started = Instant::now();

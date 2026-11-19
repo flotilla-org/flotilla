@@ -57,7 +57,7 @@ pub(super) fn observations(source: &Source, target: &mut Import, _: &mut Carried
     let declarations = declarations(source);
     let observer_of = |source: &IssueSource| declarations.preferred_observer(source).map(|(_, home)| home);
     let change_requests = copies::<ChangeRequest>(source, "changerequests", target, report);
-    import_change_requests(&change_requests, &observer_of, target, report);
+    import_change_requests(&change_requests, &declarations.forges, &observer_of, target, report);
     let issues = copies::<Issue>(source, "issues", target, report);
     import_issues(&issues, &observer_of, target, report);
 }

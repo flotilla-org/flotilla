@@ -7,7 +7,7 @@ use flotilla_inbox::{
     Cursor, EngineInbox, Error, InboxBackend, InboxLog, MemoryInbox, MemoryInboxLog, Rules, RESIDENT_BUDGET,
 };
 use flotilla_inbox_testkit::{address, consumer, inbox, spec, Evidence, SessionPort, Supervisors};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     machines::{agent_session::AgentSession, message::*},
     MemoryLog, Ref, Transport,
@@ -16,13 +16,13 @@ use futures::{StreamExt, TryStreamExt};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
-fn database() -> Arc<Mutex<Store>> {
-    Arc::new(Mutex::new(
+fn database() -> Arc<StoreHandle> {
+    Arc::new(StoreHandle::new(
         Store::open(Connection::open_in_memory().expect("db"), "test", flotilla_state_machines::kinds().expect("registry")).expect("store"),
     ))
 }
 
-fn backend(store: Arc<Mutex<Store>>, evidence: Arc<Evidence>, budget: usize) -> (SqliteInbox, CountingLog) {
+fn backend(store: Arc<StoreHandle>, evidence: Arc<Evidence>, budget: usize) -> (SqliteInbox, CountingLog) {
     let log = CountingLog::new(store.clone());
     let backend = SqliteInbox::open_with_budget("test", log.clone(), evidence, Arc::new(Supervisors), budget).expect("open");
     backend.register_blocking(consumer("a"), SessionPort::new("a", StoreLog::new(store)));
@@ -225,12 +225,14 @@ async fn watch_replays_historical_states_after_eviction() {
             states.push(state);
         }
     }
+    // Settling keeps the time it was delivered.
+    let delivered_at = states[1].delivered_at().expect("delivered");
     assert_eq!(
         states,
         vec![
             MessageState::Pending,
-            MessageState::Awaiting { receiver: consumer("a") },
-            MessageState::Settled { receiver: Some(consumer("a")) }
+            MessageState::Awaiting { receiver: consumer("a"), delivered_at },
+            MessageState::Settled { receiver: Some(consumer("a")), delivered_at: Some(delivered_at) }
         ]
     );
 }
@@ -311,7 +313,7 @@ async fn watch_pages_preserve_large_changes_and_followers() {
         expected.push((message.clone(), MessageState::Pending));
         let reason = DropReason::Withdrawn { by: address("project:test/role:sender"), authority: authority.clone() };
         backend.drop(&message, reason.clone()).await.expect("drop");
-        expected.push((message, MessageState::Dropped { reason, receiver: None, watermark: None }));
+        expected.push((message, MessageState::Dropped { reason, receiver: None, delivered_at: None, watermark: None }));
     }
     let events =
         backend.watch(&inbox(), Some(Cursor(0))).await.expect("watch").take(expected.len()).try_collect::<Vec<_>>().await.expect("stream");
@@ -693,7 +695,7 @@ async fn watch_lag_survives_sqlite_connection_restart() {
     let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let file = File(std::env::temp_dir().join(format!("inbox-watch-{}-{unique}.sqlite", std::process::id())));
     let open = || {
-        CountingLog::new(Arc::new(Mutex::new(
+        CountingLog::new(Arc::new(StoreHandle::new(
             Store::open(Connection::open(&file.0).unwrap(), "test", flotilla_state_machines::kinds().unwrap()).unwrap(),
         )))
     };

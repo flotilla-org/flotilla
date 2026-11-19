@@ -135,6 +135,10 @@ impl Address {
         if !kind.may_follow(parent) {
             return Err(Error::Shape { kind, parent });
         }
+        // A host's role is one of its daemon's inboxes: messages, not artifacts, sit under it.
+        if kind == Kind::Artifact && self.segments.len() >= 2 && self.segments[self.segments.len() - 2].kind == Kind::Host {
+            return Err(Error::ArtifactUnderHostRole);
+        }
         if kind == Kind::Account && parent == Some(Kind::Usage) && normalise_usage(&value) != value {
             return Err(Error::InvalidValue { kind, value, reason: "usage accounts are trimmed and lowercase" });
         }

@@ -208,6 +208,11 @@ pub struct AgentSession;
 pub enum Activity {
     #[store(code = "wo")]
     Working,
+    /// The agent is waiting on a person: a permission prompt, an elicitation
+    /// or a question. Attention lives here, not on a terminal, because
+    /// agents without a terminal report it too.
+    #[store(code = "ni")]
+    NeedsInput,
     #[store(code = "id")]
     Idle,
     #[store(code = "in")]

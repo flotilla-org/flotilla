@@ -55,23 +55,28 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
     let mut stand_in = stand_in(declared_path, harness_in_image).await;
     let env_id = stand_in.env_id.clone();
     let root = stand_in.root().to_path_buf();
-    // #4163: provisioned through the Environment reconciler, which records it Ready.
-    let environments = stand_in.backend.using::<Environment>(NAMESPACE);
-    let record = environments.get(env_id.as_str()).await.expect("environment record");
-    let reconciler = EnvironmentReconciler::new(
-        Arc::new(DockerControllerRuntime { state: Arc::clone(&stand_in.state) }),
-        stand_in.backend.clone(),
-        NAMESPACE,
-    );
-    let prepared = reconciler.prepare(&record).await.expect("prepare");
-    let mut status = record.status.clone().unwrap_or_default();
-    reconciler.reconcile(&record, &prepared, chrono::Utc::now()).patch.expect("provision patch").apply(&mut status);
-    assert_eq!((status.phase, status.message.as_deref()), (EnvironmentPhase::Ready, None), "a drydock vessel reaches Ready");
+    // #4163: provisioned through the environment runtime the Environment controller realises
+    // launches with; the launch is then recorded Ready with the facts it reported.
+    let provisioning = DockerControllerRuntime { state: Arc::clone(&stand_in.state) }
+        .provision_environment(env_id.as_str(), &stand_in.spec)
+        .await
+        .expect("a drydock vessel is provisioned");
+    let flotilla_provisioning::reconcilers::EnvironmentProvisioning::Cloud(cloud) = provisioning else {
+        panic!("a cloud sandbox is provisioned as one")
+    };
     let handle = stand_in.handle().await.expect("provisioned handle");
-    assert_eq!(status.backing_id.as_deref(), Some(handle.backing_id()));
-    assert_eq!(status.image_ref.as_deref(), stand_in.spec.cloud_sandbox.as_ref().map(|cloud| cloud.image.as_str()));
-    assert_eq!(status.provider_descriptor.as_ref().map(|descriptor| descriptor.instance.as_str()), Some("stand-in"));
-    environments.update_status(env_id.as_str(), &record.metadata.resource_version, &status).await.expect("environment status");
+    assert_eq!(cloud.backing_id, handle.backing_id());
+    assert_eq!(Some(cloud.image_ref.as_str()), stand_in.spec.cloud_sandbox.as_ref().map(|cloud| cloud.image.as_str()));
+    assert_eq!(cloud.provider_descriptor.instance, "stand-in");
+    engine_environments(&stand_in.state.daemon).ready(
+        env_id.as_str(),
+        &cloud.backing_id,
+        flotilla_resources::environment_records::LaunchFacts {
+            image_ref: Some(cloud.image_ref.clone()),
+            provider_descriptor: Some(*cloud.provider_descriptor.clone()),
+            ..Default::default()
+        },
+    );
 
     // The vessel layer: the generation's CLI is on the vessel's own PATH beside
     // the provider's environment, and the socket the vessel's environment names
@@ -110,9 +115,8 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
             context: Box::new(flotilla_resources::TerminalCrewContext {
                 namespace: NAMESPACE.to_string(),
                 convoy: stand_in.convoy.clone(),
-                vessel_ref: "demo-work".to_string(),
+                vessel_ref: stand_in.vessel.clone(),
             }),
-            message: None,
         },
         cwd: root.join("skill-source").display().to_string(),
         env: BTreeMap::new(),
@@ -122,14 +126,16 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
         seed_pinned_harness(&root.join("vessel"), "claude-code");
     }
     TerminalControllerRuntime { state: Arc::clone(&stand_in.state) }
-        .ensure_session("terminal-demo-work-coder", (&session).into(), &[])
+        .ensure_session("terminal-demo-work-coder", &first_launch("terminal-demo-work-coder"), (&session).into(), &[])
         .await
         .expect("launch");
 
-    let home = Path::new(flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE)
-        .join("agent-homes/requesters")
-        .join(&stand_in.convoy)
-        .join("coder/claude");
+    let home = flotilla_resources::account_access::requester_home(
+        Path::new(flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE),
+        &stand_in.convoy,
+        "coder",
+        "claude",
+    );
     let launched = stand_in
         .pool
         .ensured
@@ -141,9 +147,14 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
     // #3663: the home's skills link resolves into the agent's content cache.
     assert!(fs::symlink_metadata(home.join("skills")).expect("skills link").file_type().is_symlink());
     assert!(fs::read_to_string(home.join("skills/research/SKILL.md")).expect("pushed skill").contains("name: research"));
-    let deliveries = flotilla_projections::read_projections::access_delivery_evidence(&stand_in.backend, NAMESPACE, &stand_in.convoy)
-        .await
-        .expect("deliveries");
+    let deliveries = flotilla_projections::read_projections::access_delivery_evidence(
+        &stand_in.backend,
+        stand_in.state.daemon.lifecycle_reads().as_ref(),
+        NAMESPACE,
+        &stand_in.convoy,
+    )
+    .await
+    .expect("deliveries");
     let [delivery] = deliveries.as_slice() else { panic!("one access delivered: {deliveries:?}") };
     assert_eq!(Path::new(&delivery.home), home);
     let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
@@ -243,6 +254,8 @@ async fn a_failed_vessel_layer_discards_only_a_vessel_it_created() {
 struct StandIn {
     temp: tempfile::TempDir,
     convoy: String,
+    /// The launch that serves the convoy's work.
+    vessel: String,
     env_id: EnvironmentId,
     spec: EnvironmentSpec,
     state: Arc<ControllerRuntimeState>,
@@ -270,7 +283,11 @@ impl StandIn {
     fn clean_up(&self) {
         self.host.abort();
         let base = Path::new(flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE);
-        let _ = fs::remove_dir_all(base.join("agent-material/requesters").join(&self.convoy));
+        let _ = fs::remove_dir_all(flotilla_resources::account_access::requester_convoy_dir(
+            base,
+            flotilla_resources::account_access::REQUESTER_MATERIAL_DIR,
+            &self.convoy,
+        ));
         let digest = format!("{:x}", sha2::Sha256::digest(self.env_id.as_str().as_bytes()));
         let _ = fs::remove_dir_all(base.join("crew-sockets").join(&digest[..16]));
         let _ = fs::remove_dir_all(base.join("vessel-layers").join(&digest[..16]));
@@ -416,10 +433,10 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
         }),
         ..Default::default()
     };
-    backend.using::<Environment>(NAMESPACE).create(&empty_meta(env_id.as_str()), &spec).await.expect("environment record");
+    engine_environments(&daemon).request(env_id.as_str(), &spec, None);
     let source = LocalSkillSource::new(root, "research");
-    freeze_crew(&backend, &convoy, "demo-work", "coder", "claude-code", vec![source.selected.clone()]).await;
-    bind_account(&backend, &convoy, "coder", "claude-max", "test@example.com").await;
+    let (convoy, vessel) = freeze_crew(&daemon, &convoy, "coder", "claude-code", vec![source.selected.clone()]).await;
+    bind_account(&daemon, &convoy, "coder", "claude-max", "test@example.com").await;
 
     let adapters: Arc<dyn CommandRunner> =
         Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build()));
@@ -466,7 +483,7 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
     let tools = GenerationCli { root: root.to_path_buf(), refused: Arc::clone(&refuse_tools) };
     state.environment_tools = EnvironmentToolProvisioner::new(vec![Arc::new(tools)]);
     let state = Arc::new(state);
-    StandIn { temp, convoy, env_id, spec, state, backend, pool, _gateway: gateway, host, crew_connections, refuse_tools }
+    StandIn { temp, convoy, vessel, env_id, spec, state, backend, pool, _gateway: gateway, host, crew_connections, refuse_tools }
 }
 
 /// The vessel's image, as interior discovery finds it: with its harness, or without one.

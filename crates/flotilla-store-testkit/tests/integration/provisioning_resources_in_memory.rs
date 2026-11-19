@@ -52,7 +52,6 @@ async fn vessel_metadata_and_status_roundtrip() {
                 image: None,
                 degraded: Default::default(),
                 configured_limits: None,
-                runtime_observation: None,
                 placement_decision: None,
                 phase: VesselPhase::Ready,
                 message: None,
@@ -69,9 +68,6 @@ async fn vessel_metadata_and_status_roundtrip() {
                 ready_at: Some(Utc::now()),
                 requested_stance: Some(flotilla_resources::Stance::WorkspaceWrite),
                 effective_stance: Some(flotilla_resources::Stance::Contained),
-                held_credentials: Default::default(),
-                credential_delivery_retry: None,
-                credential_refresh_retry: None,
             },
         )
         .await
@@ -153,7 +149,6 @@ async fn agent_terminal_session_preserves_structured_launch_and_canonical_brief(
                 convoy: "demo".into(),
                 vessel_ref: "demo-implement".into(),
             }),
-            message: None,
         },
         cwd: "/workspace".into(),
         env: [("DECLARED_VALUE".into(), "hello declared crew".into())].into_iter().collect(),

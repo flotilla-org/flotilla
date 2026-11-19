@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use flotilla_protocol::{
-    commands::{ExplainedSubjectFact, ExplainedSubjectObservation},
+    commands::{ExplainedDischarge, ExplainedEndedVessel, ExplainedSubjectFact, ExplainedSubjectObservation},
     result_set::ConvoySubjectRow,
     CanonicalHostId, CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, EvidenceFreshness, ExplainedDecisionLedger,
-    ExplainedSettlement, ExplainedUnclaimedWork, FulfilmentAllocation, HostName, HostSnapshot, HostSummary, IssueSource, NodeId, NodeInfo,
-    PeerConnectionState, PlacementDecision, PlacementTargetHost, Relationship, StreamKey, Subject, SubjectKind, TopologyResponse,
-    TopologyRoute,
+    ExplainedSettlement, ExplainedUnclaimedWork, ExplainedUnmetExpectation, FulfilmentAllocation, HostName, HostSnapshot, HostSummary,
+    IssueSource, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementTargetHost, Relationship, StreamKey, Subject,
+    SubjectKind, TopologyResponse, TopologyRoute,
 };
 
 use super::{event_stream_seq, format_command_result, format_convoy_explanation_human, format_event_human, format_topology_dot};
@@ -203,11 +203,10 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         holds: Vec::new(),
         cascade: None,
         environment_observations: Default::default(),
-        stalled: None,
-        recent_events: Vec::new(),
-        lifecycle_mutations: Vec::new(),
+        stalls: Vec::new(),
         namespace: "flotilla".into(),
         convoy: "ledger".into(),
+        role: String::new(),
         phase: "Landing".into(),
         message: Some("waiting for review evidence".into()),
         role_needs: Default::default(),
@@ -224,7 +223,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
         messages: Vec::new(),
-        held_deliveries: Vec::new(),
         queued_turns: Vec::new(),
         unclaimed_work: vec![ExplainedUnclaimedWork { vessel: "work".into(), role: "coder".into(), evidence: "turn_idle".into() }],
         artifacts: vec![flotilla_protocol::ExplainedArtifact {
@@ -242,7 +240,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T11:59:00Z".into()),
                 comment_url: Some("https://example.test/pull/1#prior".into()),
                 missing: false,
-                override_principal: None,
                 completed_while_crew_active: false,
                 message: Some("first turn complete".into()),
                 superseded: true,
@@ -256,7 +253,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T12:00:00Z".into()),
                 comment_url: Some("https://example.test/pull/1#comment-2".into()),
                 missing: false,
-                override_principal: None,
                 completed_while_crew_active: false,
                 message: None,
                 superseded: false,
@@ -270,7 +266,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T12:01:00Z".into()),
                 comment_url: Some("https://example.test/pull/1#orphaned".into()),
                 missing: true,
-                override_principal: None,
                 completed_while_crew_active: false,
                 message: None,
                 superseded: false,
@@ -284,15 +279,21 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T12:02:00Z".into()),
                 comment_url: None,
                 missing: true,
-                override_principal: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
                 completed_while_crew_active: true,
                 message: None,
                 superseded: false,
             },
         ],
-        settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
+        settlement: ExplainedSettlement {
+            mode: "world_terminal".into(),
+            satisfied: false,
+            disposition: None,
+            unmet: Vec::new(),
+            discharged: Vec::new(),
+        },
         account_bindings: Vec::new(),
         access_deliveries: Vec::new(),
+        held_by: None,
     };
 
     // Every claim renders the active-process marker, including a superseded
@@ -411,7 +412,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         .contains("work/coder claimed_at=2026-08-21T12:00:00Z artifact=artifact/ledger comment=https://example.test/pull/1#comment-2"));
     assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (PR comment exists, decision-ledger artifact not found) comment=https://example.test/pull/1#orphaned"));
     assert!(output.contains(
-        "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (completed by flotilla/operator with --force) — completed while crew active"
+        "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (decision-ledger artifact not found) — completed while crew active"
     ));
     // #2677: the human display names durable artifact evidence with no PR comment;
     // a failed bound projection is a separate flag, never a missing ledger.
@@ -423,19 +424,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         raised_at: "2026-10-07T12:00:00Z".into(),
     });
     assert!(format_convoy_explanation_human(&held).contains("checks-settled held since=2026-10-07T12:00:00Z: episode limit"));
-    // #3455: a held batch is named at the top, before every other section.
-    let mut held_batch = explanation.clone();
-    held_batch.held_deliveries.push(flotilla_protocol::commands::ExplainedHeldDelivery {
-        batch: "message-0".into(),
-        receiver: "flotilla/ledger/work/coder".into(),
-        members: vec!["message-0".into()],
-        reason: "delivery held: terminal was not ready before submission; attempt 3/3".into(),
-        clear_command: "flotilla resource fail-message-batch message-0 --namespace flotilla --reason '<why>'".into(),
-        description: "message batch `message-0` is held for flotilla/ledger/work/coder".into(),
-    });
-    assert!(format_convoy_explanation_human(&held_batch).starts_with(
-        "Convoy: flotilla/ledger\nPhase: Landing\nHELD DELIVERY: message batch `message-0` is held for flotilla/ledger/work/coder\n"
-    ));
     // #3460: an idle crew that cannot take a turn is named next to the
     // waiting Messages and under its crew delivery.
     let mut obstructed = explanation.clone();
@@ -460,9 +448,6 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         session: "terminal-ledger-work-coder".into(),
         role: "coder".into(),
         last_delivery_rung: None,
-        delivered_message_id: None,
-        sender: None,
-        pending_briefs: Vec::new(),
     });
     let output = format_convoy_explanation_human(&obstructed);
     assert!(output.contains(
@@ -518,8 +503,9 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         environment_observations: Default::default(),
         namespace: "flotilla".into(),
         convoy: "reserved-only".into(),
+        role: String::new(),
         phase: "Running".into(),
-        stalled: None,
+        stalls: Vec::new(),
         message: None,
         role_needs: BTreeMap::new(),
         skills: BTreeMap::new(),
@@ -561,19 +547,48 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
         messages: Vec::new(),
-        held_deliveries: Vec::new(),
         queued_turns: Vec::new(),
         unclaimed_work: Vec::new(),
         decision_ledgers: Vec::new(),
         artifacts: Vec::new(),
-        settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
-        recent_events: Vec::new(),
-        lifecycle_mutations: Vec::new(),
+        settlement: ExplainedSettlement {
+            mode: "world_terminal".into(),
+            satisfied: true,
+            disposition: Some("closed-unmerged".into()),
+            unmet: Vec::new(),
+            discharged: vec![ExplainedDischarge {
+                expectation: ExplainedUnmetExpectation {
+                    reason: "missing_status".into(),
+                    subject: "checkout/checkout-dead".into(),
+                    detail: "no inspection of the checkout has been read".into(),
+                },
+                ended_vessels: vec![ExplainedEndedVessel {
+                    launch: "triage-label-work#1".into(),
+                    reading: "Released".into(),
+                    reason: Some("released".into()),
+                    ended_at: "2026-11-12T00:00:00+00:00".into(),
+                }],
+            }],
+        },
         account_bindings: Vec::new(),
         access_deliveries: Vec::new(),
+        held_by: Some(flotilla_protocol::commands::ExplainedHolds::Ended {
+            holds: vec!["change-request:forge:dummy-forge/repo:dummy%2Ffleet/cr:1".into(), "message:message-1".into()],
+        }),
     };
 
     let output = format_convoy_explanation_human(&explanation);
+    // Each hold is named by its kind and what it names.
+    assert!(
+        output.contains("Held by:\n  - change-request: forge:dummy-forge/repo:dummy%2Ffleet/cr:1\n  - message: message-1\n"),
+        "{output}"
+    );
+    // An unread checkout dropped rather than met is named with the vessel whose end dropped it.
+    assert!(output.contains("Discharged unread (no vessel left to read them):"), "{output}");
+    assert!(output.contains("  - missing_status: checkout/checkout-dead — no inspection of the checkout has been read"), "{output}");
+    assert!(output.contains("      triage-label-work#1 Released (released) at 2026-11-12T00:00:00+00:00"), "{output}");
+    // A delivered convoy's settlement names the exit it was delivered by (run 3 F7).
+    assert!(output.contains("Settlement: SATISFIED (world_terminal, closed-unmerged)\n"), "{output}");
     // Glue: both human surfaces print the admission diagnostic verbatim.
     assert!(output.contains(&format!("Warning: {}", explanation.warnings[0])));
     let started = super::format_command_result(&flotilla_protocol::CommandValue::ConvoyStarted {
@@ -627,13 +642,6 @@ fn replaced_pending_brief_echoes_the_displaced_text() {
 fn convoy_resume_reports_immediate_and_deferred_delivery_distinctly() {
     assert_eq!(format_command_result(&CommandValue::ConvoyBriefDelivered { displaced: None }), "brief delivered now");
     assert_eq!(format_command_result(&CommandValue::ConvoyBriefQueued { displaced: None }), "brief queued for turn end");
-    // #3455: a brief behind a held batch says so and names the hold.
-    let held = format_command_result(&CommandValue::ConvoyBriefHeld {
-        displaced: None,
-        held: "it waits behind a held batch: message batch `held-0` is held".into(),
-    });
-    assert_eq!(held, "brief queued, not for turn end: it waits behind a held batch: message batch `held-0` is held");
-    assert!(!held.contains("queued for turn end"));
 }
 
 #[test]
@@ -756,22 +764,21 @@ fn blob_sync_diagnostics_render_in_host_list_and_status() {
             .convoy_count(0)
             .staleness(flotilla_protocol::FleetHostStaleness::Current)
             .observation_agreement(flotilla_protocol::FleetObservationAgreement::Agree)
-            .daemon_rss_bytes(128 * 1024 * 1024)
             .blob_sync(sync.clone())
             .build()],
         ..Default::default()
     };
     let list = super::format_fleet_health_human(&fleet);
-    assert!(list.contains("Daemon RSS"));
-    assert!(list.contains("128.0 MiB"));
     assert!(list.contains("Blob Sync"));
     assert!(list.contains("2 pending; endpoint unavailable"));
 
     let status = flotilla_protocol::HostStatusResponse {
         change_stream: Some(flotilla_protocol::ChangeStreamStatus {
             watermark: 7,
+            followed_at: Some(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
             last_error: Some("home/rs/large: resource exceeds assembly limit".into()),
             consecutive_failures: 2,
+            paths: Vec::new(),
         }),
         environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("local")),
         host_name: HostName::new("local"),
@@ -786,9 +793,43 @@ fn blob_sync_diagnostics_render_in_host_list_and_status() {
     };
     let output = super::format_host_status_human(&status);
     assert!(output.contains("Change stream: watermark 7, 2 consecutive failures"));
+    // A failing home shows how long ago its last round completed.
+    assert!(output.contains("Change stream last round: 2023-11-14 22:13:20 UTC ("));
+    assert!(output.contains("s ago)"));
     assert!(output.contains("Change stream error: home/rs/large"));
     assert!(output.contains("Blob sync: 2 pending"));
     assert!(output.contains("Blob sync error: endpoint unavailable"));
+
+    // A peer home shows each path that follows it: a degraded path beside a followed one.
+    let followed_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let peer = flotilla_protocol::HostStatusResponse {
+        change_stream: Some(flotilla_protocol::ChangeStreamStatus {
+            watermark: 7,
+            followed_at: Some(followed_at),
+            last_error: None,
+            consecutive_failures: 0,
+            paths: vec![
+                flotilla_protocol::ChangeStreamPathStatus {
+                    via: None,
+                    followed_at: Some(followed_at),
+                    last_error: None,
+                    consecutive_failures: 0,
+                },
+                flotilla_protocol::ChangeStreamPathStatus {
+                    via: Some(NodeId::new("relay-node")),
+                    followed_at: None,
+                    last_error: Some("relay refused".into()),
+                    consecutive_failures: 3,
+                },
+            ],
+        }),
+        is_local: false,
+        ..status
+    };
+    let output = super::format_host_status_human(&peer);
+    assert!(!output.contains("Change stream error"));
+    assert!(output.contains("Change stream path direct: last round 2023-11-14 22:13:20 UTC ("));
+    assert!(output.contains("Change stream path via relay-node: last round none yet, 3 consecutive failures: relay refused\n"));
 }
 
 // Behaviour: convoy explain keeps the plural layout and shows differing states,
@@ -811,8 +852,10 @@ fn convoy_explanation_subject_observations_snapshot() {
     for (number, state, checks, review, readiness, freshness) in [
         (1, Some("open"), Some("pass"), Some("approved"), "ready_to_merge", EvidenceFreshness::Fresh),
         (2, Some("merged"), Some("pending"), Some("none"), "merged_not_landed", EvidenceFreshness::Stale),
-        (3, None, None, None, "awaiting_review_response", EvidenceFreshness::Missing),
-        (4, None, None, None, "awaiting_review_response", EvidenceFreshness::Fresh),
+        (3, None, None, None, "unknown", EvidenceFreshness::Missing),
+        (4, None, None, None, "unknown", EvidenceFreshness::Fresh),
+        // Run 4 R4-4: checks running and mergeability unknown say so, naming no review.
+        (5, Some("open"), Some("pending"), Some("none"), "checks_pending", EvidenceFreshness::Fresh),
     ] {
         let subject = Subject {
             kind: SubjectKind::ChangeRequest,
@@ -831,6 +874,7 @@ fn convoy_explanation_subject_observations_snapshot() {
             subject,
             state: fact(state, freshness),
             checks: fact(checks, freshness),
+            mergeable: fact((number == 1).then_some("mergeable"), freshness),
             review: fact(review, freshness),
             review_actionable_at_head: fact(state.map(|_| "false"), freshness),
             readiness: fact(Some(readiness), freshness),
@@ -843,38 +887,24 @@ fn convoy_explanation_subject_observations_snapshot() {
     let output = format_convoy_explanation_human(&explanation);
     let subjects = output.split("Subjects:\n").nth(1).expect("subjects").split("\nChange requests:").next().expect("section");
     insta::assert_snapshot!(subjects, @r###"
-      produces !1, !2, !3, !4
-        !1 state=open checks=pass review=approved actionable_at_head=false readiness=ready_to_merge
+      produces !1, !2, !3, !4, !5
+        !1 state=open checks=pass mergeable=mergeable review=approved actionable_at_head=false readiness=ready_to_merge
         !1 https://github.com/owner/repo/pull/1
-        !2 state=merged (stale) checks=pending (stale) review=none (stale) actionable_at_head=false (stale) readiness=merged_not_landed (stale)
+        !2 state=merged (stale) checks=pending (stale) mergeable=unknown (stale) review=none (stale) actionable_at_head=false (stale) readiness=merged_not_landed (stale)
         !2 https://github.com/owner/repo/pull/2
-        !3 state=unknown (missing) checks=unknown (missing) review=unknown (missing) actionable_at_head=unknown (missing) readiness=awaiting_review_response (missing)
+        !3 state=unknown (missing) checks=unknown (missing) mergeable=unknown (missing) review=unknown (missing) actionable_at_head=unknown (missing) readiness=unknown (missing)
         !3 https://github.com/owner/repo/pull/3
-        !4 state=unknown checks=unknown review=unknown actionable_at_head=unknown readiness=awaiting_review_response
+        !4 state=unknown checks=unknown mergeable=unknown review=unknown actionable_at_head=unknown readiness=unknown
         !4 https://github.com/owner/repo/pull/4
+        !5 state=open checks=pending mergeable=unknown review=none actionable_at_head=false readiness=checks_pending
+        !5 https://github.com/owner/repo/pull/5
     "###);
 }
 
-// A completion wait must keep the caller pending, state the deadline, and
-// retry the original claim only when GitHub's advertised cooldown has elapsed.
-#[tokio::test(start_paused = true)]
-async fn crew_completion_wait_retries_same_claim_after_deadline() {
-    completion_wait_case(false, false).await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn cancelling_completion_wait_stops_future_claims() {
-    completion_wait_case(true, false).await;
-}
-
-// #3586: pending PR promises are advisory, exit successfully and never retry.
-// Glue: exercise the CLI's existing command-result boundary with one event.
+// A forced completion is a plain command: a failure (an unreachable convoy home) ends it, and
+// the caller never submits it again.
 #[tokio::test]
-async fn crew_completion_advisory_succeeds_without_retry() {
-    completion_wait_case(false, true).await;
-}
-
-async fn completion_wait_case(cancel: bool, advisory: bool) {
+async fn a_failed_forced_completion_is_not_retried() {
     use std::sync::{Arc, Mutex};
 
     use flotilla_protocol::{Command, CommandAction, CrewCommandContext};
@@ -895,50 +925,24 @@ async fn completion_wait_case(cancel: bool, advisory: bool) {
                 vessel_ref: Some("vessel".into()),
                 role: Some("coder".into()),
             },
-            message: Some("PR delivered".into()),
+            message: Some("operator verdict".into()),
             disposition: None,
-            decision_ledger_ref: Some("ledger".into()),
-            force: false,
         },
     };
     let mut run = Box::pin(super::run_command(&daemon, command.clone(), super::OutputFormat::Json));
     // Drive subscription/dispatch before emitting the fake daemon event.
     assert!(futures::poll!(&mut run).is_pending());
-    let event = |result| DaemonEvent::CommandFinished {
+    tx.send(DaemonEvent::CommandFinished {
         command_id: 1,
         node_id: NodeId::new("node-local-test"),
         repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "".into() },
         repo: None,
-        result,
-    };
-    if advisory {
-        let result = CommandValue::CrewCompletionAdvisory { pending: vec!["template/pr: waiting on PR merge".into()] };
-        tx.send(event(result.clone())).expect("advisory event");
-        assert_eq!(run.await.expect("successful CLI result"), result);
-        assert_eq!(calls.lock().expect("calls").len(), 1);
-        assert!(format_command_result(&result).contains("template/pr: waiting on PR merge"));
-        return;
-    }
-    tx.send(event(CommandValue::CrewCompletionWaiting {
-        reason: "GitHub secondary limit".into(),
-        retry_at: chrono::Utc::now() + chrono::Duration::seconds(60),
-    }))
-    .expect("wait event");
-    assert!(futures::poll!(&mut run).is_pending());
-    tokio::time::advance(std::time::Duration::from_secs(59)).await;
-    assert!(futures::poll!(&mut run).is_pending());
-    assert_eq!(calls.lock().expect("calls").len(), 1);
-    if cancel {
-        drop(run);
-        tokio::time::advance(std::time::Duration::from_secs(120)).await;
-        assert_eq!(calls.lock().expect("calls").len(), 1, "cancelled caller must not submit another claim");
-        return;
-    }
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    assert!(futures::poll!(&mut run).is_pending());
-    assert_eq!(*calls.lock().expect("calls"), vec![command.clone(), command]);
-    tx.send(event(CommandValue::Ok)).expect("ready event");
-    assert_eq!(run.await.expect("completed claim"), CommandValue::Ok);
+        result: CommandValue::Error { message: "convoy home kiwi is unreachable".into() },
+    })
+    .expect("failure event");
+    let result = run.await.expect("the failure ends the command");
+    assert!(matches!(&result, CommandValue::Error { message } if message.contains("unreachable")), "{result:?}");
+    assert_eq!(*calls.lock().expect("calls"), vec![command]);
 }
 
 // #2498: human output abbreviates Unicode evidence; --full and JSON retain it.

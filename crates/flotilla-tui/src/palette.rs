@@ -381,7 +381,12 @@ fn subject_completions(noun: &str, partial: &str, model: &TuiModel, namespaces: 
             // Single-namespace MVP: list convoys in "flotilla".
             namespaces
                 .get("flotilla")
-                .map(|m| m.convoys.values().map(|c| (c.id.name().to_string(), format!("{:?}", c.phase))).collect::<Vec<(String, String)>>())
+                .map(|m| {
+                    m.convoys
+                        .values()
+                        .map(|c| (c.id.name().to_string(), c.phase.map_or_else(|| "Unreadable".to_owned(), |phase| format!("{phase:?}"))))
+                        .collect::<Vec<(String, String)>>()
+                })
                 .unwrap_or_default()
         }
         "repo" => {
@@ -730,11 +735,12 @@ mod tests {
             origin_host: None,
             workflow_ref: "wf".into(),
             dispatching_principal_ref: Default::default(),
-            phase: ConvoyPhase::Active,
+            phase: Some(ConvoyPhase::Active),
+            unreadable: None,
             message: None,
             disposition: None,
             repo_hint: None,
-            project_ref: None,
+            project_ref: "flotilla".into(),
             issues: Vec::new(),
             subjects: Vec::new(),
             vessels: vessels

@@ -3,12 +3,18 @@
 //! so Repository's writers (ensure, project ops, the reconciler's status) and readers keep their
 //! behaviour on either.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use flotilla_provisioning::engine::repositories::EngineRepositories;
 use flotilla_resources::{
     definition_provenance::{VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION},
-    Clock, DefaultBranchObservation, DefaultBranchProvenance, InputMeta, Repository, RepositorySpec, RepositoryStatus, SystemClock,
+    repository::{forge_service_url_key, FORGE_SERVICE_URL_FIELD},
+    Clock, DefaultBranchObservation, DefaultBranchProvenance, ForgeKind, ForgeSpec, InputMeta, Repository, RepositorySpec,
+    RepositoryStatus, SystemClock,
 };
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::{ensure_repository, watch_resource_kind_including_replicas, ResourceBackend, StoreQuery};
@@ -68,6 +74,33 @@ async fn contract(backend: &ResourceBackend) {
     };
     let found = repositories.query_declared(&query).await.expect("query");
     assert_eq!(found.items.iter().map(|item| item.object.metadata.name.as_str()).collect::<Vec<_>>(), [name.as_str()]);
+
+    // A forge's repositories are selected by its service URL, and no other forge's are.
+    let on_forge = |forge_id: &str, repository: &str| {
+        let forge = ForgeSpec::builder()
+            .forge_id(forge_id.to_owned())
+            .kind(ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["forge.example".to_owned()]))
+            .https_url(format!("https://forge.example/{forge_id}"))
+            .git_ssh_host("forge.example".to_owned())
+            .build();
+        RepositorySpec::remote(format!("https://forge.example/{forge_id}/acme/{repository}.git"))
+            .expect("remote")
+            .on_forge(&forge)
+            .expect("on forge")
+    };
+    let (lab, lab2) = (on_forge("lab", "widgets"), on_forge("lab2", "gadgets"));
+    for spec in [&lab, &lab2] {
+        ensure_repository(&repositories, &spec.key(), spec).await.expect("ensure on a forge");
+    }
+    let on_lab = lab.key().to_string();
+    let query = StoreQuery {
+        fields: BTreeMap::from([(FORGE_SERVICE_URL_FIELD.into(), forge_service_url_key("https://forge.example/lab/").into())]),
+        include_replicas: true,
+        ..Default::default()
+    };
+    let found = repositories.query_declared(&query).await.expect("query by forge");
+    assert_eq!(found.items.iter().map(|item| item.object.metadata.name.as_str()).collect::<Vec<_>>(), [on_lab.as_str()]);
 
     // A write at a version that moved on is refused.
     assert!(repositories.update(&meta, &observed.metadata.resource_version, &spec).await.is_err(), "stale version");

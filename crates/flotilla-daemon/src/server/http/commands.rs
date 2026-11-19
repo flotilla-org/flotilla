@@ -18,6 +18,7 @@ use axum::{
 };
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_daemon_api::event_sink::CommandCompletions;
 use flotilla_protocol::{
     CommandCaller, CommandValue, DaemonEvent, DispatcherErrorClass, Message, Request as RpcRequest, Response as RpcResponse, ResponseResult,
 };
@@ -91,10 +92,10 @@ struct ProgressCollector {
 }
 
 impl ProgressCollector {
-    fn new(events: broadcast::Receiver<DaemonEvent>, order: Arc<AtomicU64>) -> Self {
+    fn new(events: broadcast::Receiver<DaemonEvent>, completions: CommandCompletions, order: Arc<AtomicU64>) -> Self {
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
         let (retire, retired) = mpsc::unbounded_channel();
-        let task = tokio::spawn(collect_all_progress(events, routes.clone(), order, retired, false));
+        let task = tokio::spawn(collect_all_progress(events, completions, routes.clone(), order, retired, false));
         Self { routes, retire, task }
     }
 
@@ -358,12 +359,14 @@ pub(super) async fn handle(
     // Hold routing admission across dispatch, not the record table: immediate
     // completions wait here until their watch sender has been registered.
     // Admission is already serialized. While dispatch holds this lock, progress
-    // for all records queues in the bounded broadcast buffer; lag marks every
-    // active observation unknown, and a later completion can recover it.
+    // for all records queues in the bounded broadcast buffer, where lag truncates
+    // it; outcomes queue in the completion capture, which lag cannot drop.
     let mut collector_slot = if kind == "execute" { Some(commands.collector.lock().await) } else { None };
-    let collector = collector_slot
-        .as_mut()
-        .map(|slot| slot.get_or_insert_with(|| ProgressCollector::new(daemon.subscribe(), commands.eviction_sequence.clone())));
+    let collector = collector_slot.as_mut().map(|slot| {
+        slot.get_or_insert_with(|| {
+            ProgressCollector::new(daemon.subscribe(), daemon.watch_completions(), commands.eviction_sequence.clone())
+        })
+    });
     let mut routes = match collector.as_ref() {
         Some(collector) => Some(collector.routes.lock().await),
         None => None,
@@ -573,85 +576,120 @@ struct CompletionScope {
     project: Option<(String, String)>,
 }
 
+/// Steps come from the daemon-wide broadcast, where lag loses only progress.
+/// Outcomes come from the sink's completion capture, which lag cannot drop, so
+/// an outcome is unknown only once the daemon's sink is gone.
 async fn collect_all_progress(
     mut events: broadcast::Receiver<DaemonEvent>,
+    mut completions: CommandCompletions,
     routes: Arc<Mutex<ProgressRoutes>>,
     order: Arc<AtomicU64>,
     mut retired: mpsc::UnboundedReceiver<u64>,
     stop_when_empty: bool,
 ) {
+    let mut steps_open = true;
     loop {
-        let event = tokio::select! {
+        tokio::select! {
             id = retired.recv() => {
                 let Some(id) = id else { break };
                 routes.lock().await.senders.remove(&id);
                 continue;
             }
-            event = events.recv() => event,
-        };
-        let mut routes = routes.lock().await;
-        match event {
-            Err(error) => {
-                let closed = matches!(error, RecvError::Closed);
-                for sender in routes.senders.values() {
-                    sender.send_modify(|s| {
-                        s.observation_lost(format!("command progress unavailable: {error}; do not retry blindly"), closed, &order)
-                    });
-                }
-                if closed {
+            step = events.recv(), if steps_open => {
+                let mut routes = routes.lock().await;
+                steps_open = route_step(&mut routes, step);
+            }
+            finished = completions.next() => {
+                let mut routes = routes.lock().await;
+                let Some(finished) = finished else {
+                    for sender in routes.senders.values() {
+                        sender.send_modify(|s| {
+                            s.observation_lost("command outcome unavailable: daemon events closed; do not retry blindly".into(), true, &order)
+                        });
+                    }
                     routes.closed = true;
                     routes.senders.clear();
                     break;
-                }
-            }
-            Ok(mut event) => {
-                let command_id = match &event {
-                    DaemonEvent::CommandFinished { command_id, .. } | DaemonEvent::CommandStepUpdate { command_id, .. } => *command_id,
-                    _ => continue,
                 };
-                let Some(sender) = routes.senders.get(&command_id) else { continue };
-                let scope = sender.borrow().completion_scope.clone();
-                if let Some((namespace, project)) = &scope.project {
-                    environment_supervision::scope_completion(&mut event, namespace, project);
-                }
-                match event {
-                    DaemonEvent::CommandFinished { result, .. } => {
-                        sender.send_modify(|s| {
-                            s.state = "finished";
-                            s.outcome = Some(result);
-                            s.eviction_order = Some(order.fetch_add(1, Ordering::Relaxed));
-                            s.observation_error = None;
-                            s.unknown_since = None;
-                            s.collector_closed = true;
-                        });
-                        routes.senders.remove(&command_id);
+                // The sink captures a completion before broadcasting it, after the
+                // command's own steps, so its steps are already buffered: route them first.
+                while steps_open {
+                    match events.try_recv() {
+                        Ok(step) => steps_open = route_step(&mut routes, Ok(step)),
+                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                            steps_open = route_step(&mut routes, Err(RecvError::Lagged(skipped)))
+                        }
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(broadcast::error::TryRecvError::Closed) => steps_open = false,
                     }
-                    event @ DaemonEvent::CommandStepUpdate { .. } if !scope.transport_bound => sender.send_modify(|s| s.push_step(event)),
-                    _ => {}
                 }
+                route_completion(&mut routes, finished, &order);
             }
         }
-        if stop_when_empty && routes.senders.is_empty() {
+        if stop_when_empty && routes.lock().await.senders.is_empty() {
             break;
         }
     }
 }
 
+/// Routes one broadcast step; returns whether the broadcast is still open.
+fn route_step(routes: &mut ProgressRoutes, step: Result<DaemonEvent, RecvError>) -> bool {
+    match step {
+        Err(RecvError::Lagged(_)) => {
+            for sender in routes.senders.values() {
+                sender.send_modify(|s| s.progress_truncated = true);
+            }
+            true
+        }
+        Err(RecvError::Closed) => false,
+        Ok(event @ DaemonEvent::CommandStepUpdate { command_id, .. }) => {
+            if let Some(sender) = routes.senders.get(&command_id) {
+                if !sender.borrow().completion_scope.transport_bound {
+                    sender.send_modify(|s| s.push_step(event));
+                }
+            }
+            true
+        }
+        Ok(_) => true,
+    }
+}
+
+fn route_completion(routes: &mut ProgressRoutes, mut event: DaemonEvent, order: &AtomicU64) {
+    let DaemonEvent::CommandFinished { command_id, .. } = &event else { return };
+    let command_id = *command_id;
+    let Some(sender) = routes.senders.remove(&command_id) else { return };
+    if let Some((namespace, project)) = &sender.borrow().completion_scope.project {
+        environment_supervision::scope_completion(&mut event, namespace, project);
+    }
+    let DaemonEvent::CommandFinished { result, .. } = event else { return };
+    sender.send_modify(|s| {
+        s.state = "finished";
+        s.outcome = Some(result);
+        s.eviction_order = Some(order.fetch_add(1, Ordering::Relaxed));
+        s.observation_error = None;
+        s.unknown_since = None;
+        s.collector_closed = true;
+    });
+}
+
 // Focused lifecycle tests use the same multiplexed loop with one route.
 #[cfg(test)]
 async fn collect_progress(
-    events: broadcast::Receiver<DaemonEvent>,
+    sink: &flotilla_daemon_api::event_sink::BroadcastEventSink,
     command_id: u64,
     sender: watch::Sender<CommandState>,
     order: Arc<AtomicU64>,
     scope: CompletionScope,
-) {
+) -> JoinHandle<()> {
     sender.send_modify(|s| s.completion_scope = scope);
     let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
     routes.lock().await.senders.insert(command_id, sender);
     let (retire, retired) = mpsc::unbounded_channel();
-    collect_all_progress(events, routes, order, retired, true).await;
-    drop(retire);
+    let collect = collect_all_progress(sink.subscribe(), sink.watch_completions(), routes, order, retired, true);
+    tokio::spawn(async move {
+        collect.await;
+        drop(retire);
+    })
 }
 
 fn cancel_status(class: DispatcherErrorClass, state: &CommandState) -> StatusCode {
@@ -680,6 +718,9 @@ fn error_status(class: DispatcherErrorClass) -> StatusCode {
 mod tests {
     use std::sync::Arc;
 
+    use crate::server::tests::launch_of;
+    use crate::testkits::engine::{current_launch, engine as install_engine};
+
     use axum::{
         body::{to_bytes, Body},
         http::Request as HttpRequest,
@@ -687,16 +728,15 @@ mod tests {
     };
     use flotilla_config::ConfigStore;
     use flotilla_core::in_process::InProcessDaemon;
+    use flotilla_daemon_api::event_sink::{BroadcastEventSink, EventSink};
     use flotilla_protocol::{Command, CommandAction, HostName};
     use flotilla_provider_runtime::CommandRunner;
-    use flotilla_store::ResourceBackend;
-    use flotilla_store_memory::InMemoryBackend;
     use tower::ServiceExt;
 
     use super::*;
     use crate::blob_store::{BlobStore, TieredBlobStore};
     use crate::server::http::{HttpRouter, ListenerOrigin, LoginStore};
-    use crate::server::tests::{caller_mountinfo, placed_crew_daemon, supervisor_daemon};
+    use crate::server::tests::{caller_mountinfo, engine_environments, placed_crew_daemon, supervisor_daemon};
     use crate::server::{caller, http::auth::PeerEvidence};
     use flotilla_protocol::PrincipalRef;
 
@@ -722,10 +762,12 @@ mod tests {
                 config,
                 discovery,
                 HostName::new("http-test"),
-                ResourceBackend::new(InMemoryBackend::default()),
+                flotilla_store_memory::engine_home_backend(),
                 Arc::new(crate::peer::HostPeerOverlay::default()),
             )
             .await;
+            // Composed with its engine, as the runtime composes a daemon.
+            install_engine(&daemon);
             Self::from_daemon(temp, daemon)
         }
 
@@ -906,31 +948,16 @@ mod tests {
     // A container reaching the main socket retains crew authority, never operator authority.
     #[tokio::test]
     async fn unix_peer_evidence_keeps_container_crew_bound() {
-        use flotilla_resources::{Environment, EnvironmentStatus, InputMeta};
         for cbor in [false, true] {
             let (temp, daemon) = placed_crew_daemon("unix-crew").await;
-            let environments = daemon.resource_backend().using::<Environment>("flotilla");
-            let env = environments
-                .create(
-                    &InputMeta::builder().name("unix-crew".into()).build(),
-                    &serde_json::from_value(json!({"docker":{"host_ref":"host","image":"image"}})).unwrap(),
-                )
-                .await
-                .unwrap();
-            environments
-                .update_status(
-                    "unix-crew",
-                    &env.metadata.resource_version,
-                    &EnvironmentStatus {
-                        runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
-                            container_id: Some("kernel-container".into()),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap();
+            // The environment is realised under its container's immutable ID.
+            engine_environments(&daemon).put_ready(
+                "unix-crew",
+                &serde_json::from_value(json!({"docker":{"host_ref":"host","image":"image"}})).unwrap(),
+                None,
+                "kernel-container",
+                Default::default(),
+            );
             let h = Harness::from_daemon(temp, daemon);
             let mut evidence = host_evidence();
             Arc::get_mut(&mut evidence).unwrap().caller.process.as_mut().unwrap().container = Some("kernel-container".into());
@@ -968,11 +995,12 @@ mod tests {
     async fn async_crew_completion_is_scoped() {
         for cbor in [false, true] {
             let (temp, daemon) = supervisor_daemon().await;
+            let target = current_launch(&daemon, "target");
             let h = Harness::from_daemon(temp, daemon);
             let caller =
                 CallerAuth::Environment { environment: flotilla_protocol::EnvironmentId::new("supervisor-environment"), peer: None };
             let command = Command::builder()
-                .action(CommandAction::ConvoyAbandon { namespace: None, name: "target".into(), reason: "scope test".into() })
+                .action(CommandAction::ConvoyAbandon { namespace: None, name: target, reason: "scope test".into() })
                 .build();
             let accepted = h.call("POST", "/v1/commands", Some(serde_json::to_value(command).unwrap()), cbor, caller.clone()).await;
             assert_eq!(accepted.0, StatusCode::ACCEPTED, "{}", accepted.1);
@@ -990,7 +1018,7 @@ mod tests {
             // Event bus boundary: deterministic foreign data and a step on the
             // dispatched command's retained scope, consumed by the real collector.
             let order = Arc::new(AtomicU64::new(0));
-            let (events, input) = broadcast::channel(4);
+            let events = BroadcastEventSink::new(broadcast::channel(4).0);
             let (sender, state) = watch::channel(CommandState::new(id, None, &order));
             {
                 let mut records = h.commands.records.lock().await;
@@ -1000,8 +1028,8 @@ mod tests {
                 }
                 record.state = state.clone();
             }
-            let task = tokio::spawn(collect_progress(input, 77, sender, order, scope));
-            events.send(step("private progress".into())).unwrap();
+            let task = collect_progress(&events, 77, sender, order, scope).await;
+            events.emit(step("private progress".into()));
             let rows = ["project-a", "project-b"]
                 .into_iter()
                 .map(|project| {
@@ -1023,7 +1051,7 @@ mod tests {
             if let DaemonEvent::CommandFinished { result, .. } = &mut event {
                 *result = CommandValue::CrewStalls(Box::new(flotilla_protocol::CrewStallsResponse { rows, ..Default::default() }));
             }
-            events.send(event).unwrap();
+            events.emit(event);
             task.await.unwrap();
             assert!(state.borrow().steps.is_empty());
             {
@@ -1050,7 +1078,6 @@ mod tests {
                     kind: "convoy".into(),
                     name: None,
                     include_replicas: false,
-                    replica_sources: false,
                     cursor: None,
                 })
                 .build(),
@@ -1119,6 +1146,13 @@ mod tests {
             let url = accepted["url"].as_str().unwrap();
             assert_eq!(headers[header::LOCATION], url);
             assert_eq!(accepted["id"], url.strip_prefix("/v1/commands/").unwrap());
+            // The watch's first step is recorded after the POST returns: read the progress once it is.
+            let id = Uuid::parse_str(accepted["id"].as_str().unwrap()).unwrap();
+            let mut state = h.commands.records.lock().await[&id].state.clone();
+            tokio::time::timeout(Duration::from_secs(10), state.wait_for(|state| !state.steps.is_empty()))
+                .await
+                .expect("the watch records a step")
+                .expect("the command's state is held");
             let (status, running, _) = h.call("GET", &format!("{url}?wait=0.01"), None, cbor, CallerAuth::Bearer).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(running["state"], "running");
@@ -1514,11 +1548,8 @@ mod tests {
             let own = h.call("GET", url, None, cbor, caller.clone()).await;
             assert_eq!(own.0, StatusCode::OK);
             assert!(!own.1["outcome"].is_null());
-            let sessions = daemon.resource_backend().using::<flotilla_resources::TerminalSession>("flotilla");
-            let session = sessions.get("placed-session").await.unwrap();
-            let mut status = session.status.unwrap();
-            status.crew = None;
-            sessions.update_status("placed-session", &session.metadata.resource_version, &status).await.unwrap();
+            // The crew's launch ends.
+            install_engine(&daemon).terminals.release(&launch_of(&daemon, "placed-session"));
             let retired = h.call("GET", url, None, cbor, caller).await;
             assert_eq!(retired.0, StatusCode::FORBIDDEN);
             assert_eq!(retired.1["message"], "EnvironmentIdentityUnavailable: no placed crew");
@@ -1772,37 +1803,39 @@ mod tests {
     // out-of-order completions only to the matching record, and survives empty periods.
     #[tokio::test]
     async fn shared_collector_routes_many_commands_with_one_subscription() {
-        let (events, input) = broadcast::channel(64);
+        let (bus, _) = broadcast::channel(64);
+        let events = BroadcastEventSink::new(bus.clone());
         let order = Arc::new(AtomicU64::new(0));
-        let collector = ProgressCollector::new(input, order.clone());
+        let collector = ProgressCollector::new(events.subscribe(), events.watch_completions(), order.clone());
         let mut states = Vec::new();
         for id in 0..8 {
             let (sender, state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
             collector.routes.lock().await.senders.insert(id, sender);
             states.push(state);
         }
-        assert_eq!(events.receiver_count(), 1);
+        assert_eq!(bus.receiver_count(), 1);
         for id in (0..8).rev() {
             let mut progress = step(format!("step-{id}"));
             let DaemonEvent::CommandStepUpdate { command_id, .. } = &mut progress else { unreachable!() };
             *command_id = id;
-            events.send(progress).unwrap();
+            events.emit(progress);
             let mut completion = finished();
             let DaemonEvent::CommandFinished { command_id, .. } = &mut completion else { unreachable!() };
             *command_id = id;
-            events.send(completion.clone()).unwrap();
+            events.emit(completion.clone());
             // Duplicate completion must not mutate another route.
-            events.send(completion).unwrap();
+            events.emit(completion);
             tokio::time::timeout(Duration::from_secs(1), states[id as usize].wait_for(|s| s.outcome.is_some())).await.unwrap().unwrap();
             for (n, state) in states.iter().enumerate() {
                 assert_eq!(state.borrow().outcome.is_some(), n >= id as usize);
                 assert_eq!(state.borrow().steps.len(), usize::from(n >= id as usize));
             }
-            assert_eq!(events.receiver_count(), 1);
+            assert_eq!(bus.receiver_count(), 1);
         }
         let (sender, mut state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
         collector.routes.lock().await.senders.insert(99, sender);
         drop(events);
+        drop(bus);
         tokio::time::timeout(Duration::from_secs(1), state.wait_for(|s| s.collector_closed)).await.unwrap().unwrap();
         assert_eq!(state.borrow().state, "unknown");
         assert!(state.borrow().outcome.is_none());
@@ -1840,31 +1873,33 @@ mod tests {
         drop(permit);
     }
 
-    // Lagged/closed observations must never fabricate an execution outcome. A lagged
-    // observer keeps consuming and can recover the actual finish event later.
+    // Broadcast lag loses only progress: traffic that overruns the broadcast past
+    // a command's completion still leaves its outcome recorded, with the step
+    // history marked truncated. Only a closed sink makes an outcome unknown, and
+    // a closed observation never fabricates one.
     #[tokio::test]
-    async fn lagged_progress_is_unknown_then_recovers() {
+    async fn lagged_progress_truncates_steps_but_keeps_the_outcome() {
         let order = Arc::new(AtomicU64::new(0));
-        let (events, receiver) = broadcast::channel(1);
-        events.send(step("first".into())).unwrap();
-        events.send(step("second".into())).unwrap();
-        let (sender, mut state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
-        let task = tokio::spawn(collect_progress(receiver, 77, sender, order.clone(), CompletionScope::default()));
-        tokio::time::timeout(Duration::from_secs(1), state.wait_for(|s| s.state == "unknown")).await.unwrap().unwrap();
-        assert!(state.borrow().outcome.is_none());
-        assert!(state.borrow().progress_truncated);
-        assert!(state.borrow().observation_error.is_some());
-        events.send(finished()).unwrap();
-        task.await.unwrap();
+        let events = BroadcastEventSink::new(broadcast::channel(1).0);
+        let (sender, state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
+        let task = collect_progress(&events, 77, sender, order.clone(), CompletionScope::default()).await;
+        events.emit(step("first".into()));
+        events.emit(finished());
+        for n in 0..4 {
+            events.emit(step(format!("after-{n}")));
+        }
+        tokio::time::timeout(Duration::from_secs(1), task).await.expect("outcome survives lag").unwrap();
         assert_eq!(state.borrow().state, "finished");
+        assert!(matches!(state.borrow().outcome, Some(CommandValue::Cancelled)));
+        assert!(state.borrow().progress_truncated);
         assert!(state.borrow().observation_error.is_none());
         assert!(state.borrow().unknown_since.is_none());
-        assert!(matches!(state.borrow().outcome, Some(CommandValue::Cancelled)));
 
-        let (events, receiver) = broadcast::channel(1);
+        let events = BroadcastEventSink::new(broadcast::channel(1).0);
         let (sender, state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
+        let task = collect_progress(&events, 77, sender, order, CompletionScope::default()).await;
         drop(events);
-        collect_progress(receiver, 77, sender, order, CompletionScope::default()).await;
+        task.await.unwrap();
         assert_eq!(state.borrow().state, "unknown");
         assert!(state.borrow().outcome.is_none());
         assert!(state.borrow().collector_closed);
@@ -1920,7 +1955,7 @@ mod tests {
     async fn expired_wait_can_observe_later_completion() {
         let h = Harness::new().await;
         let id = Uuid::new_v4();
-        let (events, receiver) = broadcast::channel(4);
+        let events = BroadcastEventSink::new(broadcast::channel(4).0);
         let (sender, state) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
         let permit = h.commands.reserve_for(&user()).await.unwrap();
         h.commands
@@ -1928,12 +1963,12 @@ mod tests {
             .lock()
             .await
             .insert(id, Record { _permit: permit, command_id: Some(77), owner: user(), state, _registration: None });
-        let task = tokio::spawn(collect_progress(receiver, 77, sender, h.commands.eviction_sequence.clone(), CompletionScope::default()));
+        let task = collect_progress(&events, 77, sender, h.commands.eviction_sequence.clone(), CompletionScope::default()).await;
         let url = format!("/v1/commands/{id}");
         let running = h.call("GET", &format!("{url}?wait=0.001"), None, false, CallerAuth::Bearer).await;
         assert_eq!(running.1["state"], "running");
         assert!(running.1["outcome"].is_null());
-        events.send(finished()).unwrap();
+        events.emit(finished());
         let done = h.call("GET", &format!("{url}?wait=1"), None, true, CallerAuth::Bearer).await;
         assert_eq!(done.1["state"], "finished");
         assert_eq!(done.1["outcome"], serde_json::to_value(CommandValue::Cancelled).unwrap());
@@ -1981,9 +2016,9 @@ mod tests {
     async fn unknown_records_expire_and_eviction_retires_routes() {
         let h = Harness::new().await;
         let now = Instant::now();
-        let (events, _) = broadcast::channel(1);
+        let events = BroadcastEventSink::new(broadcast::channel(1).0);
         let mut first_state = None;
-        let collector = ProgressCollector::new(events.subscribe(), h.commands.eviction_sequence.clone());
+        let collector = ProgressCollector::new(events.subscribe(), events.watch_completions(), h.commands.eviction_sequence.clone());
         for n in 0..RECORD_LIMIT {
             let id = Uuid::from_u128((RECORD_LIMIT - n) as u128);
             let permit = h.commands.reserve_for_at(&user(), now).await.unwrap();
@@ -2027,8 +2062,8 @@ mod tests {
             state.observation_lost("transient lag".into(), false, &h.commands.eviction_sequence);
             let (sender, receiver) = watch::channel(state);
             let observer = sender.clone();
-            let (events, input) = broadcast::channel(4);
-            let collector = ProgressCollector::new(input, h.commands.eviction_sequence.clone());
+            let events = BroadcastEventSink::new(broadcast::channel(4).0);
+            let collector = ProgressCollector::new(events.subscribe(), events.watch_completions(), h.commands.eviction_sequence.clone());
             collector.routes.lock().await.senders.insert(77, sender);
             let registration = Some(collector.registration(77));
             let permit = h.commands.reserve_for(&user()).await.unwrap();
@@ -2053,7 +2088,7 @@ mod tests {
             })
             .await
             .unwrap();
-            events.send(finished()).unwrap();
+            events.emit(finished());
             let reply = request.await;
             assert_eq!(reply.1["state"], "finished");
             assert_eq!(reply.1["outcome"], serde_json::to_value(CommandValue::Cancelled).unwrap());
@@ -2069,9 +2104,10 @@ mod tests {
         let h = Harness::new().await;
         let id = Uuid::new_v4();
         let (sender, receiver) = watch::channel(CommandState::new(id, None, &h.commands.eviction_sequence));
-        let (events, input) = broadcast::channel(1);
+        let events = BroadcastEventSink::new(broadcast::channel(1).0);
+        let task = collect_progress(&events, 77, sender, h.commands.eviction_sequence.clone(), CompletionScope::default()).await;
         drop(events);
-        collect_progress(input, 77, sender, h.commands.eviction_sequence.clone(), CompletionScope::default()).await;
+        task.await.unwrap();
         assert!(receiver.borrow().evictable_order(Instant::now()).is_some());
         let permit = h.commands.reserve_for(&user()).await.unwrap();
         h.commands

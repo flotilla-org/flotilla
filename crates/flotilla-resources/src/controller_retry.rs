@@ -42,6 +42,14 @@ pub struct RetryBackoff {
 pub const PROVISIONING_RETRY_BACKOFF: RetryBackoff =
     RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(15 * 60) };
 
+/// A host-local loop's retries after a failure (a failed sync pass, a watch that fails or ends):
+/// 2 s doubling to 5 min, at most [`LOCAL_RETRY_LIMIT`] times in a row.
+pub const LOCAL_RETRY_BACKOFF: RetryBackoff = RetryBackoff { initial: Duration::from_secs(2), maximum: Duration::from_secs(5 * 60) };
+
+/// Failures in a row after which a host-local loop stops retrying on time and waits for its
+/// event alone.
+pub const LOCAL_RETRY_LIMIT: u32 = 10;
+
 impl RetryBackoff {
     pub fn delay(self, attempts: u32) -> Duration {
         self.initial.saturating_mul(1_u32 << attempts.saturating_sub(1).min(31)).min(self.maximum)
@@ -90,6 +98,16 @@ impl ControllerRetry {
             attempts: previous.map_or(1, |retry| retry.attempts.saturating_add(1)),
             first_failure_at: previous.map_or(now, |retry| retry.first_failure_at),
             disposition: ControllerRetryDisposition::Terminal { needs },
+        }
+    }
+
+    /// When a retryable sequence still within its attempts runs past the ceiling's duration.
+    pub fn stall_due(&self, ceiling: RetryCeiling) -> Option<DateTime<Utc>> {
+        match &self.disposition {
+            ControllerRetryDisposition::Retryable { .. } if self.attempts < ceiling.attempts => Some(
+                self.first_failure_at + chrono::Duration::from_std(ceiling.total_duration).expect("retry ceiling fits chrono duration"),
+            ),
+            _ => None,
         }
     }
 

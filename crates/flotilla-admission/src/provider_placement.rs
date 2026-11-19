@@ -47,35 +47,27 @@ mod tests {
     // guest's POSIX root, and freezes that root without a metadata label.
     #[hegel::test]
     fn cloud_controller_selection_is_unique_and_root_is_absolute(tc: hegel::TestCase) {
-        use flotilla_resources::{Host, HostSpec, HostStatus, InputMeta, ENVIRONMENT_PROVIDERS_CAPABILITY};
+        use flotilla_resources::{HostSpec, HostStatus, InputMeta, ENVIRONMENT_PROVIDERS_CAPABILITY};
         let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
         let absolute = tc.draw(gs::booleans());
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+            let backend = flotilla_provisioning_testkit::EngineBackend::open("admission");
             for i in 0..count {
-                let hosts = backend.using::<Host>("flotilla");
-                let host = hosts
-                    .create(
-                        &InputMeta::builder().name(format!("controller-{i}")).build(),
-                        &HostSpec { display_name: format!("controller-{i}"), ..Default::default() },
-                    )
-                    .await
-                    .unwrap();
                 let mut declaration = provider(EnvironmentClass::CloudSandbox);
                 declaration.capabilities.workspace_root = if absolute { "/guest/work" } else { "relative/work" }.into();
-                hosts
-                    .update_status(
-                        &host.metadata.name,
-                        &host.metadata.resource_version,
-                        &HostStatus {
+                // Each controller is written at its own home, as its daemon publishes it.
+                backend
+                    .put_host_at_its_home(
+                        &format!("controller-{i}"),
+                        &HostSpec { display_name: format!("controller-{i}"), ..Default::default() },
+                        Some(&HostStatus {
                             capabilities: [(ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::to_value(vec![declaration]).unwrap())]
                                 .into_iter()
                                 .collect(),
                             ..Default::default()
-                        },
+                        }),
                     )
-                    .await
-                    .unwrap();
+                    .await;
             }
             let spec = FulfilmentKindSpec::builder()
                 .host_ref(String::new())
@@ -210,13 +202,12 @@ mod tests {
     #[hegel::test]
     fn host_observations_drive_each_vessels_frozen_selection(tc: hegel::TestCase) {
         use flotilla_resources::{Host, HostSpec, HostStatus, InputMeta, ENVIRONMENT_PROVIDERS_CAPABILITY};
-        use flotilla_store::ResourceBackend;
-        use flotilla_store_memory::InMemoryBackend;
         let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
         let observations: Vec<_> = (0..steps).map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(4))).collect();
         let label = flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let backend = ResourceBackend::new(InMemoryBackend::default());
+            // Host feta is this home's own.
+            let backend = flotilla_provisioning_testkit::EngineBackend::open("feta");
             let hosts = backend.using::<Host>("flotilla");
             let mut host = hosts
                 .create(&InputMeta::builder().name("feta".into()).build(), &HostSpec { display_name: "feta".into(), ..Default::default() })
@@ -251,7 +242,7 @@ mod tests {
                     }
                     _ => serde_json::to_value(advertisements).unwrap(),
                 };
-                host = hosts
+                let written = hosts
                     .update_status(
                         "feta",
                         &host.metadata.resource_version,
@@ -260,8 +251,16 @@ mod tests {
                             ..Default::default()
                         },
                     )
-                    .await
-                    .unwrap();
+                    .await;
+                host = match written {
+                    Ok(host) => host,
+                    Err(error) => {
+                        // The engine refuses a malformed observation as it is written: no
+                        // placement can select from it.
+                        assert_ne!(observation, 0, "a well-formed observation is held: {error}");
+                        continue;
+                    }
+                };
                 let mut vessel_kind = original.clone();
                 let result = crate::support::resolve_placement_provider(&backend, "flotilla", &mut vessel_kind).await;
                 assert_eq!(result.is_ok(), observation == 0);

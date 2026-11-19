@@ -12,14 +12,11 @@ out=$1
 jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
 [ -r "$jar" ] || { echo "missing readable Apalache jar: $jar; install Apalache or set APALACHE_JAR" >&2; exit 2; }
 mkdir -p "$out"
-for machine in ${MACHINES:-lifecycle agent_session convoy message ensure vessel awaiting_reply manifest_root}; do
+for machine in ${MACHINES:-lifecycle agent_session convoy message vessel awaiting_reply manifest_root}; do
   module="${machine}_conformance"
-  invariant=()
-  if [ "$machine" = convoy ]; then invariant=(--invariant quotaRefinesPlacement); fi
-  quint compile ${server[@]+"${server[@]}"} "$machine.qnt" --target tlaplus ${invariant[@]+"${invariant[@]}"} > "$out/$machine.compile.log"
+  quint compile ${server[@]+"${server[@]}"} "$machine.qnt" --target tlaplus > "$out/$machine.compile.log"
   awk '/^-+ MODULE/{found=1} found' "$out/$machine.compile.log" > "$out/$module.tla"
   printf 'INIT q_init\nNEXT q_step\n' > "$out/$module.cfg"
-  if [ "$machine" = convoy ]; then printf 'INVARIANT q_inv\n' >> "$out/$module.cfg"; fi
   java -Xmx2g -Xss512k -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers "${TLC_WORKERS:-4}" \
     -metadir "$out/$machine.states" -dump "$out/$machine" \
     -config "$out/$module.cfg" "$out/$module.tla" > "$out/$machine.tlc.log" 2>&1

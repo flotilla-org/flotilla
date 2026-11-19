@@ -19,6 +19,7 @@ async fn connector_rebuilds_warn_only_on_gap_transitions() {
         .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "work"))
         .name("work")
         .workflow_ref("dev")
+        .project_ref("dev")
         .phase(ConvoyPhase::Active)
         .subjects(
             ["forge-a.example", "forge-b.example"]

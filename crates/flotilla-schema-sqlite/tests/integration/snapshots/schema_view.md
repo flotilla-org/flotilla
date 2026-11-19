@@ -4,37 +4,35 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
-| `awaiting_reply` | root | 12 | – | – | `open_by_sender` (sender), `open_by_subject` (subject), `by_message` (message), `deadline` (deadline) |
+| `awaiting_reply` | root | 15 | – | – | `open_by_sender` (sender), `open_by_subject` (subject), `by_message` (message), `deadline` (deadline) |
 | `agent_session` | root | 9 | – | – | – |
-| `convoy` | root | 9 | – | `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_quota` (state data), `convoy_retired` (state data) | `open_by_project` (project) |
+| `convoy` | root | 14 | – | `convoy_subjects` (records), `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_retired_duties` (state data) | `open_by_project` (project), `by_launch` (project, launch_of, launch) |
+| `convoy_subjects` | records | 6 | – | – | – |
 | `convoy_duties` | child | 6 | 1: `scope` 1 | `convoy_duties_scope_promises` (child) | – |
 | `convoy_duties_scope_promises` | child | 3 | – | – | – |
-| `convoy_seats` | records | 10 | – | – | – |
+| `convoy_seats` | records | 11 | – | – | – |
 | `convoy_promises` | records | 12 | – | `convoy_promises_submissions` (records) | `by_label` (unique convoy, label) |
 | `convoy_promises_submissions` | records | 8 | – | – | `by_address` (address) |
-| `convoy_quota` | state data | 3 | – | – | – |
-| `convoy_retired` | state data | 2 | – | – | – |
+| `convoy_retired_duties` | state data | 2 | – | – | – |
 | `dossier` | root | 7 | – | `dossier_inputs` (child), `dossier_deliverables` (records) | – |
 | `dossier_inputs` | child | 5 | 3: `tag` 3 | `dossier_inputs_items` (child) | – |
 | `dossier_inputs_items` | child | 4 | – | – | – |
 | `dossier_deliverables` | records | 9 | 2: `source` 2 | `dossier_deliverables_evidence` (records) | – |
 | `dossier_deliverables_evidence` | records | 9 | – | `dossier_deliverables_evidence_metadata` (child) | – |
 | `dossier_deliverables_evidence_metadata` | child | 5 | – | – | – |
-| `ensure` | root | 15 | – | `ensure_recorded` (state data), `ensure_created` (state data) | `by_inbox` (inbox) |
-| `ensure_recorded` | state data | 2 | – | – | – |
-| `ensure_created` | state data | 2 | – | – | – |
-| `message` | root | 23 | 5: `expectation` 2, `reason` 3 | `message_references` (child) | `pending_by_inbox` (inbox, admitted_seq), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
+| `message` | root | 24 | 5: `expectation` 2, `reason` 3 | `message_references` (child) | `by_inbox` (inbox, state, admitted_seq), `delivered_by_inbox` (inbox, delivered_at), `settled_by_inbox` (inbox, state_since), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
 | `message_references` | child | 5 | – | – | – |
 | `person` | root | 4 | – | – | – |
 | `referral` | root | 24 | 12: `subject` 6, `condition_address` 6 | `referral_references` (child) | `by_session` (session, seq), `by_reply` (in_reply_to) |
 | `referral_references` | child | 11 | 9: `tag` 9 | – | `repository_ref` (repository), `resource_ref` (resource) |
+| `service` | root | 4 | – | – | – |
 | `ticket` | root | 14 | – | `ticket_assignees` (state data), `ticket_notes` (state data) | `open_by_queue` (queue) |
 | `ticket_assignees` | state data | 2 | – | – | – |
 | `ticket_notes` | state data | 3 | – | – | – |
 | `terminal_session` | root | 23 | 6: `source` 4, `ending` 2 | `terminal_session_env` (child), `terminal_session_labels` (child) | `by_vessel` (vessel, ordinal), `live_by_pool` (pool) |
 | `terminal_session_env` | child | 3 | – | – | – |
 | `terminal_session_labels` | child | 2 | – | – | – |
-| `vessel` | root | 18 | 2: `ending` 2 | `vessel_shape` (child) | `live_by_host` (host), `by_convoy` (convoy) |
+| `vessel` | root | 20 | 2: `ending` 2 | `vessel_shape` (child) | `live_by_host` (host), `by_launch` (convoy, launch_of, launch) |
 | `vessel_shape` | child | 3 | – | – | – |
 
 Tables wider than 30 columns:
@@ -43,9 +41,8 @@ Tables wider than 30 columns:
 States with data (one label column, then data shared by name across the labels):
 - `awaiting_reply`.`state`: label `state` and `state_since`; data columns `reason`; data tables –
 - `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `activity`, `activity_since`, `activity_cause`, `reason`; data tables –
-- `convoy`.`state`: label `state` and `state_since`; data columns `reason`; data tables `convoy_quota`, `convoy_retired`
-- `ensure`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `bound`; data tables `ensure_recorded`, `ensure_created`
-- `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –
+- `convoy`.`state`: label `state` and `state_since`; data columns `disposition`, `cause`, `reason`; data tables `convoy_retired_duties`
+- `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `delivered_at`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –
 - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_by`, `hold_until`, `reason`, `closed_by`, `signature_who`, `signature_at`; data tables `ticket_assignees`, `ticket_notes`
 - `terminal_session`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `ending`, `ending_reason`, `cause_category`, `cause_detail`; data tables –
 - `vessel`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `ending`, `ending_reason`, `cause_category`, `cause_detail`; data tables –
@@ -58,7 +55,10 @@ Interned column domains:
 | `awaiting_reply` | `recipient` | `ad` |
 | `awaiting_reply` | `subject` | `ad` |
 | `awaiting_reply` | `kind` | `ak` |
+| `convoy` | `launch_of` | `ln` |
+| `convoy` | `workflow_ref` | `wf` |
 | `convoy` | `project` | `ad` |
+| `convoy_subjects` | `subject` | `ad` |
 | `convoy_duties` | `owner_role` | `rl` |
 | `convoy_duties` | `owner_seat` | `st` |
 | `convoy_seats` | `role` | `rl` |
@@ -74,14 +74,9 @@ Interned column domains:
 | `convoy_promises_submissions` | `address` | `ad` |
 | `convoy_promises_submissions` | `by_role` | `rl` |
 | `convoy_promises_submissions` | `by_seat` | `st` |
-| `convoy_quota` | `key` | `vc` |
 | `dossier_deliverables` | `label` | `lb` |
 | `dossier_deliverables` | `source_step` | `st` |
 | `dossier_deliverables_evidence` | `verdict_by` | `wr` |
-| `ensure` | `inbox` | `ad` |
-| `ensure` | `bound` | `rn` |
-| `ensure_recorded` | `value` | `rn` |
-| `ensure_created` | `value` | `rn` |
 | `message` | `sender` | `ad` |
 | `message` | `inbox` | `ad` |
 | `message` | `expectation_condition` | `ad` |
@@ -102,5 +97,6 @@ Interned column domains:
 | `terminal_session` | `role` | `rl` |
 | `terminal_session` | `pool` | `pl` |
 | `terminal_session` | `source_selector` | `sl` |
+| `vessel` | `launch_of` | `ln` |
 | `vessel` | `class` | `vc` |
 | `vessel` | `host` | `hs` |

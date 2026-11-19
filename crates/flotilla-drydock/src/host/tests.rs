@@ -568,34 +568,14 @@ impl tokio::io::AsyncWrite for Held {
     }
 }
 
-/// Log lines written while a test runs.
-#[derive(Clone, Default)]
-struct Logged(Arc<StdMutex<Vec<u8>>>);
-impl io::Write for Logged {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-impl Logged {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
-
 // #4054: a connect dropped partway through its agent upgrade's upload logs
 // the abandoned upgrade: the vessel, the build's digest, how many bytes the
 // agent holds and why. Mutation check: without the connect's upgrade watch
 // the drop leaves no log line and this scenario fails.
 #[tokio::test]
 async fn a_connect_dropped_partway_through_an_upgrade_logs_it_abandoned() {
-    let logged = Logged::default();
-    let writer = logged.clone();
-    let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
-    let _logging = tracing::subscriber::set_default(subscriber);
+    let (logging, logged) = flotilla_log_testkit::capture(tracing::Level::INFO);
+    let _logging = tracing::dispatcher::set_default(&logging);
 
     let root = tempfile::Builder::new().prefix("fvu-").tempdir_in("/tmp").unwrap();
     let directory = root.path().join("vessel");

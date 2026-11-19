@@ -9,19 +9,15 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use flotilla_store::load_metrics::{ControllerMetricsRegistry, HistogramSnapshot, ReplicationLoadMetrics, StoreLoadMetrics};
+use flotilla_core::in_process::local_host::LocalHostReading;
+use flotilla_store::load_metrics::{callers, ControllerMetricsRegistry, HistogramSnapshot, ReadCounts, ReplicationLoadMetrics};
 
 use super::RouterState;
 
+#[derive(Default)]
 pub(in crate::server) struct LoadMetrics {
-    pub store: Arc<StoreLoadMetrics>,
     pub controllers: OnceLock<Arc<ControllerMetricsRegistry>>,
     pub replication: Arc<ReplicationLoadMetrics>,
-}
-impl LoadMetrics {
-    pub fn new(store: Arc<StoreLoadMetrics>) -> Self {
-        Self { store, controllers: OnceLock::new(), replication: Arc::default() }
-    }
 }
 
 pub(super) async fn handle(State(RouterState(state)): State<RouterState>) -> Response {
@@ -33,7 +29,8 @@ pub(super) async fn handle(State(RouterState(state)): State<RouterState>) -> Res
     };
     // Serve only Prometheus 0.0.4 text, without OpenMetrics negotiation. Recheck
     // histogram-family and separate _max gauge names before changing formats.
-    let text = render(metrics, daemon);
+    let local = daemon.local_host_reading().await;
+    let text = render(metrics, daemon, &local);
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], text).into_response()
 }
 
@@ -52,12 +49,30 @@ impl Exposition {
     fn family(&mut self, name: &str, kind: &str) {
         self.current = name.to_owned();
         let help = match name {
-            "flotilla_store_read_contention_total" => "Busy read refusals returned to callers; each refusal counts once.",
-            "flotilla_store_queue_wait_seconds" => "Time queued before a store read or write starts, in seconds.",
-            "flotilla_store_execution_seconds" => "Store read or write execution time, excluding queue wait, in seconds.",
+            "flotilla_store_queue_wait_seconds" => {
+                "Time queued before a store read or write starts (the decided store: waiting for its lock), in seconds."
+            }
+            "flotilla_store_execution_seconds" => {
+                "Store read or write execution time, excluding queue wait (the decided store: its lock held), in seconds."
+            }
+            "flotilla_store_wal_frames" => "Frames in the store's write-ahead log at its writer's last checkpoint.",
+            "flotilla_store_wal_uncheckpointed_frames" => {
+                "Write-ahead log frames the writer's last checkpoint could not copy back, because a reader holds them."
+            }
+            "flotilla_store_wal_checkpoints_total" => {
+                "The writer's write-ahead log checkpoints: complete, or starved by a reader holding the log."
+            }
+            "flotilla_convoys_waiting_capacity" => "Convoys this home holds that wait for capacity on a host their placement chose.",
+            "flotilla_convoys_unreadable" => "Convoy launches, at any home, whose records cannot be read; each is listed with why.",
             "flotilla_dispatch_time_from_ready_seconds" => {
                 "Time from an issue entering the dispatch queue to its convoy's creation, in seconds."
             }
+            "flotilla_disk_free_bytes" => "Free bytes on the filesystem convoy admission measures.",
+            "flotilla_admission_free_space_floor_bytes" => "The free space below which this host admits no convoy, in bytes.",
+            "flotilla_daemon_info" => "This daemon's version, as a label; always 1.",
+            "flotilla_daemon_start_time_seconds" => "When this daemon started, in Unix seconds.",
+            "flotilla_blob_sync_pending" => "Blobs written locally that the fleet tiers do not hold yet.",
+            "flotilla_blob_sync_failing" => "1 while the last blob sync pass failed; the error is logged when it changes.",
             _ => "Daemon load instrumentation; counters are cumulative and peaks are high-water marks since startup.",
         };
         self.families.entry(self.current.clone()).or_insert_with(|| format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
@@ -72,8 +87,7 @@ impl Exposition {
     }
     fn histogram(&mut self, name: &str, labels: &str, histogram: &HistogramSnapshot) {
         self.family(name, "histogram");
-        // Even u64::MAX is a real finite microsecond bound, not an infinity
-        // sentinel. Preserve it and append the separate Prometheus +Inf bucket.
+        // The histogram's own export bounds, then +Inf for everything above the last.
         for (upper, count) in histogram.cumulative_buckets() {
             self.sample(&format!("{name}_bucket"), &format!("{labels},le=\"{}\"", upper as f64 / 1_000_000.0), count);
         }
@@ -82,21 +96,57 @@ impl Exposition {
         self.sample(&format!("{name}_count"), labels, histogram.count());
         self.number(&format!("{name}_max"), "gauge", labels, histogram.summary().max_micros as f64 / 1_000_000.0);
     }
+    /// One caller's engine reads, by kind: callers are controller kinds and fixed task names.
+    fn reads(&mut self, caller: &str, reads: &ReadCounts) {
+        for (kind, counts) in reads {
+            let labels = format!(",caller=\"{}\",kind=\"{}\"", escaped(caller), escaped(kind));
+            for (shape, value) in [("keyed", counts.keyed), ("index", counts.index), ("whole_kind", counts.whole_kind)] {
+                self.number("flotilla_engine_reads_total", "counter", &format!("{labels},shape=\"{shape}\""), value);
+            }
+            for (name, value) in [("read_rows", counts.rows), ("records_decoded", counts.decoded), ("records_converted", counts.converted)]
+            {
+                self.number(&format!("flotilla_engine_{name}_total"), "counter", &labels, value);
+            }
+        }
+    }
 }
-fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDaemon) -> String {
+fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDaemon, local: &LocalHostReading) -> String {
     let mut out = Exposition { current: String::new(), host: escaped(daemon.host_name().as_str()), families: Default::default() };
-    let store = metrics.store.snapshot();
-    for (operation, wait, execution, peak) in [
-        ("read", &store.read_wait, &store.read_execution, store.read_queue_peak),
-        ("write", &store.write_wait, &store.write_execution, store.write_queue_peak),
-    ] {
-        let labels = format!(",operation=\"{operation}\"");
+    // This host's live figures: the stored Host carries only what remote readers decide on.
+    if let Some(bytes) = local.disk_free_bytes {
+        out.number("flotilla_disk_free_bytes", "gauge", "", bytes);
+    }
+    if let Some(bytes) = local.admission_free_space_floor_bytes {
+        out.number("flotilla_admission_free_space_floor_bytes", "gauge", "", bytes);
+    }
+    if let Some(version) = &local.daemon_version {
+        out.number("flotilla_daemon_info", "gauge", &format!(",version=\"{}\"", escaped(version)), 1);
+    }
+    if let Some(started_at) = local.daemon_started_at {
+        out.number("flotilla_daemon_start_time_seconds", "gauge", "", started_at.timestamp());
+    }
+    if let Some(sync) = &local.blob_sync {
+        out.number("flotilla_blob_sync_pending", "gauge", "", sync.pending_count);
+        out.number("flotilla_blob_sync_failing", "gauge", "", u8::from(sync.last_error.is_some()));
+    }
+    // The decided store's waits and executions are its lock's holds.
+    let decided = daemon.decided_store_metrics().snapshot();
+    for (operation, wait, execution) in
+        [("read", &decided.read_wait, &decided.read_execution), ("write", &decided.write_wait, &decided.write_execution)]
+    {
+        let labels = format!(",store=\"decided\",operation=\"{operation}\"");
         out.histogram("flotilla_store_queue_wait_seconds", &labels, wait);
         out.histogram("flotilla_store_execution_seconds", &labels, execution);
-        out.number("flotilla_store_queue_peak", "gauge", &labels, peak);
     }
-    out.number("flotilla_store_reads_shed_total", "counter", "", store.reads_shed);
-    out.number("flotilla_store_read_contention_total", "counter", "", store.read_contention);
+    if let Ok(service) = daemon.decided_store() {
+        let wal = service.wal();
+        let labels = ",store=\"decided\"";
+        out.number("flotilla_store_wal_frames", "gauge", labels, wal.frames);
+        out.number("flotilla_store_wal_uncheckpointed_frames", "gauge", labels, wal.uncheckpointed);
+        for (result, count) in [("complete", wal.complete), ("starved", wal.starved)] {
+            out.number("flotilla_store_wal_checkpoints_total", "counter", &format!("{labels},result=\"{result}\""), count);
+        }
+    }
     if let Some(controllers) = metrics.controllers.get() {
         // Kinds are registered by the compiled controller set, never resource IDs.
         for (kind, snapshot) in controllers.snapshot() {
@@ -105,17 +155,30 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
             out.histogram("flotilla_controller_reconcile_seconds", &labels, &snapshot.reconcile);
             for (name, value) in [
                 ("wakes", snapshot.wakes),
+                ("enqueued", snapshot.enqueued),
+                ("enqueued_coalesced", snapshot.enqueued_coalesced),
                 ("requeues", snapshot.requeues),
                 ("requeues_coalesced", snapshot.requeues_coalesced),
                 ("failures", snapshot.failures),
                 ("resyncs", snapshot.resyncs),
                 ("resync_enqueued", snapshot.resync_enqueued),
+                ("skipped", snapshot.skipped),
             ] {
                 out.number(&format!("flotilla_controller_{name}_total"), "counter", &labels, value);
             }
             out.number("flotilla_controller_busy_seconds_total", "counter", &labels, snapshot.busy_micros as f64 / 1_000_000.0);
             out.number("flotilla_controller_queue_peak", "gauge", &labels, snapshot.queue_peak);
+            out.number("flotilla_controller_parked", "gauge", &labels, snapshot.parked);
+            out.reads(&kind, &snapshot.reads);
+            out.reads(&format!("{kind} watches"), &snapshot.watch_reads);
         }
+    }
+    for (caller, reads) in callers() {
+        out.reads(&caller, &reads);
+    }
+    if let Some(convoys) = daemon.engine_convoys() {
+        out.number("flotilla_convoys_waiting_capacity", "gauge", "", convoys.memory().capacity_waits());
+        out.number("flotilla_convoys_unreadable", "gauge", "", convoys.memory().unreadable());
     }
     for ((project, workflow), histogram) in crate::dispatch_reconciler::DispatchMetrics::global().snapshot() {
         let labels = format!(",project=\"{}\",workflow=\"{}\"", escaped(&project), escaped(&workflow));
@@ -124,31 +187,10 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
     let replication = metrics.replication.snapshot();
     for (name, value) in [
         ("snapshots", replication.snapshots),
-        ("lag_resets", replication.lag_resets),
         ("stream_failures", replication.stream_failures),
         ("events_applied", replication.events_applied),
     ] {
         out.number(&format!("flotilla_replication_{name}_total"), "counter", "", value);
-    }
-    for (consumer, snapshot) in flotilla_store::load_metrics::read_retry_snapshot() {
-        let labels = format!(",consumer=\"{consumer}\"");
-        for (name, value) in [
-            ("retries", snapshot.retries),
-            ("recoveries", snapshot.recoveries),
-            ("failures", snapshot.failures),
-            ("cancellations", snapshot.cancellations),
-        ] {
-            out.number(&format!("flotilla_read_retry_{name}_total"), "counter", &labels, value);
-        }
-        for (name, value) in [
-            ("peak_consecutive", snapshot.peak_consecutive),
-            ("active", snapshot.active),
-            ("prolonged", snapshot.prolonged),
-            ("consecutive", snapshot.consecutive),
-        ] {
-            out.number(&format!("flotilla_read_retry_{name}"), "gauge", &labels, value);
-        }
-        out.number("flotilla_read_retry_oldest_seconds", "gauge", &labels, snapshot.oldest_millis as f64 / 1000.0);
     }
     for row in daemon.forge_budget_rows() {
         let labels = format!(",identity=\"{}\",budget=\"{}\"", escaped(&row.identity), escaped(&row.budget));
@@ -182,6 +224,7 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
     };
+    use flotilla_store::load_metrics::{ExportBounds, LatencyHistogram, StoreExecution};
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -196,19 +239,18 @@ mod tests {
         std::fs::write(dir.path().join("daemon.toml"), "machine_id = \"metrics-host\"\n[dummy_fleet]\n").unwrap();
         let daemon_config = config.load_daemon_config().unwrap();
         let mut discovery = flotilla_discovery_testkit::fake_discovery_with_host_directories(dir.path());
-        let fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, &mut discovery).unwrap();
-        let sqlite = flotilla_store_sqlite::SqliteBackend::open_in_memory().unwrap();
-        let metrics = Arc::new(LoadMetrics::new(sqlite.load_metrics()));
+        let fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, config.state_dir().as_path(), &mut discovery).unwrap().unwrap();
+        let metrics = Arc::new(LoadMetrics::default());
         let daemon = flotilla_core::in_process::InProcessDaemon::new_with_resource_backend(
             vec![],
             config.clone(),
             discovery,
             flotilla_protocol::HostName::new("metrics-host"),
-            flotilla_store::ResourceBackend::new(sqlite),
+            crate::server::build_embedded_resource_backend(),
             Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
-        crate::dummy_fleet::attach_dummy_fleet(&fleet, &daemon).unwrap();
+        fleet.resume();
         let runtime = crate::runtime::DaemonRuntime::start_with_options(
             daemon.clone(),
             config,
@@ -236,10 +278,28 @@ mod tests {
         // and command port used by the fleet integration harness.
         use flotilla_daemon_api::daemon::DaemonHandle;
         use flotilla_dummy_fleet::catalog::{self, CrewMix, DUMMY_FULFILMENT_KIND};
-        use flotilla_resources::{FulfilmentKind, Host, InputMeta, Repository, WorkflowTemplate};
+        use flotilla_resources::{
+            FleetDesignation, FleetDesignationSpec, FulfilmentKind, Host, InputMeta, Project, Repository, WorkflowTemplate,
+            FLEET_DESIGNATION_NAME,
+        };
         let backend = daemon.resource_backend();
-        let host = backend.clone().using::<Host>("flotilla").list().await.unwrap().items.remove(0);
+        // The fleet is designated, as the dummy catalog designates it: a checkout's branch is
+        // looked up through the fleet's forge observer role.
         let repository = catalog::repository(&forge).unwrap();
+        backend
+            .definitions::<Project>("flotilla")
+            .create(&InputMeta::builder().name(catalog::FLEET_PROJECT.into()).build(), &catalog::fleet_project(&repository))
+            .await
+            .unwrap();
+        backend
+            .definitions::<FleetDesignation>("flotilla")
+            .create(
+                &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
+                &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
+            )
+            .await
+            .unwrap();
+        let host = backend.clone().using::<Host>("flotilla").list().await.unwrap().items.remove(0);
         let repositories = backend.clone().using::<Repository>("flotilla");
         repositories.create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository).await.unwrap();
         backend
@@ -280,16 +340,7 @@ mod tests {
         daemon
             .execute(
                 flotilla_protocol::Command::builder()
-                    .action(flotilla_protocol::CommandAction::ConvoyCreate {
-                        name: "metrics-load".into(),
-                        workflow_ref: CrewMix::Coder.workflow_name().into(),
-                        inputs: vec![],
-                        repository_url: Some(catalog::repository_url(&forge)),
-                        r#ref: Some("main".into()),
-                        project_ref: None,
-                        placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
-                        adopted_checkout: None,
-                    })
+                    .action(catalog::dispatch("metrics-load", CrewMix::Coder.workflow_name(), DUMMY_FULFILMENT_KIND))
                     .build(),
             )
             .await
@@ -316,14 +367,10 @@ mod tests {
         for family in [
             "flotilla_store_queue_wait_seconds",
             "flotilla_store_execution_seconds",
-            "flotilla_store_read_contention_total",
             "flotilla_controller_reconcile_seconds",
             "flotilla_replication_stream_failures_total",
-            "flotilla_read_retry_retries_total",
             "flotilla_forge_budget_calls_total",
             "flotilla_forge_budget_window_calls",
-            "flotilla_store_queue_peak",
-            "flotilla_store_reads_shed_total",
             "flotilla_store_queue_wait_seconds_max",
             "flotilla_store_execution_seconds_max",
             "flotilla_controller_queue_wait_seconds",
@@ -331,29 +378,25 @@ mod tests {
             "flotilla_controller_reconcile_seconds_max",
             "flotilla_controller_busy_seconds_total",
             "flotilla_controller_queue_peak",
+            "flotilla_controller_parked",
             "flotilla_controller_wakes_total",
             "flotilla_controller_requeues_total",
             "flotilla_controller_requeues_coalesced_total",
             "flotilla_controller_failures_total",
             "flotilla_controller_resyncs_total",
             "flotilla_controller_resync_enqueued_total",
+            "flotilla_controller_skipped_total",
             "flotilla_replication_snapshots_total",
-            "flotilla_replication_lag_resets_total",
             "flotilla_replication_events_applied_total",
-            "flotilla_read_retry_recoveries_total",
-            "flotilla_read_retry_failures_total",
-            "flotilla_read_retry_cancellations_total",
-            "flotilla_read_retry_peak_consecutive",
-            "flotilla_read_retry_active",
-            "flotilla_read_retry_prolonged",
-            "flotilla_read_retry_consecutive",
-            "flotilla_read_retry_oldest_seconds",
             "flotilla_forge_budget_reported_cost_total",
             "flotilla_forge_budget_unreported_calls_total",
             "flotilla_forge_budget_window_reported_cost",
             "flotilla_forge_budget_window_unreported_calls",
             "flotilla_forge_budget_window_start_seconds",
             "flotilla_dispatch_time_from_ready_seconds",
+            "flotilla_store_wal_frames",
+            "flotilla_store_wal_uncheckpointed_frames",
+            "flotilla_store_wal_checkpoints_total",
         ] {
             assert!(text.contains(&format!("# TYPE {family} ")), "missing {family}");
         }
@@ -365,6 +408,8 @@ mod tests {
                 | prometheus_parse::Value::Untyped(value) => assert!(value.is_finite() && *value >= 0.0),
                 prometheus_parse::Value::Histogram(buckets) => {
                     assert!(buckets.windows(2).all(|pair| pair[0].count <= pair[1].count));
+                    // Each histogram exports its own bounds (at most 25) and +Inf.
+                    assert!(buckets.len() <= 26, "{} exports {} buckets", sample.metric, buckets.len());
                 }
                 _ => panic!("unexpected summary"),
             }
@@ -382,7 +427,7 @@ mod tests {
                 > 0));
         }
         assert!(text.contains("flotilla_forge_budget_calls_total{host=\"metrics-host\",identity=\"host gh login\",budget=\"REST\"} 1"));
-        runtime.shutdown();
+        runtime.shutdown().await;
     }
 
     // Behaviour: the loopback policy admits GET /metrics without credentials,
@@ -395,14 +440,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("daemon.toml"), "machine_id = \"metrics-policy\"\n").unwrap();
         let config = Arc::new(flotilla_config::ConfigStore::with_base(dir.path().to_path_buf()));
-        let sqlite = flotilla_store_sqlite::SqliteBackend::open_in_memory().unwrap();
-        let metrics = Arc::new(LoadMetrics::new(sqlite.load_metrics()));
+        let metrics = Arc::new(LoadMetrics::default());
         let daemon = flotilla_core::in_process::InProcessDaemon::new_with_resource_backend(
             vec![],
             config,
             flotilla_discovery_testkit::fake_discovery(false),
             flotilla_protocol::HostName::new("metrics-policy"),
-            flotilla_store::ResourceBackend::new(sqlite),
+            crate::server::build_embedded_resource_backend(),
             Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
@@ -435,11 +479,83 @@ mod tests {
         }
     }
 
-    // Behaviour: the largest internal microsecond bucket stays finite and
-    // ordered below one +Inf bucket. One boundary example covers this conversion.
+    /// A fleet tier that refuses every request.
+    struct UnreachableFleet;
+
+    #[async_trait::async_trait]
+    impl crate::blob_store::BlobStore for UnreachableFleet {
+        async fn put(&self, _: &[u8]) -> Result<crate::blob_store::BlobDigest, String> {
+            Err("fleet unreachable".into())
+        }
+        async fn get(&self, _: &crate::blob_store::BlobDigest) -> Result<Option<Vec<u8>>, String> {
+            Err("fleet unreachable".into())
+        }
+        async fn has(&self, _: &crate::blob_store::BlobDigest) -> Result<bool, String> {
+            Err("fleet unreachable".into())
+        }
+        async fn delete(&self, _: &crate::blob_store::BlobDigest) -> Result<(), String> {
+            Err("fleet unreachable".into())
+        }
+    }
+
+    // Behaviour: GET /metrics exports this host's free disk, admission floor, version, start time
+    // and blob sync, which the stored Host does not carry; remote readers take them from here.
+    #[tokio::test]
+    async fn metrics_export_the_local_host_figures() {
+        use crate::blob_store::BlobStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.toml"), "machine_id = \"metrics-local\"\n").unwrap();
+        let config = Arc::new(flotilla_config::ConfigStore::with_base(dir.path().to_path_buf()));
+        let daemon = flotilla_core::in_process::InProcessDaemon::new_with_resource_backend(
+            vec![],
+            config,
+            flotilla_discovery_testkit::fake_discovery(false),
+            flotilla_protocol::HostName::new("metrics-local"),
+            crate::server::build_embedded_resource_backend(),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        let blobs = Arc::new(crate::blob_store::TieredBlobStore::new(
+            &dir.path().join("blobs"),
+            vec![("fleet".into(), Arc::new(UnreachableFleet))],
+        ));
+        blobs.put(b"written while the fleet is away").await.unwrap();
+        blobs.sync_once().await.unwrap();
+        let started_at = chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap();
+        daemon
+            .install_local_host_identity(flotilla_core::in_process::local_host::LocalHostIdentity {
+                version: "metrics-version".into(),
+                started_at,
+                blob_sync: Some(blobs),
+            })
+            .unwrap();
+        let logins = Arc::new(super::super::LoginStore::new(daemon.clock_for_scenarios()));
+        let router = HttpRouter::for_daemon(daemon.clone(), logins, Default::default())
+            .with_load_metrics(Arc::new(LoadMetrics::default()), true)
+            .into_router();
+        let response = router.oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 8_000_000).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        prometheus_parse::Scrape::parse(text.lines().map(|line| Ok(line.to_owned()))).unwrap();
+        for sample in [
+            format!("flotilla_disk_free_bytes{{host=\"metrics-local\"}} {}", 100u64 * 1024 * 1024 * 1024),
+            format!("flotilla_admission_free_space_floor_bytes{{host=\"metrics-local\"}} {}", 20u64 * 1024 * 1024 * 1024),
+            "flotilla_daemon_info{host=\"metrics-local\",version=\"metrics-version\"} 1".to_string(),
+            "flotilla_daemon_start_time_seconds{host=\"metrics-local\"} 1790000000".to_string(),
+            "flotilla_blob_sync_pending{host=\"metrics-local\"} 1".to_string(),
+            "flotilla_blob_sync_failing{host=\"metrics-local\"} 1".to_string(),
+        ] {
+            assert!(text.lines().any(|line| line == sample), "missing {sample}");
+        }
+        assert!(!text.contains("fleet unreachable"), "the sync error text is not a label");
+    }
+
+    // Behaviour: a value above a histogram's last bound reaches only +Inf, and the
+    // finite buckets are exactly the histogram's own bounds.
     #[test]
-    fn histogram_top_bucket_is_finite() {
-        let histogram = flotilla_store::load_metrics::LatencyHistogram::default();
+    fn a_value_above_the_last_bound_reaches_only_inf() {
+        let histogram = LatencyHistogram::<StoreExecution>::default();
         histogram.record(Duration::MAX);
         let mut out = Exposition { current: String::new(), host: "host".into(), families: Default::default() };
         out.histogram("latency_seconds", "", &histogram.snapshot());
@@ -447,21 +563,25 @@ mod tests {
         let scrape = prometheus_parse::Scrape::parse(text.lines().map(|line| Ok(line.to_owned()))).unwrap();
         let sample = scrape.samples.iter().find(|sample| sample.metric == "latency_seconds").unwrap();
         let prometheus_parse::Value::Histogram(buckets) = &sample.value else { panic!("expected histogram") };
-        assert_eq!(buckets.iter().filter(|bucket| bucket.less_than.is_infinite()).count(), 1);
-        let finite = &buckets[buckets.len() - 2];
-        assert!(finite.less_than.is_finite());
-        assert_eq!(finite.less_than, u64::MAX as f64 / 1_000_000.0);
-        assert_eq!(finite.count, 1.0);
-        assert_eq!(buckets.last().unwrap().count, 1.0);
+        let (infinite, finite) = buckets.split_last().unwrap();
+        assert!(infinite.less_than.is_infinite());
+        assert_eq!(infinite.count, 1.0);
+        let bounds = finite.iter().map(|bucket| bucket.less_than).collect::<Vec<_>>();
+        assert_eq!(bounds, StoreExecution::MICROS.iter().map(|bound| *bound as f64 / 1_000_000.0).collect::<Vec<_>>());
+        assert!(finite.iter().all(|bucket| bucket.count == 0.0));
     }
 
     // Behaviour: bucket exposition conserves counts and sums, uses inclusive
     // cumulative bounds, and always terminates with +Inf. The generator spans
-    // empty/duplicate samples, zero and sub-bucket boundaries through one second.
+    // empty/duplicate samples, zero, values exactly on a bound, and values past the
+    // last bound.
     #[hegel::test]
     fn histogram_exposition_conserves_observations(tc: hegel::TestCase) {
-        let values = tc.draw(hegel::generators::vecs(hegel::generators::integers::<u64>().min_value(0).max_value(1_000_000)).max_size(40));
-        let histogram = flotilla_store::load_metrics::LatencyHistogram::default();
+        let mut values =
+            tc.draw(hegel::generators::vecs(hegel::generators::integers::<u64>().min_value(0).max_value(3_000_000)).max_size(40));
+        let on_bounds = tc.draw(hegel::generators::vecs(hegel::generators::sampled_from(StoreExecution::MICROS.to_vec())).max_size(10));
+        values.extend(on_bounds);
+        let histogram = LatencyHistogram::<StoreExecution>::default();
         for value in &values {
             histogram.record(Duration::from_micros(*value));
         }

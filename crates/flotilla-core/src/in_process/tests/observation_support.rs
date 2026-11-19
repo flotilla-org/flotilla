@@ -10,8 +10,7 @@ use flotilla_protocol::HostName;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{Repository, RepositoryKey, RepositorySpec};
-use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 
 use super::support::test_meta;
 use crate::in_process::InProcessDaemon;
@@ -37,7 +36,6 @@ pub(super) enum RestAdmissionLookup {
 
 pub(super) enum RestAdmissionSelection {
     Failure(RestAdmissionReply),
-    Absent,
     Found(usize),
     Ambiguous,
 }
@@ -127,6 +125,8 @@ pub(super) struct RestAdmissionFixture {
     pub(super) calls: Arc<AtomicUsize>,
     pub(super) daemon: Arc<InProcessDaemon>,
     pub(super) keys: Vec<RepositoryKey>,
+    /// The engine's readings, installed on the daemon, with no checkout held to start with.
+    pub(super) engine: super::TestEngine,
     pub(super) _config: tempfile::TempDir,
 }
 
@@ -136,7 +136,7 @@ pub(super) async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lo
     use flotilla_github_providers::change_request::GitHubChangeRequest;
     let config = tempfile::tempdir().expect("tempdir");
     std::fs::write(config.path().join("daemon.toml"), "machine_id = \"rest-admission-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let responses = outcomes
         .into_iter()
         .enumerate()
@@ -153,6 +153,7 @@ pub(super) async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lo
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    let engine = super::test_engine(&daemon);
     daemon.set_provisioning_namespace("flotilla".into()).await;
     let mut keys = Vec::new();
     for index in 0..2 {
@@ -175,5 +176,5 @@ pub(super) async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lo
         );
         keys.push(key);
     }
-    RestAdmissionFixture { calls, daemon, keys, _config: config }
+    RestAdmissionFixture { calls, daemon, keys, engine, _config: config }
 }

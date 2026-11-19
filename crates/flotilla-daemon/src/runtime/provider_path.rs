@@ -83,9 +83,15 @@ pub(super) async fn provision(
             }
         },
     };
-    if provider.receives_host_tools() {
+    // A cloud sandbox is registered even when its provider takes no host tools,
+    // so its checkouts and sessions resolve it by name; only a provider that
+    // receives host tools gets the vessel layer. A host-direct environment is
+    // the host's own, registered as direct already.
+    if provider.receives_host_tools() || spec.cloud_sandbox.is_some() {
         let delivered = async {
-            deliver_vessel_layer(state, &id, spec, &handle).await?;
+            if provider.receives_host_tools() {
+                deliver_vessel_layer(state, &id, spec, &handle).await?;
+            }
             let (bag, registry) = probe_provisioned_environment(state, &id, &handle).await?;
             if let Some(cloud) = &spec.cloud_sandbox {
                 let factories = &state.daemon.discovery_runtime().factories;

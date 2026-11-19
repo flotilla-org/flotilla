@@ -155,7 +155,7 @@ fn history_is_a_paged_range_over_the_log_that_decodes_to_the_homes_events() {
     assert_eq!(decoded[1..].iter().flatten().cloned().collect::<Vec<_>>(), logged, "each edge's entry is the event the home returned");
     drop(read);
     let current = loaded::<Message>(&mut home, "a");
-    assert_eq!(current.state(), &MessageState::Settled { receiver: Some(message::agent("s", "h")) });
+    assert_eq!(current.state(), &MessageState::Settled { receiver: Some(message::agent("s", "h")), delivered_at: Some(at(2)) });
 }
 
 // Behaviour (R2): the log's refusal is the write's. A write the store refuses (here, the stored

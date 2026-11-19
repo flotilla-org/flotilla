@@ -12,7 +12,8 @@ use std::{
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_provisioning::engine::observations::EngineObservations;
 use flotilla_resources::{
-    engine_records::{EngineRecords, ObservationFailures},
+    address::record_name,
+    engine_records::{KindRecords, ObservationFailures, Record},
     ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Clock, InputMeta, Issue, IssueSpec, IssueStatus,
     Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision,
 };
@@ -57,6 +58,11 @@ fn cr_spec(number: u64, authority: &str) -> ChangeRequestSpec {
     }
 }
 
+/// Change request 1's record name, the one its observer writes it under.
+fn cr_1() -> String {
+    record_name(&cr_spec(1, "alpha").address(&[]).expect("address")).expect("record name")
+}
+
 fn cr_status(state: ObservedChangeRequestState, checks: ObservedChecks, at: DateTime<Utc>) -> ChangeRequestStatus {
     let seen = |value| Observation { value, observed_at: at };
     ChangeRequestStatus {
@@ -92,11 +98,11 @@ async fn contract(backend: &ResourceBackend, observer: &str) {
     let mut watch = watch_resource_kind_including_replicas(backend, NS, "ChangeRequest").await.expect("watch");
 
     // The observer creates its record of a change request and publishes what it observed; every read finds it.
-    let created = change_requests.create(&InputMeta::builder().name("cr-1".into()).build(), &cr_spec(1, observer)).await.expect("create");
+    let created = change_requests.create(&InputMeta::builder().name(cr_1()).build(), &cr_spec(1, observer)).await.expect("create");
     let open = cr_status(ObservedChangeRequestState::Open, ObservedChecks::Pending, Utc::now());
-    let published = change_requests.update_status("cr-1", &created.metadata.resource_version, &open).await.expect("publish");
+    let published = change_requests.update_status(&cr_1(), &created.metadata.resource_version, &open).await.expect("publish");
     tokio::time::timeout(Duration::from_secs(10), watch.stream.next()).await.expect("a watch event").expect("open").expect("event");
-    let read = backend.including_replicas::<ChangeRequest>(NS).get("cr-1").await.expect("read").object;
+    let read = backend.including_replicas::<ChangeRequest>(NS).get(&cr_1()).await.expect("read").object;
     assert_eq!(read.spec.observing_authority, observer);
     assert_eq!((read.spec.service.as_str(), read.spec.number), ("github.com", 1));
     assert_eq!(values(read.status.as_ref().expect("status")), values(&open));
@@ -112,7 +118,7 @@ async fn contract(backend: &ResourceBackend, observer: &str) {
     };
     assert!(backend.query_declared::<ChangeRequest>(NS, &merged_query).await.expect("query").items.is_empty());
     let merged = cr_status(ObservedChangeRequestState::Merged, ObservedChecks::Pass, Utc::now());
-    change_requests.update_status("cr-1", &published.metadata.resource_version, &merged).await.expect("publish merged");
+    change_requests.update_status(&cr_1(), &published.metadata.resource_version, &merged).await.expect("publish merged");
     assert_eq!(backend.query_declared::<ChangeRequest>(NS, &merged_query).await.expect("query").items.len(), 1);
 
     // An issue's record likewise.
@@ -130,8 +136,8 @@ async fn contract(backend: &ResourceBackend, observer: &str) {
     );
 
     // When nothing demands it any more, the observer deletes it; it is gone from every read.
-    change_requests.delete("cr-1").await.expect("delete");
-    assert!(backend.including_replicas::<ChangeRequest>(NS).get("cr-1").await.is_err());
+    change_requests.delete(&cr_1()).await.expect("delete");
+    assert!(backend.including_replicas::<ChangeRequest>(NS).get(&cr_1()).await.is_err());
     assert!(change_requests.list().await.expect("list").items.is_empty());
 }
 
@@ -160,8 +166,28 @@ async fn the_engine_keeps_the_observation_contract() {
     }
 }
 
-fn status_of(object: &flotilla_resources::engine_records::EngineObject) -> ChangeRequestStatus {
-    serde_json::from_value(object.status.clone().expect("status")).expect("decodes")
+// Behaviour (#3108 keyed reads): readers get a change request by its subject's record name, so a
+// write under any other name is refused, naming both, and nothing is written.
+#[tokio::test]
+async fn a_change_request_under_another_name_is_refused() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (_, records) = open(&directory, "alpha", ManualClock::at(1_800_000_000));
+    let records = cr_port(&records);
+    let spec = cr_spec(1, "alpha");
+    let refused = records.apply("cr-1", None, &BTreeMap::new(), &BTreeMap::new(), &spec).await;
+    let error = String::from(refused.expect_err("a name that is not the record name is refused"));
+    assert!(error.contains("cr-1") && error.contains(&cr_1()), "{error}");
+    assert!(records.sources().await.expect("sources").is_empty(), "nothing is written");
+    records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("the record name is written");
+}
+
+/// The observation records as the ChangeRequest port.
+fn cr_port(records: &Arc<EngineObservations>) -> &dyn KindRecords<ChangeRequest> {
+    &**records
+}
+
+fn status_of(object: &Record<ChangeRequest>) -> ChangeRequestStatus {
+    object.status.clone().expect("status")
 }
 
 // Behaviour (observation ruling: written only when a value changes): a publish that changes no
@@ -171,14 +197,15 @@ async fn a_publish_that_changes_no_value_writes_nothing() {
     let directory = tempfile::tempdir().expect("temp dir");
     let clock = ManualClock::at(1_800_000_000);
     let (_, records) = open(&directory, "alpha", clock.clone());
-    let spec = serde_json::to_value(cr_spec(1, "alpha")).expect("spec");
-    records.apply("ChangeRequest", "cr-1", &BTreeMap::new(), &BTreeMap::new(), spec.clone()).await.expect("create");
-    let status = |checks, at| serde_json::to_value(cr_status(ObservedChangeRequestState::Open, checks, epoch(at))).expect("status");
-    let first = records.set_status("ChangeRequest", "cr-1", status(ObservedChecks::Pending, 10)).await.expect("publish");
-    let again = records.set_status("ChangeRequest", "cr-1", status(ObservedChecks::Pending, 20)).await.expect("publish again");
-    let reapplied = records.apply("ChangeRequest", "cr-1", &BTreeMap::new(), &BTreeMap::new(), spec).await.expect("ensure again");
+    let records = cr_port(&records);
+    let spec = cr_spec(1, "alpha");
+    let created = records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("create");
+    let status = |checks, at| cr_status(ObservedChangeRequestState::Open, checks, epoch(at));
+    let first = records.set_status(&cr_1(), created.version, &status(ObservedChecks::Pending, 10)).await.expect("publish");
+    let again = records.set_status(&cr_1(), first.version, &status(ObservedChecks::Pending, 20)).await.expect("publish again");
+    let reapplied = records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("ensure again");
     assert_eq!((again.version, reapplied.version), (first.version, first.version));
-    let changed = records.set_status("ChangeRequest", "cr-1", status(ObservedChecks::Pass, 30)).await.expect("publish change");
+    let changed = records.set_status(&cr_1(), reapplied.version, &status(ObservedChecks::Pass, 30)).await.expect("publish change");
     assert!(changed.version > first.version);
     assert_eq!(status_of(&changed).checks.value, Some(ObservedChecks::Pass));
 }
@@ -189,25 +216,56 @@ async fn a_publish_that_changes_no_value_writes_nothing() {
 async fn a_failing_observer_ages_its_values_from_the_first_failure() {
     let directory = tempfile::tempdir().expect("temp dir");
     let clock = ManualClock::at(1_800_000_000);
-    let (_, records) = open(&directory, "alpha", clock.clone());
-    let spec = serde_json::to_value(cr_spec(1, "alpha")).expect("spec");
-    records.apply("ChangeRequest", "cr-1", &BTreeMap::new(), &BTreeMap::new(), spec).await.expect("create");
-    let open = serde_json::to_value(cr_status(ObservedChangeRequestState::Open, ObservedChecks::Pass, epoch(0))).expect("status");
-    records.set_status("ChangeRequest", "cr-1", open.clone()).await.expect("publish");
-    let read = || async { status_of(&records.get("ChangeRequest", "cr-1").await.expect("get").expect("held")).state.observed_at };
+    let (_, observations) = open(&directory, "alpha", clock.clone());
+    let records = cr_port(&observations);
+    let created = records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &cr_spec(1, "alpha")).await.expect("create");
+    let open = cr_status(ObservedChangeRequestState::Open, ObservedChecks::Pass, epoch(0));
+    records.set_status(&cr_1(), created.version, &open).await.expect("publish");
+    let read = || async { status_of(&records.get(&cr_1()).await.expect("get").expect("held")).state.observed_at };
     assert_eq!(read().await, epoch(1_800_000_000));
 
     clock.set(1_800_000_100);
-    records.failing("ChangeRequest", "cr-1").await.expect("failing");
+    observations.failing("ChangeRequest", &cr_1()).await.expect("failing");
     clock.set(1_800_000_900);
-    let version = records.get("ChangeRequest", "cr-1").await.expect("get").expect("held").version;
-    records.failing("ChangeRequest", "cr-1").await.expect("still failing");
-    assert_eq!(records.get("ChangeRequest", "cr-1").await.expect("get").expect("held").version, version, "failing is recorded once");
+    let version = records.get(&cr_1()).await.expect("get").expect("held").version;
+    observations.failing("ChangeRequest", &cr_1()).await.expect("still failing");
+    assert_eq!(records.get(&cr_1()).await.expect("get").expect("held").version, version, "failing is recorded once");
     assert_eq!(read().await, epoch(1_800_000_100));
 
-    records.set_status("ChangeRequest", "cr-1", open).await.expect("a read succeeds again");
+    records.set_status(&cr_1(), version, &open).await.expect("a read succeeds again");
     assert_eq!(read().await, epoch(1_800_000_900));
-    records.failing("ChangeRequest", "absent").await.expect("an absent record is done");
+    observations.failing("ChangeRequest", "absent").await.expect("an absent record is done");
+}
+
+// Behaviour (#3108 observed_at, option B): this home's values are confirmed by its observer's
+// last read, not by the time they are read: they age while the observer is silent, a read that
+// changes nothing confirms them again without writing, and after a restart, until the observer
+// reads again, they are confirmed when the record was last written.
+#[tokio::test]
+async fn this_homes_values_are_confirmed_by_the_observers_last_read() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let clock = ManualClock::at(1_800_000_000);
+    let (service, observations) = open(&directory, "alpha", clock.clone());
+    let records = cr_port(&observations);
+    let created = records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &cr_spec(1, "alpha")).await.expect("create");
+    let open = cr_status(ObservedChangeRequestState::Open, ObservedChecks::Pass, epoch(0));
+    clock.set(1_800_000_010);
+    let written = records.set_status(&cr_1(), created.version, &open).await.expect("publish");
+    async fn read(records: &dyn KindRecords<ChangeRequest>) -> DateTime<Utc> {
+        status_of(&records.get(&cr_1()).await.expect("get").expect("held")).state.observed_at
+    }
+
+    clock.set(1_800_000_500);
+    assert_eq!(read(records).await, epoch(1_800_000_010), "values age while the observer is silent");
+
+    let again = records.set_status(&cr_1(), written.version, &open).await.expect("an unchanged read");
+    assert_eq!(again.version, written.version, "an unchanged read writes nothing");
+    clock.set(1_800_000_900);
+    assert_eq!(read(records).await, epoch(1_800_000_500), "an unchanged read confirms the values");
+
+    drop(observations);
+    let restarted = Arc::new(EngineObservations::open(service, clock.clone() as Arc<dyn Clock>).expect("reopen"));
+    assert_eq!(read(cr_port(&restarted)).await, epoch(1_800_000_010), "after a restart, the last write confirms them");
 }
 
 /// One round of `from`'s stream applied at `to`, served at `at`; a reset round when `cursor` is none.
@@ -233,24 +291,90 @@ fn pump(from: &Service, from_home: &str, to: &Service, cursor: Option<u64>, at: 
 async fn another_homes_values_are_confirmed_when_that_home_was_last_heard() {
     let directory = tempfile::tempdir().expect("temp dir");
     let clock = ManualClock::at(1_800_000_000);
-    let (beta, beta_records) = open(&directory, "beta", clock.clone());
-    let (alpha, alpha_records) = open(&directory, "alpha", clock.clone());
-    let spec = serde_json::to_value(cr_spec(1, "beta")).expect("spec");
-    beta_records.apply("ChangeRequest", "cr-1", &BTreeMap::new(), &BTreeMap::new(), spec.clone()).await.expect("create");
-    let merged = serde_json::to_value(cr_status(ObservedChangeRequestState::Merged, ObservedChecks::Pass, epoch(0))).expect("status");
-    beta_records.set_status("ChangeRequest", "cr-1", merged).await.expect("publish");
+    let (beta, beta_observations) = open(&directory, "beta", clock.clone());
+    let (alpha, alpha_observations) = open(&directory, "alpha", clock.clone());
+    let (beta_records, alpha_records) = (cr_port(&beta_observations), cr_port(&alpha_observations));
+    let spec = cr_spec(1, "beta");
+    let created = beta_records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("create");
+    let merged = cr_status(ObservedChangeRequestState::Merged, ObservedChecks::Pass, epoch(0));
+    beta_records.set_status(&cr_1(), created.version, &merged).await.expect("publish");
     let cursor = pump(&beta, "beta", &alpha, None, epoch(1_800_000_050));
-    let read = || async { alpha_records.get("ChangeRequest", "cr-1").await.expect("get").expect("held") };
+    let read = || async { alpha_records.get(&cr_1()).await.expect("get").expect("held") };
     assert_eq!((read().await.home, status_of(&read().await).state.observed_at), ("beta".to_owned(), epoch(1_800_000_050)));
     pump(&beta, "beta", &alpha, Some(cursor), epoch(1_800_000_070));
     assert_eq!(status_of(&read().await).state.observed_at, epoch(1_800_000_070));
 
     // A former observer's own copy, failing since before beta was last heard, reads below beta's.
-    alpha_records.apply("ChangeRequest", "cr-1", &BTreeMap::new(), &BTreeMap::new(), spec).await.expect("own copy");
+    alpha_records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("own copy");
     clock.set(1_800_000_060);
-    alpha_records.failing("ChangeRequest", "cr-1").await.expect("failing");
+    alpha_observations.failing("ChangeRequest", &cr_1()).await.expect("failing");
     clock.set(1_800_000_100);
     assert_eq!(read().await.home, "beta");
-    assert_eq!(alpha_records.sources("ChangeRequest").await.expect("sources").len(), 2);
-    assert_eq!(alpha_records.list("ChangeRequest").await.expect("list").len(), 1);
+    assert_eq!(alpha_records.sources().await.expect("sources").len(), 2);
+    assert_eq!(alpha_records.list().await.expect("list").len(), 1);
+}
+
+/// Observes every source, or none.
+#[derive(Debug)]
+struct Observes(bool);
+
+#[async_trait::async_trait]
+impl flotilla_resources::engine_records::SourceObservers for Observes {
+    async fn observes(&self, _: &str, _: &str) -> Result<bool, String> {
+        Ok(self.0)
+    }
+}
+
+// Behaviour (single writer, #3108): a home that does not observe a change request's source is
+// refused every write of it through the store's typed paths, its record and its failures alike,
+// so no copy of its own, however recently written, stands beside the observer's; every read here
+// is the observer's facts, replicated from its home.
+#[tokio::test]
+async fn a_home_that_does_not_observe_the_source_writes_nothing_and_reads_the_observers_facts() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let clock = ManualClock::at(1_800_000_000);
+    let (beta, beta_records) = open(&directory, "beta", clock.clone());
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::forge_observation::register(&mut kinds).expect("register");
+    let alpha = Arc::new(Service::open(&directory.path().join("alpha.sqlite"), "alpha", kinds).expect("store"));
+    let alpha_records = Arc::new(
+        EngineObservations::open(Arc::clone(&alpha), clock.clone() as Arc<dyn Clock>).expect("open").observed_by(Arc::new(Observes(false))),
+    );
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.install_engine_records(alpha_records.clone());
+
+    let beta_port = cr_port(&beta_records);
+    let created =
+        beta_port.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &cr_spec(1, "beta")).await.expect("the observer's record");
+    let merged = cr_status(ObservedChangeRequestState::Merged, ObservedChecks::Pass, epoch(0));
+    beta_port.set_status(&cr_1(), created.version, &merged).await.expect("publish");
+    pump(&beta, "beta", &alpha, None, epoch(1_800_000_050));
+
+    let change_requests = backend.using::<ChangeRequest>(NS);
+    let refused = change_requests.create(&InputMeta::builder().name(cr_1()).build(), &cr_spec(1, "alpha")).await;
+    let error = refused.expect_err("a home that does not observe the source writes no record of it").to_string();
+    assert!(error.contains("written only by the observer of github.com flotilla-org/flotilla"), "{error}");
+    let branch = flotilla_resources::engine_records::BranchChangeRequest {
+        name: cr_1(),
+        home: "alpha".into(),
+        service: "github.com".into(),
+        scope: "flotilla-org/flotilla".into(),
+        number: 1,
+        branch: "feature".into(),
+        state: Some(ObservedChangeRequestState::Open),
+    };
+    use flotilla_resources::engine_records::ChangeRequestBranches;
+    assert!(alpha_records.found_on_branch(&branch).await.is_err(), "nor what a branch read found");
+
+    let read = backend.including_replicas::<ChangeRequest>(NS).get(&cr_1()).await.expect("read").object;
+    assert_eq!(read.spec.observing_authority, "beta");
+    assert_eq!(values(read.status.as_ref().expect("status")), values(&merged));
+    let selected = flotilla_resources::select_change_requests(
+        backend.including_replicas::<ChangeRequest>(NS).list().await.expect("list").items.iter().map(|copy| &copy.object),
+    );
+    assert_eq!(selected.values().map(|record| record.spec.observing_authority.as_str()).collect::<Vec<_>>(), vec!["beta"]);
+    assert_eq!(
+        cr_port(&alpha_records).sources().await.expect("sources").iter().map(|copy| copy.home.as_str()).collect::<Vec<_>>(),
+        vec!["beta"]
+    );
 }

@@ -1,45 +1,24 @@
-//! ADR 0062 ImageBuild execution through the build-service port. The port
-//! and the host's materials are in-process stand-ins; the store, the
-//! reconcilers and admission's get-or-create are real.
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
-    time::Duration,
-};
+//! ADR 0062 ImageBuild execution on the engine (#3108): a builder on a real decided store runs the
+//! image build launcher and controller; the build-service port and the host's materials are
+//! in-process stand-ins.
+use std::sync::{atomic::Ordering, Arc};
 
-use async_trait::async_trait;
-use chrono::Utc;
-use flotilla_environment::environment::EnvironmentProvisionError;
-use flotilla_environment::environment::{
-    image::{BuiltImage, FailedImageBuild, ImageBuildRequest, ImageDeliveryTarget, SecretFile},
-    registry_auth::{RegistryAuthMaterial, RegistryConfig},
-    ImageBuildService, RegistryAuth,
+use flotilla_engine_store::plain::{PendingChange, PlainLog};
+use flotilla_environment::environment::image::FailedImageBuild;
+use flotilla_protocol::LifecycleReading;
+use flotilla_provisioning::engine::{
+    image_build_actuator::{attribute_recipe_failure, build_log_name},
+    image_builds::demand_of,
 };
-use flotilla_protocol::{EnvironmentId, HostSummary, LifecycleReading, NodeId, NodeInfo, SystemInfo};
-use flotilla_provisioning::reconcilers::{
-    image_build::{attribute_recipe_failure, image_build_retry_backoff, registry_build_cache},
-    EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, ImageBuildMaterials, ImageBuildReconciler, LocalProvisioning,
-};
-use flotilla_resources::lifecycle_reads::{LifecycleReads, ProvisioningKind};
+use flotilla_provisioning_testkit::image_build::*;
 use flotilla_resources::{
-    image_identity, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentSpec, FleetDesignation,
-    FleetDesignationSpec, Host, HostImageAction, HostSpec, HostStatus, ImageBuild, ImageBuildCapacity, ImageBuildFailure,
-    ImageBuildFailureClass, ImageBuildPhase, ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageCacheBinding,
-    ImageDelivery, ImageLayerProbe, ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageProbeOutcome, InputMeta, ResolvedImage,
-    FLEET_DESIGNATION_NAME, IMAGE_BUILD_MAX_ATTEMPTS,
+    image_build_records::ImageBuildRecords, image_identity, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass,
+    ImageBuildReservation, ImageBuildSpec, ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageProbeOutcome,
 };
-use flotilla_store::{apply_status_patch, controller::Reconciler, ResourceBackend};
-use flotilla_store_testkit::VirtualClock;
-use tokio::sync::Notify;
+use flotilla_schema::{NewChange, Ref, Timestamp};
 
-pub(crate) const NS: &str = "test";
-pub(crate) const HOST: &str = "builder";
-const WRAPPER: &str = "flotilla_run_with_preludes exec \"$@\"";
-const REPOSITORY: &str = "registry.test/flotilla/crew-images";
+/// The kind's policy: five tries in all.
+const TRIES: usize = 5;
 
 fn layer(name: &str, tier: ImageLayerTier, secrets: &[&str]) -> ImageLayerSpec {
     ImageLayerSpec::builder()
@@ -73,425 +52,81 @@ fn build_spec(layers: Vec<ImageLayerSpec>, architecture: &str, delivery: ImageDe
         .build()
 }
 
-pub(crate) fn digest(fill: char) -> String {
-    format!("sha256:{}", fill.to_string().repeat(64))
+fn local(seed: usize) -> ImageBuildSpec {
+    build_spec(layers(seed, &[]), "amd64", ImageDelivery::Local, 1)
 }
 
-pub(crate) async fn host(backend: &ResourceBackend, architecture: &str, capacity: Option<ImageBuildCapacity>) {
-    let hosts = backend.using::<Host>(NS);
-    let obj = hosts
-        .create(&InputMeta::builder().name(HOST.into()).build(), &HostSpec { image_build_capacity: capacity, ..Default::default() })
-        .await
-        .expect("host");
-    let status = HostStatus::builder()
-        .capabilities(Default::default())
-        .ready(true)
-        .description(
-            HostSummary::builder()
-                .environment_id(EnvironmentId::new(HOST))
-                .node(NodeInfo::new(NodeId::new(HOST), HOST.to_string()))
-                .system(SystemInfo { arch: Some(architecture.into()), ..Default::default() })
-                .build(),
-        )
-        .build();
-    hosts.update_status(HOST, &obj.metadata.resource_version, &status).await.expect("host status");
+fn calls(builder: &Builder) -> usize {
+    builder.build_service.calls.load(Ordering::SeqCst)
 }
 
-pub(crate) fn builder(slots: u32) -> Option<ImageBuildCapacity> {
-    Some(ImageBuildCapacity::Builder { architecture: "amd64".into(), slots, reservation: ImageBuildReservation { cpu: 2, disk_bytes: 1 } })
-}
-
-async fn create(backend: &ResourceBackend, spec: &ImageBuildSpec) -> String {
-    let name = spec.resource_name();
-    backend.using::<ImageBuild>(NS).create(&InputMeta::builder().name(name.clone()).build(), &spec.clone().into()).await.expect("build");
-    name
-}
-
-/// What a test wants the service to do for one call.
-#[derive(Clone)]
-pub(crate) enum Behaviour {
-    Succeed,
-    Fail {
-        class: ImageBuildFailureClass,
-        probes: Vec<ImageProbeOutcome>,
-        failed_step: Option<String>,
-    },
-    /// Wait until released.
-    Gate,
-    /// The build job panics.
-    Panic,
-}
-
-/// In-process stand-in for the build-service port. It enforces the request
-/// contract: the identity recomputes from the ordered layers, which are the
-/// ImageBuild's layers in order; the architecture and probe CPUs are the
-/// build's; the delivery target matches the build's delivery (a push carries
-/// the registry cache sibling and a credential admitted for that repository);
-/// exactly the declared build secrets are passed; and the probe wrapper is
-/// the configured prelude wrapper.
-pub(crate) struct BuildService {
-    expected: Mutex<BTreeMap<String, ImageBuildSpec>>,
-    behaviour: Mutex<Behaviour>,
-    pub(crate) calls: AtomicUsize,
-    running: AtomicUsize,
-    peak: AtomicUsize,
-    release: Notify,
-    dropped: AtomicUsize,
-}
-
-impl BuildService {
-    pub(crate) fn new(behaviour: Behaviour) -> Arc<Self> {
-        Arc::new(Self {
-            expected: Mutex::new(BTreeMap::new()),
-            behaviour: Mutex::new(behaviour),
-            calls: AtomicUsize::new(0),
-            running: AtomicUsize::new(0),
-            peak: AtomicUsize::new(0),
-            release: Notify::new(),
-            dropped: AtomicUsize::new(0),
-        })
-    }
-
-    pub(crate) fn expect(&self, spec: &ImageBuildSpec) {
-        self.expected.lock().expect("expected").insert(spec.identity.clone(), spec.clone());
+fn cause(reading: &LifecycleReading) -> &str {
+    match reading {
+        LifecycleReading::GaveUp { cause } => cause,
+        other => panic!("not given up: {other:?}"),
     }
 }
 
-struct Running<'a>(&'a BuildService);
-impl Drop for Running<'_> {
-    fn drop(&mut self) {
-        self.0.running.fetch_sub(1, Ordering::SeqCst);
-        self.0.dropped.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-#[async_trait]
-impl ImageBuildService for BuildService {
-    async fn build(&self, request: ImageBuildRequest<'_>, log: &mut String) -> Result<BuiltImage, FailedImageBuild> {
-        let spec = self.expected.lock().expect("expected").get(request.identity).cloned().expect("an admitted identity");
-        assert_eq!(image_identity(request.layers), request.identity, "identity recomputes from the layers");
-        assert_eq!(request.layers, spec.layers.as_slice(), "the build's ordered layers");
-        assert_eq!(request.architecture, spec.architecture);
-        assert_eq!(request.probe_cpus, spec.reservation.cpu);
-        assert_eq!(request.probe_wrapper, WRAPPER);
-        let declared: BTreeSet<_> = spec.layers.iter().flat_map(|layer| layer.build_secrets.iter().cloned()).collect();
-        assert_eq!(request.secrets.keys().cloned().collect::<BTreeSet<_>>(), declared, "exactly the declared secrets");
-        match (&request.delivery, &spec.delivery) {
-            (ImageDeliveryTarget::Push { repository, cache_repository, auth }, ImageDelivery::Registry { repository: expected }) => {
-                assert_eq!(repository, expected);
-                assert_eq!(cache_repository, &format!("{expected}/buildcache:{}", spec.architecture));
-                assert_eq!(cache_repository, &registry_build_cache(expected, &spec.architecture));
-                auth.validate(repository, HostImageAction::ImagePush).expect("push credential admitted for the repository");
-            }
-            (ImageDeliveryTarget::Load, ImageDelivery::Local) => {}
-            (target, delivery) => panic!("delivery {target:?} does not match {delivery:?}"),
-        }
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(running, Ordering::SeqCst);
-        let _running = Running(self);
-        log.push_str(&format!("built {}\n", request.identity));
-        let behaviour = self.behaviour.lock().expect("behaviour").clone();
-        let probes = |outcomes: &[ImageProbeOutcome]| {
-            request
-                .layers
-                .iter()
-                .enumerate()
-                .map(|(index, layer)| ImageLayerProbe {
-                    layer: layer.name.clone(),
-                    outcome: outcomes.get(index).cloned().unwrap_or(ImageProbeOutcome::Passed),
-                })
-                .collect::<Vec<_>>()
-        };
-        if matches!(behaviour, Behaviour::Gate) {
-            self.release.notified().await;
-        }
-        match behaviour {
-            Behaviour::Panic => panic!("the build service panicked"),
-            Behaviour::Succeed | Behaviour::Gate => Ok(BuiltImage {
-                digest: match request.delivery {
-                    ImageDeliveryTarget::Push { repository, .. } => format!("{repository}@{}", digest('d')),
-                    ImageDeliveryTarget::Load => digest('d'),
-                },
-                probes: probes(&[]),
-            }),
-            Behaviour::Fail { class, probes: outcomes, failed_step } => Err(FailedImageBuild {
-                failure: ImageBuildFailure { class, reason: "build failed".into() },
-                probes: probes(&outcomes),
-                failed_step,
-            }),
-        }
-    }
-}
-
-/// Credential-store stand-in for a push credential's material.
-struct PushMaterial;
-impl RegistryAuthMaterial for PushMaterial {
-    fn config(&self) -> Result<RegistryConfig, String> {
-        Err("the stand-in service never lowers credentials".into())
-    }
-    fn authorize(&self, _: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        panic!("builds make no HTTP registry calls")
-    }
-}
-
-/// Stand-in for the daemon's credential store and blob store.
-#[derive(Default)]
-pub(crate) struct Materials {
-    granted: BTreeSet<String>,
-    push_auths: AtomicUsize,
-    logs: Mutex<BTreeMap<String, String>>,
-}
-
-#[async_trait]
-impl ImageBuildMaterials for Materials {
-    async fn push_auth(&self, repository: &str) -> Result<RegistryAuth, ImageBuildFailure> {
-        self.push_auths.fetch_add(1, Ordering::SeqCst);
-        Ok(RegistryAuth::new(repository.into(), HostImageAction::ImagePush, Arc::new(PushMaterial)))
-    }
-    async fn secret(&self, name: &str) -> Result<SecretFile, ImageBuildFailure> {
-        if self.granted.contains(name) {
-            Ok(SecretFile::at(PathBuf::from(format!("/private/{name}"))))
-        } else {
-            Err(ImageBuildFailure { class: ImageBuildFailureClass::Recipe, reason: format!("build secret `{name}` is not granted") })
-        }
-    }
-    async fn keep_log(&self, build: &str, attempt: u32, log: &str) -> Result<String, String> {
-        let reference = format!("image-build-log-{build}-{attempt}");
-        self.logs.lock().expect("logs").insert(reference.clone(), log.to_string());
-        Ok(reference)
-    }
-}
-
-pub(crate) fn reconciler(
-    backend: &ResourceBackend,
-    service: &Arc<BuildService>,
-    materials: &Arc<Materials>,
-    clock: &Arc<VirtualClock>,
-) -> ImageBuildReconciler {
-    ImageBuildReconciler::new(
-        Some(Arc::clone(service) as Arc<dyn ImageBuildService>),
-        Arc::clone(materials) as Arc<dyn ImageBuildMaterials>,
-        backend,
-        NS,
-        HOST,
-        WRAPPER,
-    )
-    .with_clock(Arc::clone(clock) as Arc<dyn flotilla_resources::Clock>)
-    .with_liveness_interval(Duration::from_millis(5))
-}
-
-/// One controller step for `name`, as the controller loop performs it.
-pub(crate) async fn tick(backend: &ResourceBackend, reconciler: &ImageBuildReconciler, clock: &VirtualClock, name: &str) {
-    let builds = backend.using::<ImageBuild>(NS);
-    let Ok(obj) = builds.get(name).await else { return };
-    let prepared = reconciler.prepare(&obj).await.expect("prepare");
-    let outcome = reconciler.reconcile(&obj, &prepared, flotilla_resources::Clock::now(clock));
-    if let Some(patch) = outcome.patch {
-        apply_status_patch(&builds, name, &patch).await.expect("status patch");
-    }
-}
-
-/// Step until `name` settles (Built, or Failed with no retry pending) or a
-/// step budget runs out, letting background jobs run between steps.
-pub(crate) async fn settle(backend: &ResourceBackend, reconciler: &ImageBuildReconciler, clock: &VirtualClock, name: &str) {
-    for _ in 0..200 {
-        tick(backend, reconciler, clock, name).await;
-        let status = backend.using::<ImageBuild>(NS).get(name).await.expect("build").status.unwrap_or_default();
-        let retrying = status.failure.as_ref().is_some_and(|failure| failure.class == ImageBuildFailureClass::Infrastructure)
-            && status.attempt < IMAGE_BUILD_MAX_ATTEMPTS;
-        if status.phase == ImageBuildPhase::Built || (status.phase == ImageBuildPhase::Failed && !retrying) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-}
-
-async fn status(backend: &ResourceBackend, name: &str) -> flotilla_resources::ImageBuildStatus {
-    backend.using::<ImageBuild>(NS).get(name).await.expect("build").status.unwrap_or_default()
-}
-
-// ADR 0062: an image is built once per identity. Concurrent admissions for
-// one composition get-or-create one ImageBuild, and any number of
-// (concurrent and repeated) controller steps execute it exactly once.
-// Generated span: 2..8 concurrent admissions, 1..6 concurrent steps per round,
-// registry or local delivery.
+// ADR 0062: an image is built once per identity. Concurrent admissions of one composition write
+// one demand, and its builder launches it once and builds it once, under its digest, keeping the
+// try's log. Generated span: 2..8 concurrent admissions, registry or local delivery.
 #[hegel::test]
 fn concurrent_demand_executes_one_build_per_identity(tc: hegel::TestCase) {
     let admissions = tc.draw(hegel::generators::integers::<usize>().min_value(2).max_value(8));
-    let fanout = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(6));
     let registry = tc.draw(hegel::generators::booleans());
-    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        host(&backend, "x86_64", builder(2)).await;
-        if registry {
-            backend
-                .definitions::<flotilla_resources::Project>(NS)
-                .create(
-                    &InputMeta::builder().name("fleet".into()).build(),
-                    &flotilla_resources::ProjectSpec::builder().display_name("Fleet".into()).build(),
-                )
-                .await
-                .expect("fleet project");
-            backend
-                .definitions::<FleetDesignation>(NS)
-                .create(
-                    &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
-                    &FleetDesignationSpec {
-                        fleet: None,
-                        project: "fleet".into(),
-                        image_cache: Some(ImageCacheBinding {
-                            repository: REPOSITORY.into(),
-                            pull_credential: "crew-image-registry-pull".into(),
-                            push_credential: "crew-image-registry-push".into(),
-                        }),
-                    },
-                )
-                .await
-                .expect("fleet designation");
-        }
-        let layers = layers(0, &[]);
-        let resolved = ResolvedImage { identity: image_identity(&layers), layers, shadowed: Vec::new() };
-        // Each admission plans at placement and creates at its commit; a
-        // concurrent creator's copy is reused.
-        let names = futures::future::join_all((0..admissions).map(|_| async {
-            let planned = flotilla_admission::image_build::plan_image_build(&backend, NS, &resolved, HOST).await?;
-            flotilla_admission::image_build::create_planned_builds(&backend, NS, std::slice::from_ref(&planned)).await?;
-            Ok::<_, String>(planned.name)
+    tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime").block_on(async {
+        let builder = Builder::start("x86_64", builder(2), BuildService::new(Behaviour::Succeed), Arc::new(Materials::default()));
+        let delivery = if registry { ImageDelivery::Registry { repository: REPOSITORY.into() } } else { ImageDelivery::Local };
+        let spec = build_spec(layers(0, &[]), "amd64", delivery, 1);
+        builder.build_service.expect(&spec);
+        let name = spec.resource_name();
+        let written = futures::future::join_all((0..admissions).map(|_| {
+            let (builds, spec, name) = (Arc::clone(&builder.builds), spec.clone(), name.clone());
+            tokio::task::spawn_blocking(move || builds.demand(&name, &spec).expect("demand"))
         }))
         .await;
-        let name = names[0].clone().expect("admission");
-        assert!(names.iter().all(|joined| joined.as_ref() == Ok(&name)), "every admission joins one build");
-        let builds = backend.using::<ImageBuild>(NS).list().await.expect("list").items;
-        assert_eq!(builds.len(), 1);
-        let spec = builds[0].spec.current().expect("current").clone();
-        assert_eq!(spec.delivery, if registry { ImageDelivery::Registry { repository: REPOSITORY.into() } } else { ImageDelivery::Local });
-        let service = BuildService::new(Behaviour::Succeed);
-        service.expect(&spec);
-        let materials = Arc::new(Materials::default());
-        let clock = Arc::new(VirtualClock::new(Utc::now()));
-        let reconciler = reconciler(&backend, &service, &materials, &clock);
-        for _ in 0..40 {
-            futures::future::join_all((0..fanout).map(|_| tick(&backend, &reconciler, &clock, &name))).await;
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let built = status(&backend, &name).await;
-        assert_eq!(built.phase, ImageBuildPhase::Built);
-        assert_eq!(built.attempt, 1);
-        assert_eq!(service.calls.load(Ordering::SeqCst), 1, "one execution per identity");
-        assert_eq!(materials.push_auths.load(Ordering::SeqCst), usize::from(registry));
-        let log_ref = built.log_ref.expect("log kept");
-        assert!(materials.logs.lock().expect("logs")[&log_ref].contains(&spec.identity), "the build log is kept as the artifact");
+        assert_eq!(written.into_iter().map(|joined| joined.expect("joined")).filter(|written| *written).count(), 1, "one demand");
+        let built = builder.settled(&name).await;
+        assert_eq!(built.digest(), Some(if registry { format!("{REPOSITORY}@{}", digest('d')) } else { digest('d') }).as_deref());
+        assert_eq!(calls(&builder), 1, "one execution per identity");
+        assert_eq!(builder.materials.push_auths.load(Ordering::SeqCst), usize::from(registry));
+        let logs = builder.materials.logs.lock().expect("logs");
+        assert!(logs[&build_log_name(&built.launch, 1)].contains(&spec.identity), "the build log is kept as the artifact");
     });
 }
 
-// ADR 0062 A12: infrastructure failures return to Queued with exponential
-// backoff (30 s doubling) and never start before `not_before`; after
-// IMAGE_BUILD_MAX_ATTEMPTS attempts the build stays Failed. Each attempt
-// resolves a fresh push credential.
-#[tokio::test]
-async fn infrastructure_failures_retry_with_backoff_up_to_the_attempt_ceiling() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    host(&backend, "amd64", builder(1)).await;
-    let spec = build_spec(layers(0, &[]), "amd64", ImageDelivery::Registry { repository: REPOSITORY.into() }, 2);
-    let name = create(&backend, &spec).await;
+// ADR 0062 A12: an infrastructure failure is tried again at the kind's backoff, each try with a
+// fresh push credential and its own log, until five tries are spent; then the build gives up.
+#[tokio::test(start_paused = true)]
+async fn infrastructure_failures_retry_up_to_the_policy() {
     let service =
         BuildService::new(Behaviour::Fail { class: ImageBuildFailureClass::Infrastructure, probes: Vec::new(), failed_step: None });
-    service.expect(&spec);
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    let reconciler = reconciler(&backend, &service, &materials, &clock);
-    for attempt in 1..=IMAGE_BUILD_MAX_ATTEMPTS {
-        for _ in 0..200 {
-            tick(&backend, &reconciler, &clock, &name).await;
-            let current = status(&backend, &name).await;
-            let settled = current.phase == ImageBuildPhase::Queued
-                || (current.phase == ImageBuildPhase::Failed && attempt == IMAGE_BUILD_MAX_ATTEMPTS);
-            if current.attempt == attempt && settled {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert_eq!(service.calls.load(Ordering::SeqCst), attempt as usize);
-        let current = status(&backend, &name).await;
-        assert_eq!(current.failure.as_ref().map(|failure| failure.class), Some(ImageBuildFailureClass::Infrastructure));
-        if attempt == IMAGE_BUILD_MAX_ATTEMPTS {
-            for _ in 0..5 {
-                tick(&backend, &reconciler, &clock, &name).await;
-            }
-            clock.advance(chrono::Duration::hours(2));
-            tick(&backend, &reconciler, &clock, &name).await;
-            let exhausted = status(&backend, &name).await;
-            assert_eq!(exhausted.phase, ImageBuildPhase::Failed, "exhausted attempts stay failed");
-            assert_eq!(exhausted.attempt, IMAGE_BUILD_MAX_ATTEMPTS);
-            break;
-        }
-        assert_eq!(current.phase, ImageBuildPhase::Queued, "an infrastructure failure returns to Queued");
-        let not_before = current.not_before.expect("backoff");
-        assert_eq!(not_before - current.finished_at.expect("finished"), image_build_retry_backoff(attempt));
-        // Before the backoff elapses nothing starts.
-        clock.set(not_before - chrono::Duration::seconds(1));
-        tick(&backend, &reconciler, &clock, &name).await;
-        assert_eq!(status(&backend, &name).await.phase, ImageBuildPhase::Queued);
-        clock.set(not_before);
-    }
-    assert_eq!(service.calls.load(Ordering::SeqCst), IMAGE_BUILD_MAX_ATTEMPTS as usize);
-    assert_eq!(materials.push_auths.load(Ordering::SeqCst), IMAGE_BUILD_MAX_ATTEMPTS as usize, "a fresh credential per attempt");
-    let backoffs: Vec<_> = (1..IMAGE_BUILD_MAX_ATTEMPTS).map(|attempt| image_build_retry_backoff(attempt).num_seconds()).collect();
-    assert_eq!(backoffs, [30, 60, 120, 240]);
+    let builder = Builder::start("amd64", builder(1), service, Arc::new(Materials::default()));
+    let name = builder.demand(&build_spec(layers(0, &[]), "amd64", ImageDelivery::Registry { repository: REPOSITORY.into() }, 2));
+    let gave_up = builder.settled(&name).await;
+    assert!(cause(&gave_up.reading).contains("build failed"), "{:?}", gave_up.reading);
+    assert_eq!(calls(&builder), TRIES);
+    assert_eq!(builder.materials.push_auths.load(Ordering::SeqCst), TRIES, "a fresh credential per try");
+    let logs: Vec<String> = builder.materials.logs.lock().expect("logs").keys().cloned().collect();
+    let mut tries: Vec<String> = (1..=TRIES as u32).map(|attempt| build_log_name(&gave_up.launch, attempt)).collect();
+    tries.sort();
+    assert_eq!(logs, tries);
 }
 
-// A panicked build job ends its attempt as an infrastructure failure, so
-// the retry backoff and the attempt ceiling apply: it is never re-spawned
-// as the same attempt, and after IMAGE_BUILD_MAX_ATTEMPTS it stays Failed.
-#[tokio::test]
+// A panicked build job ends its try as an infrastructure failure, so the backoff and the policy
+// apply: it is never run again as the same try, and after five it gives up.
+#[tokio::test(start_paused = true)]
 async fn panicked_build_jobs_are_bounded_infrastructure_failures() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    host(&backend, "amd64", builder(1)).await;
-    let spec = build_spec(layers(0, &[]), "amd64", ImageDelivery::Local, 1);
-    let name = create(&backend, &spec).await;
-    let service = BuildService::new(Behaviour::Panic);
-    service.expect(&spec);
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    let reconciler = reconciler(&backend, &service, &materials, &clock);
-    for attempt in 1..=IMAGE_BUILD_MAX_ATTEMPTS {
-        for _ in 0..200 {
-            tick(&backend, &reconciler, &clock, &name).await;
-            let current = status(&backend, &name).await;
-            let settled = current.phase == ImageBuildPhase::Queued
-                || (current.phase == ImageBuildPhase::Failed && attempt == IMAGE_BUILD_MAX_ATTEMPTS);
-            if current.attempt == attempt && settled {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let current = status(&backend, &name).await;
-        assert_eq!(service.calls.load(Ordering::SeqCst), attempt as usize, "one execution per attempt");
-        let failure = current.failure.clone().expect("failure");
-        assert_eq!(failure.class, ImageBuildFailureClass::Infrastructure);
-        assert!(failure.reason.contains("panic"), "{}", failure.reason);
-        assert!(current.probes.iter().all(|probe| probe.outcome == ImageProbeOutcome::NotRun));
-        if attempt < IMAGE_BUILD_MAX_ATTEMPTS {
-            assert_eq!(current.phase, ImageBuildPhase::Queued, "a panicked attempt backs off before the next");
-            assert_eq!(current.not_before.expect("backoff") - current.finished_at.expect("finished"), image_build_retry_backoff(attempt));
-            clock.set(current.not_before.expect("backoff"));
-        }
-    }
-    for _ in 0..5 {
-        tick(&backend, &reconciler, &clock, &name).await;
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    clock.advance(chrono::Duration::hours(2));
-    tick(&backend, &reconciler, &clock, &name).await;
-    assert_eq!(status(&backend, &name).await.phase, ImageBuildPhase::Failed, "exhausted attempts stay failed");
-    assert_eq!(service.calls.load(Ordering::SeqCst), IMAGE_BUILD_MAX_ATTEMPTS as usize);
+    let builder = Builder::start("amd64", builder(1), BuildService::new(Behaviour::Panic), Arc::new(Materials::default()));
+    let name = builder.demand(&local(0));
+    let gave_up = builder.settled(&name).await;
+    assert!(cause(&gave_up.reading).contains("ended abnormally"), "{:?}", gave_up.reading);
+    assert_eq!(calls(&builder), TRIES, "one execution per try");
 }
 
-// ADR 0062 A12: a recipe failure is terminal for its identity (no retry of
-// identical inputs), keeps every layer's probe outcome and the build log,
-// and names the owner of the failing layer: the first failed probe's layer,
-// else the failing build step's layer, else the composition.
+// ADR 0062 A12: a recipe failure gives up at once (no retry of identical inputs), keeps every
+// layer's probe outcome in the build log, and names the owner of the failing layer: the first
+// failed probe's layer, else the failing build step's layer, else the composition.
 #[tokio::test]
 async fn recipe_failures_are_terminal_with_probe_evidence_and_an_owner() {
     let cases = [
@@ -499,575 +134,230 @@ async fn recipe_failures_are_terminal_with_probe_evidence_and_an_owner() {
             vec![ImageProbeOutcome::Passed, ImageProbeOutcome::Passed, ImageProbeOutcome::Failed { reason: "no cc".into() }],
             Some("rust"),
             "layer `wheelhouse` 1.0 from project `wheelhouse`",
+            ["probe base: passed", "probe rust: passed", "probe wheelhouse: failed: no cc"],
         ),
         (
             vec![ImageProbeOutcome::NotRun, ImageProbeOutcome::NotRun, ImageProbeOutcome::NotRun],
             Some("rust"),
             "layer `rust` 1.0 from the flotilla stdlib",
+            ["probe base: not run", "probe rust: not run", "probe wheelhouse: not run"],
         ),
-        (vec![ImageProbeOutcome::NotRun, ImageProbeOutcome::NotRun, ImageProbeOutcome::NotRun], None, "the composition sha256:"),
+        (
+            vec![ImageProbeOutcome::NotRun, ImageProbeOutcome::NotRun, ImageProbeOutcome::NotRun],
+            None,
+            "the composition sha256:",
+            ["probe base: not run", "probe rust: not run", "probe wheelhouse: not run"],
+        ),
     ];
-    for (seed, (outcomes, failed_step, owner)) in cases.into_iter().enumerate() {
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        host(&backend, "amd64", None).await;
-        let spec = build_spec(layers(seed, &[]), "amd64", ImageDelivery::Local, 1);
-        let name = create(&backend, &spec).await;
+    for (seed, (outcomes, failed_step, owner, probes)) in cases.into_iter().enumerate() {
         let service = BuildService::new(Behaviour::Fail {
             class: ImageBuildFailureClass::Recipe,
-            probes: outcomes.clone(),
+            probes: outcomes,
             failed_step: failed_step.map(str::to_string),
         });
-        service.expect(&spec);
-        let materials = Arc::new(Materials::default());
-        let clock = Arc::new(VirtualClock::new(Utc::now()));
-        let reconciler = reconciler(&backend, &service, &materials, &clock);
-        settle(&backend, &reconciler, &clock, &name).await;
-        clock.advance(chrono::Duration::days(1));
-        for _ in 0..10 {
-            tick(&backend, &reconciler, &clock, &name).await;
-        }
-        let failed = status(&backend, &name).await;
-        assert_eq!(failed.phase, ImageBuildPhase::Failed);
-        assert_eq!(service.calls.load(Ordering::SeqCst), 1, "identical inputs never retry");
-        let failure = failed.failure.expect("failure");
-        assert_eq!(failure.class, ImageBuildFailureClass::Recipe);
-        assert!(failure.reason.contains(&format!("(owner: {owner}")), "{}", failure.reason);
-        let probes: Vec<_> = failed.probes.iter().map(|probe| (probe.layer.as_str(), probe.outcome.clone())).collect();
-        assert_eq!(probes, vec![("base", outcomes[0].clone()), ("rust", outcomes[1].clone()), ("wheelhouse", outcomes[2].clone())]);
-        assert!(materials.logs.lock().expect("logs").contains_key(&failed.log_ref.expect("log kept")));
+        let builder = Builder::start("amd64", None, service, Arc::new(Materials::default()));
+        let name = builder.demand(&local(seed));
+        let gave_up = builder.settled(&name).await;
+        assert_eq!(calls(&builder), 1, "identical inputs never retry");
+        assert!(cause(&gave_up.reading).contains(&format!("(owner: {owner}")), "{:?}", gave_up.reading);
+        let logs = builder.materials.logs.lock().expect("logs");
+        let log = &logs[&build_log_name(&gave_up.launch, 1)];
+        assert!(probes.iter().all(|probe| log.contains(probe)), "{log}");
     }
 }
 
 // Glue: attribution leaves infrastructure failures unowned.
 #[test]
 fn infrastructure_failures_name_no_owner() {
-    let spec = build_spec(layers(0, &[]), "amd64", ImageDelivery::Local, 1);
     let failed = FailedImageBuild {
         failure: ImageBuildFailure { class: ImageBuildFailureClass::Infrastructure, reason: "no such host".into() },
         probes: Vec::new(),
         failed_step: Some("rust".into()),
     };
-    assert_eq!(attribute_recipe_failure(&spec, &failed).reason, "no such host");
+    assert_eq!(attribute_recipe_failure(&local(0), &failed).reason, "no such host");
 }
 
-// A declared secret that is not granted refuses the build naming the secret,
-// as a recipe failure before the service runs; granted ones reach the
-// service, and only those the layers declare.
+// A declared secret that is not granted gives the build up naming the secret, before the service
+// runs; granted ones reach the service, and only those the layers declare.
 #[tokio::test]
 async fn build_secrets_are_resolved_by_declared_name_only() {
     for granted in [false, true] {
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        host(&backend, "amd64", None).await;
-        let spec = build_spec(layers(0, &["npm-token"]), "amd64", ImageDelivery::Local, 1);
-        let name = create(&backend, &spec).await;
-        let service = BuildService::new(Behaviour::Succeed);
-        service.expect(&spec);
         let mut materials = Materials::default();
         materials.granted.insert("unrelated".into());
         if granted {
             materials.granted.insert("npm-token".into());
         }
-        let materials = Arc::new(materials);
-        let clock = Arc::new(VirtualClock::new(Utc::now()));
-        let reconciler = reconciler(&backend, &service, &materials, &clock);
-        settle(&backend, &reconciler, &clock, &name).await;
-        let settled = status(&backend, &name).await;
+        let builder = Builder::start("amd64", None, BuildService::new(Behaviour::Succeed), Arc::new(materials));
+        let name = builder.demand(&build_spec(layers(0, &["npm-token"]), "amd64", ImageDelivery::Local, 1));
+        let settled = builder.settled(&name).await;
         if granted {
-            assert_eq!(settled.phase, ImageBuildPhase::Built);
+            assert!(settled.digest().is_some());
         } else {
-            assert_eq!(settled.phase, ImageBuildPhase::Failed);
-            assert!(settled.failure.expect("refusal").reason.contains("`npm-token`"));
-            assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+            assert!(cause(&settled.reading).contains("`npm-token`"), "{:?}", settled.reading);
+            assert_eq!(calls(&builder), 0);
         }
     }
 }
 
-// Host.spec.image_build_capacity bounds concurrent builds: with `slots`
-// slots and more queued identities, at most `slots` are Building (published
-// before any build process runs), and the rest start as slots free up. An
-// undeclared capacity is one slot; an explicit None builds nothing.
+// Host.image_builds bounds concurrent builds: with `slots` slots and more demanded identities, at
+// most `slots` run at once, and the rest start as slots free up. An undeclared capacity is one
+// slot; an explicit None builds nothing.
 #[rstest::rstest]
 #[case::declared(builder(2), 2)]
 #[case::undeclared(None, 1)]
 #[case::forbidden(Some(ImageBuildCapacity::None), 0)]
 #[tokio::test]
 async fn build_slots_bound_concurrent_builds(#[case] capacity: Option<ImageBuildCapacity>, #[case] slots: usize) {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    host(&backend, "amd64", capacity).await;
-    let service = BuildService::new(Behaviour::Gate);
-    let mut names = Vec::new();
-    for seed in 0..4 {
-        let spec = build_spec(layers(seed, &[]), "amd64", ImageDelivery::Local, 1);
-        service.expect(&spec);
-        names.push(create(&backend, &spec).await);
+    let builder = Builder::start("amd64", capacity, BuildService::new(Behaviour::Gate), Arc::new(Materials::default()));
+    let names: Vec<String> = (0..4).map(|seed| builder.demand(&local(seed))).collect();
+    let launched = |builder: &Builder| names.iter().all(|name| builder.record(name).is_some());
+    builder.until("every build launched", launched).await;
+    builder.until("the slots filled", |builder| builder.build_service.running.load(Ordering::SeqCst) == slots).await;
+    if slots == 0 {
+        // A host that builds nothing waits: no try is spent.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(names.iter().all(|name| builder.record(name).expect("launched").reading == LifecycleReading::InProgress));
+        assert_eq!(calls(&builder), 0);
+        return;
     }
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    let reconciler = reconciler(&backend, &service, &materials, &clock);
-    let building = || async {
-        let mut count = 0;
-        for name in &names {
-            count += usize::from(status(&backend, name).await.phase == ImageBuildPhase::Building);
-        }
-        count
-    };
-    for _ in 0..3 {
-        for name in &names {
-            tick(&backend, &reconciler, &clock, name).await;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    assert_eq!(building().await, slots);
-    assert_eq!(service.running.load(Ordering::SeqCst), slots);
-    for _ in 0..200 {
-        service.release.notify_waiters();
-        for name in &names {
-            tick(&backend, &reconciler, &clock, name).await;
-        }
-        assert!(building().await <= slots, "never more Building than slots");
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    let built = futures::future::join_all(names.iter().map(|name| status(&backend, name))).await;
-    let expected = if slots == 0 { ImageBuildPhase::Queued } else { ImageBuildPhase::Built };
-    assert!(built.iter().all(|status| status.phase == expected));
-    assert!(service.peak.load(Ordering::SeqCst) <= slots);
+    builder
+        .until("every build built", |builder| {
+            builder.build_service.release.notify_waiters();
+            names.iter().all(|name| builder.record(name).is_some_and(|record| record.digest().is_some()))
+        })
+        .await;
+    assert_eq!(builder.build_service.peak.load(Ordering::SeqCst), slots, "never more running than slots");
+    assert_eq!(calls(&builder), names.len());
 }
 
-// Builds for another architecture than this host's, or for another host, are
-// never executed here.
+// A demand of another architecture than this host builds waits; one of another builder is not
+// launched here.
 #[tokio::test]
-async fn foreign_architectures_and_hosts_are_ignored() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    host(&backend, "amd64", builder(2)).await;
-    let arm = build_spec(layers(0, &[]), "arm64", ImageDelivery::Local, 1);
-    let mut elsewhere = build_spec(layers(1, &[]), "amd64", ImageDelivery::Local, 1);
-    elsewhere.host_ref = "other".into();
-    let service = BuildService::new(Behaviour::Succeed);
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    let reconciler = reconciler(&backend, &service, &materials, &clock);
-    for spec in [arm, elsewhere] {
-        service.expect(&spec);
-        let name = create(&backend, &spec).await;
-        for _ in 0..5 {
-            tick(&backend, &reconciler, &clock, &name).await;
-        }
-        assert!(backend.using::<ImageBuild>(NS).get(&name).await.expect("build").status.is_none());
-    }
-    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
-}
-
-// A declared builder capacity is the operator's word: an arm64 host that declares amd64
-// builds amd64 (emulated), while one that declares nothing builds only its own architecture.
-#[rstest::rstest]
-#[case::declared(builder(1), true)]
-#[case::undeclared(None, false)]
-#[tokio::test]
-async fn a_declared_architecture_builds_on_another_host_architecture(#[case] capacity: Option<ImageBuildCapacity>, #[case] runs: bool) {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    host(&backend, "aarch64", capacity).await;
-    let spec = build_spec(layers(0, &[]), "amd64", ImageDelivery::Local, 1);
-    let service = BuildService::new(Behaviour::Succeed);
-    service.expect(&spec);
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    let reconciler = reconciler(&backend, &service, &materials, &clock);
-    let name = create(&backend, &spec).await;
-    for _ in 0..5 {
-        tick(&backend, &reconciler, &clock, &name).await;
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    assert_eq!(service.calls.load(Ordering::SeqCst) > 0, runs);
-}
-
-// Deleting a Building ImageBuild (the operator retry, or withdrawn demand)
-// abandons its running job; nothing is recorded and the service future is
-// dropped.
-#[tokio::test]
-async fn deleting_a_building_build_abandons_its_job() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    host(&backend, "amd64", None).await;
-    let spec = build_spec(layers(0, &[]), "amd64", ImageDelivery::Local, 1);
-    let name = create(&backend, &spec).await;
-    let service = BuildService::new(Behaviour::Gate);
-    service.expect(&spec);
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    let reconciler = reconciler(&backend, &service, &materials, &clock);
-    for _ in 0..3 {
-        tick(&backend, &reconciler, &clock, &name).await;
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    assert_eq!(service.running.load(Ordering::SeqCst), 1);
-    backend.using::<ImageBuild>(NS).delete(&name).await.expect("delete");
-    for _ in 0..200 {
-        if service.dropped.load(Ordering::SeqCst) == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    assert_eq!(service.dropped.load(Ordering::SeqCst), 1, "the running attempt is abandoned");
-    assert!(materials.logs.lock().expect("logs").is_empty(), "an abandoned attempt records nothing");
-}
-
-// ADR 0047: retired ADR 0053 per-stage records are garbage-collected by the
-// controller; nothing reads them.
-#[tokio::test]
-async fn retired_records_are_deleted() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let builds = backend.using::<ImageBuild>(NS);
-    builds.create(&InputMeta::builder().name("old-stage".into()).build(), &ImageBuildResourceSpec::Retired).await.expect("retired");
-    let service = BuildService::new(Behaviour::Succeed);
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    // Hosts without a build service still collect retired records.
-    let reconciler = ImageBuildReconciler::new(None, materials as Arc<dyn ImageBuildMaterials>, &backend, NS, HOST, WRAPPER);
-    tick(&backend, &reconciler, &clock, "old-stage").await;
-    assert!(builds.list().await.expect("list").items.is_empty());
-    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
-}
-
-/// Docker runtime stand-in: records what the provider was asked to run.
-#[derive(Default)]
-struct Docker {
-    provisioned: Mutex<Vec<(String, DockerImagePullPolicy)>>,
-}
-#[async_trait]
-impl EnvironmentRuntime for Docker {
-    async fn provision_environment(
-        &self,
-        _name: &str,
-        spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
-        let spec = spec.docker.as_ref().expect("Docker scenario input");
-
-        self.provisioned.lock().expect("provisioned").push((spec.image.clone(), spec.pull_policy));
-        Ok(EnvironmentProvisioning::Local(LocalProvisioning {
-            configured_limits: None,
-            backing_id: Some("container".into()),
-            image_ref: Some(spec.image.clone()),
-            local_image_id: Some(digest('d')),
-            registry_digest: spec.image.split_once('@').map(|(_, digest)| digest.to_string()),
-        }))
-    }
-    async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-// End to end: a composed Environment waits while its build runs, then
-// becomes Ready on the built digest: `repository@digest` pulled with the
-// authored policy for registry delivery, the local image ID with pull policy
-// Never for single-host local mode.
-#[rstest::rstest]
-#[case::registry(ImageDelivery::Registry { repository: REPOSITORY.into() })]
-#[case::local(ImageDelivery::Local)]
-#[tokio::test]
-async fn environment_becomes_ready_with_the_built_digest(#[case] delivery: ImageDelivery) {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    host(&backend, "amd64", builder(1)).await;
-    let spec = build_spec(layers(0, &[]), "amd64", delivery.clone(), 2);
-    let name = create(&backend, &spec).await;
-    let environments = backend.using::<Environment>(NS);
-    environments
+async fn foreign_architectures_and_builders_are_not_built() {
+    let builder = Builder::start("amd64", builder(2), BuildService::new(Behaviour::Succeed), Arc::new(Materials::default()));
+    let arm = builder.demand(&build_spec(layers(0, &[]), "arm64", ImageDelivery::Local, 1));
+    let elsewhere = local(1);
+    let demand = demand_of(&elsewhere, Ref::new("other", "other-node")).expect("demand");
+    PlainLog::new(builder.service.store())
         .create(
-            &InputMeta::builder().name("env".into()).build(),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: None,
-                docker: Some(DockerEnvironmentSpec {
-                    image_build_ref: Some(name.clone()),
-                    host_ref: HOST.into(),
-                    image: String::new(),
-                    declared_agent_adapters: BTreeSet::new(),
-                    required_agent_adapters: BTreeSet::new(),
-                    pull_policy: DockerImagePullPolicy::IfNotPresent,
-                    mounts: Vec::new(),
-                    env: Default::default(),
-                }),
-            },
+            &elsewhere.resource_name(),
+            &demand,
+            &PendingChange::new(NewChange::new("admission", Timestamp::from_datetime(&chrono::Utc::now()))),
         )
-        .await
-        .expect("environment");
-    let docker = Arc::new(Docker::default());
-    let environment = EnvironmentReconciler::new(Arc::clone(&docker), backend.clone(), NS);
-    let step_environment = || async {
-        let env = environments.get("env").await.expect("environment");
-        let prepared = environment.prepare(&env).await.expect("prepare");
-        if let Some(patch) = environment.reconcile(&env, &prepared, Utc::now()).patch {
-            apply_status_patch(&environments, "env", &patch).await.expect("environment patch");
-        }
-        environments.get("env").await.expect("environment").status.expect("status")
+        .expect("demand of another builder");
+    builder.until("the arm64 build launched", |builder| builder.record(&arm).is_some()).await;
+    // A build demanded after both is built: both were passed over.
+    let after = builder.demand(&local(2));
+    assert!(builder.settled(&after).await.digest().is_some());
+    assert_eq!(builder.record(&arm).expect("launched").reading, LifecycleReading::InProgress, "waits for an arm64 builder");
+    assert_eq!(builder.record(&elsewhere.resource_name()), None, "launched by its own builder");
+    assert_eq!(calls(&builder), 1);
+}
+
+// A build is released once no home demands it; the image stays in its cache. Demanded again, it
+// is launched again. Withdrawing the demand of a running build lets it finish first.
+#[tokio::test]
+async fn a_build_no_home_demands_is_released_and_launched_again_on_demand() {
+    let builder = Builder::start("amd64", None, BuildService::new(Behaviour::Gate), Arc::new(Materials::default()));
+    let spec = local(0);
+    let name = builder.demand(&spec);
+    builder.until("the build running", |builder| builder.build_service.running.load(Ordering::SeqCst) == 1).await;
+    let first = builder.record(&name).expect("launched").launch;
+    builder.builds.withdraw(&name).expect("withdraw");
+    assert_eq!(builder.builds.demanded(&name).expect("read"), None);
+    // A stored permit: the running build may not have reached its gate yet.
+    builder.build_service.release.notify_one();
+    builder.until("released", |builder| builder.record(&name).is_some_and(|record| record.reading == LifecycleReading::Released)).await;
+    assert_eq!(builder.build_service.dropped.load(Ordering::SeqCst), 1, "the running build finished");
+    *builder.build_service.behaviour.lock().expect("behaviour") = Behaviour::Succeed;
+    builder.demand(&spec);
+    let again = builder.settled(&name).await;
+    assert_ne!(again.launch, first, "launched again");
+    assert!(again.digest().is_some());
+}
+
+// The operator's retry launches a given-up build again at its builder; a build that has not
+// given up is not retried.
+#[tokio::test]
+async fn a_retry_launches_a_given_up_build_again() {
+    let service = BuildService::new(Behaviour::Fail { class: ImageBuildFailureClass::Recipe, probes: Vec::new(), failed_step: None });
+    let builder = Builder::start("amd64", None, service, Arc::new(Materials::default()));
+    let name = builder.demand(&local(0));
+    let gave_up = builder.settled(&name).await;
+    *builder.build_service.behaviour.lock().expect("behaviour") = Behaviour::Succeed;
+    let retried = builder.builds.retry(&name).expect("retry");
+    assert_ne!(retried, gave_up.launch, "a new launch");
+    let built = builder.settled(&name).await;
+    assert_eq!(built.launch, retried);
+    assert!(built.digest().is_some());
+    assert!(builder.builds.retry(&name).expect_err("built").contains("has not given up"));
+    assert!(builder.builds.retry("image-unknown").expect_err("unknown").contains("not launched here"));
+}
+
+// A demand is refused unless it is named for its spec and its builder host has a Host record
+// here; a different demand under a held name is refused.
+#[tokio::test]
+async fn a_demand_names_its_build_and_a_known_builder() {
+    let builder = Builder::start("amd64", None, BuildService::new(Behaviour::Gate), Arc::new(Materials::default()));
+    let spec = local(0);
+    assert!(builder.builds.demand("misnamed", &spec).expect_err("misnamed").contains("is named"));
+    let mut unknown = spec.clone();
+    unknown.host_ref = "nowhere".into();
+    assert!(builder.builds.demand(&unknown.resource_name(), &unknown).expect_err("unknown host").contains("no Host record"));
+    assert!(builder.builds.demand(&spec.resource_name(), &spec).expect("written"));
+    assert!(!builder.builds.demand(&spec.resource_name(), &spec).expect("held"), "already demanded");
+    let mut other = spec.clone();
+    other.reservation.cpu = 4;
+    assert!(builder.builds.demand(&spec.resource_name(), &other).expect_err("different").contains("another build"));
+    assert_eq!(builder.builds.builder_home(&spec.resource_name()).expect("read"), Some(BUILDER_HOME.to_owned()));
+}
+
+// A build demanded at another home is launched by its builder, which follows that home's demand.
+// The admitting home reads the launch at the builder's home once its log arrives, and an
+// environment there names the build at the builder's home.
+#[tokio::test]
+async fn a_build_demanded_at_another_home_is_built_and_read_at_its_builder() {
+    use flotilla_engine_store::{open_home, StoreLog};
+    use flotilla_provisioning::engine::{environments::request_of, image_builds::EngineImageBuilds, LifecycleHome, Lifecycles};
+    use flotilla_provisioning::stored::image_build::ImageBuildKind;
+    use flotilla_provisioning_testkit::{replicate_home, OtherHome};
+    use flotilla_resources::{DockerEnvironmentSpec, EnvironmentSpec};
+
+    let builder = Builder::start("amd64", builder(1), BuildService::new(Behaviour::Succeed), Arc::new(Materials::default()));
+    let admitting = OtherHome::open("admitting-node");
+    // The builder's Host record arrives at the admitting home.
+    replicate_home(&builder.service, BUILDER_HOME, admitting.service());
+    let lifecycles: Arc<dyn Lifecycles<ImageBuildKind>> =
+        Arc::new(LifecycleHome::new(admitting.home(), open_home(StoreLog::new(admitting.service().store())).expect("image builds")));
+    let builds = EngineImageBuilds::over(lifecycles, Arc::clone(admitting.service()));
+    let spec = build_spec(layers(0, &[]), "amd64", ImageDelivery::Registry { repository: REPOSITORY.into() }, 1);
+    builder.build_service.expect(&spec);
+    let name = spec.resource_name();
+    assert!(builds.demand(&name, &spec).expect("demand"));
+    assert_eq!(builds.builder_home(&name).expect("read"), Some(BUILDER_HOME.to_owned()));
+    assert_eq!(builds.get(&name).expect("read"), None, "not launched before the builder follows the demand");
+
+    replicate_home(admitting.service(), admitting.home(), &builder.service);
+    let built = builder.settled(&name).await;
+    assert!(built.digest().is_some());
+    replicate_home(&builder.service, BUILDER_HOME, admitting.service());
+    let read = builds.get(&name).expect("read").expect("launched at its builder");
+    assert_eq!((read.home.as_str(), read.launch.as_str(), read.digest()), (BUILDER_HOME, built.launch.as_str(), built.digest()));
+
+    let environment = EnvironmentSpec {
+        docker: Some(DockerEnvironmentSpec {
+            host_ref: "consumer".into(),
+            image: "composed".into(),
+            image_build_ref: Some(name.clone()),
+            declared_agent_adapters: Default::default(),
+            required_agent_adapters: Default::default(),
+            pull_policy: Default::default(),
+            mounts: vec![],
+            env: Default::default(),
+        }),
+        ..Default::default()
     };
-    let waiting = step_environment().await;
-    assert_eq!(waiting.phase, EnvironmentPhase::Provisioning);
-    assert!(docker.provisioned.lock().expect("provisioned").is_empty(), "no image before the build");
-
-    let service = BuildService::new(Behaviour::Succeed);
-    service.expect(&spec);
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    let reconciler = reconciler(&backend, &service, &materials, &clock);
-    settle(&backend, &reconciler, &clock, &name).await;
-    let built = status(&backend, &name).await.digest.expect("built digest");
-    let ready = step_environment().await;
-    assert_eq!(ready.phase, EnvironmentPhase::Ready);
-    let expected = match delivery {
-        ImageDelivery::Registry { .. } => (format!("{REPOSITORY}@{}", digest('d')), DockerImagePullPolicy::IfNotPresent),
-        ImageDelivery::Local => (digest('d'), DockerImagePullPolicy::Never),
-    };
-    assert_eq!(built, expected.0);
-    assert_eq!(*docker.provisioned.lock().expect("provisioned"), vec![expected]);
-}
-
-// Shared property helper: engine phase, tally and deadlines win over stale build evidence without a copy.
-pub(super) async fn assert_image_lifecycle(old_phase: ImageBuildPhase, ending: flotilla_provisioning_testkit::Ending<'_>) {
-    use flotilla_provisioning::{engine::image_build::ImageBuildBinding, reconcilers::image_build::ImageBuildAction};
-    use flotilla_provisioning_testkit::{image_build, store_object, LifecycleFixture};
-    use flotilla_resources::ImageBuildStatusPatch;
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    host(&backend, "amd64", None).await;
-    let mut obj = image_build(old_phase);
-    obj.metadata.namespace = NS.into();
-    let name = obj.metadata.name.as_str();
-    store_object(&backend, obj.clone()).await;
-    let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
-    fixture.request(&obj);
-    let reads = off_runtime_reads(fixture.reads.clone());
-    let writes = backend.using::<ImageBuild>(NS).with_lifecycle_status_reads(reads.clone());
-    // Another local record forces the capacity scan to cross the real lifecycle port.
-    let other_spec = build_spec(layers(61, &[]), "amd64", ImageDelivery::Local, 1);
-    let other_name = create(&backend, &other_spec).await;
-    let other = backend.using::<ImageBuild>(NS).get(&other_name).await.expect("other build");
-    fixture.request(&other);
-    let service = BuildService::new(Behaviour::Succeed);
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(chrono::DateTime::from_timestamp(3, 0).expect("time")));
-    let reconciler = reconciler(&backend, &service, &materials, &clock).with_lifecycle_reads(reads);
-    let prepared = reconciler.prepare(&obj).await.expect("engine permits start despite old terminal phase");
-    assert!(matches!(prepared.action, ImageBuildAction::Waiting(_)));
-    drop(prepared);
-    let observed = status(&backend, name).await;
-    assert_eq!((observed.phase, observed.attempt), (ImageBuildPhase::Building, 1));
-    fixture.retry(&obj, "network");
-    assert!(reconciler.retry_disposition(&obj).is_none(), "the async prepare path handles engine backoff without a synchronous read");
-    let prepared = reconciler.prepare(&obj).await.expect("retry");
-    assert!(matches!(prepared.action, ImageBuildAction::Waiting(Some(delay)) if delay == Duration::from_secs(29)));
-    drop(prepared);
-    // An accepted infrastructure failure leaves an actuator observation; engine backoff permits the next attempt.
-    apply_status_patch(
-        &writes,
-        name,
-        &ImageBuildStatusPatch::Failed {
-            at: chrono::DateTime::from_timestamp(3, 0).expect("time"),
-            failure: ImageBuildFailure { class: ImageBuildFailureClass::Infrastructure, reason: "network".into() },
-            probes: vec![],
-            log_ref: String::new(),
-        },
-    )
-    .await
-    .expect("failure observation");
-    clock.advance(chrono::Duration::seconds(30));
-    assert!(matches!(reconciler.prepare(&obj).await.expect("engine permits retry").action, ImageBuildAction::Waiting(_)));
-    let restarted = status(&backend, name).await;
-    assert_eq!(restarted.attempt, 2);
-    assert!(restarted.started_at.is_some_and(|started| started >= chrono::DateTime::from_timestamp(32, 0).expect("deadline")));
-    fixture.finish(&obj, ending);
-    let selected = flotilla_store::read_image_build(&backend, NS, name, fixture.reads.clone()).await.expect("selected");
-    assert_eq!(
-        selected.lifecycle,
-        fixture.reads.try_reading(flotilla_resources::lifecycle_reads::ProvisioningKind::ImageBuild, name, None).expect("read")
-    );
-    let prepared = reconciler.prepare(&obj).await.expect("ending");
-    assert!(matches!(prepared.action, ImageBuildAction::None));
-    assert!(reconciler.reconcile(&obj, &prepared, Utc::now()).patch.is_none());
-    assert_eq!(obj.status.as_ref().expect("snapshot").phase, old_phase);
-    drop(prepared);
-    fixture.poison();
-    assert!(reconciler.prepare(&obj).await.err().expect("read failure").to_string().contains("poisoned"));
-    assert!(flotilla_store::read_image_build(&backend, NS, name, fixture.reads.clone()).await.is_err());
-    let actual = backend.using::<ImageBuild>(NS).get(name).await.expect("resource remains readable");
-    let error = writes
-        .update_status(name, &actual.metadata.resource_version, actual.status.as_ref().expect("status"))
-        .await
-        .expect_err("authority read errors cannot select legacy validation, even for an unchanged status");
-    assert!(error.to_string().contains("poisoned"));
-}
-
-// Environment provisioning uses the selected engine digest and refuses stale Built evidence after loss.
-#[tokio::test]
-async fn environment_image_dependency_follows_engine_without_a_copy() {
-    use flotilla_provisioning::engine::image_build::ImageBuildBinding;
-    use flotilla_provisioning::reconcilers::environment::EnvironmentPrepared;
-    use flotilla_provisioning_testkit::{image_build, store_object, Ending, LifecycleFixture};
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    host(&backend, "amd64", None).await;
-    let mut build = image_build(ImageBuildPhase::Built);
-    build.metadata.namespace = NS.into();
-    store_object(&backend, build.clone()).await;
-    let env = backend
-        .using::<Environment>(NS)
-        .create(
-            &InputMeta::builder().name("env".into()).build(),
-            &EnvironmentSpec {
-                provider_address: None,
-                host_direct: None,
-                cloud_sandbox: None,
-                docker: Some(DockerEnvironmentSpec {
-                    host_ref: HOST.into(),
-                    image: String::new(),
-                    image_build_ref: Some(build.metadata.name.clone()),
-                    declared_agent_adapters: Default::default(),
-                    required_agent_adapters: Default::default(),
-                    pull_policy: Default::default(),
-                    mounts: vec![],
-                    env: Default::default(),
-                }),
-            },
-        )
-        .await
-        .expect("environment");
-    let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
-    fixture.request(&build);
-    let docker = Arc::new(Docker::default());
-    let reconciler = EnvironmentReconciler::new(docker.clone(), backend, NS).with_lifecycle_reads(fixture.reads.clone());
-    assert!(matches!(reconciler.prepare(&env).await.expect("requested"), EnvironmentPrepared::Waiting(_)));
-    fixture.finish(&build, Ending::Ready("engine digest"));
-    reconciler.prepare(&env).await.expect("ready");
-    assert_eq!(*docker.provisioned.lock().expect("calls"), vec![("engine digest".into(), DockerImagePullPolicy::Never)]);
-    fixture.finish(&build, Ending::Lost("engine digest"));
-    assert!(matches!(reconciler.prepare(&env).await.expect("lost"), EnvironmentPrepared::Waiting(_)));
-    assert_eq!(docker.provisioned.lock().expect("calls").len(), 1);
-    fixture.poison();
-    assert!(reconciler.prepare(&env).await.is_err());
-}
-
-// Pin the reachable Queued → infrastructure failure → engine-permitted retry path independently of stale terminal examples.
-#[tokio::test]
-async fn image_retry_observations_follow_engine_without_a_copy() {
-    for old_phase in [ImageBuildPhase::Queued, ImageBuildPhase::Built] {
-        assert_image_lifecycle(old_phase, flotilla_provisioning_testkit::Ending::Ready("engine digest")).await;
-    }
-}
-
-// Both transactional backends keep legacy policy for unheld builds, CAS checks, and checked-read failures.
-#[tokio::test]
-async fn image_status_authority_requires_a_held_engine_resource() {
-    use flotilla_provisioning::engine::image_build::ImageBuildBinding;
-    use flotilla_provisioning_testkit::{image_build, store_object, LifecycleFixture};
-    use flotilla_store_sqlite::SqliteBackend;
-    for backend in [
-        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
-        ResourceBackend::new(SqliteBackend::open_in_memory().expect("resource store")),
-    ] {
-        let obj = image_build(ImageBuildPhase::Built);
-        let current = store_object(&backend, obj.clone()).await;
-        let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
-        let builds = backend.using::<ImageBuild>("flotilla").with_lifecycle_status_reads(off_runtime_reads(fixture.reads.clone()));
-        let mut observed = current.status.clone().expect("status");
-        observed.log_ref = Some("new observation".into());
-        assert!(builds
-            .update_status(&obj.metadata.name, &current.metadata.resource_version, &observed)
-            .await
-            .expect_err("unheld Built remains immutable")
-            .to_string()
-            .contains("immutable"));
-        fixture.request(&obj);
-        let updated = builds
-            .update_status(&obj.metadata.name, &current.metadata.resource_version, &observed)
-            .await
-            .expect("engine owns phase, observation remains mutable");
-        assert!(builds
-            .update_status(&obj.metadata.name, &current.metadata.resource_version, &observed)
-            .await
-            .expect_err("engine authority cannot bypass CAS")
-            .to_string()
-            .contains("resourceVersion"));
-        fixture.finish(&obj, flotilla_provisioning_testkit::Ending::Released);
-        let mut ending_observed = observed.clone();
-        ending_observed.log_ref = Some("after ending".into());
-        let ended = builds
-            .update_status(&obj.metadata.name, &updated.metadata.resource_version, &ending_observed)
-            .await
-            .expect("ending retains engine ownership");
-        fixture.poison();
-        assert!(builds
-            .update_status(&obj.metadata.name, &ended.metadata.resource_version, &ending_observed)
-            .await
-            .expect_err("read error cannot fall back, even for identical status")
-            .to_string()
-            .contains("poisoned"));
-    }
-}
-
-/// Instrument a real port to require reads off the thread driving a current-thread runtime.
-fn off_runtime_reads(reads: Arc<dyn LifecycleReads>) -> Arc<dyn LifecycleReads> {
-    struct OffRuntime {
-        reads: Arc<dyn LifecycleReads>,
-        runtime_thread: std::thread::ThreadId,
-    }
-    impl LifecycleReads for OffRuntime {
-        fn try_reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Result<Option<LifecycleReading>, String> {
-            assert_ne!(std::thread::current().id(), self.runtime_thread, "lifecycle store read blocked the async runtime thread");
-            self.reads.try_reading(kind, name, origin)
-        }
-    }
-    Arc::new(OffRuntime { reads, runtime_thread: std::thread::current().id() })
-}
-
-// A transient authority error after completion must retain the result, not execute the attempt again.
-#[tokio::test]
-async fn completed_build_survives_post_collection_read_failure() {
-    use flotilla_provisioning::engine::image_build::ImageBuildBinding;
-    use flotilla_provisioning_testkit::LifecycleFixture;
-    struct FailOnce {
-        inner: Arc<dyn LifecycleReads>,
-        countdown: AtomicUsize,
-    }
-    impl LifecycleReads for FailOnce {
-        fn try_reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Result<Option<LifecycleReading>, String> {
-            if self.countdown.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)) == Ok(1) {
-                return Err("transient post-collection read".into());
-            }
-            self.inner.try_reading(kind, name, origin)
-        }
-    }
-    let backend = ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open_in_memory().expect("resource store"));
-    host(&backend, "amd64", None).await;
-    let spec = build_spec(layers(701, &[]), "amd64", ImageDelivery::Local, 1);
-    let name = create(&backend, &spec).await;
-    let builds = backend.using::<ImageBuild>(NS);
-    let obj = builds.get(&name).await.expect("build");
-    let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
-    fixture.request(&obj);
-    let reads = Arc::new(FailOnce { inner: fixture.reads.clone(), countdown: AtomicUsize::new(0) });
-    let service = BuildService::new(Behaviour::Gate);
-    service.expect(&spec);
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    let reconciler = reconciler(&backend, &service, &materials, &clock).with_lifecycle_reads(reads.clone());
-    tick(&backend, &reconciler, &clock, &name).await;
-    tick(&backend, &reconciler, &clock, &name).await;
-    service.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while materials.logs.lock().expect("logs").is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("completed build log");
-    tokio::task::yield_now().await;
-    // Building reads authority once before collecting, then refreshes after collection.
-    // Fail the refresh; failing the gate would return a prepare error rather than this frame.
-    reads.countdown.store(2, Ordering::SeqCst);
-    let obj = builds.get(&name).await.expect("build");
-    let prepared = reconciler.prepare(&obj).await.expect("read error frame");
-    let outcome = reconciler.reconcile(&obj, &prepared, Utc::now());
-    assert!(outcome.patch.is_none());
-    assert!(outcome.events.iter().any(|event| event.reason == "LifecycleReadFailed" && event.message == "transient post-collection read"));
-    drop(prepared);
-    settle(&backend, &reconciler, &clock, &name).await;
-    assert_eq!(status(&backend, &name).await.phase, ImageBuildPhase::Built);
-    assert_eq!(service.calls.load(Ordering::SeqCst), 1, "the finished attempt is retained across the failed read");
+    let builder_home = |build: &str| builds.builder_home(build)?.ok_or_else(|| format!("{build} is demanded nowhere"));
+    let request = request_of(&environment, None, builder_home).expect("request");
+    assert_eq!(request.image_build, Some(Ref::new(name, BUILDER_HOME)));
 }

@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use flotilla_resources::{CrewMessageDelivery, CrewMessageSender, PendingBrief, TerminalCrewMessage, TurnDeliveryEpisode};
+use flotilla_resources::TurnDeliveryStatus;
 use flotilla_store::{decode_stored_resource_document, StoredRecord, REGISTERED_RESOURCE_KINDS, RETIRED_RESOURCE_KINDS};
 use serde_json::Value;
 
@@ -70,7 +70,14 @@ fn retired_corpus_kinds_decode_as_dropped_and_purged_ones_refuse() {
     let usage: Value = serde_json::from_str(include_str!("../fixtures/retired-usage.json")).unwrap();
     let dispatch: Vec<Value> = serde_json::from_str(include_str!("../fixtures/retired-dispatch.json")).unwrap();
     let forge_reads: Vec<Value> = serde_json::from_str(include_str!("../fixtures/retired-forge-read.json")).unwrap();
-    let fixed = || std::iter::once(usage.clone()).chain(dispatch.iter().cloned()).chain(forge_reads.iter().cloned());
+    // r355 held no Regard rows; this fixed one stands in until the corpus is refreshed.
+    let regard: Value = serde_json::from_str(include_str!("../fixtures/retired-regard.json")).unwrap();
+    let fixed = || {
+        std::iter::once(usage.clone())
+            .chain(dispatch.iter().cloned())
+            .chain(forge_reads.iter().cloned())
+            .chain(std::iter::once(regard.clone()))
+    };
     for retired in RETIRED_RESOURCE_KINDS {
         assert!(!REGISTERED_RESOURCE_KINDS.iter().any(|registered| registered.kind == retired.kind), "{} is retired", retired.kind);
         let recorded = if AFTER_R355_KINDS.contains(&retired.kind) { Vec::new() } else { recorded(retired.kind) };
@@ -167,25 +174,21 @@ fn gone_checkout_status_decodes_as_a_stored_record() {
     decode_stored_resource_document(&checkout).expect("stored Checkout with Gone phase decodes");
 }
 
+// #2710's retired queue fields and episode sender are dropped on decode.
 #[test]
-fn prior_generation_crew_delivery_records_decode_without_sender() {
-    let message: TerminalCrewMessage =
-        serde_json::from_value(serde_json::json!({"id":"old", "text":"continue"})).expect("old terminal message");
-    assert_eq!(message.sender, CrewMessageSender::Unknown);
-    assert_eq!(message.delivery, CrewMessageDelivery::Queued);
-
-    let pending: PendingBrief = serde_json::from_value(serde_json::json!({
-        "vessel":"work", "role":"coder", "content":"continue", "queued_at":"2026-01-01T00:00:00Z"
+fn prior_generation_crew_delivery_records_decode_without_retired_fields() {
+    let delivery: TurnDeliveryStatus = serde_json::from_value(serde_json::json!({
+        "episodes": [{
+            "subject_revision":"abc", "evidence_at":"2026-01-01T00:00:00Z", "judged_claim_at":"2026-01-01T00:00:00Z",
+            "outcome":{"kind":"delivered", "rung":"warm-session", "delivered_at":"2026-01-01T00:00:00Z"},
+            "sender":{"kind":"flotilla-nudge"}
+        }],
+        "pending_brief": {"vessel":"work", "role":"coder", "content":"continue", "queued_at":"2026-01-01T00:00:00Z"},
+        "pending_supervisor_turn": {"vessel":"work", "role":"coder", "message":{"id":"old", "text":"continue"}}
     }))
-    .expect("old pending brief");
-    assert_eq!(pending.sender, CrewMessageSender::Unknown);
-
-    let episode: TurnDeliveryEpisode = serde_json::from_value(serde_json::json!({
-        "subject_revision":"abc", "evidence_at":"2026-01-01T00:00:00Z", "judged_claim_at":"2026-01-01T00:00:00Z",
-        "outcome":{"kind":"delivered", "rung":"warm-session", "delivered_at":"2026-01-01T00:00:00Z"}
-    }))
-    .expect("old turn episode");
-    assert_eq!(episode.sender, CrewMessageSender::Unknown);
+    .expect("old turn delivery");
+    assert_eq!(delivery.episodes.len(), 1);
+    assert_eq!(delivery.episodes[0].subject_revision, "abc");
 }
 
 #[test]

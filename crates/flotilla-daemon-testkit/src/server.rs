@@ -5,13 +5,12 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow},
-    CommandCaller, GoodbyeReason, HostName, NodeId, NodeInfo, PeerWireMessage, ResourceRef, SurfaceDeclaration,
+    CommandCaller, GoodbyeReason, HostName, NodeInfo, PeerWireMessage, ResourceRef, SurfaceDeclaration,
 };
-use flotilla_replication::{DigestControl, DigestScheduler};
 use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
-use flotilla_daemon::server::{build_remote_command_router, peer_runtime::PeerRuntime};
+use flotilla_daemon::server::{build_remote_command_router, change_stream::StreamHolds, peer_runtime::PeerRuntime};
 use flotilla_daemon::{
     blob_store::TieredBlobStore,
     peer::{
@@ -24,7 +23,13 @@ use flotilla_daemon::{
 
 pub async fn apply_convoy_replica_feed(daemon: &InProcessDaemon, namespace: &str, name: &str, home: HostName) {
     let resource = ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, namespace, name).on_host(home.clone());
-    let row = ConvoyRow::builder().resource(resource).name(name).workflow_ref("scratch").phase(ConvoyPhase::Pending).build();
+    let row = ConvoyRow::builder()
+        .resource(resource)
+        .name(name)
+        .workflow_ref("scratch")
+        .project_ref(namespace)
+        .phase(ConvoyPhase::Pending)
+        .build();
     let state = daemon.aggregator_projection_state().await;
     state.write().await.replace_replica_rows(HashMap::from([(home, HashMap::from([(row.resource.clone(), row)]))]));
 }
@@ -56,7 +61,59 @@ pub struct InMemoryRequestTopology {
     pub leader_host: HostName,
     pub follower_host: HostName,
     pub shutdown_tx: watch::Sender<bool>,
+    /// The homes whose change streams the leader holds back.
+    pub leader_stream_holds: StreamHolds,
+    /// The homes whose change streams the follower holds back.
+    pub follower_stream_holds: StreamHolds,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The daemons' temporary homes, removed after everything above drops.
+    _homes: Vec<tempfile::TempDir>,
+}
+
+/// A harness daemon and the temporary home it was made in, which goes when this does, or when
+/// the topology it joins does. A daemon made elsewhere comes with no home to remove.
+pub struct HomedDaemon {
+    pub daemon: Arc<InProcessDaemon>,
+    pub home: Option<tempfile::TempDir>,
+}
+
+impl HomedDaemon {
+    pub fn new(daemon: Arc<InProcessDaemon>, home: tempfile::TempDir) -> Self {
+        Self { daemon, home: Some(home) }
+    }
+}
+
+impl std::ops::Deref for HomedDaemon {
+    type Target = Arc<InProcessDaemon>;
+
+    fn deref(&self) -> &Arc<InProcessDaemon> {
+        &self.daemon
+    }
+}
+
+impl From<Arc<InProcessDaemon>> for HomedDaemon {
+    fn from(daemon: Arc<InProcessDaemon>) -> Self {
+        Self { daemon, home: None }
+    }
+}
+
+impl InMemoryRequestTopology {
+    /// Holds the follower's change stream at the leader once the leader has installed everything
+    /// the follower has committed so far. The leader keeps what came before and installs nothing
+    /// the follower commits after, so a scenario can prove an outcome needs none of it there.
+    pub async fn hold_follower_stream_at_leader(&self) {
+        let follower = self.follower.decided_store().expect("follower engine store");
+        let leader = self.leader.decided_store().expect("leader engine store");
+        let home = follower.home().to_owned();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while leader.watermark(&home).expect("leader watermark").home_seq < follower.last_sequence(&home).expect("follower log") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leader should catch up with the follower's change stream");
+        self.leader_stream_holds.hold(&home);
+    }
 }
 
 impl Drop for InMemoryRequestTopology {
@@ -71,11 +128,12 @@ impl Drop for InMemoryRequestTopology {
 /// The clients exercise the same request dispatcher and remote router as a
 /// socket client, while tests may inspect each host's authoritative store.
 pub struct InMemoryRequestMesh {
-    pub digest_driver: Option<DigestDriver>,
     pub hosts: Vec<Arc<InProcessDaemon>>,
     pub clients: Vec<Arc<SocketDaemon>>,
     pub shutdown_txs: Vec<watch::Sender<bool>>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The hosts' temporary homes, removed after everything above drops.
+    _homes: Vec<tempfile::TempDir>,
 }
 
 impl Drop for InMemoryRequestMesh {
@@ -86,115 +144,70 @@ impl Drop for InMemoryRequestMesh {
     }
 }
 
-type DigestControls = HashMap<(NodeId, NodeId, String), Arc<DrivenDigest>>;
-
-struct DrivenDigest {
-    sender: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<Result<bool, String>>>,
-    control: Arc<DigestControl>,
+/// `hosts`' daemons, and their homes for the mesh to hold.
+fn homed(hosts: Vec<impl Into<HomedDaemon>>) -> (Vec<Arc<InProcessDaemon>>, Vec<tempfile::TempDir>) {
+    let (mut daemons, mut homes) = (Vec::new(), Vec::new());
+    for host in hosts {
+        let HomedDaemon { daemon, home } = host.into();
+        daemons.push(daemon);
+        homes.extend(home);
+    }
+    (daemons, homes)
 }
 
-/// Explicit digest rounds for routed test sessions. Production keeps its periodic timer.
-#[derive(Clone, Default)]
-pub struct DigestDriver {
-    controls: Arc<std::sync::Mutex<DigestControls>>,
-}
-
-impl DigestDriver {
-    fn control(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Arc<DrivenDigest> {
-        self.controls
-            .lock()
-            .expect("digest controls")
-            .entry((holder.clone(), origin.clone(), kind.to_string()))
-            .or_insert_with(|| {
-                let (sender, requests) = mpsc::unbounded_channel();
-                let (ready, _) = watch::channel(false);
-                Arc::new(DrivenDigest { sender, control: Arc::new(DigestControl { requests: Mutex::new(requests), ready }) })
-            })
-            .clone()
-    }
-
-    /// Wait until the current primary watch has applied a bookmark.
-    /// Readiness resets when it restarts; later bookmarks keep it ready.
-    pub async fn watch_ready(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Result<(), String> {
-        let control = self.control(holder, origin, kind);
-        let mut ready = control.control.ready.subscribe();
-        ready.wait_for(|ready| *ready).await.map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    /// Returns after reconciliation, including persisted cursor confirmation.
-    /// Queued requests survive unrelated watch errors and run on its replacement.
-    /// `true` means repair; errors preserve the previous replica set and cursor.
-    pub async fn round(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Result<bool, String> {
-        self.watch_ready(holder, origin, kind).await?;
-        let control = self.control(holder, origin, kind);
-        let (completion, result) = tokio::sync::oneshot::channel();
-        control.sender.send(completion).map_err(|error| error.to_string())?;
-        result.await.map_err(|error| error.to_string())?
+impl InMemoryRequestMesh {
+    fn holding(mut self, homes: Vec<tempfile::TempDir>) -> Self {
+        self._homes = homes;
+        self
     }
 }
 
-pub async fn spawn_in_memory_request_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
-    spawn_in_memory_request_mesh_with_replication_kinds(hosts, None).await
-}
-
-/// Exercise the production router and replicators for the kinds a scenario authors.
-/// `None` preserves full-fleet replication; a selected set avoids starting unrelated
-/// watch commands on every connection in generated, repeatedly rebuilt meshes.
-pub async fn spawn_in_memory_request_mesh_with_replication_kinds(
-    hosts: Vec<Arc<InProcessDaemon>>,
-    replication_kinds: Option<&'static [&'static str]>,
-) -> Result<InMemoryRequestMesh, String> {
-    spawn_in_memory_request_mesh_with_filter(hosts, replication_kinds, Arc::new(Some)).await
+pub async fn spawn_in_memory_request_mesh(hosts: Vec<impl Into<HomedDaemon>>) -> Result<InMemoryRequestMesh, String> {
+    spawn_in_memory_request_mesh_with_filter(hosts, Arc::new(Some)).await
 }
 
 /// A network-boundary fault injector for replication scenarios. Returning None
-/// drops one envelope; changing a request can simulate a failed authoritative list.
+/// drops one envelope; changing a request can simulate a failed stream round.
 pub async fn spawn_in_memory_request_mesh_with_filter(
-    hosts: Vec<Arc<InProcessDaemon>>,
-    replication_kinds: Option<&'static [&'static str]>,
+    hosts: Vec<impl Into<HomedDaemon>>,
     filter: EnvelopeFilter,
 ) -> Result<InMemoryRequestMesh, String> {
-    spawn_request_mesh(hosts, replication_kinds, filter, None).await
-}
-
-/// Like the filtered mesh, with explicit digest rounds replacing test-only timers.
-pub async fn spawn_in_memory_request_mesh_with_digest_driver(
-    hosts: Vec<Arc<InProcessDaemon>>,
-    replication_kinds: Option<&'static [&'static str]>,
-    filter: EnvelopeFilter,
-) -> Result<InMemoryRequestMesh, String> {
-    spawn_request_mesh(hosts, replication_kinds, filter, Some(DigestDriver::default())).await
+    let (hosts, homes) = homed(hosts);
+    Ok(spawn_request_mesh(hosts, filter).await?.holding(homes))
 }
 
 /// A full mesh whose hosts record replication into the given metrics, one per
 /// host in order, for load measurement (#3206).
 pub async fn spawn_in_memory_request_mesh_with_replication_metrics(
-    hosts: Vec<Arc<InProcessDaemon>>,
+    hosts: Vec<impl Into<HomedDaemon>>,
     replication_metrics: Vec<Arc<flotilla_store::load_metrics::ReplicationLoadMetrics>>,
 ) -> Result<InMemoryRequestMesh, String> {
+    let (hosts, homes) = homed(hosts);
     if replication_metrics.len() != hosts.len() {
         return Err("replication metrics must name one entry per host".into());
     }
-    spawn_request_mesh_with_metrics(hosts, None, Arc::new(Some), None, replication_metrics).await
+    Ok(spawn_request_graph(hosts, Arc::new(Some), replication_metrics, |_, _| true).await?.holding(homes))
 }
 
-async fn spawn_request_mesh(
-    hosts: Vec<Arc<InProcessDaemon>>,
-    replication_kinds: Option<&'static [&'static str]>,
-    filter: EnvelopeFilter,
-    digest_driver: Option<DigestDriver>,
-) -> Result<InMemoryRequestMesh, String> {
+/// Hosts linked in a line, each only to the next: the first and last are not directly connected,
+/// so what crosses between them is passed on by the hosts between.
+pub async fn spawn_in_memory_request_line(hosts: Vec<impl Into<HomedDaemon>>) -> Result<InMemoryRequestMesh, String> {
+    let (hosts, homes) = homed(hosts);
     let replication_metrics = hosts.iter().map(|_| Arc::default()).collect();
-    spawn_request_mesh_with_metrics(hosts, replication_kinds, filter, digest_driver, replication_metrics).await
+    Ok(spawn_request_graph(hosts, Arc::new(Some), replication_metrics, |left, right| right == left + 1).await?.holding(homes))
 }
 
-async fn spawn_request_mesh_with_metrics(
+async fn spawn_request_mesh(hosts: Vec<Arc<InProcessDaemon>>, filter: EnvelopeFilter) -> Result<InMemoryRequestMesh, String> {
+    let replication_metrics = hosts.iter().map(|_| Arc::default()).collect();
+    spawn_request_graph(hosts, filter, replication_metrics, |_, _| true).await
+}
+
+/// Hosts linked wherever `linked(left, right)` holds, for `left < right`.
+async fn spawn_request_graph(
     hosts: Vec<Arc<InProcessDaemon>>,
-    replication_kinds: Option<&'static [&'static str]>,
     filter: EnvelopeFilter,
-    digest_driver: Option<DigestDriver>,
     replication_metrics: Vec<Arc<flotilla_store::load_metrics::ReplicationLoadMetrics>>,
+    linked: fn(usize, usize) -> bool,
 ) -> Result<InMemoryRequestMesh, String> {
     if hosts.is_empty() {
         return Err("request mesh needs at least one host".into());
@@ -209,6 +222,9 @@ async fn spawn_request_mesh_with_metrics(
     }
     for left in 0..hosts.len() {
         for right in (left + 1)..hosts.len() {
+            if !linked(left, right) {
+                continue;
+            }
             let (left_transport, right_transport) = channel_transport_pair_with_nodes(
                 NodeInfo::new(hosts[left].node_id().clone(), hosts[left].host_name().to_string()),
                 NodeInfo::new(hosts[right].node_id().clone(), hosts[right].host_name().to_string()),
@@ -242,8 +258,6 @@ async fn spawn_request_mesh_with_metrics(
             router.clone(),
             None,
         )
-        .with_replication_kinds(replication_kinds)
-        .with_digest_driver(digest_driver.clone().map(|driver| Arc::new(driver) as Arc<dyn DigestScheduler>))
         .with_replication_metrics(replication_metrics)
         .spawn();
         tasks.push(runtime);
@@ -281,9 +295,10 @@ async fn spawn_request_mesh_with_metrics(
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let mut ready = true;
-            for host in &hosts {
+            for (index, host) in hosts.iter().enumerate() {
                 let topology = host.get_topology().await.map_err(|error| error.to_string())?;
-                ready &= topology.routes.iter().filter(|route| route.connected).count() == hosts.len() - 1;
+                let links = (0..hosts.len()).filter(|other| *other != index && linked(index.min(*other), index.max(*other))).count();
+                ready &= topology.routes.iter().filter(|route| route.connected).count() >= links;
             }
             if ready {
                 return Ok::<(), String>(());
@@ -294,12 +309,12 @@ async fn spawn_request_mesh_with_metrics(
     .await
     .map_err(|_| "timed out waiting for in-memory request mesh to connect".to_string())??;
 
-    Ok(InMemoryRequestMesh { digest_driver, hosts, clients, shutdown_txs, _tasks: tasks })
+    Ok(InMemoryRequestMesh { hosts, clients, shutdown_txs, _tasks: tasks, _homes: Vec::new() })
 }
 
 pub async fn spawn_in_memory_request_topology(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
 ) -> Result<InMemoryRequestTopology, String> {
     spawn_in_memory_request_topology_stateful(leader, follower).await
 }
@@ -307,59 +322,50 @@ pub async fn spawn_in_memory_request_topology(
 /// Like [`spawn_in_memory_request_topology`] but performs a Hello handshake so
 /// the client gets a server-assigned `session_id` for cursor ownership.
 pub async fn spawn_in_memory_request_topology_stateful(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None, None, None).await
-}
-
-/// Stateful pair with replication limited to the kinds authored by a scenario.
-/// Use an explicit set to hold unrelated declarations off the placement host.
-pub async fn spawn_in_memory_request_topology_with_replication_kinds(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
-    replication_kinds: &'static [&'static str],
-) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None, None, Some(replication_kinds)).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None, None).await
 }
 
 /// Stateful in-memory topology whose client declares an explicit attention
 /// character during the Hello handshake.
 pub async fn spawn_in_memory_request_topology_stateful_with_surface(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
     surface: SurfaceDeclaration,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), None, None, None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), None, None).await
 }
 
 pub async fn spawn_in_memory_request_topology_stateful_with_caller(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
     surface: SurfaceDeclaration,
     caller: CommandCaller,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), None, None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), None).await
 }
 
 pub async fn spawn_in_memory_request_topology_stateful_with_caller_and_blob_store(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
     surface: SurfaceDeclaration,
     caller: CommandCaller,
     blob_store: Arc<TieredBlobStore>,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), Some(blob_store), None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), Some(blob_store)).await
 }
 
 async fn spawn_in_memory_request_topology_stateful_with_options(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
     surface: Option<SurfaceDeclaration>,
     caller: Option<CommandCaller>,
     blob_store: Option<Arc<TieredBlobStore>>,
-    replication_kinds: Option<&'static [&'static str]>,
 ) -> Result<InMemoryRequestTopology, String> {
+    let HomedDaemon { daemon: leader, home: leader_home } = leader.into();
+    let HomedDaemon { daemon: follower, home: follower_home } = follower.into();
     let leader_host = leader.host_name().clone();
     let follower_host = follower.host_name().clone();
 
@@ -391,6 +397,8 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
         leader_remote_router.install_blob_store(blob_store)?;
     }
     let follower_remote_router = build_remote_command_router(&follower, &follower_peer_manager);
+    let leader_stream_holds = StreamHolds::default();
+    let follower_stream_holds = StreamHolds::default();
 
     let (leader_runtime_handle, _leader_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
         PeerRuntime::new(
@@ -401,7 +409,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
             leader_remote_router.clone(),
             None,
         )
-        .with_replication_kinds(replication_kinds)
+        .with_stream_holds(leader_stream_holds.clone())
         .spawn();
     let (follower_runtime_handle, _follower_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
         PeerRuntime::new(
@@ -412,7 +420,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
             follower_remote_router,
             None,
         )
-        .with_replication_kinds(replication_kinds)
+        .with_stream_holds(follower_stream_holds.clone())
         .spawn();
 
     // Spawn the server-side client session handler BEFORE the client handshake,
@@ -478,7 +486,10 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
         leader_host,
         follower_host,
         shutdown_tx,
+        leader_stream_holds,
+        follower_stream_holds,
         _tasks: vec![leader_runtime_handle, follower_runtime_handle, client_session_handle],
+        _homes: leader_home.into_iter().chain(follower_home).collect(),
     })
 }
 
@@ -536,12 +547,6 @@ impl PeerTransport for FilteredTransport {
     }
 }
 
-impl DigestScheduler for DigestDriver {
-    fn control(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Arc<DigestControl> {
-        self.control(holder, origin, kind).control.clone()
-    }
-}
-
 /// Spawn the peer networking runtime with pre-built components.
 ///
 /// Test-only entry point: callers provide a PeerManager with pre-configured
@@ -564,6 +569,5 @@ pub fn spawn_test_peer_networking(
         remote_command_router,
         None,
     )
-    .with_replication_kinds(None)
     .spawn()
 }

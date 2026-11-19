@@ -44,6 +44,10 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryImageBuild { .. }
         // A check's report is a CLI wait loop with no TUI effect.
         | CommandAction::ImageCheck { .. }
+        | CommandAction::ImageBuildRetry { .. }
+        // A held checkout's recheck or archive ruling is a CLI action; its effect is the release.
+        | CommandAction::CheckoutRecheck { .. }
+        | CommandAction::CheckoutArchive { .. }
         | CommandAction::QueryFleetList { .. }
         | CommandAction::QueryCrewStalls { .. }
         | CommandAction::QueryCrewCapabilities { .. }
@@ -52,7 +56,6 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryDaemonLogs { .. }
         | CommandAction::QueryExplainConvoy { .. }
         | CommandAction::QueryChangeStream { .. }
-        | CommandAction::QueryResourceDigest { .. }
         | CommandAction::QueryResourceList { .. }
         | CommandAction::QueryManifestRoots { .. }
         | CommandAction::QueryResourceGet { .. }
@@ -102,8 +105,6 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::ResourceManifestResolve { .. }
         | CommandAction::ConvoyEnsureRoll { .. }
         | CommandAction::ResourceReconcileNow { .. }
-        | CommandAction::MessageDeliverBatch { .. }
-        | CommandAction::MessageFailBatch { .. }
         | CommandAction::PersonAcknowledge { .. }
         | CommandAction::PersonAnswer { .. }
         | CommandAction::ResourceStatusPatch { .. }

@@ -1,4 +1,4 @@
-//! The Attentions contract, run against the old store and the engine: raise is idempotent per
+//! The Attentions contract, run against the engine: raise is idempotent per
 //! sender and subject, a changed reason replaces the open one, clear withdraws it, a person's
 //! acknowledgement settles it and answers its episode, and open for a subject sees only the open
 //! ones about it or under it.
@@ -7,16 +7,18 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 
-use flotilla_core::primitives::{view::record_name, MessagePrimitives};
+use flotilla_engine_messages::{view::record_name, MessagePrimitives};
+use flotilla_engine_messages_testkit::Served;
+use flotilla_provisioning_testkit::EngineFixture;
 use flotilla_resources::{
     attentions::{Attention, Attentions, Fact, Sender, Subject},
-    Convoy, ConvoyEnsure, Demand, DemandState, DemandStatusPatch, FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec,
-    ResourceObject, SystemClock, TerminalSession, Vessel, CONVOY_LABEL, FLEET_DESIGNATION_NAME, ROLE_LABEL,
+    Convoy, ConvoyEnsure, FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec, SystemClock, TerminalSession,
+    CONVOY_LABEL, FLEET_DESIGNATION_NAME, ROLE_LABEL,
 };
 use flotilla_schema_sqlite::stream::Service;
-use flotilla_state_machines::machines::message::MessageState;
-use flotilla_store::{OldStoreAttentions, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
+use futures::{stream::BoxStream, StreamExt};
 use hegel::{generators as gs, TestCase};
 use serde_json::json;
 
@@ -55,11 +57,6 @@ async fn records() -> ResourceBackend {
         .create(&meta("standing-gui"), &spec::<ConvoyEnsure>(json!({"project_ref": NAMESPACE, "role": "gui", "repositories": []})))
         .await
         .expect("ensure");
-    backend
-        .using::<Vessel>(NAMESPACE)
-        .create(&meta("demo-work"), &spec::<Vessel>(json!({"convoy_ref": "demo", "vessel_name": "work", "fulfilment_kind_ref": "p"})))
-        .await
-        .expect("vessel");
     let mut session = meta("session-1");
     session.labels = BTreeMap::from([(CONVOY_LABEL.to_owned(), "demo".to_owned()), (ROLE_LABEL.to_owned(), "coder".to_owned())]);
     backend
@@ -77,61 +74,44 @@ async fn records() -> ResourceBackend {
 
 /// One implementation under the contract, and how a person acknowledges an attention there.
 enum Implementation {
-    Old { attentions: OldStoreAttentions, backend: ResourceBackend },
-    Engine { primitives: Arc<MessagePrimitives>, _dir: tempfile::TempDir },
+    Engine { primitives: Served<Arc<MessagePrimitives>>, _engine: EngineFixture, _dir: tempfile::TempDir },
 }
 
 impl Implementation {
-    async fn old() -> Self {
-        let backend = records().await;
-        Implementation::Old { attentions: OldStoreAttentions::new(backend.clone()), backend }
-    }
-
     async fn engine() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let service = Arc::new(
-            Service::open(&dir.path().join("decided.sqlite"), "home-a", flotilla_engine_store::registry().expect("registry"))
-                .expect("store"),
+            Service::open(
+                &dir.path().join("decided.sqlite"),
+                "home-a",
+                flotilla_provisioning::stored::decided_registry().expect("registry"),
+            )
+            .expect("store"),
         );
-        let primitives = MessagePrimitives::open("home-a", service, records().await, Arc::new(SystemClock)).expect("primitives");
-        Implementation::Engine { primitives: Arc::new(primitives), _dir: dir }
+        // The convoy's work is launched here, where a credential refresh reads its vessel.
+        let engine = EngineFixture::over_service(&service);
+        engine.vessels.request("demo", "work", "home-a");
+        let (_, primitives) = engine_at_store("home-a", service, records().await);
+        primitives.install_lifecycle_reads(engine.reads()).expect("lifecycle reads");
+        Implementation::Engine { primitives, _engine: engine, _dir: dir }
     }
 
     fn attentions(&self) -> &dyn Attentions {
         match self {
-            Implementation::Old { attentions, .. } => attentions,
             Implementation::Engine { primitives, .. } => primitives.as_ref(),
         }
     }
 
     async fn acknowledge(&self, fact: &Fact) {
         match self {
-            Implementation::Old { backend, .. } => {
-                let prefix = match fact {
-                    Fact::Hold { .. } => "ensure-attention-",
-                    Fact::Drift { .. } => "ensure-config-drift-",
-                    Fact::ReclaimRefused { .. } => "reclaim-refusal-",
-                    Fact::CredentialRefresh { .. } => "credential-refresh-",
-                    Fact::DeliveryHeld { .. } => "terminal-delivery-",
-                };
-                let demands = backend.using::<Demand>(NAMESPACE);
-                let listed: Vec<ResourceObject<Demand>> = demands.list().await.expect("demands").items;
-                // A person acknowledges what is open.
-                let open = |demand: &&ResourceObject<Demand>| {
-                    demand.status.as_ref().is_none_or(|status| matches!(status.state, DemandState::Raised | DemandState::Escalated))
-                };
-                for demand in listed.iter().filter(|demand| demand.metadata.name.starts_with(prefix)).filter(open) {
-                    let patch = DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "person".into() };
-                    flotilla_store::apply_status_patch(&demands, &demand.metadata.name, &patch).await.expect("acknowledge");
-                }
-            }
             Implementation::Engine { primitives, .. } => {
                 let sender = format!("fleet:lab/role:{}", fact.sender().role());
                 let pending: Vec<_> = primitives
-                    .messages()
+                    .person_messages(NAMESPACE)
+                    .await
                     .expect("messages")
                     .into_iter()
-                    .filter(|(_, message)| *message.state() == MessageState::Pending && message.spec().sender.as_str() == sender)
+                    .filter(|(_, message)| message.spec().sender.as_str() == sender)
                     .collect();
                 for (_, message) in pending {
                     let about = message.spec().subject().expect("subject").address.clone();
@@ -150,6 +130,7 @@ fn subject_suffix(subject: &Subject) -> String {
         Subject::StandingRole { project, role } => format!("project:{project}/role:{role}"),
         Subject::Vessel { convoy, vessel } => format!("convoy:{convoy}/vessel:{vessel}"),
         Subject::ConvoyRole { convoy, role } => format!("convoy:{convoy}/role:{role}"),
+        Subject::Checkout { host, checkout } => format!("host:{host}/checkout:{checkout}"),
     }
 }
 
@@ -174,7 +155,9 @@ fn attention(fact: usize, reason: &str, began_at: DateTime<Utc>) -> Attention {
                 began_at,
             )
         }
-        _ => Attention::new(Fact::DeliveryHeld { session: "session-1".into(), convoy: convoy(), role: "coder".into() }, reason, began_at),
+        4 => Attention::new(Fact::DeliveryHeld { session: "session-1".into(), convoy: convoy(), role: "coder".into() }, reason, began_at),
+        // About a checkout at its host: told through the convoy, but not a record under it.
+        _ => Attention::new(Fact::CheckoutHeld { convoy: convoy(), host: "home-a".into(), checkout: "demo-work".into() }, reason, began_at),
     }
 }
 
@@ -189,8 +172,7 @@ async fn episode_start() -> DateTime<Utc> {
     Utc::now()
 }
 
-const FACTS: usize = 5;
-const DELIVERY: usize = 4;
+const FACTS: usize = 6;
 
 #[derive(Debug, Clone, Copy)]
 enum Step {
@@ -283,7 +265,7 @@ async fn check(implementation: &Implementation, model: &mut Model, after: &[Step
     }
 }
 
-fn contract(tc: TestCase, engine: bool) {
+fn contract(tc: TestCase) {
     let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(14));
     // Raises, clears and acknowledgements of every fact, and the convoy's records ending.
     let steps: Vec<Step> = (0..count)
@@ -299,15 +281,13 @@ fn contract(tc: TestCase, engine: bool) {
         .collect();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let implementation = if engine { Implementation::engine().await } else { Implementation::old().await };
+        let implementation = Implementation::engine().await;
         let mut model = Model::default();
         for (index, step) in steps.iter().enumerate() {
             match *step {
                 Step::Raise { fact, reason } => {
                     let key = key(fact);
                     let began_at = model.episode(&key).await;
-                    // On the old store the old Message controller owns a held delivery's reason.
-                    let reason = if fact == DELIVERY && !engine { 0 } else { reason };
                     let attention = attention(fact, ["held", "still held"][reason], began_at);
                     implementation.attentions().raise(NAMESPACE, &attention).await.expect("raise");
                     // An acknowledgement answers every raise of its episode.
@@ -347,21 +327,21 @@ fn contract(tc: TestCase, engine: bool) {
 }
 
 #[hegel::test(test_cases = 100)]
-fn the_old_store_keeps_the_attentions_contract(tc: TestCase) {
-    contract(tc, false);
-}
-
-#[hegel::test(test_cases = 100)]
 fn the_engine_keeps_the_attentions_contract(tc: TestCase) {
-    contract(tc, true);
+    contract(tc);
 }
 
 impl Implementation {
     /// How many records this implementation stores, open or not.
     async fn stored(&self) -> usize {
         match self {
-            Implementation::Old { backend, .. } => backend.using::<Demand>(NAMESPACE).list().await.expect("demands").items.len(),
-            Implementation::Engine { primitives, .. } => primitives.messages().expect("messages").len(),
+            Implementation::Engine { primitives, .. } => {
+                let mut stored = 0;
+                for inbox in primitives.person_inboxes(NAMESPACE).await.expect("person inboxes") {
+                    stored += primitives.inbox_messages(&inbox).expect("messages").len();
+                }
+                stored
+            }
         }
     }
 }
@@ -392,11 +372,6 @@ async fn an_acknowledgement_answers_its_episode(implementation: Implementation) 
 // Behaviour: an acknowledgement answers its episode's raises, a clear leaves it as it is, and the
 // next episode is told again.
 #[tokio::test]
-async fn the_old_store_answers_an_episode_once() {
-    an_acknowledgement_answers_its_episode(Implementation::old().await).await;
-}
-
-#[tokio::test]
 async fn the_engine_answers_an_episode_once() {
     an_acknowledgement_answers_its_episode(Implementation::engine().await).await;
 }
@@ -409,35 +384,31 @@ async fn nothing_open_is_left_within(implementation: Implementation) {
     }
     implementation.acknowledge(&attention(0, "", began_at).fact).await;
     attentions.clear_within(NAMESPACE, &Subject::convoy("demo")).await.expect("clear within");
-    let left: Vec<_> = attentions.open(NAMESPACE, None, None).await.expect("open").into_iter().map(|open| open.subject).collect();
-    assert_eq!(left, [key(2).1], "only the standing role's drift is not under the convoy");
-    if let Implementation::Old { backend, .. } = &implementation {
-        let names: Vec<_> =
-            backend.using::<Demand>(NAMESPACE).list().await.expect("demands").items.into_iter().map(|d| d.metadata.name).collect();
-        assert_eq!(names, ["ensure-config-drift-standing-gui"], "the acknowledged hold's demand is deleted too");
-    }
+    let left: std::collections::BTreeSet<_> =
+        attentions.open(NAMESPACE, None, None).await.expect("open").into_iter().map(|open| open.subject).collect();
+    assert_eq!(left, [key(2).1, key(5).1].into(), "only the standing role's drift and the checkout's hold are not under the convoy");
 }
 
 // Behaviour: clearing within a convoy ends every attention about it and its records, acknowledged
 // or open, and none about another record.
-#[tokio::test]
-async fn the_old_store_clears_every_attention_within_a_convoy() {
-    nothing_open_is_left_within(Implementation::old().await).await;
-}
-
 #[tokio::test]
 async fn the_engine_clears_every_attention_within_a_convoy() {
     nothing_open_is_left_within(Implementation::engine().await).await;
 }
 
 /// A home's engine over its own decided store.
-fn engine_at(home: &str, backend: ResourceBackend, dir: &tempfile::TempDir) -> (Arc<Service>, Arc<MessagePrimitives>) {
+fn engine_at(home: &str, backend: ResourceBackend, dir: &tempfile::TempDir) -> (Arc<Service>, Served<Arc<MessagePrimitives>>) {
     let service = Arc::new(
         Service::open(&dir.path().join(format!("{home}.sqlite")), home, flotilla_engine_store::registry().expect("registry"))
             .expect("store"),
     );
-    let primitives = MessagePrimitives::open(home, Arc::clone(&service), backend, Arc::new(SystemClock)).expect("primitives");
-    (service, Arc::new(primitives))
+    engine_at_store(home, service, backend)
+}
+
+/// A home's engine over decided store `service`, held with the backend it reads.
+fn engine_at_store(home: &str, service: Arc<Service>, backend: ResourceBackend) -> (Arc<Service>, Served<Arc<MessagePrimitives>>) {
+    let primitives = MessagePrimitives::open(home, Arc::clone(&service), backend.clone(), Arc::new(SystemClock)).expect("primitives");
+    (service, Served::new(Arc::new(primitives), backend))
 }
 
 /// One round of `from`'s stream applied at `to`, as a follower does.
@@ -461,9 +432,18 @@ fn follow(from: &Service, from_home: &str, to: &Service, cursor: &mut Option<u64
     *cursor = Some(next);
 }
 
+/// The next tick on `signal`: the change stream reads the log on its own task after a commit.
+async fn next_signal(signal: &mut BoxStream<'static, ()>, what: &str) {
+    tokio::time::timeout(Duration::from_secs(10), signal.next())
+        .await
+        .unwrap_or_else(|_| panic!("{what}"))
+        .expect("the change stream ended");
+}
+
 // Behaviour: an attention raised at one home, and its acknowledgement there, reach another home's
 // readers with the replicated entries: the signal fires when Messages are applied, with no local
-// write, and not for entries of another kind.
+// write. That another kind's entries do not tick is engine-store watch.rs's
+// a_pass_over_another_kinds_entries_does_not_tick, which drives the pass by hand.
 #[tokio::test]
 async fn another_homes_attentions_signal_their_readers_when_they_arrive() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -474,26 +454,18 @@ async fn another_homes_attentions_signal_their_readers_when_they_arrive() {
     let mut signal = b.changes().expect("the engine signals its readers");
     a.register_person(flotilla_schema::Timestamp::from_datetime(&Utc::now())).await.expect("a person at home a");
     follow(&a_store, "home-a", &b_store, &mut cursor);
-    assert!(signal.try_recv().is_err(), "another kind's entries are no attention: its readers are not signalled");
     let hold = attention(0, "held", episode_start().await);
     let (sender, subject) = (hold.fact.sender(), hold.fact.subject());
     a.raise(NAMESPACE, &hold).await.expect("raise at home a");
-    assert!(signal.try_recv().is_err(), "nothing has reached home b yet");
     follow(&a_store, "home-a", &b_store, &mut cursor);
-    signal.try_recv().expect("applying home a's entries signals home b's readers");
+    next_signal(&mut signal, "applying home a's entries signals home b's readers").await;
     let seen = b.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open at home b");
     assert_eq!(seen.len(), 1, "home b reads home a's hold");
 
-    let message = a
-        .messages()
-        .expect("messages")
-        .into_iter()
-        .map(|(_, message)| message)
-        .find(|message| *message.state() == MessageState::Pending)
-        .expect("the hold");
+    let (_, message) = a.person_messages(NAMESPACE).await.expect("messages").into_iter().next().expect("the hold");
     a.acknowledge(NAMESPACE, &record_name(message.name()).expect("record")).await.expect("acknowledge at home a");
     follow(&a_store, "home-a", &b_store, &mut cursor);
-    signal.try_recv().expect("the acknowledgement's entries signal home b's readers");
+    next_signal(&mut signal, "the acknowledgement's entries signal home b's readers").await;
     assert!(b.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open at home b").is_empty());
     assert!(b.acknowledged(NAMESPACE, sender, &subject, hold.began_at).await.expect("acknowledged at home b").is_some());
 }

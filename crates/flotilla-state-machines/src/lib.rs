@@ -41,8 +41,8 @@
 //! Every machine's stored kind is its [`Resource`] (#3392 ruling D5): the
 //! storage derive targets the machine's spec, which names the kind, its code,
 //! indexes and state, and its state; the store keeps its name and version and
-//! logs its edges. Message, AgentSession, Person, Convoy,
-//! Vessel and Ensure declare their specs here, listed under their permanent
+//! logs its edges. Message, AgentSession, Person, Convoy and
+//! Vessel declare their specs here, listed under their permanent
 //! codes by the production registry ([`kinds`]), and any other lifecycle
 //! kind's request is its spec wherever it is declared. A reference to a
 //! definitions-class kind or to anything outside the store is an address
@@ -70,8 +70,8 @@ pub use code::{changed, Coded, Datum, Edge, EdgeArg, StateValue};
 pub use home::{Created, Home, Resource, WriteError};
 pub use log::{edge_event, EntryError, Log, LogError, LoggedEdgeOf, MemoryLog};
 pub use machine::{
-    Check, DeclaredEdge, DefError, Diagram, EdgeDef, EdgeKind, EndDef, Ended, Fault, Label, Machine, MachineDef, NoRecords, RecordWrite,
-    StepError, WrongState,
+    launch_name, Check, DeclaredEdge, DefError, Diagram, EdgeDef, EdgeKind, EndDef, Ended, Fault, Label, Machine, MachineDef, NoRecords,
+    RecordWrite, StepError, WrongState,
 };
 pub use read::{Admission, Handle, InputRead, Judged, Kind, Ref, Source, Table, Version};
 pub use record::{EdgeEventOf, EdgePayload, Transport};

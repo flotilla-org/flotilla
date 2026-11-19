@@ -1,7 +1,0 @@
----
-source: crates/flotilla-crew/src/crew_ops/tests.rs
-expression: "frame_crew_message(&sender, \"Example message.\")"
----
-[flotilla · turn: conflicting · submit your deliverables; your part ends when your promises are kept]
-
-Example message.

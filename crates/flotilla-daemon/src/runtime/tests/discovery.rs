@@ -1,5 +1,7 @@
 use super::*;
 use crate::runtime::discovery::crew_pool_available;
+use crate::testkits::engine::engine;
+use crate::testkits::engine::session_request;
 
 #[cfg(unix)]
 #[tokio::test]
@@ -106,7 +108,7 @@ async fn bad_ssh_host_does_not_block_daemon_startup_or_other_hosts() {
     assert!(good.status.expect("other SSH observation").ready);
     assert!(daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE).get("host-direct-good-ssh-host").await.is_ok());
 
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -176,7 +178,15 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };
-    register_ssh_host_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile).await.expect("register SSH resources");
+    register_ssh_host_resources(
+        &daemon.resource_backend(),
+        engine_environments(&daemon).reads.clone(),
+        NAMESPACE,
+        &local_host_id,
+        &profile,
+    )
+    .await
+    .expect("register SSH resources");
     profile
         .fulfilment_facts
         .write()
@@ -188,11 +198,11 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
         .expect("write remote credential metadata");
     apply_ssh_host_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("publish SSH observation");
     let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id).await.expect("SSH Host");
-    // #3793: the owning daemon declares the configured cap and publishes the
-    // free slots it counts for each of the host's kinds.
+    // #3793: the owning daemon declares the configured cap. Free slots are a judgement on the
+    // engine, counted afresh by admission, so the Host carries none (`host_import.rs`).
     assert_eq!(host.spec.max_vessels, Some(2));
     let status = host.status.expect("SSH status");
-    assert_eq!(status.fulfilment_facts.get("host-direct-ssh-test-host").and_then(|facts| facts.free_vessel_slots), Some(2));
+    assert!(status.fulfilment_facts.contains_key("host-direct-ssh-test-host"));
     assert!(status.ready);
     assert!(status.credential_expiry().expect("SSH credential expiry").contains_key(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE));
     let kinds = daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
@@ -238,30 +248,25 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
     );
     // The SSH host's host-direct Environment resolves to the provider in the
     // SSH environment's registry, not the owner's.
-    let environment =
-        daemon.resource_backend().using::<Environment>(NAMESPACE).get(environment_id.as_str()).await.expect("SSH host-direct Environment");
+    let environments_engine = engine_environments(&daemon);
+    let environment = EnvironmentRecords::find(environments_engine.environments.as_ref(), environment_id.as_str())
+        .expect("read")
+        .expect("SSH host-direct Environment");
     assert_eq!(
         environment.spec.provider_address.as_ref().expect("new SSH environments write an address").to_string(),
         format!("host:{host_id}/provider:host-direct")
     );
     let environments = DockerControllerRuntime { state: Arc::clone(&state) };
-    // A labelled preceding-generation record may carry a host display alias.
-    // Resolving its label must preserve the SSH place authority and instance.
-    let legacy_meta = InputMeta::builder()
-        .name("legacy-ssh-alias".into())
-        .labels(BTreeMap::from([(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), "host-direct".into())]))
-        .build();
-    daemon
-        .resource_backend()
-        .store()
-        .create_raw(
-            flotilla_store::ResourceKind::of::<Environment>(),
-            NAMESPACE,
-            &legacy_meta,
-            &json!({"host_direct":{"host_ref":"beaufort", "repo_default_dir":"/work"}}),
-        )
-        .await
-        .expect("legacy SSH record");
+    // A request naming its host by a display alias, with no provider address. Resolving the
+    // alias must preserve the SSH place authority and instance.
+    environments_engine.request(
+        "legacy-ssh-alias",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "beaufort".into(), repo_default_dir: "/work".into() }),
+            ..Default::default()
+        },
+        None,
+    );
     let selected = environments.provider_for_environment("legacy-ssh-alias").await.expect("SSH alias provider");
     let expected = environments.provider_for_environment(environment_id.as_str()).await.expect("SSH provider");
     assert!(Arc::ptr_eq(&selected, &expected), "alias and canonical place must retain the same instance");
@@ -317,14 +322,18 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
         .cwd(worktree_path.display().to_string())
         .pool("cleat".to_string())
         .build();
-    let session = sessions.create(&identity.input_meta(), &spec).await.expect("tool session");
+    // The tool's launch is held by its vessel.
+    let mut request = session_request(&identity.name(), &spec);
+    request.vessel = Some(identity.vessel_ref.clone());
+    let launch = engine(&daemon).terminals.request(&request);
+    let session = sessions.get(&identity.name()).await.expect("tool session");
     for label in [None, Some("")] {
         let mut unowned = session.clone();
         unowned.metadata.labels.remove(flotilla_resources::VESSEL_REF_LABEL);
         if let Some(label) = label {
             unowned.metadata.labels.insert(flotilla_resources::VESSEL_REF_LABEL.to_string(), label.to_string());
         }
-        let error = terminal.ensure_session("unowned", (&unowned).into(), &[]).await.expect_err("missing vessel");
+        let error = terminal.ensure_session("unowned", &first_launch("unowned"), (&unowned).into(), &[]).await.expect_err("missing vessel");
         assert!(error.contains("requires a session vessel identity"), "{error}");
     }
     // An empty agent context must be refused even if metadata names a vessel.
@@ -342,11 +351,13 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
             convoy: "ssh-crew".into(),
             vessel_ref: String::new(),
         }),
-        message: None,
     };
-    let error = terminal.ensure_session("unowned-agent", (&unowned_agent).into(), &[]).await.expect_err("empty agent vessel");
+    let error = terminal
+        .ensure_session("unowned-agent", &first_launch("unowned-agent"), (&unowned_agent).into(), &[])
+        .await
+        .expect_err("empty agent vessel");
     assert!(error.contains("requires a session vessel identity"), "{error}");
-    let launched = terminal.ensure_session(&identity.name(), (&session).into(), &[]).await.expect("tool in vessel");
+    let launched = terminal.ensure_session(&identity.name(), &launch, (&session).into(), &[]).await.expect("tool in vessel");
     let session_id = launched.session_id;
     assert_eq!(vessel_pool.0.ensured.lock().await.len(), 1);
     assert!(pool.ensured.lock().await.is_empty(), "host pool must not launch tool crews");

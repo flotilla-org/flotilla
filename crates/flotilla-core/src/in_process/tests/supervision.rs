@@ -1,130 +1,103 @@
-use flotilla_store_memory::InMemoryBackend;
-use std::collections::BTreeMap;
+use flotilla_store_memory::engine_home_backend;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, NodeId};
-use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, Selector,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL,
-};
+use flotilla_resources::{Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, TerminalSession as ResourceTerminalSession};
 use flotilla_store::ResourceBackend;
 use futures::{FutureExt, StreamExt};
 
-use super::support::test_meta;
+use super::support::{crew_messages, designate_fleet, install_engine_messages, test_engine};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource};
 
 // #2559: an idle reconciliation pass must neither write resources nor emit
 // events, because its runtime caller is triggered by those same watches.
 #[tokio::test]
 async fn supervisor_turn_reconciliation_noop_contract() {
-    // The whole finite domain: pending and terminal Message states, each on both real
-    // storage backends with new-only terminal shapes. Every pass is asserted idle, so
-    // the longest run of repeated passes covers the shorter ones as its prefixes.
+    // The whole finite domain: pending and terminal Message states. Every pass is asserted
+    // idle, so the longest run of repeated passes covers the shorter ones as its prefixes.
     let passes = 4;
     for terminal_message in [false, true] {
-        for sqlite in [false, true] {
-            let temp = tempfile::tempdir().expect("contract directory");
-            std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"noop-contract\"\n").expect("daemon identity");
-            let backend = if sqlite {
-                ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(temp.path().join("resources.db")).expect("sqlite backend"))
-            } else {
-                ResourceBackend::new(InMemoryBackend::default())
-            };
-            let daemon = InProcessDaemon::new_with_resource_backend(
-                Vec::new(),
-                Arc::new(ConfigStore::with_base(temp.path())),
-                fake_discovery(false),
-                HostName::new("noop-contract"),
-                backend.clone(),
-                std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-            )
-            .await;
-            // Keep contract resources outside the daemon's background provisioning namespace.
-            let namespace = "noop-contract";
-            let sessions = backend.clone().using::<ResourceTerminalSession>(namespace);
-            let convoys = backend.clone().using::<ResourceConvoy>(namespace);
-            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "empty store", passes).await;
+        let temp = tempfile::tempdir().expect("contract directory");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"noop-contract\"\n").expect("daemon identity");
+        let backend = engine_home_backend();
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            fake_discovery(false),
+            HostName::new("noop-contract"),
+            backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        let engine = test_engine(&daemon);
+        // Keep contract resources outside the daemon's background provisioning namespace.
+        // The fleet's Projects, which the Message path's roles come from, are served in `flotilla`.
+        let namespace = "flotilla";
+        assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "empty store", passes).await;
 
-            let spec = ResourceTerminalSessionSpec {
-                env_ref: "env".to_string(),
-                role: "governor".to_string(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("governor"),
-                    brief: flotilla_resources::TerminalBrief {
-                        path: "brief.md".to_string(),
-                        content: "standing brief".to_string(),
-                        artifact_digest: None,
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: namespace.to_string(),
-                        convoy: "convoy".to_string(),
-                        vessel_ref: "govern".to_string(),
-                    }),
-                    message: None,
+        let governor = |session: &str, vessel: Option<String>| TerminalLaunchRequest {
+            session: session.to_string(),
+            environment: "env".to_string(),
+            vessel,
+            role: "governor".to_string(),
+            pool: "cleat".to_string(),
+            cwd: "/workspace".to_string(),
+            env: Default::default(),
+            source: TerminalLaunchSource::Agent {
+                capability: "governor".to_string(),
+                adapter: None,
+                model: None,
+                brief: flotilla_resources::TerminalBrief {
+                    path: "brief.md".to_string(),
+                    content: "standing brief".to_string(),
+                    artifact_digest: None,
+                    copies: Vec::new(),
                 },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            };
-            sessions.create(&test_meta("unrelated"), &spec).await.expect("unrelated terminal");
-            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "unrelated terminal", passes).await;
+            },
+        };
+        engine.terminals.request(&governor("unrelated", None));
+        assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "unrelated terminal", passes).await;
 
-            let convoy = convoys
-                .create(&test_meta("convoy"), &ConvoySpec::builder().workflow_ref("governor".to_string()).build())
-                .await
-                .expect("convoy");
-            convoys
-                .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus::default())
-                .await
-                .expect("pending turn");
-            let session = sessions
-                .create(
-                    &InputMeta::builder()
-                        .name("governor".to_string())
-                        .labels(BTreeMap::from([
-                            (CONVOY_LABEL.to_string(), "convoy".to_string()),
-                            (VESSEL_LABEL.to_string(), "govern".to_string()),
-                            (ROLE_LABEL.to_string(), "governor".to_string()),
-                        ]))
-                        .build(),
-                    &spec,
-                )
-                .await
-                .expect("queued terminal");
-            sessions
-                .update_status(
-                    &session.metadata.name,
-                    &session.metadata.resource_version,
-                    &ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() },
-                )
-                .await
-                .expect("running terminal");
-            let intent = flotilla_resources::MessageSpec::builder()
-                .sender("system:test".into())
-                .receiver("noop-contract/convoy/govern/governor".into())
-                .relation(flotilla_resources::MessageRelation::System)
-                .body("supervise".into())
-                .build();
-            let inbox = daemon.message_inbox(namespace).await;
-            inbox.accept(&test_meta("input"), &intent, Utc::now()).await.expect("new Message");
-            if terminal_message {
-                let messages = backend.using::<flotilla_resources::Message>(namespace);
-                let record = messages.get("input").await.unwrap();
-                let mut status = record.status.unwrap();
-                status.phase = flotilla_resources::MessagePhase::Expired;
-                status.since = Utc::now();
-                messages.update_status("input", &record.metadata.resource_version, &status).await.unwrap();
-            }
-            let state = if terminal_message { "new-only expired Message" } else { "new-only Message" };
-            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, state, passes).await;
+        let convoy = super::support::admit(
+            &daemon,
+            "convoy",
+            ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("governor".to_string()).build(),
+            ConvoyStatus {
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![flotilla_resources::VesselRequirement::builder()
+                        .name("govern".to_string())
+                        .crew(vec![flotilla_engine_convoys_testkit::agent("governor")])
+                        .build()],
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+        let vessel = engine.vessels.request(&convoy, "govern", "noop-contract");
+        let session = engine.terminals.request(&governor("governor", Some(vessel)));
+        engine.terminals.ready(&session, "governor-sid", &Default::default());
+        let receiver = flotilla_resources::crew_role_address(namespace, &convoy, "govern", "governor");
+        let intent =
+            flotilla_engine_messages_testkit::intent("system:nudge", &receiver, flotilla_resources::MessageRelation::System, "supervise");
+        flotilla_engine_messages_testkit::designate_fleet(&backend, namespace).await;
+        let primitives = install_engine_messages(&daemon);
+        primitives.admit("input", &intent).await.expect("new Message");
+        if terminal_message {
+            // Delivered, it awaits nothing more: it has ended.
+            flotilla_engine_messages_testkit::deliver_turn(&primitives, namespace, &receiver, "input", "session", Utc::now()).await;
         }
+        let state = if terminal_message { "ended Message" } else { "Message" };
+        assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, state, passes).await;
     }
 }
 
@@ -135,8 +108,6 @@ async fn assert_supervisor_turn_passes_are_idle(
     state: &str,
     passes: usize,
 ) {
-    let backend_name = if backend.durable_local() { "sqlite" } else { "in-memory" };
-    let state = format!("{backend_name}: {state}");
     let sessions = backend.clone().using::<ResourceTerminalSession>(namespace);
     let convoys = backend.clone().using::<ResourceConvoy>(namespace);
     // This namespace has no concurrent writers, so list-to-subscribe cannot miss a write.
@@ -166,8 +137,8 @@ async fn assert_supervisor_turn_passes_are_idle(
 
 #[tokio::test]
 async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
-    let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("home"));
-    let placement = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("placement"));
+    let home = engine_home_backend().with_local_root(NodeId::new("home"));
+    let placement = engine_home_backend().with_local_root(NodeId::new("placement"));
     let temp = tempfile::tempdir().expect("config dir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"home\"\n").expect("machine identity");
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -191,91 +162,75 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     )
     .await;
     let convoys = home.clone().using::<ResourceConvoy>("flotilla");
-    let governor = convoys
-        .create(
-            &test_meta("governor-convoy"),
-            &ConvoySpec::builder().workflow_ref("governor".to_string()).role("governor".to_string()).build(),
-        )
-        .await
-        .expect("governor convoy");
     let existing_attention = flotilla_resources::ConvoyAttention {
         source: "existing-attention".to_string(),
         reason: "Existing concern".to_string(),
         raised_at: Utc::now(),
     };
-    convoys
-        .update_status(
-            &governor.metadata.name,
-            &governor.metadata.resource_version,
-            &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Active,
-                work: BTreeMap::from([(
-                    "govern".to_string(),
-                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-                )]),
-                crew_work: BTreeMap::from([(
-                    "govern".to_string(),
-                    BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                attention: Some(existing_attention.clone()),
-                ..Default::default()
+    test_engine(&daemon);
+    let placement_engine = test_engine(&placement_daemon);
+    designate_fleet(&daemon.resource_backend()).await;
+    designate_fleet(&placement).await;
+    // The governor convoy is admitted at home, its work `govern` crewed by the governor, and
+    // replicated to the placement host.
+    let governor = super::support::admit(
+        &daemon,
+        "governor-convoy",
+        ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("governor".to_string()).role("governor".to_string()).build(),
+        ConvoyStatus {
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: None,
+                turn_delivery: Default::default(),
+                vessels: vec![flotilla_resources::VesselRequirement::builder()
+                    .name("govern".to_string())
+                    .crew(vec![flotilla_engine_convoys_testkit::agent("governor")])
+                    .build()],
+            }),
+            attention: Some(existing_attention.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    flotilla_provisioning_testkit::replicate_home(
+        &daemon.decided_store().expect("home store"),
+        daemon.node_id().as_str(),
+        &placement_daemon.decided_store().expect("placement store"),
+    );
+    // The governor's session runs on the placement host, held for its work's launch there.
+    let vessel = placement_engine.vessels.request(&governor, "govern", "placement");
+    let governor_session = placement_engine.terminals.request(&TerminalLaunchRequest {
+        session: "governor-terminal".to_string(),
+        environment: "remote-env".to_string(),
+        vessel: Some(vessel),
+        role: "governor".to_string(),
+        pool: "cleat".to_string(),
+        cwd: "/workspace".to_string(),
+        env: Default::default(),
+        source: TerminalLaunchSource::Agent {
+            capability: "governor".to_string(),
+            adapter: None,
+            model: None,
+            brief: flotilla_resources::TerminalBrief {
+                path: "brief.md".to_string(),
+                content: "standing brief".to_string(),
+                artifact_digest: None,
+                copies: Vec::new(),
             },
-        )
-        .await
-        .expect("running governor");
-    let sessions = placement.clone().using::<ResourceTerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("governor-terminal".to_string())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), "governor-convoy".to_string()),
-                    (VESSEL_LABEL.to_string(), "govern".to_string()),
-                    (ROLE_LABEL.to_string(), "governor".to_string()),
-                ]))
-                .build(),
-            &ResourceTerminalSessionSpec {
-                env_ref: "remote-env".to_string(),
-                role: "governor".to_string(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("governor"),
-                    brief: flotilla_resources::TerminalBrief {
-                        path: "brief.md".to_string(),
-                        content: "standing brief".to_string(),
-                        artifact_digest: None,
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".to_string(),
-                        convoy: "governor-convoy".to_string(),
-                        vessel_ref: "governor-convoy-govern".to_string(),
-                    }),
-                    message: None,
-                },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("governor terminal on placement host");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() },
-        )
-        .await
-        .expect("running terminal");
+        },
+    });
+    placement_engine.terminals.ready(&governor_session, "governor-sid", &Default::default());
     let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
-        .convoy("governor-convoy".to_string())
+        .convoy(governor.clone())
         .source("supervision-stalled-crew".to_string())
         .vessel("govern".to_string())
         .role("governor".to_string())
         .brief("Escalated from coder@work in graphql-budget@flotilla:\n\nSupervise the stalled crew".to_string())
         .subject_revision("stall-1".to_string())
-        .sender("system:stall-judge".into())
+        .sender(flotilla_crew::leaf_engine::Party::fleet("stall-judge"))
         .relation(flotilla_resources::MessageRelation::Supervisor)
         .build();
     // Boundary fake for publication to the owning host; receiver admission
@@ -293,15 +248,17 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
             ))
         }
     }
-    let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> = Arc::new(PlacementPublisher(placement_daemon));
+    let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
+        Arc::new(PlacementPublisher(Arc::clone(&placement_daemon)));
     daemon.set_resource_intent_publisher(Arc::downgrade(&publisher));
     daemon.deliver_standing_turn(&request).await.expect("remote governor intent accepted");
-    let messages = placement.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver messages").items;
+    let messages = crew_messages(&placement_daemon, "flotilla").await;
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].spec.receiver, "flotilla/governor-convoy/govern/governor");
+    assert_eq!(messages[0].spec.receiver, format!("flotilla/{governor}/govern/governor"));
     assert_eq!(messages[0].spec.relation, flotilla_resources::MessageRelation::Supervisor);
     assert_eq!(messages[0].spec.body, "Escalated from coder@work in graphql-budget@flotilla:\n\nSupervise the stalled crew");
-    assert_eq!(messages[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Accepted);
+    // Admitted and not yet received: the engine's pending Message.
+    assert_eq!(messages[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Deliverable);
     assert!(home.using::<flotilla_resources::Message>("flotilla").list().await.expect("sender messages").items.is_empty());
-    assert_eq!(convoys.get("governor-convoy").await.expect("governor").status.expect("status").attention, Some(existing_attention));
+    assert_eq!(convoys.get(&governor).await.expect("governor").status.expect("status").attention, Some(existing_attention));
 }

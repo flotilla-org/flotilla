@@ -5,19 +5,19 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_core::primitives::{
-    convert::{Conversion, NoRecords, ReferenceAddresses},
+    convert::{AtLaunches, Conversion, NoRecords, ReferenceAddresses},
     import::{
         admission_order, check, import_all, import_message, ImportDrop, ImportRefusal, Imported, ImportedMessage, OldMessage, ReadRecords,
     },
-    roles::FleetRoles,
-    view::ViewLookups,
-    OldStoreRecords,
 };
+use flotilla_engine_messages::{roles::FleetRoles, view::ViewLookups, OldStoreRecords};
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
+    convoy::engine::{ImportedLaunch, ImportedLaunches},
     Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation,
     MessageSpec, MessageStatus, ObjectMeta, RepositorySpec, ResolvedMessageReceiver, ResourceObject,
 };
+use flotilla_schema::Timestamp;
 use flotilla_state_machines::machines::{
     consumer::{ConsumerKind, Receiver},
     message::{DropReason, MessageState},
@@ -26,7 +26,8 @@ use hegel::{generators as gs, generators::Generator, TestCase};
 
 const HOME: &str = "alpha";
 const RECEIVER: &str = "flotilla/demo/work/coder";
-const INBOX: &str = "project:flotilla/convoy:demo/role:coder";
+/// The receiver's seat in the launch convoy `demo` imports as.
+const INBOX: &str = "project:flotilla/convoy:demo%231/role:coder";
 
 fn at(seconds: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(seconds, 0).single().expect("timestamp")
@@ -68,6 +69,11 @@ fn delivered() -> ResolvedMessageReceiver {
     }
 }
 
+/// When [`delivered`] says the message was delivered.
+fn delivered_at() -> Timestamp {
+    Timestamp::from_datetime(&at(20))
+}
+
 fn status(phase: MessagePhase, sequence: Option<u64>, receiver: Option<ResolvedMessageReceiver>) -> MessageStatus {
     MessageStatus {
         phase,
@@ -107,9 +113,39 @@ fn outcome(records: &[ResourceObject<Message>], name: &str) -> Result<Imported, 
     outcome_holding(records, name, &NoRecords)
 }
 
+/// `records`, with each convoy an address names imported as its own name's first launch: the
+/// launch an imported convoy's records name it by (#3108).
+struct FirstLaunches<'a>(&'a dyn ReferenceAddresses);
+
+impl ReferenceAddresses for FirstLaunches<'_> {
+    fn address(&self, reference: &MessageReference) -> Result<flotilla_schema::Address, String> {
+        self.0.address(reference)
+    }
+    fn missing(&self, reference: &MessageReference) -> Option<&'static str> {
+        self.0.missing(reference)
+    }
+    fn convoy_project(&self, convoy: &str) -> Option<String> {
+        self.0.convoy_project(convoy)
+    }
+    fn convoy_ended(&self, convoy: &str) -> bool {
+        self.0.convoy_ended(convoy)
+    }
+    fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
+        self.0.principal_roles(project, principal)
+    }
+    fn launched(&self, address: flotilla_schema::Address) -> Result<flotilla_schema::Address, String> {
+        let Some(convoy) = address.get(flotilla_resources::address::AddressKind::Convoy) else { return Ok(address) };
+        let project = address.get(flotilla_resources::address::AddressKind::Project).unwrap_or("flotilla");
+        let first = ImportedLaunch { home: HOME.into(), project: project.into(), of: convoy.into(), n: 1 };
+        AtLaunches { records: self.0, launches: &ImportedLaunches::default().with("flotilla", convoy, first), namespace: "flotilla" }
+            .launched(address)
+    }
+}
+
 fn outcome_holding(records: &[ResourceObject<Message>], name: &str, held: &dyn ReferenceAddresses) -> Result<Imported, ImportRefusal> {
     let roles = FleetRoles::declared("fleet").expect("roles");
-    let conversion = Conversion { roles: &roles, forges: &[], records: held };
+    let launched = FirstLaunches(held);
+    let conversion = Conversion { roles: &roles, forges: &[], records: &launched };
     let world = world(records);
     let old = records.iter().find(|record| record.metadata.name == name).expect("named record");
     import_message(&OldMessage { record: old, home: HOME.into() }, 1, &conversion, &world)
@@ -159,7 +195,24 @@ fn delivered_imports_as_awaiting_its_session() {
         spec(RECEIVER, "system:nudge", MessageExpectation::Reply),
         status(MessagePhase::Delivered, Some(1), Some(delivered())),
     )];
-    assert_eq!(*imported(&records, "message-a").resource.state(), MessageState::Awaiting { receiver: session_receiver() });
+    assert_eq!(
+        *imported(&records, "message-a").resource.state(),
+        MessageState::Awaiting { receiver: session_receiver(), delivered_at: delivered_at() }
+    );
+}
+
+// Behaviour: a message delivered and then settled keeps when it was delivered, from its
+// receiver's receipt, apart from when it settled.
+#[test]
+fn delivered_then_settled_keeps_when_it_was_delivered() {
+    let records = [record(
+        "message-a",
+        spec(RECEIVER, "system:nudge", MessageExpectation::Reply),
+        status(MessagePhase::Answered, Some(1), Some(delivered())),
+    )];
+    let message = imported(&records, "message-a").resource;
+    assert_eq!(*message.state(), MessageState::Settled { receiver: Some(session_receiver()), delivered_at: Some(delivered_at()) });
+    assert_eq!(message.since(), Timestamp::from_datetime(&at(30)), "settled when its status says, after the delivery");
 }
 
 // Behaviour: Satisfied, Answered and OutcomeMet become Settled, keeping their receiver.
@@ -173,7 +226,7 @@ fn settled_phases_import_as_settled() {
         let records = [record("message-a", spec(RECEIVER, "system:turn-rules", expectation), status(phase, Some(1), Some(delivered())))];
         assert_eq!(
             *imported(&records, "message-a").resource.state(),
-            MessageState::Settled { receiver: Some(session_receiver()) },
+            MessageState::Settled { receiver: Some(session_receiver()), delivered_at: Some(delivered_at()) },
             "{phase:?}"
         );
     }
@@ -187,7 +240,7 @@ fn expired_imports_as_dropped_expired() {
     let records = [record("message-a", expiring, status(MessagePhase::Expired, Some(1), None))];
     assert_eq!(
         *imported(&records, "message-a").resource.state(),
-        MessageState::Dropped { reason: DropReason::Expired, receiver: None, watermark: None }
+        MessageState::Dropped { reason: DropReason::Expired, receiver: None, delivered_at: None, watermark: None }
     );
 }
 
@@ -207,7 +260,7 @@ fn superseded_imports_as_dropped_by_its_successor() {
     let by = format!("{INBOX}/message:message-new").parse().expect("successor address");
     assert_eq!(
         *imported(&records, "message-old").resource.state(),
-        MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: None, watermark: None }
+        MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: None, delivered_at: None, watermark: None }
     );
     let successor = imported(&records, "message-new");
     assert_eq!(
@@ -226,7 +279,7 @@ fn dead_lettered_imports_as_dropped_undeliverable() {
     )];
     assert_eq!(
         *imported(&records, "message-a").resource.state(),
-        MessageState::Dropped { reason: DropReason::Undeliverable, receiver: None, watermark: None }
+        MessageState::Dropped { reason: DropReason::Undeliverable, receiver: None, delivered_at: None, watermark: None }
     );
 }
 
@@ -267,7 +320,10 @@ fn delivered_expecting_nothing_imports_as_settled() {
         spec(RECEIVER, "system:turn-rules", MessageExpectation::None),
         status(MessagePhase::Delivered, Some(1), Some(delivered())),
     )];
-    assert_eq!(*imported(&records, "message-a").resource.state(), MessageState::Settled { receiver: Some(session_receiver()) });
+    assert_eq!(
+        *imported(&records, "message-a").resource.state(),
+        MessageState::Settled { receiver: Some(session_receiver()), delivered_at: Some(delivered_at()) }
+    );
 }
 
 fn settled(record: &ResourceObject<Message>) -> bool {
@@ -352,7 +408,7 @@ fn a_missing_record_drops_when_settled_or_its_convoy_ended_and_is_refused_while_
             let (reason, detail) = if other == "replied-to message" {
                 ("a message it names is gone", "message-gone")
             } else {
-                ("it references a kind with no address", "TerminalSession")
+                ("a referenced session is gone", "session `terminal-1`")
             };
             (phase, receiver, reason, detail)
         }
@@ -399,6 +455,32 @@ fn the_receivers_convoy_is_the_delivered_holders_else_the_addressed_roles() {
     assert_eq!(refusal.record, "standing-unknown-holder");
 }
 
+// Behaviour (#3108): a record whose receiver is a role of a convoy that imports as no launch is
+// never stored under the old convoy's name, nor dropped: refused by name, settled or not, and
+// whether its convoy ended or is live, with why its convoy has no launch.
+#[test]
+fn a_record_whose_convoy_imports_as_no_launch_is_refused() {
+    let roles = FleetRoles::declared("fleet").expect("roles");
+    let records = [
+        record("settled", spec(RECEIVER, "system:turn-rules", MessageExpectation::None), status(MessagePhase::Satisfied, Some(1), None)),
+        record("open", spec(RECEIVER, "system:turn-rules", MessageExpectation::None), status(MessagePhase::Deliverable, Some(2), None)),
+    ];
+    let world = world(&records);
+    let none = ImportedLaunches::default();
+    let outcome = |name: &str, phase: Option<ConvoyPhase>| {
+        let held = holding(vec![convoy("demo", phase)]);
+        let launched = AtLaunches { records: &held, launches: &none, namespace: "flotilla" };
+        let conversion = Conversion { roles: &roles, forges: &[], records: &launched };
+        let old = records.iter().find(|record| record.metadata.name == name).expect("named record");
+        import_message(&OldMessage { record: old, home: HOME.into() }, 1, &conversion, &world)
+    };
+    for (name, phase) in [("settled", ConvoyPhase::Active), ("open", ConvoyPhase::Landed), ("open", ConvoyPhase::Active)] {
+        let refusal = outcome(name, Some(phase)).expect_err("refused");
+        assert_eq!(refusal.record, name);
+        assert!(refusal.reason.contains("names a convoy not in this host's replica"), "{refusal}");
+    }
+}
+
 // Behaviour: a supersession whose successor is unrecorded or gone is dropped.
 #[test]
 fn superseded_records_without_their_successor_are_dropped() {
@@ -438,7 +520,7 @@ fn record_references_map_drop_or_refuse() {
         status: None,
     };
     let records = OldStoreRecords::from_records("flotilla", Vec::new(), Vec::new(), Vec::new(), Vec::new(), vec![local], Vec::new());
-    let conversion = Conversion { roles: &roles, forges: &[], records: &records };
+    let conversion = Conversion { roles: &roles, forges: &[], records: &FirstLaunches(&records) };
     let referring = |name: &str, reference: MessageReference, phase: MessagePhase, receiver: Option<ResolvedMessageReceiver>| {
         let mut spec = spec(RECEIVER, "system:turn-rules", MessageExpectation::None);
         spec.references = vec![reference];
@@ -505,7 +587,7 @@ fn records_naming_a_dropped_message_drop_when_settled_and_refuse_when_open() {
         record("message-open", reply, status(MessagePhase::Accepted, Some(3), None)),
     ];
     let roles = FleetRoles::declared("fleet").expect("roles");
-    let conversion = Conversion { roles: &roles, forges: &[], records: &NoRecords };
+    let conversion = Conversion { roles: &roles, forges: &[], records: &FirstLaunches(&NoRecords) };
     let world = world(&records);
     let results = import_all(records.iter().map(|record| OldMessage { record, home: HOME.into() }), &conversion, &world);
     let named = |name: &str| {
@@ -560,7 +642,7 @@ fn generated_records_import_or_are_refused_by_name(tc: TestCase) {
     let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
     let records: Vec<_> = (0..count).map(|index| generated(&tc, index)).collect();
     let roles = FleetRoles::declared("fleet").expect("roles");
-    let conversion = Conversion { roles: &roles, forges: &[], records: &NoRecords };
+    let conversion = Conversion { roles: &roles, forges: &[], records: &FirstLaunches(&NoRecords) };
     let world = world(&records);
     let olds = || records.iter().map(|record| OldMessage { record, home: HOME.into() });
     let results = import_all(olds(), &conversion, &world);
@@ -622,7 +704,7 @@ fn stored_record_corpus_imports_with_no_refusals() {
         }
     }
     let roles = FleetRoles::declared("fleet").expect("roles");
-    let conversion = Conversion { roles: &roles, forges: &[], records: &NoRecords };
+    let conversion = Conversion { roles: &roles, forges: &[], records: &FirstLaunches(&NoRecords) };
     let world = ReadRecords {
         messages: records.iter().map(|record| (record.metadata.name.clone(), (record, HOME.to_owned()))).collect(),
         sessions: BTreeMap::new(),
@@ -637,11 +719,12 @@ fn stored_record_corpus_imports_with_no_refusals() {
 // fleet-role senders and inboxes under fleet:, independently of the charter Project.
 #[tokio::test]
 async fn named_designation_imports_fleet_role_messages() {
-    use flotilla_core::primitives::{import::rehearse, roles::designated_fleet_roles};
+    use flotilla_core::primitives::import::rehearse;
+    use flotilla_engine_messages::roles::designated_fleet_roles;
+    use flotilla_provisioning_testkit::EngineBackend;
     use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec};
-    use flotilla_store::ResourceBackend;
-    use flotilla_store_memory::InMemoryBackend;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let home = EngineBackend::open(HOME);
+    let backend = home.backend.clone();
     backend
         .definitions::<Project>("flotilla")
         .apply(
@@ -663,7 +746,7 @@ async fn named_designation_imports_fleet_role_messages() {
         record("to-fleet", spec("system:nudge", RECEIVER, MessageExpectation::None), status(MessagePhase::Accepted, Some(2), None)),
     ];
     let roles = designated_fleet_roles(&backend, "flotilla").await.expect("fleet roles");
-    let conversion = Conversion { roles: &roles, forges: &[], records: &NoRecords };
+    let conversion = Conversion { roles: &roles, forges: &[], records: &FirstLaunches(&NoRecords) };
     let world = world(&records);
     let imported = import_all(records.iter().map(|record| OldMessage { record, home: HOME.into() }), &conversion, &world)
         .into_iter()
@@ -679,4 +762,125 @@ async fn named_designation_imports_fleet_role_messages() {
     assert_eq!(to_fleet.resource.spec().inbox.as_str(), "fleet:lab/role:nudge");
     assert_eq!(to_fleet.resource.name(), "fleet:lab/role:nudge/message:to-fleet");
     assert!(rehearse(&imported).is_empty(), "all imported records restore into the engine store");
+}
+
+// A charter notice delivered before the cut-over, named from its receiver's old spelling, imports
+// under the name a charter pass gives it, so the pass at the same revision finds it and sends no
+// second notice.
+#[tokio::test]
+async fn an_imported_charter_notice_is_the_one_a_charter_pass_finds() {
+    use std::sync::Arc;
+
+    use flotilla_core::primitives::import::write_messages;
+    use flotilla_engine_messages::{roles::designated_fleet_roles, EngineCharterNotices};
+    use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+    use flotilla_engine_store::Import;
+    use flotilla_messaging::{
+        charter_notice_name, reconcile_charter_notifications_with_receivers, CharterProseRenderer, MessageReceiverSnapshot,
+        FLEET_STORE_SENDER,
+    };
+    use flotilla_resources::{
+        definition_provenance::CHARTER_REVISION_ANNOTATION, InputMeta, Project, ProjectSpec, RoleDefinition, Selector, TerminalBrief,
+        TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    };
+    use flotilla_schema_sqlite::stream::Service;
+    use flotilla_store::ResourceBackend;
+    use flotilla_store_memory::InMemoryBackend;
+    use sha2::{Digest, Sha256};
+
+    const NS: &str = "flotilla";
+    const GUIDE: &str = "root/root-one/work/guide";
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    designate_fleet(&backend, NS).await;
+    backend
+        .definitions::<Project>(NS)
+        .apply(
+            &InputMeta::builder()
+                .name("root".into())
+                .annotations(BTreeMap::from([(CHARTER_REVISION_ANNOTATION.into(), "first".into())]))
+                .build(),
+            &ProjectSpec::builder()
+                .display_name("root".into())
+                .role_definitions(BTreeMap::from([("guide".into(), RoleDefinition::default())]))
+                .build(),
+        )
+        .await
+        .expect("project");
+    backend
+        .using::<Convoy>(NS)
+        .create(
+            &InputMeta::builder().name("root-one".into()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("root".into()).build(),
+        )
+        .await
+        .expect("convoy");
+    let holder = TerminalSessionSpec::builder()
+        .env_ref("host-direct".into())
+        .role("guide".into())
+        .cwd("/workspace".into())
+        .pool("cleat".into())
+        .source(TerminalSessionSource::Agent {
+            selector: Selector::for_capability("coding"),
+            brief: TerminalBrief { path: "guide.md".into(), content: "guide".into(), artifact_digest: None, copies: Vec::new() },
+            context: Box::new(TerminalCrewContext { namespace: NS.into(), convoy: "root-one".into(), vessel_ref: "root-one-work".into() }),
+        })
+        .build();
+    backend
+        .using::<TerminalSession>(NS)
+        .create(
+            &InputMeta::builder()
+                .name("terminal-root-one".into())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.into(), "root-one".into()),
+                    (ROLE_LABEL.into(), "guide".into()),
+                    (VESSEL_LABEL.into(), "work".into()),
+                ]))
+                .build(),
+            &holder,
+        )
+        .await
+        .expect("holder");
+
+    // The notice as the old pass wrote it, delivered to the guide.
+    let subject =
+        MessageReference::ControlRecord { resource: ResourceRef::new("flotilla.work/v1", "Project", NS, "root"), revision: "first".into() };
+    let old_name = format!("charter-{:x}", Sha256::digest(format!("{GUIDE}\0first").as_bytes()));
+    let mut notice = spec(GUIDE, FLEET_STORE_SENDER, MessageExpectation::None);
+    notice.references = vec![subject.clone()];
+    notice.subject = Some(subject);
+    let receiver = ResolvedMessageReceiver { role_address: Some(GUIDE.into()), ..delivered() };
+    let records = [record(&old_name, notice, status(MessagePhase::Delivered, Some(1), Some(receiver)))];
+    let roles = designated_fleet_roles(&backend, NS).await.expect("fleet roles");
+    let held = OldStoreRecords::empty(NS);
+    let conversion = Conversion { roles: &roles, forges: &[], records: &FirstLaunches(&held) };
+    let imported = import_all(records.iter().map(|record| OldMessage { record, home: HOME.into() }), &conversion, &world(&records))
+        .into_iter()
+        .map(|result| match result {
+            Ok(Imported::Message(message)) => *message,
+            other => panic!("not imported: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    let inbox = imported[0].resource.spec().inbox.clone();
+    let sender = imported[0].resource.spec().sender.clone();
+    assert_eq!(imported[0].resource.name(), format!("{inbox}/message:{}", charter_notice_name(&inbox, &sender, "first")));
+
+    let dir = tempfile::tempdir().expect("store directory");
+    let path = dir.path().join("decided.sqlite");
+    let registry = || flotilla_engine_store::registry().expect("engine kind registry");
+    {
+        let mut target = Import::create(&path, HOME, registry()).expect("import target");
+        assert!(write_messages(&imported, &mut target).is_empty(), "the notice is written");
+    }
+    let service = Arc::new(Service::open(&path, HOME, registry()).expect("decided store"));
+    let home = EngineMessagesHome::over(service, NS, &backend);
+    let primitives = home.primitives();
+    let notices = EngineCharterNotices { primitives: Arc::clone(primitives), namespace: NS.into() };
+    let receivers = MessageReceiverSnapshot::load(&backend, NS).await.expect("receivers");
+    let projects = backend.including_replicas::<Project>(NS).list().await.expect("projects");
+    reconcile_charter_notifications_with_receivers(&notices, &CharterProseRenderer, &backend, &receivers, &projects)
+        .await
+        .expect("charter pass");
+
+    assert!(primitives.message(imported[0].resource.name()).await.expect("load").is_some(), "the imported notice is stored");
+    assert!(primitives.open_in(&inbox).expect("open messages").is_empty(), "no second notice at the revision already delivered");
 }

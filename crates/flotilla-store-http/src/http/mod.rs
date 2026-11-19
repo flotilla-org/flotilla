@@ -6,6 +6,14 @@ use serde_json::Value;
 mod bootstrap;
 mod kubeconfig;
 
+/// `value` percent-encoded as one URL path segment, so a name holding `/`, `#` or `?` (a launch
+/// name, `name#n`) stays one segment.
+fn segment(value: &str) -> String {
+    let mut url = reqwest::Url::parse("http://segment.invalid/").expect("a URL with a path");
+    url.path_segments_mut().expect("an http URL has path segments").pop_if_empty().push(value);
+    url.path()[1..].to_owned()
+}
+
 use std::{borrow::Cow, collections::BTreeMap, pin::Pin};
 
 pub use bootstrap::{ensure_crd, ensure_namespace};
@@ -68,12 +76,12 @@ impl HttpBackend {
             self.base_url.trim_end_matches('/'),
             paths.group,
             paths.version,
-            namespace,
+            segment(namespace),
             paths.plural
         );
         if let Some(name) = name {
             url.push('/');
-            url.push_str(name);
+            url.push_str(&segment(name));
         }
         if status {
             url.push_str("/status");
@@ -126,25 +134,6 @@ impl HttpBackend {
         let response = self.http.get(url).send().await.map_err(|err| ResourceError::other(format!("GET resource position: {err}")))?;
         let list: PositionResponse = Self::decode_response(response, None).await?;
         Ok(crate::ResourcePosition { resource_version: list.metadata.resource_version, generation: list.metadata.generation })
-    }
-
-    pub async fn digest_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        query: &crate::DigestQuery,
-    ) -> Result<crate::PartitionDigest, ResourceError> {
-        let url = self.namespaced_url(resource_kind.paths, namespace, None, false);
-        let parameters = match query {
-            crate::DigestQuery::Root => vec![("digest", "root".to_string())],
-            crate::DigestQuery::Children { expected_root } => vec![("digest", "children".into()), ("expectedRoot", expected_root.clone())],
-            crate::DigestQuery::Snapshot { expected_root, bucket } => {
-                vec![("digest", "snapshot".into()), ("expectedRoot", expected_root.clone()), ("bucket", bucket.to_string())]
-            }
-        };
-        let response =
-            self.http.get(url).query(&parameters).send().await.map_err(|error| ResourceError::other(format!("GET digest: {error}")))?;
-        Self::decode_response(response, None).await
     }
 
     pub async fn query_declared(
@@ -278,14 +267,6 @@ impl HttpBackend {
         Ok(ReadResourceList { items })
     }
 
-    pub async fn list_replica_sources_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-    ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
-        self.list_read_view_raw(resource_kind, namespace, "replicaSources").await
-    }
-
     async fn list_read_view_raw(
         &self,
         resource_kind: ResourceKind,
@@ -316,14 +297,6 @@ impl HttpBackend {
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
         self.watch_read_view_raw(resource_kind, namespace, "includeReplicas").await
-    }
-
-    pub async fn watch_replica_sources_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
-        self.watch_read_view_raw(resource_kind, namespace, "replicaSources").await
     }
 
     async fn watch_read_view_raw(
@@ -475,7 +448,15 @@ impl HttpBackend {
                     | WatchStart::FromVersionInGeneration { resource_version: requested_version, .. } => requested_version,
                     WatchStart::Now => String::new(),
                 };
-                return Err(ResourceError::WatchExpired { requested_version, compacted_through: None });
+                // The server's Status message says why; a body that cannot be read still expires.
+                let reason = match response.bytes().await {
+                    Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+                        .ok()
+                        .and_then(|status| status.get("message").and_then(Value::as_str).map(str::to_owned))
+                        .unwrap_or_else(|| "the server gave no reason".to_owned()),
+                    Err(_) => "the server's reason could not be read".to_owned(),
+                };
+                return Err(ResourceError::WatchExpired { requested_version, compacted_through: None, reason });
             }
             let bytes = response.bytes().await.map_err(|err| ResourceError::other(format!("read watch error body: {err}")))?;
             return Err(map_status_error(status, &bytes, None));

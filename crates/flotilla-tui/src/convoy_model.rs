@@ -178,13 +178,16 @@ pub struct ConvoySummary {
     pub workflow_ref: String,
     #[builder(default)]
     pub dispatching_principal_ref: PrincipalRef,
-    pub phase: ConvoyPhase,
+    /// `None` exactly when the launch is `unreadable`.
+    pub phase: Option<ConvoyPhase>,
+    /// Why this launch's record could not be read.
+    pub unreadable: Option<String>,
     pub placement_decision: Option<PlacementDecision>,
     pub message: Option<String>,
     pub disposition: Option<String>,
     pub repo_hint: Option<RepoKey>,
     /// The Project this convoy belongs to (`ConvoySpec.project_ref`).
-    pub project_ref: Option<String>,
+    pub project_ref: String,
     #[builder(default)]
     pub issues: Vec<wire::ConvoyIssueRow>,
     #[builder(default)]
@@ -210,7 +213,8 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
             origin_host: row.resource.host.clone(),
             workflow_ref: row.workflow_ref.clone(),
             dispatching_principal_ref: row.dispatching_principal_ref.clone(),
-            phase: row.phase.into(),
+            phase: row.phase.map(Into::into),
+            unreadable: row.unreadable.clone(),
             placement_decision: row.placement_decision.clone(),
             message: row.message.clone(),
             disposition: row.disposition.clone(),
@@ -229,12 +233,22 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
 }
 
 impl ConvoySummary {
+    /// The launch has a known terminal phase.
+    pub fn is_ended(&self) -> bool {
+        self.phase.is_some_and(ConvoyPhase::is_terminal)
+    }
+
+    /// The phase as the surfaces label it; an unreadable launch has none.
+    pub fn phase_label(&self) -> &'static str {
+        self.phase.map_or("unreadable", ConvoyPhase::label)
+    }
+
     pub fn address(&self) -> String {
-        self.project_ref.as_ref().map_or_else(|| self.name.clone(), |project| format!("{}@{project}", self.name))
+        format!("{}@{}", self.name, self.project_ref)
     }
 
     pub fn display_name(&self) -> String {
-        self.project_ref.as_ref().map_or_else(|| self.name.clone(), |project| format!("{} @ {project}", self.name))
+        format!("{} @ {}", self.name, self.project_ref)
     }
 }
 
@@ -271,7 +285,7 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
 }
 
 fn wire_convoy_address(row: &wire::ConvoyRow) -> String {
-    row.project_ref.as_ref().map_or_else(|| row.name.clone(), |project| format!("{}@{project}", row.name))
+    format!("{}@{}", row.name, row.project_ref)
 }
 
 #[cfg(test)]
@@ -301,6 +315,7 @@ mod tests {
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "remote-convoy").on_host(HostName::new("feta")))
             .name("remote-convoy")
             .workflow_ref("review-and-fix")
+            .project_ref("flotilla")
             .phase(wire::ConvoyPhase::Failed)
             .build();
 

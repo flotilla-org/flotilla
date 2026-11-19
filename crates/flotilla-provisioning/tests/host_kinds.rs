@@ -240,7 +240,13 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
         "system": {"arch": "aarch64"}
     }))
     .expect("summary");
-    for (free, floor, below) in [(Some(5), Some(10), true), (Some(10), Some(10), false), (None, Some(10), false), (Some(5), None, false)] {
+    for (free, floor, below) in [
+        (Some(5), Some(10), Some(true)),
+        (Some(10), Some(10), Some(false)),
+        (None, Some(10), None),
+        (Some(5), None, None),
+        (None, None, None),
+    ] {
         let status = HostStatus {
             description: Some(summary.clone()),
             disk_free_bytes: free,
@@ -394,6 +400,26 @@ fn a_previous_generations_ssh_host_and_missing_baseline_import() {
     assert_eq!(observation.agent_adapter_baseline, BTreeSet::from(["claude-code".to_owned()]));
 }
 
+// Behaviour (ADR 0047, #3108): the frozen fleet still stores an SSH host under its pre-#4001
+// names, the `agentless_ssh` connection and the `agentless` key; the cut-over import reads it as
+// an SSH host, its marker dropped as the connection carries it.
+#[test]
+fn the_frozen_fleets_pre_4001_ssh_host_imports() {
+    let connection: HostConnection =
+        serde_json::from_value(json!({"kind": "agentless_ssh", "owning_daemon": "udder", "destination": "crew@b1"})).expect("decodes");
+    let spec = HostSpec { connection, ..ssh("udder") };
+    let status = HostStatus {
+        capabilities: serde_json::from_value(json!({
+            "agentless": true, "transport": "ssh", "placement": "host_direct_only", "owning_daemon": "udder"
+        }))
+        .expect("capabilities"),
+        ..HostStatus::default()
+    };
+    let (host, _, dropped) = records(import_host(&object("b1", spec, Some(status)), "udder").expect("imports"));
+    assert!(matches!(host.connection, host_kinds::Connection::SshHost { ref owning_daemon, .. } if owning_daemon == "udder"));
+    assert!(dropped.contains(&("HostObservation", "the SSH capability markers, which the connection carries")), "{dropped:?}");
+}
+
 // Behaviour (#3824 layer 4c): nothing is dropped silently. An unknown capability key, a capability
 // that does not decode, a provider instance or condition type held twice, an SSH owner that differs
 // from the connection's, and one name held in two namespaces at a home are each refused, named.
@@ -461,18 +487,17 @@ impl flotilla_engine_store::ImportTarget for RefusingObservations {
         self.0.imports(home)
     }
 
-    fn write_with<K: flotilla_schema::Kind + PartialEq>(
+    fn write_named_with<K: flotilla_schema::Kind + PartialEq>(
         &mut self,
         home: &str,
-        name: &str,
         change: &flotilla_schema::NewChange,
         version: u64,
-        make: impl FnOnce(u64) -> K,
-    ) -> Result<K, String> {
+        make: impl FnOnce(u64) -> (String, K),
+    ) -> Result<(String, K), String> {
         if K::KIND == "HostObservation" {
             return Err("refused".to_owned());
         }
-        self.0.write_with(home, name, change, version, make)
+        self.0.write_named_with(home, change, version, make)
     }
 
     fn holds<K: flotilla_schema::Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
@@ -499,4 +524,57 @@ fn a_refused_observation_write_refuses_its_host() {
         [("HostObservation", "kiwi")]
     );
     assert!(report.imported.is_empty(), "{report:?}");
+}
+
+/// The host kinds as the build before #3108's free-space ruling rendered them: the free-space
+/// flag NOT NULL.
+fn registry_with_a_required_flag() -> flotilla_schema::KindRegistry {
+    let mut older = flotilla_schema::KindRegistry::new();
+    for set in host_kinds::registry().expect("registry").iter() {
+        let mut set = set.clone();
+        for table in &mut set.tables {
+            for column in table.columns.iter_mut().filter(|column| column.name == "below_free_space_floor") {
+                column.nullable = false;
+            }
+        }
+        older.register_table_set(set).expect("older registry");
+    }
+    older
+}
+
+// Behaviour (ADR 0047 N→N+1, #3108): a store written while the free-space flag was required
+// (#4142) opens under this build, which widens the column: each stored row reads back as known,
+// and an unknown flag is then written.
+#[test]
+fn a_stored_required_free_space_flag_reads_as_known_and_widens_to_unknown() {
+    use flotilla_schema::NewChange;
+    let mut old =
+        Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry_with_a_required_flag()).expect("old store");
+    let mut ids = Vec::new();
+    for (name, below) in [("kiwi", true), ("feta", false)] {
+        let observation = host_kinds::HostObservation { below_free_space_floor: Some(below), ..Default::default() };
+        let mut write = old.write().expect("write");
+        let change = write.open_change(&NewChange::new("probe", Timestamp(1))).expect("change");
+        ids.push((write.insert(name, &observation, change).expect("insert").id, below));
+        write.commit().expect("commit");
+    }
+    let conn = old.into_connection();
+    assert!(conn.execute("UPDATE host_observation SET below_free_space_floor = NULL", []).is_err(), "the old column is required");
+
+    let mut store = Store::open(conn, "home", host_kinds::registry().expect("registry")).expect("opens widened");
+    for (id, below) in &ids {
+        let read = store.read().expect("read").load::<host_kinds::HostObservation>(*id).expect("load").expect("kept");
+        assert_eq!(read.value.below_free_space_floor, Some(*below));
+    }
+    let mut write = store.write().expect("write");
+    let current = write.load::<host_kinds::HostObservation>(ids[0].0).expect("load").expect("held");
+    let change = write.open_change(&NewChange::new("probe", Timestamp(2))).expect("change");
+    write.update(&current, &host_kinds::HostObservation::default(), change).expect("an unknown flag is written");
+    write.commit().expect("commit");
+    let read = store.read().expect("read").load::<host_kinds::HostObservation>(ids[0].0).expect("load").expect("kept");
+    assert_eq!(read.value.below_free_space_floor, None);
+    let conn = store.into_connection();
+    let stored: String =
+        conn.query_row("SELECT sql FROM sqlite_schema WHERE name = 'host_observation'", [], |row| row.get(0)).expect("table");
+    assert!(schema_ddl(&host_kinds::registry().expect("registry"), DdlMode::Create).contains(&format!("{stored};\n")), "{stored}");
 }

@@ -1,14 +1,18 @@
 //! Demand-side composed images (ADR 0062). Admission resolves each vessel's
-//! ordered layer list and get-or-creates the one ImageBuild for that identity
-//! and the placement architecture. Executing builds belongs to the build
-//! service; this module never runs one.
+//! ordered layer list and demands, at its home, the one image build for that
+//! identity and the placement architecture. Executing builds belongs to the
+//! builder; this module never runs one.
 use flotilla_resources::image_architecture::{canonical_image_architecture, host_architecture};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use flotilla_resources::{
-    canonical_host_id, image_build_name, CapabilityNeed, CrewSource, FleetDesignation, Host, ImageBuild, ImageBuildCapacity,
-    ImageBuildReservation, ImageBuildSpec, ImageCatalogue, ImageDelivery, ImageLayer, ImageRequest, ImageSelection, InputMeta,
-    ResolvedImage, ResourceError, ResourceObject, ResourceProvenance, VesselRequirement, FLEET_DESIGNATION_NAME,
+    canonical_host_id, image_build_name, image_build_records::ImageBuildRecords, lifecycle_reads::LifecycleReads, CapabilityNeed,
+    CrewSource, FleetDesignation, Host, ImageBuildCapacity, ImageBuildReservation, ImageBuildSpec, ImageCatalogue, ImageDelivery,
+    ImageLayer, ImageRequest, ImageSelection, ResolvedImage, ResourceError, ResourceObject, ResourceProvenance, VesselRequirement,
+    FLEET_DESIGNATION_NAME,
 };
 use flotilla_store::{ResourceBackend, StoreQuery};
 
@@ -192,17 +196,15 @@ fn registry_builder(
 pub const CLOUD_IMAGE_CACHE_MISSING: &str =
     "a cloud sandbox runs its vessel's composed image from the fleet image cache, and FleetDesignation declares no `image_cache`";
 
-/// The ImageBuild a vessel's composed image uses on its placement: its name,
-/// and the spec to create when no copy of that name exists yet.
+/// The image build a vessel's composed image uses on its placement: its name, and what to
+/// demand under it unless the build is already demanded or launched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedImageBuild {
     pub name: String,
-    pub create: Option<ImageBuildSpec>,
+    pub spec: ImageBuildSpec,
 }
 
-/// Plan, without writing, the ImageBuild for `resolved` on the placement
-/// host's architecture. An existing build with the expected name, local or
-/// replicated, is reused whatever its copies say.
+/// Plan, without writing, the image build for `resolved` on the placement host's architecture.
 pub async fn plan_image_build(
     backend: &ResourceBackend,
     namespace: &str,
@@ -236,14 +238,11 @@ pub async fn plan_image_build_for(
         None => placement_architecture,
     };
     let name = expected_build_name(&resolved.identity, &architecture, image_cache.as_ref(), &placement.metadata.name);
-    plan_named_build(backend, namespace, resolved, name, &architecture, || {
-        choose_builder(&hosts, placement, &architecture, image_cache.as_ref())
-    })
-    .await
+    planned_build(resolved, name, &architecture, choose_builder(&hosts, placement, &architecture, image_cache.as_ref())?)
 }
 
-/// Plan, without writing, a cloud vessel's ImageBuild: built for the cloud platform and pushed to
-/// the fleet image cache, the only place a cloud provider reads it from.
+/// Plan, without writing, a cloud vessel's image build: built for the cloud platform and pushed
+/// to the fleet image cache, the only place a cloud provider reads it from.
 pub async fn plan_cloud_image_build(
     backend: &ResourceBackend,
     namespace: &str,
@@ -253,32 +252,15 @@ pub async fn plan_cloud_image_build(
     let architecture = flotilla_resources::realisation_settings::CLOUD_SANDBOX_ARCHITECTURE;
     let name = expected_build_name(&resolved.identity, architecture, Some(&cache), "");
     let hosts = hosts(backend, namespace).await?;
-    plan_named_build(backend, namespace, resolved, name, architecture, || registry_builder(&hosts, architecture, &cache)).await
+    planned_build(resolved, name, architecture, registry_builder(&hosts, architecture, &cache)?)
 }
 
-/// An existing build with this name, local or replicated, is reused whatever its copies say;
-/// otherwise `choose` names the builder and delivery of the build to create.
-async fn plan_named_build(
-    backend: &ResourceBackend,
-    namespace: &str,
+fn planned_build(
     resolved: &ResolvedImage,
     name: String,
     architecture: &str,
-    choose: impl FnOnce() -> Result<(String, ImageDelivery, ImageBuildReservation), String>,
+    (host_ref, delivery, reservation): (String, ImageDelivery, ImageBuildReservation),
 ) -> Result<PlannedImageBuild, String> {
-    // Planning only needs existence; source phase ranking cannot affect whether demand already exists.
-    if backend
-        .including_replicas::<ImageBuild>(namespace)
-        .get_all(&name)
-        .await
-        .map_err(|error| error.to_string())?
-        .items
-        .iter()
-        .any(|source| !source.object.spec.is_retired())
-    {
-        return Ok(PlannedImageBuild { name, create: None });
-    }
-    let (host_ref, delivery, reservation) = choose()?;
     let spec = ImageBuildSpec::builder()
         .identity(resolved.identity.clone())
         .architecture(architecture.to_string())
@@ -288,41 +270,66 @@ async fn plan_named_build(
         .reservation(reservation)
         .build();
     debug_assert_eq!(spec.resource_name(), name);
-    Ok(PlannedImageBuild { name, create: Some(spec) })
+    Ok(PlannedImageBuild { name, spec })
 }
 
-/// Create the planned builds that do not exist yet, once admission has passed
-/// every refusal. Returns the names this call created, so a failed commit can
-/// remove them again; a concurrent creator's copy is reused.
-pub async fn create_planned_builds(
-    backend: &ResourceBackend,
-    namespace: &str,
-    planned: &[PlannedImageBuild],
-) -> Result<Vec<String>, String> {
-    let builds = backend.using::<ImageBuild>(namespace);
-    let mut created = Vec::new();
-    for build in planned {
-        let Some(spec) = &build.create else { continue };
-        if created.contains(&build.name) {
-            continue;
-        }
-        match builds.create(&InputMeta::builder().name(build.name.clone()).build(), &spec.clone().into()).await {
-            Ok(_) => created.push(build.name.clone()),
-            Err(ResourceError::Conflict { .. }) => {}
-            Err(error) => {
-                remove_created_builds(backend, namespace, &created).await;
-                return Err(format!("create ImageBuild {}: {error}", build.name));
+/// Demand the planned builds at this home once admission has passed every refusal. A build this
+/// home already demands is left as it is; one already launched elsewhere is demanded as launched,
+/// so every home's demand names the same builder. Returns the names this call demanded, so a
+/// failed commit can withdraw them again.
+pub async fn demand_planned_builds(reads: Arc<dyn LifecycleReads>, planned: &[PlannedImageBuild]) -> Result<Vec<String>, String> {
+    // An admission that plans no build reads no image builds.
+    if planned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let planned = planned.to_vec();
+    tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+        let builds = reads.image_builds()?;
+        let mut demanded = Vec::new();
+        for build in &planned {
+            if demanded.contains(&build.name) {
+                continue;
+            }
+            let written = builds.demanded(&build.name).and_then(|held| match held {
+                Some(_) => Ok(false),
+                None => {
+                    let spec = builds.get(&build.name)?.map_or_else(|| build.spec.clone(), |launched| launched.spec);
+                    builds.demand(&build.name, &spec)
+                }
+            });
+            match written {
+                Ok(true) => demanded.push(build.name.clone()),
+                Ok(false) => {}
+                Err(error) => {
+                    withdraw(builds, &demanded);
+                    return Err(format!("demand image build {}: {error}", build.name));
+                }
             }
         }
-    }
-    Ok(created)
+        Ok(demanded)
+    }))
+    .await
+    .map_err(|error| format!("demand image builds: {error}"))?
 }
 
-/// Best-effort removal of builds an abandoned admission created.
-pub async fn remove_created_builds(backend: &ResourceBackend, namespace: &str, created: &[String]) {
-    for name in created {
-        if let Err(error) = backend.using::<ImageBuild>(namespace).delete(name).await {
-            tracing::warn!(image_build = %name, %error, "could not remove an abandoned admission's image build");
+/// Best-effort withdrawal of the demands an abandoned admission wrote.
+pub async fn withdraw_demanded_builds(reads: Arc<dyn LifecycleReads>, demanded: &[String]) {
+    if demanded.is_empty() {
+        return;
+    }
+    let demanded = demanded.to_vec();
+    let withdrawn =
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.image_builds().map(|builds| withdraw(builds, &demanded))))
+            .await;
+    if let Err(error) = withdrawn.map_err(|error| error.to_string()).and_then(|withdrawn| withdrawn) {
+        tracing::warn!(%error, "could not withdraw an abandoned admission's image build demands");
+    }
+}
+
+fn withdraw(builds: &dyn ImageBuildRecords, demanded: &[String]) {
+    for name in demanded {
+        if let Err(error) = builds.withdraw(name) {
+            tracing::warn!(image_build = %name, %error, "could not withdraw an abandoned admission's image build demand");
         }
     }
 }

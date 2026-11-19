@@ -6,10 +6,8 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
-    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus, LandingCredentialScope,
-    PlacementStatus, RepositoryKey, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch,
-    TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority,
-    WorkPhase, WorkState, WorkflowSnapshot,
+    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, PlacementStatus, StatusPatch, TurnDeliveryEpisode,
+    TurnDeliveryOutcome, TurnDeliveryRung, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 
 #[test]
@@ -38,20 +36,20 @@ fn force_does_not_relabel_a_ledger_backed_claim_as_overridden() {
 enum LifecycleClass {
     Duplicate,
     Continuation,
-    NewAttempt,
     Resettlement,
 }
 
 const NONE: &[LifecycleClass] = &[];
 const DUPLICATE: &[LifecycleClass] = &[LifecycleClass::Duplicate];
 const CONTINUATION: &[LifecycleClass] = &[LifecycleClass::Continuation];
-const NEW_ATTEMPT: &[LifecycleClass] = &[LifecycleClass::NewAttempt];
 const DUPLICATE_RESETTLEMENT: &[LifecycleClass] = &[LifecycleClass::Duplicate, LifecycleClass::Resettlement];
 const DUPLICATE_CONTINUATION_RESETTLEMENT: &[LifecycleClass] =
     &[LifecycleClass::Duplicate, LifecycleClass::Continuation, LifecycleClass::Resettlement];
 
 macro_rules! define_patch_kinds {
     ($($kind:ident => $classes:expr),+ $(,)?) => {
+        // Each kind is named for its resource and patch; only Convoy has lifecycle patches left.
+        #[allow(clippy::enum_variant_names)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
         enum PatchKind {
             $($kind),+
@@ -72,11 +70,10 @@ macro_rules! define_patch_kinds {
 define_patch_kinds! {
     ConvoyPromise => NONE,
     ConvoyRestoreTurnActivation => DUPLICATE,
-    ConvoyObserveEnvironment => NONE,
-    ConvoySetStalled => NONE,
+    ConvoySetStall => NONE,
+    ConvoyEndStall => NONE,
     ConvoySetNudgeObligations => NONE,
     ConvoySetTeardownWait => NONE,
-    ConvoyRecordLifecycleMutation => NONE,
     ConvoySetPlacementDecision => NONE,
     ConvoyBootstrap => DUPLICATE,
     ConvoyBackfillCrewWork => NONE,
@@ -88,12 +85,9 @@ define_patch_kinds! {
     ConvoySetSettlementAttention => NONE,
     ConvoyRecordLandingEvent => NONE,
     ConvoyObserveTurnHookHealth => NONE,
-    ConvoyQueueSupervisorTurn => NONE,
-    ConvoyAcknowledgeSupervisorTurn => NONE,
     ConvoyWorkLaunching => DUPLICATE,
     ConvoyWorkRunning => DUPLICATE,
     ConvoyWorkInterrupted => CONTINUATION,
-    ConvoyWorkProvisioningRetry => CONTINUATION,
     ConvoyForceWorkCompleted => DUPLICATE,
     ConvoyMarkWorkFailed => DUPLICATE,
     ConvoyMarkWorkCancelled => DUPLICATE,
@@ -112,37 +106,6 @@ define_patch_kinds! {
     ConvoyFailTurnDelivery => NONE,
     ConvoyObserveQueuedTurnDeliveries => NONE,
     ConvoyRollUpWork => DUPLICATE_CONTINUATION_RESETTLEMENT,
-    TerminalHoldTurnDelivery => NONE,
-    TerminalMarkStarting => NEW_ATTEMPT,
-    TerminalClearRetiredLaunches => NONE,
-    TerminalMarkRunning => DUPLICATE,
-    TerminalObserveCleatEndpoint => NONE,
-    TerminalObserveDaemonReach => NONE,
-    TerminalMarkMessageDelivered => NONE,
-    TerminalMarkDeliveryExpired => NONE,
-    TerminalMarkControllerFenceUnverifiable => NONE,
-    TerminalMarkDeliveryUnconfirmed => NONE,
-    TerminalMarkDeliveryNotSubmitted => NONE,
-    TerminalObserveAttention => NONE,
-    TerminalObserveToolActivity => NONE,
-    TerminalObserveNativeCodexHook => NONE,
-    TerminalMarkCompletionPending => NONE,
-    TerminalClearMessageDeliveryHold => NONE,
-    TerminalClearCompletionPending => NONE,
-    TerminalMarkStopped => DUPLICATE,
-    TerminalMarkLost => DUPLICATE,
-    TerminalMarkRevived => CONTINUATION,
-    TerminalMarkFailed => DUPLICATE,
-    TerminalMarkReconcileDegraded => NONE,
-    TerminalClearReconcileDegraded => NONE,
-    VesselObserveRuntime => NONE,
-    VesselRequireEnvironmentRecreation => NONE,
-    VesselMarkProvisioning => DUPLICATE,
-    VesselMarkReady => DUPLICATE,
-    VesselStageLandingCredentials => DUPLICATE,
-    VesselMarkInterrupted => NONE,
-    VesselMarkLost => NONE,
-    VesselMarkFailed => NONE,
 }
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
@@ -152,18 +115,16 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::HoldTurnDelivery { .. } => PatchKind::ConvoyHoldTurnDelivery,
         ConvoyStatusPatch::RestoreTurnActivation { .. } => PatchKind::ConvoyRestoreTurnActivation,
         ConvoyStatusPatch::RecordNaming { .. }
-        | ConvoyStatusPatch::RecordEnsureAdmission { .. }
         | ConvoyStatusPatch::DiscoverSubjects { .. }
         | ConvoyStatusPatch::RecordBranchSubjectScan { .. }
         | ConvoyStatusPatch::RecordBranchSubjectScanFailure { .. }
         | ConvoyStatusPatch::UnlinkSubject { .. } => {
             panic!("admission and subject patches are outside this lifecycle contract")
         }
-        ConvoyStatusPatch::ObserveEnvironment { .. } => PatchKind::ConvoyObserveEnvironment,
-        ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
+        ConvoyStatusPatch::SetStall { .. } => PatchKind::ConvoySetStall,
+        ConvoyStatusPatch::EndStall { .. } => PatchKind::ConvoyEndStall,
         ConvoyStatusPatch::SetNudgeObligations { .. } => PatchKind::ConvoySetNudgeObligations,
         ConvoyStatusPatch::SetTeardownWait { .. } => PatchKind::ConvoySetTeardownWait,
-        ConvoyStatusPatch::RecordLifecycleMutation { .. } => PatchKind::ConvoyRecordLifecycleMutation,
         ConvoyStatusPatch::SetPlacementDecision { .. } => PatchKind::ConvoySetPlacementDecision,
         ConvoyStatusPatch::Bootstrap { .. } => PatchKind::ConvoyBootstrap,
         ConvoyStatusPatch::BackfillCrewWork { .. } => PatchKind::ConvoyBackfillCrewWork,
@@ -174,17 +135,14 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::Settle { .. } => PatchKind::ConvoySettle,
         ConvoyStatusPatch::SetSettlementAttention { .. } => PatchKind::ConvoySetSettlementAttention,
         ConvoyStatusPatch::ObserveTurnHookHealth { .. } => PatchKind::ConvoyObserveTurnHookHealth,
-        ConvoyStatusPatch::QueueSupervisorTurn { .. } => PatchKind::ConvoyQueueSupervisorTurn,
-        ConvoyStatusPatch::AcknowledgeSupervisorTurn { .. } => PatchKind::ConvoyAcknowledgeSupervisorTurn,
         ConvoyStatusPatch::WorkLaunching { .. } => PatchKind::ConvoyWorkLaunching,
         ConvoyStatusPatch::WorkRunning { .. } => PatchKind::ConvoyWorkRunning,
         ConvoyStatusPatch::WorkInterrupted { .. } => PatchKind::ConvoyWorkInterrupted,
-        ConvoyStatusPatch::WorkProvisioningRetry { .. } => PatchKind::ConvoyWorkProvisioningRetry,
         ConvoyStatusPatch::ForceWorkCompleted { .. } => PatchKind::ConvoyForceWorkCompleted,
         ConvoyStatusPatch::MarkWorkFailed { .. } => PatchKind::ConvoyMarkWorkFailed,
         ConvoyStatusPatch::MarkWorkCancelled { .. } => PatchKind::ConvoyMarkWorkCancelled,
         ConvoyStatusPatch::MarkConvoyAbandoned { .. } => PatchKind::ConvoyMarkConvoyAbandoned,
-        ConvoyStatusPatch::Promise { .. } | ConvoyStatusPatch::ObservePromise { .. } | ConvoyStatusPatch::HandPromisesToEngine => {
+        ConvoyStatusPatch::Promise { .. } | ConvoyStatusPatch::ObservePromise { .. } | ConvoyStatusPatch::HandPromisesToEngine { .. } => {
             PatchKind::ConvoyPromise
         }
         ConvoyStatusPatch::MarkCrewCompleted { .. } => PatchKind::ConvoyMarkCrewCompleted,
@@ -200,55 +158,6 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::FailTurnDelivery { .. } => PatchKind::ConvoyFailTurnDelivery,
         ConvoyStatusPatch::ObserveQueuedTurnDeliveries { .. } => PatchKind::ConvoyObserveQueuedTurnDeliveries,
         ConvoyStatusPatch::RollUpWork { .. } => PatchKind::ConvoyRollUpWork,
-    }
-}
-
-fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind {
-    match patch {
-        TerminalSessionStatusPatch::HoldTurnDelivery { .. } => PatchKind::TerminalHoldTurnDelivery,
-        TerminalSessionStatusPatch::MarkStarting => PatchKind::TerminalMarkStarting,
-        TerminalSessionStatusPatch::ClearRetiredLaunches => PatchKind::TerminalClearRetiredLaunches,
-        TerminalSessionStatusPatch::MarkRunning { .. } => PatchKind::TerminalMarkRunning,
-        TerminalSessionStatusPatch::ObserveCleatEndpoint { .. } => PatchKind::TerminalObserveCleatEndpoint,
-        TerminalSessionStatusPatch::ObserveDaemonReach { .. } => PatchKind::TerminalObserveDaemonReach,
-        TerminalSessionStatusPatch::MarkMessageDelivered { .. } => PatchKind::TerminalMarkMessageDelivered,
-        TerminalSessionStatusPatch::MarkDeliveryExpired => PatchKind::TerminalMarkDeliveryExpired,
-        TerminalSessionStatusPatch::MarkControllerFenceUnverifiable { .. } => PatchKind::TerminalMarkControllerFenceUnverifiable,
-        TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { .. } => PatchKind::TerminalMarkDeliveryUnconfirmed,
-        TerminalSessionStatusPatch::MarkDeliveryNotSubmitted { .. } => PatchKind::TerminalMarkDeliveryNotSubmitted,
-        TerminalSessionStatusPatch::MarkStopped { .. } => PatchKind::TerminalMarkStopped,
-        TerminalSessionStatusPatch::MarkLost { .. } => PatchKind::TerminalMarkLost,
-        TerminalSessionStatusPatch::MarkRevived => PatchKind::TerminalMarkRevived,
-        TerminalSessionStatusPatch::MarkFailed { .. } => PatchKind::TerminalMarkFailed,
-        TerminalSessionStatusPatch::MarkReconcileDegraded { .. } => PatchKind::TerminalMarkReconcileDegraded,
-        TerminalSessionStatusPatch::ClearReconcileDegraded => PatchKind::TerminalClearReconcileDegraded,
-        TerminalSessionStatusPatch::ObserveAttention { .. } => PatchKind::TerminalObserveAttention,
-        TerminalSessionStatusPatch::ObserveToolActivity { .. } => PatchKind::TerminalObserveToolActivity,
-        TerminalSessionStatusPatch::ObserveNativeCodexHook { .. } => PatchKind::TerminalObserveNativeCodexHook,
-        TerminalSessionStatusPatch::Observe { .. } => PatchKind::TerminalObserveAttention,
-        TerminalSessionStatusPatch::MarkCompletionPending { .. } => PatchKind::TerminalMarkCompletionPending,
-        TerminalSessionStatusPatch::ClearMessageDeliveryHold { .. } => PatchKind::TerminalClearMessageDeliveryHold,
-        TerminalSessionStatusPatch::ClearCompletionPending => PatchKind::TerminalClearCompletionPending,
-    }
-}
-
-fn vessel_patch_kind(patch: &VesselStatusPatch) -> PatchKind {
-    match patch {
-        VesselStatusPatch::ObserveDegradation { .. }
-        | VesselStatusPatch::CredentialDelivery { .. }
-        | VesselStatusPatch::CredentialRefresh { .. }
-        | VesselStatusPatch::RecordImage { .. }
-        | VesselStatusPatch::ReplaceImage { .. } => {
-            panic!("credential, degradation and image status patches are outside this lifecycle contract")
-        }
-        VesselStatusPatch::ObserveRuntime { .. } => PatchKind::VesselObserveRuntime,
-        VesselStatusPatch::RequireEnvironmentRecreation { .. } => PatchKind::VesselRequireEnvironmentRecreation,
-        VesselStatusPatch::MarkProvisioning { .. } => PatchKind::VesselMarkProvisioning,
-        VesselStatusPatch::MarkReady { .. } => PatchKind::VesselMarkReady,
-        VesselStatusPatch::MarkInterrupted { .. } => PatchKind::VesselMarkInterrupted,
-        VesselStatusPatch::StageLandingCredentials { .. } => PatchKind::VesselStageLandingCredentials,
-        VesselStatusPatch::MarkLost { .. } => PatchKind::VesselMarkLost,
-        VesselStatusPatch::MarkFailed { .. } => PatchKind::VesselMarkFailed,
     }
 }
 
@@ -287,7 +196,6 @@ fn ts(seconds: i64) -> DateTime<Utc> {
 
 fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> WorkState {
     WorkState {
-        provisioning_retry: None,
         phase,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: Some(ts(5)),
@@ -310,6 +218,8 @@ fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_
         started_at,
         finished_at,
         message: None,
+        stall_reason: None,
+        stall_proposed_disposition: None,
         disposition: None,
         decision_ledger_ref: None,
         decision_ledger_digest: None,
@@ -327,13 +237,13 @@ fn active_convoy_status() -> ConvoyStatus {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -344,6 +254,7 @@ fn active_convoy_status() -> ConvoyStatus {
             "implement".to_string(),
             BTreeMap::from([("coder".to_string(), crew_state(CrewWorkPhase::Working, Some(ts(10)), None))]),
         )]),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(10)),
         finished_at: None,
@@ -353,7 +264,6 @@ fn active_convoy_status() -> ConvoyStatus {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     }
 }
 
@@ -396,18 +306,6 @@ fn patch_variants_exhaustively_declare_their_lifecycle_classes() {
             message: "address review".to_string(),
         }),
         PatchKind::ConvoyHandoffCrewWork
-    );
-    assert_eq!(terminal_session_patch_kind(&TerminalSessionStatusPatch::MarkStarting), PatchKind::TerminalMarkStarting);
-    assert_eq!(
-        vessel_patch_kind(&VesselStatusPatch::MarkProvisioning {
-            image: None,
-            placement_decision: None,
-            observed_kind_ref: "docker".to_string(),
-            observed_kind_version: "2".to_string(),
-            started_at: ts(30),
-            message: None,
-        }),
-        PatchKind::VesselMarkProvisioning
     );
 }
 
@@ -461,6 +359,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     work: status.work.clone(),
                     crew_work: status.crew_work.clone(),
                     dispatch_promises: Vec::new(),
+                    standing: false,
                     phase: ConvoyPhase::Active,
                     started_at: Some(ts(30)),
                 };
@@ -718,176 +617,6 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             },
         },
         LifecycleCase {
-            name: "terminal running",
-            kind: PatchKind::TerminalMarkRunning,
-            exercise: || {
-                let mut status = TerminalSessionStatus {
-                    codex_native_hooks: false,
-                    last_hook_working_at: None,
-                    configured_limits: None,
-                    turn_delivery_hold: None,
-                    last_tool_activity_at: None,
-                    last_output_digest: None,
-                    last_output_activity_at: None,
-                    phase: TerminalSessionPhase::Running,
-                    session_id: Some("session-a".to_string()),
-                    cleat_endpoint: None,
-                    pid: Some(42),
-                    started_at: Some(ts(10)),
-                    stopped_at: None,
-                    inner_command_status: Some(InnerCommandStatus::Running),
-                    inner_exit_code: None,
-                    message: None,
-                    crew: None,
-                    retired_launches: Default::default(),
-                    launch_command: Some("bash".to_string()),
-                    delivered_message_id: None,
-                    attention: None,
-                    screen_obstruction: None,
-                    occupancy: Default::default(),
-                    completion_pending: None,
-                    degraded: None,
-                    daemon_unreachable: None,
-                    stashed_drafts: Vec::new(),
-                };
-                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                let patch = TerminalSessionStatusPatch::MarkRunning {
-                    configured_limits: None,
-                    session_id: "session-a".to_string(),
-                    pid: Some(42),
-                    started_at: ts(30),
-                    crew: None,
-                    launch_command: "bash".to_string(),
-                    delivered_message_id: None,
-                };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                (before, after)
-            },
-        },
-        LifecycleCase {
-            name: "terminal stopped",
-            kind: PatchKind::TerminalMarkStopped,
-            exercise: || {
-                let mut status = TerminalSessionStatus {
-                    phase: TerminalSessionPhase::Stopped,
-                    started_at: Some(ts(10)),
-                    stopped_at: Some(ts(20)),
-                    ..TerminalSessionStatus::default()
-                };
-                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                let patch = TerminalSessionStatusPatch::MarkStopped {
-                    stopped_at: ts(30),
-                    inner_command_status: Some(InnerCommandStatus::Exited),
-                    inner_exit_code: Some(0),
-                    message: None,
-                };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                (before, after)
-            },
-        },
-        LifecycleCase {
-            name: "terminal lost",
-            kind: PatchKind::TerminalMarkLost,
-            exercise: || {
-                let mut status = TerminalSessionStatus {
-                    phase: TerminalSessionPhase::Lost,
-                    started_at: Some(ts(10)),
-                    stopped_at: Some(ts(20)),
-                    ..TerminalSessionStatus::default()
-                };
-                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                let patch = TerminalSessionStatusPatch::MarkLost { reason: "generation is dead".to_string(), lost_at: ts(30) };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                (before, after)
-            },
-        },
-        LifecycleCase {
-            name: "terminal failure",
-            kind: PatchKind::TerminalMarkFailed,
-            exercise: || {
-                let mut status = TerminalSessionStatus {
-                    phase: TerminalSessionPhase::Failed,
-                    started_at: Some(ts(10)),
-                    stopped_at: Some(ts(20)),
-                    ..TerminalSessionStatus::default()
-                };
-                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                let patch = TerminalSessionStatusPatch::MarkFailed { message: "still failed".to_string(), stopped_at: Some(ts(30)) };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                (before, after)
-            },
-        },
-        LifecycleCase {
-            name: "vessel provisioning",
-            kind: PatchKind::VesselMarkProvisioning,
-            exercise: || {
-                let mut status = VesselStatus { phase: VesselPhase::Provisioning, started_at: Some(ts(10)), ..VesselStatus::default() };
-                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
-                let patch = VesselStatusPatch::MarkProvisioning {
-                    image: None,
-                    placement_decision: None,
-                    observed_kind_ref: "docker".to_string(),
-                    observed_kind_version: "2".to_string(),
-                    started_at: ts(30),
-                    message: None,
-                };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
-                (before, after)
-            },
-        },
-        LifecycleCase {
-            name: "vessel ready",
-            kind: PatchKind::VesselMarkReady,
-            exercise: || {
-                let mut status =
-                    VesselStatus { phase: VesselPhase::Ready, started_at: Some(ts(10)), ready_at: Some(ts(20)), ..VesselStatus::default() };
-                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
-                let patch = VesselStatusPatch::MarkReady {
-                    image: None,
-                    configured_limits: None,
-                    placement_decision: None,
-                    environment_ref: Some("env-a".to_string()),
-                    image_ref: Some("registry.example/crew:latest".to_string()),
-                    local_image_id: Some("sha256:test-image".to_string()),
-                    registry_digest: None,
-                    checkout_refs: Default::default(),
-                    terminal_session_refs: Vec::new(),
-                    requested_stance: Stance::WorkspaceWrite,
-                    effective_stance: Stance::Contained,
-                    ready_at: ts(30),
-                };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
-                (before, after)
-            },
-        },
-        LifecycleCase {
-            name: "landing credentials staged",
-            kind: PatchKind::VesselStageLandingCredentials,
-            exercise: || {
-                let mut status =
-                    VesselStatus { phase: VesselPhase::Ready, started_at: Some(ts(10)), ready_at: Some(ts(20)), ..VesselStatus::default() };
-                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
-                let patch = VesselStatusPatch::StageLandingCredentials {
-                    credentials: BTreeMap::from([(
-                        "landing".to_string(),
-                        LandingCredentialScope::Branch {
-                            repository: RepositoryKey("github.com-org-repo".to_string()),
-                            branch: "topic".to_string(),
-                        },
-                    )]),
-                };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
-                (before, after)
-            },
-        },
-        LifecycleCase {
             name: "Message continuation queued",
             kind: PatchKind::ConvoyQueueMessageFollowUp,
             exercise: || {
@@ -940,22 +669,6 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                     phase: WorkPhase::Running,
                     transitioned_at: ts(30),
                     message: None,
-                };
-                apply_and_replay(&mut status, &patch);
-                (before, work_timestamps(&status))
-            },
-        },
-        LifecycleCase {
-            name: "work provisioning retry",
-            kind: PatchKind::ConvoyWorkProvisioningRetry,
-            exercise: || {
-                let mut status = settled_convoy_status();
-                status.phase = ConvoyPhase::Landing;
-                let before = work_timestamps(&status);
-                let patch = ConvoyStatusPatch::WorkProvisioningRetry {
-                    work: "implement".into(),
-                    retry: flotilla_resources::ControllerRetry::retryable(None, ts(30), flotilla_resources::PROVISIONING_RETRY_BACKOFF),
-                    message: "skill staging failed".into(),
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, work_timestamps(&status))
@@ -1062,8 +775,8 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                         subject_revision: "abc123".to_string(),
                         evidence_at: ts(30),
                         judged_claim_at: ts(20),
+                        owes: true,
                         outcome: TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, delivered_at: ts(30) },
-                        sender: Default::default(),
                     },
                     vessel: "implement".to_string(),
                     role: "coder".to_string(),
@@ -1073,22 +786,6 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                 (before, convoy_timestamps(&status))
             },
         },
-        LifecycleCase {
-            name: "terminal session revived after a false loss",
-            kind: PatchKind::TerminalMarkRevived,
-            exercise: || {
-                let mut status = TerminalSessionStatus {
-                    phase: TerminalSessionPhase::Lost,
-                    started_at: Some(ts(10)),
-                    stopped_at: Some(ts(20)),
-                    ..TerminalSessionStatus::default()
-                };
-                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                apply_and_replay(&mut status, &TerminalSessionStatusPatch::MarkRevived);
-                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                (before, after)
-            },
-        },
     ];
 
     assert_case_coverage(LifecycleClass::Continuation, &cases);
@@ -1096,43 +793,6 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
         let (before, after) = (case.exercise)();
         assert_eq!(after.started_at, before.started_at, "{} continuation must keep started_at", case.name);
         assert_eq!(after.finished_at, None, "{} continuation must clear finished_at", case.name);
-    }
-}
-
-#[test]
-fn new_attempt_transitions_replace_attempt_timestamps() {
-    let cases = [LifecycleCase {
-        name: "terminal session restart",
-        kind: PatchKind::TerminalMarkStarting,
-        exercise: || {
-            let mut status = TerminalSessionStatus {
-                phase: TerminalSessionPhase::Stopped,
-                started_at: Some(ts(10)),
-                stopped_at: Some(ts(20)),
-                ..TerminalSessionStatus::default()
-            };
-            let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-            apply_and_replay(&mut status, &TerminalSessionStatusPatch::MarkStarting);
-            let patch = TerminalSessionStatusPatch::MarkRunning {
-                configured_limits: None,
-                session_id: "session-b".to_string(),
-                pid: Some(43),
-                started_at: ts(30),
-                crew: None,
-                launch_command: "bash".to_string(),
-                delivered_message_id: None,
-            };
-            apply_and_replay(&mut status, &patch);
-            let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-            (before, after)
-        },
-    }];
-
-    assert_case_coverage(LifecycleClass::NewAttempt, &cases);
-    for case in &cases {
-        let (before, after) = (case.exercise)();
-        assert_ne!(after.started_at, before.started_at, "{} new attempt must replace its start timestamp", case.name);
-        assert_eq!(after.finished_at, None, "{} new attempt must clear its finish timestamp", case.name);
     }
 }
 
@@ -1317,8 +977,8 @@ fn ledger_admission_digest_survives_duplicates_and_resets_for_new_turns(tc: hege
                 subject_revision: "new-head".into(),
                 evidence_at: ts(40),
                 judged_claim_at: ts(20),
+                owes: true,
                 outcome: TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, delivered_at: ts(40) },
-                sender: Default::default(),
             },
             vessel: "implement".into(),
             role: "coder".into(),
@@ -1345,7 +1005,7 @@ fn suppressed_message_admission_does_not_open_another_workflow_turn() {
         subject_revision: "head".into(),
         evidence_at: ts(30),
         judged_claim_at: ts(20),
-        sender: Default::default(),
+        owes: true,
         outcome: TurnDeliveryOutcome::MessageAccepted {
             new_turn: false,
             message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "canonical"),

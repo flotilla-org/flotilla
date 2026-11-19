@@ -692,8 +692,8 @@ mod reference;
 mod tests {
     use std::sync::Mutex;
 
+    use flotilla_provisioning_testkit::EngineBackend;
     use flotilla_resources::{ProjectRepositorySpec, RepositoryKey};
-    use flotilla_store_memory::InMemoryBackend;
     use hegel::generators as gs;
 
     use super::*;
@@ -720,8 +720,8 @@ mod tests {
     fn reader(files: BTreeMap<String, String>) -> MemoryReader {
         MemoryReader { files, layer: None, revision: "commit-b".into(), reads: Mutex::default(), layer_reads: Mutex::default() }
     }
-    fn backend() -> ResourceBackend {
-        ResourceBackend::new(InMemoryBackend::default())
+    fn backend() -> EngineBackend {
+        EngineBackend::open("home")
     }
 
     // #2777 review: the fetch budget is independent of the document budget,
@@ -866,6 +866,11 @@ mod tests {
                 &flotilla_resources::InputMeta::builder()
                     .name(primary.resource_name())
                     .labels(BTreeMap::from([(flotilla_resources::MANAGED_BY_LABEL.to_string(), PROJECT_IMAGE_MANAGER.to_string())]))
+                    // Stamped as the project image writer stamps a layer it materializes.
+                    .annotations(BTreeMap::from([
+                        (flotilla_resources::definition_provenance::MATERIALIZED_PROJECT_ANNOTATION.to_string(), "app".to_string()),
+                        (flotilla_resources::definition_provenance::SOURCE_COMMIT_ANNOTATION.to_string(), "commit-a".to_string()),
+                    ]))
                     .build(),
                 &primary.into(),
             )

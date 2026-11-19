@@ -2,31 +2,27 @@
 //! moves. Each layer that moves a plain kind adds one `#[hegel::test]` calling [`contract`] with
 //! a generator of its specs.
 
-use std::{
-    collections::BTreeMap,
-    fmt::Debug,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, fmt::Debug, sync::Arc};
 
 use flotilla_engine_store::{
     plain::{register_plain, PendingChange, Plain, PlainError, PlainLog},
     rehearse_plain,
 };
 use flotilla_schema::{Kind, KindRegistry, NewChange, Stored, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
 const HOME: &str = "alpha";
 const REPLICA: &str = "beta";
 
-fn open(home: &str, kinds: &KindRegistry) -> Arc<Mutex<Store>> {
-    Arc::new(Mutex::new(Store::open(Connection::open_in_memory().expect("SQLite"), home, kinds.clone()).expect("store")))
+fn open(home: &str, kinds: &KindRegistry) -> Arc<StoreHandle> {
+    Arc::new(StoreHandle::new(Store::open(Connection::open_in_memory().expect("SQLite"), home, kinds.clone()).expect("store")))
 }
 
 /// Applies every entry the home logged after `after` at the replica, each after its change, as the
 /// change stream does, and returns the last sequence applied.
-fn follow(home: &Arc<Mutex<Store>>, replica: &Arc<Mutex<Store>>, after: u64) -> u64 {
+fn follow(home: &Arc<StoreHandle>, replica: &Arc<StoreHandle>, after: u64) -> u64 {
     let (events, changes) = {
         let mut home = home.lock().expect("home");
         let mut read = home.read().expect("read");
@@ -256,6 +252,37 @@ fn a_follower_names_written_resources_and_rescans_after_a_snapshot() {
     assert_eq!(pass(&mut follower), vec![Followed::Rescan(HOME.into())], "a snapshot leaves no entries to read");
 }
 
+// Behaviour: a follower of the store's own home passes over an empty change (a reserved launch
+// number, which moves the home's sequence and logs nothing) without a rescan, whether the pass
+// comes before or after the next write.
+#[test]
+fn a_follower_of_its_own_home_passes_over_an_empty_change() {
+    use flotilla_engine_store::follow::{Followed, Follower};
+    use flotilla_schema::Identity;
+    let mut kinds = KindRegistry::new();
+    register_plain::<Sample>(&mut kinds).expect("register");
+    let home = open(HOME, &kinds);
+    let log = PlainLog::new(Arc::clone(&home));
+    let spec = Sample { title: "a".into(), owner: "b".into(), limit: None, tags: Vec::new() };
+    let homes = [HOME.to_owned()];
+    let mut follower = Follower::new([<Sample as Kind>::CODE]);
+    let pass = |follower: &mut Follower| follower.pass(&mut home.lock().expect("home").read().expect("read"), &homes).expect("pass");
+    let reserve = || {
+        let mut store = home.lock().expect("home");
+        let mut write = store.write().expect("write");
+        write.open_change(&NewChange::new("writer", Timestamp::from_micros(1))).expect("empty change");
+        write.commit().expect("commit");
+    };
+    let named = |name: &str| Followed::Changed(Identity { kind: <Sample as Kind>::CODE, name: name.into(), home: HOME.into() });
+    log.create("one", &spec, &change(1)).expect("create");
+    assert_eq!(pass(&mut follower), vec![Followed::Rescan(HOME.into())], "a home first seen is rescanned");
+    reserve();
+    assert_eq!(pass(&mut follower), Vec::new(), "the empty change at the end of the log names nothing");
+    reserve();
+    log.create("two", &spec, &change(2)).expect("create");
+    assert_eq!(pass(&mut follower), vec![named("two")], "an empty change before a write names only the write");
+}
+
 // Behaviour (#4024): a joining change is one change for every write of one reason; another writer's
 // change naming the same record in between starts a new one; an unchanged record declared again
 // is written under the new change by `touch`, and `last_change` names it.
@@ -291,4 +318,34 @@ fn joining_touch_and_last_change() {
     assert_eq!(log.get::<Sample>("one", HOME).expect("get").expect("held").spec, spec, "a touch changes no field");
     assert_eq!(log.last_change::<Sample>("one", HOME).expect("read").expect("changed").seq, third.seq, "joined the newest");
     assert_eq!(log.last_change::<Sample>("absent", HOME).expect("read"), None);
+}
+
+// Behaviour (#3108): a create that joins an earlier change is created at its own time, not the
+// joined change's, and its create entry carries that time, so a replica reads the same.
+#[test]
+fn a_create_joining_an_earlier_change_is_created_at_its_own_time() {
+    use flotilla_schema::{ChangeItem, CreatedAt, Identity};
+    let mut kinds = KindRegistry::new();
+    register_plain::<Sample>(&mut kinds).expect("register");
+    let (home, replica) = (open(HOME, &kinds), open(REPLICA, &kinds));
+    let log = PlainLog::new(Arc::clone(&home));
+    let spec = Sample { title: "a".into(), owner: "b".into(), limit: None, tags: Vec::new() };
+    let root = Identity { kind: <Sample as Kind>::CODE, name: "root".into(), home: HOME.into() };
+    let reason = |at: i64| {
+        PendingChange::joining(
+            NewChange::new("manifest", Timestamp::from_micros(at))
+                .with_items([ChangeItem { record: root.clone(), revision: Some("r1".into()) }]),
+        )
+    };
+    log.create("one", &spec, &reason(1)).expect("one");
+    log.create("two", &spec, &reason(2)).expect("two");
+    let joined = log.last_change::<Sample>("two", HOME).expect("read").expect("changed");
+    assert_eq!(joined.seq, log.last_change::<Sample>("one", HOME).expect("read").expect("changed").seq, "one change");
+    assert_eq!(log.created::<Sample>("one", HOME).expect("one"), CreatedAt::from(Timestamp::from_micros(1)));
+    assert_eq!(log.created::<Sample>("two", HOME).expect("two"), CreatedAt::from(Timestamp::from_micros(2)), "its own time");
+
+    follow(&home, &replica, 0);
+    let mirror = PlainLog::new(replica);
+    assert_eq!(mirror.created::<Sample>("one", HOME).expect("one"), CreatedAt::from(Timestamp::from_micros(1)));
+    assert_eq!(mirror.created::<Sample>("two", HOME).expect("two"), CreatedAt::from(Timestamp::from_micros(2)), "as the home");
 }

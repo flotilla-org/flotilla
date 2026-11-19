@@ -18,7 +18,11 @@ use flotilla_resources::{
     pinned_workflow_ref, Clock, Convoy, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, Project, ProjectStatusPatch,
     ReadWatchEvent, ResolvedIssueSourceBinding, ResourceError, ResourceObject, SystemClock,
 };
-use flotilla_store::{apply_status_patch, load_metrics::HistogramSnapshot, load_metrics::LatencyHistogram, ResourceBackend};
+use flotilla_store::{
+    apply_status_patch,
+    load_metrics::{DispatchWait, HistogramSnapshot, LatencyHistogram},
+    ResourceBackend,
+};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tracing::{info, warn};
 
@@ -54,11 +58,13 @@ struct PassIssueReads {
     issues: BTreeMap<IssueRef, Result<Issue, String>>,
 }
 
+type DispatchHistogram = LatencyHistogram<DispatchWait>;
+
 /// Time from ready to dispatch, by Project and workflow, for this process. Never evicted: both keys
 /// are operator-authored names, a small set.
 #[derive(Debug, Default)]
 pub(crate) struct DispatchMetrics {
-    time_from_ready: std::sync::Mutex<BTreeMap<(String, String), Arc<LatencyHistogram>>>,
+    time_from_ready: std::sync::Mutex<BTreeMap<(String, String), Arc<DispatchHistogram>>>,
 }
 
 impl DispatchMetrics {
@@ -182,6 +188,8 @@ pub(crate) struct ReconcilePass {
     pub blocked: usize,
     pub dispatches_observed: usize,
     pub project_errors: usize,
+    /// When a queue goes stale and needs attention, if no change comes first.
+    pub next_due: Option<DateTime<Utc>>,
 }
 
 pub(crate) struct DispatchReconciler {
@@ -220,9 +228,7 @@ impl DispatchReconciler {
         let convoy_error = self.refresh_convoys(&mut mission).await.err();
         let mut project_convoys = ProjectConvoys::new();
         for convoy in mission.convoys.values() {
-            if let Some(project) = &convoy.spec.project_ref {
-                project_convoys.entry(project.clone()).or_default().push(convoy.clone());
-            }
+            project_convoys.entry(convoy.spec.project_ref.clone()).or_default().push(convoy.clone());
         }
         let local = self.backend.local_root().map_err(|e| e.to_string())?;
         let mut homes = BTreeMap::new();
@@ -284,6 +290,7 @@ impl DispatchReconciler {
                     total.queued += outcome.queued;
                     total.blocked += outcome.blocked;
                     total.dispatches_observed += outcome.dispatches_observed;
+                    total.next_due = total.next_due.into_iter().chain(outcome.next_due).min();
                 }
                 Err(error) => {
                     warn!(project = %project.metadata.name, %error, "dispatch reconciliation failed for project; continuing pass");
@@ -447,7 +454,8 @@ impl DispatchReconciler {
             .map_err(|error| error.to_string())?;
         }
 
-        Ok(ReconcilePass { queued: queue.len(), blocked, dispatches_observed, ..ReconcilePass::default() })
+        let next_due = dispatch_queue_stale_since(&queue, policy).filter(|stale_since| *stale_since > now);
+        Ok(ReconcilePass { queued: queue.len(), blocked, dispatches_observed, next_due, ..ReconcilePass::default() })
     }
 
     async fn cached_facts(&self, reference: &IssueRef, reads: &mut PassIssueReads) -> Result<DispatchIssueFacts, String> {
@@ -497,14 +505,10 @@ impl DispatchReconciler {
                         continue;
                     }
                     if let Some(previous) = state.convoys.remove(&name) {
-                        if let Some(project) = &previous.spec.project_ref {
-                            state.occupancy.remove(project);
-                        }
+                        state.occupancy.remove(&previous.spec.project_ref);
                     }
                     if let Some(object) = object {
-                        if let Some(project) = &object.spec.project_ref {
-                            state.occupancy.remove(project);
-                        }
+                        state.occupancy.remove(&object.spec.project_ref);
                         state.convoys.insert(name, Arc::new(object));
                     }
                 }
@@ -571,6 +575,12 @@ impl DispatchReconciler {
     }
 }
 
+fn dispatch_queue_stale_since(queue: &[DispatchQueueEntry], policy: &DispatchPolicy) -> Option<DateTime<Utc>> {
+    let oldest = queue.iter().map(|entry| entry.ready_observed_at).min()?;
+    let threshold = i64::try_from(policy.stale_after_seconds).unwrap_or(i64::MAX);
+    Some(oldest.checked_add_signed(Duration::seconds(threshold)).unwrap_or(DateTime::<Utc>::MAX_UTC))
+}
+
 fn dispatch_queue_attention(
     queue: &[DispatchQueueEntry],
     policy: &DispatchPolicy,
@@ -578,8 +588,7 @@ fn dispatch_queue_attention(
     now: DateTime<Utc>,
 ) -> Option<DispatchQueueAttention> {
     let oldest = queue.iter().map(|entry| entry.ready_observed_at).min()?;
-    let threshold = i64::try_from(policy.stale_after_seconds).unwrap_or(i64::MAX);
-    let stale_since = oldest.checked_add_signed(Duration::seconds(threshold)).unwrap_or(DateTime::<Utc>::MAX_UTC);
+    let stale_since = dispatch_queue_stale_since(queue, policy)?;
     (now >= stale_since).then(|| {
         let observed_at = previous
             .filter(|attention| {
@@ -594,9 +603,9 @@ fn dispatch_queue_attention(
 mod tests {
     use std::{collections::HashMap, sync::Mutex};
 
+    use flotilla_engine_convoys_testkit::{single_agent, EngineHome};
     use flotilla_protocol::IssueSource;
     use flotilla_resources::ConvoyIssue;
-    use flotilla_resources::ConvoyPhase;
     use flotilla_resources::ConvoySpec;
     use flotilla_resources::InputMeta;
     use flotilla_resources::InputValue;
@@ -604,6 +613,8 @@ mod tests {
     use flotilla_resources::ProjectSpec;
     use flotilla_resources::RepositoryKey;
     use flotilla_store_testkit::VirtualClock;
+
+    use crate::testkits::engine::engine;
 
     use super::*;
 
@@ -763,12 +774,43 @@ mod tests {
         );
     }
 
+    /// Waits until `wake` is told of a convoy change, as the daemon's dispatch task is woken
+    /// before it runs a pass.
+    async fn told(wake: &mut (impl futures::Stream<Item = Result<ReadWatchEvent<Convoy>, ResourceError>> + Unpin)) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), wake.next())
+            .await
+            .expect("told of the convoy in time")
+            .expect("watching convoys")
+            .expect("a convoy change");
+    }
+
+    /// Waits until the watch tells of `launch`, ended or live as `ended` says.
+    async fn told_of(
+        wake: &mut (impl futures::Stream<Item = Result<ReadWatchEvent<Convoy>, ResourceError>> + Unpin),
+        launch: &str,
+        ended: bool,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = wake.next().await.expect("watching convoys").expect("a convoy change");
+                if let ReadWatchEvent::Added(record) | ReadWatchEvent::Modified(record) = event {
+                    let terminal = record.object.status.as_ref().is_some_and(|status| status.phase.is_terminal());
+                    if record.object.metadata.name == launch && terminal == ended {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("told of the convoy in time");
+    }
+
     async fn harness(
         ready: Vec<Issue>,
         blockers: Vec<Issue>,
         policy: DispatchPolicy,
-    ) -> (ResourceBackend, Arc<FakeIssues>, Arc<VirtualClock>, DispatchReconciler) {
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    ) -> (EngineHome, Arc<FakeIssues>, Arc<VirtualClock>, DispatchReconciler) {
+        let backend = EngineHome::open_in("dispatch-home", NAMESPACE);
         backend
             .clone()
             .using::<Project>(NAMESPACE)
@@ -815,7 +857,7 @@ mod tests {
             failing_refs: Mutex::new(Default::default()),
         });
         let clock = Arc::new(VirtualClock::new("2026-08-04T12:00:00Z".parse().expect("clock timestamp")));
-        let reconciler = DispatchReconciler::new(backend.clone(), NAMESPACE, Arc::clone(&issues) as Arc<dyn DispatchIssueSource>)
+        let reconciler = DispatchReconciler::new(backend.backend().clone(), NAMESPACE, Arc::clone(&issues) as Arc<dyn DispatchIssueSource>)
             .with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
         (backend, issues, clock, reconciler)
     }
@@ -825,7 +867,6 @@ mod tests {
     // occupancy independently of graph topology and preserve readiness aging.
     #[tokio::test]
     async fn pass_inventories_and_convoy_deltas_have_bounded_work() {
-        use flotilla_resources::ConvoyStatus;
         let (backend, issues, clock, reconciler) = harness(vec![issue("1", &["ready"], None, IssueState::Open)], vec![], policy(60)).await;
         let spec = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").spec;
         for id in 0..12 {
@@ -848,43 +889,34 @@ mod tests {
             assert_eq!(state.occupancy_rebuilds, 13);
             assert_eq!(state.convoy_lists, 1);
         }
-        let convoys = backend.using::<Convoy>(NAMESPACE);
-        convoys
-            .create(
-                &InputMeta::builder().name("watched".into()).build(),
-                &ConvoySpec::builder().workflow_ref("implement".into()).project_ref("widgets".into()).build(),
-            )
-            .await
-            .expect("convoy add");
+        // A launch's project is fixed at its admission and a launch is never deleted (#3108): a
+        // move is one launch ending and another admitted on the destination, and an update is a
+        // landing. Once retirement lands, a retire step here counts one more occupancy update.
+        let mut wake = backend.including_replicas::<Convoy>(NAMESPACE).watch().await.expect("watch convoys");
+        let on = |project: &str| ConvoySpec::builder().workflow_ref("implement".into()).project_ref(project.into()).build();
+        let watched = backend.admit("watched", on("widgets"), single_agent("coder")).await;
+        told_of(&mut wake, &watched, false).await;
         reconciler.reconcile_once().await.expect("add pass");
         assert_eq!(reconciler.mission.lock().await.occupancy_rebuilds, 14);
         let widgets = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("widgets").status.expect("status");
         assert_eq!(widgets.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 1);
-        let mut moved = convoys.get("watched").await.expect("convoy");
-        moved.spec.project_ref = Some("overlap-0".into());
-        convoys.update(&InputMeta::from(&moved.metadata), &moved.metadata.resource_version, &moved.spec).await.expect("move convoy");
+        let ended = backend.convoy(&watched).await;
+        backend.convoys.path().get().expect("the Convoy path").abandon(&ended, "operator", "abandoned").await.expect("end the launch");
+        told_of(&mut wake, &watched, true).await;
+        let moved = backend.admit("moved", on("overlap-0"), single_agent("coder")).await;
+        told_of(&mut wake, &moved, false).await;
         reconciler.reconcile_once().await.expect("move pass");
         assert_eq!(reconciler.mission.lock().await.occupancy_rebuilds, 16, "old and new scopes each update once");
         let widgets = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("widgets").status.expect("status");
         let moved_project = backend.using::<Project>(NAMESPACE).get("overlap-0").await.expect("destination").status.expect("status");
         assert_eq!(widgets.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 0);
         assert_eq!(moved_project.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 1);
-        let current = convoys.get("watched").await.expect("convoy");
-        convoys
-            .update_status(
-                "watched",
-                &current.metadata.resource_version,
-                &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
-            )
-            .await
-            .expect("convoy update");
+        flotilla_engine_convoys_testkit::land(&backend.convoys.path(), &backend.convoy(&moved).await).await;
+        told_of(&mut wake, &moved, true).await;
         reconciler.reconcile_once().await.expect("update pass");
-        assert_eq!(reconciler.mission.lock().await.occupancy_rebuilds, 17);
-        convoys.delete("watched").await.expect("convoy remove");
-        reconciler.reconcile_once().await.expect("remove pass");
         {
             let state = reconciler.mission.lock().await;
-            assert_eq!(state.occupancy_rebuilds, 18);
+            assert_eq!(state.occupancy_rebuilds, 17);
             assert_eq!(state.boards.rebuilds(), 13);
             assert_eq!(state.convoy_lists, 1);
         }
@@ -924,15 +956,11 @@ mod tests {
         let (home, issues, _, reconciler) = harness(vec![issue("1", &["ready"], None, IssueState::Open)], Vec::new(), policy(3600)).await;
         let project = home.using::<Project>(NAMESPACE).get("widgets").await.unwrap();
         for root in ["second-reconciler", "third-reconciler"] {
-            let other = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())
-                .with_local_root(flotilla_protocol::NodeId::new(root));
-            other.using::<Project>(NAMESPACE).create(&InputMeta::builder().name("widgets".into()).build(), &project.spec).await.unwrap();
-            other
-                .replica_writer::<Project>(home.local_root().unwrap(), NAMESPACE)
-                .replace(&home.using::<Project>(NAMESPACE).list().await.unwrap(), Utc::now())
-                .await
-                .unwrap();
-            let pass = DispatchReconciler::new(other, NAMESPACE, issues.clone()).reconcile_once().await.unwrap();
+            let other = EngineHome::open_in(root, NAMESPACE);
+            home.replicate_to(&other);
+            let replicated = other.including_replicas::<Project>(NAMESPACE).get("widgets").await.unwrap();
+            assert_eq!(replicated.object.spec, project.spec, "the home's Project replicated");
+            let pass = DispatchReconciler::new(other.backend().clone(), NAMESPACE, issues.clone()).reconcile_once().await.unwrap();
             assert_eq!(pass, ReconcilePass::default());
             assert_eq!(*issues.ready_calls.lock().unwrap(), 0);
         }
@@ -979,8 +1007,10 @@ mod tests {
         let mut boards = issues.boards(&backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project")).await.expect("board");
         boards[0].issues.push(tracking);
         *issues.board_override.lock().expect("board") = Some(boards.clone());
-        reconciler.reconcile_once().await.expect("first pass");
+        let pass = reconciler.reconcile_once().await.expect("first pass");
         let first = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        // Without a change, the pass is due again when the queue goes stale.
+        assert_eq!(pass.next_due, Some(first.dispatch_queue[0].ready_observed_at + Duration::seconds(60)));
         let score = first.dispatch_queue[0].score.as_ref().expect("score");
         assert_eq!(f64::from(score.attributes.weight), 2.0);
         assert_eq!(score.attributes.priority, flotilla_protocol::Priority::High);
@@ -989,7 +1019,8 @@ mod tests {
         boards[0].issues.last_mut().expect("tracking").mission_fields.weight = Some(7.5.try_into().expect("value"));
         *issues.board_override.lock().expect("board") = Some(boards);
         clock.advance(Duration::seconds(60));
-        reconciler.reconcile_once().await.expect("re-rank pass");
+        let pass = reconciler.reconcile_once().await.expect("re-rank pass");
+        assert_eq!(pass.next_due, None, "attention raised");
         let second = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
         assert_eq!(second.dispatch_queue[0].ready_observed_at, first.dispatch_queue[0].ready_observed_at);
         let score = second.dispatch_queue[0].score.as_ref().expect("score");
@@ -1074,12 +1105,11 @@ mod tests {
         reconciler.reconcile_once().await.expect("queue pass");
         let ready_at = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue[0]
             .ready_observed_at;
-        let convoy = backend
-            .clone()
-            .using::<Convoy>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name("human-dispatch".to_string()).build(),
-                &ConvoySpec {
+        let mut wake = backend.including_replicas::<Convoy>(NAMESPACE).watch().await.expect("watch convoys");
+        let launch = backend
+            .admit(
+                "human-dispatch",
+                ConvoySpec {
                     continuation: None,
                     subjects: Vec::new(),
                     role: String::new(),
@@ -1090,7 +1120,7 @@ mod tests {
                     placement_policy: Some("docker-local".to_string()),
                     repositories: Vec::new(),
                     r#ref: Some("fix-2".to_string()),
-                    project_ref: Some("widgets".to_string()),
+                    project_ref: "widgets".to_string(),
                     adopted_checkout_refs: Default::default(),
                     issues: vec![ConvoyIssue {
                         reference: ready.reference.clone(),
@@ -1107,9 +1137,11 @@ mod tests {
                     instruction: None,
                     promises: Vec::new(),
                 },
+                single_agent("coder"),
             )
-            .await
-            .expect("manual convoy");
+            .await;
+        told(&mut wake).await;
+        let convoy = backend.convoy(&launch).await;
         clock.advance(Duration::seconds(90));
 
         let outcome = reconciler.reconcile_once().await.expect("dispatch pass");
@@ -1133,25 +1165,12 @@ mod tests {
         let expected = convoy.metadata.creation_timestamp.signed_duration_since(ready_at).to_std().expect("dispatched after ready");
         assert_eq!(timed(&metrics), (1, u64::try_from(expected.as_micros()).expect("micros")));
         // Only live convoys serve an issue; terminal history cannot suppress a
-        // reopened/retriaged issue forever. Every lifecycle phase is covered.
-        use flotilla_resources::ConvoyStatus;
-        let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-        for phase in [
-            ConvoyPhase::Pending,
-            ConvoyPhase::Active,
-            ConvoyPhase::Interrupted,
-            ConvoyPhase::Landing,
-            ConvoyPhase::Landed,
-            ConvoyPhase::Failed,
-            ConvoyPhase::Abandoned,
-        ] {
-            let current = convoys.get("human-dispatch").await.expect("convoy");
-            convoys
-                .update_status("human-dispatch", &current.metadata.resource_version, &ConvoyStatus { phase, ..Default::default() })
-                .await
-                .expect("phase");
-            assert_eq!(reconciler.reconcile_once().await.expect("phase pass").queued, usize::from(phase.is_terminal()));
-        }
+        // reopened/retriaged issue forever. Which phases are terminal is
+        // ConvoyPhase's own mapping; here the launch lives, then ends.
+        assert_eq!(reconciler.reconcile_once().await.expect("live pass").queued, 0);
+        backend.convoys.path().get().expect("the Convoy path").abandon(&convoy, "operator", "abandoned").await.expect("end the launch");
+        told_of(&mut wake, &launch, true).await;
+        assert_eq!(reconciler.reconcile_once().await.expect("ended pass").queued, 1);
         assert_eq!(timed(&metrics).0, 1);
     }
 
@@ -1161,12 +1180,11 @@ mod tests {
         let waiting = issue("3", &[READY_ISSUE_LABEL], None, IssueState::Open);
         let (backend, issues, clock, reconciler) = harness(vec![dispatched.clone(), waiting.clone()], vec![], policy(60)).await;
         reconciler.reconcile_once().await.expect("queue pass");
+        let mut wake = backend.including_replicas::<Convoy>(NAMESPACE).watch().await.expect("watch convoys");
         backend
-            .clone()
-            .using::<Convoy>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name("missing-workflow-dispatch".to_string()).build(),
-                &ConvoySpec {
+            .admit(
+                "missing-workflow-dispatch",
+                ConvoySpec {
                     continuation: None,
                     subjects: Vec::new(),
                     role: String::new(),
@@ -1177,7 +1195,7 @@ mod tests {
                     placement_policy: None,
                     repositories: Vec::new(),
                     r#ref: Some("fix-2".to_string()),
-                    project_ref: Some("widgets".to_string()),
+                    project_ref: "widgets".to_string(),
                     adopted_checkout_refs: Default::default(),
                     issues: vec![ConvoyIssue {
                         reference: dispatched.reference,
@@ -1194,9 +1212,10 @@ mod tests {
                     instruction: None,
                     promises: Vec::new(),
                 },
+                single_agent("coder"),
             )
-            .await
-            .expect("manual convoy");
+            .await;
+        told(&mut wake).await;
         clock.advance(Duration::seconds(60));
 
         let outcome = reconciler.reconcile_once().await.expect("dispatch pass");
@@ -1455,5 +1474,144 @@ mod tests {
             );
             assert!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.is_empty());
         });
+    }
+
+    /// A forge whose issue "1" carries the ready label once `ready` is set; its board and ready
+    /// query both say so.
+    #[derive(Default)]
+    struct LabelForge {
+        ready: std::sync::atomic::AtomicBool,
+    }
+
+    impl LabelForge {
+        fn issue(&self, reference: IssueRef) -> Issue {
+            let labels = if self.ready.load(std::sync::atomic::Ordering::SeqCst) { vec![READY_ISSUE_LABEL.to_string()] } else { vec![] };
+            Issue::builder()
+                .reference(reference)
+                .title("Widget".into())
+                .labels(labels)
+                .state(IssueState::Open)
+                .as_of(Utc::now())
+                .provider_name("test".into())
+                .provider_display_name("Test".into())
+                .build()
+        }
+    }
+
+    #[async_trait]
+    impl flotilla_issue_tracker::IssueProvider for LabelForge {
+        fn supports(&self, _: &IssueSource) -> bool {
+            true
+        }
+        fn board_includes_mission_fields(&self) -> bool {
+            true
+        }
+        async fn query(
+            &self,
+            source: &IssueSource,
+            _: &IssueQuery,
+            _: u32,
+            _: usize,
+        ) -> Result<flotilla_protocol::issue_query::IssueResultPage, String> {
+            let issue = self.issue(IssueRef { source: source.clone(), id: "1".into() });
+            let items = if issue.labels.is_empty() { vec![] } else { vec![issue] };
+            Ok(flotilla_protocol::issue_query::IssueResultPage { total: Some(items.len() as u32), items, has_more: false })
+        }
+        async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String> {
+            Ok(self.issue(reference.clone()))
+        }
+        async fn dispatch_facts(&self, _: &IssueRef) -> Result<DispatchIssueFacts, String> {
+            Ok(DispatchIssueFacts::default())
+        }
+        async fn list_changed_since(&self, _: &IssueSource, _: &str, _: usize) -> Result<flotilla_protocol::IssueChangeset, String> {
+            Ok(flotilla_protocol::IssueChangeset { updated: vec![], closed: vec![], has_more: false })
+        }
+        async fn open_in_browser(&self, _: &IssueRef) -> Result<(), String> {
+            unreachable!("no browser")
+        }
+        async fn dispatch_board(&self, source: &IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
+            let issue = self.issue(IssueRef { source: source.clone(), id: "1".into() });
+            Ok(flotilla_protocol::DispatchBoardRepository {
+                source: source.clone(),
+                observed_at: Utc::now(),
+                age_seconds: 0,
+                refresh_error: None,
+                issues: vec![flotilla_protocol::DispatchBoardIssue::builder()
+                    .id("1".into())
+                    .title(issue.title)
+                    .state(IssueState::Open)
+                    .url("https://github.com/acme/widgets/issues/1".into())
+                    .updated_at(String::new())
+                    .labels(issue.labels)
+                    .blocked_by(vec![])
+                    .pull_requests(vec![])
+                    .build()],
+                pull_requests: vec![],
+            })
+        }
+    }
+
+    // The ready query is cached for a minute, and is read after the board. A board change marks
+    // it out of date, so the pass the change wakes decides on the new label rather than the old one.
+    #[tokio::test(start_paused = true)]
+    async fn a_board_change_makes_the_pass_read_the_new_ready_label() {
+        let temp = tempfile::tempdir().expect("config");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"dispatch-wake-test\"\n").expect("daemon config");
+        let backend = flotilla_store_memory::engine_home_backend();
+        let clock = Arc::new(VirtualClock::new(Utc::now()));
+        let forge = Arc::new(LabelForge::default());
+        let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
+            Vec::new(),
+            Arc::new(flotilla_config::ConfigStore::with_base(temp.path())),
+            flotilla_discovery_testkit::fake_discovery_with_provider_set(
+                flotilla_discovery_testkit::FakeDiscoveryProviders::default().with_issue_tracker(forge.clone()),
+            ),
+            flotilla_protocol::HostName::new("test-host"),
+            backend.clone(),
+            clock.clone(),
+            Arc::new(crate::peer::HostPeerOverlay::default()),
+        )
+        .await;
+        // Composed with its engine, as the runtime composes a daemon.
+        engine(&daemon);
+        backend
+            .using::<Project>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name("widgets".to_string()).build(),
+                &ProjectSpec::builder()
+                    .display_name("Widgets".to_string())
+                    .issue_source_bindings(vec![flotilla_resources::IssueSourceBindingSpec::builder()
+                        .source(source())
+                        .alias("widgets".to_string())
+                        .build()])
+                    .dispatch_policy(DispatchPolicy::builder().stale_after_seconds(3600).build())
+                    .build(),
+            )
+            .await
+            .expect("project");
+        let reconciler = DispatchReconciler::new(
+            backend.clone(),
+            NAMESPACE,
+            Arc::new(DaemonDispatchIssueSource::new(Arc::clone(&daemon))) as Arc<dyn DispatchIssueSource>,
+        );
+        let mut changes = daemon.dispatch_board_changes();
+        let queue =
+            || async { backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue };
+
+        // The first pass enrols the source; its first observation is a change.
+        reconciler.reconcile_once().await.expect("cold pass");
+        changes.changed().await.expect("first board observation");
+        clock.advance(Duration::seconds(10));
+        reconciler.reconcile_once().await.expect("unready pass");
+        assert!(queue().await.is_empty());
+
+        // The label lands. The board's next refresh, a minute on, sees it while the ready query
+        // read ten seconds after the board is still within its minute.
+        forge.ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        clock.advance(Duration::seconds(50));
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        changes.changed().await.expect("board change");
+        reconciler.reconcile_once().await.expect("woken pass");
+        assert_eq!(queue().await.iter().map(|entry| entry.issue.id.as_str()).collect::<Vec<_>>(), vec!["1"]);
     }
 }

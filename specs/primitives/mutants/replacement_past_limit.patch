@@ -1,10 +1,10 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -212,7 +212,6 @@
-           else Moved(Open(nextGeneration(w)))
-       | ReplaceSeat(seat) => if (not(w.seats.keys().contains(seat))) Refused(UnknownSeat)
-           else if (w.retiredSeats.contains(seat)) Refused(SeatRetired)
--          else if (w.seats.get(seat).replacements >= REPLACEMENT_LIMIT) Refused(ReplacementsExhausted)
-           else withSeat(w, seat, { ...w.seats.get(seat), replacements: w.seats.get(seat).replacements + 1 })
-       | Deliver => if (openPromises(w).size() > 0) Refused(PromisesOutstanding(openPromises(w)))
-           else if (holdingDuties(w).size() > 0) Refused(DutyHolds(holdingDuties(w)))
+@@ -226,7 +226,6 @@
+   def seatReplaced(id: int, seat: Seat): Outcome =
+     if (not(known(id, seat))) Refused(UnknownSeat)
+     else if (seatRetired(id, seat)) Refused(SeatRetired)
+-    else if (seats.get(id).get(seat).replacements >= REPLACEMENT_LIMIT) Refused(ReplacementsExhausted)
+     else Accepted
+   def subjectLinked(id: int, a: { subject: str, source: LinkSource, authorised: bool }): Outcome =
+     if (not(a.authorised)) Refused(Unauthorised) else if (linked(id).contains(a.subject)) Refused(SubjectLinked) else Accepted

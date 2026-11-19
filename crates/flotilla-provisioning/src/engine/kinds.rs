@@ -1,6 +1,6 @@
 //! FulfilmentKind on the engine, behind `[primitives]`.
 //!
-//! [`EngineKinds`] is the [`EngineRecords`] port of FulfilmentKind over the decided store. This
+//! [`EngineKinds`] is the [`KindRecords`] port of FulfilmentKind over the decided store. This
 //! home writes its own kinds through the plain-kind port; every home's are read from a resident map
 //! kept current by following the log.
 //!
@@ -10,9 +10,8 @@
 //! as the change's item.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
 };
 
 use flotilla_engine_store::{
@@ -22,15 +21,18 @@ use flotilla_engine_store::{
 use flotilla_resources::{
     definition_provenance::SEEDING_MANAGER,
     definitions::{origin, stamp},
-    engine_records::{EngineObject, EngineRecords},
-    FulfilmentKindSpec, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, WriteError},
+    FulfilmentKind, FulfilmentKindSpec, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
 };
 use flotilla_schema::{ChangeHeader, ChangeItem, Identity, Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
-use serde_json::Value;
 
 use super::provenance;
+use super::reads::created_at;
+use super::resume::followed_since;
+use super::watch::CommitsSeen;
+use super::watch::SharedChanges;
 use crate::stored::{manifest_root::ManifestRoot, placement::FulfilmentKindDefinition};
 
 const KIND: &str = <FulfilmentKindDefinition as Kind>::KIND;
@@ -41,17 +43,14 @@ const ROOT: KindCode = <flotilla_state_machines::Resource<ManifestRoot> as Kind>
 
 const SEEDING: &str = "seeding";
 
-/// How often a change stream looks for new entries in the log, as the account port's does.
-const POLL: Duration = Duration::from_millis(500);
-
 /// How often a write that loses a race to another writer of its name reads and tries again.
 const WRITE_ATTEMPTS: usize = 3;
 
 /// The writer of a delete, which names no origin: the port deletes what its callers remove.
 const WRITER: &str = "kind-records";
 
-/// One home's record as the resident map holds it: the old object it reads as, or why it does not.
-type Held = Result<EngineObject, String>;
+/// One home's record as the resident map holds it.
+type Held = Record<FulfilmentKind>;
 
 /// Every home's records, by name and home.
 type Records = BTreeMap<(String, String), Held>;
@@ -108,7 +107,7 @@ fn stamps(read: &mut Read<'_>, roots: &mut provenance::Roots, name: &str, change
     }
 }
 
-/// Record `id` as the old object, with the stamps its last change says.
+/// Record `id` as the resource, with the stamps its last change says.
 fn object(
     read: &mut Read<'_>,
     roots: &mut provenance::Roots,
@@ -120,8 +119,8 @@ fn object(
 ) -> Result<Held, StoreError> {
     let change = read.last_change(id)?;
     let (labels, annotations) = stamps(read, roots, &name, change.as_ref())?;
-    let spec = serde_json::to_value(value.spec()).map_err(|error| format!("{KIND} {name} at {home}: {error}"));
-    Ok(spec.map(|spec| EngineObject { name, home, version, labels, annotations, spec, status: None }))
+    let created_at = created_at(read, id)?;
+    Ok(Record { name, home, version, created_at, labels, annotations, spec: value.spec(), status: None })
 }
 
 fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
@@ -175,6 +174,10 @@ pub struct EngineKinds {
     home: String,
     log: PlainLog,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
+    // One follower for every watcher of these records on this daemon.
+    changes: SharedChanges,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -190,7 +193,15 @@ impl EngineKinds {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
         let follower = Follower::new([CODE, ROOT]);
-        let opened = Self { service, home, log, resident: Mutex::new(Resident { follower, records: Records::new() }), clock };
+        let opened = Self {
+            changes: SharedChanges::new(Arc::clone(&service), [CODE], "fulfilment kinds"),
+            commits: CommitsSeen::follow(&service, [CODE, ROOT]),
+            service,
+            home,
+            log,
+            resident: Mutex::new(Resident { follower, records: Records::new() }),
+            clock,
+        };
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
@@ -213,6 +224,9 @@ impl EngineKinds {
     /// Brings the resident map up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         {
             let Resident { follower, records } = &mut *resident;
@@ -228,7 +242,8 @@ impl EngineKinds {
                     }
                     Ok(())
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .inspect_err(|_| self.commits.give_back())?;
         }
         Ok(resident)
     }
@@ -237,16 +252,21 @@ impl EngineKinds {
         Timestamp::from_datetime(&self.clock.now())
     }
 
+    /// Refused as stale when a `version` is given and the record has moved from it: the log's
+    /// edit at the version read checks it again.
     fn write(
         &self,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
         value: &FulfilmentKindDefinition,
-    ) -> Result<EngineObject, String> {
+    ) -> Result<Held, WriteError> {
         for _ in 0..WRITE_ATTEMPTS {
             let change = PendingChange::joining(change_of(labels, annotations, &self.home, self.now())?);
-            let written = match self.log.get::<FulfilmentKindDefinition>(name, &self.home).map_err(|error| error.to_string())? {
+            let current = self.log.get::<FulfilmentKindDefinition>(name, &self.home).map_err(|error| error.to_string())?;
+            WriteError::unless_at(version, current.as_ref().map(|current| current.version))?;
+            let written = match current {
                 // An unchanged kind written again for the same reason logs nothing; for a new reason
                 // it is written again under that change.
                 Some(current) if current.spec == *value => {
@@ -262,91 +282,123 @@ impl EngineKinds {
             };
             match written {
                 Ok(version) => {
-                    let spec = serde_json::to_value(value.spec()).map_err(|error| format!("{KIND} {name}: {error}"))?;
-                    return Ok(EngineObject {
+                    let created = self.log.created::<FulfilmentKindDefinition>(name, &self.home).map_err(|error| error.to_string())?;
+                    return Ok(Record {
                         name: name.to_owned(),
                         home: self.home.clone(),
                         version,
+                        created_at: created.to_datetime(),
                         labels: labels.clone(),
                         annotations: annotations.clone(),
-                        spec,
+                        spec: value.spec(),
                         status: None,
                     });
                 }
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
-                Err(error) => return Err(format!("write {KIND} {name}: {error}")),
+                Err(error) => return Err(format!("write {KIND} {name}: {error}").into()),
             }
         }
-        Err(format!("write {KIND} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers"))
+        Err(format!("write {KIND} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers").into())
     }
 }
 
-fn refuse_kind(kind: &str) -> Result<(), String> {
-    if kind == KIND {
-        Ok(())
-    } else {
-        Err(format!("{kind} is not served by the fulfilment kind records"))
+impl flotilla_store::EnginePort for EngineKinds {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<FulfilmentKind>(self);
     }
 }
 
 #[async_trait::async_trait]
-impl EngineRecords for EngineKinds {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[KIND]
+impl KindRecords<FulfilmentKind> for EngineKinds {
+    fn codes(&self) -> Vec<KindCode> {
+        vec![CODE, ROOT]
+    }
+
+    /// From the shared follower of the log.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
+    }
+
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, self.codes()))
     }
 
     fn home(&self) -> String {
         self.home.clone()
     }
 
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn get(&self, name: &str) -> Result<Option<Held>, String> {
         let resident = self.refresh()?;
-        resolve(&resident.records, &self.home, name).transpose()
+        Ok(resolve(&resident.records, &self.home, name))
     }
 
-    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn list(&self) -> Result<Vec<Held>, String> {
         let resident = self.refresh()?;
         let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
         // The map orders by name, then home, so one name's homes are adjacent.
         names.dedup();
-        Ok(names
-            .into_iter()
-            .filter_map(|name| resolve(&resident.records, &self.home, name))
-            .filter_map(|held| held.map_err(|error| tracing::warn!(%error, "skipping a fulfilment kind that does not encode")).ok())
-            .collect())
+        Ok(names.into_iter().filter_map(|name| resolve(&resident.records, &self.home, name)).collect())
     }
 
-    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn sources(&self) -> Result<Vec<Held>, String> {
+        let resident = self.refresh()?;
+        Ok(resident.records.values().cloned().collect())
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Held>, LogPosition), String> {
+        let resident = self.refresh()?;
+        Ok((resident.records.values().cloned().collect(), LogPosition::logged(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::logged(self.refresh()?.follower.cursors().clone()))
+    }
+
+    /// A root's change names every kind of its home: its baselines hold the paths they read with.
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let (changed, through) = match followed_since(&self.service, [CODE, ROOT], position)? {
+            Ok(followed) => followed,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        let resident = self.refresh()?;
+        let mut names = BTreeSet::new();
+        for identity in changed {
+            if identity.kind == ROOT {
+                names.extend(resident.records.keys().filter(|(_, home)| *home == identity.home).map(|(name, _)| name.clone()));
+            } else {
+                names.insert(identity.name);
+            }
+        }
+        Ok(Since::Changed { names, through: LogPosition::logged(through) })
+    }
+
+    /// Every home's record `name`, read from the resident map by name.
+    async fn copies(&self, name: &str) -> Result<Vec<Held>, String> {
         let resident = self.refresh()?;
         Ok(resident
             .records
-            .values()
-            .filter_map(|held| held.clone().map_err(|error| tracing::warn!(%error, "skipping a fulfilment kind that does not encode")).ok())
+            .range((name.to_owned(), String::new())..)
+            .take_while(|((held, _), _)| held == name)
+            .map(|(_, held)| held.clone())
             .collect())
     }
 
     async fn apply(
         &self,
-        kind: &str,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
-        spec: Value,
-    ) -> Result<EngineObject, String> {
-        refuse_kind(kind)?;
-        let spec: FulfilmentKindSpec = serde_json::from_value(spec).map_err(|error| format!("{KIND} spec: {error}"))?;
-        self.write(name, labels, annotations, &FulfilmentKindDefinition::new(&spec)?)
+        spec: &FulfilmentKindSpec,
+    ) -> Result<Held, WriteError> {
+        self.write(name, version, labels, annotations, &FulfilmentKindDefinition::new(spec)?)
     }
 
-    async fn set_status(&self, kind: &str, name: &str, _status: Value) -> Result<EngineObject, String> {
-        Err(format!("{kind} {name}: a fulfilment kind has no status"))
+    async fn set_status(&self, name: &str, _version: u64, _status: &()) -> Result<Held, WriteError> {
+        Err(format!("{KIND} {name}: a fulfilment kind has no status").into())
     }
 
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
-        refuse_kind(kind)?;
+    async fn delete(&self, name: &str) -> Result<(), String> {
         let Some(current) = self.log.get::<FulfilmentKindDefinition>(name, &self.home).map_err(|error| error.to_string())? else {
             return Ok(());
         };
@@ -357,21 +409,6 @@ impl EngineRecords for EngineKinds {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let service = Arc::clone(&self.service);
-        let mut follower = Follower::new([CODE]);
-        let homes = service.homes();
-        service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(|error| error.to_string())?;
-        let stream = futures::stream::unfold((service, follower), |(service, mut follower)| async move {
-            loop {
-                tokio::time::sleep(POLL).await;
-                let homes = service.homes();
-                match service.with_store(|store| Ok(!follower.pass(&mut store.read()?, &homes)?.is_empty())) {
-                    Ok(true) => return Some(((), (service, follower))),
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(%error, "fulfilment kind change stream could not read the log; retrying"),
-                }
-            }
-        });
-        Ok(Box::pin(stream))
+        self.changes.subscribe().map_err(|error| error.to_string())
     }
 }

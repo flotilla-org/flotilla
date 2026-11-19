@@ -1,7 +1,7 @@
 use color_eyre::Result;
 use flotilla_cli::cli::args::{
-    attach_mode, AttachArgs, Cli, CompleteArgs, CompletionsArgs, DaemonArgs, DaemonSubCommand, DomainCommand, EventsArgs, FleetSubCommand,
-    HookArgs, LogsArgs, LsArgs, ResourceListArgs, ResourceSubCommand, SubCommand, TopologyArgs, ViewArgs, WaitArgs,
+    attach_mode, AttachArgs, Cli, CompleteArgs, CompletionsArgs, DaemonArgs, DaemonSubCommand, DomainCommand, FleetSubCommand, HookArgs,
+    LogsArgs, LsArgs, SubCommand, TopologyArgs, ViewArgs, WaitArgs,
 };
 use flotilla_client::{
     binary_version, build_id,
@@ -157,21 +157,6 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         Some(SubCommand::Manifest { command }) => run_manifest_command(&cli, command, format).await,
         Some(SubCommand::Artifact { command }) => run_artifact_command(&cli, command, format).await,
         Some(SubCommand::Archive { command }) => flotilla_cli::frontend::archive::run_archive_command(&cli, command, format).await,
-        Some(SubCommand::Events(EventsArgs { namespace, host, local_only })) => {
-            run_resource_command(
-                &cli,
-                ResourceSubCommand::List(ResourceListArgs {
-                    kind: "events".to_string(),
-                    project: None,
-                    namespace,
-                    host,
-                    local_only,
-                    include_replicas: false,
-                }),
-                format,
-            )
-            .await
-        }
         Some(SubCommand::Domain(DomainCommand::Image(noun))) => run_image_command(&cli, noun, format).await,
         Some(SubCommand::Domain(command)) => dispatch(command.resolve()?, &cli, format).await,
 

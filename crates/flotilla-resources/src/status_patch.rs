@@ -35,10 +35,11 @@ pub trait StatusPatch<S>: Send + Sync {
     }
 }
 
+/// The patch of a kind whose status nothing writes through the store.
 pub enum NoStatusPatch {}
 
-impl StatusPatch<()> for NoStatusPatch {
-    fn apply(&self, _: &mut ()) {
+impl<S> StatusPatch<S> for NoStatusPatch {
+    fn apply(&self, _: &mut S) {
         match *self {}
     }
 }

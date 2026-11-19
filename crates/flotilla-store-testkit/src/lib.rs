@@ -1,14 +1,20 @@
 mod support;
 pub use support::*;
 mod clock;
-pub use clock::VirtualClock;
+pub use clock::{PausedClock, VirtualClock};
 pub mod fixtures;
 mod read_counts;
 pub use read_counts::{
     assert_flat_reads, measure_reads, ReadBudget, ReadCountsBackendExt, ReadOperation, ReadSnapshot, ReadTally, ScopedReads, ZeroReadGuard,
 };
-mod message;
-pub use message::LegacyMessageFixture;
+mod attentions;
+pub use attentions::NoAttentions;
+mod old_store_accounts;
+pub use old_store_accounts::OldStoreAccounts;
+mod old_store_manifest_roots;
+pub use old_store_manifest_roots::OldStoreManifestRoots;
+mod standing_roles;
+pub use standing_roles::MemoryStandingRoles;
 
 /// Fresh logical store for API-crate tests without an upward adapter dependency.
 pub fn memory_backend() -> flotilla_store::ResourceBackend {

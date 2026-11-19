@@ -13,7 +13,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
 };
 
 use flotilla_engine_store::{
@@ -23,20 +22,26 @@ use flotilla_engine_store::{
     StoreLog,
 };
 use flotilla_resources::account_access::{
-    binding_name, requester_parts, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords, BindingRecord,
-    BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite,
+    binding_name, requester_address, requester_parts, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords,
+    BindingRecord, BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite,
+    ACCOUNT_BINDING_LABEL, ACCOUNT_CREDENTIAL_LABEL,
 };
-use flotilla_schema::{Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
+use flotilla_resources::engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, WriteError as RecordWriteError};
+use flotilla_resources::{address::AddressKind, convoy::engine::ImportedLaunches, CONVOY_LABEL};
+use flotilla_schema::{CreatedAt, Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
 use futures::stream::BoxStream;
 
+use chrono::{DateTime, Utc};
+
+use super::reads::created_at;
+use super::resume::{followed_since, logged_since};
+use super::watch::CommitsSeen;
+use super::watch::EngineWatch;
 use crate::stored::account::{
     self as stored, AccountBinding, BindingEdge, BindingSpec, BindingState, Close, ObserveEpoch, ProvisionSpec, Regrant, Revoke,
 };
-
-/// How often a change stream looks for new entries in the log.
-const POLL: Duration = Duration::from_millis(500);
 
 /// The writer recorded on this home's account writes.
 const WRITER: &str = "account-records";
@@ -54,6 +59,7 @@ struct Resident {
     follower: Follower,
     bindings: Bindings,
     provisions: Provisions,
+    created: Created,
 }
 
 /// The account records of the decided store at one home.
@@ -67,6 +73,8 @@ pub struct EngineAccounts {
     bindings: Mutex<Home<AccountBinding, StoreLog>>,
     provisions: PlainLog,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -86,8 +94,21 @@ impl EngineAccounts {
         let home = log.home().to_owned();
         let bindings = open_home::<AccountBinding>(log)?;
         let provisions = PlainLog::new(service.store());
-        let resident = Resident { follower: Follower::new([BINDING, PROVISION]), bindings: BTreeMap::new(), provisions: BTreeMap::new() };
-        let accounts = Self { service, home, bindings: Mutex::new(bindings), provisions, resident: Mutex::new(resident), clock };
+        let resident = Resident {
+            follower: Follower::new([BINDING, PROVISION]),
+            bindings: BTreeMap::new(),
+            provisions: BTreeMap::new(),
+            created: BTreeMap::new(),
+        };
+        let accounts = Self {
+            commits: CommitsSeen::follow(&service, [BINDING, PROVISION]),
+            service,
+            home,
+            bindings: Mutex::new(bindings),
+            provisions,
+            resident: Mutex::new(resident),
+            clock,
+        };
         let homes = accounts.service.homes();
         {
             let mut resident = locked(&accounts.resident);
@@ -109,6 +130,9 @@ impl EngineAccounts {
     /// Brings the resident maps up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         self.service
             .with_store(|store| {
@@ -122,7 +146,8 @@ impl EngineAccounts {
                 }
                 Ok(())
             })
-            .map_err(store_error)?;
+            .map_err(store_error)
+            .inspect_err(|_| self.commits.give_back())?;
         Ok(resident)
     }
 
@@ -172,43 +197,66 @@ impl EngineAccounts {
 fn reload(read: &mut Read<'_>, resident: &mut Resident, identity: &Identity) -> Result<(), StoreError> {
     let key = (identity.home.clone(), identity.name.clone());
     let id = read.resolve(identity.kind, &identity.name, &identity.home)?;
+    let created_key = (identity.kind, identity.home.clone(), identity.name.clone());
+    let mut held = false;
     if identity.kind == BINDING {
         match id.map(|id| read.load::<Resource<AccountBinding>>(id)).transpose()?.flatten() {
-            Some(loaded) => resident.bindings.insert(key, loaded.value.with_identity(&loaded.name, loaded.version)),
-            None => resident.bindings.remove(&key),
-        };
+            Some(loaded) => {
+                resident.bindings.insert(key, loaded.value.with_identity(&loaded.name, loaded.version));
+                held = true;
+            }
+            None => {
+                resident.bindings.remove(&key);
+            }
+        }
     } else if identity.kind == PROVISION {
         match id.map(|id| read.load::<ProvisionSpec>(id)).transpose()?.flatten() {
             Some(loaded) => {
-                resident.provisions.insert(key, Plain { name: loaded.name, home: loaded.home, version: loaded.version, spec: loaded.value })
+                resident
+                    .provisions
+                    .insert(key, Plain { name: loaded.name, home: loaded.home, version: loaded.version, spec: loaded.value });
+                held = true;
             }
-            None => resident.provisions.remove(&key),
-        };
+            None => {
+                resident.provisions.remove(&key);
+            }
+        }
     }
+    // Only a held record has a creation time: an identity named before its create has none.
+    match id.filter(|_| held) {
+        Some(id) => resident.created.insert(created_key, created_at(read, id)?),
+        None => resident.created.remove(&created_key),
+    };
     Ok(())
 }
 
 type Bindings = BTreeMap<(String, String), Resource<AccountBinding>>;
 type Provisions = BTreeMap<(String, String), Plain<ProvisionSpec>>;
+/// When each held record was created, by kind, home and name.
+type Created = BTreeMap<(KindCode, String, String), DateTime<Utc>>;
 
 /// Reads every account record homed at `home` into the resident maps, in place of what they held.
 fn rescan(read: &mut Read<'_>, resident: &mut Resident, home: &str) -> Result<(), StoreError> {
-    let (bindings, provisions) = scan_home(read, home)?;
+    let (bindings, provisions, created) = scan_home(read, home)?;
     resident.bindings.retain(|(owner, _), _| owner != home);
     resident.provisions.retain(|(owner, _), _| owner != home);
+    resident.created.retain(|(_, owner, _), _| owner != home);
     resident.bindings.extend(bindings);
     resident.provisions.extend(provisions);
+    resident.created.extend(created);
     Ok(())
 }
 
-/// Every account record homed at `home`.
-fn scan_home(read: &mut Read<'_>, home: &str) -> Result<(Bindings, Provisions), StoreError> {
+/// Every account record homed at `home`, and when each was created.
+fn scan_home(read: &mut Read<'_>, home: &str) -> Result<(Bindings, Provisions, Created), StoreError> {
     let mut bindings = Bindings::new();
+    let mut created = Created::new();
     let mut after = None;
     loop {
         let page = read.scan::<Resource<AccountBinding>>(home, after, 64)?;
         for id in page.ids {
             if let Some(loaded) = read.load::<Resource<AccountBinding>>(id)? {
+                created.insert((BINDING, home.to_owned(), loaded.name.clone()), created_at(read, id)?);
                 bindings.insert((home.to_owned(), loaded.name.clone()), loaded.value.with_identity(&loaded.name, loaded.version));
             }
         }
@@ -223,6 +271,7 @@ fn scan_home(read: &mut Read<'_>, home: &str) -> Result<(Bindings, Provisions), 
         let page = read.scan::<ProvisionSpec>(home, after, 64)?;
         for id in page.ids {
             if let Some(loaded) = read.load::<ProvisionSpec>(id)? {
+                created.insert((PROVISION, home.to_owned(), loaded.name.clone()), created_at(read, id)?);
                 provisions.insert(
                     (home.to_owned(), loaded.name.clone()),
                     Plain { name: loaded.name, home: loaded.home, version: loaded.version, spec: loaded.value },
@@ -231,7 +280,7 @@ fn scan_home(read: &mut Read<'_>, home: &str) -> Result<(Bindings, Provisions), 
         }
         after = page.next;
         if after.is_none() {
-            return Ok((bindings, provisions));
+            return Ok((bindings, provisions, created));
         }
     }
 }
@@ -500,37 +549,30 @@ impl AccountRecords for EngineAccounts {
     }
 
     async fn changes(&self, _namespace: &str) -> Result<BoxStream<'static, Result<AccountChange, String>>, String> {
-        let service = Arc::clone(&self.service);
-        let mut follower = Follower::new([BINDING, PROVISION]);
-        let homes = service.homes();
-        service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(store_error)?;
-        let stream = futures::stream::unfold(
-            (service, follower, std::collections::VecDeque::new()),
-            |(service, mut follower, mut queue)| async move {
-                loop {
-                    if let Some(change) = queue.pop_front() {
-                        return Some((Ok(change), (service, follower, queue)));
-                    }
-                    tokio::time::sleep(POLL).await;
-                    let homes = service.homes();
-                    let found = service.with_store(|store| {
-                        let mut read = store.read()?;
+        let watch = EngineWatch::start(Arc::clone(&self.service), [BINDING, PROVISION]).map_err(store_error)?;
+        let stream = futures::stream::unfold((watch, std::collections::VecDeque::new()), |(mut watch, mut queue)| async move {
+            loop {
+                if let Some(change) = queue.pop_front() {
+                    return Some((Ok(change), (watch, queue)));
+                }
+                let found = watch
+                    .next(|read, followed| {
                         let mut changes = Vec::new();
-                        for followed in follower.pass(&mut read, &homes)? {
+                        for followed in followed {
                             match followed {
-                                Followed::Changed(identity) => changes.extend(change(&mut read, &identity)?),
-                                Followed::Rescan(home) => changes.extend(rescanned(&mut read, &home)?),
+                                Followed::Changed(identity) => changes.extend(change(read, &identity)?),
+                                Followed::Rescan(home) => changes.extend(rescanned(read, &home)?),
                             }
                         }
                         Ok(changes)
-                    });
-                    match found {
-                        Ok(changes) => queue.extend(changes),
-                        Err(error) => return Some((Err(error.to_string()), (service, follower, queue))),
-                    }
+                    })
+                    .await;
+                match found {
+                    Ok(changes) => queue.extend(changes),
+                    Err(error) => return Some((Err(error.to_string()), (watch, queue))),
                 }
-            },
-        );
+            }
+        });
         Ok(Box::pin(stream))
     }
 }
@@ -562,7 +604,7 @@ fn provision_convoy(read: &mut Read<'_>, provision: &ProvisionSpec) -> Result<Op
 
 /// A change for every account record homed at `home`.
 fn rescanned(read: &mut Read<'_>, home: &str) -> Result<Vec<AccountChange>, StoreError> {
-    let (bindings, provisions) = scan_home(read, home)?;
+    let (bindings, provisions, _) = scan_home(read, home)?;
     let mut changes: Vec<_> =
         bindings.iter().map(|((_, name), binding)| AccountChange::Binding { name: name.clone(), convoy: convoy_of(binding) }).collect();
     for ((_, name), provision) in &provisions {
@@ -575,6 +617,19 @@ fn rescanned(read: &mut Read<'_>, home: &str) -> Result<Vec<AccountChange>, Stor
 /// The requester binding name ([`binding_name`]) an engine binding was opened for.
 pub fn requester_name(binding: &BindingSpec) -> Option<String> {
     requester_parts(&binding.requester).map(|(convoy, role)| binding_name(&convoy, &role, &binding.requirement))
+}
+
+/// `spec` with its requester's convoy named by the launch it imports as (#3108), in `namespace`.
+fn at_launch(mut spec: BindingSpec, namespace: &str, convoys: &ImportedLaunches) -> Result<BindingSpec, String> {
+    let (convoy, role) =
+        requester_parts(&spec.requester).ok_or_else(|| format!("requester `{}` names no convoy and role", spec.requester))?;
+    let launch = convoys.name(namespace, &convoy).ok_or_else(|| {
+        let reason = convoys.missing(namespace, &convoy).map(|reason| reason.to_string()).unwrap_or_default();
+        // The requester's address first: the project it names is the tombstone's (#3108).
+        format!("its requester `{}` {reason} (`{convoy}`)", spec.requester)
+    })?;
+    spec.requester = requester_address(spec.requester.get(AddressKind::Project), &launch, &role)?;
+    Ok(spec)
 }
 
 /// The engine name an old binding at `home` imports as, unless another of `taken` holds it.
@@ -591,6 +646,7 @@ fn imported_binding_name(spec: &BindingSpec, home: &str, taken: &mut BTreeSet<(S
 pub fn rehearse_accounts(
     bindings: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountBinding>, String)],
     provisions: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountProvision>, String)],
+    convoys: &ImportedLaunches,
     report: &mut super::import::ImportReport,
 ) {
     use super::import::ImportRefusal;
@@ -599,7 +655,7 @@ pub fn rehearse_accounts(
         .map_err(|error| format!("registry: {error:?}"))
         .and_then(|()| flotilla_engine_store::Rehearsal::open(kinds));
     match rehearsal {
-        Ok(mut rehearsal) => import_accounts(bindings, provisions, &mut rehearsal, report),
+        Ok(mut rehearsal) => import_accounts(bindings, provisions, convoys, &mut rehearsal, report),
         Err(reason) => {
             let refuse = |kind, record: &str| ImportRefusal { kind, record: record.to_owned(), reason: reason.clone() };
             report.refused.extend(bindings.iter().map(|(binding, _)| refuse("AccountBinding", &binding.metadata.name)));
@@ -617,6 +673,7 @@ pub fn rehearse_accounts(
 pub fn import_accounts(
     bindings: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountBinding>, String)],
     provisions: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountProvision>, String)],
+    convoys: &ImportedLaunches,
     target: &mut impl flotilla_engine_store::ImportTarget,
     report: &mut super::import::ImportReport,
 ) {
@@ -624,6 +681,7 @@ pub fn import_accounts(
     use flotilla_state_machines::Version;
     let change = |old: &flotilla_resources::ObjectMeta| {
         NewChange::new(flotilla_engine_store::IMPORT_WRITER, Timestamp::from_datetime(&old.creation_timestamp))
+            .created_at(CreatedAt::from_datetime(&old.creation_timestamp))
     };
     let mut renamed = BTreeMap::new();
     let mut taken = BTreeSet::new();
@@ -631,14 +689,15 @@ pub fn import_accounts(
         let refuse = |reason: String| ImportRefusal { kind: "AccountBinding", record: old.metadata.name.clone(), reason };
         // An r879 binding's home-key label (#3953) is dropped (ADR 0047).
         let spec = binding_spec(&old.spec);
-        let named = imported_binding_name(&spec, home, &mut taken);
+        let named = at_launch(spec, &old.metadata.namespace, convoys)
+            .and_then(|spec| imported_binding_name(&spec, home, &mut taken).map(|name| (name, spec)));
         let imported = target.imports(home);
-        let name = match named {
-            Ok(name) if !imported => {
-                renamed.insert((home.clone(), old.metadata.name.clone()), (home.clone(), name));
+        let (name, spec) = match named {
+            Ok(named) if !imported => {
+                renamed.insert((home.clone(), old.metadata.name.clone()), (home.clone(), named.0));
                 continue;
             }
-            Ok(name) => name,
+            Ok(named) => named,
             Err(reason) => {
                 if imported {
                     report.refused.push(refuse(reason));
@@ -661,7 +720,7 @@ pub fn import_accounts(
         });
         match written {
             Ok(_) => {
-                *report.imported.entry(("AccountBinding", label)).or_default() += 1;
+                report.import_row("AccountBinding", label);
                 renamed.insert((home.clone(), old.metadata.name.clone()), (home.clone(), name));
             }
             Err(reason) => report.refused.push(refuse(reason)),
@@ -708,8 +767,329 @@ pub fn import_accounts(
             }
         }
         match target.write(home, &old.metadata.name, &change(&old.metadata), &spec) {
-            Ok(()) => *report.imported.entry(("AccountProvision", label)).or_default() += 1,
+            Ok(()) => report.import_row("AccountProvision", label),
             Err(reason) => report.refused.push(refuse(reason)),
         }
     }
+}
+
+impl std::fmt::Debug for EngineAccounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineAccounts").field("home", &self.home).finish_non_exhaustive()
+    }
+}
+
+const BINDING_KIND: &str = "AccountBinding";
+const PROVISION_KIND: &str = "AccountProvision";
+
+/// The resource kinds the account records are served as.
+type BindingResource = flotilla_resources::AccountBinding;
+type ProvisionResource = flotilla_resources::AccountProvision;
+
+/// A binding as the resource: labelled by its own name, its credential and its requester's
+/// convoy, as its readers find it.
+fn binding_object(binding: &Resource<AccountBinding>, home: &str, created: &Created) -> Result<Record<BindingResource>, String> {
+    let record = record(binding, home);
+    let created_at = created_of(created, BINDING, home, &record.name)?;
+    let mut labels = BTreeMap::from([
+        (ACCOUNT_BINDING_LABEL.to_owned(), record.name.clone()),
+        (ACCOUNT_CREDENTIAL_LABEL.to_owned(), record.spec.credential.0.clone()),
+    ]);
+    labels.extend(convoy_of(binding).map(|convoy| (CONVOY_LABEL.to_owned(), convoy)));
+    Ok(Record {
+        name: record.name,
+        home: record.home,
+        version: binding.version().0,
+        created_at,
+        labels,
+        annotations: BTreeMap::new(),
+        spec: record.spec,
+        status: None,
+    })
+}
+
+/// When the held record `name` of `kind` at `home` was created.
+fn created_of(created: &Created, kind: KindCode, home: &str, name: &str) -> Result<DateTime<Utc>, String> {
+    created.get(&(kind, home.to_owned(), name.to_owned())).copied().ok_or_else(|| format!("{kind} {name} at {home} has no creation time"))
+}
+
+/// A provision as the resource: labelled by its binding, and its convoy while this store holds
+/// the binding.
+fn provision_object(provision: &Plain<ProvisionSpec>, bindings: &Bindings, created: &Created) -> Result<Record<ProvisionResource>, String> {
+    let record = provision_record(provision);
+    let created_at = created_of(created, PROVISION, &provision.home, &provision.name)?;
+    let mut labels = BTreeMap::from([(ACCOUNT_BINDING_LABEL.to_owned(), record.spec.binding.name.clone())]);
+    let binding = bindings.get(&(record.spec.binding.home.clone(), record.spec.binding.name.clone()));
+    labels.extend(binding.and_then(convoy_of).map(|convoy| (CONVOY_LABEL.to_owned(), convoy)));
+    Ok(Record {
+        name: record.name,
+        home: record.home,
+        version: provision.version,
+        created_at,
+        labels,
+        annotations: BTreeMap::new(),
+        spec: record.spec,
+        status: None,
+    })
+}
+
+impl EngineAccounts {
+    /// Every home's binding (named `name`, when given): only those are converted.
+    fn bindings(&self, name: Option<&str>) -> Result<Vec<Record<BindingResource>>, String> {
+        let resident = self.refresh()?;
+        resident
+            .bindings
+            .iter()
+            .filter(|((_, held), _)| name.is_none_or(|name| held == name))
+            .map(|((home, _), binding)| binding_object(binding, home, &resident.created))
+            .collect()
+    }
+
+    /// Every home's provision (named `name`, when given): only those are converted.
+    fn provisions(&self, name: Option<&str>) -> Result<Vec<Record<ProvisionResource>>, String> {
+        let resident = self.refresh()?;
+        resident
+            .provisions
+            .iter()
+            .filter(|((_, held), _)| name.is_none_or(|name| held == name))
+            .map(|(_, provision)| provision_object(provision, &resident.bindings, &resident.created))
+            .collect()
+    }
+
+    fn records_changes(&self) -> Result<BoxStream<'static, ()>, String> {
+        let watch = EngineWatch::start(Arc::clone(&self.service), [BINDING, PROVISION]).map_err(store_error)?;
+        let stream = futures::stream::unfold(watch, |mut watch| async move {
+            match watch.next(|_, _| Ok(())).await {
+                Ok(()) => Some(((), watch)),
+                Err(error) => {
+                    tracing::warn!(%error, "account records watch ended");
+                    None
+                }
+            }
+        });
+        Ok(Box::pin(stream))
+    }
+}
+
+/// Resolves each name to this home's record, else the lexically first home's.
+fn resolved<R: flotilla_resources::Resource>(objects: Vec<Record<R>>, home: &str) -> Vec<Record<R>> {
+    let mut by_name: BTreeMap<String, Record<R>> = BTreeMap::new();
+    for object in objects {
+        let keep = by_name.get(&object.name).is_some_and(|held| held.home == home || (object.home != home && held.home < object.home));
+        if !keep {
+            by_name.insert(object.name.clone(), object);
+        }
+    }
+    by_name.into_values().collect()
+}
+
+impl flotilla_store::EnginePort for EngineAccounts {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<BindingResource>(self.clone());
+        backend.install_engine_kind::<ProvisionResource>(self);
+    }
+}
+
+/// The generic resource verbs read bindings; a binding is written only by the account
+/// controllers, and changed by `flotilla convoy rebind`.
+#[async_trait::async_trait]
+impl KindRecords<BindingResource> for EngineAccounts {
+    /// A binding's labels name its requester's convoy, which a provision's read joins too.
+    fn codes(&self) -> Vec<KindCode> {
+        vec![BINDING, PROVISION]
+    }
+
+    /// From a watch that reads the log after each commit.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
+    }
+
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, KindRecords::<BindingResource>::codes(self)))
+    }
+
+    fn writes(&self) -> bool {
+        false
+    }
+
+    fn home(&self) -> String {
+        self.home.clone()
+    }
+
+    async fn get(&self, name: &str) -> Result<Option<Record<BindingResource>>, String> {
+        Ok(resolved(self.bindings(Some(name))?, &self.home).into_iter().next())
+    }
+
+    async fn copies(&self, name: &str) -> Result<Vec<Record<BindingResource>>, String> {
+        self.bindings(Some(name))
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<BindingResource>>, LogPosition), String> {
+        let resident = self.refresh()?;
+        let bindings = resident
+            .bindings
+            .iter()
+            .map(|((home, _), binding)| binding_object(binding, home, &resident.created))
+            .collect::<Result<_, _>>()?;
+        Ok((bindings, LogPosition::logged(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::logged(self.refresh()?.follower.cursors().clone()))
+    }
+
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        logged_since(&self.service, [BINDING], position)
+    }
+
+    async fn list(&self) -> Result<Vec<Record<BindingResource>>, String> {
+        Ok(resolved(self.bindings(None)?, &self.home))
+    }
+
+    async fn sources(&self) -> Result<Vec<Record<BindingResource>>, String> {
+        self.bindings(None)
+    }
+
+    async fn apply(
+        &self,
+        name: &str,
+        _version: Option<u64>,
+        _labels: &BTreeMap<String, String>,
+        _annotations: &BTreeMap<String, String>,
+        _spec: &AccountBindingSpec,
+    ) -> Result<Record<BindingResource>, RecordWriteError> {
+        Err(binding_refusal(name).into())
+    }
+
+    async fn set_status(&self, name: &str, _version: u64, _status: &()) -> Result<Record<BindingResource>, RecordWriteError> {
+        Err(format!("{BINDING_KIND} {name} keeps no status").into())
+    }
+
+    async fn delete(&self, name: &str) -> Result<(), String> {
+        Err(binding_refusal(name))
+    }
+
+    async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
+        self.records_changes()
+    }
+}
+
+/// The generic resource verbs read provisions, and write one at this place.
+#[async_trait::async_trait]
+impl KindRecords<ProvisionResource> for EngineAccounts {
+    /// A provision reads with its binding's convoy.
+    fn codes(&self) -> Vec<KindCode> {
+        vec![BINDING, PROVISION]
+    }
+
+    /// From a watch that reads the log after each commit.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
+    }
+
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, KindRecords::<ProvisionResource>::codes(self)))
+    }
+
+    fn home(&self) -> String {
+        self.home.clone()
+    }
+
+    async fn get(&self, name: &str) -> Result<Option<Record<ProvisionResource>>, String> {
+        Ok(resolved(self.provisions(Some(name))?, &self.home).into_iter().next())
+    }
+
+    async fn copies(&self, name: &str) -> Result<Vec<Record<ProvisionResource>>, String> {
+        self.provisions(Some(name))
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<ProvisionResource>>, LogPosition), String> {
+        let resident = self.refresh()?;
+        let provisions = resident
+            .provisions
+            .values()
+            .map(|provision| provision_object(provision, &resident.bindings, &resident.created))
+            .collect::<Result<_, _>>()?;
+        Ok((provisions, LogPosition::logged(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::logged(self.refresh()?.follower.cursors().clone()))
+    }
+
+    /// A binding's change names the provisions it labels with its convoy.
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let (changed, through) = match followed_since(&self.service, [BINDING, PROVISION], position)? {
+            Ok(followed) => followed,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        let resident = self.refresh()?;
+        let mut names = BTreeSet::new();
+        for identity in changed {
+            if identity.kind == BINDING {
+                names.extend(
+                    resident
+                        .provisions
+                        .values()
+                        .filter(|provision| provision.spec.binding.home == identity.home && provision.spec.binding.name == identity.name)
+                        .map(|provision| provision.name.clone()),
+                );
+            } else {
+                names.insert(identity.name);
+            }
+        }
+        Ok(Since::Changed { names, through: LogPosition::logged(through) })
+    }
+
+    async fn list(&self) -> Result<Vec<Record<ProvisionResource>>, String> {
+        Ok(resolved(self.provisions(None)?, &self.home))
+    }
+
+    async fn sources(&self) -> Result<Vec<Record<ProvisionResource>>, String> {
+        self.provisions(None)
+    }
+
+    async fn apply(
+        &self,
+        name: &str,
+        version: Option<u64>,
+        labels: &BTreeMap<String, String>,
+        _annotations: &BTreeMap<String, String>,
+        spec: &AccountProvisionSpec,
+    ) -> Result<Record<ProvisionResource>, RecordWriteError> {
+        match version {
+            // Made from a version read: the log's edit at it refuses a provision that has moved.
+            Some(version) => {
+                let held = self.provisions.get::<ProvisionSpec>(name, &self.home).map_err(|error| error.to_string())?;
+                RecordWriteError::unless_at(Some(version), held.map(|held| held.version))?;
+                match self.provisions.edit(name, version, &provision_spec(spec), &PendingChange::new(NewChange::new(WRITER, self.now()))) {
+                    Ok(_) => {}
+                    Err(PlainError::Conflict { .. } | PlainError::Missing { .. }) => return Err(RecordWriteError::Stale),
+                    Err(error) => return Err(format!("record account provision `{name}`: {error}").into()),
+                }
+            }
+            None => {
+                let convoy = labels.get(CONVOY_LABEL).map(String::as_str).unwrap_or_default();
+                self.record_provision("", name, convoy, spec, true).await?;
+            }
+        }
+        let written = self.provisions(Some(name))?.into_iter().find(|object| object.home == self.home);
+        Ok(written.ok_or_else(|| format!("{PROVISION_KIND} {name} was written but does not read back"))?)
+    }
+
+    async fn set_status(&self, name: &str, _version: u64, _status: &()) -> Result<Record<ProvisionResource>, RecordWriteError> {
+        Err(format!("{PROVISION_KIND} {name} keeps no status").into())
+    }
+
+    async fn delete(&self, name: &str) -> Result<(), String> {
+        self.delete_provision("", name).await
+    }
+
+    async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
+        self.records_changes()
+    }
+}
+
+fn binding_refusal(name: &str) -> String {
+    format!("{BINDING_KIND} {name} is written only by the account controllers; change a requester's binding with `flotilla convoy rebind`")
 }

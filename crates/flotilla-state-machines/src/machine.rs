@@ -54,6 +54,30 @@ pub trait Machine: Sized + 'static {
     /// Whatever the request names by address that must exist is read through
     /// `admission`, which records each read for the create (#3392 G1).
     fn admit(admission: &mut Admission<'_, Self>, request: Self::Request) -> Result<(Self::Spec, Self::State), Self::Refusal>;
+
+    /// For a machine whose resources are launches of a name (`<of>#<n>`, owner's ruling, #3108):
+    /// the name `spec` is a launch of, and its number, 0 until its create is logged. `None`, the
+    /// default, for a machine whose resources keep the name their creator gives.
+    ///
+    /// A launch's number is the home sequence its create takes, which its log assigns in the
+    /// create's own transaction ([`Machine::numbered`]): unique for all time at its home and
+    /// rising with each launch of one name, with gaps. It is unique and ordered within its home
+    /// only: a name launched at two homes has two series, so anything that names a launch also
+    /// names its home.
+    fn launch(_spec: &Self::Spec) -> Option<(&str, u64)> {
+        None
+    }
+
+    /// `spec` numbered `n`. Its log calls this, in the create's transaction, only for a spec
+    /// [`Machine::launch`] numbers.
+    fn numbered(spec: Self::Spec, _n: u64) -> Self::Spec {
+        spec
+    }
+}
+
+/// The name of launch `n` of `of`: `<of>#<n>`.
+pub fn launch_name(of: &str, n: u64) -> String {
+    format!("{of}#{n}")
 }
 
 /// A write to a resource's records (ADR 0064 "Records"): spec rows that only
@@ -121,6 +145,7 @@ pub enum Check<M: Machine> {
 pub struct EdgeDef<M: Machine, A> {
     from: Vec<Label<M>>,
     to: Vec<Label<M>>,
+    stays: bool,
     changes: Vec<&'static str>,
     writes: Vec<&'static str>,
     check: Option<Check<M>>,
@@ -134,6 +159,7 @@ impl<M: Machine, A: EdgeArg<Edge = M::Edge>> EdgeDef<M, A> {
         EdgeDef {
             from: Vec::new(),
             to: Vec::new(),
+            stays: false,
             changes: Vec::new(),
             writes: Vec::new(),
             check: None,
@@ -152,6 +178,13 @@ impl<M: Machine, A: EdgeArg<Edge = M::Edge>> EdgeDef<M, A> {
     /// Labels this edge may reach. May be called more than once.
     pub fn to(mut self, labels: impl IntoIterator<Item = Label<M>>) -> Self {
         self.to.extend(labels);
+        self
+    }
+
+    /// In place of [`Self::to`]: the edge keeps its label, reaching from each
+    /// label it leaves that label alone. Its targets are its sources.
+    pub fn stays(mut self) -> Self {
+        self.stays = true;
         self
     }
 
@@ -231,6 +264,8 @@ pub struct DeclaredEdge<M: Machine> {
     pub kind: EdgeKind<M>,
     pub from: Vec<Label<M>>,
     pub to: Vec<Label<M>>,
+    /// The edge keeps its label ([`EdgeDef::stays`]): `to` is `from`, each reached from itself alone.
+    pub stays: bool,
     pub changes: Vec<&'static str>,
     pub writes: Vec<&'static str>,
     check: Option<Check<M>>,
@@ -304,6 +339,8 @@ pub enum DefError {
     /// master: it could never alter the resource, and its entry would be about
     /// nothing.
     InertEdge(&'static str),
+    /// An edge that keeps its label ([`EdgeDef::stays`]) and names other targets too.
+    StayingEdgeWithTargets(&'static str),
     /// A changed datum that no target label carries.
     UnknownData {
         edge: &'static str,
@@ -396,8 +433,9 @@ impl<M: Machine> MachineDef<M> {
         self.by_kind.entry(A::KIND).or_insert(self.edges.len());
         self.edges.push(DeclaredEdge {
             kind: A::KIND,
+            to: if edge.stays && edge.to.is_empty() { edge.from.clone() } else { edge.to },
             from: edge.from,
-            to: edge.to,
+            stays: edge.stays,
             changes: edge.changes,
             writes: edge.writes,
             check: edge.check,
@@ -467,6 +505,9 @@ impl<M: Machine> MachineDef<M> {
             if edge.to.is_empty() {
                 errors.insert(DefError::EdgeWithoutTarget(name));
             }
+            if edge.stays && edge.to != edge.from {
+                errors.insert(DefError::StayingEdgeWithTargets(name));
+            }
             if edge.from.is_empty() {
                 errors.insert(DefError::EdgeWithoutSource(name));
             }
@@ -475,7 +516,7 @@ impl<M: Machine> MachineDef<M> {
                 && edge.master.is_none()
                 && !edge.from.is_empty()
                 && !edge.to.is_empty()
-                && edge.from.iter().all(|from| edge.to.iter().all(|to| from == to))
+                && (edge.stays || edge.from.iter().all(|from| edge.to.iter().all(|to| from == to)))
             {
                 errors.insert(DefError::InertEdge(name));
             }
@@ -550,7 +591,7 @@ impl<M: Machine> MachineDef<M> {
             let changes = format!("{changes}{writes}");
             for from in &edge.from {
                 for to in &edge.to {
-                    if diagram == Diagram::Labels && from == to {
+                    if (diagram == Diagram::Labels && from == to) || (edge.stays && from != to) {
                         continue;
                     }
                     out.push_str(&format!("  {} --> {}: {}{}\n", from.name(), to.name(), edge.kind.name(), changes));
@@ -597,7 +638,7 @@ impl<M: Machine> MachineDef<M> {
         if !stray.is_empty() {
             return Err(StepError::Fault(Fault::Writes { edge: kind, fields: stray }));
         }
-        if !declared.to.contains(&next.label()) {
+        if !declared.to.contains(&next.label()) || (declared.stays && next.label() != label) {
             return Err(StepError::Fault(Fault::Target { edge: kind, target: next.label() }));
         }
         let stray: Vec<&'static str> = changed(state, &next).into_iter().filter(|data| !declared.changes.contains(data)).collect();

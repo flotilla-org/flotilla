@@ -1,11 +1,14 @@
 //! Routed delivery pulls one bounded frame at a time. The producer retains a consistent
-//! WAL read cut, queues two frames, and releases it when its consumer expires.
+//! WAL read cut, queues two frames, and releases it when its consumer expires. A tail round is
+//! held open until the home's log advances past the follower's cursor, or for [`HOLD`] when it
+//! does not, so a follower starts its next round as soon as one ends and hears each entry as it
+//! is committed, with no polling.
 //! See the [implementation choice](https://github.com/flotilla-org/flotilla/blob/main/docs/implementation-choices/change-stream.md).
 
 use flotilla_protocol::CommandValue;
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::{
-    stream::{Frame, Service},
+    stream::{CommitListener, Committed, Frame, Service},
     StoreError,
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -13,20 +16,36 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 
 struct Session {
     peer: String,
+    /// The home whose log the round serves: this store's own, or one it relays.
+    home: Option<String>,
     receiver: Mutex<mpsc::Receiver<Result<Vec<u8>, String>>>,
     touched: std::sync::Mutex<tokio::time::Instant>,
 }
 type Receiver = Arc<Session>;
+/// A follower: the peer and the home it follows here (this store's own when absent).
+type Follower = (String, Option<String>);
+/// The homes each follower was last told this store holds.
+type Told = std::sync::Mutex<HashMap<Follower, Vec<String>>>;
 pub(super) struct Rounds {
     sessions: Arc<Mutex<HashMap<String, Receiver>>>,
+    /// The homes each peer was last told this store holds, by the peer and the home it follows:
+    /// a held round ends at once when they differ, so a home that arrived between two rounds is
+    /// not left to the hold's end.
+    told: Arc<Told>,
     workers: Arc<Semaphore>,
 }
 impl Default for Rounds {
     fn default() -> Self {
-        Self { sessions: Default::default(), workers: Arc::new(Semaphore::new(MAX_ROUNDS)) }
+        Self { sessions: Default::default(), told: Default::default(), workers: Arc::new(Semaphore::new(MAX_ROUNDS)) }
     }
 }
 const DEADLINE: Duration = Duration::from_secs(15);
+/// How long a tail round waits for an entry before it ends with a keepalive: within the
+/// follower's frame deadline, so a quiet home still proves its link.
+const HOLD: Duration = Duration::from_secs(10);
+
+/// The home's time when a round takes its read cut, after any hold.
+pub(super) type Now = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 // The whole-home mesh currently sizes for a few hosts. Reserve the blocking pool for
 // other SQLite users. Replaced workers retain their permit until they exit; the global
 // semaphore, rather than the one-current-session-per-peer rule, bounds worker count.
@@ -39,18 +58,25 @@ impl Rounds {
         self.sessions.lock().await.get(session).map(|session| session.peer.clone()).ok_or_else(|| "change-stream session expired".into())
     }
 
+    /// A frame of a round of `home`'s log (this store's own when absent) for `peer`. Each peer
+    /// holds one current round per home it follows here.
     pub(super) async fn next(
         &self,
         peer: &str,
+        home: Option<String>,
         service: Arc<Service>,
         after: Option<u64>,
         session: Option<String>,
-        now: Timestamp,
+        now: Now,
     ) -> Result<CommandValue, String> {
         let (session, receiver) = if let Some(session) = session {
             let receiver = self.sessions.lock().await.get(&session).cloned().ok_or("change-stream session expired")?;
             if receiver.peer != peer {
                 return Err("change-stream session belongs to another peer".into());
+            }
+            // A continuation names its home by its session alone.
+            if home.is_some() && receiver.home != home {
+                return Err("change-stream session follows another home".into());
             }
             (session, receiver)
         } else {
@@ -58,6 +84,7 @@ impl Rounds {
             let (tx, rx) = mpsc::channel(2);
             let receiver = Arc::new(Session {
                 peer: peer.to_owned(),
+                home: home.clone(),
                 receiver: Mutex::new(rx),
                 touched: std::sync::Mutex::new(tokio::time::Instant::now()),
             });
@@ -65,7 +92,7 @@ impl Rounds {
             // A reconnect starts a new round immediately. Dropping the abandoned
             // receiver makes its producer fail at its next send, releasing its permit
             // only when the blocking worker exits (which may still await a writer).
-            rounds.retain(|_, session| session.peer != peer);
+            rounds.retain(|_, session| session.peer != peer || session.home != home);
             if rounds.len() >= MAX_ROUNDS {
                 return Err("too many change-stream sessions".into());
             }
@@ -97,11 +124,30 @@ impl Rounds {
             });
             let sessions = Arc::clone(&self.sessions);
             let key = session.clone();
+            let told = Arc::clone(&self.told);
+            let follower = (peer.to_owned(), home.clone());
             tokio::spawn(async move {
                 let (frames, mut incoming) = mpsc::channel(2);
+                let home = home.unwrap_or_else(|| service.home().to_owned());
+                // A consumer that leaves while the round is held ends it.
+                let held = tokio::select! {
+                    held = hold(&service, &home, after, &told, &follower) => held,
+                    () = tx.closed() => {
+                        sessions.lock().await.remove(&key);
+                        return;
+                    }
+                };
+                if let Err(error) = held {
+                    let _ = tokio::time::timeout(DEADLINE, tx.send(Err(error))).await;
+                    tx.closed().await;
+                    sessions.lock().await.remove(&key);
+                    return;
+                }
+                // Recorded before the round reads them, so what the keepalive says is never less.
+                told.lock().expect("told homes").insert(follower, service.homes());
                 let worker = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    service.serve(after, now, |bytes| {
+                    service.serve_home(&home, after, now(), |bytes| {
                         frames.blocking_send(bytes.to_vec()).map_err(|_| StoreError::Stream("routed consumer closed".into()))
                     })
                 });
@@ -147,10 +193,49 @@ impl Rounds {
     }
 }
 
+/// Holds a tail round open until `home`'s log here passes `after`, a home is newly held here
+/// (so a follower hears of it at once), or [`HOLD`] passes. It waits on the store's commits that
+/// move `home` or add a home, not a timer, and holds no thread while it waits. A snapshot round
+/// (`after` absent) is not held.
+async fn hold(service: &Arc<Service>, home: &str, after: Option<u64>, told: &Told, follower: &Follower) -> Result<(), String> {
+    let Some(after) = after else { return Ok(()) };
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let listener: Arc<CommitListener> = {
+        let (wake, home) = (Arc::clone(&wake), home.to_owned());
+        Arc::new(move |committed: &Committed<'_>| {
+            if committed.moved(&home) {
+                wake.notify_one()
+            }
+        })
+    };
+    service.on_commit(Arc::downgrade(&listener));
+    let homes = told.lock().expect("told homes").get(follower).cloned().unwrap_or_default();
+    let until = tokio::time::Instant::now() + HOLD;
+    loop {
+        let read = Arc::clone(service);
+        let home = home.to_owned();
+        let last = tokio::task::spawn_blocking(move || read.last_sequence(&home))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        if last > after || service.homes() != homes {
+            return Ok(());
+        }
+        tokio::select! {
+            () = wake.notified() => {}
+            () = tokio::time::sleep_until(until) => return Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use flotilla_schema::KindRegistry;
+
+    fn at(stamp: i64) -> Now {
+        Arc::new(move || Timestamp(stamp))
+    }
 
     // A disconnected routed consumer loses its session after the idle deadline, while
     // progress renews that deadline. Completion removes the session immediately.
@@ -160,36 +245,36 @@ mod tests {
         let service = Arc::new(Service::open(&dir.path().join("home.db"), "home", KindRegistry::new()).unwrap());
         let rounds = Rounds::default();
         let CommandValue::ChangeStreamFrame { session, .. } =
-            rounds.next("peer", Arc::clone(&service), None, None, Timestamp(1)).await.unwrap()
+            rounds.next("peer", None, Arc::clone(&service), None, None, at(1)).await.unwrap()
         else {
             panic!("frame");
         };
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(10)).await;
         let CommandValue::ChangeStreamFrame { frame, .. } =
-            rounds.next("peer", Arc::clone(&service), None, Some(session.clone()), Timestamp(1)).await.unwrap()
+            rounds.next("peer", None, Arc::clone(&service), None, Some(session.clone()), at(1)).await.unwrap()
         else {
             panic!("frame");
         };
         assert!(matches!(Frame::decode(&frame).unwrap(), Frame::End { .. }));
         tokio::time::advance(Duration::from_secs(10)).await;
         let CommandValue::ChangeStreamFrame { frame, .. } =
-            rounds.next("peer", Arc::clone(&service), None, Some(session.clone()), Timestamp(1)).await.unwrap()
+            rounds.next("peer", None, Arc::clone(&service), None, Some(session.clone()), at(1)).await.unwrap()
         else {
             panic!("frame");
         };
         assert!(matches!(Frame::decode(&frame).unwrap(), Frame::Keepalive { .. }));
-        assert!(rounds.next("peer", Arc::clone(&service), None, Some(session), Timestamp(1)).await.is_err());
+        assert!(rounds.next("peer", None, Arc::clone(&service), None, Some(session), at(1)).await.is_err());
         // Resume with a fresh wall clock while the blocking source takes its read cut.
         tokio::time::resume();
         let CommandValue::ChangeStreamFrame { session, .. } =
-            rounds.next("peer", Arc::clone(&service), None, None, Timestamp(2)).await.unwrap()
+            rounds.next("peer", None, Arc::clone(&service), None, None, at(2)).await.unwrap()
         else {
             panic!("frame");
         };
         tokio::time::pause();
         tokio::time::advance(DEADLINE + Duration::from_secs(1)).await;
-        assert!(rounds.next("peer", service, None, Some(session), Timestamp(2)).await.is_err());
+        assert!(rounds.next("peer", None, service, None, Some(session), at(2)).await.is_err());
     }
     // A fresh round replaces the peer's abandoned cursor immediately. Other peers
     // progress independently, and an opaque session token grants no cross-peer access.
@@ -199,24 +284,24 @@ mod tests {
         let service = Arc::new(Service::open(&dir.path().join("home.db"), "home", KindRegistry::new()).unwrap());
         let rounds = Rounds::default();
         let CommandValue::ChangeStreamFrame { session, .. } =
-            rounds.next("first", Arc::clone(&service), None, None, Timestamp(1)).await.unwrap()
+            rounds.next("first", None, Arc::clone(&service), None, None, at(1)).await.unwrap()
         else {
             panic!("frame");
         };
         let CommandValue::ChangeStreamFrame { session: active, .. } =
-            rounds.next("first", Arc::clone(&service), None, None, Timestamp(1)).await.unwrap()
+            rounds.next("first", None, Arc::clone(&service), None, None, at(1)).await.unwrap()
         else {
             panic!("replacement frame");
         };
         assert_eq!(
-            rounds.next("first", Arc::clone(&service), None, Some(session), Timestamp(1)).await.unwrap_err(),
+            rounds.next("first", None, Arc::clone(&service), None, Some(session), at(1)).await.unwrap_err(),
             "change-stream session expired"
         );
-        assert!(rounds.next("other", Arc::clone(&service), None, Some(active), Timestamp(1)).await.unwrap_err().contains("another peer"));
+        assert!(rounds.next("other", None, Arc::clone(&service), None, Some(active), at(1)).await.unwrap_err().contains("another peer"));
         for index in 1..MAX_ROUNDS {
-            assert!(rounds.next(&format!("peer-{index}"), Arc::clone(&service), None, None, Timestamp(1)).await.is_ok());
+            assert!(rounds.next(&format!("peer-{index}"), None, Arc::clone(&service), None, None, at(1)).await.is_ok());
         }
-        assert!(rounds.next("overflow", service, None, None, Timestamp(1)).await.unwrap_err().contains("too many"));
+        assert!(rounds.next("overflow", None, service, None, None, at(1)).await.unwrap_err().contains("too many"));
     }
 
     // A source failure releases its cursor as soon as it is delivered, so the same peer
@@ -230,7 +315,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         let rounds = Rounds::default();
         for _ in 0..2 {
-            let error = rounds.next("peer", Arc::clone(&service), None, None, Timestamp(1)).await.unwrap_err();
+            let error = rounds.next("peer", None, Arc::clone(&service), None, None, at(1)).await.unwrap_err();
             assert!(error.contains("unable to open database file"), "{error}");
         }
     }

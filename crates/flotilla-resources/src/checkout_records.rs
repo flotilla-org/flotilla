@@ -1,0 +1,490 @@
+//! Checkouts as the engine holds them (#3108): the port every checkout reader and requester
+//! uses, served over the decided store.
+//!
+//! A checkout is one branch checked out at one path in one environment, held for the role's
+//! convoy. Each try at it is a launch of its own
+//! (`<checkout>#<n>`): a launch that ended (given up, lost, released) is never revived, and a new
+//! request after it starts the next launch. Its integration is its home's inspection, written only
+//! when an inspected value changes; when the values were last confirmed is judged at read time.
+//! Nothing here is stored in this shape.
+
+use chrono::{DateTime, Utc};
+use flotilla_protocol::LifecycleReading;
+
+pub use crate::clone_records::launched;
+use crate::{CheckoutSpec, RepositoryKey};
+
+/// What a refused request says when its holder's engine Convoy is not admitted yet: the request
+/// waits for the convoy rather than failing.
+pub const HOLDER_NOT_OPEN: &str = "is not admitted on the engine yet";
+
+/// What a refused request says when its holder's engine Convoy has ended: nothing new is held for
+/// it, and what asked is released with it rather than failed.
+pub const HOLDER_ENDED: &str = "has ended";
+
+/// Who a checkout is held for. The holder carries no ownership: a finishing holder finds its
+/// checkouts by it and releases them.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CheckoutHolder {
+    /// A convoy role's: the convoy, by name.
+    Convoy(String),
+}
+
+/// One launch of a checkout as a reader sees it: with its home's inspection, or without it
+/// (`I = ()`) for a reader that never looks at it, which then is not read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckoutRecord<I = Option<Integration>> {
+    /// The launch: `<checkout>#<n>`.
+    pub name: String,
+    /// The home that holds it: the host of its environment.
+    pub home: String,
+    /// What it checks out, as the old spec showed it: an adopted checkout is `Observed`, its
+    /// `is_main` derived from its branch.
+    pub spec: CheckoutSpec,
+    pub holder: Option<CheckoutHolder>,
+    /// When this launch was requested.
+    pub requested_at: DateTime<Utc>,
+    pub reading: LifecycleReading,
+    /// How it was made short of what was asked, as its launch found when it was realised.
+    pub degraded: Option<String>,
+    /// Its home's inspection, if one has been written; `()` where it was not read.
+    pub integration: I,
+}
+
+/// A launch read without its integration.
+pub type CheckoutLaunch = CheckoutRecord<()>;
+
+impl CheckoutLaunch {
+    /// This launch with its home's inspection, as read.
+    pub fn with_integration(self, integration: Option<Integration>) -> CheckoutRecord {
+        CheckoutRecord {
+            name: self.name,
+            home: self.home,
+            spec: self.spec,
+            holder: self.holder,
+            requested_at: self.requested_at,
+            reading: self.reading,
+            degraded: self.degraded,
+            integration,
+        }
+    }
+}
+
+impl<I> CheckoutRecord<I> {
+    /// The checkout this launch is of: its name without the launch number.
+    pub fn checkout_name(&self) -> &str {
+        launched(&self.name)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self.reading, LifecycleReading::Ready { .. })
+    }
+
+    /// Whether it has ended: released, lost, failed or given up.
+    pub fn ended(&self) -> bool {
+        matches!(
+            self.reading,
+            LifecycleReading::Released | LifecycleReading::Lost { .. } | LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. }
+        )
+    }
+
+    /// The path it is checked out at.
+    pub fn path(&self) -> Option<&str> {
+        match &self.spec {
+            CheckoutSpec::Observed(spec) => Some(&spec.path),
+            spec => spec.target_path(),
+        }
+    }
+}
+
+/// Each checkout's latest launch among `records`, by checkout name: later launches of a checkout
+/// replace earlier ones.
+pub fn latest_launches<I>(records: impl IntoIterator<Item = CheckoutRecord<I>>) -> std::collections::BTreeMap<String, CheckoutRecord<I>> {
+    let number = |record: &CheckoutRecord<I>| record.name.rsplit_once('#').and_then(|(_, n)| n.parse::<u32>().ok()).unwrap_or(0);
+    let mut latest = std::collections::BTreeMap::<String, CheckoutRecord<I>>::new();
+    for record in records {
+        match latest.get(record.checkout_name()) {
+            Some(held) if number(held) >= number(&record) => {}
+            _ => {
+                latest.insert(record.checkout_name().to_owned(), record);
+            }
+        }
+    }
+    latest
+}
+
+impl CheckoutRecord {
+    /// Its home's inspection, if one has been written.
+    pub fn inspection(&self) -> Option<&Inspection> {
+        self.integration.as_ref().map(|integration| &integration.inspection)
+    }
+}
+
+impl<I> CheckoutRecord<I> {
+    /// The branch it checks out, without `refs/heads/`.
+    pub fn branch(&self) -> &str {
+        let reference = match &self.spec {
+            CheckoutSpec::Worktree(spec) => spec.r#ref.as_str(),
+            CheckoutSpec::FreshClone(spec) => spec.r#ref.as_str(),
+            CheckoutSpec::Observed(spec) => spec.r#ref.as_str(),
+        };
+        reference.strip_prefix("refs/heads/").unwrap_or(reference)
+    }
+
+    /// The realised path: its reading's identity once ready.
+    pub fn ready_path(&self) -> Option<&str> {
+        match &self.reading {
+            LifecycleReading::Ready { identity } => Some(identity),
+            _ => None,
+        }
+    }
+
+    /// This launch in the shape the surfaces' rows take, under the checkout's name: its spec, its
+    /// phase and path from its reading, its holder as the convoy label and its authority as the
+    /// authority label. A read view, never stored. Its integration is not in it: a reader of
+    /// integration reads [`CheckoutRecord::integration`], with the forge observation's states.
+    pub fn read_view(&self) -> crate::ResourceObject<crate::Checkout> {
+        use crate::{CheckoutPhase, CheckoutStatus, LifecycleAuthority};
+        let (phase, message) = match &self.reading {
+            LifecycleReading::Ready { .. } => (CheckoutPhase::Ready, None),
+            LifecycleReading::Released => (CheckoutPhase::Gone, None),
+            LifecycleReading::Lost { reason } => (CheckoutPhase::Gone, reason.clone()),
+            LifecycleReading::Failed { reason } => (CheckoutPhase::Failed, Some(reason.clone())),
+            LifecycleReading::GaveUp { cause } => (CheckoutPhase::Failed, Some(cause.clone())),
+            LifecycleReading::InProgress => (CheckoutPhase::Pending, None),
+            LifecycleReading::Retrying { cause, .. } | LifecycleReading::Exhausted { cause } => {
+                (CheckoutPhase::Pending, Some(cause.clone()))
+            }
+        };
+        let authority =
+            if matches!(self.spec, CheckoutSpec::Observed(_)) { LifecycleAuthority::Adopted } else { LifecycleAuthority::Managed };
+        let mut labels = std::collections::BTreeMap::from([
+            (crate::AUTHORITY_LABEL.to_string(), authority.as_label_value().to_string()),
+            (crate::REPO_KEY_LABEL.to_string(), self.spec.repo_ref().to_string()),
+        ]);
+        if let Some(CheckoutHolder::Convoy(launch)) = &self.holder {
+            labels.insert(crate::CONVOY_LABEL.to_string(), launched(launch).to_owned());
+        }
+        crate::ResourceObject {
+            metadata: crate::ObjectMeta {
+                name: self.checkout_name().to_owned(),
+                namespace: String::new(),
+                resource_version: self.name.clone(),
+                labels,
+                annotations: Default::default(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: self.requested_at,
+                merge: None,
+            },
+            spec: self.spec.clone(),
+            status: Some(CheckoutStatus {
+                degraded: self.degraded.clone(),
+                phase,
+                path: self.ready_path().map(str::to_owned),
+                commit: None,
+                branch_provenance: Default::default(),
+                integration: Default::default(),
+                message,
+            }),
+        }
+    }
+}
+
+/// A checkout's integration as its home last inspected it. A `None` judgement is one the
+/// inspection could not make.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Inspection {
+    /// The checkout's HEAD when it was inspected.
+    pub head_revision: Option<String>,
+    pub clean: Option<bool>,
+    pub pushed: Option<bool>,
+    pub landed: Option<bool>,
+    pub clean_details: Vec<String>,
+    pub pushed_details: Vec<String>,
+    pub landed_details: Vec<String>,
+    /// The change request the branch is associated with, by its forge number; its state is the
+    /// forge observation's.
+    pub change_request: Option<u64>,
+    pub landed_evidence: Option<Landed>,
+    /// The digest of the branch's ref on `origin`, read through Git transport.
+    pub remote_digest: Option<String>,
+}
+
+impl Inspection {
+    /// The inspection a checkout's VCS inspection made, as `status` reports it. An unknown
+    /// condition is a judgement it could not make; a change request whose forge number does not
+    /// parse is not one this inspection can name.
+    pub fn of_status(status: &crate::CheckoutIntegrationStatus) -> Self {
+        use crate::ConditionValue;
+        let judged = |condition: &crate::IntegrationCondition| match condition.value {
+            ConditionValue::True => Some(true),
+            ConditionValue::False => Some(false),
+            ConditionValue::Unknown => None,
+        };
+        let number = |id: &str| id.parse::<u64>().ok();
+        Self {
+            head_revision: status.head_revision.clone(),
+            clean: judged(&status.clean),
+            pushed: judged(&status.pushed),
+            landed: judged(&status.landed),
+            clean_details: status.clean.details.clone(),
+            pushed_details: status.pushed.details.clone(),
+            landed_details: status.landed.details.clone(),
+            change_request: status.change_request.as_ref().and_then(|observation| number(&observation.id)),
+            landed_evidence: status.landed_evidence.as_ref().and_then(|evidence| {
+                Some(Landed {
+                    change_request: number(&evidence.change_request_id)?,
+                    merged_at: evidence
+                        .merged_at
+                        .as_deref()
+                        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                        .map(|at| at.with_timezone(&Utc)),
+                    target_ref: evidence.target_ref.clone(),
+                    head_in_merged_head: evidence.checkout_head_in_merged_head,
+                })
+            }),
+            // Only the checkout's own branch's ref is observed.
+            remote_digest: status.remote_refs.values().next().map(|observation| observation.digest.clone()),
+        }
+    }
+
+    /// This inspection merged onto `held`: a held landing latches, so an inspection that cannot
+    /// judge `landed` keeps it. Unknown is not false. A landing a merged change request evidences
+    /// latches whatever the HEAD; one judged without a change request (no commits beyond its base)
+    /// latches at the HEAD it was judged at, since a later commit is work that has not landed.
+    pub fn latched(mut self, held: &Inspection) -> Self {
+        let same_head = self.head_revision.is_some() && self.head_revision == held.head_revision;
+        if self.landed.is_none() && held.landed == Some(true) && (held.landed_evidence.is_some() || same_head) {
+            self.landed = Some(true);
+            self.landed_details = held.landed_details.clone();
+            if self.landed_evidence.is_none() {
+                self.landed_evidence = held.landed_evidence.clone();
+            }
+            if self.change_request.is_none() {
+                self.change_request = held.change_request;
+            }
+        }
+        self
+    }
+}
+
+/// The merged change request that landed a checkout's branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Landed {
+    pub change_request: u64,
+    pub merged_at: Option<DateTime<Utc>>,
+    pub target_ref: Option<String>,
+    /// The checkout's HEAD was verified in the merged head.
+    pub head_in_merged_head: bool,
+}
+
+/// A checkout's integration as a reader sees it: the inspection, and when it was last confirmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Integration {
+    pub inspection: Inspection,
+    /// When its values were last confirmed: since its home's inspections started failing, else
+    /// when its home was last heard, which for this home is now.
+    pub confirmed_at: DateTime<Utc>,
+    /// When its values were last inspected: this home's latest successful inspection of it,
+    /// whether or not it changed them, else since its inspections started failing, else when an
+    /// inspection last wrote them. Never the time it is read; explain shows this.
+    pub inspected_at: DateTime<Utc>,
+    /// Since when its home's inspections have failed.
+    pub failing_since: Option<DateTime<Utc>>,
+}
+
+impl Integration {
+    /// Its values were confirmed within `lifetime` of `now`. A confirmation read after `now` (this
+    /// home's are confirmed as they are read) is as fresh as one at `now`.
+    pub fn confirmed_within(&self, now: DateTime<Utc>, lifetime: std::time::Duration) -> bool {
+        chrono::Duration::from_std(lifetime).is_ok_and(|lifetime| now.signed_duration_since(self.confirmed_at) < lifetime)
+    }
+
+    /// Its values were inspected within `lifetime` of `now`.
+    pub fn inspected_within(&self, now: DateTime<Utc>, lifetime: std::time::Duration) -> bool {
+        chrono::Duration::from_std(lifetime).is_ok_and(|lifetime| now.signed_duration_since(self.inspected_at) < lifetime)
+    }
+}
+
+/// What changed among the checkouts, at any home.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckoutChange {
+    /// The launch `name` at `home` changed: its lifecycle, its facts or its integration.
+    Changed { name: String, home: String },
+    /// Any of them may have changed: a home's log was read afresh.
+    Rescanned,
+}
+
+/// Which launches [`CheckoutRecords::launches`] reads.
+#[derive(Clone, Copy, Debug)]
+pub enum Launches<'a> {
+    /// `name` at `home` (this home when `None`): a launch, or a checkout's latest launch.
+    Named { name: &'a str, home: Option<&'a str> },
+    /// Every launch held for a holder, across homes.
+    Held(&'a CheckoutHolder),
+    /// Every launch at this home.
+    Here,
+    /// Every launch at every home this one follows.
+    Every,
+}
+
+/// The checkout port, served by the engine's [`crate::lifecycle_reads::LifecycleReads`]. Each
+/// read is keyed or indexed. [`CheckoutRecords::request`] and the integration writes are the only
+/// writes, and only for this home: the Checkout controller writes every lifecycle edge after them.
+pub trait CheckoutRecords: Send + Sync {
+    /// The stored kinds these checkouts are read from: a log entry of any other kind changes none.
+    fn codes(&self) -> Vec<flotilla_schema::KindCode>;
+    /// `name` held at `home`, or at this home when `None`. A launch name (`<checkout>#<n>`) reads
+    /// that launch; a checkout's name reads its latest launch.
+    fn get(&self, name: &str, home: Option<&str>) -> Result<Option<CheckoutRecord>, String>;
+    /// Every launch held for `holder`, across homes, ended or not.
+    fn held(&self, holder: &CheckoutHolder) -> Result<Vec<CheckoutRecord>, String>;
+    /// Every launch of a checkout of `repository`, across homes.
+    fn of_repository(&self, repository: &RepositoryKey) -> Result<Vec<CheckoutRecord>, String>;
+    /// Every launch made in environment `environment` homed at `home` (this home when `None`).
+    fn in_environment(&self, environment: &str, home: Option<&str>) -> Result<Vec<CheckoutRecord>, String>;
+    /// Every launch held at this home, ended or not.
+    fn here(&self) -> Result<Vec<CheckoutRecord>, String>;
+    /// This home.
+    fn home(&self) -> &str;
+    /// Every launch at every home this one follows, ended or not.
+    fn every(&self) -> Result<Vec<CheckoutRecord>, String>;
+    /// The launches `which` selects, as [`CheckoutRecords::get`], [`CheckoutRecords::held`],
+    /// [`CheckoutRecords::here`] and [`CheckoutRecords::every`] read them, without reading their
+    /// integration.
+    fn launches(&self, which: Launches<'_>) -> Result<Vec<CheckoutLaunch>, String>;
+    /// The launch that serves a request for checkout `name` with `spec`, held for `holder`, at
+    /// this home: the latest launch of `name` when that has not ended, else its next launch,
+    /// requested now. A live launch requested otherwise is refused: one name is one checkout.
+    fn request(&self, name: &str, spec: &CheckoutSpec, holder: Option<&CheckoutHolder>) -> Result<String, String>;
+    /// Writes launch `launch`'s inspection, latched onto the held one, if it changed anything:
+    /// the inspections are succeeding again. Returns whether it wrote.
+    fn inspected(&self, launch: &str, inspection: Inspection) -> Result<bool, String>;
+    /// Records that launch `launch`'s inspection failed, if its inspections were not failing
+    /// already; the held values stay, confirmed when they started to fail.
+    fn inspection_failed(&self, launch: &str) -> Result<(), String>;
+    /// The checkouts' changes from now on, as their records are written or replicated here.
+    /// Where none are followed, the channel is closed.
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<CheckoutChange> {
+        tokio::sync::broadcast::channel(1).1
+    }
+    /// A cursor over the checkouts' changes from now on, read from the log; none where no log is
+    /// held, and a reader then reads everything afresh.
+    fn cursor(&self) -> Option<Box<dyn crate::lifecycle_reads::ChangeCursor<CheckoutChange>>> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn landed() -> Inspection {
+        Inspection {
+            landed: Some(true),
+            landed_details: vec!["merged".into()],
+            change_request: Some(7),
+            landed_evidence: Some(Landed {
+                change_request: 7,
+                merged_at: None,
+                target_ref: Some("main".into()),
+                head_in_merged_head: true,
+            }),
+            ..Inspection::default()
+        }
+    }
+
+    #[test]
+    fn an_unjudged_landing_keeps_held_evidence() {
+        let latched = Inspection { clean: Some(true), ..Inspection::default() }.latched(&landed());
+        assert_eq!(latched.landed, Some(true));
+        assert_eq!(latched.change_request, Some(7));
+        assert_eq!(latched.landed_evidence, landed().landed_evidence);
+        assert_eq!(latched.clean, Some(true));
+    }
+
+    #[test]
+    fn a_judged_landing_replaces_held_evidence() {
+        let judged = Inspection { landed: Some(false), ..Inspection::default() };
+        assert_eq!(judged.clone().latched(&landed()), judged);
+    }
+
+    // Behaviour (d11 finding 1): a landing judged without a change request (no commits beyond
+    // base) latches while the HEAD it was judged at stands, so an inspection that cannot judge
+    // `landed` (convoy association unavailable after a restart) does not unlatch it; a moved or
+    // unread HEAD does not keep it.
+    #[test]
+    fn a_landing_without_evidence_latches_at_its_head() {
+        let held = Inspection { landed_evidence: None, change_request: None, head_revision: Some("abc".into()), ..landed() };
+        let at = |head: Option<&str>| Inspection { clean: Some(false), head_revision: head.map(str::to_owned), ..Inspection::default() };
+        let latched = at(Some("abc")).latched(&held);
+        assert_eq!((latched.landed, latched.clean, latched.landed_details), (Some(true), Some(false), vec!["merged".to_owned()]));
+        assert_eq!(at(Some("def")).latched(&held), at(Some("def")), "a later commit has not landed");
+        assert_eq!(at(None).latched(&held), at(None), "an unread HEAD keeps nothing");
+    }
+
+    // Behaviour: a VCS inspection's conditions become judgements (unknown is no judgement), its
+    // landing evidence and change request their forge numbers, and its branch's remote ref its
+    // digest.
+    #[test]
+    fn a_vcs_inspection_reads_as_the_engines_inspection() {
+        use crate::{
+            ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, CheckoutIntegrationStatus, ConditionValue,
+            IntegrationCondition, LandedEvidence, RemoteRefObservation,
+        };
+        let condition = |value, detail: &str| IntegrationCondition::builder().value(value).details(vec![detail.to_owned()]).build();
+        let status = CheckoutIntegrationStatus {
+            head_revision: Some("abc".into()),
+            clean: condition(ConditionValue::True, "clean"),
+            pushed: condition(ConditionValue::Unknown, "no upstream"),
+            landed: condition(ConditionValue::True, "PR #7 merged"),
+            landed_evidence: Some(LandedEvidence {
+                change_request_id: "7".into(),
+                merged_at: Some("2026-11-06T10:00:00Z".into()),
+                target_ref: Some("main".into()),
+                checkout_head_in_merged_head: true,
+            }),
+            change_request: Some(
+                ChangeRequestObservation::builder()
+                    .id("7".into())
+                    .state(ChangeRequestState::Merged)
+                    .mergeability(ChangeRequestMergeability::Unknown)
+                    .observed_at(String::new())
+                    .build(),
+            ),
+            remote_refs: [(
+                "refs/heads/feature".to_owned(),
+                RemoteRefObservation::builder().digest("d1".into()).observed_at(String::new()).build(),
+            )]
+            .into(),
+        };
+        let inspection = Inspection::of_status(&status);
+        assert_eq!(
+            inspection,
+            Inspection {
+                head_revision: Some("abc".into()),
+                clean: Some(true),
+                pushed: None,
+                landed: Some(true),
+                clean_details: vec!["clean".into()],
+                pushed_details: vec!["no upstream".into()],
+                landed_details: vec!["PR #7 merged".into()],
+                change_request: Some(7),
+                landed_evidence: Some(Landed {
+                    change_request: 7,
+                    merged_at: DateTime::parse_from_rfc3339("2026-11-06T10:00:00Z").ok().map(|at| at.with_timezone(&Utc)),
+                    target_ref: Some("main".into()),
+                    head_in_merged_head: true,
+                }),
+                remote_digest: Some("d1".into()),
+            }
+        );
+        let unnumbered = CheckoutIntegrationStatus {
+            landed_evidence: status.landed_evidence.clone().map(|evidence| LandedEvidence { change_request_id: "x".into(), ..evidence }),
+            ..status
+        };
+        assert_eq!(Inspection::of_status(&unnumbered).landed_evidence, None);
+    }
+}

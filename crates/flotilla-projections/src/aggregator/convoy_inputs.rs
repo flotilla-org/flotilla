@@ -1,16 +1,25 @@
 //! Secondary evidence indexes used when projecting one changed Convoy.
-//! Rebuilt at the existing coalesced secondary-input boundary, never for an
-//! ordinary Convoy event. Entries contain keys, not copied resource bodies.
+//! Rebuilt with a full projection, and moved one entry at a time as a vessel
+//! or session changes. Entries contain keys, not copied resource bodies.
 use super::*;
 type Parent = (String, String);
+/// Moves `key` in `index` from parent `from` to parent `to`.
+fn reindex<K: Clone + PartialEq>(index: &mut HashMap<Parent, Vec<K>>, key: &K, from: Option<Parent>, to: Option<Parent>) {
+    if let Some(keys) = from.and_then(|from| index.get_mut(&from)) {
+        keys.retain(|held| held != key);
+    }
+    if let Some(to) = to {
+        let keys = index.entry(to).or_default();
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+}
 #[derive(Default)]
 pub(super) struct ConvoyInputs {
     ready: bool,
     sessions: HashMap<Parent, Vec<SessionKey>>,
     vessels: HashMap<Parent, Vec<RepositorySourceKey>>,
-    checkouts: HashMap<Parent, Vec<RepositorySourceKey>>,
-    named_checkouts: HashMap<Parent, Vec<RepositorySourceKey>>,
-    clones: HashMap<Parent, Vec<RepositorySourceKey>>,
 }
 impl Aggregator {
     pub(super) fn rebuild_convoy_inputs(&mut self) {
@@ -27,16 +36,20 @@ impl Aggregator {
                 .or_default()
                 .push(key.clone());
         }
-        for (key, item) in &self.readiness_checkouts {
-            if let Some(parent) = item.object.metadata.labels.get(CONVOY_LABEL) {
-                index.checkouts.entry((item.object.metadata.namespace.clone(), parent.clone())).or_default().push(key.clone());
-            }
-            index.named_checkouts.entry((key.0.clone(), key.1.clone())).or_default().push(key.clone());
-        }
-        for key in self.readiness_clones.keys() {
-            index.clones.entry((key.0.clone(), key.1.clone())).or_default().push(key.clone());
-        }
         self.convoy_inputs = index;
+    }
+    /// Moves vessel `key` in the index from the convoy it served to the one it serves now, as one
+    /// vessel's change does without rebuilding the index.
+    pub(super) fn reindex_vessel(&mut self, key: &RepositorySourceKey, from: Option<Parent>, to: Option<Parent>) {
+        if self.convoy_inputs.ready {
+            reindex(&mut self.convoy_inputs.vessels, key, from, to);
+        }
+    }
+    /// Moves session `key` in the index from the convoy it crewed to the one it crews now.
+    pub(super) fn reindex_session(&mut self, key: &SessionKey, from: Option<Parent>, to: Option<Parent>) {
+        if self.convoy_inputs.ready {
+            reindex(&mut self.convoy_inputs.sessions, key, from, to);
+        }
     }
     pub(super) fn convoy_sessions(
         &self,
@@ -73,43 +86,10 @@ impl Aggregator {
                 .filter_map(|key| self.readiness_vessels.get(key)),
         )
     }
-    pub(super) fn convoy_checkouts(&self, namespace: &str, name: &str) -> Box<dyn Iterator<Item = &ReadResourceObject<Checkout>> + '_> {
-        if !self.convoy_inputs.ready {
-            return Box::new(self.readiness_checkouts.values());
-        }
-        Box::new(
-            self.convoy_inputs
-                .checkouts
-                .get(&(namespace.into(), name.into()))
-                .into_iter()
-                .flatten()
-                .filter_map(|key| self.readiness_checkouts.get(key)),
-        )
-    }
-    pub(super) fn named_checkouts(&self, namespace: &str, name: &str) -> Box<dyn Iterator<Item = &ReadResourceObject<Checkout>> + '_> {
-        if !self.convoy_inputs.ready {
-            return Box::new(self.readiness_checkouts.values());
-        }
-        Box::new(
-            self.convoy_inputs
-                .named_checkouts
-                .get(&(namespace.into(), name.into()))
-                .into_iter()
-                .flatten()
-                .filter_map(|key| self.readiness_checkouts.get(key)),
-        )
-    }
-    pub(super) fn named_clones(&self, namespace: &str, name: &str) -> Box<dyn Iterator<Item = &ReadResourceObject<CloneResource>> + '_> {
-        if !self.convoy_inputs.ready {
-            return Box::new(self.readiness_clones.values());
-        }
-        Box::new(
-            self.convoy_inputs
-                .clones
-                .get(&(namespace.into(), name.into()))
-                .into_iter()
-                .flatten()
-                .filter_map(|key| self.readiness_clones.get(key)),
-        )
+    /// The checkouts the engine holds for `convoy`, at every home, by checkout name (#3108), as
+    /// held here: projecting a convoy reads none.
+    pub(super) fn held_checkouts(&self, convoy: &ResourceObject<Convoy>) -> HeldCheckouts {
+        let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(convoy) else { return Ok(BTreeMap::new()) };
+        self.held_launches.held(&holder)
     }
 }

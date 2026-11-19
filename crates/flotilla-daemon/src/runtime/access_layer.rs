@@ -23,7 +23,7 @@ use flotilla_environment::environment::{vessel_ops, EntryKind, VesselAgent};
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     account_access::{requester_home, requester_material, AccessName},
-    AccessDelivery, Convoy, Environment, PinUnpack, ResourceError, ResourceObject, Vessel, CONVOY_LABEL,
+    AccessDelivery, Convoy, PinUnpack, ResourceObject, Vessel, CONVOY_LABEL,
 };
 use flotilla_schema::Timestamp;
 use flotilla_vessel_delivery::{
@@ -308,21 +308,22 @@ async fn frozen_crew(state: &ControllerRuntimeState, launch: &AccountLaunch<'_>,
         .and_then(|requirement| requirement.crew.iter().find(|crew| crew.role == launch.role))
         .ok_or_else(|| format!("crew `{}` is missing from convoy `{}`'s frozen vessel `{}`", launch.role, launch.convoy, vessel_ref))?;
     // The crew's Role Address, its access key until the #3108 cut-over.
-    let project = convoy.object.spec.project_ref.as_deref().unwrap_or(launch.namespace);
-    let access = flotilla_resources::access_delivery::access_key(project, launch.convoy, &vessel.object.spec.vessel_name, launch.role);
+    let access = flotilla_resources::access_delivery::access_key(
+        &convoy.object.spec.project_ref,
+        launch.convoy,
+        &vessel.object.spec.vessel_name,
+        launch.role,
+    );
     Ok(FrozenCrew { access, skills: crew.skills.selected.clone() })
 }
 
 /// What the vessel's Environment declares for its harnesses, such as an explicit home.
 async fn declared_environment(state: &ControllerRuntimeState, launch: &AccountLaunch<'_>) -> Result<BTreeMap<String, String>, String> {
-    match state.daemon.resource_backend().including_replicas::<Environment>(launch.namespace).get(launch.env_ref).await {
-        Ok(environment) => {
-            let spec = environment.object.spec;
-            Ok(spec.docker.map(|docker| docker.env).or(spec.cloud_sandbox.map(|cloud| cloud.env)).unwrap_or_default())
-        }
-        Err(ResourceError::NotFound { .. }) => Ok(BTreeMap::new()),
-        Err(error) => Err(error.to_string()),
-    }
+    Ok(state
+        .environment(launch.env_ref)
+        .await?
+        .and_then(|environment| environment.spec.docker.map(|docker| docker.env).or(environment.spec.cloud_sandbox.map(|cloud| cloud.env)))
+        .unwrap_or_default())
 }
 
 /// The crew's skill tree, fetched on the controlling daemon and pushed into the vessel
@@ -426,22 +427,42 @@ impl TreeDelivery for LoginDelivery {
 /// host delays the rest of a rotation pass by at most this.
 const LOGIN_PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Pushes of one crew's login that fail in a row before it waits for the next rotation:
+/// about five minutes of backoff.
+const LOGIN_PUSH_RETRY_LIMIT: u32 = 10;
+
 /// #4037: push the central login's current crew copy into every crew home holding an older
 /// one, on every kind of place, through the crew's own vessel agent: the refresher rotates
 /// the central login and no crew can refresh its copy. A failed push is recorded as the
-/// access's retry, which `convoy explain` shows, and is attempted again once due.
-pub(super) async fn redeliver_central_logins(state: &Arc<ControllerRuntimeState>, namespace: &str) -> Result<(), String> {
-    let Some(material) = state.agent_material.as_ref() else { return Ok(()) };
+/// access's retry, which `convoy explain` shows. After a `rotated` login every stale home is
+/// pushed; otherwise only those whose retry fell due, at most [`LOGIN_PUSH_RETRY_LIMIT`] times
+/// in a row. Answers when the earliest pending retry falls due.
+pub(super) async fn redeliver_central_logins(
+    state: &Arc<ControllerRuntimeState>,
+    namespace: &str,
+    rotated: bool,
+) -> Result<Option<Timestamp>, String> {
+    let Some(material) = state.agent_material.as_ref() else { return Ok(None) };
     let backend = state.daemon.resource_backend();
     let now = Timestamp::from_datetime(&state.daemon.clock().now());
     let records = backend.using::<AccessDelivery>(namespace).list().await.map_err(|error| format!("list access deliveries: {error}"))?;
     let mut login = None;
     let vessels = tokio::sync::OnceCell::new();
+    let mut next_retry: Option<Timestamp> = None;
     for record in records.items {
         let Some(landed) = record.spec.needs.get(LOGIN).filter(|landed| HarnessLogin::is_central(&landed.digest)) else { continue };
         let retry = record.spec.retry.as_ref().filter(|retry| retry.need == LOGIN);
-        if retry.is_some_and(|retry| retry.next_at > now) {
-            continue;
+        if let Some(retry) = retry {
+            // A permanent failure waits for its record to be removed.
+            if retry.next_at == Timestamp::MAX {
+                continue;
+            }
+            if !rotated && (retry.attempts >= LOGIN_PUSH_RETRY_LIMIT || retry.next_at > now) {
+                if retry.attempts < LOGIN_PUSH_RETRY_LIMIT {
+                    next_retry = Some(next_retry.map_or(retry.next_at, |next| next.min(retry.next_at)));
+                }
+                continue;
+            }
         }
         let login = match &login {
             Some(login) => login,
@@ -484,12 +505,16 @@ pub(super) async fn redeliver_central_logins(state: &Arc<ControllerRuntimeState>
             }
         }
         // One record's write losing a race with a launch must not hold back every later crew;
-        // the next pass reads it afresh.
-        if let Err(error) = status::record_push(state, namespace, &record, LOGIN, &digest, pushed).await {
-            tracing::warn!(access = %record.spec.access, place = %record.spec.place, %error, "failed to record a central Codex login push");
+        // the next rotation reads it afresh.
+        match status::record_push(state, namespace, &record, LOGIN, &digest, pushed, LOGIN_PUSH_RETRY_LIMIT).await {
+            Ok(Some(at)) => next_retry = Some(next_retry.map_or(at, |next| next.min(at))),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(access = %record.spec.access, place = %record.spec.place, %error, "failed to record a central Codex login push")
+            }
         }
     }
-    Ok(())
+    Ok(next_retry)
 }
 
 /// The live vessel an access record's crew is aboard, by the access key [`frozen_crew`] composes.
@@ -505,7 +530,7 @@ fn record_vessel<'a>(vessels: &'a [ResourceObject<Vessel>], record: &ResourceObj
 /// Whether an access key `{project}/{convoy}/{vessel}/{role}` names this convoy's vessel,
 /// whatever the project and role hold.
 fn access_names_vessel(access: &str, convoy: &str, vessel_name: &str) -> bool {
-    access.contains(&format!("/{convoy}/{vessel_name}/"))
+    access.contains(&format!("/{}/{vessel_name}/", flotilla_resources::convoy_segment(convoy)))
 }
 
 #[cfg(test)]

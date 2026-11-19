@@ -2,6 +2,7 @@
 // Tests share a process: isolate state and keep process-wide mutations in separate targets.
 mod bench;
 mod checks;
+mod created;
 mod ddl;
 mod derive_codec;
 mod derive_indexes;
@@ -10,10 +11,12 @@ mod derive_states;
 mod domains;
 mod edges;
 mod fixtures;
+mod handle;
 mod history;
 mod homes;
 mod interning;
 mod log;
+mod observers;
 mod ownership;
 mod plans;
 mod queries;
@@ -30,3 +33,4 @@ mod tables;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;
 mod versions;
+mod wal;

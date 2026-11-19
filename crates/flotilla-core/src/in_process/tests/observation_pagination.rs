@@ -1,4 +1,4 @@
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +11,6 @@ use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::HostName;
 use flotilla_resources::{Repository, RepositorySpec};
-use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
 use crate::in_process::InProcessDaemon;
@@ -81,19 +80,20 @@ impl CommandRunner for BusyObservationRunner {
 async fn source_pagination_fairness_survives_provider_rediscovery() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), r#"machine_id = "fair-pagination-test""#).expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let repository = RepositorySpec::remote("https://github.com/team/one").expect("repository");
-    backend.using::<Repository>("flotilla").create(&test_meta(&repository.key().to_string()), &repository).await.expect("repository");
+    let backend = engine_home_backend();
     let runner = Arc::new(BusyObservationRunner::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery_with_runner(false, runner.clone()),
         HostName::new("test-host"),
-        backend,
+        backend.clone(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    super::test_engine(&daemon);
+    let repository = RepositorySpec::remote("https://github.com/team/one").expect("repository");
+    backend.using::<Repository>("flotilla").create(&test_meta(&repository.key().to_string()), &repository).await.expect("repository");
     daemon
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
         .expect("capability");

@@ -1,32 +1,45 @@
 use super::*;
 
-pub(super) async fn replicate_local_kind<T: Resource>(source: &InProcessDaemon, target: &InProcessDaemon) {
-    let listed = source
-        .resource_backend()
-        .using::<T>(NAMESPACE)
-        .list()
-        .await
-        .unwrap_or_else(|error| panic!("list {} for test replication: {error}", T::API_PATHS.kind));
-    target
-        .resource_backend()
-        .replica_writer::<T>(source.node_id().clone(), NAMESPACE)
-        .replace(&listed, Utc::now())
-        .await
-        .unwrap_or_else(|error| panic!("replicate {} in test: {error}", T::API_PATHS.kind));
+/// Sends everything `source`'s decided store holds of its own home to `target`'s, as its log
+/// arrives at a peer.
+pub(super) fn replicate_decided_store(source: &InProcessDaemon, target: &InProcessDaemon) {
+    let from = source.decided_store().expect("source decided store");
+    let to = target.decided_store().expect("target decided store");
+    flotilla_provisioning_testkit::replicate_home(&from, source.node_id().as_str(), &to);
 }
 
+/// One round of each daemon's engine home to the other, as their followers receive them.
 pub(super) async fn bridge_runtime_resource_stores(first: &InProcessDaemon, second: &InProcessDaemon) {
-    replicate_local_kind::<Convoy>(first, second).await;
-    replicate_local_kind::<Vessel>(first, second).await;
-    replicate_local_kind::<FulfilmentKind>(first, second).await;
-    replicate_local_kind::<ResourceCheckout>(first, second).await;
-    replicate_local_kind::<TerminalSession>(first, second).await;
+    follow_engine_home(first, second).await;
+    follow_engine_home(second, first).await;
+}
 
-    replicate_local_kind::<Convoy>(second, first).await;
-    replicate_local_kind::<Vessel>(second, first).await;
-    replicate_local_kind::<FulfilmentKind>(second, first).await;
-    replicate_local_kind::<ResourceCheckout>(second, first).await;
-    replicate_local_kind::<TerminalSession>(second, first).await;
+/// One round of `from`'s engine home after what `to` holds of it, as a peer's follower receives
+/// it: the engine Convoys, clones and checkouts `from` decided reach `to`. As a production round,
+/// it runs on a blocking thread, since it reads and writes the stores, and is served only once
+/// the home's log has passed the follower's cursor; the bridge runs every few milliseconds beside
+/// both daemons' controllers on the test's one runtime thread.
+async fn follow_engine_home(from: &InProcessDaemon, to: &InProcessDaemon) {
+    let (Ok(from), Ok(to)) = (from.decided_store(), to.decided_store()) else { return };
+    tokio::task::spawn_blocking(move || {
+        let home = from.home().to_owned();
+        let after = to.last_sequence(&home).expect("the follower's cursor");
+        if after >= from.last_sequence(&home).expect("the home's last sequence") {
+            return;
+        }
+        let mut frames = Vec::new();
+        from.serve(Some(after), flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()), |frame| {
+            frames.push(frame.to_vec());
+            Ok(())
+        })
+        .expect("serve the engine home");
+        to.with_store(|store| {
+            flotilla_schema_sqlite::stream::Follower::new(store).receive(&home, |sink| frames.iter().try_for_each(|frame| sink(frame)))
+        })
+        .expect("follow the engine home");
+    })
+    .await
+    .expect("the engine home's round finishes");
 }
 
 pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) {
@@ -49,31 +62,24 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         repo_default_dir: temp.path().join("kiwi-repos").display().to_string(),
         ..manual_profile(&kiwi_host_ref, false)
     };
-    let feta_profile = LocalProvisioningProfile {
+    let mut feta_profile = LocalProvisioningProfile {
         repo_default_dir: temp.path().join("feta-repos").display().to_string(),
         ..manual_profile(&feta_host_ref, docker)
     };
+    // Feta advertises its container provider by the name its registry holds it under.
+    for provider in &mut feta_profile.environment_providers {
+        if provider.kind.as_ref().is_some_and(|kind| kind.class == flotilla_protocol::provider::EnvironmentClass::Container) {
+            provider.instance = "docker".to_string();
+        }
+    }
     fs::create_dir_all(&kiwi_profile.repo_default_dir).expect("kiwi repo root");
     fs::create_dir_all(&feta_profile.repo_default_dir).expect("feta repo root");
-    register_startup_resources(&kiwi, NAMESPACE, &kiwi_profile).await.expect("register kiwi resources");
-    register_startup_resources(&feta, NAMESPACE, &feta_profile).await.expect("register feta resources");
-    assert!(
-        feta.resource_backend()
-            .replica_writer::<Convoy>(kiwi.node_id().clone(), NAMESPACE)
-            .cursor()
-            .await
-            .expect("read initial Convoy replica cursor")
-            .is_none(),
-        "the placement host must begin with an empty replica store"
-    );
-    assert!(
-        feta.resource_backend()
-            .replica_writer::<Vessel>(kiwi.node_id().clone(), NAMESPACE)
-            .cursor()
-            .await
-            .expect("read initial Vessel replica cursor")
-            .is_none(),
-        "the placement host must begin with an empty replica store"
+    let kiwi_provisioning = engine_startup(&kiwi, NAMESPACE, &kiwi_profile).await.expect("register kiwi resources");
+    let feta_provisioning = engine_startup(&feta, NAMESPACE, &feta_profile).await.expect("register feta resources");
+    assert_eq!(
+        feta.decided_store().expect("feta decided store").last_sequence(kiwi.node_id().as_str()).expect("feta's cursor on kiwi"),
+        0,
+        "the placement host must begin holding nothing of kiwi's"
     );
 
     let kiwi_state = Arc::new(ControllerRuntimeState::new(
@@ -85,14 +91,16 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         kiwi_profile.host_direct_environment_name(),
     ));
     let feta_registry = if docker {
-        let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
-            id: EnvironmentId::new("env-remote-placement-work"),
-            image: ImageId::new("test-image"),
-            runner: Arc::new(ProcessCommandRunner),
-            env_vars: HashMap::from([("HOME".to_string(), temp.path().join("container-home").display().to_string())]),
-            destroyed: Arc::new(AtomicBool::new(false)),
-        });
-        passthrough_registry_with_environment(handle)
+        let home = temp.path().join("container-home").display().to_string();
+        passthrough_registry_with_environment(move |id| {
+            Arc::new(TestInteriorEnvironment {
+                id,
+                image: ImageId::new("test-image"),
+                runner: Arc::new(ProcessCommandRunner),
+                env_vars: HashMap::from([("HOME".to_string(), home)]),
+                destroyed: Arc::new(AtomicBool::new(false)),
+            }) as EnvironmentHandle
+        })
     } else {
         passthrough_registry()
     };
@@ -107,17 +115,12 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         )
         .with_environment_tools(fixed_environment_tools(temp.path())),
     );
-    let mut controller_handles = spawn_controller_loops(
-        kiwi_state,
-        NAMESPACE,
-        Duration::from_millis(25),
-        ControllerSupervision::default(),
-        RuntimeHealth::default(),
-    );
+    let mut controller_handles =
+        spawn_controller_loops(kiwi_state, &kiwi_provisioning, NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
     controller_handles.extend(spawn_controller_loops(
         feta_state,
+        &feta_provisioning,
         NAMESPACE,
-        Duration::from_millis(25),
         ControllerSupervision::default(),
         RuntimeHealth::default(),
     ));
@@ -135,7 +138,24 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
     let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
     let repo_url = format!("file://{}", source.path().display());
     let repository_spec = RepositorySpec::remote(&repo_url).expect("test repository spec");
-    let repository_key = repository_spec.key();
+    flotilla_store::ensure_repository(&kiwi.resource_backend().using::<Repository>(NAMESPACE), &repository_spec.key(), &repository_spec)
+        .await
+        .expect("repository create should succeed");
+    // A file remote has no forge to name its default branch: the project names it.
+    kiwi.resource_backend()
+        .definitions::<flotilla_resources::Project>(NAMESPACE)
+        .create(
+            &empty_meta("remote-placement"),
+            &flotilla_resources::ProjectSpec::builder()
+                .display_name("Remote placement".to_string())
+                .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder()
+                    .repo(repository_spec.key())
+                    .default_branch("main".to_string())
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("create project");
     let workflow_name = if docker { "remote-docker" } else { "remote-host-direct" };
     kiwi.resource_backend()
         .using::<WorkflowTemplate>(NAMESPACE)
@@ -148,6 +168,7 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
                     .name("work".to_string())
                     .crew(vec![CrewSpec::builder()
                         .role("coder".to_string())
+                        .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("coder")])
                         .source(CrewSource::Tool { command: "true".to_string() })
                         .build()])
                     .build()])
@@ -170,79 +191,55 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         .create(&empty_meta(policy_name), &kind)
         .await
         .expect("create remote fulfilment kind");
+    // The kind is a decided record homed at kiwi: it reaches feta as kiwi's log does.
+    replicate_decided_store(&kiwi, &feta);
+    // Both hosts publish their advertisements; feta's Host reaches kiwi, which places on it.
+    apply_host_heartbeat(&kiwi, NAMESPACE, &kiwi_profile, &test_health_identity()).await.expect("kiwi heartbeat");
+    apply_host_heartbeat(&feta, NAMESPACE, &feta_profile, &test_health_identity()).await.expect("feta heartbeat");
+    let host_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while let Err(error) = kiwi.canonical_host_id_internal(NAMESPACE, &feta_host_ref).await {
+        assert!(tokio::time::Instant::now() < host_deadline, "feta's Host never reached kiwi: {error}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Admission places the work on feta: the only host the policy names.
+    let mut rx = kiwi.subscribe();
+    let create_id = kiwi
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "remote-placement".to_string(),
+                    workflow_ref: workflow_name.to_string(),
+                    inputs: Vec::new(),
+                    r#ref: Some("remote-placement".to_string()),
+                    project_ref: "remote-placement".to_string(),
+                    placement_policy: Some(policy_name.to_string()),
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
+        .await
+        .expect("convoy create command should start");
+    let created = wait_for_command_result(&mut rx, create_id).await;
+    let convoy_name = convoy_record_name(&kiwi.resource_backend(), "remote-placement").await;
+    assert_eq!(created, created_launch("remote-placement", &convoy_name));
     let convoys = kiwi.resource_backend().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(
-            &empty_meta("remote-placement"),
-            &ConvoySpec {
-                continuation: None,
-                subjects: Vec::new(),
-                role: String::new(),
-                generation: 1,
-                workflow_ref: workflow_name.to_string(),
-                dispatching_principal_ref: Default::default(),
-                inputs: BTreeMap::new(),
-                placement_policy: Some(policy_name.to_string()),
-                repositories: vec![ConvoyRepositorySpec {
-                    url: repo_url,
-                    repo_ref: repository_key,
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: repository_spec.leaf_slug(),
-                    subpaths: Vec::new(),
-                }],
-                r#ref: Some("remote-placement".to_string()),
-                project_ref: None,
-                adopted_checkout_refs: BTreeMap::new(),
-                issues: Vec::new(),
-                change_request: None,
-                instruction: None,
-                promises: Vec::new(),
-            },
-        )
-        .await
-        .expect("create admitting Convoy");
-    convoys
-        .update_status(
-            "remote-placement",
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                placement_decision: Some(PlacementDecision {
-                    provider_instance: None,
-                    provider_workspace_root: None,
-                    minimal_alternatives: Vec::new(),
-                    escalation_reason: None,
-                    kind: policy_name.to_string(),
-                    target_host: PlacementTargetHost {
-                        reference: CanonicalHostId::resolved(feta_host_ref.clone()),
-                        display_name: "feta".to_string(),
-                    },
-                    refused_candidates: Vec::new(),
-                    viable_not_selected: Vec::new(),
-                    allocation: None,
-                }),
-                ..ConvoyStatus::default()
-            },
-        )
-        .await
-        .expect("record remote placement");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let running = convoys.get("remote-placement").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
+        let running = convoys.get(&convoy_name).await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
             status.phase == ConvoyPhase::Active && status.work.get("work").is_some_and(|work| work.phase == WorkPhase::Running)
         });
         if running {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            let kiwi_convoy = convoys.get("remote-placement").await.expect("kiwi Convoy");
+            let kiwi_convoy = convoys.get(&convoy_name).await.expect("kiwi Convoy");
             let kiwi_vessels = kiwi.resource_backend().using::<Vessel>(NAMESPACE).list().await.expect("kiwi Vessels");
             let feta_vessels = feta.resource_backend().using::<Vessel>(NAMESPACE).list().await.expect("feta Vessels");
             let feta_clones = feta.resource_backend().using::<Clone>(NAMESPACE).list().await.expect("feta Clones");
-            let feta_checkouts = feta.resource_backend().using::<ResourceCheckout>(NAMESPACE).list().await.expect("feta Checkouts");
+            let feta_checkouts = feta.lifecycle_reads().checkouts().and_then(|checkouts| checkouts.here());
             let feta_terminals = feta.resource_backend().using::<TerminalSession>(NAMESPACE).list().await.expect("feta TerminalSessions");
-            let feta_environments = feta.resource_backend().using::<Environment>(NAMESPACE).list().await.expect("feta Environments");
+            let feta_environments = feta.lifecycle_reads().environments().and_then(|environments| environments.live());
             panic!(
                 "remote placement did not reach Running: convoy={kiwi_convoy:?} kiwi_vessels={kiwi_vessels:?} \
                      feta_vessels={feta_vessels:?} feta_clones={feta_clones:?} feta_checkouts={feta_checkouts:?} \
@@ -252,32 +249,39 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    let actuator = feta.resource_backend().using::<Vessel>(NAMESPACE).get("remote-placement-work").await.expect("feta actuator Vessel");
+    // The work's launch is requested at the placement host, which actuates it.
+    let feta_launch = feta
+        .lifecycle_reads()
+        .vessels()
+        .and_then(|vessels| vessels.of_convoy(&convoy_name))
+        .expect("feta launches")
+        .into_iter()
+        .find(|launch| !launch.ended())
+        .expect("feta's launch of the work");
+    let actuator = feta.resource_backend().using::<Vessel>(NAMESPACE).get(&feta_launch.name).await.expect("feta actuator Vessel");
     assert_eq!(actuator.status.as_ref().map(|status| status.phase), Some(flotilla_resources::VesselPhase::Ready));
     assert_eq!(actuator.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).map(String::as_str), Some(feta_host_ref.as_str()));
-    let owner = kiwi.resource_backend().using::<Vessel>(NAMESPACE).get("remote-placement-work").await.expect("kiwi owner Vessel");
+    // The admitting side requests no launch of its own for remote work (#3108): it has no
+    // Vessel to fail, only the placement host's replicated launch.
+    let kiwi_reads = kiwi.lifecycle_reads();
+    let kiwi_vessels = kiwi_reads.vessels().expect("kiwi vessels");
     assert!(
-        owner.status.as_ref().is_none_or(|status: &VesselStatus| status.phase != flotilla_resources::VesselPhase::Failed),
-        "the admitting-side Vessel must not attempt remote actuation"
+        kiwi_vessels.at(kiwi_vessels.home()).expect("kiwi's launches").iter().all(|launch| launch.convoy != convoy_name),
+        "the admitting side must not attempt remote actuation"
     );
     assert!(
-        matches!(
-            kiwi.resource_backend().using::<Environment>(NAMESPACE).get(&feta_profile.host_direct_environment_name()).await,
-            Err(ResourceError::NotFound { .. })
-        ),
+        kiwi.lifecycle_reads()
+            .environments()
+            .and_then(|environments| environments.get(&feta_profile.host_direct_environment_name(), None))
+            .expect("read kiwi's environments")
+            .is_none(),
         "the placement host's Environment must remain host-local"
     );
-    let ready_checkouts = feta
-        .resource_backend()
-        .using::<ResourceCheckout>(NAMESPACE)
-        .list()
-        .await
-        .expect("feta Checkouts")
-        .items
-        .into_iter()
-        .filter(|checkout| checkout.status.as_ref().map(|status| status.phase) == Some(ResourceCheckoutPhase::Ready))
-        .count();
-    assert_eq!(ready_checkouts, 1);
+    // The work's checkout is feta's, ready there, and only there.
+    let ready_checkouts = feta.lifecycle_reads().checkouts().and_then(|checkouts| checkouts.here()).expect("feta's checkouts");
+    assert_eq!(ready_checkouts.iter().filter(|checkout| checkout.is_ready()).count(), 1, "{ready_checkouts:?}");
+    let kiwi_checkouts = kiwi.lifecycle_reads().checkouts().and_then(|checkouts| checkouts.here()).expect("kiwi's checkouts");
+    assert!(kiwi_checkouts.is_empty(), "the placement host's checkout is not kiwi's: {kiwi_checkouts:?}");
 
     bridge.abort();
     for handle in controller_handles {

@@ -7,9 +7,9 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 
 use flotilla_resources::{
-    access_delivery::{DeliveredNeed, DeliveryMechanism, DeliveryRetry},
+    access_delivery::{record_name, DeliveredNeed, DeliveryMechanism, DeliveryRetry},
     account_access::{requester_convoy_dir, REQUESTER_HOME_DIR, REQUESTER_MATERIAL_DIR},
-    AccessDelivery, AccessDeliverySpec, Convoy, Environment, InputMeta, ResourceError, ResourceObject, CONVOY_LABEL,
+    AccessDelivery, AccessDeliverySpec, Convoy, InputMeta, ResourceError, ResourceObject, CONVOY_LABEL,
 };
 use flotilla_schema::Timestamp;
 use flotilla_store::controller::{ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, SecondaryWatch};
@@ -125,7 +125,8 @@ impl AccessStatus {
 }
 
 /// Record a push of `need` outside a launch into the home `record` names (#4037): the
-/// digest that landed, or the retry a failure leaves.
+/// digest that landed, or the retry a failure leaves. Answers when that retry falls due, unless
+/// the push has failed `limit` times in a row.
 pub(in crate::runtime) async fn record_push(
     state: &ControllerRuntimeState,
     namespace: &str,
@@ -133,7 +134,8 @@ pub(in crate::runtime) async fn record_push(
     need: &str,
     digest: &str,
     pushed: Result<(), String>,
-) -> Result<(), String> {
+    limit: u32,
+) -> Result<Option<Timestamp>, String> {
     let now = state.daemon.clock().now();
     let mut spec = record.spec.clone();
     spec.retry = match pushed {
@@ -158,16 +160,8 @@ pub(in crate::runtime) async fn record_push(
         .using::<AccessDelivery>(namespace)
         .update(&meta, &record.metadata.resource_version, &spec)
         .await
-        .map(drop)
-        .map_err(|error| format!("record access delivery `{}`: {error}", record.metadata.name))
-}
-
-/// One record per (access, place). The access is opaque and may hold any character, so
-/// the name is a digest of the pair.
-pub(in crate::runtime) fn record_name(access: &str, place: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::new().chain_update(access.as_bytes()).chain_update([0]).chain_update(place.as_bytes()).finalize();
-    format!("access-{}", &format!("{digest:x}")[..16])
+        .map_err(|error| format!("record access delivery `{}`: {error}", record.metadata.name))?;
+    Ok(spec.retry.filter(|retry| retry.need == need && retry.attempts < limit).map(|retry| retry.next_at))
 }
 
 fn delivery_mechanism(mechanism: Mechanism) -> DeliveryMechanism {
@@ -194,40 +188,58 @@ fn bounded(error: &str) -> String {
     }
 }
 
-/// Removes a record once its place or its convoy is gone; the home went with the place,
-/// and the access ended with the convoy.
+/// Removes a record once its place or its convoy is recorded as ended; the home went with the
+/// place, and the access ended with the convoy.
 pub(in crate::runtime) fn status_controller(
     state: std::sync::Arc<ControllerRuntimeState>,
     namespace: String,
 ) -> (Vec<Box<dyn SecondaryWatch<Primary = AccessDelivery>>>, AccessStatusReconciler) {
-    (Vec::new(), AccessStatusReconciler { state, namespace })
+    (Vec::new(), AccessStatusReconciler { state, namespace, held: Default::default() })
 }
 
 pub(in crate::runtime) struct AccessStatusReconciler {
     state: std::sync::Arc<ControllerRuntimeState>,
     namespace: String,
+    /// Each record held because its place or convoy cannot be found, by name, with the reason
+    /// last logged: a hold is logged when it begins or its reason changes, not at every pass.
+    held: std::sync::Mutex<BTreeMap<String, String>>,
 }
 
 impl AccessStatusReconciler {
     pub(in crate::runtime) async fn retire(&self, record: &ResourceObject<AccessDelivery>) -> Result<(), String> {
         let backend = self.state.daemon.resource_backend();
-        let gone = |found: Result<_, ResourceError>| -> Result<bool, String> {
-            match found {
-                Ok(_) => Ok(false),
-                Err(ResourceError::NotFound { .. }) => Ok(true),
-                Err(error) => Err(error.to_string()),
-            }
-        };
         let place = &record.spec.place;
+        let mut unresolved = Vec::new();
+        // A place that ended is gone: its environment is not launched again. One not found here
+        // is no record that it ended.
         let place_gone = *place != self.state.host_direct_environment_name
-            && gone(backend.including_replicas::<Environment>(&self.namespace).get(place).await.map(drop))?;
+            && match self.state.environment(place).await? {
+                Some(environment) => environment.ended(),
+                None => {
+                    unresolved.push(format!("its place `{place}` is not found"));
+                    false
+                }
+            };
+        // A convoy that ended is gone too: a launch is ended, never deleted, and holds no access.
+        // One not found here is no record that it ended: its requester state stays. Imported
+        // ended convoys rely on this pass at start-up (#3108 ruling (x)): one held only by an
+        // access delivery the old fleet had not yet removed retires once this removes it.
         let convoy_gone = match record.metadata.labels.get(CONVOY_LABEL) {
-            Some(convoy) => gone(backend.including_replicas::<Convoy>(&self.namespace).get(convoy).await.map(drop))?,
+            Some(convoy) => match backend.including_replicas::<Convoy>(&self.namespace).get(convoy).await {
+                Ok(read) => read.object.status.is_some_and(|status| status.phase.is_terminal()),
+                Err(ResourceError::NotFound { .. }) => {
+                    unresolved.push(format!("its convoy `{convoy}` is not found"));
+                    false
+                }
+                Err(error) => return Err(error.to_string()),
+            },
             None => false,
         };
         if !(place_gone || convoy_gone) {
+            self.hold(&record.metadata.name, (!unresolved.is_empty()).then(|| unresolved.join("; ")));
             return Ok(());
         }
+        self.hold(&record.metadata.name, None);
         // The access ended with its convoy: its requester state goes from an SSH host, whose
         // dirs nothing else removes. A failure keeps the record, so the next pass retries. With the
         // place gone too the host is no longer ours to drive, so the record goes without cleanup.
@@ -241,6 +253,22 @@ impl AccessStatusReconciler {
         match backend.using::<AccessDelivery>(&self.namespace).delete(&record.metadata.name).await {
             Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
             Err(error) => Err(format!("remove access delivery `{}`: {error}", record.metadata.name)),
+        }
+    }
+
+    /// Notes `name` held for `reason`, or no longer held with none; a hold is logged when it
+    /// begins or its reason changes.
+    fn hold(&self, name: &str, reason: Option<String>) {
+        let mut held = self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match reason {
+            Some(reason) if held.get(name) != Some(&reason) => {
+                tracing::warn!(namespace = %self.namespace, delivery = %name, %reason, "access delivery held: not retired, requester state kept");
+                held.insert(name.to_owned(), reason);
+            }
+            Some(_) => {}
+            None => {
+                held.remove(name);
+            }
         }
     }
 }

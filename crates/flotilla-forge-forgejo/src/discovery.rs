@@ -2,7 +2,7 @@
 //! the change-request and issue-tracker factories.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use flotilla_config::provider_config::ForgejoIssueTrackerConfig;
 use flotilla_discovery_api::provider_config::ProviderConfig;
@@ -15,29 +15,81 @@ use flotilla_resources::ForgeKind;
 
 use crate::{ForgejoAuth, ForgejoIssueProviderConfig, FORGEJO_AUTH_PROVIDER};
 
+/// The last Forgejo authentication failure one factory told: a standing failure is probed again
+/// by every lookup, and is told once, again only when it changes, and once more when it ends.
+/// Held in memory by the factory; a restart tells it afresh.
+#[derive(Clone, Debug, Default)]
+pub struct AuthReport(Arc<Mutex<Option<String>>>);
+
+impl AuthReport {
+    fn failed(&self, error: &str) {
+        let mut last = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.as_deref() != Some(error) {
+            tracing::warn!(%error, "Forgejo authentication unavailable");
+            *last = Some(error.to_owned());
+        }
+    }
+
+    fn resolved(&self) {
+        if self.0.lock().unwrap_or_else(PoisonError::into_inner).take().is_some() {
+            tracing::info!("Forgejo authentication available");
+        }
+    }
+}
+
 /// Resolve the Forgejo connection and its transport off the async runtime,
-/// bounding the credential and CA file reads by the shared probe timeout.
+/// bounding the credential and CA file reads by the shared probe timeout. An
+/// authentication failure is told through `report`.
 pub async fn bounded_forgejo_provider_config(
     env: &EnvironmentBag,
     config: &dyn ProviderConfigView,
     settings: &ProviderConfig,
     http: Arc<dyn HttpClient>,
+    report: &AuthReport,
 ) -> Result<(ForgejoIssueProviderConfig, Arc<dyn HttpClient>), Vec<UnmetRequirement>> {
     let env = env.clone();
     let settings = settings.clone();
     let config = config.base_path().clone();
-    flotilla_provider_runtime::probe::blocking("Forgejo credential", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
-        Ok(forgejo_provider_config(&env, &config, &settings).and_then(|resolved| Ok((resolved, forgejo_transport(&env, http)?))))
-    })
-    .await
-    .map_err(|error| vec![UnmetRequirement::MissingAuth(error)])?
+    let resolved =
+        flotilla_provider_runtime::probe::blocking("Forgejo credential", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
+            Ok(forgejo_provider_config(&env, &config, &settings)
+                .and_then(|resolved| Ok((resolved, forgejo_transport(&env, http).map_err(Refused::from)?))))
+        })
+        .await
+        .map_err(|error| vec![UnmetRequirement::MissingAuth(error)])?;
+    // Told here, on the caller's task, rather than on the blocking thread that read the files.
+    match resolved {
+        Ok(resolved) => {
+            report.resolved();
+            Ok(resolved)
+        }
+        Err(Refused { unmet, auth }) => {
+            if let Some(error) = auth {
+                report.failed(&error);
+            }
+            Err(unmet)
+        }
+    }
+}
+
+/// Why the connection was not resolved, with the authentication failure's cause when that was it.
+#[derive(Debug)]
+struct Refused {
+    unmet: Vec<UnmetRequirement>,
+    auth: Option<String>,
+}
+
+impl From<Vec<UnmetRequirement>> for Refused {
+    fn from(unmet: Vec<UnmetRequirement>) -> Self {
+        Self { unmet, auth: None }
+    }
 }
 
 fn forgejo_provider_config(
     env: &EnvironmentBag,
     config: &DaemonHostPath,
     settings: &ProviderConfig,
-) -> Result<ForgejoIssueProviderConfig, Vec<UnmetRequirement>> {
+) -> Result<ForgejoIssueProviderConfig, Refused> {
     if let Some(binding) = env.forge_override() {
         binding.validate().map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
         let identity = env.repo_identity().ok_or_else(|| vec![UnmetRequirement::MissingRemoteHost("origin".into())])?;
@@ -63,10 +115,8 @@ fn forgejo_provider_config(
         .map(|forge| forge.https_url.as_str())
         .or_else(|| forgejo.service_url.as_deref().map(str::trim).filter(|url| !url.is_empty()))
         .ok_or_else(|| vec![UnmetRequirement::MissingConfig("[issue_tracker.forgejo].service_url or Forge".into())])?;
-    let auth = resolve_forgejo_auth(env, config, &forgejo).map_err(|error| {
-        tracing::warn!(%error, "Forgejo authentication unavailable");
-        vec![UnmetRequirement::MissingAuth(FORGEJO_AUTH_PROVIDER.into())]
-    })?;
+    let auth = resolve_forgejo_auth(env, config, &forgejo)
+        .map_err(|error| Refused { unmet: vec![UnmetRequirement::MissingAuth(FORGEJO_AUTH_PROVIDER.into())], auth: Some(error) })?;
     Ok(ForgejoIssueProviderConfig::new(service_url.into(), forgejo.api_base_url, auth))
 }
 

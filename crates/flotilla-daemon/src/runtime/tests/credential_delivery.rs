@@ -1,170 +1,125 @@
 use super::*;
+use crate::testkits::engine::{admit_convoy, engine, runtime_terminals};
+use flotilla_crew::crew_capabilities::CardScope;
+use flotilla_engine_messages::view::record_name;
 use flotilla_resources::attentions::Subject;
-use flotilla_store_memory::InMemoryBackend;
-
-#[tokio::test]
-async fn credential_refresh_retry_waits_until_deadline_without_rewriting_status() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let environments = backend.clone().using::<Environment>(NAMESPACE);
-    environments
-        .create(
-            &empty_meta("refresh-work"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("create environment");
-    let failure = CredentialRefreshError {
-        environment_ref: "refresh-work".into(),
-        credential_name: Some("github-app".into()),
-        message: "provider unavailable".into(),
-        should_surface: true,
-    };
-    record_credential_refresh_dispositions(&backend, NAMESPACE, std::slice::from_ref(&failure)).await.expect("record first failure");
-    let first = environments.get("refresh-work").await.expect("environment after first failure");
-    let retry = first.status.expect("status").credential_refresh_retry.expect("retry record");
-    assert_eq!(retry.attempts, 1);
-    record_credential_refresh_dispositions(&backend, NAMESPACE, std::slice::from_ref(&failure))
-        .await
-        .expect("observe failure again before deadline");
-    let second = environments.get("refresh-work").await.expect("environment after repeated failure");
-    assert_eq!(second.metadata.resource_version, first.metadata.resource_version);
-    assert_eq!(second.status.expect("status").credential_refresh_retry, Some(retry));
-    record_credential_refresh_dispositions(&backend, NAMESPACE, &[]).await.expect("clear on recovery");
-    assert!(environments
-        .get("refresh-work")
-        .await
-        .expect("environment after recovery")
-        .status
-        .expect("status")
-        .credential_refresh_retry
-        .is_none());
-}
+use tokio_util::task::AbortOnDropHandle;
 
 #[tokio::test]
 async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     let temp = tempfile::tempdir().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"credential-refresh-test\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    daemon.open_message_primitives().expect("message path");
+    designate_fleet(&daemon).await;
     let backend = daemon.resource_backend();
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("credential-convoy"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .credential_refs(BTreeSet::from(["github-app".to_string(), "forgejo".to_string()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                ..ConvoyStatus::default()
-            },
-        )
-        .await
-        .expect("set convoy status");
-    // The vessel's environment keeps its credential retry episode.
-    backend
-        .using::<Environment>(NAMESPACE)
-        .create(
-            &empty_meta("standing-vessel"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("create environment");
-    let vessels = backend.using::<Vessel>(NAMESPACE);
-    let vessel = vessels
-        .create(
-            &empty_meta("credential-vessel"),
-            &VesselSpec {
-                convoy_ref: "credential-convoy".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("create vessel");
-    vessels
-        .update_status(
-            &vessel.metadata.name,
-            &vessel.metadata.resource_version,
-            &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some("standing-vessel".to_string()),
-                ..VesselStatus::default()
-            },
-        )
-        .await
-        .expect("place vessel");
+    let engine = engine(&daemon);
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: vec![VesselRequirement::builder()
+                .name("work".to_string())
+                .credential_refs(BTreeSet::from(["github-app".to_string(), "forgejo".to_string()]))
+                .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                .build()],
+        }),
+        ..ConvoyStatus::default()
+    };
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("test".to_string()).build();
+    let convoy = flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy(NAMESPACE, "credential-convoy", spec, status),
+    )
+    .await;
+    let launch = engine.vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
+    engine_environments(&daemon).request(
+        "standing-vessel",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+            ..Default::default()
+        },
+        Some(&launch),
+    );
+    engine.vessels.ready(&launch, "standing-vessel");
     let transient = CredentialRefreshError {
         environment_ref: "standing-vessel".to_string(),
         credential_name: Some("github-app".to_string()),
         message: "credential `github-app`: outage; expires in 180 seconds".to_string(),
         should_surface: false,
+        first_failure_at: None,
     };
     let attentions = daemon.attentions();
     let open = || async { attentions.open(NAMESPACE, None, None).await.expect("open attentions") };
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[transient]).await.expect("ignore transient failure");
+    // A person acknowledges every open attention: each is a Message pending at this home.
+    let primitives = daemon.message_primitives().expect("message path");
+    let acknowledge_all = || async {
+        for (_, message) in primitives.person_messages(NAMESPACE).await.expect("messages") {
+            primitives.acknowledge(NAMESPACE, &record_name(message.name()).expect("record")).await.expect("acknowledge attention");
+        }
+    };
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[transient])
+        .await
+        .expect("ignore transient failure");
     assert!(open().await.is_empty());
 
+    // When the vessel's current run of failures began, as the store reports it; a full fix ends it.
+    let episode = std::cell::Cell::new(chrono::Utc::now());
     let failure = |message: &str, should_surface| CredentialRefreshError {
         environment_ref: "standing-vessel".to_string(),
         credential_name: Some("github-app".to_string()),
         message: message.to_string(),
         should_surface,
+        first_failure_at: Some(episode.get()),
     };
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 120 seconds", true)])
-        .await
-        .expect("raise attention");
-    let told = open().await;
-    assert_eq!(told.len(), 1);
-    assert_eq!(told[0].subject, Subject::Vessel { convoy: "credential-convoy".into(), vessel: "work".into() });
-    assert!(told[0].reason.contains("expires in 120 seconds"));
-    let demands = backend.using::<Demand>(NAMESPACE);
-    let raised_demand = demands.list().await.expect("list demands").items.remove(0);
-    flotilla_store::apply_status_patch(
-        &demands,
-        &raised_demand.metadata.name,
-        &flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "operator".to_string() },
+    reconcile_credential_refresh_attention_in(
+        &*daemon.attentions(),
+        &backend,
+        NAMESPACE,
+        &[failure("outage; expires in 120 seconds", true)],
     )
     .await
-    .expect("acknowledge demand");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 60 seconds", true)])
-        .await
-        .expect("the same credential keeps failing");
+    .expect("raise attention");
+    let told = open().await;
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].subject, Subject::Vessel { convoy: convoy.clone(), vessel: "work".into() });
+    assert!(told[0].reason.contains("expires in 120 seconds"));
+    acknowledge_all().await;
+    reconcile_credential_refresh_attention_in(
+        &*daemon.attentions(),
+        &backend,
+        NAMESPACE,
+        &[failure("outage; expires in 60 seconds", true)],
+    )
+    .await
+    .expect("the same credential keeps failing");
     assert!(open().await.is_empty(), "an acknowledged attention is not raised again while the same credentials fail");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[]).await.expect("recovery");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 90 seconds", true)])
-        .await
-        .expect("a new failure");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[]).await.expect("recovery");
+    episode.set(chrono::Utc::now());
+    reconcile_credential_refresh_attention_in(
+        &*daemon.attentions(),
+        &backend,
+        NAMESPACE,
+        &[failure("outage; expires in 90 seconds", true)],
+    )
+    .await
+    .expect("a new failure");
     assert_eq!(open().await.len(), 1, "a failure after recovery is told again");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expired 5 seconds ago", false)])
-        .await
-        .expect("retain alert during retry");
+    reconcile_credential_refresh_attention_in(
+        &*daemon.attentions(),
+        &backend,
+        NAMESPACE,
+        &[failure("outage; expired 5 seconds ago", false)],
+    )
+    .await
+    .expect("retain alert during retry");
     assert_eq!(open().await.len(), 1);
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[]).await.expect("clear on recovery");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[]).await.expect("clear on recovery");
+    episode.set(chrono::Utc::now());
     assert!(open().await.is_empty());
 
     // Each change of the failing set is told: {github-app}, then {github-app, forgejo}, then {github-app}.
@@ -172,45 +127,43 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     for (failing, told) in
         [(vec![failure("outage", true)], 1), (vec![failure("outage", true), forgejo], 2), (vec![failure("outage", true)], 1)]
     {
-        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &failing).await.expect("raise attention");
+        reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &failing).await.expect("raise attention");
         let open = open().await;
         assert_eq!(open.len(), 1, "one attention per vessel");
         assert_eq!(open[0].reason.lines().count(), told, "{}", open[0].reason);
     }
     // A partial fix keeps an acknowledged attention; a full fix clears it; the next failure is told.
     let forgejo = CredentialRefreshError { credential_name: Some("forgejo".to_string()), ..failure("token refused", true) };
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true), forgejo]).await.expect("two fail");
-    for demand in demands.list().await.expect("list demands").items {
-        let acknowledge =
-            flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "operator".to_string() };
-        flotilla_store::apply_status_patch(&demands, &demand.metadata.name, &acknowledge).await.expect("acknowledge demand");
-    }
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true)]).await.expect("partial fix");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true), forgejo])
+        .await
+        .expect("two fail");
+    acknowledge_all().await;
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true)])
+        .await
+        .expect("partial fix");
     assert!(open().await.is_empty(), "a partial fix leaves the acknowledgement standing");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[]).await.expect("full fix");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true)]).await.expect("fails again");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[]).await.expect("full fix");
+    episode.set(chrono::Utc::now());
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true)])
+        .await
+        .expect("fails again");
     assert_eq!(open().await.len(), 1, "after a full fix, a new failure is told");
 
     // Owner decision of 2026-11-02: a credential that starts failing while the attention is
     // acknowledged begins a new episode, and the person is told again.
-    let acknowledge_all = || async {
-        for demand in demands.list().await.expect("list demands").items {
-            let acknowledge =
-                flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "operator".to_string() };
-            flotilla_store::apply_status_patch(&demands, &demand.metadata.name, &acknowledge).await.expect("acknowledge demand");
-        }
-    };
     acknowledge_all().await;
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true)]).await.expect("still failing");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true)])
+        .await
+        .expect("still failing");
     assert!(open().await.is_empty(), "acknowledged while the same credential fails");
     let forgejo = CredentialRefreshError { credential_name: Some("forgejo".to_string()), ..failure("token refused", true) };
     let both = [failure("outage", true), forgejo];
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &both).await.expect("another starts failing");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &both).await.expect("another starts failing");
     let told = open().await;
     assert_eq!(told.len(), 1, "a newly failing credential is told again");
     assert_eq!(told[0].reason.lines().count(), 2, "{}", told[0].reason);
     acknowledge_all().await;
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &both).await.expect("both still failing");
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &both).await.expect("both still failing");
     assert!(open().await.is_empty(), "the new episode's acknowledgement stands while both fail");
 }
 
@@ -232,69 +185,42 @@ fn docker_environment_metadata_decodes_non_empty_credential_scopes() {
     assert_eq!(credential_scopes_from_environment(&spec).expect("decode credential scopes"), expected);
 }
 
-// #2577: misspelled mappings surface at host level, while a valid Forge
-// needs no checkout. Late declarations and config corrections clear them.
+// #2577: misspelled mappings are diagnosed, while a valid Forge needs no checkout. Late
+// declarations and config corrections clear them. The diagnosis is advisory: the heartbeat
+// makes it, but the engine Host keeps only conditions that block readiness or forge
+// observation (`host_import.rs`), so it is read where the heartbeat reads it.
 #[tokio::test]
 async fn daemon_forgejo_credential_mapping_heartbeat_lifecycle() {
     let temp = TempDir::new().expect("tempdir");
     credential_mapping_config(temp.path(), Some("lba"));
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    // Checkouts are the engine's; the test reads that none was made.
+    engine(&daemon);
     let backend = daemon.resource_backend();
     declare_mapping_forge(&backend, NAMESPACE).await;
     let host_id = daemon.local_host_id().expect("host id").to_string();
     let profile = manual_profile(&host_id, false);
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("heartbeat");
     let status = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("host").status.expect("status");
-    let condition = status
-        .conditions
-        .iter()
-        .find(|condition| condition.condition_type == "DaemonForgejoCredentials")
-        .expect("misspelled mapping diagnosis");
+    assert!(status.ready, "an unresolved mapping must not block unrelated placement");
+    let condition = daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("misspelled mapping diagnosis");
+    assert_eq!(condition.condition_type, "DaemonForgejoCredentials");
     assert_eq!(condition.reason, "UnresolvedForgeMappings");
     assert!(condition.message.contains("`lba`"));
     assert!(condition.message.contains(&format!("namespaces `{NAMESPACE}`")));
     assert!(!condition.blocks_readiness());
-    assert!(status.ready, "an unresolved mapping must not block unrelated placement");
-    let fleet = daemon.fleet_health_internal().await.expect("fleet health");
-    assert!(fleet
-        .hosts
-        .iter()
-        .find(|host| host.is_local)
-        .expect("local host")
-        .degraded_conditions
-        .iter()
-        .any(|message| message.contains("`lba`")));
 
     credential_mapping_config(temp.path(), Some("lab"));
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("corrected heartbeat");
-    let status = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("host").status.expect("status");
-    assert!(status.conditions.iter().all(|condition| condition.condition_type != "DaemonForgejoCredentials"));
+    assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_none());
     assert!(backend.using::<Checkout>(NAMESPACE).list().await.expect("checkouts").items.is_empty());
 
     backend.using::<Forge>(NAMESPACE).delete("lab").await.expect("delete Forge");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("unresolved heartbeat");
-    assert!(backend
-        .using::<Host>(NAMESPACE)
-        .get(&host_id)
-        .await
-        .expect("host")
-        .status
-        .expect("status")
-        .conditions
-        .iter()
-        .any(|condition| condition.condition_type == "DaemonForgejoCredentials"));
+    assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_some());
     declare_mapping_forge(&backend, NAMESPACE).await;
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("late declaration heartbeat");
-    assert!(backend
-        .using::<Host>(NAMESPACE)
-        .get(&host_id)
-        .await
-        .expect("host")
-        .status
-        .expect("status")
-        .conditions
-        .iter()
-        .all(|condition| condition.condition_type != "DaemonForgejoCredentials"));
+    assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_none());
 
     credential_mapping_config(temp.path(), Some("lba"));
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("diagnosis").is_some());
@@ -316,22 +242,18 @@ async fn daemon_forgejo_credential_mapping_errors_are_advisory_and_retry() {
     assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_some(), "later heartbeats retry the diagnosis");
 }
 
-// An unqualified host-local mapping can serve a source-addressed request
-// whose Forge is replicated into a namespace with no local checkout.
+// An unqualified host-local mapping can serve a source-addressed request whose Forge is
+// declared at another home, with no local checkout. The engine keeps no namespaces, so the
+// other home's declaration is the one outside this daemon's.
 #[tokio::test]
 async fn daemon_forgejo_credential_mapping_resolves_replica_in_another_namespace() {
     let temp = TempDir::new().expect("tempdir");
     credential_mapping_config(temp.path(), Some("lab"));
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    // Checkouts are the engine's; the test reads that none was made.
+    engine(&daemon);
     assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_some());
-    let authority = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    declare_mapping_forge(&authority, "other").await;
-    daemon
-        .resource_backend()
-        .replica_writer::<Forge>(NodeId::new("forge-authority"), "other")
-        .replace(&authority.using::<Forge>("other").list().await.expect("Forge snapshot"), Utc::now())
-        .await
-        .expect("replicate Forge outside runtime namespace");
+    declare_mapping_forge_at_home(&daemon, "forge-authority").await;
     assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_none());
     assert!(daemon.resource_backend().using::<Checkout>("other").list().await.expect("checkouts").items.is_empty());
 }
@@ -387,30 +309,18 @@ async fn daemon_forgejo_credential_mapping_waits_for_forge_replication() {
         )
         .await;
     daemon.publish_peer_connection_status(&peer, PeerConnectionState::Connected).await;
-    let backend = daemon.resource_backend();
-    let authority = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    backend
-        .replica_writer::<Host>(peer_id.clone(), NAMESPACE)
-        .replace(&authority.using::<Host>(NAMESPACE).list().await.expect("host snapshot"), Utc::now())
-        .await
-        .expect("unrelated replication");
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("pending Forge replication").is_none());
-    let writer = backend.replica_writer::<Forge>(peer_id, NAMESPACE);
-    writer
-        .replace(&authority.using::<Forge>(NAMESPACE).list().await.expect("empty Forge snapshot"), Utc::now())
-        .await
-        .expect("empty Forge replication settled");
+    // The authority's decided log arrives, holding no Forge: its absence is settled.
+    let target = daemon.decided_store().expect("decided store");
+    flotilla_provisioning_testkit::other_home_for(&target, peer_id.as_str()).replicate_to(&target);
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("settled absence").is_some());
-    declare_mapping_forge(&authority, NAMESPACE).await;
-    writer
-        .replace(&authority.using::<Forge>(NAMESPACE).list().await.expect("Forge snapshot"), Utc::now())
-        .await
-        .expect("late Forge replication");
+    // The declaration itself is a decided record: it arrives as the authority's log does.
+    declare_mapping_forge_at_home(&daemon, "forge-authority").await;
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("replicated declaration").is_none());
 }
 
-// #2577: source-addressed requests can use declarations outside the runtime
-// namespace. Exercise config removal/correction and declaration arrival/deletion
+// #2577: source-addressed requests can use declarations made at another home. Exercise
+// config removal/correction and declaration arrival/deletion
 // in generated order, checking the invariant after every step.
 #[hegel::test]
 fn daemon_forgejo_credential_mapping_sequences(tc: hegel::TestCase) {
@@ -433,7 +343,9 @@ fn daemon_forgejo_credential_mapping_sequences(tc: hegel::TestCase) {
                 0 => key = None,
                 1 => key = Some("lba"),
                 2 => key = Some("lab"),
-                3 if !declared => {
+                // One Forge owns an issue service across homes: a declaration here and one at
+                // another home are never both present.
+                3 if !declared && !other_declared => {
                     declare_mapping_forge(&backend, NAMESPACE).await;
                     declared = true;
                 }
@@ -441,8 +353,8 @@ fn daemon_forgejo_credential_mapping_sequences(tc: hegel::TestCase) {
                     backend.using::<Forge>(NAMESPACE).delete("lab").await.expect("delete Forge");
                     declared = false;
                 }
-                5 if !other_declared => {
-                    declare_mapping_forge(&backend, "other").await;
+                5 if !other_declared && !declared => {
+                    declare_mapping_forge_at_home(&daemon, "forge-authority").await;
                     other_declared = true;
                 }
                 _ => {}
@@ -499,33 +411,14 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
         .await
         .expect("credential declaration");
     let env_id = EnvironmentId::new("contained-claude");
-    backend
-        .using::<Environment>(NAMESPACE)
-        .create(
-            &empty_meta(env_id.as_str()),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_build_ref: None,
-                    host_ref: "host-test".into(),
-                    image: "contained-image".into(),
-                    declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                    required_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: BTreeMap::new(),
-                }),
-            },
-        )
-        .await
-        .expect("environment record");
+    let mut spec = docker_environment_spec("host-test", BTreeSet::from(["claude-code".into()]));
+    spec.docker.as_mut().expect("docker").required_agent_adapters = BTreeSet::from(["claude-code".into()]);
+    engine_environments(&daemon).request(env_id.as_str(), &spec, None);
     let source = LocalSkillSource::new(temp.path(), "research");
-    freeze_crew(&backend, "demo", "demo-work", "coder", "claude-code", vec![source.selected.clone()]).await;
-    bind_account(&backend, "demo", "coder", "claude-max", "test@example.com").await;
+    let (convoy, vessel) = freeze_crew(&daemon, "demo", "coder", "claude-code", vec![source.selected.clone()]).await;
+    bind_account(&daemon, &convoy, "coder", "claude-max", "test@example.com").await;
 
-    let home = PathBuf::from("/home/crew/flotilla/agent-homes/requesters/demo/coder/claude");
+    let home = flotilla_resources::account_access::requester_home(Path::new("/home/crew/flotilla"), &convoy, "coder", "claude");
     let runner: Arc<dyn CommandRunner> =
         Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build()));
     let bag = EnvironmentBag::new()
@@ -567,6 +460,7 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
         FLOTILLA_SKILLS_DIR_ENV,
         source.supply.display().to_string(),
     )]))));
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -598,17 +492,19 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
             },
             context: Box::new(flotilla_resources::TerminalCrewContext {
                 namespace: NAMESPACE.to_string(),
-                convoy: "demo".to_string(),
-                vessel_ref: "demo-work".to_string(),
+                convoy: convoy.clone(),
+                vessel_ref: vessel.clone(),
             }),
-            message: None,
         },
         cwd: temp.path().display().to_string(),
         env: BTreeMap::new(),
         pool: "fake-terminals".to_string(),
     };
 
-    TerminalControllerRuntime { state }.ensure_session("terminal-demo-work-coder", (&spec).into(), &[]).await.expect("launch");
+    TerminalControllerRuntime { state: Arc::clone(&state) }
+        .ensure_session("terminal-demo-work-coder", &first_launch("terminal-demo-work-coder"), (&spec).into(), &[])
+        .await
+        .expect("launch");
 
     let ensured = pool.ensured.lock().await;
     let [launch] = ensured.as_slice() else { panic!("expected one launch") };
@@ -620,8 +516,14 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
         "the crew's frozen skills are pushed into the agent's cache and linked from that same home"
     );
     // Contract 4: the access's status shows the same home and each need's mechanism.
-    let deliveries =
-        flotilla_projections::read_projections::access_delivery_evidence(&backend, NAMESPACE, "demo").await.expect("deliveries");
+    let deliveries = flotilla_projections::read_projections::access_delivery_evidence(
+        &backend,
+        state.daemon.lifecycle_reads().as_ref(),
+        NAMESPACE,
+        &convoy,
+    )
+    .await
+    .expect("deliveries");
     let [delivery] = deliveries.as_slice() else { panic!("one access delivered: {deliveries:?}") };
     assert_eq!(Path::new(&delivery.home), home);
     let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
@@ -674,6 +576,7 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
         ("HOME", home.display().to_string()),
         (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
     ]))));
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             daemon,
@@ -823,6 +726,7 @@ async fn codex_credential_and_agent_material_conflict_before_container_creation(
         config.state_dir().as_path().to_path_buf(),
     ));
     let agent_material = Arc::new(test_agent_material_registry(env));
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             daemon,
@@ -915,6 +819,7 @@ async fn an_unprovisioned_central_codex_credential_fails_before_registry_preflig
         ("HOME", home.display().to_string()),
         (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
     ]))));
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             daemon,
@@ -965,6 +870,35 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"slow-credentials-test\"\n").expect("daemon identity");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let daemon = in_memory_daemon(Vec::new(), config.clone()).await;
+    let env_id = EnvironmentId::new("env-work");
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: vec![VesselRequirement::builder()
+                .name("work".to_string())
+                .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                .build()],
+        }),
+        ..ConvoyStatus::default()
+    };
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("test".to_string()).build();
+    let convoy = flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy(NAMESPACE, "credential-work", spec, status),
+    )
+    .await;
+    // The work's launch and its live crew, running before this start as the last run's controller left them.
+    // Written on its decided store before the runtime starts, as the runtime's engine finds them.
+    let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store().expect("decided store"));
+    let vessel = vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
+    vessels.ready(&vessel, env_id.as_str());
+    create_credential_test_session(&runtime_terminals(&daemon), "live-crew", &vessel, env_id.as_str());
     let runtime = DaemonRuntime::start_with_options(
         daemon.clone(),
         config.clone(),
@@ -1000,7 +934,6 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
         runner.clone(),
         temp.path().to_path_buf(),
     ));
-    let env_id = EnvironmentId::new("env-work");
     daemon
         .register_provisioned_environment(
             env_id.clone(),
@@ -1015,70 +948,18 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
             Some(passthrough_registry()),
         )
         .expect("adopt test environment");
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("credential-work"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                ..ConvoyStatus::default()
-            },
-        )
-        .await
-        .expect("live convoy");
-    let vessels = backend.using::<Vessel>(NAMESPACE);
-    let vessel = vessels
-        .create(
-            &empty_meta("credential-work-vessel"),
-            &VesselSpec {
-                convoy_ref: "credential-work".to_string(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel");
-    vessels
-        .update_status(
-            &vessel.metadata.name,
-            &vessel.metadata.resource_version,
-            &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some(env_id.to_string()),
-                ..VesselStatus::default()
-            },
-        )
-        .await
-        .expect("placed vessel");
-    create_credential_test_session(&backend, "live-crew", "credential-work", "credential-work-vessel", env_id.as_str()).await;
-    let state =
+    let state = Arc::new(
         ControllerRuntimeState::new(daemon.clone(), config, passthrough_registry(), None, "test-host".into(), "host-direct-test".into())
-            .with_credential_store(store.clone());
+            .with_credential_store(store.clone()),
+    );
+    let mut delivery = CredentialDelivery::new(state).expect("a credential store");
     let log = tempfile::NamedTempFile::new().expect("timing log");
     let subscriber = tracing_subscriber::fmt().json().with_ansi(false).with_writer(log.reopen().expect("writer")).finish();
     // The test uses Tokio's current-thread runtime, so the scoped dispatcher
     // covers both the spawned phase and its cancellation/drop path.
-    let _logging = tracing::subscriber::set_default(subscriber);
+    let _logging = tracing::dispatcher::set_default(&flotilla_log_testkit::dispatch(subscriber));
     let phase_started = tokio::time::Instant::now();
-    let task = tokio::spawn(async move { phase("reconcile_work_credentials", reconcile_work_credentials(&state, NAMESPACE)).await });
+    let task = tokio::spawn(async move { phase("reconcile_work_credentials", delivery.start()).await });
     tokio::time::timeout(Duration::from_secs(1), runner.entered.notified()).await.expect("work credential preflight starts");
     tokio::time::advance(Duration::from_millis(38_650)).await;
     assert!(!task.is_finished(), "credential preflight is still pending");
@@ -1110,36 +991,397 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
         .find(|record| record["fields"]["phase"] == "reconcile_work_credentials" && record["fields"]["status"] == "completed")
         .unwrap_or_else(|| panic!("credential phase timing absent from log: {records}"));
     assert!(finish["fields"]["duration_ms"].as_f64().expect("duration") >= 38_650.0);
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 
 // Credential attention ignores terminal convoy history before decoding it.
 #[tokio::test]
 async fn credential_attention_reads_only_live_convoys() {
-    use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
-    flotilla_store_testkit::fixtures::seed_convoy_history()
-        .backend(&backend)
-        .namespace("flotilla")
-        .landed(300)
-        .active(10)
-        .call()
-        .await
-        .expect("convoy history");
+    use flotilla_engine_convoys_testkit::{land, single_agent, EngineHome};
+    let home = EngineHome::open_in("home", "flotilla");
+    let backend = home.backend().clone();
+    // 300 landed launches and 10 live ones.
+    for index in 0..310 {
+        let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("workflow".into()).build();
+        let launch = home.admit(&format!("history-{index}"), spec, single_agent("coder")).await;
+        if index < 300 {
+            land(&home.convoys.path(), &home.convoy(&launch).await).await;
+        }
+    }
 
     let failure = CredentialRefreshError {
         environment_ref: "missing".into(),
         credential_name: Some("github-app".into()),
         message: "unavailable".into(),
         should_surface: true,
+        first_failure_at: None,
     };
-    let (result, reads) = measure_reads(super::super::credentials::reconcile_credential_refresh_attention_in(
-        &flotilla_store::OldStoreAttentions::new(backend.clone()),
-        &backend,
-        "flotilla",
-        &[failure],
-    ))
-    .await;
-    result.expect("attention");
-    assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&10));
+    // The engine's attentions read no convoy either: only the live convoys are decoded.
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
+    let reads = Arc::new(flotilla_store::load_metrics::CallerReads::default());
+    attributed(
+        Arc::clone(&reads),
+        super::super::credentials::reconcile_credential_refresh_attention_in(
+            home.messages.primitives().as_ref(),
+            &backend,
+            "flotilla",
+            &[failure],
+        ),
+    )
+    .await
+    .expect("attention");
+    // The engine's convoy port returns the live launches' rows alone, and the whole operation
+    // reads no more than those.
+    let counts = reads.snapshot();
+    assert_eq!(counts.get("Convoy port").map(|convoys| convoys.rows), Some(10));
+    assert_eq!(counts.values().map(|kind| kind.keyed + kind.rows).sum::<u64>(), 16, "every read the operation made: {counts:?}");
+}
+
+/// Counts each session's card readings and delivers nothing.
+#[derive(Default)]
+struct CountedCards(std::sync::Mutex<BTreeMap<String, u32>>);
+
+impl CountedCards {
+    fn readings(&self, session: &str) -> u32 {
+        self.0.lock().expect("readings").get(session).copied().unwrap_or_default()
+    }
+
+    /// `session`'s readings once more than `after` were made and none more for a second: the
+    /// passes the controller's watches woke as they opened have ended.
+    async fn settled(&self, session: &str, after: u32) -> u32 {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut last = self.readings(session);
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let now = self.readings(session);
+                if now > after && now == last {
+                    return now;
+                }
+                last = now;
+            }
+        })
+        .await
+        .expect("the controller's first passes end")
+    }
+}
+
+#[async_trait]
+impl flotilla_capability_contract::SessionCapabilitySource for CountedCards {
+    async fn credentials(&self, _: &str, _: &BTreeSet<String>) -> Result<Vec<flotilla_capability_contract::CredentialCapability>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn endpoints(&self, _: &str, session: &str) -> Result<BTreeMap<String, String>, String> {
+        *self.0.lock().expect("readings").entry(session.to_owned()).or_default() += 1;
+        Ok(BTreeMap::new())
+    }
+}
+
+/// The fulfilment kind the first crew of [`RunningCards`] was placed by.
+const CARDS_KIND: &str = "cards-kind";
+/// The fulfilment kind the second crew of [`RunningCards`] was placed by.
+const OTHER_CARDS_KIND: &str = "cards-kind-other";
+
+/// The fulfilment kind [`CARDS_KIND`] or [`OTHER_CARDS_KIND`] is, on `host`.
+fn cards_kind(host: &str) -> FulfilmentKindSpec {
+    FulfilmentKindSpec {
+        host_ref: host.to_owned(),
+        pool: "test".to_string(),
+        cost_class: Default::default(),
+        grants: BTreeSet::from([flotilla_resources::FulfilmentGrant("network:scoped".to_string())]),
+        realisation: FulfilmentRealisation::HostDirect,
+    }
+}
+
+/// The credential delivery controller running over two crews, `cards-session-0` and
+/// `cards-session-1`, each in a convoy and environment of its own, placed by [`CARDS_KIND`] and
+/// [`OTHER_CARDS_KIND`]. The first convoy's coder is bound to an account, and its Docker
+/// environment runs the image of `build`, launched and not yet built. Each card was read once
+/// before the controller started.
+struct RunningCards {
+    daemon: Arc<InProcessDaemon>,
+    source: Arc<CountedCards>,
+    convoys: Vec<String>,
+    build: String,
+    _controller: AbortOnDropHandle<()>,
+    _temp: TempDir,
+}
+
+/// Admits convoy `cards-{n}` as admission does: its placement snapshot of `kind`, then the convoy
+/// placed by `kind`, its vessel, environment and running coder session `cards-session-{n}`. The
+/// first convoy's environment runs the image of `build`. Returns the launch and the snapshot.
+async fn admit_card_crew(daemon: &Arc<InProcessDaemon>, n: usize, kind: &str, build: &str) -> (String, String) {
+    let fixture = engine(daemon);
+    let host = daemon.local_host_id().expect("local host").to_string();
+    let name = format!("cards-{n}");
+    let snapshot = format!("placement-snapshot-cards-{n}");
+    flotilla_admission::support::ensure_prepared_placement_snapshot(
+        &daemon.resource_backend(),
+        NAMESPACE,
+        &snapshot,
+        &name,
+        &cards_kind(&host),
+    )
+    .await
+    .expect("placement snapshot");
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        placement_decision: Some(
+            PlacementDecision::builder()
+                .kind(kind.to_string())
+                .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host.clone()), display_name: host.clone() })
+                .build(),
+        ),
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: vec![VesselRequirement::builder()
+                .name("work".to_string())
+                .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                .build()],
+        }),
+        ..ConvoyStatus::default()
+    };
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("test".to_string()).build();
+    let launch = admit_convoy(daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, &name, spec, status)).await;
+    let vessel = fixture.vessels.request(&launch, "work", &host);
+    let environment = format!("cards-env-{n}");
+    let spec = if n == 0 {
+        let mut spec = docker_environment_spec(&host, BTreeSet::new());
+        spec.docker.as_mut().expect("docker").image_build_ref = Some(build.to_owned());
+        spec
+    } else {
+        EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+            ..Default::default()
+        }
+    };
+    engine_environments(daemon).request(&environment, &spec, Some(&vessel));
+    fixture.vessels.ready(&vessel, &environment);
+    create_credential_test_session(&fixture.terminals, &format!("cards-session-{n}"), &vessel, &environment);
+    (launch, snapshot)
+}
+
+impl RunningCards {
+    async fn start() -> Self {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"capability-cards-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        daemon.open_message_primitives().expect("message path");
+        designate_fleet(&daemon).await;
+        let fixture = engine(&daemon);
+        let host = daemon.local_host_id().expect("local host").to_string();
+        for kind in [CARDS_KIND, OTHER_CARDS_KIND] {
+            daemon
+                .resource_backend()
+                .using::<FulfilmentKind>(NAMESPACE)
+                .create(&empty_meta(kind), &cards_kind(&host))
+                .await
+                .expect("fulfilment kind");
+        }
+        fixture.image_builds.host("builder", "amd64");
+        let build = fixture.image_builds.put(&flotilla_provisioning_testkit::image_build_spec());
+        let mut convoys = Vec::new();
+        for (n, kind) in [CARDS_KIND, OTHER_CARDS_KIND].into_iter().enumerate() {
+            convoys.push(admit_card_crew(&daemon, n, kind, &build).await.0);
+        }
+        bind_account(&daemon, &convoys[0], "coder", "claude-max", "a@example.com").await;
+        let source = Arc::new(CountedCards::default());
+        daemon.set_session_capability_source(Arc::clone(&source) as Arc<dyn flotilla_capability_contract::SessionCapabilitySource>).await;
+        daemon.refresh_capability_cards(NAMESPACE, &CardScope::every()).await.expect("the cards' first reading");
+        let store = Arc::new(CredentialStore::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::default()),
+            EnvironmentBag::new(),
+            Arc::new(ProcessCommandRunner),
+            temp.path().to_path_buf(),
+        ));
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                Arc::clone(&daemon),
+                config,
+                passthrough_registry(),
+                None,
+                "test-host".to_string(),
+                "host-direct-test".to_string(),
+            )
+            .with_credential_store(store),
+        );
+        let mut delivery = CredentialDelivery::new(Arc::clone(&state)).expect("a credential store");
+        delivery.start().await.expect("nothing to deliver");
+        let controller = AbortOnDropHandle::new(tokio::spawn(delivery.run(state.controller_metrics.for_kind("CredentialDelivery"))));
+        Self { daemon, source, convoys, build, _controller: controller, _temp: temp }
+    }
+
+    /// The body of the open capability Message to convoy `n`'s coder that names `text`.
+    async fn card_naming(&self, n: usize, text: &str) -> String {
+        let receiver = flotilla_resources::crew_role_address(NAMESPACE, &self.convoys[n], "work", "coder");
+        let primitives = self.daemon.message_primitives().expect("message path");
+        let inbox = primitives.inbox_for(NAMESPACE, &receiver).await.expect("the coder's inbox");
+        let capabilities = primitives.roles(NAMESPACE).await.expect("fleet roles").system_sender("system:capabilities");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let open = primitives.open_in(&inbox).expect("the coder's messages");
+                if let Some(body) = open.into_iter().find_map(|(_, message)| {
+                    let body = flotilla_engine_messages::view::body_text(message.spec().body.value());
+                    (Some(&message.spec().sender) == capabilities.as_ref() && body.contains(text)).then_some(body)
+                }) {
+                    return body;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("a capability Message naming {text} reaches convoy {n}'s coder"))
+    }
+}
+
+// Behaviour: rebinding a convoy's account refreshes that convoy's running crew's card, with no
+// other event, and no other convoy's.
+#[tokio::test]
+async fn a_rebind_reaches_a_running_sessions_card_with_no_other_event() {
+    let cards = RunningCards::start().await;
+    let other = cards.source.settled("cards-session-1", 1).await;
+    let now = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + chrono::Duration::seconds(1)));
+    let reopened = super::launch_support::pending_binding(&cards.convoys[0], "coder", "claude-b", "b@example.com", now);
+    cards.daemon.account_records().rebind(NAMESPACE, reopened, None, now).await.expect("rebind");
+
+    let card = cards.card_naming(0, "credential `claude-b` (account b@example.com)").await;
+    assert!(!card.contains("claude-max"), "{card}");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(cards.source.readings("cards-session-1"), other, "the other convoy's card is not read again");
+}
+
+// Behaviour: a change to the grants of the fulfilment kind a crew was placed by reaches its
+// running card, with no other event, and no card of a crew placed by another kind.
+#[tokio::test]
+async fn a_fulfilment_kinds_grants_reach_a_running_sessions_card_with_no_other_event() {
+    let cards = RunningCards::start().await;
+    cards.source.settled("cards-session-0", 1).await;
+    let other = cards.source.settled("cards-session-1", 1).await;
+    let kinds = cards.daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
+    let kind = kinds.get(CARDS_KIND).await.expect("fulfilment kind");
+    let mut spec = kind.spec.clone();
+    spec.grants.insert(flotilla_resources::FulfilmentGrant("network:host".to_string()));
+    kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("grant host networking");
+
+    cards.card_naming(0, "You can use host networking and its available egress.").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(cards.source.readings("cards-session-1"), other, "a card of another kind is not read again");
+}
+
+// Behaviour: admitting a convoy and tearing it down, which write and delete its placement
+// snapshot, read only that convoy's card: the running crews of the other convoys are not read
+// again. (d11 finding 2: each admission and teardown re-read every card, one after another.)
+#[tokio::test]
+async fn admitting_and_tearing_down_a_convoy_reads_only_its_cards() {
+    let cards = RunningCards::start().await;
+    let first = cards.source.settled("cards-session-0", 1).await;
+    let second = cards.source.settled("cards-session-1", 1).await;
+
+    let (_, snapshot) = admit_card_crew(&cards.daemon, 2, CARDS_KIND, &cards.build).await;
+    let admitted = cards.source.settled("cards-session-2", 0).await;
+    // Its release, at teardown, deletes its placement snapshot.
+    cards.daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE).delete(&snapshot).await.expect("release the placement snapshot");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert!(admitted >= 1, "the admitted convoy's card is read");
+    assert_eq!(cards.source.readings("cards-session-0"), first, "another convoy's card is not read again");
+    assert_eq!(cards.source.readings("cards-session-1"), second, "another convoy's card is not read again");
+}
+
+// Behaviour: an image build becoming built reaches the running card of a crew on its image, with
+// no other event: the card lists the image's verified tools. A crew on no image is not read again.
+#[tokio::test]
+async fn a_built_image_reaches_a_running_sessions_card_with_no_other_event() {
+    let cards = RunningCards::start().await;
+    cards.source.settled("cards-session-0", 1).await;
+    let other = cards.source.settled("cards-session-1", 1).await;
+    engine(&cards.daemon).image_builds.finish(&cards.build, flotilla_provisioning_testkit::Ending::Ready("sha256:built"));
+
+    cards.card_naming(0, "Verified tools and runtimes: tool:verified.").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(cards.source.readings("cards-session-1"), other, "a card on no image is not read again");
+}
+
+// Behaviour: the build of an image no crew runs reaches no card: its launch and its becoming built
+// read no running crew's card again, neither the one on another image nor the one on none.
+#[tokio::test]
+async fn an_unrelated_images_build_reads_no_card() {
+    let cards = RunningCards::start().await;
+    let first = cards.source.settled("cards-session-0", 1).await;
+    let second = cards.source.settled("cards-session-1", 1).await;
+    let builds = &engine(&cards.daemon).image_builds;
+    let mut spec = flotilla_provisioning_testkit::image_build_spec();
+    spec.layers[0].version = "2".into();
+    spec.identity = flotilla_resources::image_identity(&spec.layers);
+    let unrelated = builds.put(&spec);
+    assert_ne!(unrelated, cards.build, "a build of another image");
+    builds.finish(&unrelated, flotilla_provisioning_testkit::Ending::Ready("sha256:unrelated"));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(cards.source.readings("cards-session-0"), first, "a card on another image is not read again");
+    assert_eq!(cards.source.readings("cards-session-1"), second, "a card on no image is not read again");
+}
+
+// Behaviour: a launch whose card could not be rendered gets its card at the next credential pass,
+// whatever woke it: here a binding of the other convoy's crew.
+#[tokio::test]
+async fn a_launch_whose_card_failed_gets_it_at_the_next_pass() {
+    let cards = RunningCards::start().await;
+    cards.source.settled("cards-session-1", 1).await;
+    // What a launch does when its card does not render: it marks the card to try again, and
+    // observes the advisory card its brief carries.
+    cards.daemon.retry_capability_card(NAMESPACE, "cards-session-0");
+    cards
+        .daemon
+        .observe_launch_capability_card(NAMESPACE, "cards-session-0", "Capabilities are currently unavailable.")
+        .await
+        .expect("the launch observes its card");
+    let read = cards.source.settled("cards-session-0", 0).await;
+
+    bind_account(&cards.daemon, &cards.convoys[1], "coder", "claude-max", "a@example.com").await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while cards.source.readings("cards-session-0") == read {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the failed launch's card is read at the next pass");
+    cards.card_naming(0, "credential `claude-max` (account a@example.com)").await;
+}
+
+// Behaviour: a convoy's change after admission refreshes no card, and reads no card's convoy: what
+// a card reads of its convoy is frozen at admission. The change here is a subject linked through
+// the Convoy path, after the crew's launch rendered its card.
+#[tokio::test]
+async fn a_convoy_change_refreshes_no_card() {
+    let cards = RunningCards::start().await;
+    cards.source.settled("cards-session-0", 1).await;
+    cards
+        .daemon
+        .observe_launch_capability_card(NAMESPACE, "cards-session-0", "the card the launch rendered")
+        .await
+        .expect("the launch observes its card");
+    let read = cards.source.settled("cards-session-0", 0).await;
+
+    let convoy = cards.daemon.resource_backend().using::<Convoy>(NAMESPACE).get(&cards.convoys[0]).await.expect("convoy");
+    let subject = flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+        id: "1".into(),
+    };
+    let path = cards.daemon.convoy_engine_path().get().cloned().expect("the Convoy path");
+    path.link(&convoy, &subject, flotilla_resources::SubjectDiscoverySource::Operator, "operator").await.expect("link a subject");
+    let linked = cards.daemon.resource_backend().using::<Convoy>(NAMESPACE).get(&cards.convoys[0]).await.expect("convoy");
+    assert_ne!(linked.metadata.resource_version, convoy.metadata.resource_version, "the convoy changed");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(cards.source.readings("cards-session-0"), read, "no card of the changed convoy is read again");
 }

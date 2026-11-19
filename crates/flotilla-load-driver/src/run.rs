@@ -7,13 +7,16 @@ use std::{
 };
 
 use flotilla_dummy_fleet::catalog::CrewMix;
-use flotilla_store::load_metrics::LatencyHistogram;
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use flotilla_store::load_metrics::{attributed, caller, LatencyHistogram};
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::time::Instant;
 
 use crate::{
     plan::LoadPlan,
-    report::{summary, window_metrics, DispatchSummary, LoadReport, MixSummary, RampSummary, SeriesPoint, TargetErrors, WindowSummary},
+    report::{
+        summary, window_metrics, window_reads, DispatchSummary, LoadReport, MixSummary, RampSummary, SeriesPoint, TargetErrors,
+        WindowSummary,
+    },
     target::{ConvoyObservation, ConvoyState, FleetTarget, TargetSample},
 };
 
@@ -110,6 +113,67 @@ fn merge_errors(count: &mut u64, samples: &mut Vec<String>, errors: TargetErrors
     }
 }
 
+/// A dispatch that finished: its name, home, mix, scheduled start and result.
+type Admitted = (String, usize, CrewMix, Instant, Result<(), String>);
+
+/// The dispatches in flight. They run alongside every other call the driver makes on the target:
+/// a dispatch admits through the same stores the target's reads and abandons take, so one left
+/// unpolled while the driver awaits another call can hold what that call waits for, and neither
+/// returns.
+struct Admitting<'a> {
+    pending: FuturesUnordered<BoxFuture<'a, Admitted>>,
+    /// Dispatches that finished while the driver awaited another call, not yet taken.
+    finished: VecDeque<Admitted>,
+}
+
+impl<'a> Admitting<'a> {
+    fn new() -> Self {
+        Self { pending: FuturesUnordered::new(), finished: VecDeque::new() }
+    }
+
+    fn push(&mut self, dispatch: BoxFuture<'a, Admitted>) {
+        self.pending.push(dispatch);
+    }
+
+    /// Dispatches not yet taken, finished or not.
+    fn len(&self) -> usize {
+        self.pending.len() + self.finished.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Dispatches still running.
+    fn in_flight(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The next dispatch to finish.
+    async fn next(&mut self) -> Option<Admitted> {
+        match self.finished.pop_front() {
+            Some(admitted) => Some(admitted),
+            None => self.pending.next().await,
+        }
+    }
+
+    /// A dispatch that has finished, without waiting for one.
+    fn ready(&mut self) -> Option<Admitted> {
+        self.finished.pop_front().or_else(|| self.pending.next().now_or_never().flatten())
+    }
+
+    /// `work`, with the dispatches in flight running alongside it; those that finish are kept.
+    async fn alongside<T>(&mut self, work: impl std::future::Future<Output = T>) -> T {
+        let mut work = std::pin::pin!(work);
+        loop {
+            tokio::select! {
+                out = &mut work => return out,
+                Some(admitted) = self.pending.next(), if !self.pending.is_empty() => self.finished.push_back(admitted),
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Progress {
     open: HashMap<String, Dispatched>,
@@ -175,8 +239,13 @@ impl Progress {
     }
 }
 
-/// Run warm-up, a measurement window, then stop admissions and drain.
+/// Run warm-up, a measurement window, then stop admissions and drain. What the driver reads of an
+/// in-process target counts for it, apart from the daemon's own work.
 pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport, String> {
+    attributed(caller("load driver"), drive(target, plan)).await
+}
+
+async fn drive(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport, String> {
     if plan.running == 0
         || plan.dispatch_concurrency == 0
         || !plan.ramp_per_second.is_finite()
@@ -194,7 +263,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     let mut due = (1..=plan.running).map(|i| started + spacing.mul_f64(i as f64)).collect::<VecDeque<_>>();
     let mut next_due = started + spacing.mul_f64(plan.running as f64);
     let mut progress = Progress::default();
-    let mut admitting = FuturesUnordered::<futures::future::BoxFuture<'_, (String, usize, CrewMix, Instant, Result<(), String>)>>::new();
+    let mut admitting = Admitting::new();
     let mut next_index = 0u64;
     let mut dispatched = 0u64;
     let mut dispatch_errors = 0u64;
@@ -205,8 +274,8 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     let mut target_errors = 0u64;
     let mut target_error_samples = Vec::new();
     let mut failing_ticks = 0u32;
-    let backlog = LatencyHistogram::default();
-    let admission = LatencyHistogram::default();
+    let backlog = <LatencyHistogram>::default();
+    let admission = <LatencyHistogram>::default();
     let mut peak_running = 0usize;
     let mut ramp_end: Option<Instant> = None;
     let mut warmup_ended_at_window = 0;
@@ -240,7 +309,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         let now = Instant::now();
         let errors_before = target_errors;
 
-        let (ended, errors) = progress.tick(target, plan, window_start.is_some()).await;
+        let (ended, errors) = admitting.alongside(progress.tick(target, plan, window_start.is_some())).await;
         merge_errors(&mut target_errors, &mut target_error_samples, errors);
         // Only the admitting phase replaces completed slots. Drain shares all
         // observation, outcome and deadline handling without scheduling work.
@@ -261,7 +330,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         let running = progress.open.len();
         peak_running = peak_running.max(running);
         if now >= next_series {
-            let sample = target.sample().await.ok();
+            let sample = admitting.alongside(target.sample()).await.ok();
             let resident_bytes = sample.as_ref().and_then(|sample| sample.resident_bytes);
             if let Some(sample) = sample {
                 last_sample = Some((now, sample));
@@ -281,7 +350,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
             && ((running >= plan.running && progress.ended_total >= plan.warmup_ended as u64)
                 || now.duration_since(started) >= plan.max_ramp)
         {
-            match target.sample().await {
+            match admitting.alongside(target.sample()).await {
                 Ok(sample) => {
                     ramp_end = Some(now);
                     warmup_ended_at_window = progress.ended_total;
@@ -300,7 +369,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         // Replacement slots are scheduled only when the previous work ends.
         while due.front().is_some_and(|at| *at <= now)
             && progress.open.len() + admitting.len() < plan.running
-            && admitting.len() < plan.dispatch_concurrency
+            && admitting.in_flight() < plan.dispatch_concurrency
         {
             let began = due.pop_front().expect("due dispatch");
             let index = next_index;
@@ -323,7 +392,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     };
     let mut closing = None;
     for attempt in 1..=CLOSING_SAMPLE_ATTEMPTS {
-        match target.sample().await {
+        match admitting.alongside(target.sample()).await {
             Ok(sample) => {
                 closing = Some((Instant::now(), sample));
                 break;
@@ -331,7 +400,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
             Err(error) => {
                 note_error(&mut target_errors, &mut target_error_samples, format!("closing sample: {error}"));
                 if attempt < CLOSING_SAMPLE_ATTEMPTS {
-                    tokio::time::sleep(plan.tick).await;
+                    admitting.alongside(tokio::time::sleep(plan.tick)).await;
                 }
             }
         }
@@ -343,7 +412,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
             .ok_or_else(|| format!("no sample of the window's end after {CLOSING_SAMPLE_ATTEMPTS} attempts: {target_error_samples:?}"))?,
     };
     let window = window_ended.duration_since(window_began);
-    let open_at_end = target.open_breakdown().await.unwrap_or_else(|error| {
+    let open_at_end = admitting.alongside(target.open_breakdown()).await.unwrap_or_else(|error| {
         note_error(&mut target_errors, &mut target_error_samples, format!("open breakdown: {error}"));
         BTreeMap::new()
     });
@@ -353,7 +422,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
     // In-flight admissions are not cancelled at the boundary: every successful
     // admission belongs to the run and must be observed through cleanup.
     loop {
-        while let Some(Some((name, home, mix, began, result))) = admitting.next().now_or_never() {
+        while let Some((name, home, mix, began, result)) = admitting.ready() {
             match result {
                 Ok(()) => {
                     admission.record(began.elapsed());
@@ -363,9 +432,9 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
                 Err(error) => note_error(&mut dispatch_errors, &mut error_samples, error),
             }
         }
-        let (_, errors) = progress.tick(target, plan, false).await;
+        let (_, errors) = admitting.alongside(progress.tick(target, plan, false)).await;
         merge_errors(&mut target_errors, &mut target_error_samples, errors);
-        let audit_succeeded = match target.audit().await {
+        let audit_succeeded = match admitting.alongside(target.audit()).await {
             Ok(audit) => {
                 last_audit = audit;
                 true
@@ -384,7 +453,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
             }
             break;
         }
-        tokio::time::sleep(plan.tick).await;
+        admitting.alongside(tokio::time::sleep(plan.tick)).await;
     }
     if admitted == 0 {
         progress.evidence.errors.insert(format!("no dispatch was admitted ({dispatch_errors} failed): {error_samples:?}"));
@@ -441,6 +510,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         target_errors: TargetErrors { count: target_errors, samples: target_error_samples },
         window: progress.window_outcomes.summary(window.as_secs_f64()),
         home_metrics: window_metrics(&start_sample, &end_sample, window),
+        reads: window_reads(&start_sample, &end_sample),
         resident_bytes: end_sample.resident_bytes,
         open_at_end,
         series,

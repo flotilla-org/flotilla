@@ -4,13 +4,13 @@ use flotilla_schema::{Address, Timestamp};
 use serde_json::Value;
 use std::{collections::BTreeSet, fmt};
 
-/// The delivery condition of `controller_delivery`'s envelope, and the
+/// The delivery condition of `service_delivery`'s envelope, and the
 /// turn-rules role that withdraws a message once it lapses.
 pub const DELIVERY: &str = "project:still-wanted";
 pub const TURN_RULES: &str = "project:fleet/role:turn-rules";
 /// Microseconds per model clock tick (ten minutes).
 pub const UNIT: i64 = 600_000_000;
-/// The inbox every replayed message and Ensure names, as the world keys it:
+/// The inbox every replayed message names, as the world keys it:
 /// a canonical inbox address.
 pub const INBOX: &str = "project:replay/role:inbox";
 /// The authorised party, the superseding message and the outcome condition, as
@@ -22,9 +22,11 @@ pub fn moment(ticks: i64) -> Timestamp {
     Timestamp::from_micros(ticks * UNIT)
 }
 
-/// A resource name as the model integer it stands for.
+/// A resource name as the model integer it stands for; a launch (`<id>#<n>`) stands for the id
+/// it is a launch of.
 pub fn id_of(name: &str) -> i64 {
-    name.parse().unwrap_or_else(|_| panic!("resource name {name} is not a model id"))
+    let id = name.split_once('#').map_or(name, |(of, _)| of);
+    id.parse().unwrap_or_else(|_| panic!("resource name {name} is not a model id"))
 }
 
 /// A canonical address; the world is keyed by its text.

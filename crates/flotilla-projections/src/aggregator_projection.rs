@@ -342,7 +342,7 @@ impl AggregatorProjectionState {
             .local_rows
             .values()
             .chain(convoys.replica_rows.values().flat_map(|rows| rows.values()))
-            .filter(|convoy| convoy_phase_represents_issues(convoy.phase))
+            .filter(|convoy| convoy.phase.is_some_and(convoy_phase_represents_issues))
             .flat_map(|convoy| convoy.issues.iter().map(|issue| issue.reference.clone()))
             .collect()
     }
@@ -527,7 +527,7 @@ fn convoy_phase_represents_issues(phase: ConvoyPhase) -> bool {
 }
 
 fn convoy_scopes(row: &ConvoyRow) -> Vec<QueryScope> {
-    let Some(project) = row.project_ref.as_deref() else { return Vec::new() };
+    let project = row.project_ref.as_str();
     let mut scopes = vec![QueryScope::new(&row.resource.namespace, project)];
     if let Some(name) = project.strip_prefix(&format!("{}/", row.resource.namespace)) {
         scopes.push(QueryScope::new(&row.resource.namespace, name));
@@ -537,10 +537,7 @@ fn convoy_scopes(row: &ConvoyRow) -> Vec<QueryScope> {
 
 fn convoy_matches_scope(row: &ConvoyRow, scope: &QueryScope) -> bool {
     row.resource.namespace == scope.namespace
-        && row
-            .project_ref
-            .as_deref()
-            .is_some_and(|project| project == scope.name || project == format!("{}/{}", scope.namespace, scope.name))
+        && (row.project_ref == scope.name || row.project_ref == format!("{}/{}", scope.namespace, scope.name))
 }
 
 fn merged_issue_state(issue_sets: &[(QueryScope, ResultSet)]) -> ResultSetState {
@@ -756,7 +753,7 @@ mod tests {
         let mut rows = (0..4)
             .map(|index| {
                 let mut row = convoy_row("flotilla", &format!("terminal-{index}"), "roadmap");
-                row.phase = ConvoyPhase::Landed;
+                row.phase = Some(ConvoyPhase::Landed);
                 row
             })
             .collect::<Vec<_>>();
@@ -871,7 +868,7 @@ mod tests {
             for (index, project, action, replica) in ops {
                 let mut row = convoy_row("flotilla", &format!("work-{index}"), &format!("project-{project}"));
                 if action == 3 {
-                    row.project_ref = Some(format!("flotilla/project-{project}"));
+                    row.project_ref = format!("flotilla/project-{project}");
                 }
                 if replica {
                     row.resource.host = Some(HostName::new("remote"));
@@ -953,11 +950,11 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let active = convoy_row("flotilla", "active", "roadmap");
         let mut landing = convoy_row("flotilla", "landing", "roadmap");
-        landing.phase = ConvoyPhase::Landing;
+        landing.phase = Some(ConvoyPhase::Landing);
         let mut landed = convoy_row("flotilla", "landed", "roadmap");
-        landed.phase = ConvoyPhase::Landed;
+        landed.phase = Some(ConvoyPhase::Landed);
         let mut failed = convoy_row("flotilla", "failed", "roadmap");
-        failed.phase = ConvoyPhase::Failed;
+        failed.phase = Some(ConvoyPhase::Failed);
         {
             let mut convoys = state.write().await;
             convoys.local_rows = [active.clone(), landing.clone(), landed.clone(), failed.clone()]

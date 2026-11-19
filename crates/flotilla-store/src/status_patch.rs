@@ -32,6 +32,31 @@ where
     }
 }
 
+/// Applies an observer's patch to `name`'s status, for a writer that needs nothing back. A kind
+/// whose port keeps its own order of writes takes the patch there and compares it with what it
+/// holds, so nothing is read through the resolver; any other kind is patched as
+/// [`apply_status_patch`] patches it.
+#[track_caller]
+pub fn observe_status<'a, T>(
+    resolver: &'a TypedResolver<T>,
+    name: &'a str,
+    patch: &'a T::StatusPatch,
+) -> impl Future<Output = Result<(), ResourceError>> + 'a
+where
+    T: Resource + 'a,
+    T::Status: Default,
+    T::StatusPatch: Sync,
+{
+    let patched = apply_status_patch(resolver, name, patch);
+    async move {
+        let apply = |status: &mut T::Status| patch.apply(status);
+        match resolver.patch_engine_status(name, &apply).await {
+            Some(written) => written.map(|_| ()),
+            None => patched.await.map(|_| ()),
+        }
+    }
+}
+
 /// Apply a patch with an injected action between reading a version and writing it.
 /// This is used by callers testing a conflict and the subsequent optimistic retry.
 /// A patch whose `StatusPatch::requires_write` declines the change returns the

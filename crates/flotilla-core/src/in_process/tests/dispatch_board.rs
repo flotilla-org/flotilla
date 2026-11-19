@@ -1,4 +1,4 @@
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,8 +6,7 @@ use std::time::Duration;
 use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
-use flotilla_resources::{Convoy as ResourceConvoy, ConvoySpec, InputMeta, Project, ProjectSpec, PROJECT_LABEL, ROLE_LABEL};
-use flotilla_store::ResourceBackend;
+use flotilla_resources::{ConvoySpec, Project, ProjectSpec};
 
 use super::support::{test_meta, SuspendedBoardProvider};
 use crate::in_process::InProcessDaemon;
@@ -20,13 +19,24 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
     use flotilla_resources::{DispatchQueueEntry, ProjectStatus};
     let temp = tempfile::tempdir().expect("config");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"dispatch-board-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "org/large".into() };
     let provider = Arc::new(SuspendedBoardProvider {
         calls: AtomicUsize::new(0),
         issue_calls: AtomicUsize::new(0),
         release: tokio::sync::Semaphore::new(0),
     });
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::default().with_issue_tracker(provider.clone())),
+        HostName::new("test-host"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    // The engine's readings, which a running daemon always has.
+    super::test_engine(&daemon);
     let projects = backend.using::<Project>("flotilla");
     let mut binding = flotilla_resources::IssueSourceBindingSpec::from(source.clone());
     binding.alias = Some("large".into());
@@ -77,24 +87,14 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
             .expect("readiness projection");
     }
     for id in 0..400 {
-        backend
-            .using::<ResourceConvoy>("flotilla")
-            .create(
-                &test_meta(&format!("convoy-{id}")),
-                &ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("large".to_string()).build(),
-            )
-            .await
-            .expect("convoy");
+        super::support::admit(
+            &daemon,
+            &format!("convoy-{id}"),
+            ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("large".to_string()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        )
+        .await;
     }
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(temp.path())),
-        fake_discovery_with_provider_set(FakeDiscoveryProviders::default().with_issue_tracker(provider.clone())),
-        HostName::new("test-host"),
-        backend.clone(),
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
     let cold = tokio::time::timeout(Duration::from_secs(1), daemon.dispatch_board_internal(Some("large")))
         .await
         .expect("interactive read must not wait for forge");
@@ -167,34 +167,31 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
     }
     // #3313: convoy explain uses the shared warm board and live accounting,
     // exposes a ticket override, and never waits on a remote observation.
-    backend
-        .using::<ResourceConvoy>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("convoy-explained".into())
-                .labels(std::collections::BTreeMap::from([(ROLE_LABEL.into(), "explained".into()), (PROJECT_LABEL.into(), "large".into())]))
-                .build(),
-            &ConvoySpec::builder()
-                .workflow_ref("workflow".into())
-                .project_ref("large".into())
-                .issues(vec![flotilla_resources::ConvoyIssue {
-                    reference: flotilla_protocol::IssueRef { source: source.clone(), id: "0".into() },
-                    repository_ref: None,
-                    snapshot: flotilla_resources::IssueSnapshot {
-                        title: "Urgent".into(),
-                        body: None,
-                        state: flotilla_protocol::IssueState::Open,
-                        labels: vec!["priority:urgent".into()],
-                        as_of: now,
-                    },
-                }])
-                .build(),
-        )
-        .await
-        .expect("explained convoy");
+    let explained = super::support::admit(
+        &daemon,
+        "convoy-explained",
+        ConvoySpec::builder()
+            .workflow_ref("workflow".into())
+            .project_ref("large".into())
+            .role("explained".into())
+            .issues(vec![flotilla_resources::ConvoyIssue {
+                reference: flotilla_protocol::IssueRef { source: source.clone(), id: "0".into() },
+                repository_ref: None,
+                snapshot: flotilla_resources::IssueSnapshot {
+                    title: "Urgent".into(),
+                    body: None,
+                    state: flotilla_protocol::IssueState::Open,
+                    labels: vec!["priority:urgent".into()],
+                    as_of: now,
+                },
+            }])
+            .build(),
+        flotilla_engine_convoys_testkit::single_agent("coder"),
+    )
+    .await;
     // A live convoy's score is independent of whether its address is a record name or its role
     // under its project.
-    for address in ["convoy-explained", "explained@large"] {
+    for address in [explained.as_str(), "explained@large"] {
         let explanation = tokio::time::timeout(Duration::from_secs(1), daemon.explain_convoy_internal(Some("flotilla"), address))
             .await
             .expect("explain stays local")

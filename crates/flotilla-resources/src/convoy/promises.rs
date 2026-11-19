@@ -1,5 +1,5 @@
 //! Promise state machine shared by commands and discovery. Verdicts retain every attempt.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -88,7 +88,11 @@ pub struct Submission {
     /// ADR 0047: one-roll decoder shim for optional submission evidence.
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
-    pub submitted_at: DateTime<Utc>,
+    /// When it was submitted; absent where the reader holds only the engine's record, which does
+    /// not carry the time (its log entry does). Widened from required (run 3 F7): every stored
+    /// value still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub verdict: Option<SubmissionVerdict>,
 }
@@ -194,7 +198,7 @@ pub enum PromiseOperation {
     Declare { id: String, kind: PromiseKind, source: PromiseSource },
     Submit { id: String, kind: PromiseKind, source: PromiseSource, submission: Submission },
     Retract { id: String, reason: String },
-    Verdict { id: String, reference: String, submitted_at: DateTime<Utc>, verdict: SubmissionVerdict },
+    Verdict { id: String, reference: String, submitted_at: Option<DateTime<Utc>>, verdict: SubmissionVerdict },
 }
 
 pub fn owned<'a>(status: &'a ConvoyStatus, vessel: &str, role: &str) -> &'a [Promise] {
@@ -331,71 +335,20 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
         // Status patches apply without a Forge list: a forge-id or public
         // GitHub spelling resolves, and an existing subject in another
         // spelling of the same request is not discovered twice.
-        if let Ok(subject) = submission.subject_address(&[]).and_then(|address| crate::address::subject_for(&address)) {
+        // A submission applied here is always timed; one without a time is discovered by nothing.
+        if let (Ok(subject), Some(at)) =
+            (submission.subject_address(&[]).and_then(|address| crate::address::subject_for(&address)), submission.submitted_at)
+        {
             if !status.produces_any(|produced| crate::address::same_subject(produced, &subject, &[])) {
-                status.discover_subject(
-                    subject,
-                    flotilla_protocol::Relationship::Produces,
-                    super::SubjectDiscoverySource::Claim,
-                    submission.submitted_at,
-                );
+                status.discover_subject(subject, flotilla_protocol::Relationship::Produces, super::SubjectDiscoverySource::Claim, at);
             }
         }
     }
 }
 
-/// Open obligations follow the work. Finished history stays with its owner.
-pub fn handoff(status: &mut ConvoyStatus, vessel: &str, sender: &str, target: &str) {
-    if sender == target {
-        return;
-    }
-    let Some(crew) = status.promises.get_mut(vessel) else {
-        return;
-    };
-    let Some(promises) = crew.get_mut(sender) else {
-        return;
-    };
-    let mut moving = Vec::new();
-    promises.retain(|promise| {
-        if promise.state.terminal() {
-            true
-        } else {
-            moving.push(promise.clone());
-            false
-        }
-    });
-    let target_promises = crew.entry(target.into()).or_default();
-    for mut promise in moving {
-        if promise.kind == PromiseKind::DecisionLedger {
-            for submission in &mut promise.submissions {
-                submission.metadata.entry("producer".into()).or_insert_with(|| sender.into());
-            }
-        }
-        if target_promises.iter().any(|p| p.id == promise.id) {
-            let original = promise.id.clone();
-            let mut sequence = 1;
-            loop {
-                promise.id = handoff_id(sender, &original, sequence);
-                if !target_promises.iter().any(|p| p.id == promise.id) {
-                    break;
-                }
-                sequence += 1;
-            }
-        }
-        promise.role = target.into();
-        target_promises.push(promise);
-    }
-}
-
-/// Handoff renames an ID that collides at the target to
-/// `handoff/{sender}/{original}/{sequence}`. [`handoff_origin`] is its inverse;
-/// keep the two together.
-fn handoff_id(sender: &str, original: &str, sequence: u32) -> String {
-    format!("handoff/{sender}/{original}/{sequence}")
-}
-
-/// The ID a handoff rename wrapped, one level deep. Role names contain no `/`,
-/// so the sender is the first segment and the sequence the last.
+/// The ID an old-store handoff's rename (`handoff/{sender}/{original}/{sequence}`) wrapped, one
+/// level deep, as statuses stored before the engine's Reassign still hold. Role names contain no
+/// `/`, so the sender is the first segment and the sequence the last.
 fn handoff_origin(id: &str) -> Option<&str> {
     let (_sender, rest) = id.strip_prefix("handoff/")?.split_once('/')?;
     rest.rsplit_once('/').map(|(original, _sequence)| original)
@@ -602,7 +555,11 @@ fn dispatch_origin(mut id: &str) -> &str {
 /// Idempotent: a dispatch promise already present anywhere in its vessel,
 /// including after a handoff moved it to another role, is never re-declared,
 /// nor is an ID its owner already holds from another source.
-pub fn admitted_declarations(dispatch: &[DispatchPromise], status: &ConvoyStatus) -> Vec<(String, String, PromiseOperation)> {
+pub fn admitted_declarations(
+    dispatch: &[DispatchPromise],
+    status: &ConvoyStatus,
+    standing: bool,
+) -> Vec<(String, String, PromiseOperation)> {
     let mut declarations = template_declarations(status);
     declarations.extend(
         dispatch
@@ -633,7 +590,43 @@ pub fn admitted_declarations(dispatch: &[DispatchPromise], status: &ConvoyStatus
                 )
             }),
     );
+    if !standing {
+        let ledgers = default_ledgers(status, &declarations);
+        declarations.extend(ledgers);
+    }
     declarations
+}
+
+/// Owner ruling (#3108): admission gives every agent seat of a non-standing
+/// convoy a promise, so a convoy never reads Landing while one of its agents
+/// owes nothing. A seat the template and dispatch declare nothing for, and
+/// that owns nothing yet, owes a template decision ledger, unless its dispatch
+/// excluded the template ledger. A standing convoy's seats owe nothing: it
+/// stays open across tasks.
+fn default_ledgers(status: &ConvoyStatus, declared: &[(String, String, PromiseOperation)]) -> Vec<(String, String, PromiseOperation)> {
+    status
+        .workflow_snapshot
+        .iter()
+        .flat_map(|snapshot| &snapshot.vessels)
+        .flat_map(|vessel| {
+            vessel
+                .crew
+                .iter()
+                .filter(|crew| matches!(crew.source, crate::CrewSource::Agent { .. }))
+                .filter(|crew| !crew.promise_exclusions.contains(&PromiseKind::DecisionLedger))
+                .filter(|crew| seeds_open_promises(status, &vessel.name, &crew.role))
+                .filter(|crew| !declared.iter().any(|(owner, role, _)| owner == &vessel.name && role == &crew.role))
+                .filter(|crew| owned(status, &vessel.name, &crew.role).is_empty())
+                .map(|crew| {
+                    let kind = PromiseKind::DecisionLedger;
+                    (
+                        vessel.name.clone(),
+                        crew.role.clone(),
+                        PromiseOperation::Declare { id: format!("template/{}", kind.as_str()), kind, source: PromiseSource::Template },
+                    )
+                })
+        })
+        .collect()
 }
 
 /// Discovery and explicit claim attribution share the same submission transition.
@@ -659,7 +652,7 @@ pub fn discovered_submission(
         id,
         kind: PromiseKind::Pr,
         source: PromiseSource::Crew,
-        submission: Submission { reference, metadata: BTreeMap::new(), submitted_at: now, verdict: None },
+        submission: Submission { reference, metadata: BTreeMap::new(), submitted_at: Some(now), verdict: None },
     })
 }
 
@@ -719,6 +712,82 @@ pub fn next_observation(
     None
 }
 
+/// The change requests an ended convoy's Submitted pr promises name, each its current submission's
+/// (#3108 ruling 1): the world still resolves them, and until it does they hold the convoy. None
+/// for a convoy still open, whose observations [`next_observation`] makes.
+pub fn ended_submissions(status: &ConvoyStatus, forges: &[crate::ForgeSpec]) -> BTreeSet<Address> {
+    if !status.phase.is_terminal() {
+        return BTreeSet::new();
+    }
+    status
+        .promises
+        .values()
+        .flat_map(BTreeMap::values)
+        .flatten()
+        .filter(|promise| promise.kind == PromiseKind::Pr && promise.state == PromiseState::Submitted)
+        .filter_map(|promise| promise.submissions.last()?.subject_address(forges).ok())
+        .filter(|address| address.kind() == AddressKind::ChangeRequest)
+        .collect()
+}
+
+/// An ended convoy's next resolution by the world (#3108 ruling 1): a Submitted pr promise whose
+/// change request merged is kept, and one whose change request closed is rejected, the convoy
+/// staying ended. Nothing else is observed of an ended convoy.
+pub fn next_ended_observation(
+    status: &ConvoyStatus,
+    change_requests: &BTreeMap<String, crate::ResourceObject<crate::ChangeRequest>>,
+    forges: &[crate::ForgeSpec],
+    now: DateTime<Utc>,
+    stale_after: std::time::Duration,
+) -> Option<super::ConvoyStatusPatch> {
+    if !status.phase.is_terminal() {
+        return None;
+    }
+    let artifacts = BTreeMap::new();
+    status.promises.iter().find_map(|(vessel, crew)| {
+        crew.iter().find_map(|(role, promises)| {
+            promises.iter().filter(|promise| promise.kind == PromiseKind::Pr).find_map(|promise| {
+                let operation = observed_verdict(promise, role, change_requests, &artifacts, forges, now, stale_after)?;
+                Some(super::ConvoyStatusPatch::ObservePromise { vessel: vessel.clone(), role: role.clone(), operation })
+            })
+        })
+    })
+}
+
+/// The artifacts [`next_observation`] reads for `convoy`'s decision ledger promises: each open
+/// promise's ledger slot, and each submitted one's submitted artifact.
+pub fn ledger_artifact_names(status: &ConvoyStatus, convoy: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    if status.phase.is_terminal() {
+        return names;
+    }
+    for crew in status.promises.values() {
+        for (role, promises) in crew {
+            for promise in promises.iter().filter(|promise| promise.kind == PromiseKind::DecisionLedger) {
+                match promise.state {
+                    PromiseState::Open => {
+                        names.extend(crate::address::artifact_slot_record_name(convoy, role, "decision-ledger", convoy).ok())
+                    }
+                    PromiseState::Submitted => {
+                        names.extend(promise.submissions.last().map(|submission| submitted_artifact(submission).to_owned()))
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The record name of the artifact `submission` references.
+fn submitted_artifact(submission: &Submission) -> &str {
+    submission
+        .reference
+        .strip_prefix("artifact/")
+        .map(|reference| reference.rsplit('/').next().unwrap_or(reference))
+        .unwrap_or(&submission.reference)
+}
+
 fn ledger_submission(
     promise: &Promise,
     convoy: &str,
@@ -738,7 +807,7 @@ fn ledger_submission(
         submission: Submission {
             reference: name,
             metadata: BTreeMap::from([("digest".into(), artifact.spec.digest.clone())]),
-            submitted_at: now,
+            submitted_at: Some(now),
             verdict: None,
         },
     })
@@ -761,12 +830,7 @@ fn observed_verdict(
         // Kept verifies artifact existence/provenance, not the quality of its
         // decisions. Ledger validation remains the artifact intake boundary.
         PromiseKind::DecisionLedger => {
-            let name = submission
-                .reference
-                .strip_prefix("artifact/")
-                .map(|reference| reference.rsplit('/').next().unwrap_or(reference))
-                .unwrap_or(&submission.reference);
-            let artifact = artifacts.get(name)?;
+            let artifact = artifacts.get(submitted_artifact(submission))?;
             if artifact.spec.kind != "decision-ledger"
                 || artifact.spec.producer != submission.metadata.get("producer").map(String::as_str).unwrap_or(role)
                 || submission.metadata.get("digest").is_some_and(|digest| *digest != artifact.spec.digest)
@@ -969,11 +1033,11 @@ mod tests {
                 )]),
                 ..Default::default()
             };
-            for (vessel, role, operation) in admitted_declarations(&[], &status) {
+            for (vessel, role, operation) in admitted_declarations(&[], &status, false) {
                 apply(&mut status, &vessel, &role, &operation);
             }
             assert_eq!(owned(&status, "work", "coder").iter().filter(|p| p.kind == PromiseKind::Pr).count(), 1);
-            assert!(admitted_declarations(&[], &status).is_empty());
+            assert!(admitted_declarations(&[], &status, false).is_empty());
             status
                 .promises
                 .get_mut("work")
@@ -1066,7 +1130,7 @@ mod tests {
             submission: Submission {
                 reference: format!("cr/github.com/org/repo/{attempt}"),
                 metadata: BTreeMap::new(),
-                submitted_at: DateTime::from_timestamp(attempt, 0).unwrap(),
+                submitted_at: DateTime::from_timestamp(attempt, 0),
                 verdict: None,
             },
         }
@@ -1075,7 +1139,7 @@ mod tests {
         PromiseOperation::Verdict {
             id: id.into(),
             reference: format!("cr/github.com/org/repo/{attempt}"),
-            submitted_at: DateTime::from_timestamp(attempt, 0).unwrap(),
+            submitted_at: DateTime::from_timestamp(attempt, 0),
             verdict: SubmissionVerdict {
                 accepted,
                 who: "forge".into(),
@@ -1085,12 +1149,7 @@ mod tests {
         }
     }
     fn submission(reference: &str) -> Submission {
-        Submission {
-            reference: reference.into(),
-            metadata: BTreeMap::new(),
-            submitted_at: DateTime::from_timestamp(1, 0).unwrap(),
-            verdict: None,
-        }
+        Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at: DateTime::from_timestamp(1, 0), verdict: None }
     }
 
     // ADR 0066 §3: a submission names its PR whatever text recorded it: the
@@ -1146,7 +1205,7 @@ mod tests {
             submission: Submission {
                 reference: reference.into(),
                 metadata: BTreeMap::from([(key.to_string(), "yes".to_string())]),
-                submitted_at: DateTime::from_timestamp(1, 0).unwrap(),
+                submitted_at: DateTime::from_timestamp(1, 0),
                 verdict: None,
             },
         };
@@ -1267,26 +1326,6 @@ mod tests {
         apply(&mut status, "work", "coder", &verdict("feature", 1, true));
         apply(&mut status, "work", "coder", &enriched);
         assert!(owned(&status, "work", "coder")[0].submissions[0].verdict.as_ref().unwrap().accepted);
-    }
-    // ADR 0061: handoff carries unfinished obligations without losing source,
-    // attempts or completed history, including colliding role-local identifiers.
-    #[test]
-    fn handoff_moves_open_promises_and_retains_history() {
-        let mut status = ConvoyStatus::default();
-        apply(&mut status, "work", "coder", &submit("feature", 1));
-        apply(&mut status, "work", "reviewer", &submit("feature", 2));
-        apply(&mut status, "work", "reviewer", &submit("handoff/coder/feature/1", 4));
-        apply(&mut status, "work", "coder", &submit("finished", 3));
-        apply(&mut status, "work", "coder", &verdict("finished", 3, true));
-        handoff(&mut status, "work", "coder", "reviewer");
-        assert_eq!(owned(&status, "work", "coder").len(), 1);
-        assert_eq!(owned(&status, "work", "coder")[0].state, PromiseState::Kept);
-        let moved = &owned(&status, "work", "reviewer")[2];
-        assert_eq!(moved.id, "handoff/coder/feature/2");
-        assert_eq!(moved.role, "reviewer");
-        assert_eq!(moved.state, PromiseState::Submitted);
-        assert_eq!(moved.submissions.len(), 1);
-        assert_ne!(moved.id, "feature");
     }
     // ADR 0021: settled history cannot propose patches that terminal status
     // ignores, including previous-generation records with unpromised subjects.
@@ -1621,6 +1660,66 @@ mod tests {
         assert!(error.contains("`work/reviewer` is a tool crew member"), "{error}");
     }
 
+    // Owner ruling (#3108): admission gives every agent seat of a non-standing convoy a promise.
+    // An agent the template and dispatch declare nothing for owes a template decision ledger; a
+    // tool seat, a seat whose dispatch excluded the ledger, and a standing convoy's seats do not.
+    // Seeding again adds nothing.
+    #[test]
+    fn an_agent_seat_owing_nothing_gets_a_template_decision_ledger() {
+        let agent = |role: &str| {
+            crate::CrewSpec::builder()
+                .role(role.to_string())
+                .source(crate::CrewSource::Agent { selector: crate::Selector::for_capability("code"), prompt: None, brief_template: None })
+                .build()
+        };
+        let mut excluded = agent("excluded");
+        excluded.promise_exclusions.push(PromiseKind::DecisionLedger);
+        let tool = crate::CrewSpec::builder()
+            .role("tool".to_string())
+            .source(crate::CrewSource::Tool { command: "sleep infinity".into() })
+            .build();
+        let mut owing = agent("owing");
+        owing.promises.push(crate::TemplatePromise { owner: "owing".into(), kind: PromiseKind::Pr });
+        let status = ConvoyStatus {
+            workflow_snapshot: Some(crate::WorkflowSnapshot {
+                cascade: None,
+                exit: None,
+                turn_delivery: Default::default(),
+                stall_nudges: Default::default(),
+                supervision: None,
+                vessels: vec![crate::VesselRequirement::builder()
+                    .name("work".to_string())
+                    .crew(vec![agent("idle"), excluded, tool, owing, agent("dispatched")])
+                    .build()],
+            }),
+            ..Default::default()
+        };
+        let dispatch = vec![dispatched("notes", PromiseKind::Pr, "dispatched")];
+        let seeded = |standing| {
+            admitted_declarations(&dispatch, &status, standing)
+                .into_iter()
+                .map(|(_, role, operation)| match operation {
+                    PromiseOperation::Declare { id, kind, source } => (role, id, kind, source),
+                    other => panic!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            seeded(false),
+            vec![
+                ("owing".into(), "template/pr".into(), PromiseKind::Pr, PromiseSource::Template),
+                ("dispatched".into(), "notes".into(), PromiseKind::Pr, PromiseSource::Dispatch),
+                ("idle".into(), "template/decision-ledger".into(), PromiseKind::DecisionLedger, PromiseSource::Template),
+            ]
+        );
+        assert!(seeded(true).iter().all(|(role, ..)| role != "idle"), "a standing convoy's seats owe nothing by default");
+        let mut admitted = status.clone();
+        for (vessel, role, operation) in admitted_declarations(&dispatch, &status, false) {
+            apply(&mut admitted, &vessel, &role, &operation);
+        }
+        assert!(admitted_declarations(&dispatch, &admitted, false).is_empty());
+    }
+
     // ADR 0061: Bootstrap seeds frozen dispatch promises beside template ones,
     // open and dispatch-sourced, under the label the crew submits against.
     // Re-seeding is idempotent, including after handoff moves (and renames)
@@ -1646,6 +1745,7 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), pending()), ("reviewer".into(), pending())]))]),
             dispatch.clone(),
+            false,
             super::super::ConvoyPhase::Pending,
             None,
         )
@@ -1668,8 +1768,9 @@ mod tests {
                 ("notes".into(), PromiseSource::Dispatch, PromiseKind::DecisionLedger, PromiseState::Open),
             ]
         );
-        assert!(admitted_declarations(&dispatch, &status).is_empty());
-        // A colliding handoff renames the moved promise; it is still seeded.
+        assert!(admitted_declarations(&dispatch, &status, false).is_empty());
+        // An old-store handoff renamed a moved promise that collided at its target, as statuses
+        // stored before the engine's Reassign hold; it is still seeded.
         let mut collided = status.clone();
         apply(
             &mut collided,
@@ -1677,11 +1778,15 @@ mod tests {
             "reviewer",
             &PromiseOperation::Declare { id: "api-split".into(), kind: PromiseKind::Pr, source: PromiseSource::Crew },
         );
-        handoff(&mut collided, "work", "coder", "reviewer");
+        let crew = collided.promises.get_mut("work").unwrap();
+        let coder = crew.get_mut("coder").unwrap();
+        let mut moved = coder.remove(coder.iter().position(|p| p.id == "api-split").unwrap());
+        (moved.id, moved.role) = ("handoff/coder/api-split/1".into(), "reviewer".into());
+        crew.get_mut("reviewer").unwrap().push(moved);
         assert!(owned(&collided, "work", "reviewer")
             .iter()
             .any(|p| p.id == "handoff/coder/api-split/1" && p.source == PromiseSource::Dispatch));
-        assert!(admitted_declarations(&dispatch, &collided)
+        assert!(admitted_declarations(&dispatch, &collided, false)
             .iter()
             .all(|(_, _, operation)| !matches!(operation, PromiseOperation::Declare { source: PromiseSource::Dispatch, .. })));
         // Finished crew are skipped; promises outside the snapshot are ignored.
@@ -1689,7 +1794,7 @@ mod tests {
         fresh.promises.clear();
         fresh.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = super::super::CrewWorkPhase::Done;
         let stray = DispatchPromise { label: "stray".into(), kind: PromiseKind::Pr, vessel: "work".into(), role: "designer".into() };
-        let seeded = admitted_declarations(&[dispatch.clone(), vec![stray]].concat(), &fresh);
+        let seeded = admitted_declarations(&[dispatch.clone(), vec![stray]].concat(), &fresh, false);
         assert_eq!(
             seeded.iter().map(|(vessel, role, _)| format!("{vessel}/{role}")).collect::<Vec<_>>(),
             vec!["work/reviewer", "work/reviewer"]

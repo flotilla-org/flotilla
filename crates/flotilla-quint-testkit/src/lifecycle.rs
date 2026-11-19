@@ -13,7 +13,7 @@ pub fn ending_value(ending: &Ending) -> Value {
 
 pub fn vanish_cause(value: &Value) -> VanishCause {
     match tag(value) {
-        "Lost" => VanishCause::Lost,
+        "Lost" => VanishCause::lost(),
         "Failed" => VanishCause::Failed { reason: text(payload(value)).into() },
         other => panic!("vanish cause {other}"),
     }

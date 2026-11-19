@@ -1,6 +1,6 @@
 //! The dummy agent harness. Launching selects the crew script from the brief
-//! and hands it to the dummy terminal pool through the launch environment;
-//! screen classification reads the pool's rendered status line.
+//! and hands it to the dummy terminal pool through the launch environment.
+//! Like Claude Code's adapter, it reports attention through hooks only.
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use flotilla_discovery_api::EnvironmentBag;
 use flotilla_environment::environment::dummy::{DUMMY_CREW_BINARY, DUMMY_FLEET_ENV};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_resources::{TerminalAttentionState, TerminalBrief};
+use flotilla_resources::TerminalBrief;
 
 use crate::crew::CrewScript;
 
@@ -48,13 +48,11 @@ impl AgentAdapter for DummyAgentAdapter {
         Ok(AgentLaunchPlan { command: DUMMY_CREW_BINARY.into(), env, stance: TRUSTED_IMPLICIT_STANCE.into() })
     }
 
-    fn classify_screen_attention(&self, screen: &str) -> Option<TerminalAttentionState> {
-        let status = screen.lines().find(|line| line.starts_with("flotilla dummy crew"))?;
-        match status.rsplit(" · ").next()? {
-            SCREEN_WORKING => Some(TerminalAttentionState::Working),
-            SCREEN_IDLE => Some(TerminalAttentionState::Idle),
-            _ => None,
-        }
+    /// A dummy crew stands in for Claude Code, which reports its attention only through its
+    /// hooks: the daemon gives it the hook URL and token Claude Code takes, and reads nothing
+    /// from its screen.
+    fn posts_claude_code_hooks(&self) -> bool {
+        true
     }
 }
 
@@ -99,12 +97,12 @@ mod tests {
         assert!(adapter.launch(&request("dummy-script: pilot")).is_err());
     }
 
+    // As Claude Code's adapter: attention comes from hooks, never from the screen.
     #[test]
-    fn screens_classify_as_working_or_idle() {
+    fn attention_comes_from_hooks_not_the_screen() {
         let adapter = DummyAgentAdapter { long_runner_turns: 1 };
-        assert_eq!(adapter.classify_screen_attention("flotilla dummy crew · coder · working\n"), Some(TerminalAttentionState::Working));
-        assert_eq!(adapter.classify_screen_attention("flotilla dummy crew · coder · idle\n"), Some(TerminalAttentionState::Idle));
-        assert_eq!(adapter.classify_screen_attention("$ cargo test\n"), None);
+        assert!(adapter.posts_claude_code_hooks());
+        assert_eq!(adapter.classify_screen_attention("flotilla dummy crew · coder · working\n"), None);
     }
 
     #[test]

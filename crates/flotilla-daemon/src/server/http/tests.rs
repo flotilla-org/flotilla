@@ -17,14 +17,17 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use flotilla_protocol::EnvironmentId;
-use flotilla_resources::{Clock, Convoy, ConvoySpec, InputMeta};
+use flotilla_resources::{
+    engine_records::{KindRecords, LogPosition, Record, Since},
+    AccessDelivery, Clock, InputMeta, CONVOY_LABEL,
+};
 use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 use super::{
     login::{LOGIN_CODE_LIFETIME, SESSION_LIFETIME, SESSION_LIMIT},
+    table_tests::{delivery, engine_backend_in, EngineStore},
     tcp::{TOKEN_DIRECTORY, TOKEN_FILE},
     CallerAuth, HttpRouter, ListenAddress, ListenerOrigin, LoginStore, TcpListener,
 };
@@ -52,6 +55,8 @@ struct Incarnation {
     logins: Arc<LoginStore>,
     origin: ListenerOrigin,
     router: Router,
+    /// The decided store an engine-served backend reads, when this incarnation opened one.
+    _store: Option<EngineStore>,
 }
 
 impl Incarnation {
@@ -59,13 +64,18 @@ impl Incarnation {
         Self::with_origin(ListenerOrigin::known(ORIGIN))
     }
 
+    /// Over the engine's home, as the daemon composes its backend (see `engine_backend`).
     fn with_origin(origin: ListenerOrigin) -> Self {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let (backend, store) = engine_backend_in("flotilla");
+        Self { _store: Some(store), ..Self::over(backend, origin) }
+    }
+
+    fn over(backend: ResourceBackend, origin: ListenerOrigin) -> Self {
         let clock = Arc::new(ManualClock(Mutex::new(DateTime::parse_from_rfc3339("2026-10-19T12:00:00Z").expect("time").into())));
         let logins = Arc::new(LoginStore::new(clock.clone()));
         let router =
             HttpRouter::builder().backend(backend.clone()).logins(Arc::clone(&logins)).tcp_origin(origin.clone()).build().into_router();
-        Self { backend, clock, logins, origin, router }
+        Self { backend, clock, logins, origin, router, _store: None }
     }
 
     /// The router as a listener serves it: the listener attaches the caller.
@@ -152,11 +162,11 @@ async fn resource_api_serves_user_callers_with_its_existing_contract() {
     let daemon = Incarnation::new();
     daemon
         .backend
-        .using::<Convoy>("flotilla")
-        .create(&InputMeta::builder().name("listed".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+        .using::<AccessDelivery>("flotilla")
+        .create(&InputMeta::builder().name("listed".into()).build(), &delivery("demo"))
         .await
-        .expect("seed convoy");
-    let path = "/apis/flotilla.work/v1/namespaces/flotilla/convoys";
+        .expect("seed delivery");
+    let path = "/apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries";
     for caller in [CallerAuth::Socket(None), CallerAuth::Bearer] {
         let reply = daemon.call(caller, get(path)).await;
         assert_eq!(reply.status, StatusCode::OK);
@@ -181,20 +191,14 @@ async fn resource_api_serves_user_callers_with_its_existing_contract() {
 #[tokio::test]
 async fn resource_watch_streams_newline_delimited_events() {
     let daemon = Incarnation::new();
-    let convoys = daemon.backend.using::<Convoy>("flotilla");
-    convoys
-        .create(&InputMeta::builder().name("before".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-        .await
-        .expect("seed convoy");
-    let mut request = get("/apis/flotilla.work/v1/namespaces/flotilla/convoys?watch=true");
+    let deliveries = daemon.backend.using::<AccessDelivery>("flotilla");
+    deliveries.create(&InputMeta::builder().name("before".into()).build(), &delivery("demo")).await.expect("seed delivery");
+    let mut request = get("/apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries?watch=true");
     request.extensions_mut().insert(CallerAuth::Socket(None));
     let response = daemon.router.clone().oneshot(request).await.expect("router");
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
-    convoys
-        .create(&InputMeta::builder().name("after".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-        .await
-        .expect("watched convoy");
+    deliveries.create(&InputMeta::builder().name("after".into()).build(), &delivery("demo")).await.expect("watched delivery");
     let mut received = Vec::new();
     while !String::from_utf8_lossy(&received).contains("\"after\"") {
         let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), futures::StreamExt::next(&mut body))
@@ -209,6 +213,112 @@ async fn resource_watch_streams_newline_delimited_events() {
         lines.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON event per line")).collect::<Vec<_>>();
     assert!(events.iter().any(|event| event["object"]["metadata"]["name"] == "before"));
     assert!(events.iter().any(|event| event["type"] == "ADDED" && event["object"]["metadata"]["name"] == "after"));
+}
+
+/// The collection's resourceVersion, as a list over `path` returns it, encoded for a query.
+async fn listed_version(daemon: &Incarnation, path: &str) -> String {
+    let listed = daemon.call(CallerAuth::Socket(None), get(path)).await;
+    assert_eq!(listed.status, StatusCode::OK);
+    let version = listed.json()["metadata"]["resourceVersion"].as_str().expect("a listing's resourceVersion").to_owned();
+    url::form_urlencoded::byte_serialize(version.as_bytes()).collect()
+}
+
+// #3108: one name's copies carry the kind's position, as a listing does: a watch resumes from it
+// with the change made since as its first event.
+#[tokio::test]
+async fn a_names_copies_carry_a_position_a_watch_resumes_from() {
+    let daemon = Incarnation::new();
+    let deliveries = daemon.backend.using::<AccessDelivery>("flotilla");
+    deliveries.create(&InputMeta::builder().name("before".into()).build(), &delivery("demo")).await.expect("seed delivery");
+    let path = "/apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries";
+    let version = listed_version(&daemon, &format!("{path}/before?allProvenances=true")).await;
+    deliveries.create(&InputMeta::builder().name("after".into()).build(), &delivery("demo")).await.expect("delivery since");
+    let mut request = get(&format!("{path}?watch=true&resourceVersion={version}"));
+    request.extensions_mut().insert(CallerAuth::Socket(None));
+    let response = daemon.router.clone().oneshot(request).await.expect("router");
+    assert_eq!(response.status(), StatusCode::OK, "a resume from the copies' resourceVersion starts");
+    let mut body = response.into_body().into_data_stream();
+    let mut received = Vec::new();
+    while !received.contains(&b'\n') {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), futures::StreamExt::next(&mut body))
+            .await
+            .expect("watch event in time")
+            .expect("watch open")
+            .expect("watch chunk");
+        received.extend_from_slice(&chunk);
+    }
+    let line = String::from_utf8(received).expect("UTF-8");
+    let first: serde_json::Value = serde_json::from_str(line.lines().next().expect("a line")).expect("one JSON event");
+    assert_eq!((first["type"].as_str(), first["object"]["metadata"]["name"].as_str()), (Some("MODIFIED"), Some("after")));
+}
+
+// #3108: a collection watch resumes from a listing's resourceVersion, with or without the other
+// homes' copies: it sends no snapshot, and its first event is the change made since the listing.
+#[tokio::test]
+async fn resource_watch_resumes_from_a_listing_resource_version() {
+    for replicas in ["", "&includeReplicas=true"] {
+        let daemon = Incarnation::new();
+        let deliveries = daemon.backend.using::<AccessDelivery>("flotilla");
+        deliveries.create(&InputMeta::builder().name("before".into()).build(), &delivery("demo")).await.expect("seed delivery");
+        let path = "/apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries";
+        let listing = if replicas.is_empty() { path.to_owned() } else { format!("{path}?includeReplicas=true") };
+        let version = listed_version(&daemon, &listing).await;
+        deliveries.create(&InputMeta::builder().name("after".into()).build(), &delivery("demo")).await.expect("delivery since");
+        let mut request = get(&format!("{path}?watch=true&resourceVersion={version}{replicas}"));
+        request.extensions_mut().insert(CallerAuth::Socket(None));
+        let response = daemon.router.clone().oneshot(request).await.expect("router");
+        assert_eq!(response.status(), StatusCode::OK, "{replicas}");
+        let mut body = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        while !received.contains(&b'\n') {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), futures::StreamExt::next(&mut body))
+                .await
+                .expect("watch event in time")
+                .expect("watch open")
+                .expect("watch chunk");
+            received.extend_from_slice(&chunk);
+        }
+        let line = String::from_utf8(received).expect("UTF-8");
+        let first: serde_json::Value = serde_json::from_str(line.lines().next().expect("a line")).expect("one JSON event");
+        assert_eq!((first["type"].as_str(), first["object"]["metadata"]["name"].as_str()), (Some("MODIFIED"), Some("after")), "{replicas}");
+    }
+}
+
+// #3108: a watch from a resourceVersion is gone (410) once the log no longer holds what followed
+// it: another home's Forges reached this store as a snapshot, which logs nothing to read since.
+#[tokio::test]
+async fn resource_watch_from_before_a_snapshot_catch_up_is_gone() {
+    use flotilla_resources::{Forge, ForgeKind, ForgeSpec};
+    let daemon = Incarnation::new();
+    let service = &daemon._store.as_ref().expect("an engine store").service;
+    let forge = |id: &str| {
+        ForgeSpec::builder()
+            .forge_id(id.to_owned())
+            .kind(ForgeKind::Forgejo)
+            .hosts([format!("{id}.example")].into())
+            .https_url(format!("https://{id}.example"))
+            .git_ssh_host(format!("{id}.example"))
+            .build()
+    };
+    let beta = flotilla_provisioning_testkit::other_home::OtherHome::open("beta");
+    beta.definition::<Forge>("beta-one", &forge("one")).await;
+    beta.replicate_to(service);
+    let path = "/apis/flotilla.work/v1/namespaces/flotilla/forges";
+    let version = listed_version(&daemon, &format!("{path}?includeReplicas=true")).await;
+    beta.definition::<Forge>("beta-two", &forge("two")).await;
+    beta.replicate_to(service);
+    for replicas in ["", "&includeReplicas=true"] {
+        // A watch that started would stream until dropped.
+        let resumed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            daemon.call(CallerAuth::Socket(None), get(&format!("{path}?watch=true&resourceVersion={version}{replicas}"))),
+        )
+        .await
+        .expect("a resume past a snapshot is answered, not started");
+        assert_eq!(resumed.status, StatusCode::GONE, "{replicas}");
+        let reason = resumed.json()["message"].as_str().unwrap_or_default().to_owned();
+        assert!(reason.starts_with("beta") && reason.contains("snapshot"), "the 410 says why: {reason}");
+    }
 }
 
 // Only the main Unix socket mints login codes, and only when a TCP listener exists to
@@ -351,7 +461,7 @@ async fn resource_http_honors_declared_selectors() {
         let router = daemon.router.clone();
         async move {
             let request = format!(
-                "GET /apis/flotilla.work/v1/namespaces/flotilla/convoys?{parameters} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                "GET /apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries?{parameters} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
             );
             through_front_door(router, CallerAuth::Socket(None), &request).await
         }
@@ -360,19 +470,27 @@ async fn resource_http_honors_declared_selectors() {
         let body = response.split_once("\r\n\r\n").expect("HTTP response").1;
         serde_json::from_str::<serde_json::Value>(body).expect("JSON body")["items"].clone()
     };
+    // An AccessDelivery's one label is its convoy, read back from the record.
     for (name, label) in [("selected", "target"), ("excluded", "other"), ("punctuation()!", "a+b")] {
-        let meta =
-            InputMeta::builder().name(name.to_owned()).labels(std::collections::BTreeMap::from([("team".into(), label.into())])).build();
-        backend.using::<Convoy>("flotilla").create(&meta, &ConvoySpec::builder().workflow_ref("workflow".into()).build()).await.unwrap();
+        backend
+            .using::<AccessDelivery>("flotilla")
+            .create(&InputMeta::builder().name(name.to_owned()).build(), &delivery(label))
+            .await
+            .unwrap();
     }
-    for parameters in ["labelSelector=team%3Dtarget", "fieldSelector=metadata.name%3Dselected"] {
-        let response = request(parameters.into()).await;
+    let by_label = |selector: &str| {
+        url::form_urlencoded::Serializer::new(String::new()).append_pair("labelSelector", &format!("{CONVOY_LABEL}={selector}")).finish()
+    };
+    for parameters in [by_label("target"), "fieldSelector=metadata.name%3Dselected".into()] {
+        let response = request(parameters).await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert_eq!(items(&response).as_array().unwrap().len(), 1);
         assert_eq!(items(&response)[0]["metadata"]["name"], "selected");
     }
-    for (parameter, selector) in [("labelSelector", "team=a+b"), ("fieldSelector", "metadata.name=punctuation()!")] {
-        let parameters = url::form_urlencoded::Serializer::new(String::new()).append_pair(parameter, selector).finish();
+    for (parameter, selector) in
+        [("labelSelector", format!("{CONVOY_LABEL}=a+b")), ("fieldSelector", "metadata.name=punctuation()!".into())]
+    {
+        let parameters = url::form_urlencoded::Serializer::new(String::new()).append_pair(parameter, &selector).finish();
         let response = request(parameters).await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert_eq!(items(&response).as_array().unwrap().len(), 1);
@@ -387,10 +505,11 @@ async fn resource_http_honors_declared_selectors() {
     ] {
         assert!(request(parameters.into()).await.starts_with("HTTP/1.1 400"), "{parameters}");
     }
-    let query = flotilla_store::StoreQuery::labels(&std::collections::BTreeMap::from([("team".into(), "target".into())]), false, true);
+    let query =
+        flotilla_store::StoreQuery::labels(&std::collections::BTreeMap::from([(CONVOY_LABEL.into(), "target".into())]), false, true);
     let parameters: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("storeQuery", &serde_json::to_string(&query).unwrap())
-        .append_pair("labelSelector", "team=target")
+        .append_pair("labelSelector", &format!("{CONVOY_LABEL}=target"))
         .finish();
     assert!(request(parameters).await.starts_with("HTTP/1.1 400"), "duplicate merged selector key is refused");
     let parameters: String = url::form_urlencoded::Serializer::new(String::new())
@@ -400,6 +519,187 @@ async fn resource_http_honors_declared_selectors() {
     let response = request(parameters).await;
     assert!(response.starts_with("HTTP/1.1 200"), "distinct query and selector predicates are combined");
     assert_eq!(items(&response).as_array().unwrap().len(), 1);
+}
+
+/// An engine port serving every registered kind, holding no records.
+#[derive(Debug)]
+struct EveryKindEmpty;
+
+impl flotilla_store::EnginePort for EveryKindEmpty {
+    fn install(self: Arc<Self>, backend: &ResourceBackend) {
+        struct Install<'a>(&'a ResourceBackend, Arc<EveryKindEmpty>);
+        impl flotilla_store::RegisteredKindVisitor for Install<'_> {
+            fn visit<R: flotilla_resources::Resource>(&mut self) {
+                self.0.install_engine_kind::<R>(Arc::clone(&self.1) as Arc<dyn KindRecords<R>>);
+            }
+        }
+        flotilla_store::visit_registered_kinds(&mut Install(backend, self));
+    }
+}
+
+#[async_trait::async_trait]
+impl<R: flotilla_resources::Resource> KindRecords<R> for EveryKindEmpty {
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+        Vec::new()
+    }
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        flotilla_resources::engine_records::Ticks::AtCommit
+    }
+    fn home(&self) -> String {
+        "home-a".into()
+    }
+    async fn get(&self, _: &str) -> Result<Option<Record<R>>, String> {
+        Ok(None)
+    }
+    async fn list(&self) -> Result<Vec<Record<R>>, String> {
+        Ok(Vec::new())
+    }
+    async fn sources(&self) -> Result<Vec<Record<R>>, String> {
+        Ok(Vec::new())
+    }
+    async fn positioned(&self) -> Result<(Vec<Record<R>>, LogPosition), String> {
+        Ok((Vec::new(), LogPosition::default()))
+    }
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::default())
+    }
+    async fn changed_since(&self, _: &LogPosition) -> Result<Since, String> {
+        Ok(Since::Changed { names: Default::default(), through: LogPosition::default() })
+    }
+    async fn copies(&self, _: &str) -> Result<Vec<Record<R>>, String> {
+        Ok(Vec::new())
+    }
+    async fn apply(
+        &self,
+        _: &str,
+        _: Option<u64>,
+        _: &std::collections::BTreeMap<String, String>,
+        _: &std::collections::BTreeMap<String, String>,
+        _: &R::Spec,
+    ) -> Result<Record<R>, flotilla_resources::engine_records::WriteError> {
+        Err("read only".to_owned().into())
+    }
+    async fn set_status(&self, _: &str, _: u64, _: &R::Status) -> Result<Record<R>, flotilla_resources::engine_records::WriteError> {
+        Err(String::from("read only").into())
+    }
+    async fn delete(&self, _: &str) -> Result<(), String> {
+        Err("read only".into())
+    }
+    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
+        Err("no changes".into())
+    }
+}
+
+// Kind discovery on the engine's home answers from the engine alone: an old store that refuses
+// every access is never reached.
+#[tokio::test]
+async fn kind_discovery_on_the_engine_home_reads_no_old_store() {
+    use flotilla_daemon_testkit::old_store::{OldStore, OldStoreAccesses};
+
+    let accesses = Arc::new(OldStoreAccesses::default());
+    let backend = ResourceBackend::new(OldStore::unavailable(Arc::clone(&accesses)));
+    backend.compose_as_engine_home();
+    backend.serve_engine_in("flotilla");
+    backend.install_engine_records(Arc::new(EveryKindEmpty));
+    let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
+    let reply = daemon.call(CallerAuth::Socket(None), get("/apis/flotilla.work/v1")).await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    assert!(accesses.accesses().is_empty(), "{}", accesses.report());
+}
+
+// A kind the engine serves is in the engine's namespace alone: a read through another answers
+// none of its records.
+#[tokio::test]
+async fn engine_records_are_not_read_through_another_namespace() {
+    use flotilla_resources::MessageRelation;
+
+    let home = flotilla_engine_convoys_testkit::EngineHome::open_in("home-a", "flotilla");
+    let backend = home.backend().clone();
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
+    let spec = flotilla_engine_messages_testkit::intent("flotilla/reviewer", "flotilla/coder", MessageRelation::Peer, "a");
+    home.messages.primitives().admit("to-coder", &spec).await.expect("admit");
+    let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
+    let items = |reply: Reply| {
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+        reply.json()["items"].as_array().expect("items").len()
+    };
+    let list = |namespace: &str| get(&format!("/apis/flotilla.work/v1/namespaces/{namespace}/messages"));
+    assert_eq!(items(daemon.call(CallerAuth::Socket(None), list("flotilla")).await), 1);
+    assert_eq!(items(daemon.call(CallerAuth::Socket(None), list("empty")).await), 0);
+    let read = daemon.call(CallerAuth::Socket(None), get("/apis/flotilla.work/v1/namespaces/empty/messages/to-coder")).await;
+    assert_eq!(read.status, StatusCode::NOT_FOUND, "{:?}", read.body);
+}
+
+// A selector on an undeclared field is refused for a kind the engine serves, as the store refuses
+// it, rather than answering with every record.
+#[tokio::test]
+async fn engine_served_kind_refuses_an_undeclared_query_field() {
+    use flotilla_resources::MessageRelation;
+
+    let home = flotilla_engine_convoys_testkit::EngineHome::open_in("home-a", "flotilla");
+    let backend = home.backend().clone();
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
+    let spec = flotilla_engine_messages_testkit::intent("flotilla/reviewer", "flotilla/coder", MessageRelation::Peer, "a");
+    home.messages.primitives().admit("to-coder", &spec).await.expect("admit");
+    let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
+    let reply = daemon
+        .call(CallerAuth::Socket(None), get("/apis/flotilla.work/v1/namespaces/flotilla/messages?fieldSelector=spec.unknown%3Dx"))
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{:?}", reply.body);
+    assert!(String::from_utf8_lossy(&reply.body).contains("undeclared query field spec.unknown"), "{:?}", reply.body);
+}
+
+// A Message query reads the engine's messages and answers with only those it selects, with or
+// without other homes' copies: a receiver's open messages, every open message, and the replies to
+// one message.
+#[tokio::test]
+async fn message_queries_answer_only_the_engine_messages_they_select() {
+    use flotilla_resources::MessageRelation;
+    use flotilla_store::MessageQuery;
+
+    let engine = flotilla_engine_convoys_testkit::EngineHome::open_in("home-a", "flotilla");
+    let backend = engine.backend().clone();
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
+    let home = &engine.messages;
+    let intent =
+        |sender: &str, receiver: &str, body: &str| flotilla_engine_messages_testkit::intent(sender, receiver, MessageRelation::Peer, body);
+    let primitives = home.primitives();
+    let mut answer = intent("flotilla/coder", "flotilla/reviewer", "d");
+    answer.in_reply_to = Some("to-coder-a".into());
+    for (name, spec) in [
+        ("to-coder-a", intent("flotilla/reviewer", "flotilla/coder", "a")),
+        ("to-coder-b", intent("flotilla/reviewer", "flotilla/coder", "b")),
+        ("to-reviewer", intent("flotilla/coder", "flotilla/reviewer", "c")),
+        ("answer", answer),
+    ] {
+        primitives.admit(name, &spec).await.unwrap_or_else(|error| panic!("admit {name}: {error}"));
+    }
+    let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
+    let names = |reply: Reply| {
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+        let mut names = reply.json()["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["metadata"]["name"].as_str().expect("name").to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let coder = "project:flotilla/role:coder".to_owned();
+    for include_replicas in [true, false] {
+        let query = |query: MessageQuery| {
+            let parameters = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("messageQuery", &serde_json::to_string(&query).expect("query"))
+                .append_pair("includeReplicas", &include_replicas.to_string())
+                .finish();
+            get(&format!("/apis/flotilla.work/v1/namespaces/flotilla/messages?{parameters}"))
+        };
+        let call = |request| daemon.call(CallerAuth::Socket(None), request);
+        assert_eq!(names(call(query(MessageQuery::Active { receiver: Some(coder.clone()) })).await), ["to-coder-a", "to-coder-b"]);
+        assert_eq!(names(call(query(MessageQuery::active())).await), ["answer", "to-coder-a", "to-coder-b", "to-reviewer"]);
+        assert_eq!(names(call(query(MessageQuery::ReplyTo { name: "to-coder-a".into() })).await), ["answer"]);
+    }
 }
 
 /// A TCP listener over one incarnation's router, bound on 127.0.0.1 with a chosen port.
@@ -594,7 +894,7 @@ async fn tcp_origin_rules_close_rebinding_hijacking_and_csrf() {
     assert_ne!(send("GET", "/v1/hello", upgrade(vec![("Authorization", bearer.clone())])).await, 403, "bearer upgrade needs no Origin");
 
     let cookie = tcp.daemon.login_cookie().await;
-    let resources = "/apis/flotilla.work/v1/namespaces/flotilla/convoys";
+    let resources = "/apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries";
     assert_eq!(send("GET", resources, vec![("Cookie", cookie.clone())]).await, 200, "cookie GET");
     assert_eq!(send("POST", resources, vec![("Cookie", cookie.clone())]).await, 403, "cookie POST without Origin");
     assert_eq!(send("POST", resources, vec![("Cookie", cookie.clone()), ("Origin", origin.clone())]).await, 405, "admitted to the route");
@@ -615,11 +915,10 @@ struct HttpStreamSample {
 #[tokio::test]
 async fn http_change_stream_requires_peer_session() {
     use flotilla_protocol::CommandValue;
-    use flotilla_schema::{KindRegistry, NewChange, Timestamp};
+    use flotilla_schema::{NewChange, Timestamp};
     use flotilla_schema_sqlite::stream::Service;
-    let (_dir, daemon) = super::super::tests::empty_daemon().await;
     let files = tempfile::tempdir().expect("files");
-    let mut kinds = KindRegistry::new();
+    let mut kinds = super::super::tests::decided_kinds();
     kinds.register::<HttpStreamSample>().expect("kind");
     let service = Arc::new(Service::open(&files.path().join("home.db"), "home", kinds).expect("service"));
     service
@@ -635,7 +934,7 @@ async fn http_change_stream_requires_peer_session() {
             write.commit()
         })
         .expect("seed more frames than the producer queues");
-    daemon.install_decided_store(Arc::clone(&service)).expect("store");
+    let (_dir, daemon) = super::super::tests::daemon_with_decided_store("local", Arc::clone(&service)).await;
     let router =
         HttpRouter::for_daemon(Arc::clone(&daemon), Arc::new(LoginStore::new(daemon.clock_for_scenarios())), ListenerOrigin::default())
             .into_router();
@@ -656,7 +955,7 @@ async fn http_change_stream_requires_peer_session() {
     let mut bodies = Vec::new();
     for index in 0..16 {
         let CommandValue::ChangeStreamFrame { session, .. } =
-            daemon.next_change_stream_frame(&format!("peer-{index}"), None, None).await.expect("peer-issued cursor")
+            daemon.next_change_stream_frame(&format!("peer-{index}"), None, None, None).await.expect("peer-issued cursor")
         else {
             panic!("frame")
         };
@@ -667,7 +966,7 @@ async fn http_change_stream_requires_peer_session() {
         assert_eq!(response.status(), StatusCode::OK);
         bodies.push(response.into_body());
     }
-    assert!(daemon.next_change_stream_frame("peer-17", None, None).await.expect_err("global cap").contains("too many"));
+    assert!(daemon.next_change_stream_frame("peer-17", None, None, None).await.expect_err("global cap").contains("too many"));
     let read = tokio::task::spawn_blocking(move || service.with_store(|store| store.read()?.last_sequence("home")));
     assert_eq!(
         tokio::time::timeout(std::time::Duration::from_secs(2), read)

@@ -21,7 +21,9 @@ pub enum Kind {
     Convoy,
     /// A convoy's vessel.
     Vessel,
-    /// A standing role under a fleet or project, or a convoy role.
+    /// A standing role under a fleet, project or host, or a convoy role. A
+    /// host's role is one of that host's daemon's own inboxes, such as its
+    /// checkout inspector, and has no artifact slots (ADR 0066 amendment).
     Role,
     /// An artifact slot under its producing role; always followed by `of:`.
     Artifact,
@@ -48,10 +50,13 @@ pub enum Kind {
     Usage,
     /// A provider account place, or an account under a usage provider.
     Account,
+    /// A checkout on its host, by the checkout's name: the subject a host's
+    /// checkout inspector is asked about (ADR 0066 amendment).
+    Checkout,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 19] = [
+    pub const ALL: [Kind; 20] = [
         Kind::Host,
         Kind::Provider,
         Kind::Project,
@@ -71,6 +76,7 @@ impl Kind {
         Kind::Ref,
         Kind::Usage,
         Kind::Account,
+        Kind::Checkout,
     ];
 
     /// The segment token, as printed before `:`.
@@ -95,6 +101,7 @@ impl Kind {
             Kind::Ref => "ref",
             Kind::Usage => "usage",
             Kind::Account => "account",
+            Kind::Checkout => "checkout",
         }
     }
 
@@ -104,10 +111,11 @@ impl Kind {
         match self {
             Kind::Fleet | Kind::Project | Kind::Forge | Kind::Usage | Kind::Host => parent.is_none(),
             // A convoy without a Project is valid today (`ConvoySpec.project_ref`
-            // is optional); a convoy with one sits under it.
-            Kind::Convoy => matches!(parent, None | Some(Kind::Project)),
+            // is optional); a convoy with one sits under it. Under a host it is the
+            // convoy homed there, as a checkout's holder names it (#3108).
+            Kind::Convoy => matches!(parent, None | Some(Kind::Project | Kind::Host)),
             Kind::Vessel => parent == Some(Kind::Convoy),
-            Kind::Role => matches!(parent, Some(Kind::Fleet | Kind::Project | Kind::Convoy)),
+            Kind::Role => matches!(parent, Some(Kind::Fleet | Kind::Project | Kind::Convoy | Kind::Host)),
             Kind::Artifact => parent == Some(Kind::Role),
             // A message sits under its inbox, which is always a role.
             Kind::Message => parent == Some(Kind::Role),
@@ -117,6 +125,7 @@ impl Kind {
             Kind::ChangeRequest | Kind::Issue | Kind::Comment | Kind::Commit | Kind::Ref => parent == Some(Kind::Repo),
             Kind::Account => matches!(parent, None | Some(Kind::Usage)),
             Kind::Provider => matches!(parent, Some(Kind::Host | Kind::Account)),
+            Kind::Checkout => parent == Some(Kind::Host),
         }
     }
 }

@@ -5,27 +5,28 @@
 //! exhausted, lost) are computed per key at read time from the stored state and the policy, and
 //! never stored. A Gone state carries its ending, including on snapshot-only replicas.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_schema::{Address, IndexQuery, Kind, Ref, Timestamp};
-use flotilla_schema_sqlite::{Read, ResourceId, Store, StoreError};
+use flotilla_schema_sqlite::{Read, ResourceId, StoreError, StoreHandle};
 use flotilla_state_machines::{
-    machines::{
-        convoy::ConvoyId,
-        lifecycle::{Ending, Lifecycle, LifecycleKind, LifecycleState},
-        vessel::{VesselKind, VesselSpec},
-    },
+    edge_event,
+    machines::lifecycle::{Ending, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState, VanishCause},
     Cause, Resource,
 };
 
 use crate::stored::{
     checkout::{CheckoutKind, CheckoutRequest},
-    clone::{CloneKind, CloneRequest},
+    clone::CloneKind,
     environment::{EnvironmentKind, EnvironmentRequest},
-    image_build::ImageBuildKind,
     terminal_session::{TerminalSessionKind, TerminalSessionRequest},
-    Holder,
+    Holder, Launches,
 };
+
+/// When held resource `id` was last created, as an old object's creation time.
+pub(crate) fn created_at(read: &mut Read<'_>, id: ResourceId) -> Result<chrono::DateTime<chrono::Utc>, StoreError> {
+    Ok(read.creation_time(id)?.to_datetime())
+}
 
 /// How a provisioning resource stands now: a judgement over its stored state, never stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,8 +39,9 @@ pub enum Judgement {
     Exhausted { last: Cause },
     /// Realised under `identity`.
     Ready { identity: String },
-    /// Gone, observed absent without a release.
-    Lost,
+    /// Gone, observed absent without a release; `reason` is why, when its home said, read from
+    /// the `Vanish` entry that ended it.
+    Lost { reason: Option<String> },
     /// Gone after an observed failure.
     Failed { reason: String },
     /// Gone, torn down on purpose.
@@ -57,6 +59,8 @@ pub struct View<K: LifecycleKind> {
     pub state: LifecycleState,
     /// When the current state was entered.
     pub since: Timestamp,
+    /// When it was requested: its creation time.
+    pub created: chrono::DateTime<chrono::Utc>,
     pub judgement: Judgement,
 }
 
@@ -81,7 +85,7 @@ pub fn judge<K: LifecycleKind>(state: &LifecycleState) -> Judgement {
         LifecycleState::Realised { identity } => Judgement::Ready { identity: identity.clone() },
         LifecycleState::Gone { ending } => match ending {
             Ending::Released => Judgement::Released,
-            Ending::Lost => Judgement::Lost,
+            Ending::Lost => Judgement::Lost { reason: None },
             Ending::Failed { reason } => Judgement::Failed { reason: reason.clone() },
         },
         LifecycleState::GaveUp { cause } => Judgement::GaveUp { cause: cause.clone() },
@@ -109,13 +113,11 @@ impl From<StoreError> for ReadError {
 /// The provisioning read port. Each method is one keyed or indexed read of the decided store.
 pub trait ProvisioningReads: Send + Sync {
     fn environment(&self, name: &str, home: &str) -> Result<Option<View<EnvironmentKind>>, ReadError>;
-    fn image_build(&self, name: &str, home: &str) -> Result<Option<View<ImageBuildKind>>, ReadError>;
+    /// A clone launch by its name, or a clone's latest launch by the clone's name.
     fn repository_clone(&self, name: &str, home: &str) -> Result<Option<View<CloneKind>>, ReadError>;
     fn checkout(&self, name: &str, home: &str) -> Result<Option<View<CheckoutKind>>, ReadError>;
     /// The checkouts made in an environment (`checkout.by_environment`).
     fn environment_checkouts(&self, environment: &str, home: &str) -> Result<Vec<View<CheckoutKind>>, ReadError>;
-    /// An environment's clone of a repository (`clone.by_environment`).
-    fn environment_clone(&self, environment: &str, home: &str, repository: &str) -> Result<Option<View<CloneKind>>, ReadError>;
     /// The terminal sessions held for `holder` (`terminal_session.by_holder`), every launch: a
     /// vessel finds the sessions that run in it so.
     fn held_sessions(&self, holder: &Holder) -> Result<Vec<View<TerminalSessionKind>>, ReadError>;
@@ -128,11 +130,6 @@ pub trait ProvisioningReads: Send + Sync {
     fn held_checkouts(&self, holder: &Holder) -> Result<Vec<View<CheckoutKind>>, ReadError>;
     /// The environments held for `holder` (`environment.by_holder`): a vessel finds its environment so.
     fn held_environments(&self, holder: &Holder) -> Result<Vec<View<EnvironmentKind>>, ReadError>;
-    /// A vessel's lease, by its name at its home (#3629 Q6): Requested once granted on its pinned
-    /// host, Realised once ready, Gone once it ended.
-    fn vessel(&self, name: &str, home: &str) -> Result<Option<View<VesselKind>>, ReadError>;
-    /// A convoy's vessels (`vessel.by_convoy`), every lease, live or ended.
-    fn convoy_vessels(&self, convoy: &ConvoyId) -> Result<Vec<View<VesselKind>>, ReadError>;
 }
 
 /// The read port over one decided store.
@@ -141,37 +138,132 @@ pub trait ProvisioningReads: Send + Sync {
 /// 10,000-convoy ceiling (`provisioning_bench`), so a view that reads per checkout stays well
 /// inside a frame. A write holds the same lock for one
 /// short transaction (about 0.1 to 0.4 ms), which bounds how long a read can wait for it.
+#[derive(Clone)]
 pub struct StoreReads {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreHandle>,
 }
 
 /// Resource-facing lifecycle readings backed by the engine's keyed read port.
 pub struct LifecycleReadPort {
     reads: StoreReads,
     home: String,
+    environments: Option<Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>>,
+    clones: Option<Arc<dyn flotilla_resources::clone_records::CloneRecords>>,
+    image_builds: Option<Arc<dyn flotilla_resources::image_build_records::ImageBuildRecords>>,
+    checkouts: Option<Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>>,
+    agent_sessions: Option<Arc<dyn flotilla_resources::agent_activity::AgentSessionReads>>,
+    terminals: Option<Arc<dyn flotilla_resources::terminal_records::TerminalRecords>>,
+    vessels: Option<Arc<dyn flotilla_resources::vessel_records::VesselRecords>>,
+    convoys: Option<Arc<dyn flotilla_resources::convoy_records::ConvoyRecords>>,
+    /// The Vessel and session launches its views join, held once.
+    joins: flotilla_resources::held_joins::HeldJoins,
 }
 
 impl LifecycleReadPort {
     pub fn new(reads: StoreReads, home: String) -> Self {
-        Self { reads, home }
+        Self {
+            reads,
+            home,
+            environments: None,
+            clones: None,
+            image_builds: None,
+            checkouts: None,
+            agent_sessions: None,
+            terminals: None,
+            vessels: None,
+            convoys: None,
+            joins: Default::default(),
+        }
+    }
+
+    /// Serves `sessions` as the engine's AgentSessions.
+    pub fn with_agent_sessions(mut self, sessions: Arc<dyn flotilla_resources::agent_activity::AgentSessionReads>) -> Self {
+        self.agent_sessions = Some(sessions);
+        self
+    }
+
+    /// Serves `terminals` as the engine's terminal sessions.
+    pub fn with_terminals(mut self, terminals: Arc<dyn flotilla_resources::terminal_records::TerminalRecords>) -> Self {
+        self.terminals = Some(terminals);
+        self
+    }
+
+    /// Serves `convoys` as the engine's convoys.
+    pub fn with_convoys(mut self, convoys: Arc<dyn flotilla_resources::convoy_records::ConvoyRecords>) -> Self {
+        self.convoys = Some(convoys);
+        self
+    }
+
+    /// Serves `clones` as the engine's clones.
+    pub fn with_clones(mut self, clones: Arc<dyn flotilla_resources::clone_records::CloneRecords>) -> Self {
+        self.clones = Some(clones);
+        self
+    }
+
+    /// Serves `builds` as the engine's image builds.
+    pub fn with_image_builds(mut self, builds: Arc<dyn flotilla_resources::image_build_records::ImageBuildRecords>) -> Self {
+        self.image_builds = Some(builds);
+        self
+    }
+
+    /// Serves `checkouts` as the engine's checkouts.
+    pub fn with_checkouts(mut self, checkouts: Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>) -> Self {
+        self.checkouts = Some(checkouts);
+        self
+    }
+
+    /// Serves `environments` as the engine's environments.
+    pub fn with_environments(mut self, environments: Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>) -> Self {
+        self.environments = Some(environments);
+        self
+    }
+
+    /// Serves `vessels` as the engine's vessels.
+    pub fn with_vessels(mut self, vessels: Arc<dyn flotilla_resources::vessel_records::VesselRecords>) -> Self {
+        self.vessels = Some(vessels);
+        self
     }
 }
 
 impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
-    fn try_terminal_launch(
-        &self,
-        name: &str,
-        origin: Option<&str>,
-    ) -> Result<Option<flotilla_resources::terminal_launches::TerminalLaunch>, String> {
-        self.reads
-            .terminal_session(name, origin.unwrap_or(&self.home))
-            .map(|view| {
-                view.map(|view| flotilla_resources::terminal_launches::TerminalLaunch {
-                    name: view.name,
-                    reading: view.judgement.reading(),
-                })
-            })
-            .map_err(|error| format!("engine TerminalSession/{name}: {error}"))
+    fn home(&self) -> Result<&str, String> {
+        Ok(&self.home)
+    }
+
+    fn environments(&self) -> Result<&dyn flotilla_resources::environment_records::EnvironmentRecords, String> {
+        self.environments.as_deref().ok_or_else(|| "this read port serves no environments".to_owned())
+    }
+
+    fn clones(&self) -> Result<&dyn flotilla_resources::clone_records::CloneRecords, String> {
+        self.clones.as_deref().ok_or_else(|| "this read port serves no clones".to_owned())
+    }
+
+    fn image_builds(&self) -> Result<&dyn flotilla_resources::image_build_records::ImageBuildRecords, String> {
+        self.image_builds.as_deref().ok_or_else(|| "this read port serves no image builds".to_owned())
+    }
+
+    fn checkouts(&self) -> Result<&dyn flotilla_resources::checkout_records::CheckoutRecords, String> {
+        self.checkouts.as_deref().ok_or_else(|| "this read port serves no checkouts".to_owned())
+    }
+
+    fn agent_sessions(&self) -> Result<&dyn flotilla_resources::agent_activity::AgentSessionReads, String> {
+        self.agent_sessions.as_deref().ok_or_else(|| "this read port serves no AgentSessions".to_owned())
+    }
+
+    fn terminals(&self) -> Result<&dyn flotilla_resources::terminal_records::TerminalRecords, String> {
+        self.terminals.as_deref().ok_or_else(|| "this read port serves no terminal sessions".to_owned())
+    }
+
+    fn vessels(&self) -> Result<&dyn flotilla_resources::vessel_records::VesselRecords, String> {
+        self.vessels.as_deref().ok_or_else(|| "this read port serves no vessels".to_owned())
+    }
+
+    fn convoys(&self) -> Result<&dyn flotilla_resources::convoy_records::ConvoyRecords, String> {
+        self.convoys.as_deref().ok_or_else(|| "this read port serves no convoys".to_owned())
+    }
+
+    fn joins(&self) -> Result<&flotilla_resources::held_joins::HeldJoins, String> {
+        Ok(&self.joins)
     }
 
     fn try_reading(
@@ -184,11 +276,9 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
         let home = origin.unwrap_or(&self.home);
         let judgement = match kind {
             ProvisioningKind::Environment => self.reads.environment(name, home).map(|view| view.map(|view| view.judgement)),
-            ProvisioningKind::ImageBuild => self.reads.image_build(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::Clone => self.reads.repository_clone(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::Checkout => self.reads.checkout(name, home).map(|view| view.map(|view| view.judgement)),
             ProvisioningKind::TerminalSession => self.reads.terminal_session(name, home).map(|view| view.map(|view| view.judgement)),
-            ProvisioningKind::Vessel => self.reads.vessel(name, home).map(|view| view.map(|view| view.judgement)),
         };
         judgement
             .map(|judgement| judgement.map(|judgement| judgement.reading()))
@@ -201,18 +291,26 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
 const PAGE: u32 = 256;
 
 impl StoreReads {
-    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+    pub fn new(store: Arc<StoreHandle>) -> Self {
         Self { store }
     }
 
-    fn read<T>(&self, read: impl FnOnce(&mut Read<'_>) -> Result<T, ReadError>) -> Result<T, ReadError> {
+    /// Calls `listener` after each commit to the store, while the caller keeps it alive.
+    /// Calls `counter` after each commit to the store, before anything is woken by it, while the
+    /// caller keeps it alive.
+    pub(crate) fn on_count(&self, counter: std::sync::Weak<flotilla_schema_sqlite::stream::CommitListener>) -> Result<(), ReadError> {
+        self.store.lock().map_err(|_| ReadError("decided store lock poisoned".into()))?.on_count(counter);
+        Ok(())
+    }
+
+    pub(crate) fn read<T>(&self, read: impl FnOnce(&mut Read<'_>) -> Result<T, ReadError>) -> Result<T, ReadError> {
         let mut store = self.store.lock().map_err(|_| ReadError("decided store lock poisoned".into()))?;
         let mut reader = store.read()?;
         read(&mut reader)
     }
 }
 
-fn view<K>(read: &mut Read<'_>, id: ResourceId) -> Result<Option<View<K>>, ReadError>
+pub(crate) fn view<K>(read: &mut Read<'_>, id: ResourceId) -> Result<Option<View<K>>, ReadError>
 where
     K: LifecycleKind,
     Resource<Lifecycle<K>>: Kind,
@@ -220,8 +318,13 @@ where
 {
     let Some(loaded) = read.load::<Resource<Lifecycle<K>>>(id)? else { return Ok(None) };
     let state = loaded.value.state().clone();
+    let judgement = match judge::<K>(&state) {
+        Judgement::Lost { .. } => Judgement::Lost { reason: lost_reason::<K>(read, id)? },
+        judgement => judgement,
+    };
     Ok(Some(View {
-        judgement: judge::<K>(&state),
+        judgement,
+        created: created_at(read, id)?,
         name: loaded.name,
         home: loaded.home,
         request: loaded.value.spec().clone(),
@@ -230,7 +333,32 @@ where
     }))
 }
 
-fn keyed<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<View<K>>, ReadError>
+/// Why `id` was lost, when its home said: the reason its `Vanish` entry carries. The few
+/// entries of one lifecycle resource are read in order; the latest `Vanish` is the one that
+/// ended it. A replica holding the record from a snapshot has no entry yet, and no reason.
+fn lost_reason<K>(read: &mut Read<'_>, id: ResourceId) -> Result<Option<String>, ReadError>
+where
+    K: LifecycleKind,
+{
+    let mut reason = None;
+    let mut after = 0;
+    loop {
+        let entries = read.changes(id, after, 64)?;
+        let Some(last) = entries.last() else { return Ok(reason) };
+        after = last.home_seq;
+        for entry in &entries {
+            let edge = edge_event::<Lifecycle<K>>(entry, Timestamp(0)).map_err(|error| ReadError(error.to_string()))?;
+            if let Some(LifecycleEdge::Vanish(vanish)) = edge.map(|edge| edge.arguments) {
+                reason = match vanish.cause {
+                    VanishCause::Lost { reason } => reason,
+                    VanishCause::Failed { .. } => None,
+                };
+            }
+        }
+    }
+}
+
+pub(crate) fn keyed<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<View<K>>, ReadError>
 where
     K: LifecycleKind,
     Resource<Lifecycle<K>>: Kind,
@@ -241,7 +369,20 @@ where
     }
 }
 
-fn indexed<K, Q>(read: &mut Read<'_>, query: &IndexQuery<Q>) -> Result<Vec<View<K>>, ReadError>
+/// The newest launch (`<name>#<n>`) of `name` at `home`: the last row of the kind's `by_launch`
+/// index for `name` at that home. Launch numbers are ordered within one home only.
+pub(crate) fn latest<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<View<K>>, ReadError>
+where
+    K: Launches,
+    Resource<Lifecycle<K>>: Kind,
+{
+    match read.integer_index_keys_before(&K::by_launch(name), home, i64::MAX, 1)?.first() {
+        Some((id, _)) => view(read, *id),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn indexed<K, Q>(read: &mut Read<'_>, query: &IndexQuery<Q>) -> Result<Vec<View<K>>, ReadError>
 where
     K: LifecycleKind,
     Resource<Lifecycle<K>>: Kind,
@@ -265,12 +406,12 @@ impl ProvisioningReads for StoreReads {
         self.read(|read| keyed(read, name, home))
     }
 
-    fn image_build(&self, name: &str, home: &str) -> Result<Option<View<ImageBuildKind>>, ReadError> {
-        self.read(|read| keyed(read, name, home))
-    }
-
     fn repository_clone(&self, name: &str, home: &str) -> Result<Option<View<CloneKind>>, ReadError> {
-        self.read(|read| keyed(read, name, home))
+        // A launch is read as itself; a clone, as its latest launch.
+        if flotilla_resources::clone_records::launched(name) != name {
+            return self.read(|read| keyed(read, name, home));
+        }
+        self.read(|read| latest(read, name, home))
     }
 
     fn checkout(&self, name: &str, home: &str) -> Result<Option<View<CheckoutKind>>, ReadError> {
@@ -279,11 +420,6 @@ impl ProvisioningReads for StoreReads {
 
     fn environment_checkouts(&self, environment: &str, home: &str) -> Result<Vec<View<CheckoutKind>>, ReadError> {
         self.read(|read| indexed(read, &CheckoutRequest::by_environment(&Ref::new(environment.to_owned(), home))))
-    }
-
-    fn environment_clone(&self, environment: &str, home: &str, repository: &str) -> Result<Option<View<CloneKind>>, ReadError> {
-        let query = CloneRequest::by_environment(&Ref::new(environment.to_owned(), home), &repository.to_owned());
-        self.read(|read| Ok(indexed(read, &query)?.into_iter().next()))
     }
 
     fn provider_environments(&self, provider: &Address) -> Result<Vec<View<EnvironmentKind>>, ReadError> {
@@ -295,26 +431,7 @@ impl ProvisioningReads for StoreReads {
     }
 
     fn terminal_session(&self, name: &str, home: &str) -> Result<Option<View<TerminalSessionKind>>, ReadError> {
-        // Launches are numbered from 1 without gaps, so the latest is found by doubling past it and
-        // halving back, as the write path's `current` does: O(log launches) keyed reads.
-        self.read(|read| {
-            let Some(first) = keyed(read, &super::launch(name, 1), home)? else { return Ok(None) };
-            let (mut held, mut probe) = ((1, first), 2u32);
-            let mut absent = loop {
-                match keyed(read, &super::launch(name, probe), home)? {
-                    Some(view) => (held, probe) = ((probe, view), probe.saturating_mul(2)),
-                    None => break probe,
-                }
-            };
-            while absent - held.0 > 1 {
-                let mid = held.0 + (absent - held.0) / 2;
-                match keyed(read, &super::launch(name, mid), home)? {
-                    Some(view) => held = (mid, view),
-                    None => absent = mid,
-                }
-            }
-            Ok(Some(held.1))
-        })
+        self.read(|read| latest(read, name, home))
     }
 
     fn held_checkouts(&self, holder: &Holder) -> Result<Vec<View<CheckoutKind>>, ReadError> {
@@ -323,14 +440,6 @@ impl ProvisioningReads for StoreReads {
 
     fn held_environments(&self, holder: &Holder) -> Result<Vec<View<EnvironmentKind>>, ReadError> {
         self.read(|read| indexed(read, &EnvironmentRequest::by_holder(holder)))
-    }
-
-    fn vessel(&self, name: &str, home: &str) -> Result<Option<View<VesselKind>>, ReadError> {
-        self.read(|read| keyed(read, name, home))
-    }
-
-    fn convoy_vessels(&self, convoy: &ConvoyId) -> Result<Vec<View<VesselKind>>, ReadError> {
-        self.read(|read| indexed(read, &VesselSpec::by_convoy(convoy)))
     }
 }
 
@@ -352,7 +461,7 @@ impl Judgement {
             Judgement::Exhausted { last } => LifecycleReading::Exhausted { cause: last.detail.clone() },
             Judgement::Ready { identity } => LifecycleReading::Ready { identity: identity.clone() },
             Judgement::Failed { reason } => LifecycleReading::Failed { reason: reason.clone() },
-            Judgement::Lost => LifecycleReading::Lost,
+            Judgement::Lost { reason } => LifecycleReading::Lost { reason: reason.clone() },
             Judgement::Released => LifecycleReading::Released,
             Judgement::GaveUp { cause } => LifecycleReading::GaveUp { cause: cause.detail.clone() },
         }

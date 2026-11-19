@@ -9,8 +9,10 @@
 //! | Under a built-in's name (layer 2a) | dropped: the built-in is served from the code |
 //! | Deleted (the merge reads it as deleted) | dropped |
 //! | A retired ADR 0053 image layer | dropped: inert for resolution |
+//! | A workflow snapshot no live convoy references | dropped: an ended convoy never tears down on the engine |
 //! | With a field still in merge conflict | the merged value readers see, noted with its sibling values |
 //! | Declared by a manifest at one or more homes | one record at each declaring home |
+//! | Materialised by project ops at one or more homes | one record at each materialising home |
 //! | Declared by none | one record at the home that created it; the other copies fold into it |
 //!
 //! Project (layer 3b) imports alike, with its project operations' status as records of their own
@@ -27,26 +29,29 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::{DateTime, Utc};
 use flotilla_engine_store::{ImportTarget, Rehearsal};
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
     builtins::is_builtin,
     definitions::{declares, DefinitionOrigin},
-    CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, ObjectMeta, Project,
-    Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
+    is_prepared_snapshot, ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer,
+    ImageLayerResourceSpec, ManifestRoot as OldRoot, ObjectMeta, Project, Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
+    WORKFLOW_SNAPSHOT_KIND,
 };
-use flotilla_schema::{Kind, Timestamp};
+use flotilla_schema::{CreatedAt, Kind, Timestamp};
 use flotilla_store::{definition_is_live, merge_definition_copies};
 
 use super::{
-    import::{ImportRefusal, ImportReport},
+    import::{ImportRefusal, ImportReport, RowOutcome},
+    placement_import::UNREFERENCED,
     project_import::write_project_ops,
-    provenance::change_of,
+    provenance::{change_of, declared_elsewhere, legacy_root, stamped_root, DeclaringRoot},
 };
 use crate::stored::{
     definition::{
-        self as stored, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition,
-        ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
+        self as stored, ConvoyEnsureDefinition, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition,
+        FleetDesignationDefinition, ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
     },
     project::{self, ProjectDefinition},
 };
@@ -92,6 +97,7 @@ whole_definition!(
     CredentialSpec => CredentialSpecDefinition,
     CredentialGrant => CredentialGrantDefinition,
     CrewDefaults => CrewDefaultsDefinition,
+    ConvoyEnsure => ConvoyEnsureDefinition,
 );
 
 impl DefinitionKind for ImageLayerDefinition {
@@ -123,8 +129,17 @@ pub struct DefinitionCopies {
     pub crew_defaults: Vec<DefinitionCopy<CrewDefaults>>,
     pub image_layers: Vec<DefinitionCopy<ImageLayer>>,
     pub workflow_templates: Vec<DefinitionCopy<WorkflowTemplate>>,
+    /// The workflow snapshots a live convoy references, by name. Any other snapshot is dropped:
+    /// an ended convoy never tears down on the engine, so nothing would release it.
+    pub live_workflow_snapshots: BTreeSet<String>,
+    /// A standing role's declaration (#3108). Its old status is not carried: the role's reading
+    /// is derived from its convoy generations and its hold attention.
+    pub convoy_ensures: Vec<DefinitionCopy<ConvoyEnsure>>,
     /// Project (layer 3b), with its ProjectOps records from the copies' statuses.
     pub projects: Vec<DefinitionCopy<Project>>,
+    /// Every home's old ManifestRoots, each with its home, imported or not: a previous-generation
+    /// stamp naming its host is matched against the roots of the copy's home.
+    pub manifest_roots: Vec<(ResourceObject<OldRoot>, String)>,
 }
 
 /// Maps every copy in `copies` onto the engine, restores each record into one temporary store
@@ -144,15 +159,39 @@ pub fn rehearse_definitions(copies: &DefinitionCopies) -> ImportReport {
 /// imports, each through the change its origin's writer makes, into `report`. A name is
 /// reported only where a copy of it is held at a home `target` imports.
 pub fn import_definitions(copies: &DefinitionCopies, target: &mut impl ImportTarget, report: &mut ImportReport) {
-    write_kind::<ForgeDefinition>(&copies.forges, target, report);
-    write_kind::<FleetDesignationDefinition>(&copies.fleet_designations, target, report);
-    write_kind::<CredentialSpecDefinition>(&copies.credential_specs, target, report);
-    write_kind::<CredentialGrantDefinition>(&copies.credential_grants, target, report);
-    write_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, target, report);
-    write_kind::<ImageLayerDefinition>(&copies.image_layers, target, report);
-    write_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, target, report);
-    let projects = write_kind::<ProjectDefinition>(&copies.projects, target, report);
+    let roots = &copies.manifest_roots;
+    write_kind::<ForgeDefinition>(&copies.forges, roots, target, report);
+    write_kind::<FleetDesignationDefinition>(&copies.fleet_designations, roots, target, report);
+    write_kind::<CredentialSpecDefinition>(&copies.credential_specs, roots, target, report);
+    write_kind::<CredentialGrantDefinition>(&copies.credential_grants, roots, target, report);
+    write_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, roots, target, report);
+    write_kind::<ImageLayerDefinition>(&copies.image_layers, roots, target, report);
+    let templates = referenced_templates(copies, &|home| target.imports(home), report);
+    write_kind::<WorkflowTemplateDefinition>(&templates, roots, target, report);
+    write_kind::<ConvoyEnsureDefinition>(&copies.convoy_ensures, roots, target, report);
+    let projects = write_kind::<ProjectDefinition>(&copies.projects, roots, target, report);
     write_project_ops(&copies.projects, &projects, target, report);
+}
+
+/// The workflow template copies to import: each copy of a workflow snapshot no live convoy
+/// references is dropped, and counted where `imports` accepts its home.
+fn referenced_templates(
+    copies: &DefinitionCopies,
+    imports: &dyn Fn(&str) -> bool,
+    report: &mut ImportReport,
+) -> Vec<DefinitionCopy<WorkflowTemplate>> {
+    let mut kept = Vec::new();
+    for copy in &copies.workflow_templates {
+        let metadata = &copy.object.metadata;
+        if is_prepared_snapshot(&metadata.labels, WORKFLOW_SNAPSHOT_KIND) && !copies.live_workflow_snapshots.contains(&metadata.name) {
+            if imports(&copy.home) {
+                report.drop_rows(<WorkflowTemplateDefinition as Kind>::KIND, UNREFERENCED, 1);
+            }
+            continue;
+        }
+        kept.push(DefinitionCopy { namespace: copy.namespace.clone(), object: copy.object.clone(), home: copy.home.clone() });
+    }
+    kept
 }
 
 /// One engine record the import makes: its namespace, name, home and value.
@@ -163,24 +202,32 @@ pub struct ImportedDefinition<S> {
     pub record: S,
     /// Why its home's copy was written: the import's change for it.
     pub origin: DefinitionOrigin,
-    /// When its home's copy was created: the time of the import's change.
-    pub created: Timestamp,
+    /// When its home's copy was created, as the old store stamped it: the time of the import's
+    /// change and the record's creation time.
+    pub created: DateTime<Utc>,
 }
 
 /// Maps the copies of `D`'s kind onto engine records, one group of copies per namespace and name.
-/// Drops are counted and refusals listed in `report`.
-pub fn import_kind<D: DefinitionKind>(copies: &[DefinitionCopy<D::Old>], report: &mut ImportReport) -> Vec<ImportedDefinition<D::Stored>>
+/// Drops are counted and refusals listed in `report`. A manifest stamp is resolved against
+/// `roots`, every home's old ManifestRoots.
+pub fn import_kind<D: DefinitionKind>(
+    copies: &[DefinitionCopy<D::Old>],
+    roots: &[(ResourceObject<OldRoot>, String)],
+    report: &mut ImportReport,
+) -> Vec<ImportedDefinition<D::Stored>>
 where
     ResourceObject<D::Old>: Clone,
 {
-    import_kind_at::<D>(copies, &|_| true, report)
+    import_kind_at::<D>(copies, roots, &|_| true, report)
 }
 
 /// [`import_kind`] for the homes `imports` accepts: every copy is merged, but only records homed
 /// at an accepted home are made, and a name is counted, noted or refused only where an accepted
-/// home holds a copy of it.
+/// home holds a copy of it. A previous-generation stamp is resolved against `roots`, every
+/// home's old ManifestRoots.
 pub fn import_kind_at<D: DefinitionKind>(
     copies: &[DefinitionCopy<D::Old>],
+    roots: &[(ResourceObject<OldRoot>, String)],
     imports: &dyn Fn(&str) -> bool,
     report: &mut ImportReport,
 ) -> Vec<ImportedDefinition<D::Stored>>
@@ -200,7 +247,7 @@ where
         }
         let refuse = |reason: String| ImportRefusal { kind, record: name.to_owned(), reason };
         if is_builtin(kind, name) {
-            *report.dropped.entry((kind, "built-in, served from the code")).or_default() += held;
+            report.drop_rows(kind, "built-in, served from the code", held);
             continue;
         }
         let merged = match merge_definition_copies(
@@ -225,12 +272,20 @@ where
             }
         }
         if !definition_is_live(&merged) {
-            *report.dropped.entry((kind, "deleted")).or_default() += held;
+            report.drop_rows(kind, "deleted", held);
             continue;
         }
         let live: Vec<_> = copies.iter().copied().filter(|copy| copy.object.metadata.deletion_timestamp.is_none()).collect();
-        let declaring: Vec<_> =
-            live.iter().copied().filter(|copy| declares(&copy.object.metadata.labels, &copy.object.metadata.annotations)).collect();
+        // Project ops materialise their entries at each home that refreshes the project, as a
+        // manifest declares at each home that applies it: every such copy keeps its own record.
+        let declaring: Vec<_> = live
+            .iter()
+            .copied()
+            .filter(|copy| {
+                declares(&copy.object.metadata.labels, &copy.object.metadata.annotations)
+                    || matches!(origin(&copy.object.metadata), Ok(DefinitionOrigin::ProjectOps { .. }))
+            })
+            .collect();
         let homes = if declaring.is_empty() {
             // An undeclared name stays with the home that created it.
             live.iter()
@@ -246,6 +301,9 @@ where
             report.refused.push(refuse("the merge reads it as live, but every copy is deleted".to_owned()));
             continue;
         }
+        // A copy held here that folds into the record at another home is that home's to import.
+        let folded_here = copies.iter().filter(|copy| imports(&copy.home) && !homes.iter().any(|kept| kept.home == copy.home)).count();
+        report.rows(kind, RowOutcome::OtherHome, folded_here);
         let folded: BTreeSet<_> =
             copies.iter().map(|copy| copy.home.as_str()).filter(|home| !homes.iter().any(|kept| kept.home == *home)).collect();
         if !folded.is_empty() {
@@ -257,7 +315,7 @@ where
             ));
         }
         for copy in homes.into_iter().filter(|copy| imports(&copy.home)) {
-            let origin = match origin(&copy.object.metadata) {
+            let origin = match origin(&copy.object.metadata).and_then(|origin| legacy_root_at(origin, &copy.home, roots)) {
                 Ok(origin) => origin,
                 Err(reason) => {
                     report.refused.push(refuse(format!("at `{}`: {reason}", copy.home)));
@@ -269,13 +327,13 @@ where
                     namespace: namespace.to_owned(),
                     name: name.to_owned(),
                     home: copy.home.clone(),
-                    created: Timestamp::from_datetime(&copy.object.metadata.creation_timestamp),
+                    created: copy.object.metadata.creation_timestamp,
                     record,
                     origin,
                 }),
                 Ok(Mapped::Dropped(reason)) => {
                     // The spec is the merged one, so every home's record drops alike: count the copies once.
-                    *report.dropped.entry((kind, reason)).or_default() += held;
+                    report.drop_rows(kind, reason, held);
                     break;
                 }
                 Err(reason) => report.refused.push(refuse(format!("at `{}`: {reason}", copy.home))),
@@ -310,6 +368,7 @@ where
 /// Writes the records `copies` import to, and returns the `(namespace, name)` of each written.
 fn write_kind<D: DefinitionKind>(
     copies: &[DefinitionCopy<D::Old>],
+    roots: &[(ResourceObject<OldRoot>, String)],
     target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) -> BTreeSet<(String, String)>
@@ -319,17 +378,41 @@ where
 {
     let kind = <D::Stored as Kind>::KIND;
     let mut written = BTreeSet::new();
-    for imported in import_kind_at::<D>(copies, &|home| target.imports(home), report) {
-        let change = change_of(&imported.origin, &imported.home, imported.created);
+    for imported in import_kind_at::<D>(copies, roots, &|home| target.imports(home), report) {
+        let change = change_of(&imported.origin, &imported.home, Timestamp::from_datetime(&imported.created))
+            .created_at(CreatedAt::from_datetime(&imported.created));
         match target.write(&imported.home, &imported.name, &change, &imported.record) {
             Ok(()) => {
-                *report.imported.entry((kind, label(&imported.origin))).or_default() += 1;
+                report.import_row(kind, label(&imported.origin));
                 written.insert((imported.namespace, imported.name));
             }
             Err(reason) => report.refused.push(ImportRefusal { kind, record: imported.name, reason }),
         }
     }
     written
+}
+
+/// The root a copy at `home` is stamped with, as the engine's apply reads it: the stamp of a root
+/// `roots` holds at `home` is left as it is; a root `roots` holds only at other homes is refused,
+/// since the record is declared there; else the stamp is a previous-generation host, matched
+/// ([`legacy_root`]) against the live roots `roots` holds at `home`. `roots` are every home's, in
+/// this run or not, so the outcome does not depend on the order kinds import.
+fn legacy_root_at(origin: DefinitionOrigin, home: &str, roots: &[(ResourceObject<OldRoot>, String)]) -> Result<DefinitionOrigin, String> {
+    let Some(root) = stamped_root(&origin) else { return Ok(origin) };
+    if roots.iter().any(|(held, held_home)| held.metadata.name == root && held_home == home) {
+        return Ok(origin);
+    }
+    let elsewhere: Vec<&str> =
+        roots.iter().filter(|(held, _)| held.metadata.name == root).map(|(_, held_home)| held_home.as_str()).collect();
+    if !elsewhere.is_empty() {
+        return Err(declared_elsewhere(root, &elsewhere));
+    }
+    let here: Vec<_> = roots
+        .iter()
+        .filter(|(held, held_home)| held_home == home && held.metadata.deletion_timestamp.is_none())
+        .map(|(held, _)| DeclaringRoot { name: held.metadata.name.clone(), host: held.spec.host.clone(), source: held.spec.source.clone() })
+        .collect();
+    legacy_root(origin, &here)
 }
 
 /// An origin's label, as the report counts it.

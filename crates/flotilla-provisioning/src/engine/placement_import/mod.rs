@@ -6,6 +6,9 @@
 //! | FulfilmentKind | the kind, written as its stamps' writer: admission's snapshot, seeding, or the definition's origin |
 //! | PlacementPolicy with a kind of its name at its home | dropped: the kind is the daemon's migration of it |
 //! | PlacementPolicy without one | the kind its topology describes; its settings are the code constants |
+//! | A placement snapshot no live imported convoy references | dropped: an ended convoy never tears down on the engine |
+//! | A placement snapshot its labelled convoy references | labelled with the launch that convoy imported as |
+//! | Any other placement snapshot | labelled with the launch of the one live convoy referencing it; refused when several do |
 //! | Deleted | dropped |
 //! | One name in several namespaces at one home | refused: the engine has no namespaces |
 
@@ -18,14 +21,14 @@ use flotilla_engine_store::ImportTarget;
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_resources::{
     definition_provenance::SEEDING_MANAGER, definitions::DefinitionOrigin, is_prepared_snapshot, FulfilmentGrant, FulfilmentKind,
-    FulfilmentKindSpec, FulfilmentRealisation, ResourceObject, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
+    FulfilmentKindSpec, FulfilmentRealisation, ResourceObject, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
 };
-use flotilla_schema::{Kind, Timestamp};
+use flotilla_schema::{CreatedAt, Kind, Timestamp};
 
 use self::retired::{PolicySpec, RetiredPolicy};
 use super::{
     definition_import::label,
-    import::{ImportRefusal, ImportReport},
+    import::{ImportRefusal, ImportReport, RowOutcome},
     kinds,
 };
 use crate::stored::placement::{self as stored, FulfilmentKindDefinition};
@@ -43,6 +46,9 @@ pub struct PlacementCopy<O> {
 pub struct PlacementCopies {
     pub kinds: Vec<PlacementCopy<ResourceObject<FulfilmentKind>>>,
     pub policies: Vec<PlacementCopy<RetiredPolicy>>,
+    /// The live convoys that reference each placement snapshot, by home and name: each convoy's
+    /// old name and the launch it imported as, which releases the snapshot on the engine.
+    pub live_references: BTreeMap<(String, String), BTreeMap<String, String>>,
 }
 
 /// A kind to write at its home, with the stamps its change is made from.
@@ -55,6 +61,8 @@ pub struct Placed {
     pub created: DateTime<Utc>,
     /// What the report counts it under: its writer.
     pub writer: &'static str,
+    /// The old kind of the row it is made from.
+    pub from: &'static str,
 }
 
 #[derive(Default)]
@@ -79,24 +87,50 @@ fn host_ref(spec: &PolicySpec) -> &str {
     }
 }
 
-/// What a copy's stamps say wrote it, as the engine's kinds read it back, with a snapshot named
-/// only by its name stamped as one.
+/// A copy's labels as written, and the writer they read back as.
+type Stamps = (BTreeMap<String, String>, &'static str);
+
+/// What a copy's stamps say wrote it, as the engine's kinds read it back; `None` for a snapshot
+/// with no live convoy to release it.
+///
+/// A snapshot is released with the launch its label names, and an ended convoy never tears down
+/// on the engine, so a snapshot no live convoy references (`live`) is dropped. The label names the
+/// launch its convoy imported as; one written before admission labelled it, or labelled for a
+/// convoy that does not reference it, takes the one live convoy that does.
 fn stamped(
-    name: &str,
     labels: &BTreeMap<String, String>,
     annotations: &BTreeMap<String, String>,
-) -> Result<(BTreeMap<String, String>, &'static str), String> {
+    live: Option<&BTreeMap<String, String>>,
+) -> Result<Option<Stamps>, String> {
     let mut labels = labels.clone();
-    if is_prepared_snapshot(name, &labels, PLACEMENT_SNAPSHOT_KIND) {
-        labels.insert(PREPARED_SNAPSHOT_LABEL.to_owned(), PLACEMENT_SNAPSHOT_KIND.to_owned());
-        return Ok((labels, label(&DefinitionOrigin::Snapshot)));
+    if is_prepared_snapshot(&labels, PLACEMENT_SNAPSHOT_KIND) {
+        let Some(live) = live.filter(|live| !live.is_empty()) else { return Ok(None) };
+        let launch = match labels.get(CONVOY_LABEL).and_then(|convoy| live.get(convoy)) {
+            Some(launch) => launch.clone(),
+            None => match live.values().collect::<Vec<_>>().as_slice() {
+                [launch] => (*launch).clone(),
+                _ => {
+                    let names: Vec<&str> = live.keys().map(String::as_str).collect();
+                    return Err(format!(
+                        "a snapshot no convoy owns is shared by live convoys `{}`, and only one can release it",
+                        names.join("`, `")
+                    ));
+                }
+            },
+        };
+        labels.insert(CONVOY_LABEL.to_owned(), launch);
+        return Ok(Some((labels, label(&DefinitionOrigin::Snapshot))));
     }
     if labels.get(MANAGED_BY_LABEL).is_some_and(|manager| manager == SEEDING_MANAGER) {
-        return Ok((labels, "seeding"));
+        return Ok(Some((labels, "seeding")));
     }
     let writer = label(&flotilla_resources::definitions::origin(&labels, annotations)?);
-    Ok((labels, writer))
+    Ok(Some((labels, writer)))
 }
+
+/// What the report counts a prepared snapshot, placement or workflow, that no convoy on the
+/// engine will release under.
+pub const UNREFERENCED: &str = "a snapshot no live convoy references";
 
 struct KindEntry {
     namespaces: BTreeSet<String>,
@@ -138,14 +172,23 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
         let report = if imports(&copy.home) { &mut *report } else { &mut ignored };
         let metadata = &copy.object.metadata;
         if metadata.deletion_timestamp.is_some() {
-            *report.dropped.entry((KINDS, "deleted")).or_default() += 1;
+            report.drop_rows(KINDS, "deleted", 1);
             continue;
         }
         let spec = &copy.object.spec;
         if let Some(instance) = metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL) {
             unpinned.push((KINDS, metadata.name.clone(), copy.home.clone(), instance.clone()));
         }
-        let record = stamped(&metadata.name, &metadata.labels, &metadata.annotations).and_then(|(labels, writer)| {
+        let live = copies.live_references.get(&(copy.home.clone(), metadata.name.clone()));
+        let stamps = match stamped(&metadata.labels, &metadata.annotations, live) {
+            Ok(None) => {
+                report.drop_rows(KINDS, UNREFERENCED, 1);
+                continue;
+            }
+            Ok(Some(stamps)) => Ok(stamps),
+            Err(reason) => Err(reason),
+        };
+        let record = stamps.and_then(|(labels, writer)| {
             Ok(Placed {
                 name: metadata.name.clone(),
                 home: copy.home.clone(),
@@ -154,6 +197,7 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
                 annotations: metadata.annotations.clone(),
                 created: metadata.creation_timestamp,
                 writer,
+                from: KINDS,
             })
         });
         if let (Ok(_), FulfilmentRealisation::HostDirect, Some(platform)) =
@@ -173,7 +217,7 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
         let refuse =
             |reason: String| ImportRefusal { kind: POLICIES, record: name.clone(), reason: format!("at `{}`: {reason}", copy.home) };
         if metadata.deletion_timestamp.is_some() {
-            *report.dropped.entry((POLICIES, "deleted")).or_default() += 1;
+            report.drop_rows(POLICIES, "deleted", 1);
             continue;
         }
         if spec.priority != 0 {
@@ -185,8 +229,9 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
         if spec.docker_per_vessel.as_ref().is_some_and(|docker| !docker.agent_adapters.is_empty()) {
             *report.dropped.entry((POLICIES, "agent adapters, an image fact the host probes")).or_default() += 1;
         }
-        let snapshot = is_prepared_snapshot(name, &metadata.labels, PLACEMENT_SNAPSHOT_KIND);
-        let stamps = stamped(name, &metadata.labels, &metadata.annotations).and_then(|stamps| {
+        let snapshot = is_prepared_snapshot(&metadata.labels, PLACEMENT_SNAPSHOT_KIND);
+        let live = copies.live_references.get(&(copy.home.clone(), name.clone()));
+        let stamps = stamped(&metadata.labels, &metadata.annotations, live).and_then(|stamps| {
             if snapshot {
                 Ok(stamps)
             } else {
@@ -194,7 +239,11 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
             }
         });
         let (labels, writer) = match stamps {
-            Ok(stamps) => stamps,
+            Ok(Some(stamps)) => stamps,
+            Ok(None) => {
+                report.drop_rows(POLICIES, UNREFERENCED, 1);
+                continue;
+            }
             Err(reason) => {
                 report.refused.push(refuse(reason));
                 continue;
@@ -204,6 +253,7 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
         if let Some(entry) = kinds.get_mut(&key) {
             // The daemon already migrated it to this kind.
             entry.namespaces.insert(copy.namespace.clone());
+            report.drop_rows(POLICIES, "migrated already: its FulfilmentKind imports", 1);
         } else {
             if let Some(instance) = spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.clone()) {
                 unpinned.push((POLICIES, name.clone(), copy.home.clone(), instance));
@@ -223,6 +273,7 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
                     annotations: metadata.annotations.clone(),
                     created: metadata.creation_timestamp,
                     writer,
+                    from: POLICIES,
                 })
                 .map_err(|reason| format!("its kind: {reason}"));
             let refused = record.is_err();
@@ -279,9 +330,13 @@ pub fn write_placement(copies: &PlacementCopies, target: &mut impl ImportTarget,
     let placed = import_placement_at(copies, &|home| target.imports(home), report).kinds;
     for placed in placed {
         let written = kinds::change_of(&placed.labels, &placed.annotations, &placed.home, Timestamp::from_datetime(&placed.created))
+            .map(|change| change.created_at(CreatedAt::from_datetime(&placed.created)))
             .and_then(|change| target.write(&placed.home, &placed.name, &change, &placed.record));
         match written {
-            Ok(()) => *report.imported.entry((KINDS, placed.writer)).or_default() += 1,
+            Ok(()) => {
+                *report.imported.entry((KINDS, placed.writer)).or_default() += 1;
+                report.rows(placed.from, RowOutcome::Imported, 1);
+            }
             Err(reason) => report.refused.push(ImportRefusal { kind: KINDS, record: placed.name, reason }),
         }
     }

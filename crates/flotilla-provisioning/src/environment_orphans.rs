@@ -1,8 +1,9 @@
 //! Host-local recovery for backing containers that lost their resource records.
 //!
-//! Environments do not replicate (ADR 0016): only a successful read of this
-//! host's embedded authoritative store can prove absence. Never substitute a
-//! fleet/replica view or a remote HTTP backend here.
+//! An environment is homed at the host whose provider realises it, so only this home's engine
+//! records can prove absence: a backing whose environment is not live here (never requested,
+//! released, lost or given up) is reclaimed after a grace period. The Environment controller
+//! tears down every live one.
 //! The Docker endpoint must have one authoritative Flotilla daemon: legacy
 //! environment labels do not identify a config directory or daemon owner.
 //! See docs/development.md for deployment isolation and recovery diagnostics.
@@ -12,8 +13,7 @@ use std::{
 };
 
 use flotilla_environment::environment::{EnvironmentBacking, EnvironmentProvider};
-use flotilla_resources::{Environment, Resource};
-use flotilla_store::ResourceBackend;
+use flotilla_resources::environment_records::EnvironmentRecords;
 use tokio::time::Instant;
 
 use crate::reconcilers::EnvironmentRuntime;
@@ -35,27 +35,9 @@ pub struct EnvironmentOrphanSweep {
     pending_cleanup: BTreeSet<EnvironmentBacking>,
 }
 
-async fn protected_environments(backend: &ResourceBackend) -> Result<BTreeSet<String>, String> {
-    // HTTP is a view of someone else's authority, even if its list is empty.
-    backend.local_root().map_err(|error| error.to_string())?;
-    let mut protected = BTreeSet::new();
-    for namespace in backend.local_namespaces::<Environment>().await.map_err(|error| error.to_string())? {
-        let list = backend.using::<Environment>(&namespace).list().await.map_err(|error| error.to_string())?;
-        // Protect every phase, including soft deletion and foreign-host specs:
-        // the normal finalizer owns these, never the absence sweep.
-        protected.extend(list.items.into_iter().map(|object| object.metadata.name));
-    }
-    if let Some(diagnostics) = backend.diagnostics().await.map_err(|error| error.to_string())? {
-        // A record quarantined during a roll is not proof of absence.
-        protected.extend(
-            diagnostics
-                .decode_quarantines
-                .into_iter()
-                .filter(|record| record.kind == Environment::API_PATHS.kind)
-                .map(|record| record.name),
-        );
-    }
-    Ok(protected)
+/// The environments this home holds live: their backings are the controller's.
+fn protected_environments(environments: &dyn EnvironmentRecords) -> Result<BTreeSet<String>, String> {
+    Ok(environments.live()?.into_iter().map(|record| record.name).collect())
 }
 
 impl EnvironmentOrphanSweep {
@@ -65,7 +47,7 @@ impl EnvironmentOrphanSweep {
 
     pub async fn sweep(
         &mut self,
-        backend: &ResourceBackend,
+        environments: &dyn EnvironmentRecords,
         provider: &dyn EnvironmentProvider,
         runtime: &dyn EnvironmentRuntime,
         now: Instant,
@@ -74,18 +56,18 @@ impl EnvironmentOrphanSweep {
             self.absent_since.clear();
             return Ok(());
         }
-        self.sweep_ready(backend, provider, runtime, now).await
+        self.sweep_ready(environments, provider, runtime, now).await
     }
 
     async fn sweep_ready(
         &mut self,
-        backend: &ResourceBackend,
+        environments: &dyn EnvironmentRecords,
         provider: &dyn EnvironmentProvider,
         runtime: &dyn EnvironmentRuntime,
         now: Instant,
     ) -> Result<(), String> {
         let observations = async {
-            let protected = protected_environments(backend).await?;
+            let protected = protected_environments(environments)?;
             let backings = provider.list_backings().await?.into_iter().collect::<BTreeSet<_>>();
             Ok::<_, String>((protected, backings))
         }
@@ -103,7 +85,7 @@ impl EnvironmentOrphanSweep {
         let mut retried = BTreeSet::new();
         for backing in self.pending_cleanup.clone() {
             let environment = backing.environment_id.as_str();
-            let latest = match protected_environments(backend).await {
+            let latest = match protected_environments(environments) {
                 Ok(latest) => latest,
                 Err(error) => {
                     self.absent_since.clear();
@@ -145,7 +127,7 @@ impl EnvironmentOrphanSweep {
             }
             // Re-read authority immediately before destruction: an Environment
             // may have appeared while Docker listing or previous cleanup awaited.
-            let latest = match protected_environments(backend).await {
+            let latest = match protected_environments(environments) {
                 Ok(latest) => latest,
                 Err(error) => {
                     self.absent_since.clear();
@@ -182,20 +164,76 @@ mod tests {
     use async_trait::async_trait;
     use flotilla_environment::environment::EnvironmentProvisionError;
     use flotilla_environment::environment::{EnvironmentHandle, ProvisionOpts};
-    use flotilla_protocol::EnvironmentId;
-    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, InputMeta};
+    use flotilla_protocol::{EnvironmentId, LifecycleReading};
+    use flotilla_resources::{environment_records::EnvironmentRecord, EnvironmentSpec};
     use hegel::generators as gs;
 
     use super::*;
 
-    // This fake stands in for the Docker subprocess boundary. Store operations
-    // below use the real in-memory authoritative backend.
+    /// This home's live environments, by name: the sweep's whole authority.
+    #[derive(Default)]
+    struct Authority(Mutex<BTreeSet<String>>);
+
+    impl Authority {
+        fn create(&self, name: &str) {
+            self.0.lock().expect("authority").insert(name.to_owned());
+        }
+
+        fn end(&self, name: &str) {
+            self.0.lock().expect("authority").remove(name);
+        }
+    }
+
+    impl EnvironmentRecords for Authority {
+        fn codes(&self) -> Vec<flotilla_schema::KindCode> {
+            Vec::new()
+        }
+
+        fn get(&self, _: &str, _: Option<&str>) -> Result<Option<EnvironmentRecord>, String> {
+            unreachable!("the sweep reads live environments only")
+        }
+
+        fn find(&self, _: &str) -> Result<Option<EnvironmentRecord>, String> {
+            unreachable!("the sweep reads live environments only")
+        }
+
+        fn every(&self) -> Result<Vec<EnvironmentRecord>, String> {
+            self.live()
+        }
+
+        fn observations(&self) -> &flotilla_resources::environment_records::EnvironmentObservations {
+            unreachable!("the sweep reads live environments only")
+        }
+
+        fn live(&self) -> Result<Vec<EnvironmentRecord>, String> {
+            let record = |name: &String| EnvironmentRecord {
+                name: name.clone(),
+                home: "home".into(),
+                spec: EnvironmentSpec::default(),
+                vessel: None,
+                requested_at: chrono::DateTime::UNIX_EPOCH,
+                reading: LifecycleReading::InProgress,
+                launch: None,
+            };
+            Ok(self.0.lock().expect("authority").iter().map(record).collect())
+        }
+
+        fn held(&self, _: &str) -> Result<Vec<EnvironmentRecord>, String> {
+            unreachable!("the sweep reads live environments only")
+        }
+
+        fn request(&self, _: &str, _: &EnvironmentSpec, _: Option<&str>) -> Result<bool, String> {
+            unreachable!("the sweep requests nothing")
+        }
+    }
+
+    // This fake stands in for the Docker subprocess boundary.
     #[derive(Default, bon::Builder)]
     struct DockerBoundary {
         backings: Mutex<Vec<EnvironmentBacking>>,
         destroyed: Mutex<Vec<String>>,
         fail_listing: Mutex<bool>,
-        create_on_list: Mutex<Option<ResourceBackend>>,
+        create_on_list: Mutex<Option<Arc<Authority>>>,
         fail_cleanup: Mutex<bool>,
         cleaned: Mutex<Vec<String>>,
     }
@@ -226,8 +264,8 @@ mod tests {
                 return Err("Docker unavailable".into());
             }
             let create = self.create_on_list.lock().expect("create on list").take();
-            if let Some(backend) = create {
-                create_environment(&backend).await;
+            if let Some(authority) = create {
+                authority.create("env");
             }
             Ok(self.backings.lock().expect("backings").clone())
         }
@@ -260,27 +298,11 @@ mod tests {
     fn backing(id: &str) -> EnvironmentBacking {
         EnvironmentBacking { environment_id: EnvironmentId::new("env"), backing_id: id.into() }
     }
-    async fn create_environment(backend: &ResourceBackend) {
-        backend
-            .using::<Environment>("another-namespace")
-            .create(
-                &InputMeta::builder().name("env".into()).build(),
-                &EnvironmentSpec {
-                    cloud_sandbox: None,
-                    provider_address: None,
-                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "home".into(), repo_default_dir: "/".into() }),
-                    docker: None,
-                },
-            )
-            .await
-            .expect("authoritative environment");
-    }
-
-    // #2840: a backing with no authoritative Environment is reaped after ten
+    // #2840: a backing with no live Environment is reaped after ten
     // minutes of successful absence observations, and only once.
     #[tokio::test]
     async fn orphan_sweep_reaps_after_grace_and_is_idempotent() {
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let backend = Authority::default();
         let docker = DockerBoundary::default();
         docker.backings.lock().expect("backings").extend([backing("id"), backing("id")]);
         let mut sweep = EnvironmentOrphanSweep::default();
@@ -292,12 +314,11 @@ mod tests {
         }
     }
 
-    // #2840: startup does nothing, and a live record in home authority protects
-    // a backing even while another host has no replicated record at all.
+    // #2840: startup does nothing, and a live record at this home protects
+    // its backing.
     #[tokio::test]
-    async fn orphan_sweep_preserves_startup_and_authority_despite_replication_lag() {
-        let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let lagging_peer = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    async fn orphan_sweep_preserves_startup_and_authority() {
+        let home = Authority::default();
         let docker = DockerBoundary::default();
         docker.backings.lock().expect("backings").push(backing("id"));
         let mut sweep = EnvironmentOrphanSweep::default();
@@ -307,8 +328,7 @@ mod tests {
             assert!(docker.destroyed.lock().expect("destroyed").is_empty());
         }
         sweep.mark_ready();
-        create_environment(&home).await;
-        assert!(lagging_peer.using::<Environment>("another-namespace").list().await.expect("lagging view").items.is_empty());
+        home.create("env");
         for seconds in [1201, 1801] {
             sweep.sweep(&home, &docker, &docker, now + Duration::from_secs(seconds)).await.expect("authority");
             assert!(docker.destroyed.lock().expect("destroyed").is_empty());
@@ -319,47 +339,16 @@ mod tests {
     // the destructive boundary, even after the full grace period elapsed.
     #[tokio::test]
     async fn orphan_sweep_rechecks_authority_after_docker_listing() {
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let backend = Arc::new(Authority::default());
         let docker = DockerBoundary::default();
         docker.backings.lock().expect("backings").push(backing("id"));
         let mut sweep = EnvironmentOrphanSweep::default();
         sweep.mark_ready();
         let now = Instant::now();
-        sweep.sweep(&backend, &docker, &docker, now).await.expect("first observation");
-        *docker.create_on_list.lock().expect("create on list") = Some(backend.clone());
-        sweep.sweep(&backend, &docker, &docker, now + ORPHAN_GRACE).await.expect("racing observation");
+        sweep.sweep(backend.as_ref(), &docker, &docker, now).await.expect("first observation");
+        *docker.create_on_list.lock().expect("create on list") = Some(Arc::clone(&backend));
+        sweep.sweep(backend.as_ref(), &docker, &docker, now + ORPHAN_GRACE).await.expect("racing observation");
         assert!(docker.destroyed.lock().expect("destroyed").is_empty());
-    }
-
-    // A decode quarantine is evidence of ownership, even when the Environment
-    // cannot be listed as a typed record after a roll. Exercise real SQLite.
-    #[tokio::test]
-    async fn orphan_sweep_preserves_quarantined_environment() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("resources.sqlite");
-        let backend = ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(&path).expect("store"));
-        let connection = rusqlite::Connection::open(&path).expect("raw store");
-        connection
-            .execute(
-                "INSERT INTO resource_decode_quarantine (group_name, version, kind, namespace, name, body_json, error, quarantined_at) \
-             VALUES (?1, ?2, ?3, 'flotilla', 'env', '{}', 'old generation', ?4)",
-                rusqlite::params![
-                    Environment::API_PATHS.group,
-                    Environment::API_PATHS.version,
-                    Environment::API_PATHS.kind,
-                    chrono::Utc::now().to_rfc3339()
-                ],
-            )
-            .expect("quarantine");
-        let docker = DockerBoundary::default();
-        docker.backings.lock().expect("backings").push(backing("id"));
-        let mut sweep = EnvironmentOrphanSweep::default();
-        sweep.mark_ready();
-        let now = Instant::now();
-        for elapsed in [Duration::ZERO, ORPHAN_GRACE] {
-            sweep.sweep(&backend, &docker, &docker, now + elapsed).await.expect("quarantine observation");
-            assert!(docker.destroyed.lock().expect("destroyed").is_empty());
-        }
     }
 
     // Teardown may remove Docker backing and then fail on local state. Retry
@@ -368,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_sweep_retries_cleanup_without_reaping_replacements() {
         for replace in [false, true] {
-            let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+            let backend = Authority::default();
             let docker = DockerBoundary::default();
             docker.backings.lock().expect("backings").push(backing("old"));
             let mut sweep = EnvironmentOrphanSweep::default();
@@ -402,7 +391,7 @@ mod tests {
             .collect();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
-            let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+            let backend = Authority::default();
             let docker = DockerBoundary::default();
             docker.backings.lock().expect("backings").push(backing("id"));
             let mut sweep = EnvironmentOrphanSweep::default();
@@ -414,11 +403,11 @@ mod tests {
                 let mut readiness = StoreReadiness::Ready;
                 match operation {
                     0 if !exists => {
-                        create_environment(&backend).await;
+                        backend.create("env");
                         exists = true;
                     }
                     1 if exists => {
-                        backend.using::<Environment>("another-namespace").delete("env").await.expect("delete");
+                        backend.end("env");
                         exists = false;
                     }
                     2 => readiness = StoreReadiness::Restoring,

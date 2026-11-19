@@ -7,11 +7,11 @@
 //! |---|---|
 //! | Deleted | dropped |
 //! | `spec` | a Host record; `expected_concurrent_rust_crews` and an SSH host's destination dropped, as nothing reads them from here, and counted when set |
-//! | `status` | a HostObservation record: generation, architecture, the free-space floor as a flag, the conditions that can block readiness or forge observation, providers (class, readiness and capabilities), adapters and their baseline, held credentials and their expiry, image digests, the Codex central login |
+//! | `status` | a HostObservation record: generation, protocol fingerprint, architecture, the free-space floor as a flag, the conditions that can block readiness or forge observation, providers (class, readiness and capabilities), adapters and their baseline, held credentials and their expiry, image digests, the Codex central login |
 //! | `status.conditions` | each condition's observation time, and diagnostic conditions (blocking neither readiness nor forge observation), dropped: a judgement, and metrics |
 //! | `status.fulfilment_facts` | facts by FulfilmentKind name: a missing crew pool (no free slots on a host without a vessel cap), GUI login, harness and toolchain versions; each fact's observation time, any other free slot count, the image and its presence, and model facts dropped, as judgements or read by nothing |
 //! | Heartbeat time, readiness, `sleeping_until`, model probes | dropped: readiness is a judgement, and nothing sets the others |
-//! | The host summary (but its architecture), protocol fingerprint, daemon version and start time, sleep inhibition state, provider implementation names | dropped: display only or read by nothing; the sleep condition carries what readiness needs |
+//! | The host summary (but its architecture), daemon version and start time, sleep inhibition state, provider implementation names | dropped: display only or read by nothing; the sleep condition carries what readiness needs |
 //! | Free disk and the free-space floor | only whether free disk is below the floor |
 //! | Memory, store and blob-sync figures, `io_pressure`, `store_read_retries`, `forge_budgets` | dropped: metrics |
 //! | `terminal_pools`, `docker` and `os` capabilities | dropped: no decision reads them |
@@ -34,14 +34,14 @@ use flotilla_resources::{
 };
 use flotilla_schema::{Kind, Timestamp};
 
-use super::import::{created, ImportRefusal, ImportReport};
+use super::import::{created, ImportRefusal, ImportReport, RowOutcome};
 use crate::stored::host::{self as stored, Condition, Expiry, Facts, HostObservation, HostRecord, Provider, ProviderImages};
 
 const HOST: &str = <HostRecord as Kind>::KIND;
 const OBSERVATION: &str = <HostObservation as Kind>::KIND;
 
 /// The capability keys whose values are not carried, with the reason counted.
-const DROPPED_CAPABILITIES: [(&str, &str); 9] = [
+const DROPPED_CAPABILITIES: [(&str, &str); 10] = [
     (TERMINAL_POOLS_CAPABILITY, "terminal pools, read only for display"),
     ("docker", "the docker and os capabilities, which no decision reads"),
     ("os", "the docker and os capabilities, which no decision reads"),
@@ -49,6 +49,9 @@ const DROPPED_CAPABILITIES: [(&str, &str); 9] = [
     ("store_read_retries", "metrics"),
     ("forge_budgets", "metrics"),
     (SSH_HOST_CAPABILITY, "the SSH capability markers, which the connection carries"),
+    // The key the frozen fleet's SSH hosts still publish (pre-#4001); remove one roll after the
+    // cut-over (#3108).
+    ("agentless", "the SSH capability markers, which the connection carries"),
     (TRANSPORT_CAPABILITY, "the SSH capability markers, which the connection carries"),
     (PLACEMENT_CAPABILITY, "the SSH capability markers, which the connection carries"),
 ];
@@ -92,6 +95,11 @@ pub enum Imported {
     Dropped(&'static str),
 }
 
+/// A copy of another daemon's Host: that daemon imports its own.
+const ANOTHER_DAEMONS: &str = "a copy of another daemon's Host";
+/// A copy of an SSH host another daemon owns: its owner imports it.
+const ANOTHER_OWNERS: &str = "a copy of an SSH host another daemon owns";
+
 /// The records `old`, held at a home whose own host is `own_host`, imports to, or why it is
 /// dropped; refused with the reason.
 pub fn import_host(old: &ResourceObject<Host>, own_host: &str) -> Result<Imported, String> {
@@ -99,10 +107,8 @@ pub fn import_host(old: &ResourceObject<Host>, own_host: &str) -> Result<Importe
         return Ok(Imported::Dropped("deleted"));
     }
     match &old.spec.connection {
-        HostConnection::Daemon if old.metadata.name != own_host => return Ok(Imported::Dropped("a copy of another daemon's Host")),
-        HostConnection::SshHost { owning_daemon, .. } if owning_daemon != own_host => {
-            return Ok(Imported::Dropped("a copy of an SSH host another daemon owns"))
-        }
+        HostConnection::Daemon if old.metadata.name != own_host => return Ok(Imported::Dropped(ANOTHER_DAEMONS)),
+        HostConnection::SshHost { owning_daemon, .. } if owning_daemon != own_host => return Ok(Imported::Dropped(ANOTHER_OWNERS)),
         _ => {}
     }
     let mut dropped = Vec::new();
@@ -152,7 +158,9 @@ pub(crate) fn observation(
     let mut conditions = BTreeMap::new();
     for condition in &status.conditions {
         uncarried("each condition's observation time, a judgement");
-        if !condition.blocks_readiness && !condition.blocks_forge_observation {
+        // A remote's reachability blocks neither, but the clones that reach it wait on it.
+        let remote = condition.condition_type.starts_with(flotilla_resources::REMOTE_CONDITION_PREFIX);
+        if !condition.blocks_readiness && !condition.blocks_forge_observation && !remote {
             uncarried("diagnostic conditions, which belong in metrics");
             continue;
         }
@@ -178,9 +186,6 @@ pub(crate) fn observation(
     if description.is_some() {
         uncarried("the host summary but its architecture, display only");
     }
-    if status.protocol_fingerprint.is_some() {
-        uncarried("the protocol fingerprint, display only");
-    }
     if status.daemon_version.is_some() || status.daemon_started_at.is_some() {
         uncarried("the daemon's version and start time, display only");
     }
@@ -199,7 +204,7 @@ pub(crate) fn observation(
     if status.disk_free_bytes.is_some() || status.admission_free_space_floor_bytes.is_some() {
         uncarried("the disk figures, carried only as the free-space floor flag");
     }
-    if status.daemon_rss_bytes.is_some() || status.resource_store.is_some() || status.blob_sync.is_some() {
+    if status.resource_store.is_some() || status.blob_sync.is_some() {
         uncarried("metrics");
     }
     // Without a vessel cap only a missing pool gives no free slots; under a cap a full host does too,
@@ -219,10 +224,18 @@ pub(crate) fn observation(
     }
     Ok(HostObservation {
         daemon_generation: status.daemon_generation.clone(),
+        protocol_fingerprint: status.protocol_fingerprint.clone(),
         architecture: description
             .and_then(|summary| summary.system.arch.as_deref())
             .map(|arch| canonical_image_architecture(arch).to_owned()),
-        below_free_space_floor: matches!((status.disk_free_bytes, status.admission_free_space_floor_bytes), (Some(free), Some(floor)) if free < floor),
+        below_free_space_floor: match (status.disk_free_bytes, status.admission_free_space_floor_bytes) {
+            (Some(free), Some(floor)) => Some(free < floor),
+            // No figures at all: a status read back from the engine and written again carries
+            // the judgement it read, which stands.
+            (None, None) => status.below_free_space_floor,
+            // Either figure unknown: unknown.
+            _ => None,
+        },
         codex_central_login: codex_central_login.unwrap_or_default(),
         conditions,
         providers,
@@ -262,7 +275,7 @@ pub fn import_hosts(copies: &HostCopies, target: &mut impl ImportTarget, report:
     for copy in copies.copies.iter().filter(|copy| target.imports(&copy.home)) {
         let refuse = refusal(copy);
         if copy.object.metadata.deletion_timestamp.is_some() {
-            *report.dropped.entry((HOST, "deleted")).or_default() += 1;
+            report.drop_rows(HOST, "deleted", 1);
             continue;
         }
         let Some(own_host) = copies.homes.get(&copy.home) else {
@@ -270,7 +283,13 @@ pub fn import_hosts(copies: &HostCopies, target: &mut impl ImportTarget, report:
             continue;
         };
         match import_host(&copy.object, own_host) {
-            Ok(Imported::Dropped(reason)) => *report.dropped.entry((HOST, reason)).or_default() += 1,
+            Ok(Imported::Dropped(reason)) => {
+                *report.dropped.entry((HOST, reason)).or_default() += 1;
+                // Another daemon's Host is imported at that daemon's home.
+                let outcome =
+                    if [ANOTHER_DAEMONS, ANOTHER_OWNERS].contains(&reason) { RowOutcome::OtherHome } else { RowOutcome::Dropped(reason) };
+                report.rows(HOST, outcome, 1);
+            }
             Ok(Imported::Records { host, observation, dropped }) => importing.push((copy, Ok((host, observation, dropped)))),
             Err(reason) => importing.push((copy, Err(reason))),
         }
@@ -304,7 +323,7 @@ pub fn import_hosts(copies: &HostCopies, target: &mut impl ImportTarget, report:
                     report.refused.push(refusal);
                     continue;
                 }
-                *report.imported.entry((HOST, "spec")).or_default() += 1;
+                report.import_row(HOST, "spec");
                 if observation.is_some() {
                     *report.imported.entry((OBSERVATION, "observed")).or_default() += 1;
                 }

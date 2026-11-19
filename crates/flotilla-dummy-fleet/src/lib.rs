@@ -17,6 +17,10 @@
 //! - with `[dummy_fleet.shared_forge]`, coders instead open change requests on
 //!   a Forgejo forge every rehearsal host shares (#3374), which the ordinary
 //!   Forgejo provider observes;
+//! - what the fleet stands in for outlives the daemon process, as Docker, cleat
+//!   and a forge do: the fleet keeps a state file in the daemon's state
+//!   directory, and the next process's fleet restores its vendors' backings,
+//!   sessions, crews, checkouts and change requests from it;
 //! - the real change-request and VCS providers it keeps are wrapped read-only,
 //!   and the daemon's outbound HTTP refuses writes, so stores naming real
 //!   forges cannot be written through.
@@ -24,23 +28,28 @@
 mod adapter;
 pub mod catalog;
 mod crew;
+#[cfg(test)]
+mod fake_daemon;
 mod fleet;
 mod forge;
 mod guard;
+mod link;
 mod shared_forge;
+mod stand_in;
+mod state;
 mod terminal;
 mod vcs;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use flotilla_discovery::DiscoveryRuntime;
-use flotilla_environment::{environment::dummy::DummyEnvironmentBehaviour, factories::dummy::DummyEnvironmentFactory};
 
 pub use adapter::{DummyAgentAdapter, DUMMY_AGENT_ADAPTER, DUMMY_SCRIPT_ENV};
 pub use crew::{CrewScript, LAST_TURN_MARKER, SCRIPT_LINE_PREFIX};
-pub use fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet, DummyFleetSnapshot, DummyVendor};
+pub use fleet::{DummyFleet, DummyFleetSnapshot, DummyVendor};
 pub use flotilla_environment::environment::dummy::{DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV};
 pub use forge::DummyChangeRequestTracker;
+pub use state::STATE_FILE;
 pub use terminal::{DummyTerminalPool, DUMMY_TERMINAL_POOL};
 pub use vcs::DummyVcs;
 
@@ -59,25 +68,9 @@ impl DummyFleet {
             .into_iter()
             .map(|factory| guard::GuardedFactory::wrap(factory, guard::NoPushVcs::guard))
             .collect();
-        let environment = &self.config.environment;
-        let weak = Arc::downgrade(self);
-        // Every install comes from this same fleet Arc. Retain its first weak
-        // cleanup callback together with the surviving external environment world.
-        let vendors = self.vendor.factories.get_or_init(|| {
-            let behaviour = DummyEnvironmentBehaviour {
-                seed: self.config.seed,
-                realise_delay: Duration::from_millis(environment.realise_delay_ms),
-                failure_rate: environment.failure_rate,
-            };
-            let cleanup: flotilla_environment::environment::dummy::DummyEnvironmentCleanup = Arc::new(move |id| {
-                if let Some(fleet) = weak.upgrade() {
-                    fleet.sessions.destroy_environment(id);
-                    fleet.checkouts.destroy_environment(id);
-                }
-            });
-            [DummyEnvironmentFactory::new(behaviour.clone(), Arc::clone(&cleanup)), DummyEnvironmentFactory::cloud(behaviour, cleanup)]
-        });
-        for vendor in vendors {
+        factories.environment_providers =
+            std::mem::take(&mut factories.environment_providers).into_iter().map(stand_in::DockerStoodIn::wrap).collect();
+        for vendor in &self.vendor.factories {
             factories.environment_providers.push(Box::new(vendor.clone()));
         }
         factories.change_requests.insert(0, Box::new(forge::DummyChangeRequestFactory { fleet: Arc::clone(self) }));

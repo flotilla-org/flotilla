@@ -2,7 +2,7 @@
 // takes its repository's grants through the session's delivery path.
 use super::*;
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
-use flotilla_provisioning::reconcilers::PreparedCheckout;
+use flotilla_provisioning::checkout_runtime::PreparedCheckout;
 use flotilla_resources::CloneCredentials;
 
 const FORGE_URL: &str = "https://forge.test/acme/widgets";
@@ -98,6 +98,8 @@ async fn cloud_vessel() -> CloudVessel {
     }
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+    // The engine's readings, which a running daemon always has: they hold no clone here.
+    engine_environments(&daemon);
     daemon
         .resource_backend()
         .definitions::<CredentialSpec>(NAMESPACE)

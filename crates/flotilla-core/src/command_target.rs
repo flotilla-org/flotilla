@@ -1,6 +1,7 @@
 //! Domain decision for the host on which a command executes.
 
 use flotilla_protocol::{qualified_path::HostId, CommandAction, NodeId};
+use flotilla_store::off_frame;
 
 use crate::in_process::{ExistingConvoyTarget, InProcessDaemon};
 
@@ -82,9 +83,13 @@ impl InProcessDaemon {
         let (mut reason, mut delivery) = match action {
             A::FleetPostInstall { .. } => (TargetReason::LocalMutation, RemoteDelivery::Command),
             // Any daemon may ask for a composed image: the check reads the
-            // project's repository and get-or-creates a replicated ImageBuild
-            // that its builder host executes.
+            // project's repository and demands the image build at this home,
+            // which its builder launches.
             A::ImageCheck { .. } => (TargetReason::LocalMutation, RemoteDelivery::Command),
+            // A build's launches are written only at its builder's home.
+            A::ImageBuildRetry { .. } => (TargetReason::RecordHome, RemoteDelivery::Command),
+            // A checkout is inspected, and a ruling on it held, only at its home.
+            A::CheckoutRecheck { .. } | A::CheckoutArchive { .. } => (TargetReason::RecordHome, RemoteDelivery::Command),
             A::ConvoyStart { .. } | A::ConvoyCreate { .. } => (TargetReason::Admission, RemoteDelivery::Command),
             A::ConvoyDelete { .. }
             | A::ConvoyLink { .. }
@@ -105,8 +110,6 @@ impl InProcessDaemon {
             | A::ResourceManifestResolve { .. }
             | A::ConvoyEnsureRoll { .. }
             | A::ResourceReconcileNow { .. }
-            | A::MessageDeliverBatch { .. }
-            | A::MessageFailBatch { .. }
             | A::PersonAcknowledge { .. }
             | A::PersonAnswer { .. }
             | A::ResourceStatusPatch { .. }
@@ -133,7 +136,6 @@ impl InProcessDaemon {
             | A::QueryDaemonLogs { .. }
             | A::QueryExplainConvoy { .. }
             | A::QueryChangeStream { .. }
-            | A::QueryResourceDigest { .. }
             | A::QueryResourceList { .. }
             | A::QueryManifestRoots { .. }
             | A::QueryResourceGet { .. }
@@ -167,20 +169,20 @@ impl InProcessDaemon {
         let host = match action {
             A::ConvoyStart { intent } => {
                 let namespace = intent.namespace.clone().unwrap_or(self.provisioning_namespace().await);
-                self.convoy_start_placement_host(&namespace, intent)
+                off_frame(|| self.convoy_start_placement_host(&namespace, intent))
                     .await
                     .map_err(TargetError::Admission)?
                     .map_or(TargetHost::Local, TargetHost::Placement)
             }
             A::ConvoyCreate { placement_policy, .. } => {
                 let namespace = self.provisioning_namespace().await;
-                self.remote_placement_host(&namespace, placement_policy.as_deref())
+                off_frame(|| self.remote_placement_host(&namespace, placement_policy.as_deref()))
                     .await
                     .map_err(TargetError::Admission)?
                     .map_or(TargetHost::Local, TargetHost::Placement)
             }
             A::QueryCrewCapabilities { context } => {
-                let routing = self.resolve_crew_routing_context(context).await.map_err(TargetError::CrewSessionHome)?;
+                let routing = off_frame(|| self.resolve_crew_routing_context(context)).await.map_err(TargetError::CrewSessionHome)?;
                 let session_name =
                     routing.session_name.ok_or_else(|| TargetError::CrewSessionHome("capabilities requires a live crew session".into()))?;
                 let session_action = A::ResourceReconcileNow {
@@ -188,7 +190,7 @@ impl InProcessDaemon {
                     kind: "TerminalSession".into(),
                     name: session_name,
                 };
-                self.resource_mutation_origin(&session_action)
+                off_frame(|| self.resource_mutation_origin(&session_action))
                     .await
                     .map_err(TargetError::CrewSessionHome)?
                     .map_or(TargetHost::Local, TargetHost::Node)
@@ -199,7 +201,9 @@ impl InProcessDaemon {
                     kind: "TerminalSession".into(),
                     name: session_id.clone(),
                 };
-                if let Some(origin) = self.resource_mutation_origin(&session_action).await.map_err(TargetError::CrewSessionHome)? {
+                if let Some(origin) =
+                    off_frame(|| self.resource_mutation_origin(&session_action)).await.map_err(TargetError::CrewSessionHome)?
+                {
                     delivery = RemoteDelivery::Command;
                     TargetHost::Node(origin)
                 } else if let Some(node) = requested_node {
@@ -210,11 +214,44 @@ impl InProcessDaemon {
                     TargetHost::Local
                 }
             }
+            A::ImageBuildRetry { name } => {
+                let (reads, owned) = (self.lifecycle_reads(), name.clone());
+                let builder = off_frame(move || async move {
+                    tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.image_builds()?.builder_home(&owned)))
+                        .await
+                        .map_err(|error| format!("find the builder of {name}: {error}"))?
+                })
+                .await
+                .map_err(TargetError::RecordHome)?
+                .ok_or_else(|| TargetError::RecordHome(format!("image build `{name}` is demanded at no home this daemon follows")))?;
+                if builder == self.node_id().as_str() {
+                    TargetHost::Local
+                } else {
+                    TargetHost::Node(NodeId::new(builder))
+                }
+            }
+            A::CheckoutRecheck { checkout } | A::CheckoutArchive { checkout } => {
+                let home = off_frame(|| self.checkout_home(checkout)).await.map_err(TargetError::RecordHome)?;
+                if home == self.node_id().as_str() {
+                    TargetHost::Local
+                } else {
+                    TargetHost::Node(NodeId::new(home))
+                }
+            }
             // A person's receipt is written at the message's home (#3938).
-            A::PersonAcknowledge { message, .. } | A::PersonAnswer { message, .. } => {
-                let located =
-                    self.message_primitives().map(|engine| engine.locate(message)).transpose().map_err(TargetError::RecordHome)?;
-                match located.flatten() {
+            // The message is found by its name in each person role's inbox.
+            A::PersonAcknowledge { namespace, message, .. } | A::PersonAnswer { namespace, message, .. } => {
+                let located = match self.message_primitives() {
+                    Some(engine) => {
+                        let namespace = match namespace {
+                            Some(namespace) => namespace.clone(),
+                            None => self.provisioning_namespace().await,
+                        };
+                        off_frame(|| engine.locate_for_person(&namespace, message)).await.map_err(TargetError::RecordHome)?
+                    }
+                    None => None,
+                };
+                match located {
                     Some((_, home)) if home != self.node_id().as_str() => TargetHost::Node(NodeId::new(home)),
                     _ => {
                         reason = TargetReason::LocalMutation;
@@ -223,10 +260,10 @@ impl InProcessDaemon {
                 }
             }
             _ => {
-                if let Some(convoy) = self.resolve_existing_convoy_target(action).await.map_err(TargetError::RecordHome)? {
+                if let Some(convoy) = off_frame(|| self.resolve_existing_convoy_target(action)).await.map_err(TargetError::RecordHome)? {
                     reason = TargetReason::RecordHome;
                     TargetHost::ConvoyHome(convoy)
-                } else if let Some(origin) = self.resource_mutation_origin(action).await.map_err(TargetError::RecordHome)? {
+                } else if let Some(origin) = off_frame(|| self.resource_mutation_origin(action)).await.map_err(TargetError::RecordHome)? {
                     reason = TargetReason::RecordHome;
                     TargetHost::Node(origin)
                 } else if let Some(node) = requested_node {

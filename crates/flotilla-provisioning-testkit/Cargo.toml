@@ -7,16 +7,26 @@ publish = false
 
 [dependencies]
 flotilla-store = { path = "../flotilla-store" }
+flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-provisioning = { path = "../flotilla-provisioning" }
+flotilla-observation = { path = "../flotilla-observation" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-schema = { path = "../flotilla-schema" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 flotilla-engine-store = { path = "../flotilla-engine-store" }
-flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+flotilla-environment = { path = "../flotilla-environment" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-vcs = { path = "../flotilla-vcs" }
 rusqlite = { version = "0.37", features = ["bundled"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
+tokio = { workspace = true }
 
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

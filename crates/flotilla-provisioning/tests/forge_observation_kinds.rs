@@ -12,11 +12,12 @@ use flotilla_protocol::IssueSource;
 use flotilla_provisioning::{
     engine::{
         forge_observation_import::{import_change_requests, import_issues, ObservationCopy},
-        import::ImportReport,
+        import::{ImportReport, RowCounts},
     },
     stored::forge_observation::{self as stored, ChangeRequestRecord, IssueRecord},
 };
 use flotilla_resources::{
+    address::{record_name, stored_change_request_address},
     ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, ChangeRequestSubjectHistory, Issue, IssueSpec,
     IssueStatus, ObjectMeta, Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability,
     ObservedReviewDecision, Resource, ResourceObject,
@@ -100,6 +101,11 @@ fn cr_spec(scope: &str, number: u64, authority: &str) -> ChangeRequestSpec {
     }
 }
 
+/// The record name the observer writes the change request under.
+fn cr_name(service: &str, scope: &str, number: u64) -> String {
+    record_name(&stored_change_request_address(service, scope, number, &[]).expect("address")).expect("record name")
+}
+
 fn cr_status(state: ObservedChangeRequestState, at: DateTime<Utc>) -> ChangeRequestStatus {
     ChangeRequestStatus {
         title: known(Some("Layer 5".into()), at),
@@ -137,13 +143,15 @@ fn import_at(home: &str) -> Import {
 }
 
 fn load<K: Kind>(target: &mut Import, name: &str, home: &str) -> Option<K> {
-    let mut read = target.store().read().expect("read");
+    let mut store = target.store();
+    let mut read = store.read().expect("read");
     let id = read.resolve(K::CODE, name, home).expect("resolve")?;
     read.load::<K>(id).expect("load").map(|loaded| loaded.value)
 }
 
 fn names<K: Kind>(target: &mut Import, home: &str) -> Vec<String> {
-    let mut read = target.store().read().expect("read");
+    let mut store = target.store();
+    let mut read = store.read().expect("read");
     let page = read.scan::<K>(home, None, 64).expect("scan");
     page.ids.into_iter().filter_map(|id| read.load::<K>(id).expect("load").map(|loaded| loaded.name)).collect()
 }
@@ -192,9 +200,9 @@ fn every_observed_change_request_imports_with_its_values(tc: hegel::TestCase) {
     let old = object::<ChangeRequest>("cr", cr_spec(SCOPE, number, "alpha"), Some(status.clone()));
     let mut target = import_at("alpha");
     let mut report = ImportReport::default();
-    import_change_requests(&[copy(old, "alpha")], &observed_at_alpha, &mut target, &mut report);
+    import_change_requests(&[copy(old, "alpha")], &[], &observed_at_alpha, &mut target, &mut report);
     assert!(report.refused.is_empty(), "{report:?}");
-    let record: ChangeRequestRecord = load(&mut target, "cr", "alpha").expect("imported");
+    let record: ChangeRequestRecord = load(&mut target, &cr_name(SERVICE, SCOPE, number), "alpha").expect("imported");
     assert_eq!((record.service.as_str(), record.scope.as_str(), record.number), (SERVICE, SCOPE, number));
     assert_eq!(record.title, status.title.value);
     assert_eq!(record.author, status.author.value);
@@ -240,8 +248,9 @@ fn every_observed_issue_imports_with_its_values(tc: hegel::TestCase) {
 }
 
 // Behaviour (ADR 0047; one import per subject): among every home's copies of one
-// subject, the observer imports the one readers pick today; deleted, never-observed and
-// undeclared copies are dropped, counted where they are homed, and convoy history is dropped.
+// subject, the observer imports the one readers pick today; deleted, never-observed, undeclared
+// and staler copies are dropped, counted where they are homed, and convoy history is dropped.
+// Every row is accounted for once: the copy imported from another home as that home's.
 #[test]
 fn the_observer_imports_the_copy_readers_pick_and_counts_the_rest() {
     let observer_of = |source: &IssueSource| (source.scope == SCOPE).then(|| "alpha".to_owned());
@@ -268,21 +277,61 @@ fn the_observer_imports_the_copy_readers_pick_and_counts_the_rest() {
 
     let mut alpha = import_at("alpha");
     let mut report = ImportReport::default();
-    import_change_requests(&copies, &observer_of, &mut alpha, &mut report);
+    import_change_requests(&copies, &[], &observer_of, &mut alpha, &mut report);
     assert!(report.refused.is_empty(), "{report:?}");
-    assert_eq!(names::<ChangeRequestRecord>(&mut alpha, "alpha"), ["cr-1"]);
-    let record: ChangeRequestRecord = load(&mut alpha, "cr-1", "alpha").expect("imported");
+    assert_eq!(names::<ChangeRequestRecord>(&mut alpha, "alpha"), [cr_name(SERVICE, SCOPE, 1)]);
+    let record: ChangeRequestRecord = load(&mut alpha, &cr_name(SERVICE, SCOPE, 1), "alpha").expect("imported");
     assert_eq!(record.state, Some(stored::ChangeRequestState::Merged));
     let dropped: Vec<_> = report.dropped.iter().map(|((_, reason), count)| (*reason, *count)).collect();
-    assert_eq!(dropped, [("convoy history", 1), ("deleted", 1), ("never observed", 1), ("no declared observer", 1)]);
+    assert_eq!(
+        dropped,
+        [
+            ("a staler copy of an imported subject", 1),
+            ("convoy history", 1),
+            ("deleted", 1),
+            ("never observed", 1),
+            ("no declared observer", 1)
+        ]
+    );
+    assert_eq!(report.rows["ChangeRequest"], RowCounts { dropped: 4, copies_imported: 1, ..RowCounts::default() });
     assert_eq!(report.notes, ["ChangeRequest of github.com/someone/else not imported: no Project declares its source"]);
 
     let mut beta = import_at("beta");
     let mut report = ImportReport::default();
-    import_change_requests(&copies, &observer_of, &mut beta, &mut report);
+    import_change_requests(&copies, &[], &observer_of, &mut beta, &mut report);
     assert!(names::<ChangeRequestRecord>(&mut beta, "beta").is_empty());
     let dropped: Vec<_> = report.dropped.iter().map(|((_, reason), count)| (*reason, *count)).collect();
     assert_eq!(dropped, [("imported at its observer", 1)]);
+    assert_eq!(report.rows["ChangeRequest"], RowCounts { other_home: 1, ..RowCounts::default() });
+}
+
+// Behaviour (#3108 keyed reads): a change request imports under its subject's record name, the one
+// its observer writes and readers get it by, whatever its old name. Two old copies spelling one
+// source two ways write one record, the fresher, and the other is counted dropped by its reason; a
+// copy whose source no Forge resolves has no record name and is counted dropped.
+#[test]
+fn a_change_request_imports_under_its_record_name_once_whatever_its_spelling() {
+    let fresh =
+        object::<ChangeRequest>("cr-old", cr_spec(SCOPE, 1, "alpha"), Some(cr_status(ObservedChangeRequestState::Merged, epoch(200))));
+    let mut respelled =
+        object::<ChangeRequest>("cr-other", cr_spec(SCOPE, 1, "alpha"), Some(cr_status(ObservedChangeRequestState::Open, epoch(100))));
+    respelled.spec.service = "github".into();
+    let mut unresolved =
+        object::<ChangeRequest>("cr-host", cr_spec(SCOPE, 2, "alpha"), Some(cr_status(ObservedChangeRequestState::Open, epoch(100))));
+    unresolved.spec.service = "git.example.com".into();
+    let copies = [copy(respelled, "alpha"), copy(fresh, "alpha"), copy(unresolved, "alpha")];
+
+    let mut alpha = import_at("alpha");
+    let mut report = ImportReport::default();
+    import_change_requests(&copies, &[], &observed_at_alpha, &mut alpha, &mut report);
+    assert!(report.refused.is_empty(), "{report:?}");
+    assert_eq!(cr_name("github", SCOPE, 1), cr_name(SERVICE, SCOPE, 1), "both spellings name one record");
+    assert_eq!(names::<ChangeRequestRecord>(&mut alpha, "alpha"), [cr_name(SERVICE, SCOPE, 1)]);
+    let record: ChangeRequestRecord = load(&mut alpha, &cr_name(SERVICE, SCOPE, 1), "alpha").expect("imported");
+    assert_eq!(record.state, Some(stored::ChangeRequestState::Merged), "the fresher copy is written");
+    let dropped: Vec<_> = report.dropped.iter().map(|((_, reason), count)| (*reason, *count)).collect();
+    assert_eq!(dropped, [("another spelling of an imported subject", 1), ("no record name", 1)]);
+    assert_eq!(report.rows["ChangeRequest"], RowCounts { imported: 1, dropped: 2, ..RowCounts::default() });
 }
 
 // Behaviour (one import per subject): hosts holding different copies, each importing
@@ -310,7 +359,7 @@ fn hosts_importing_alone_write_each_subject_once_at_its_observer(tc: hegel::Test
     for home in homes {
         let mut target = import_at(home);
         let mut report = ImportReport::default();
-        import_change_requests(&copies, &observer_of, &mut target, &mut report);
+        import_change_requests(&copies, &[], &observer_of, &mut target, &mut report);
         assert!(report.refused.is_empty(), "{report:?}");
         for name in names::<ChangeRequestRecord>(&mut target, home) {
             written.entry(name).or_default().push(home);
@@ -319,7 +368,7 @@ fn hosts_importing_alone_write_each_subject_once_at_its_observer(tc: hegel::Test
     let mut expected = BTreeMap::<String, Vec<&str>>::new();
     for copy in copies.iter().filter(|copy| copy.object.status.is_some()) {
         if let Some(observer) = observers[copy.object.spec.scope.as_str()] {
-            expected.insert(copy.object.metadata.name.clone(), vec![observer]);
+            expected.insert(cr_name(SERVICE, &copy.object.spec.scope, copy.object.spec.number), vec![observer]);
         }
     }
     assert_eq!(written, expected);

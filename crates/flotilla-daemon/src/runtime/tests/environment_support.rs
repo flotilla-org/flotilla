@@ -530,6 +530,45 @@ impl EnvironmentProvider for TestInteriorEnvironmentProvider {
     }
 }
 
+/// Provisions one environment, made for the id it is requested under: an environment's name
+/// follows its vessel's launch, which a test cannot know beforehand (#3108).
+pub(super) struct RequestedInteriorEnvironmentProvider {
+    pub(super) make: Mutex<Option<MakeEnvironment>>,
+}
+
+/// Makes the environment provisioned under the id given.
+pub(super) type MakeEnvironment = Box<dyn FnOnce(EnvironmentId) -> EnvironmentHandle + Send>;
+
+#[async_trait]
+impl EnvironmentProvider for RequestedInteriorEnvironmentProvider {
+    flotilla_discovery_testkit::injected_environment_provider!();
+    async fn prepare(
+        &self,
+        _spec: &flotilla_resources::EnvironmentSpec,
+        _opts: &flotilla_environment::environment::PrepareOpts,
+    ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
+        Ok(flotilla_environment::environment::PreparedEnvironment::new(&Arc::new(()), ()))
+    }
+
+    async fn provision(
+        &self,
+        id: EnvironmentId,
+        _image: &flotilla_environment::environment::PreparedEnvironment,
+        _opts: flotilla_environment::environment::ProvisionOpts,
+    ) -> Result<EnvironmentHandle, EnvironmentProvisionError> {
+        let make = self.make.lock().await.take().ok_or_else(|| EnvironmentProvisionError::from("test environment already created"))?;
+        Ok(make(id))
+    }
+
+    async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn destroy(&self, _container_id: &str) -> Result<(), String> {
+        Err("not used".to_string())
+    }
+}
+
 pub(super) struct AdoptionEnvironmentProvider {
     pub(super) handles: Vec<EnvironmentHandle>,
 }
@@ -753,7 +792,9 @@ pub(super) fn passthrough_registry() -> Arc<ProviderRegistry> {
     Arc::new(registry)
 }
 
-pub(super) fn passthrough_registry_with_environment(handle: EnvironmentHandle) -> Arc<ProviderRegistry> {
+pub(super) fn passthrough_registry_with_environment(
+    make: impl FnOnce(EnvironmentId) -> EnvironmentHandle + Send + 'static,
+) -> Arc<ProviderRegistry> {
     use flotilla_discovery::registry::ProviderRegistry;
     use flotilla_terminal::passthrough::PassthroughTerminalPool;
 
@@ -767,11 +808,85 @@ pub(super) fn passthrough_registry_with_environment(handle: EnvironmentHandle) -
     registry.environment_providers.insert(
         "docker",
         ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
-        Arc::new(TestInteriorEnvironmentProvider { handle: Mutex::new(Some(handle)) }),
+        Arc::new(RequestedInteriorEnvironmentProvider { make: Mutex::new(Some(Box::new(make))) }),
     );
     Arc::new(registry)
 }
 
+/// The engine's environments (and clones, checkouts and terminal sessions) a test daemon reads
+/// (#3108), on its decided store: installed as its lifecycle reads on first use, and the same
+/// engine after. Records are written as the Environment controller would write them; a daemon
+/// whose controller runs opens its lifecycles with [`engine_provisioning`] instead.
+pub(super) use crate::testkits::engine::engine_environments;
+
+/// Startup seeding as the runtime runs it, over the provisioning lifecycles [`engine_provisioning`]
+/// opens for `daemon`'s controllers.
+pub(super) async fn engine_startup(
+    daemon: &Arc<InProcessDaemon>,
+    namespace: &str,
+    profile: &LocalProvisioningProfile,
+) -> Result<flotilla_provisioning::engine::ProvisioningLifecycles, String> {
+    let provisioning = engine_provisioning(daemon).await;
+    register_startup_resources(daemon, namespace, profile).await?;
+    Ok(provisioning)
+}
+
+/// The provisioning lifecycles a test daemon's controllers run on, opened as the runtime opens
+/// them, after the Message path: the Environment controller among its controller loops realises
+/// its environments, and its convoys are admitted on the engine, which holds their checkouts.
+/// Its fleet is designated, as every engine fleet is: a checkout's branch is looked up through
+/// the fleet's forge observer role.
+pub(super) async fn engine_provisioning(daemon: &Arc<InProcessDaemon>) -> flotilla_provisioning::engine::ProvisioningLifecycles {
+    designate_fleet(daemon).await;
+    if daemon.message_primitives().is_none() {
+        super::super::open_message_primitives(daemon).await.expect("open the Message path");
+    }
+    let (lifecycles, _followers) = super::super::open_provisioning_lifecycles(daemon).await.expect("open the provisioning lifecycles");
+    lifecycles
+}
+
+/// Designates the daemon's fleet, under project `fleet`, unless a FleetDesignation is held.
+pub(super) async fn designate_fleet(daemon: &InProcessDaemon) {
+    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, Project, ProjectSpec, FLEET_DESIGNATION_NAME};
+    let backend = daemon.resource_backend();
+    let designations = backend.definitions::<FleetDesignation>(NAMESPACE);
+    if designations.get(FLEET_DESIGNATION_NAME).await.is_ok() {
+        return;
+    }
+    let projects = backend.definitions::<Project>(NAMESPACE);
+    if projects.get("fleet").await.is_err() {
+        projects
+            .create(&InputMeta::builder().name("fleet".into()).build(), &ProjectSpec::builder().display_name("Fleet".into()).build())
+            .await
+            .expect("fleet project");
+    }
+    designations
+        .create(
+            &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
+            &FleetDesignationSpec { fleet: Some("fleet".into()), project: "fleet".into(), image_cache: None },
+        )
+        .await
+        .expect("fleet designation");
+}
+
+/// A Docker environment's request on `host_ref`, declaring `declared_agent_adapters`.
+pub(super) fn docker_environment_spec(host_ref: &str, declared_agent_adapters: BTreeSet<String>) -> EnvironmentSpec {
+    EnvironmentSpec {
+        docker: Some(flotilla_resources::DockerEnvironmentSpec {
+            image_build_ref: None,
+            host_ref: host_ref.to_owned(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters,
+            required_agent_adapters: BTreeSet::new(),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+        }),
+        ..Default::default()
+    }
+}
+
+/// A Docker environment on the daemon's host, realised under `container_id`.
 pub(super) async fn create_ready_docker_environment(
     daemon: &InProcessDaemon,
     name: &str,
@@ -779,41 +894,28 @@ pub(super) async fn create_ready_docker_environment(
     declared_agent_adapters: BTreeSet<String>,
 ) {
     let host_ref = daemon.local_host_id().expect("local host identity").to_string();
-    let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
-    environments
-        .create(
-            &empty_meta(name),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_build_ref: None,
-                    host_ref,
-                    image: "contained-image".to_string(),
-                    declared_agent_adapters,
-                    required_agent_adapters: BTreeSet::new(),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: BTreeMap::new(),
-                }),
-            },
-        )
-        .await
-        .expect("create environment record");
-    flotilla_store::apply_status_patch(
-        &environments,
+    engine_environments(daemon).put_ready(
         name,
-        &EnvironmentStatusPatch::MarkReady {
-            configured_limits: None,
-            docker_container_id: Some(container_id.to_string()),
+        &docker_environment_spec(&host_ref, declared_agent_adapters),
+        None,
+        container_id,
+        flotilla_resources::environment_records::LaunchFacts {
             image_ref: Some("contained-image".to_string()),
             local_image_id: Some("sha256:test-interior".to_string()),
-            registry_digest: None,
+            ..Default::default()
         },
-    )
-    .await
-    .expect("mark environment ready");
+    );
+}
+
+/// What the probes told the Environment controller, in order, since the last call.
+pub(super) fn observed_backings(state: &ControllerRuntimeState) -> Vec<flotilla_provisioning::engine::controller::BackingEvent> {
+    let mut events = state.environment_backing_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let receiver = events.as_mut().expect("the Environment controller has not taken the backing events");
+    let mut observed = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        observed.push(event);
+    }
+    observed
 }
 
 pub(super) fn adoption_registry(handles: Vec<EnvironmentHandle>) -> Arc<ProviderRegistry> {

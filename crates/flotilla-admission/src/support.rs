@@ -1,5 +1,5 @@
 //! Shared admission planning and resource helpers.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use chrono::DateTime;
@@ -7,19 +7,13 @@ use chrono::Utc;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_protocol::PlacementTargetHost;
 use flotilla_resources::canonical_placement_host_ref_from_sources;
-use flotilla_resources::Checkout as ResourceCheckout;
-use flotilla_resources::CheckoutPhase as ResourceCheckoutPhase;
-use flotilla_resources::CheckoutSpec as ResourceCheckoutSpec;
-use flotilla_resources::CheckoutStatus as ResourceCheckoutStatus;
-use flotilla_resources::Convoy;
 use flotilla_resources::FulfilmentKind;
 use flotilla_resources::FulfilmentKindSpec;
 use flotilla_resources::FulfilmentRealisation;
 use flotilla_resources::Host as ResourceHost;
-use flotilla_resources::HostOccupancy;
+use flotilla_resources::HostStatus;
 use flotilla_resources::HostStatus as ResourceHostStatus;
 use flotilla_resources::InputMeta;
-use flotilla_resources::LifecycleAuthority;
 use flotilla_resources::ObservedCheckoutSpec as ResourceObservedCheckoutSpec;
 use flotilla_resources::ProjectSpec;
 use flotilla_resources::ReadResourceObject;
@@ -30,14 +24,9 @@ use flotilla_resources::Resource;
 use flotilla_resources::ResourceError;
 use flotilla_resources::ResourceObject;
 use flotilla_resources::ResourceProvenance;
-use flotilla_resources::Vessel;
 use flotilla_resources::WorkflowTemplate;
 use flotilla_resources::WorkflowTemplateSpec;
-use flotilla_resources::CONVOY_LABEL;
-use flotilla_resources::{home_copies_first, pinned_workflow_ref};
 use flotilla_store::ResourceBackend;
-use flotilla_store::StoreQuery;
-use tracing::warn;
 
 pub fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTemplateSpec, String> {
     let spec: WorkflowTemplateSpec = serde_yml::from_str(yaml).map_err(|err| format!("invalid workflow template YAML: {err}"))?;
@@ -52,8 +41,10 @@ pub fn parse_project_yaml(yaml: &str) -> Result<ProjectSpec, String> {
     serde_yml::from_str(yaml).map_err(|err| format!("invalid project YAML: {err}"))
 }
 
+/// The checkout launch `convoy_name` adopts: named for the launch's slug, since a checkout's own
+/// name may not carry a launch number.
 pub fn adopted_checkout_name(convoy_name: &str) -> String {
-    format!("adopted-checkout-{convoy_name}")
+    format!("adopted-checkout-{}", flotilla_resources::convoy::engine::launch_slug(convoy_name))
 }
 
 #[derive(bon::Builder)]
@@ -62,80 +53,30 @@ pub struct AdoptedCheckoutRequest<'a> {
     convoy_name: &'a str,
     checkout_path: &'a Path,
     repository_spec: &'a RepositorySpec,
-    repository_url: &'a str,
     git_ref: &'a str,
     host_ref: &'a str,
 }
 
-pub async fn create_adopted_checkout_resource(
+/// The checkout a convoy adopts: its name and the observed spec its vessel requests on the
+/// engine once the engine holds the convoy (#3108). Only the repository is written here.
+pub async fn adopted_checkout_spec(
     durable_backend: &ResourceBackend,
-    observed_backend: &ResourceBackend,
     request: AdoptedCheckoutRequest<'_>,
-) -> Result<(String, String, String), String> {
-    let AdoptedCheckoutRequest { namespace, convoy_name, checkout_path, repository_spec, repository_url, git_ref, host_ref } = request;
+) -> Result<(String, ResourceObservedCheckoutSpec), String> {
+    let AdoptedCheckoutRequest { namespace, convoy_name, checkout_path, repository_spec, git_ref, host_ref } = request;
     let path = flotilla_provider_runtime::probe::canonicalize(checkout_path).await?;
-    let path_str = path.to_string_lossy().to_string();
-    let checkout_ref = adopted_checkout_name(convoy_name);
     let repository_key = repository_spec.key();
     flotilla_store::ensure_repository(&durable_backend.clone().using::<Repository>(namespace), &repository_key, repository_spec)
         .await
         .map_err(|error| error.to_string())?;
-    let meta = InputMeta::builder()
-        .name(checkout_ref.clone())
-        .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
-        .build()
-        .with_lifecycle_authority(LifecycleAuthority::Adopted);
-    let spec = ResourceCheckoutSpec::Observed(
-        ResourceObservedCheckoutSpec::builder()
-            .r#ref(git_ref.to_string())
-            .path(path_str.clone())
-            .repo_ref(repository_key)
-            .host_ref(host_ref.to_string())
-            .is_main(matches!(git_ref, "main" | "master" | "trunk"))
-            .build(),
-    );
-    let status = ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).path(path_str).build();
-
-    let durable = persist_adopted_checkout(durable_backend, namespace, &checkout_ref, &meta, &spec, &status).await?;
-    match flotilla_observation::observed_resources::project_adopted_checkout(observed_backend, namespace, &durable).await {
-        Ok(()) => {}
-        Err(ResourceError::Invalid { message }) => return Err(message),
-        Err(error) => {
-            warn!(checkout = %checkout_ref, %error, "adopted checkout committed durably but observed publication failed; reconciliation will retry");
-        }
-    }
-
-    Ok((checkout_ref, repository_url.to_string(), git_ref.to_string()))
-}
-
-pub async fn persist_adopted_checkout(
-    backend: &ResourceBackend,
-    namespace: &str,
-    checkout_ref: &str,
-    meta: &InputMeta,
-    spec: &ResourceCheckoutSpec,
-    status: &ResourceCheckoutStatus,
-) -> Result<ResourceObject<ResourceCheckout>, String> {
-    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
-    let checkout = match checkouts.create(meta, spec).await {
-        Ok(checkout) => checkout,
-        Err(ResourceError::Conflict { .. }) => {
-            let existing = checkouts.get(checkout_ref).await.map_err(|err| err.to_string())?;
-            if existing.metadata.lifecycle_authority().map_err(|err| err.to_string())? != Some(LifecycleAuthority::Adopted) {
-                return Err(format!("checkout {checkout_ref} already exists but is not adopted"));
-            }
-            if &existing.spec != spec {
-                return Err(format!("checkout {checkout_ref} already exists with different adopted checkout details"));
-            }
-            existing
-        }
-        Err(err) => return Err(err.to_string()),
-    };
-    if checkout.status.is_some() {
-        Ok(checkout)
-    } else {
-        checkouts.update_status(checkout_ref, &checkout.metadata.resource_version, status).await.map_err(|err| err.to_string())
-    }
+    let spec = ResourceObservedCheckoutSpec::builder()
+        .r#ref(git_ref.to_string())
+        .path(path.to_string_lossy().to_string())
+        .repo_ref(repository_key)
+        .host_ref(host_ref.to_string())
+        .is_main(matches!(git_ref, "main" | "master" | "trunk"))
+        .build();
+    Ok((adopted_checkout_name(convoy_name), spec))
 }
 
 pub fn home_copy_wins_by_name<T: Resource>(sources: impl IntoIterator<Item = ReadResourceObject<T>>) -> Vec<ResourceObject<T>> {
@@ -274,16 +215,17 @@ pub fn unready_placement_refusal(
     Some(reason)
 }
 
-pub fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Option<(u64, Option<u64>)>) -> Result<(), String> {
-    let Some((floor_bytes, free_bytes)) = capacity else {
-        return Err(format!("placement refused on host `{}`: admission free-space floor is unavailable", target_host.display_name));
-    };
-    if floor_bytes == 0 {
-        return Ok(());
+/// Whether the target host has room, from its status: whether its observer judged it below the
+/// free-space floor. Unknown refuses.
+pub fn check_placement_capacity(target_host: &PlacementTargetHost, status: Option<&HostStatus>) -> Result<(), String> {
+    let host = &target_host.display_name;
+    match status.and_then(|status| status.below_free_space_floor) {
+        Some(false) => Ok(()),
+        Some(true) => Err(format!(
+            "placement refused on host `{host}`: free space is below the admission floor; reap settled convoys, run scripts/prune-target.sh, or pick another host"
+        )),
+        None => Err(format!("placement refused on host `{host}`: free space is unavailable")),
     }
-    let free_bytes =
-        free_bytes.ok_or_else(|| format!("placement refused on host `{}`: free space is unavailable", target_host.display_name))?;
-    crate::admission::check_measured_free_space(&target_host.display_name, free_bytes, floor_bytes)
 }
 
 /// SSH hosts run crews in an account the owning daemon does not
@@ -294,54 +236,6 @@ pub const SSH_HOST_PIN_ONLY: &str = "SSH host takes only convoys that pin its pl
 
 pub fn is_ssh_host(host: &ResourceObject<ResourceHost>) -> bool {
     matches!(host.spec.connection, flotilla_resources::HostConnection::SshHost { .. })
-}
-
-/// What each of `hosts` holds against its cap, read from every convoy and
-/// vessel the store sees, listed once for all of them. The owning daemon is
-/// the only placer on its SSH hosts, so its store holds every convoy
-/// admitted there.
-pub async fn host_occupancies(
-    backend: &ResourceBackend,
-    namespace: &str,
-    hosts: &BTreeSet<String>,
-) -> Result<BTreeMap<String, HostOccupancy>, String> {
-    if hosts.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let query = StoreQuery { include_replicas: true, ..Default::default() };
-    let convoys = home_copies_first(backend.query_declared::<Convoy>(namespace, &query).await.map_err(|error| error.to_string())?.items);
-    let vessels = home_copies_first(backend.query_declared::<Vessel>(namespace, &query).await.map_err(|error| error.to_string())?.items);
-    // A convoy not yet bootstrapped names its vessels only in its frozen
-    // workflow snapshot record.
-    let snapshots = convoys
-        .iter()
-        .filter(|convoy| hosts.iter().any(|host| HostOccupancy::needs_workflow_vessels(convoy, host)))
-        .map(|convoy| (convoy.metadata.name.clone(), pinned_workflow_ref(convoy).to_string()))
-        .collect::<BTreeMap<_, _>>();
-    let templates = backend
-        .definitions::<WorkflowTemplate>(namespace)
-        .list_names(snapshots.values().cloned())
-        .await
-        .map_err(|error| error.to_string())?;
-    let templates = templates.into_iter().map(|template| (template.metadata.name.clone(), template)).collect::<BTreeMap<_, _>>();
-    let workflow_vessels = snapshots
-        .into_iter()
-        // A convoy whose snapshot record is missing is left out, and `count`
-        // falls back to its pins and convoy-wide decision.
-        .filter_map(|(convoy, template)| {
-            let Some(template) = templates.get(template.as_str()) else {
-                warn!(%convoy, %template, "workflow snapshot missing; counting the convoy's pins and convoy-wide decision instead");
-                return None;
-            };
-            Some((convoy, template.spec.vessels.iter().map(|vessel| vessel.name.clone()).collect()))
-        })
-        .collect();
-    Ok(hosts.iter().map(|host| (host.clone(), HostOccupancy::count(host, &convoys, &vessels, &workflow_vessels))).collect())
-}
-
-pub async fn host_occupancy(backend: &ResourceBackend, namespace: &str, host: &str) -> Result<HostOccupancy, String> {
-    let mut occupancies = host_occupancies(backend, namespace, &BTreeSet::from([host.to_string()])).await?;
-    Ok(occupancies.remove(host).unwrap_or_default())
 }
 
 /// Validate and freeze one provider for this vessel's placement.

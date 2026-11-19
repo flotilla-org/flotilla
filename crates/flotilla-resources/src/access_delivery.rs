@@ -115,16 +115,28 @@ define_resource!(
     queryable = &["metadata.name", "spec.access", "spec.place"]
 );
 
-/// The access key of a crew's role, `project/convoy/vessel/role`.
+/// The access key of a crew's role: its role address, `project/convoy/vessel/role`.
 pub fn access_key(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
-    format!("{project}/{convoy}/{vessel}/{role}")
+    crate::crew_role_address(project, convoy, vessel, role)
 }
 
 /// The convoy an access key names, if it has the four segments [`access_key`] composes.
-pub fn convoy_of_access(access: &str) -> Option<&str> {
-    let mut segments = access.split('/');
-    let (_, convoy, _, _, rest) = (segments.next()?, segments.next()?, segments.next()?, segments.next()?, segments.next());
-    rest.is_none().then_some(convoy).filter(|convoy| !convoy.is_empty())
+pub fn convoy_of_access(access: &str) -> Option<String> {
+    crate::parse_crew_role_address(access).map(|(_, convoy, _, _)| convoy).filter(|convoy| !convoy.is_empty())
+}
+
+/// `access` with its convoy segment naming `convoy` instead, composed by [`access_key`]; `None`
+/// when `access` is not a key [`access_key`] composes.
+pub fn with_convoy(access: &str, convoy: &str) -> Option<String> {
+    crate::parse_crew_role_address(access).map(|(project, _, vessel, role)| access_key(project, convoy, vessel, role))
+}
+
+/// The record name of `access` delivered at `place`: one record per pair. The access is opaque and
+/// may hold any character, so the name is a digest of the pair.
+pub fn record_name(access: &str, place: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::new().chain_update(access.as_bytes()).chain_update([0]).chain_update(place.as_bytes()).finalize();
+    format!("access-{}", &format!("{digest:x}")[..16])
 }
 
 /// The generated-table kinds of the access layer's status.
@@ -140,9 +152,22 @@ mod tests {
 
     #[test]
     fn the_convoy_is_the_second_segment_of_a_four_segment_key() {
-        assert_eq!(convoy_of_access(&access_key("flotilla", "demo-4", "implement", "coder")), Some("demo-4"));
+        assert_eq!(convoy_of_access(&access_key("flotilla", "demo-4", "implement", "coder")).as_deref(), Some("demo-4"));
+        // A standing launch's name holds its address; its key reads back whole.
+        let standing = "project:flotilla/convoy:quartermaster#3";
+        assert_eq!(convoy_of_access(&access_key("flotilla", standing, "work", "governor")).as_deref(), Some(standing));
         for key in ["", "demo", "a/b/c", "a/b/c/d/e", "a//c/d"] {
             assert_eq!(convoy_of_access(key), None, "{key:?}");
         }
+    }
+
+    #[test]
+    fn a_key_names_another_convoy_as_access_key_spells_it() {
+        let launch = "project:flotilla/convoy:quartermaster#3";
+        assert_eq!(
+            with_convoy(&access_key("flotilla", "demo", "implement", "coder"), launch),
+            Some(access_key("flotilla", launch, "implement", "coder"))
+        );
+        assert_eq!(with_convoy("a/b/c", "demo#1"), None);
     }
 }

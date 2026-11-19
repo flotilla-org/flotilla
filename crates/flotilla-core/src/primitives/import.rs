@@ -19,8 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_address::{Address, Kind};
 use flotilla_engine_store::{ImportTarget, IMPORT_WRITER};
-use flotilla_resources::{Message, MessageExpectation, MessagePhase, ResolvedMessageReceiver, ResourceObject};
-use flotilla_schema::{NewChange, Timestamp};
+use flotilla_messaging::{charter_notice_name, FLEET_STORE_SENDER};
+use flotilla_resources::{Message, MessageExpectation, MessagePhase, MessageReference, ResolvedMessageReceiver, ResourceObject};
+use flotilla_schema::{CreatedAt, NewChange, Timestamp};
 use flotilla_state_machines::{
     machines::{
         consumer::{ConsumerKind, Receiver},
@@ -32,7 +33,11 @@ use flotilla_state_machines::{
     Home, Ref, Resource, StoredState, Transport, Version,
 };
 
-use super::convert::{timestamp, Conversion};
+use super::convert::Conversion;
+
+fn timestamp(at: &chrono::DateTime<chrono::Utc>) -> flotilla_schema::Timestamp {
+    flotilla_schema::Timestamp::from_datetime(at)
+}
 
 /// One old record, as the import reads it: the record and the host it is homed at.
 pub struct OldMessage<'a> {
@@ -59,6 +64,9 @@ pub struct ImportedMessage {
     pub resource: Resource<Machine>,
     /// When the old record was created: the time of the import's change.
     pub created: Timestamp,
+    /// When the old record was created, exactly as the old store stamped it: the message's
+    /// creation time.
+    pub created_at: CreatedAt,
 }
 
 /// A record the import refuses, named.
@@ -129,6 +137,21 @@ pub fn imported_name(inbox: &Address, record: &str) -> Result<String, String> {
     Address::message(inbox, record).map(|address| address.as_str().to_owned()).map_err(|error| error.to_string())
 }
 
+/// The address an old record takes under `inbox`. A charter notice is named
+/// as a charter pass names one, from its parties and revision, so the pass
+/// finds it; every other record keeps its old name.
+fn record_address(record: &ResourceObject<Message>, inbox: &Address, conversion: &Conversion<'_>) -> Result<String, String> {
+    let spec = &record.spec;
+    match &spec.subject {
+        Some(MessageReference::ControlRecord { resource, revision })
+            if spec.sender == FLEET_STORE_SENDER && resource.kind == "Project" && record.metadata.name.starts_with("charter-") =>
+        {
+            imported_name(inbox, &charter_notice_name(inbox, &conversion.sender_of(spec)?, revision))
+        }
+        _ => imported_name(inbox, &record.metadata.name),
+    }
+}
+
 /// Maps one old record onto the new spec and state, at version `version`
 /// (its admission sequence at its home, assigned in old acceptance order).
 pub fn import_message(
@@ -140,8 +163,9 @@ pub fn import_message(
     let record = old.record.metadata.name.clone();
     match convert(old, version, conversion, world) {
         Ok(resource) => {
-            let created = Timestamp::from_datetime(&old.record.metadata.creation_timestamp);
-            Ok(Imported::Message(Box::new(ImportedMessage { record, home: old.home.clone(), resource, created })))
+            let stamped = &old.record.metadata.creation_timestamp;
+            let (created, created_at) = (Timestamp::from_datetime(stamped), CreatedAt::from_datetime(stamped));
+            Ok(Imported::Message(Box::new(ImportedMessage { record, home: old.home.clone(), resource, created, created_at })))
         }
         Err(Unimported::Missing { reason, .. }) if settled(old.record) || receiver_ended(old.record, conversion) => {
             Ok(Imported::Dropped(ImportDrop { record, reason }))
@@ -167,14 +191,18 @@ fn convert(
             return Err(missing(reason, conversion.records.address(reference).err().unwrap_or_else(|| reason.to_owned())));
         }
     }
+    // Refused even when settled: a record naming a convoy is never dropped for its launch.
+    if let Some(detail) = conversion.unlaunched(&old.record.spec) {
+        return Err(Unimported::Refused(detail));
+    }
     let reference = |name: &str| -> Result<MessageRef, String> {
         let other = world.message(name).ok_or_else(|| format!("referenced message `{name}` was not read"))?;
         let inbox = conversion.receiver(&other.record.spec)?;
-        Ok(MessageRef::new(imported_name(&inbox, name)?, other.home.clone()))
+        Ok(MessageRef::new(record_address(other.record, &inbox, conversion)?, other.home.clone()))
     };
     let mut spec = conversion.spec(&old.record.spec, &reference)?;
     spec.admitted_seq = version;
-    let name = imported_name(&spec.inbox, record)?;
+    let name = record_address(old.record, &spec.inbox, conversion)?;
     let status = old.record.status.as_ref().ok_or_else(|| "the record has no status".to_owned())?;
     let receiver = || -> Result<Receiver, Unimported> {
         let resolved = status.resolved_receiver.as_ref().ok_or_else(|| "a delivered phase without its receiver".to_owned())?;
@@ -184,15 +212,22 @@ fn convert(
         Ok(Receiver { kind: ConsumerKind::AgentSession, id, host })
     };
     let kept = || status.resolved_receiver.as_ref().map(|_| receiver()).transpose();
+    // The receiver's receipt carries when the message was delivered.
+    let delivered_at = status.resolved_receiver.as_ref().map(|resolved| timestamp(&resolved.delivered_at));
     let state = match status.phase {
         MessagePhase::Accepted | MessagePhase::WaitingOnReferences | MessagePhase::Deliverable => MessageState::Pending,
-        MessagePhase::Delivered if settled(old.record) => MessageState::Settled { receiver: Some(receiver()?) },
-        MessagePhase::Delivered => MessageState::Awaiting { receiver: receiver()? },
-        MessagePhase::Satisfied | MessagePhase::Answered | MessagePhase::OutcomeMet => MessageState::Settled { receiver: kept()? },
+        MessagePhase::Delivered if settled(old.record) => MessageState::Settled { receiver: Some(receiver()?), delivered_at },
+        MessagePhase::Delivered => MessageState::Awaiting {
+            receiver: receiver()?,
+            delivered_at: delivered_at.ok_or_else(|| "a delivered phase without its receiver".to_owned())?,
+        },
+        MessagePhase::Satisfied | MessagePhase::Answered | MessagePhase::OutcomeMet => {
+            MessageState::Settled { receiver: kept()?, delivered_at }
+        }
         MessagePhase::Expired if spec.deadline.is_none() => {
             return Err(missing("expired without a deadline", "expired without a deadline"))
         }
-        MessagePhase::Expired => MessageState::Dropped { reason: DropReason::Expired, receiver: kept()?, watermark: None },
+        MessagePhase::Expired => MessageState::Dropped { reason: DropReason::Expired, receiver: kept()?, delivered_at, watermark: None },
         MessagePhase::Superseded => {
             let by = match world.successor(record) {
                 Some(successor) => successor.record.metadata.name.clone(),
@@ -205,10 +240,14 @@ fn convert(
             let successor =
                 world.message(&by).ok_or_else(|| missing("its successor is gone", format!("its successor `{by}` was not read")))?;
             let inbox = conversion.receiver(&successor.record.spec)?;
-            let by = imported_name(&inbox, &by)?.parse().map_err(|error: flotilla_address::Error| error.to_string())?;
-            MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: kept()?, watermark: None }
+            let by = record_address(successor.record, &inbox, conversion)?
+                .parse()
+                .map_err(|error: flotilla_address::Error| error.to_string())?;
+            MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: kept()?, delivered_at, watermark: None }
         }
-        MessagePhase::DeadLettered => MessageState::Dropped { reason: DropReason::Undeliverable, receiver: kept()?, watermark: None },
+        MessagePhase::DeadLettered => {
+            MessageState::Dropped { reason: DropReason::Undeliverable, receiver: kept()?, delivered_at, watermark: None }
+        }
     };
     let state = StoredState::<Machine>::new(state, timestamp(&status.since));
     let resource = Resource::stored(name, spec, state, flotilla_state_machines::Version(version));
@@ -236,7 +275,8 @@ pub fn check(resource: &Resource<Machine>) -> Result<(), String> {
     }
     let target = resource.state();
     let receiver = target.receiver().cloned();
-    let at = Timestamp(1);
+    // Delivered when the state records it was, so the replay records the same time.
+    let at = target.delivered_at().unwrap_or(Timestamp(1));
     if let Some(receiver) = &receiver {
         world.receipts.put(&Ref::new(name), [(receiver.clone(), Transport::Turn)].into());
         home.apply(name, Deliver { receiver: receiver.clone(), transport: Transport::Turn }, &world, at).map_err(refused("delivery"))?;
@@ -282,8 +322,8 @@ pub fn check(resource: &Resource<Machine>) -> Result<(), String> {
     }
     let reached = home.get(name).expect("created").state();
     let comparable = |state: &MessageState| match state {
-        MessageState::Dropped { reason, receiver, .. } => {
-            MessageState::Dropped { reason: reason.clone(), receiver: receiver.clone(), watermark: None }
+        MessageState::Dropped { reason, receiver, delivered_at, .. } => {
+            MessageState::Dropped { reason: reason.clone(), receiver: receiver.clone(), delivered_at: *delivered_at, watermark: None }
         }
         other => other.clone(),
     };
@@ -468,7 +508,7 @@ pub fn write_messages(imported: &[ImportedMessage], target: &mut impl ImportTarg
                 next.push(message);
                 continue;
             }
-            let change = NewChange::new(IMPORT_WRITER, message.created);
+            let change = NewChange::new(IMPORT_WRITER, message.created).created_at(message.created_at);
             let result = target.write_with(&message.home, message.resource.name(), &change, message.resource.version().0, |version| {
                 let mut spec = message.resource.spec().clone();
                 spec.admitted_seq = version;

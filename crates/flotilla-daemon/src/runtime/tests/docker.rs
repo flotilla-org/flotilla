@@ -63,6 +63,7 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
         flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
     );
+    engine_environments(&daemon);
     let mut state = ControllerRuntimeState::new(
         daemon,
         Arc::clone(&config),
@@ -171,6 +172,7 @@ async fn docker_provisioning_fails_loudly_without_interior_cleat_assets() {
         flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
     );
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             daemon,
@@ -265,6 +267,7 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
             ("HOME", home.display().to_string()),
             (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
         ]))));
+        engine_environments(&daemon);
         let state = ControllerRuntimeState::new(
             daemon,
             Arc::clone(&config),
@@ -433,6 +436,7 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
             ("HOME", home.display().to_string()),
             (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
         ]))));
+        engine_environments(&daemon);
         let state = Arc::new(
             ControllerRuntimeState::new(
                 daemon,
@@ -530,6 +534,7 @@ async fn teardown_archives_staged_sessions(dead_agent: bool) {
     fs::create_dir_all(environment_home.join("codex/sessions")).expect("persistent agent home");
     fs::write(environment_home.join("codex/sessions/rollout.jsonl"), "session state").expect("persistent session state");
     let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([("HOME", home.display().to_string())]))));
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             daemon,
@@ -548,21 +553,14 @@ async fn teardown_archives_staged_sessions(dead_agent: bool) {
     let outside_state = state.config.state_dir().as_path().join("keep");
     fs::create_dir_all(&outside_state).expect("unrelated state");
     fs::write(outside_state.join("sentinel"), "keep").expect("sentinel");
-    state
-        .daemon
-        .resource_backend()
-        .using::<Environment>(NAMESPACE)
-        .create(
-            &empty_meta("contained-restarted"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: Some("host:host-test/provider:docker".parse().expect("provider address")),
-                host_direct: None,
-                docker: None,
-            },
-        )
-        .await
-        .expect("addressed environment record");
+    engine_environments(&state.daemon).request(
+        "contained-restarted",
+        &EnvironmentSpec {
+            provider_address: Some("host:host-test/provider:docker".parse().expect("provider address")),
+            ..docker_environment_spec("host-test", BTreeSet::new())
+        },
+        None,
+    );
     if dead_agent {
         state.provisioned_environments.lock().await.insert("test-interior".into(), ActiveProvisionedEnvironment { handle });
     }
@@ -628,37 +626,34 @@ async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
         flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::new(AdoptionEnvironmentProvider { handles: vec![Arc::clone(&handle)] }),
     );
+    engine_environments(&daemon);
     let state =
         Arc::new(ControllerRuntimeState::new(daemon, config, Arc::new(registry), None, "host-test".into(), "host-direct-host-test".into()));
     // Restart discarded both status identity and the in-process handle cache.
     assert!(state.provisioned_environments.lock().await.is_empty());
-    let backend = state.daemon.resource_backend();
-    let environment = backend
-        .using::<Environment>(NAMESPACE)
-        .create(
-            &empty_meta("env-lost-status"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    host_ref: "host-test".into(),
-                    image: "image".into(),
-                    image_build_ref: None,
-                    declared_agent_adapters: Default::default(),
-                    required_agent_adapters: Default::default(),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: Default::default(),
-                }),
-            },
-        )
+    // A launch whose backing identity was never recorded is released by the Environment
+    // controller's actuator with no identity.
+    use flotilla_provisioning::engine::{
+        controller::Actuator,
+        environment_actuator::{EnvironmentActuator, NoLaunchEnvironment},
+        environments::request_of,
+        launch_log::StagedFacts,
+        reads::StoreReads,
+    };
+    let fixture = engine_environments(&state.daemon);
+    let spec = docker_environment_spec("host-test", BTreeSet::new());
+    fixture.request("env-lost-status", &spec, None);
+    let actuator = EnvironmentActuator::new(
+        Arc::new(DockerControllerRuntime { state }),
+        StoreReads::new(Arc::clone(&fixture.store)),
+        fixture.home.clone(),
+        StagedFacts::default(),
+        Arc::new(NoLaunchEnvironment),
+    );
+    actuator
+        .release("env-lost-status", &request_of(&spec, None, |_| Ok(fixture.home.clone())).expect("request"), None)
         .await
-        .expect("environment without saved status");
-    EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, NAMESPACE)
-        .run_finalizer(&environment)
-        .await
-        .expect("finalize without status");
+        .expect("release without a recorded identity");
     assert!(destroyed.load(Ordering::SeqCst), "missing status must not leave the backing container running");
 }
 
@@ -678,6 +673,7 @@ async fn docker_provisioning_reports_unavailable_flotilla_cli() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    engine_environments(&daemon);
     let state = Arc::new(ControllerRuntimeState::new(
         daemon,
         config,
@@ -739,6 +735,7 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
         flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
     );
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             daemon,
@@ -813,6 +810,7 @@ async fn provisioned_environment_discovers_and_registers_interior_agent_adapters
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    engine_environments(&daemon);
     let state = ControllerRuntimeState::new(
         Arc::clone(&daemon),
         config,
@@ -898,6 +896,7 @@ async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing()
         flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::new(TestInteriorEnvironmentProvider { handle: Mutex::new(Some(handle)) }),
     );
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             daemon,

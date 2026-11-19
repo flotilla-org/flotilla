@@ -66,7 +66,7 @@ async fn delivered_watch_allocation_workload() {
     for (name, backend) in [("memory", ResourceBackend::new(InMemoryBackend::default())), ("sqlite", ResourceBackend::new(sqlite))] {
         let labels: BTreeMap<_, _> = (0..64).map(|index| (format!("label-{index}"), "x".repeat(64))).collect();
         let meta = InputMeta::builder().name("payload".into()).labels(labels).build();
-        let spec = ConvoySpec::builder().workflow_ref("w".repeat(16 * 1024)).build();
+        let spec = ConvoySpec::builder().workflow_ref("w".repeat(16 * 1024)).project_ref("allocation".into()).build();
         let resolver = backend.using::<Convoy>("allocation");
         let mut local = resolver.watch(WatchStart::Now).await.expect("local watch");
         let object = resolver.create(&meta, &spec).await.expect("create");

@@ -1,7 +1,7 @@
 //! The provisioning read port over the decided store (#3629 layer 4): keyed and indexed reads,
 //! and the judgements made per key at read time.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_engine_store::StoreLog;
 use flotilla_provisioning::{
@@ -17,19 +17,21 @@ use flotilla_provisioning::{
     },
 };
 use flotilla_schema::{Kind, KindRegistry, Ref, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Home, Outcome};
 
 const HOME: &str = "home";
 
-fn store() -> Arc<Mutex<Store>> {
+fn store() -> Arc<StoreHandle> {
     let mut registry = KindRegistry::new();
     stored::register(&mut registry).expect("registry");
-    Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")))
+    Arc::new(StoreHandle::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")))
 }
 
-fn checkout(environment: &str, convoy: &str) -> CheckoutRequest {
+fn checkout(name: &str, environment: &str, convoy: &str) -> CheckoutRequest {
     CheckoutRequest {
+        launch_of: name.into(),
+        launch: 0,
         repository: "repo".into(),
         environment: Ref::new(environment.to_owned(), HOME),
         branch: "feature".into(),
@@ -55,14 +57,15 @@ fn views_are_read_by_key_and_index_and_judged_per_key() {
     let checkouts: Arc<dyn Lifecycles<CheckoutKind>> =
         Arc::new(LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("home")));
     let reads = StoreReads::new(Arc::clone(&store));
-    for (name, environment, convoy) in [("a", "env-1", "convoy-1"), ("b", "env-1", "convoy-2"), ("c", "env-2", "convoy-1")] {
-        checkouts.request(name, checkout(environment, convoy), Timestamp(1_000_000)).expect("requested");
-    }
-    assert_eq!(reads.checkout("a", HOME).expect("read").expect("held").judgement, Judgement::InProgress);
-    assert!(reads.checkout("a", "elsewhere").expect("read").is_none(), "keyed by home too");
+    let [a, b, c] =
+        [("a", "env-1", "convoy-1"), ("b", "env-1", "convoy-2"), ("c", "env-2", "convoy-1")].map(|(name, environment, convoy)| {
+            checkouts.request(name, checkout(name, environment, convoy), Timestamp(1_000_000)).expect("requested").name().to_owned()
+        });
+    assert_eq!(reads.checkout(&a, HOME).expect("read").expect("held").judgement, Judgement::InProgress);
+    assert!(reads.checkout(&a, "elsewhere").expect("read").is_none(), "keyed by home too");
 
-    checkouts.step("a", &failure("worktree add failed"), Timestamp(2_000_000)).expect("attempt");
-    match reads.checkout("a", HOME).expect("read").expect("held").judgement {
+    checkouts.step(&a, &failure("worktree add failed"), Timestamp(2_000_000)).expect("attempt");
+    match reads.checkout(&a, HOME).expect("read").expect("held").judgement {
         Judgement::Retrying { failures: 1, next, last } => {
             assert_eq!(next, Timestamp(3_000_000), "Checkout's default policy: one second after the first failure");
             assert_eq!(last.detail, "worktree add failed");
@@ -70,22 +73,22 @@ fn views_are_read_by_key_and_index_and_judged_per_key() {
         other => panic!("{other:?}"),
     }
 
-    checkouts.step("b", &Step::Realised { identity: "/w".into() }, Timestamp(3)).expect("realised");
+    checkouts.step(&b, &Step::Realised { identity: "/w".into() }, Timestamp(3)).expect("realised");
     checkouts
-        .step("b", &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }, Timestamp(4))
+        .step(&b, &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }, Timestamp(4))
         .expect("vanished");
-    checkouts.step("c", &Step::Released, Timestamp(4)).expect("released");
-    assert_eq!(reads.checkout("b", HOME).expect("read").expect("held").judgement, Judgement::Lost);
-    assert_eq!(reads.checkout("c", HOME).expect("read").expect("held").judgement, Judgement::Released);
+    checkouts.step(&c, &Step::Released, Timestamp(4)).expect("released");
+    assert_eq!(reads.checkout(&b, HOME).expect("read").expect("held").judgement, Judgement::Lost { reason: None });
+    assert_eq!(reads.checkout(&c, HOME).expect("read").expect("held").judgement, Judgement::Released);
 
     let names = |views: Vec<flotilla_provisioning::engine::reads::View<CheckoutKind>>| {
         let mut names: Vec<String> = views.into_iter().map(|view| view.name).collect();
         names.sort();
         names
     };
-    assert_eq!(names(reads.environment_checkouts("env-1", HOME).expect("index")), ["a", "b"]);
-    assert_eq!(names(reads.held_checkouts(&Holder::convoy("convoy-1")).expect("index")), ["a", "c"]);
-    assert!(reads.held_checkouts(&Holder::ensure("convoy-1")).expect("index").is_empty(), "the holder's kind is part of it");
+    assert_eq!(names(reads.environment_checkouts("env-1", HOME).expect("index")), [a.clone(), b.clone()]);
+    assert_eq!(names(reads.held_checkouts(&Holder::convoy("convoy-1")).expect("index")), [a.clone(), c.clone()]);
+    assert!(reads.held_checkouts(&Holder::vessel("convoy-1")).expect("index").is_empty(), "the holder's kind is part of it");
     assert!(reads.environment_checkouts("env-3", HOME).expect("index").is_empty());
 }
 
@@ -102,7 +105,9 @@ fn judgements_follow_the_stored_state_and_the_policy() {
     assert!(matches!(judge::<CheckoutKind>(&failed(2, true)), Judgement::Retrying { failures: 2, .. }));
     assert_eq!(judge::<CheckoutKind>(&failed(3, true)), Judgement::Exhausted { last: cause.clone() });
     assert_eq!(judge::<CloneKind>(&failed(1, false)), Judgement::Exhausted { last: cause.clone() });
-    assert!(matches!(judge::<CloneKind>(&failed(50, true)), Judgement::Retrying { .. }), "a clone retries while wanted");
+    // A clone tries three times (#3108 ruling): a third retryable failure spends it.
+    assert!(matches!(judge::<CloneKind>(&failed(2, true)), Judgement::Retrying { failures: 2, .. }));
+    assert_eq!(judge::<CloneKind>(&failed(3, true)), Judgement::Exhausted { last: cause.clone() });
     assert_eq!(judge::<CheckoutKind>(&LifecycleState::GaveUp { cause: cause.clone() }), Judgement::GaveUp { cause });
 }
 
@@ -114,20 +119,22 @@ fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
     let reason = ["", "provider failed", "失敗"][tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2))];
     let (ending, expected) = match tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2)) {
         0 => (Step::Released, Judgement::Released),
-        1 => (Step::Vanished { cause: VanishCause::Lost }, Judgement::Lost),
+        1 => (Step::Vanished { cause: VanishCause::lost() }, Judgement::Lost { reason: None }),
         _ => (Step::Vanished { cause: VanishCause::Failed { reason: reason.into() } }, Judgement::Failed { reason: reason.into() }),
     };
     let origin = store();
     let checkouts: Arc<dyn Lifecycles<CheckoutKind>> =
         Arc::new(LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&origin))).expect("home")));
-    checkouts.request("a", checkout("env-1", "convoy-1"), Timestamp(1)).expect("requested");
-    checkouts.step("a", &Step::Realised { identity: "/w".into() }, Timestamp(2)).expect("realised");
-    checkouts.step("a", &ending, Timestamp(3)).expect("released");
+    let a = checkouts.request("a", checkout("a", "env-1", "convoy-1"), Timestamp(1)).expect("requested").name().to_owned();
+    checkouts.step(&a, &Step::Realised { identity: "/w".into() }, Timestamp(2)).expect("realised");
+    checkouts.step(&a, &ending, Timestamp(3)).expect("released");
 
     let replica_of = || {
         let mut registry = KindRegistry::new();
         stored::register(&mut registry).expect("registry");
-        Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "replica", registry).expect("store")))
+        Arc::new(StoreHandle::new(
+            Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "replica", registry).expect("store"),
+        ))
     };
     let followed = replica_of();
     {
@@ -147,7 +154,7 @@ fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
         }
         write.commit().expect("commit");
     }
-    assert_eq!(StoreReads::new(followed).checkout("a", HOME).expect("read").expect("held").judgement, expected);
+    assert_eq!(StoreReads::new(followed).checkout(&a, HOME).expect("read").expect("held").judgement, expected);
 
     let seeded = replica_of();
     {
@@ -157,7 +164,7 @@ fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
             let id = read
                 .resolve(
                     flotilla_state_machines::Resource::<flotilla_state_machines::machines::lifecycle::Lifecycle<CheckoutKind>>::CODE,
-                    "a",
+                    &a,
                     HOME,
                 )
                 .expect("resolve")
@@ -169,7 +176,7 @@ fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
         write.restore(&snapshot).expect("restored");
         write.commit().expect("commit");
     }
-    assert_eq!(StoreReads::new(seeded).checkout("a", HOME).expect("read").expect("held").judgement, expected);
+    assert_eq!(StoreReads::new(seeded).checkout(&a, HOME).expect("read").expect("held").judgement, expected);
 }
 
 // Behaviour (#3719 look-over ruling 4): a vessel finds its environment through the holder index,
@@ -194,17 +201,18 @@ fn a_vessel_finds_its_environment_by_its_holder() {
 }
 
 // Behaviour (#3629 layer 8): a terminal session is read by its record name as its current launch,
-// the latest `#<n>`, and a vessel's sessions through the `terminal_session.by_holder` index.
+// the newest by the `terminal_session.by_launch` index, and a vessel's sessions through the
+// `terminal_session.by_holder` index.
 #[test]
 fn a_session_reads_as_its_current_launch() {
-    use flotilla_provisioning::{
-        engine::launch,
-        stored::terminal_session::{Launch, TerminalSessionKind, TerminalSessionRequest},
-    };
+    use flotilla_provisioning::stored::terminal_session::{Launch, TerminalSessionKind, TerminalSessionRequest};
     let store = store();
     let sessions: Arc<dyn Lifecycles<TerminalSessionKind>> =
         Arc::new(LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("home")));
+    let name = "terminal-vessel-a-coder";
     let request = || TerminalSessionRequest {
+        launch_of: name.into(),
+        launch: 0,
         environment: Ref::new("env-a", HOME),
         holder: Some(Holder::vessel("vessel-a")),
         role: "coder".into(),
@@ -213,149 +221,63 @@ fn a_session_reads_as_its_current_launch() {
         env: Default::default(),
         source: Launch::Tool { command: "bash".into() },
     };
-    let name = "terminal-vessel-a-coder";
-    sessions.request(&launch(name, 1), request(), Timestamp(1)).expect("launch 1");
-    sessions.step(&launch(name, 1), &Step::Realised { identity: "s1".into() }, Timestamp(2)).expect("ran");
-    sessions.step(&launch(name, 1), &Step::Released, Timestamp(3)).expect("stopped");
-    sessions.request(&launch(name, 2), request(), Timestamp(4)).expect("launch 2");
-    sessions.step(&launch(name, 2), &Step::Realised { identity: "s2".into() }, Timestamp(5)).expect("ran again");
+    let first = sessions.request(name, request(), Timestamp(1)).expect("first launch").name().to_owned();
+    sessions.step(&first, &Step::Realised { identity: "s1".into() }, Timestamp(2)).expect("ran");
+    sessions.step(&first, &Step::Released, Timestamp(3)).expect("stopped");
+    let second = sessions.replace_launch(name, &first, request(), Timestamp(4)).expect("second launch");
+    sessions.step(&second, &Step::Realised { identity: "s2".into() }, Timestamp(5)).expect("ran again");
 
     let reads = StoreReads::new(store);
     let current = reads.terminal_session(name, HOME).expect("read").expect("held");
-    assert_eq!(current.name, launch(name, 2));
+    assert_eq!(current.name, second);
     assert_eq!(current.judgement, Judgement::Ready { identity: "s2".into() });
     assert!(reads.terminal_session("terminal-vessel-b-coder", HOME).expect("read").is_none());
     let mut launches: Vec<String> =
         reads.held_sessions(&Holder::vessel("vessel-a")).expect("index").into_iter().map(|view| view.name).collect();
     launches.sort();
-    assert_eq!(launches, [launch(name, 1), launch(name, 2)]);
+    let mut expected = vec![first, second.clone()];
+    expected.sort();
+    assert_eq!(launches, expected);
 
-    // Found however many launches there are (#3748 review): doubling past the latest, halving back.
-    for n in 3..=11 {
-        sessions.request(&launch(name, n), request(), Timestamp(10 + i64::from(n))).expect("launch");
-        assert_eq!(reads.terminal_session(name, HOME).expect("read").expect("held").name, launch(name, n));
+    // Found however many launches there are, numbered with the gaps the home's other writes leave.
+    let mut latest = second;
+    for _ in 0..9 {
+        sessions.step(&latest, &Step::Released, Timestamp(10)).expect("stopped");
+        latest = sessions.replace_launch(name, &latest, request(), Timestamp(11)).expect("launch");
+        assert_eq!(reads.terminal_session(name, HOME).expect("read").expect("held").name, latest);
     }
-    // A missing launch bounds the contiguous-prefix search; a later orphan is not the current launch.
-    sessions.request(&launch(name, 13), request(), Timestamp(23)).expect("orphan launch");
-    assert_eq!(reads.terminal_session(name, HOME).expect("read").expect("held").name, launch(name, 11));
 }
 
-// Behaviour (#3629 layer 8, Vessel): a vessel's lease reads by its name, Ready once realised and
-// Lost once it vanished, and a convoy's vessels through the `vessel.by_convoy` index, live or ended.
+// Behaviour (#3629 layer 8, #3108): a vessel's launch reads by its launch name, never by its
+// work's bare name; Ready once realised and Lost once it vanished; and a work's launches through
+// the `vessel.by_launch` index, live or ended, oldest first. (Reading a vessel by its old record's
+// name went with the old Vessel's binding.)
 #[test]
 fn a_vessel_reads_as_its_lease() {
-    use std::collections::BTreeMap;
+    use flotilla_protocol::LifecycleReading;
+    use flotilla_provisioning_testkit::VesselsFixture;
+    use flotilla_resources::vessel_records::{VesselRecords, VesselStep};
 
-    use flotilla_provisioning::engine::vessel::{PlacementLifecycles, PINNED_CLASS};
-    use flotilla_state_machines::{
-        machines::{
-            convoy::{ConvoyId, Priority, VesselClass},
-            vessel::{VesselKind, VesselSpec},
-        },
-        placement::Host,
-    };
-    // The crew kinds' store, which holds the Vessel kind.
-    let registry = stored::crew_registry().expect("registry");
-    let store = Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")));
-    let vessels: Arc<dyn Lifecycles<VesselKind>> = Arc::new(
-        PlacementLifecycles::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("home")).expect("placements"),
+    let fixture = VesselsFixture::at(HOME);
+    let implement = fixture.request("convoy-a", "implement", "feta");
+    fixture.ready(&implement, "env-a");
+    let review = fixture.request("convoy-a", "review", "feta");
+    fixture.ready(&review, "env-b");
+    fixture.step(&review, VesselStep::Lost { reason: "container gone".into() });
+    let replacement = fixture.request("convoy-a", "review", "feta");
+
+    let read = fixture.vessels.get(&implement, None).expect("read").expect("held");
+    assert!(implement.starts_with("convoy-a-implement#"), "{implement} is a launch of its work");
+    assert_eq!(read.reading, LifecycleReading::Ready { identity: "env-a".into() });
+    assert_eq!(read.host, "feta");
+    assert_eq!(
+        fixture.vessels.get(&review, None).expect("read").expect("held").reading,
+        LifecycleReading::Lost { reason: Some("container gone".into()) }
     );
-    let lease = || VesselSpec {
-        convoy: ConvoyId::new("convoy-a", HOME),
-        class: VesselClass::new(PINNED_CLASS),
-        shape: BTreeMap::new(),
-        priority: Priority(0),
-        host: Host::new("feta"),
-    };
-    vessels.request("convoy-a-implement", lease(), Timestamp(1)).expect("granted");
-    vessels.step("convoy-a-implement", &Step::Realised { identity: "env-a".into() }, Timestamp(2)).expect("ready");
-    vessels.request("convoy-a-review", lease(), Timestamp(3)).expect("granted");
-    vessels.step("convoy-a-review", &Step::Realised { identity: "env-b".into() }, Timestamp(4)).expect("ready");
-    vessels
-        .step("convoy-a-review", &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }, Timestamp(5))
-        .expect("lost");
-
-    let reads = StoreReads::new(store);
-    let implement = reads.vessel("convoy-a-implement", HOME).expect("read").expect("held");
-    assert_eq!(implement.judgement, Judgement::Ready { identity: "env-a".into() });
-    assert_eq!(implement.request.host, Host::new("feta"));
-    assert_eq!(reads.vessel("convoy-a-review", HOME).expect("read").expect("held").judgement, Judgement::Lost);
-    assert!(reads.vessel("convoy-b-implement", HOME).expect("read").is_none());
-    let mut convoy: Vec<String> =
-        reads.convoy_vessels(&ConvoyId::new("convoy-a", HOME)).expect("index").into_iter().map(|view| view.name).collect();
-    convoy.sort();
-    assert_eq!(convoy, ["convoy-a-implement", "convoy-a-review"]);
-}
-
-// Behaviour (#3771 review): the port reads a vessel by its old record's name, because the write
-// path names the engine's resource after it. Decided through the binding, read back by
-// `metadata.name`.
-#[test]
-fn a_vessel_written_through_the_binding_reads_by_its_old_name() {
-    use std::collections::BTreeMap;
-
-    use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
-    use flotilla_provisioning::engine::{
-        decide,
-        vessel::{PlacementLifecycles, VesselBinding},
-    };
-    use flotilla_resources::{ObjectMeta, ResourceObject, StatusPatch, VesselSpec as OldVesselSpec, VesselStatusPatch};
-    use flotilla_state_machines::machines::vessel::VesselKind;
-    let registry = stored::crew_registry().expect("registry");
-    let store = Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), HOME, registry).expect("store")));
-    let vessels: Arc<dyn Lifecycles<VesselKind>> = Arc::new(
-        PlacementLifecycles::new(HOME, Home::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("home")).expect("placements"),
-    );
-    let mut obj = ResourceObject {
-        metadata: ObjectMeta {
-            name: "convoy-a-implement".into(),
-            namespace: "flotilla".into(),
-            resource_version: "1".into(),
-            labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
-            owner_references: vec![],
-            finalizers: vec![],
-            deletion_timestamp: None,
-            creation_timestamp: chrono::DateTime::UNIX_EPOCH,
-            merge: None,
-        },
-        spec: OldVesselSpec {
-            convoy_ref: "convoy-a".into(),
-            vessel_name: "implement".into(),
-            fulfilment_kind_ref: "docker".into(),
-            adopted_checkout_refs: BTreeMap::new(),
-        },
-        status: None,
-    };
-    let provisioning = VesselStatusPatch::MarkProvisioning {
-        observed_kind_ref: "docker".into(),
-        observed_kind_version: "1".into(),
-        placement_decision: Some(
-            PlacementDecision::builder()
-                .kind("docker".into())
-                .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("feta"), display_name: "feta".into() })
-                .build(),
-        ),
-        started_at: chrono::DateTime::UNIX_EPOCH,
-        message: None,
-        image: None,
-    };
-    let decided = decide::<VesselBinding>(vessels.as_ref(), &obj, Some(provisioning), chrono::Utc::now()).patch.expect("granted");
-    decided.apply(obj.status.get_or_insert_with(Default::default));
-
-    let reads = StoreReads::new(store);
-    let view = reads.vessel(&obj.metadata.name, HOME).expect("read").expect("read by the old record's name");
-    assert_eq!(view.name, obj.metadata.name);
-    assert_eq!(view.judgement, Judgement::InProgress);
-
-    // Failure is visible only through the engine: this snapshot deliberately receives no status patch.
-    let failure = VesselStatusPatch::MarkFailed { message: "provider refused provisioning".into() };
-    let decision = decide::<VesselBinding>(vessels.as_ref(), &obj, Some(failure), chrono::Utc::now());
-    assert!(decision.ended);
-    let view = reads.vessel(&obj.metadata.name, HOME).expect("read").expect("ended vessel");
-    assert!(matches!(view.judgement, Judgement::GaveUp { ref cause } if cause.detail == "provider refused provisioning"));
-    assert_eq!(obj.status.as_ref().expect("provisioning").phase, flotilla_resources::VesselPhase::Provisioning);
-    assert_eq!(obj.status.as_ref().expect("provisioning").message, None);
+    assert!(fixture.vessels.get("convoy-a-implement", None).expect("read").is_none(), "no read by the bare work name");
+    let launches: Vec<String> =
+        fixture.vessels.launches("convoy-a", HOME, "convoy-a-review", None).expect("index").into_iter().map(|launch| launch.name).collect();
+    assert_eq!(launches, [review, replacement]);
 }
 
 // Corrupt persisted retry times remain readable in debug and release builds; diagnostics preserve a usable fallback.

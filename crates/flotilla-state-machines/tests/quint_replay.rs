@@ -1,6 +1,6 @@
 //! Quint ITF trace replay through the engine (#3220, #3319).
 //!
-//! `specs/primitives/check.sh` simulates the eight scenarios in
+//! `specs/primitives/check.sh` simulates the seven scenarios in
 //! `specs/primitives/scenarios/` and writes one ITF file per trace; nothing
 //! here is a stored fixture. Each trace drives the real single writer
 //! ([`Home::apply`]: attempts and receipts are edges too) and the placement
@@ -39,21 +39,18 @@
 //!   exactly the spec's `bound`, so `bound` renders as "a watermark is
 //!   recorded". The spec's `receipt` is false on every drop it can reach (an
 //!   undeliverable drop is refused with a receipt), and Rust has no field.
-//! - **Ensure `history` and `window`.** Rust keeps the window's tally in the
-//!   state; the history is the Ensure's `Attempted` log entries and the window
-//!   the number before the last `Resume` entry. Rendering checks the tally
-//!   against the window's outcomes.
-//! - **Lifecycle attempts.** As for Ensure, the model's `Requested(history)`
-//!   is the resource's `Attempted` log entries, and Rust keeps their tally in
-//!   Requested; rendering checks it.
+//! - **Lifecycle attempts.** The model's `Requested(history)` is the
+//!   resource's `Attempted` log entries, each `FailedEarly` entry replacing
+//!   the failure before it, and Rust keeps their tally in Requested;
+//!   rendering checks it.
 //! - **Receipts.** In `inbox_delivery` a receipt is a session's `Receive`
 //!   edge about the message, and its stream row is that entry on its way to
 //!   the message's home: the message reads the entries whose row has applied.
 //!   `message_race` has no sessions, so its receipt rows are the evidence. In
-//!   `controller_delivery` the agent's receipts are its session's entries, as
-//!   in `inbox_delivery`; the controller's kind has no Rust machine yet, so its
-//!   receipt rows are the evidence, read as a [`ConsumerKind::Controller`]
-//!   receiver's, and the model's controller store is not compared.
+//!   `service_delivery` the agent's receipts are its session's entries, as
+//!   in `inbox_delivery`; the service's records are not composed here, so its
+//!   receipt rows are the evidence, read as a [`ConsumerKind::Service`]
+//!   receiver's, and the model's service store is not compared.
 //! - **AwaitingReply `Answered` and `Expired`.** The model's `Answered({reply})`
 //!   and `Expired({at})` carry what Rust keeps outside the label: the reply is
 //!   the record's `Answer` log entry's, and the time the state's `since`. The
@@ -83,7 +80,7 @@ use session_value::session_value;
 use flotilla_quint_testkit::message::MessageSubject;
 use flotilla_quint_testkit::{
     itf,
-    replay::{at_address, constant, id_of, moment, same, slot_at, store, Step, Stream, Trace, INBOX, OWNER, UNIT},
+    replay::{at_address, constant, id_of, moment, same, slot_at, store, Step, Stream, Trace, OWNER, UNIT},
 };
 const ONE: &str = "1";
 
@@ -103,11 +100,10 @@ use flotilla_state_machines::{
         },
         consumer::ConsumerKind,
         convoy::{
-            self, Convoy, ConvoyEdge, ConvoyId, ConvoyRequest, ConvoyState, MemoryConvoyWorld, Priority, PromiseId, PromiseSource, Quota,
+            self, Convoy, ConvoyEdge, ConvoyId, ConvoyRequest, ConvoyState, MemoryConvoyWorld, Priority, PromiseId, PromiseSource,
             SeatName, VesselClass,
         },
-        ensure::{self, Ensure, EnsureEdge, EnsureSpec, EnsureState, FulfillerPhase, FulfillerStatus, MemoryEnsureWorld, UnbindReason},
-        lifecycle::{self, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed},
+        lifecycle::{self, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState, MemoryLifecycleWorld, Observed},
         message::{
             self, DropReason, InboxBinding, MemoryMessageWorld, Message, MessageEdge, MessageEdgeKind, MessageRef, MessageSpec,
             MessageState,
@@ -116,7 +112,7 @@ use flotilla_state_machines::{
     placement::{self, Dimension, Evidence, Host, Lease, Ledger, LedgerError, Units, VesselId},
     AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Ref, Resource, Transport, Version, WriteError,
 };
-use itf::{address, boolean, int, list, map_of, number, pairs, payload, set, set_of, slot, tag, text, variant};
+use itf::{address, at, boolean, int, list, map_of, number, pairs, payload, set, set_of, slot, tag, text, variant};
 use serde_json::{json, Value};
 
 fn small(v: &Value) -> u32 {
@@ -183,7 +179,8 @@ fn check_store<M: Machine>(home: &Home<M>, model: &Value, render: impl Fn(&Home<
     let ids: BTreeSet<i64> = pairs(model).iter().map(|pair| number(&pair[0])).collect();
     let stray: Vec<&str> = home.resources().map(Resource::name).filter(|name| !ids.contains(&id_of(name))).collect();
     assert!(stray.is_empty(), "{step}: {what} {stray:?} exist in Rust only");
-    same(&slots(model, |id| home.get(&id.to_string()).map(|resource| render(home, resource))), model, step, what);
+    let held = |id: i64| home.resources().find(|resource| id_of(resource.name()) == id);
+    same(&slots(model, |id| held(id).map(|resource| render(home, resource))), model, step, what);
 }
 
 // ---------------------------------------------------------------------------
@@ -312,13 +309,6 @@ impl LifecycleKind for CloneKind {
     }
 }
 
-/// `ensure_bind`'s fulfillers: terminal sessions an Ensure keeps bound.
-struct TerminalSession;
-impl LifecycleKind for TerminalSession {
-    const NAME: &'static str = "TerminalSession";
-    type Request = ();
-}
-
 /// `admission_placement`'s vessels; the ledger holds their placement requests.
 struct VesselKind;
 impl LifecycleKind for VesselKind {
@@ -340,15 +330,9 @@ fn lifecycle_outcome_value(outcome: &Outcome) -> Value {
 fn lifecycle_value<K: LifecycleKind>(home: &Home<Lifecycle<K>>, resource: &Resource<Lifecycle<K>>) -> Value {
     match resource.state() {
         LifecycleState::Requested { failures, last_failure } => {
-            let attempts: Vec<&Outcome> = home
-                .log()
-                .history(resource.name(), Version(0), usize::MAX)
-                .into_iter()
-                .filter_map(|(_, event)| match &event.arguments.edge {
-                    LifecycleEdge::Attempted(attempted) => Some(&attempted.outcome),
-                    _ => None,
-                })
-                .collect();
+            let attempts = lifecycle::attempt_history(
+                home.log().history(resource.name(), Version(0), usize::MAX).into_iter().map(|(_, event)| &event.arguments.edge),
+            );
             let since_success = attempts.iter().rev().take_while(|o| matches!(o, Outcome::Failed { .. })).count();
             assert_eq!(*failures as usize, since_success, "{}: the tally counts the failures since the last success", resource.name());
             let last = attempts.last().and_then(|o| match o {
@@ -361,7 +345,7 @@ fn lifecycle_value<K: LifecycleKind>(home: &Home<Lifecycle<K>>, resource: &Resou
                 "{}: the tally keeps the last failure",
                 resource.name()
             );
-            variant("Requested", Value::Array(attempts.into_iter().map(lifecycle_outcome_value).collect()))
+            variant("Requested", Value::Array(attempts.iter().map(lifecycle_outcome_value).collect()))
         }
         LifecycleState::Realised { identity } => variant("Realised", json!(identity)),
         LifecycleState::Gone { ending } => variant("Gone", flotilla_quint_testkit::lifecycle::ending_value(ending)),
@@ -406,7 +390,7 @@ fn lifecycle_step<K: LifecycleKind>(
             if seen {
                 world.absences.put(&observed, true);
             }
-            lifecycle::Vanish { cause: lifecycle::VanishCause::Lost, observed }.into()
+            lifecycle::Vanish { cause: lifecycle::VanishCause::lost(), observed }.into()
         }
         other => panic!("{step}: lifecycle operation {other}"),
     };
@@ -431,9 +415,11 @@ fn lifecycle_end_refuses<K: LifecycleKind>(
     let probes = vec![
         lifecycle::Realise { identity: identity.into(), observed: witness }.into(),
         lifecycle::Release { teardown: Ref::new("witness") }.into(),
-        lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: Ref::new("witness") }.into(),
+        lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost(), observed: Ref::new("witness") }
+            .into(),
         lifecycle::GiveUp { cause: cause("failure") }.into(),
         lifecycle::Attempted { outcome: Outcome::Succeeded }.into(),
+        lifecycle::FailedEarly { cause: cause("failure"), retryable: true }.into(),
     ];
     assert_end_refuses(home, name, probes, &world, now, step, tally);
 }
@@ -489,6 +475,11 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
                     other => panic!("{step}: attempt outcome {other}"),
                 };
                 accept(&mut things, ONE, lifecycle::Attempted { outcome }, &MemoryLifecycleWorld::default(), now, &step, tally);
+            }
+            "failEarly" => {
+                let early = step.pick("early");
+                let edge = lifecycle::FailedEarly { cause: cause(text(&early["cause"])), retryable: boolean(&early["retryable"]) };
+                accept(&mut things, ONE, edge, &MemoryLifecycleWorld::default(), now, &step, tally);
             }
             "giveUp" => {
                 let edge = lifecycle::GiveUp { cause: cause(text(step.pick("cause"))) };
@@ -560,11 +551,12 @@ fn refuse_without_evidence(
             (realise().into(), &stranger),
             (lifecycle::Release { teardown: Ref::new(ONE) }.into(), &none),
             (
-                lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: Ref::new(ONE) }
+                lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost(), observed: Ref::new(ONE) }
                     .into(),
                 &none,
             ),
-            (lifecycle::GiveUp { cause: cause("other") }.into(), &none),
+            // A cause the scenario never picks, so it is never the last failure's.
+            (lifecycle::GiveUp { cause: cause("stranger") }.into(), &none),
         ];
         for (edge, world) in probes {
             let kind = edge.kind();
@@ -605,23 +597,25 @@ fn refuse_without_evidence(
 // target, a submission's reference and a supervisor are addresses; a vessel
 // class is its number as text; a duty's terms are its note.
 
-fn convoy_work(state: &Value) -> &Value {
-    match tag(state) {
-        "Abandoned" => &payload(state)["work"],
-        _ => payload(state),
-    }
+/// The spec keeps each part of a convoy in its own variable, keyed by convoy.
+const CONVOY_PARTS: [&str; 8] = ["phase", "project", "priority", "duties", "retired", "promises", "seats", "subjects"];
+
+/// The convoys the model has admitted.
+fn convoy_ids(state: &Value) -> BTreeSet<i64> {
+    pairs(store(state, "C::phase")).iter().map(|pair| number(&pair[0])).collect()
+}
+
+/// Convoy `id`'s parts as one record, field by field from their variables.
+fn convoy_parts(state: &Value, id: i64) -> Value {
+    Value::Object(CONVOY_PARTS.iter().map(|part| (part.to_string(), at(store(state, &format!("C::{part}")), id).clone())).collect())
+}
+
+fn convoy_open(parts: &Value) -> bool {
+    tag(&parts["phase"]) == "Open"
 }
 
 fn class(n: u32) -> VesselClass {
     VesselClass::new(n.to_string())
-}
-
-fn quota(v: &Value) -> Quota {
-    pairs(v).iter().map(|pair| (class(small(&pair[0])), small(&pair[1]))).collect()
-}
-
-fn quota_value(quota: &Quota) -> Value {
-    map_of(quota.iter().map(|(class, count)| (int(class.0.parse().expect("model class")), int((*count).into()))))
 }
 
 fn seat(v: &Value) -> SeatName {
@@ -660,13 +654,11 @@ fn authority_of(v: &Value) -> convoy::Authority {
     }
 }
 
-/// The request the model admitted, from the state it admitted: its fixed
-/// fields, its promises as admitted, its seats, and the quota in force at
-/// admission.
-fn convoy_request(state: &Value) -> ConvoyRequest {
-    let work = convoy_work(state);
-    let spec = &work["spec"];
-    let promises = pairs(&work["promises"])
+/// The request the model admitted as convoy `id`, a launch of the id's text,
+/// from the parts it admitted: its fixed fields, its promises as admitted,
+/// and its seats.
+fn convoy_request(id: i64, parts: &Value) -> ConvoyRequest {
+    let promises = pairs(&parts["promises"])
         .iter()
         .map(|pair| {
             let record = &pair[1];
@@ -680,7 +672,7 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
             (PromiseId(small(&pair[0])), promise)
         })
         .collect();
-    let duties = pairs(&spec["duties"])
+    let duties = pairs(&parts["duties"])
         .iter()
         .map(|pair| {
             let duty = &pair[1];
@@ -692,11 +684,12 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
             (convoy::DutyId(small(&pair[0])), convoy::Duty { owner: seat(&duty["owner"]), scope, terms })
         })
         .collect();
-    let mut seats: Vec<convoy::Seat> = text_keyed(&work["seats"])
+    let mut seats: Vec<convoy::Seat> = text_keyed(&parts["seats"])
         .into_iter()
         .map(|(name, record)| convoy::Seat {
+            failed: None,
             retired: false,
-            replacements: small(&record["replacements"]),
+            replacements: 0,
             role: name.into(),
             seat: String::new(),
             parent: (tag(&record["parent"]) == "Under").then(|| seat(payload(&record["parent"]))),
@@ -705,12 +698,15 @@ fn convoy_request(state: &Value) -> ConvoyRequest {
         .collect();
     seats.sort_by_key(|seat| seat.parent.is_some());
     ConvoyRequest {
-        project: address(&spec["project"]),
+        launch_of: id.to_string(),
+        workflow_ref: "w".into(),
+        admission: flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new()))
+            .expect("freeze"),
+        project: address(&parts["project"]),
         promises,
         duties,
         seats,
-        quota: quota(&work["quota"]),
-        priority: Priority(small(&spec["priority"])),
+        priority: Priority(small(&parts["priority"])),
         kinds: flotilla_schema::Frozen::new(convoy::PromiseKinds::default()).expect("freeze"),
     }
 }
@@ -724,9 +720,9 @@ fn progress_name(progress: convoy::Progress) -> &'static str {
     }
 }
 
-/// The spec's `Open(Work) | Delivered(Work) | Abandoned({ work, reason })`,
-/// where `Work = { spec, promises, seats, retired, quota }`: the spec's fixed
-/// fields and records, and the state's retired duties and quota in force.
+/// The spec's parts of a convoy ([`CONVOY_PARTS`]), field by field: its phase,
+/// the spec's fixed fields and records, every link row, and the state's
+/// retired duties.
 fn convoy_value(resource: &Resource<Convoy>) -> Value {
     let spec = resource.spec();
     let state = resource.state();
@@ -753,7 +749,15 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
             None => constant("Root"),
             Some(parent) => variant("Under", seat_text(parent)),
         };
-        (seat_text(&row.record.name()), json!({ "parent": parent, "supervisedBy": row.record.supervised_by.name(), "replacements": int(row.record.replacements.into()) }))
+        let record = &row.record;
+        let seat = json!({
+            "parent": parent,
+            "supervisedBy": record.supervised_by.name(),
+            "replacements": int(record.replacements.into()),
+            "failed": record.failed.as_deref().unwrap_or_default(),
+            "retired": record.retired,
+        });
+        (seat_text(&record.name()), seat)
     }));
     let duties = spec.duties.iter().map(|(id, duty)| {
         let scope = match &duty.scope {
@@ -765,24 +769,58 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
             json!({ "owner": seat_text(&duty.owner), "scope": scope, "terms": duty.terms.note.as_deref().unwrap_or_default() }),
         )
     });
-    let work = json!({
-        "spec": { "project": spec.project.name(), "duties": map_of(duties), "priority": int(spec.priority.0.into()) },
+    let subjects: Vec<Value> = spec
+        .subjects
+        .iter()
+        .map(|row| {
+            let link = &row.record;
+            let source = match link.source {
+                convoy::LinkSource::Claim => "Claim",
+                convoy::LinkSource::Operator => "ByOperator",
+                convoy::LinkSource::Relay => "Relay",
+                convoy::LinkSource::Branch => "Branch",
+            };
+            json!({ "subject": link.subject.name(), "source": constant(source), "unlinked": link.unlinked })
+        })
+        .collect();
+    let phase = match state {
+        ConvoyState::Open { .. } => constant("Open"),
+        ConvoyState::Delivered { disposition, .. } => variant("Delivered", json!(disposition)),
+        ConvoyState::Abandoned { cause, reason, .. } => {
+            let cause = match cause {
+                convoy::AbandonCause::Failed => "WorkFailed",
+                convoy::AbandonCause::Operator => "OperatorDecision",
+            };
+            variant("Abandoned", json!({ "cause": constant(cause), "reason": reason }))
+        }
+        ConvoyState::Retired => constant("Retired"),
+    };
+    json!({
+        "phase": phase,
+        "project": spec.project.name(),
+        "priority": int(spec.priority.0.into()),
+        "duties": map_of(duties),
+        "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
         "promises": map_of(promises),
         "seats": seats,
-        "retiredSeats": set_of(spec.seats.iter().filter(|r| r.record.retired).map(|r| json!(r.record.role))),
-        "promiseFloor": int(spec.promise_floor.try_into().expect("model floor")),
-        "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
-        "quota": quota_value(state.quota()),
-    });
-    match state {
-        ConvoyState::Open { .. } => variant("Open", work),
-        ConvoyState::Delivered { .. } => variant("Delivered", work),
-        ConvoyState::Abandoned { reason, .. } => variant("Abandoned", json!({ "work": work, "reason": reason })),
-    }
+        "subjects": subjects,
+    })
 }
 
+/// Every convoy at `home` is one the model admitted, and each of its parts
+/// agrees with the model's.
 fn check_convoys(home: &Home<Convoy>, state: &Value, step: &Step) {
-    check_store(home, store(state, "::convoys"), |_, convoy| convoy_value(convoy), step, "convoy");
+    let ids = convoy_ids(state);
+    let stray: Vec<&str> = home.resources().map(Resource::name).filter(|name| !ids.contains(&id_of(name))).collect();
+    assert!(stray.is_empty(), "{step}: convoys {stray:?} exist in Rust only");
+    for id in ids {
+        let name = convoy_name(home, id);
+        let rust = convoy_value(home.get(&name).unwrap_or_else(|| panic!("{step}: the model admitted convoy {id}; Rust holds none")));
+        let model = convoy_parts(state, id);
+        for part in CONVOY_PARTS {
+            same(&rust[part], &model[part], step, &format!("convoy {id} {part}"));
+        }
+    }
 }
 
 /// The convoy world: the authorised edges read `authorised`, and the one
@@ -803,26 +841,40 @@ fn by() -> SeatName {
     SeatName::new(OWNER, "")
 }
 
+/// The scenario delivers with the disposition `"merged"`.
+fn delivered() -> convoy::Deliver {
+    convoy::Deliver { disposition: "merged".into() }
+}
+
+/// The scenario abandons by an operator's decision.
+fn abandon(reason: &str) -> convoy::Abandon {
+    convoy::Abandon { by: by(), cause: convoy::AbandonCause::Operator, reason: reason.into(), authority: owner() }
+}
+
 fn admit(home: &mut Home<Convoy>, step: &Step, id: i64, tally: &mut Tally) {
-    let model = slot_at(step.after, "::convoys", id).expect("admitted convoy");
-    let request = convoy_request(model);
+    assert!(convoy_ids(step.after).contains(&id), "{step}: the model admitted no convoy {id}");
+    let request = convoy_request(id, &convoy_parts(step.after, id));
     // The model admitted it, so its project was known.
     let world = MemoryConvoyWorld::default().with_limits(3, 1).with_project(&request.project);
     create(home, &id.to_string(), request, &world, step, tally);
 }
 
+/// Model convoy `id`'s resource name: its newest launch, once admitted.
+fn convoy_name(home: &Home<Convoy>, id: i64) -> String {
+    home.newest_launch(&id.to_string(), None).map(|convoy| convoy.name().to_owned()).unwrap_or_else(|| id.to_string())
+}
+
 /// From the reached state: an Open convoy delivers only with nothing open
 /// and no lifetime duty holding (`deliveredSettled`), and an operator never
-/// re-settles a settled promise (`settledPromisesFinal`); an ended convoy
-/// refuses everything.
+/// re-settles a settled promise (`settledPromisesFinal`); a delivered or
+/// abandoned convoy refuses every work edge, and a retired one everything
+/// (`retiredFinal`).
 fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &Step, tally: &mut Tally) {
     let world = convoy_world(true, true);
     let operator = SeatName::new("operator", "");
-    for (id, model) in entries(state, "::convoys") {
-        let Some(model) = model else { continue };
-        let name = id.to_string();
-        let work = convoy_work(model);
-        let current = home.get(&name).expect("convoy").state().quota().clone();
+    for id in convoy_ids(state) {
+        let model = convoy_parts(state, id);
+        let name = convoy_name(home, id);
         let retract =
             |promise| convoy::Retract { promise, by: operator.clone(), authority: convoy::Authority::Operator, reason: "decision".into() };
         let verdict = |promise| convoy::Keep::Verdict {
@@ -831,32 +883,59 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
             authority: convoy::Authority::Operator,
             reason: "decision".into(),
         };
-        if tag(model) != "Open" {
-            let probes = vec![
-                verdict(PromiseId(0)).into(),
-                retract(PromiseId(0)).into(),
-                convoy::Deliver.into(),
-                convoy::Abandon { by: by(), reason: "decision".into(), authority: owner() }.into(),
-                convoy::Readmit { quota: current, by: by(), authority: owner() }.into(),
-            ];
-            assert_end_refuses(home, &name, probes, &world, now, step, tally);
+        if !convoy_open(&model) {
+            let mut probes: Vec<ConvoyEdge> =
+                vec![verdict(PromiseId(0)).into(), retract(PromiseId(0)).into(), delivered().into(), abandon("decision").into()];
+            for pair in pairs(&model["promises"]) {
+                let (promise, owner_seat) = (PromiseId(small(&pair[0])), seat(&pair[1]["owner"]));
+                let submit = convoy::Submit {
+                    promise,
+                    by: owner_seat.clone(),
+                    address: reference(),
+                    revision: "r".into(),
+                    durable: Ref::new(reference().as_str()),
+                };
+                probes.push(submit.into());
+                let reassign = convoy::Reassign { promise, to: owner_seat, by: operator.clone(), authority: convoy::Authority::Operator };
+                probes.push(reassign.into());
+            }
+            if tag(&model["phase"]) == "Retired" {
+                assert_end_refuses(home, &name, probes, &world, now, step, tally);
+            } else {
+                // Delivered or abandoned, it waits to retire and takes no decision edge.
+                for edge in probes {
+                    let kind = edge.kind();
+                    assert!(!would_accept(home, &name, edge, &world, now, tally), "{step}: ended convoy {id} accepted {kind:?}");
+                }
+            }
+            // Abandoned, its Submitted promise still resolves by the world (#3108 ruling 1):
+            // evidence of the current submission keeps it, and a rejection returns it to Pending.
+            if tag(&model["phase"]) == "Abandoned" {
+                for pair in pairs(&model["promises"]).iter().filter(|pair| tag(&pair[1]["state"]) == "Submitted") {
+                    let promise = PromiseId(small(&pair[0]));
+                    let submission = u32::try_from(pair[1]["submissions"].as_array().expect("submissions").len()).expect("small");
+                    let kept = convoy::Keep::Observed { promise, submission };
+                    assert!(
+                        would_accept(home, &name, kept, &world, now, tally),
+                        "{step}: abandoned convoy {id} keeps {promise:?} as observed"
+                    );
+                    let rejected = convoy::Reject { promise };
+                    assert!(would_accept(home, &name, rejected, &world, now, tally), "{step}: abandoned convoy {id} rejects {promise:?}");
+                }
+            }
             continue;
         }
-        // The negative picks: without authority nothing is abandoned or
-        // readmitted, and an empty reason abandons nothing.
+        // The negative picks: without authority nothing is abandoned, and an
+        // empty reason abandons nothing.
         let refused = convoy_world(false, true);
-        let decisions: [(ConvoyEdge, &MemoryConvoyWorld); 3] = [
-            (convoy::Abandon { by: by(), reason: "decision".into(), authority: owner() }.into(), &refused),
-            (convoy::Abandon { by: by(), reason: String::new(), authority: owner() }.into(), &world),
-            (convoy::Readmit { quota: current, by: by(), authority: owner() }.into(), &refused),
-        ];
+        let decisions: [(ConvoyEdge, &MemoryConvoyWorld); 2] = [(abandon("decision").into(), &refused), (abandon("").into(), &world)];
         for (edge, decision_world) in decisions {
             let kind = edge.kind();
             assert!(!would_accept(home, &name, edge, decision_world, now, tally), "{step}: convoy {id} {kind:?} unauthorised");
         }
-        let promises = pairs(&work["promises"]);
+        let promises = pairs(&model["promises"]);
         let open = |pair: &&Value| matches!(tag(&pair[1]["state"]), "Pending" | "Submitted");
-        if would_accept(home, &name, convoy::Deliver, &world, now, tally) {
+        if would_accept(home, &name, delivered(), &world, now, tally) {
             assert!(!promises.iter().any(|pair| open(&pair)), "{step}: convoy {id} delivers with a promise open");
         }
         for pair in promises.iter().filter(|pair| !open(pair)) {
@@ -873,7 +952,7 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
         tally.steps += 1;
         // The scenario has one convoy, 1.
         let id = 1;
-        let name = id.to_string();
+        let name = convoy_name(&home, id);
         let now = moment(number(&step.before["now"]));
         // `durable` is picked only inside the submit branch.
         let durable = matches!(&step.after["mbt::nondetPicks"]["durable"], picked if picked.get("tag").and_then(Value::as_str) == Some("Some") && boolean(payload(picked)));
@@ -971,17 +1050,16 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
                 &step,
                 tally,
             ),
-            "rollover" => accept(&mut home, &name, convoy::Rollover { by: by(), authority: owner() }, &world, now, &step, tally),
             "replaceSeat" => accept(&mut home, &name, convoy::ReplaceSeat(SeatName::new("a", "")), &world, now, &step, tally),
-            "deliver" => accept(&mut home, &name, convoy::Deliver, &world, now, &step, tally),
-            "abandon" => {
-                let edge = convoy::Abandon { by: by(), reason: reason(), authority: owner() };
-                accept(&mut home, &name, edge, &world, now, &step, tally);
-            }
-            // The scenario readmits with a fixed quota, `Map(0 -> 2, 1 -> 1)`.
-            "readmit" => {
-                let quota = BTreeMap::from([(class(0), 2), (class(1), 1)]);
-                accept(&mut home, &name, convoy::Readmit { quota, by: by(), authority: owner() }, &world, now, &step, tally);
+            "deliver" => accept(&mut home, &name, delivered(), &world, now, &step, tally),
+            "abandon" => accept(&mut home, &name, abandon(&reason()), &world, now, &step, tally),
+            // Unread holds are absent from the world.
+            "retire" => {
+                let (mut world, holds, picked) = (world, Ref::new("holds"), step.pick("holds"));
+                if tag(picked) == "Read" {
+                    world.holds.put(&holds, set(payload(picked)).iter().map(|hold| text(hold).to_owned()).collect());
+                }
+                accept(&mut home, &name, convoy::Retire { holds }, &world, now, &step, tally);
             }
             "unchanged" => {}
             other => panic!("{step}: convoy_deliver operation {other}"),
@@ -992,7 +1070,7 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
 }
 
 // ---------------------------------------------------------------------------
-// admission_placement: convoy caps, the placement ledger and vessel lifecycles
+// admission_placement: admitted convoys, the placement ledger and vessel lifecycles
 
 fn units(v: &Value) -> Units {
     pairs(v).iter().map(|pair| (Dimension(small(&pair[0])), small(&pair[1]))).collect()
@@ -1032,11 +1110,11 @@ struct Placed {
     evidence: Evidence,
 }
 
-/// The scenario's world: admission quotas, the ledger, vessel lifecycles, and what
+/// The scenario's world: the admitted convoys, the ledger, vessel lifecycles, and what
 /// the harness keeps beyond them (each placement's evidence, and the leases
 /// the ledger returned and forgot).
 struct Fleet {
-    quotas: BTreeMap<i64, Quota>,
+    admitted: BTreeSet<i64>,
     ledger: Ledger,
     vessels: Home<Lifecycle<VesselKind>>,
     placed: BTreeMap<i64, Placed>,
@@ -1055,19 +1133,12 @@ impl Fleet {
         ledger.add_host(Host::new("1"), BTreeMap::from([(Dimension(0), 2), (Dimension(1), 1)])).expect("host 1");
         ledger.add_host(Host::new("2"), BTreeMap::from([(Dimension(0), 1), (Dimension(1), 2)])).expect("host 2");
         Fleet {
-            quotas: BTreeMap::new(),
+            admitted: BTreeSet::new(),
             ledger,
             vessels: Home::new("home").expect("declaration"),
             placed: BTreeMap::new(),
             returned: BTreeMap::new(),
         }
-    }
-
-    /// The ledger's caps follow the convoy's quota in force.
-    fn sync_caps(&mut self, convoy: i64) {
-        let name = convoy.to_string();
-        let quota = self.quotas.get(&convoy).expect("admitted quota").clone();
-        self.ledger.set_caps(ConvoyId::new(name, "home"), quota);
     }
 
     /// The spec's `Waiting(Request) | Leased({ placement, lifecycle }) | Gone(Placement)`,
@@ -1104,11 +1175,11 @@ impl Fleet {
         }))
     }
 
-    /// Quotas, vessels and the recorded placement evidence equal the model's,
-    /// and every live lease keeps `queuePriority` over the evidence it read.
+    /// The admitted convoys, vessels and the recorded placement evidence equal
+    /// the model's, and every live lease keeps `queuePriority` over the
+    /// evidence it read.
     fn check(&self, state: &Value, step: &Step) {
-        let observed = map_of(self.quotas.iter().map(|(id, quota)| (int(*id), quota_value(quota))));
-        same(&observed, &state["quotas"], step, "admission quotas");
+        same(&set_of(self.admitted.iter().map(|id| int(*id))), &state["admitted"], step, "admitted convoys");
         let model = store(state, "::vessels");
         same(&slots(model, |id| self.vessel_value(id, step)), model, step, "vessel");
         same(&self.placed_value(), &state["placedOn"], step, "placedOn");
@@ -1124,7 +1195,7 @@ impl Fleet {
     }
 
     /// From the reached state, every placement the ledger would grant keeps
-    /// `convoyCaps`, `hostCapacity` and `queuePriority`.
+    /// `hostCapacity` and `queuePriority`.
     fn probe(&self, state: &Value, step: &Step, tally: &mut Tally) {
         for (id, model) in entries(state, "::vessels") {
             if !model.is_some_and(|model| tag(model) == "Waiting") {
@@ -1136,13 +1207,6 @@ impl Fleet {
                 let mut trial = self.ledger.clone();
                 let evidence = trial.evidence(&vessel, host.clone()).expect("a waiting vessel's evidence");
                 let Ok(lease) = trial.place(&vessel, host.clone()).cloned() else { continue };
-                for convoy in [1, 2] {
-                    let convoy = ConvoyId::new(convoy.to_string(), "home");
-                    for class in [class(0), class(1)] {
-                        let (live, cap) = (trial.live(&convoy, &class), trial.cap(&convoy, &class));
-                        assert!(live <= cap, "{step}: placing vessel {id} on {host:?} leases {live} of {convoy:?} {class:?}, cap {cap}");
-                    }
-                }
                 for checked in hosts() {
                     assert!(trial.available(checked.clone()).is_ok(), "{step}: placing vessel {id} on {host:?} oversubscribes {checked:?}");
                 }
@@ -1183,20 +1247,8 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
         };
         match step.action() {
             "admitRequest" => {
-                assert!(!fleet.quotas.contains_key(&convoy), "{step}: admission sets a previously absent quota");
-                fleet.quotas.insert(convoy, BTreeMap::from([(class(0), 1), (class(1), 1)]));
+                assert!(fleet.admitted.insert(convoy), "{step}: a convoy is admitted once");
                 tally.writes += 1;
-                fleet.sync_caps(convoy);
-            }
-            // The scenario readmits authorised, with `Map(0 -> count, 1 -> 1)`.
-            "readmit" => {
-                let quota = BTreeMap::from([(class(0), small(step.pick("count"))), (class(1), 1)]);
-                let before = fleet.quotas.get(&convoy).expect("admitted quota");
-                assert_eq!(before.keys().collect::<Vec<_>>(), quota.keys().collect::<Vec<_>>(), "{step}: same quota keys");
-                assert!(before.iter().all(|(key, count)| quota[key] >= *count), "{step}: quota only rises");
-                fleet.quotas.insert(convoy, quota);
-                tally.writes += 1;
-                fleet.sync_caps(convoy);
             }
             "request" => {
                 let request = placement_request(payload(slot_at(step.after, "::vessels", id).expect("requested vessel")));
@@ -1232,237 +1284,25 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
 }
 
 // ---------------------------------------------------------------------------
-// ensure_bind: an Ensure and the lifecycles of its fulfillers
-
-type Fulfillers = Home<Lifecycle<TerminalSession>>;
-
-fn phase(state: &LifecycleState) -> FulfillerPhase {
-    match state {
-        LifecycleState::Requested { .. } => FulfillerPhase::Requested,
-        LifecycleState::Realised { .. } => FulfillerPhase::Realised,
-        LifecycleState::Gone { .. } => FulfillerPhase::Gone,
-        LifecycleState::GaveUp { .. } => FulfillerPhase::GaveUp,
-    }
-}
-
-/// What the Ensure reads: each fulfiller's phase from its lifecycle resource,
-/// a drained inbox and a complete teardown (the scenario passes `true` for
-/// both), and the authority as the step's `auth` pick.
-fn ensure_world(fulfillers: &Fulfillers, authorised: bool) -> MemoryEnsureWorld {
-    let mut world = MemoryEnsureWorld::default();
-    for resource in fulfillers.resources() {
-        world.fulfillers.put(&Ref::new(resource.name()), FulfillerStatus { phase: phase(resource.state()), can_receive: true });
-    }
-    world.drains.put(&Ref::new(INBOX), true);
-    world.authorities.put(&owner(), authorised);
-    world.teardowns.put(&Ref::new("fulfillers"), true);
-    world
-}
-
-fn ensure_work(model: &Value) -> &Value {
-    match tag(model) {
-        "Fulfilled" => &payload(model)["work"],
-        _ => payload(model),
-    }
-}
-
-fn fulfiller_set(fulfillers: &ensure::Fulfillers) -> Value {
-    set_of(fulfillers.iter().map(|fulfiller| int(id_of(fulfiller.name()))))
-}
-
-/// The spec's `AttemptOutcome`.
-fn outcome_value(outcome: &Outcome) -> Value {
-    match outcome {
-        Outcome::Succeeded => constant("Succeeded"),
-        Outcome::Failed { retryable, .. } => variant("Failed", json!({ "retryable": retryable })),
-    }
-}
-
-/// The spec's `Unfulfilled(Work) | Fulfilled({ work, bound }) | Held(Work) | Retired(Work)`
-/// with `Work = { recorded, created, history, window }`: the state's data,
-/// the history as the Ensure's `Attempted` entries, and the window as how
-/// many came before the last `Resume`. The state's tally must agree with
-/// the window's outcomes.
-fn ensure_value(home: &Home<Ensure>, resource: &Resource<Ensure>) -> Value {
-    let mut history = Vec::new();
-    let mut window = 0;
-    for (_, event) in home.log().history(resource.name(), Version(0), usize::MAX) {
-        match &event.arguments.edge {
-            EnsureEdge::Attempted(attempted) => history.push(attempted),
-            EnsureEdge::Resume(_) => window = history.len(),
-            _ => {}
-        }
-    }
-    let state = resource.state();
-    let current = &history[window..];
-    let since_success = current.iter().rev().take_while(|a| matches!(a.outcome, Outcome::Failed { .. })).count();
-    assert_eq!(state.failures() as usize, since_success, "{}: the tally counts the window's failures", resource.name());
-    let last_retryable = current.last().and_then(|a| match a.outcome {
-        Outcome::Failed { retryable, .. } => Some(retryable),
-        Outcome::Succeeded => None,
-    });
-    assert_eq!(state.last_failure().map(|f| f.retryable), last_retryable, "{}: the tally keeps the last failure", resource.name());
-    let history = history.iter().map(|a| json!({ "id": int(id_of(a.fulfiller.name())), "outcome": outcome_value(&a.outcome) }));
-    let work = json!({
-        "recorded": fulfiller_set(state.recorded()),
-        "created": fulfiller_set(state.created()),
-        "history": Value::Array(history.collect()),
-        "window": int(window as i64),
-    });
-    match state {
-        EnsureState::Unfulfilled { .. } => variant("Unfulfilled", work),
-        EnsureState::Fulfilled { bound, .. } => variant("Fulfilled", json!({ "work": work, "bound": int(id_of(bound.name())) })),
-        EnsureState::Held { .. } => variant("Held", work),
-        EnsureState::Retired { .. } => variant("Retired", work),
-    }
-}
-
-/// From the reached state: a create the Rust gates would accept names a
-/// recorded fulfiller while none is live (`recordedBeforeCreate`,
-/// `oneLiveFulfiller`); a bind names a recorded one (`boundRecorded`); a
-/// Retired Ensure refuses everything.
-fn probe_ensure(home: &mut Home<Ensure>, fulfillers: &Fulfillers, state: &Value, now: Timestamp, step: &Step, tally: &mut Tally) {
-    let Some(model) = slot_at(state, "::ensures", 1) else { return };
-    let world = ensure_world(fulfillers, true);
-    let fulfiller = |id: i64| Ref::<ensure::Fulfiller>::new(id.to_string());
-    if tag(model) == "Retired" {
-        let probes = vec![
-            ensure::Record { fulfiller: fulfiller(1) }.into(),
-            ensure::Create { fulfiller: fulfiller(2) }.into(),
-            ensure::Bind { fulfiller: fulfiller(1) }.into(),
-            ensure::Unbind { reason: UnbindReason::Gone, fulfiller: fulfiller(1) }.into(),
-            ensure::Hold.into(),
-            ensure::Attempted { fulfiller: fulfiller(1), outcome: Outcome::Succeeded }.into(),
-            ensure::Resume { by: "owner".into(), authority: owner() }.into(),
-            ensure::Retire { by: "owner".into(), authority: owner(), teardown: Ref::new("fulfillers") }.into(),
-        ];
-        assert_end_refuses(home, ONE, probes, &world, now, step, tally);
-        return;
-    }
-    // The negative `auth` pick: without authority, resume and retire refuse.
-    let refused = ensure_world(fulfillers, false);
-    let resume = ensure::Resume { by: "owner".into(), authority: owner() };
-    assert!(!would_accept(home, ONE, resume, &refused, now, tally), "{step}: resumes without authority");
-    let retire = ensure::Retire { by: "owner".into(), authority: owner(), teardown: Ref::new("fulfillers") };
-    assert!(!would_accept(home, ONE, retire, &refused, now, tally), "{step}: retires without authority");
-    // `heldAfterWindowFailure`: a hold the Rust gate would allow follows a
-    // failure in the current window.
-    if would_accept(home, ONE, ensure::Hold, &world, now, tally) {
-        let work = ensure_work(model);
-        let history = list(&work["history"]);
-        let window = usize::try_from(number(&work["window"])).expect("window");
-        let last = history.get(window..).and_then(<[Value]>::last);
-        assert!(last.is_some_and(|attempt| tag(&attempt["outcome"]) == "Failed"), "{step}: holds without a failure in the window");
-    }
-    let recorded: BTreeSet<i64> = set(&ensure_work(model)["recorded"]).iter().map(number).collect();
-    for id in [1, 2] {
-        if would_accept(home, ONE, ensure::Create { fulfiller: fulfiller(id) }, &world, now, tally) {
-            assert!(recorded.contains(&id), "{step}: creates unrecorded fulfiller {id}");
-            let live: Vec<&str> = fulfillers.resources().filter(|r| r.state().live()).map(Resource::name).collect();
-            assert!(live.is_empty(), "{step}: creates fulfiller {id} while {live:?} live");
-        }
-        if would_accept(home, ONE, ensure::Bind { fulfiller: fulfiller(id) }, &world, now, tally) {
-            assert!(recorded.contains(&id), "{step}: binds unrecorded fulfiller {id}");
-        }
-    }
-}
-
-/// The scenario's `L::releaseAll(recorded, true)` on retire: each recorded
-/// fulfiller is released, and one the model left unchanged (already ended)
-/// must be refused.
-fn release_all(fulfillers: &mut Fulfillers, step: &Step, now: Timestamp, tally: &mut Tally) {
-    let model = slot_at(step.before, "::ensures", 1).expect("retiring Ensure");
-    let mut world = MemoryLifecycleWorld::default();
-    world.teardowns.put(&Ref::new("fulfillers"), true);
-    for id in set(&ensure_work(model)["recorded"]).iter().map(number) {
-        let name = id.to_string();
-        if fulfillers.get(&name).is_none() {
-            continue;
-        }
-        let changed = slot_at(step.before, "::resources", id) != slot_at(step.after, "::resources", id);
-        let result = fulfillers.apply(&name, lifecycle::Release { teardown: Ref::new("fulfillers") }, &world, now).map(|_| ());
-        match (changed, result) {
-            (true, Ok(())) => tally.writes += 1,
-            (false, Err(WriteError::Refused(LifecycleRefusal::Ended(_)))) => tally.refusals += 1,
-            (changed, result) => panic!("{step}: releasing fulfiller {id} (model changed it: {changed}) answered {result:?}"),
-        }
-    }
-}
-
-fn ensure_bind(trace: &Trace, tally: &mut Tally) {
-    let mut home = Home::<Ensure>::new("home").expect("declaration");
-    let mut fulfillers = Fulfillers::new("home").expect("declaration");
-    for step in trace.steps() {
-        tally.steps += 1;
-        let now = step.tick();
-        let who = step.chosen("who");
-        let name = who.to_string();
-        let world = ensure_world(&fulfillers, step.yes("auth"));
-        let fulfiller = Ref::<ensure::Fulfiller>::new(name.clone());
-        match step.action() {
-            // The spec's `MAX_FAILURES = 2`.
-            "request" => {
-                create(&mut home, ONE, EnsureSpec { inbox: at_address(INBOX), policy: AttemptPolicy::immediate(2) }, &world, &step, tally)
-            }
-            "record" => accept(&mut home, ONE, ensure::Record { fulfiller }, &world, now, &step, tally),
-            "create" => {
-                accept(&mut home, ONE, ensure::Create { fulfiller }, &world, now, &step, tally);
-                create(&mut fulfillers, &name, (), &MemoryLifecycleWorld::default(), &step, tally);
-            }
-            op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut fulfillers, &name, op, true, true, "model", now, &step, tally),
-            "bind" => accept(&mut home, ONE, ensure::Bind { fulfiller }, &world, now, &step, tally),
-            "unbind" => accept(&mut home, ONE, ensure::Unbind { reason: UnbindReason::Gone, fulfiller }, &world, now, &step, tally),
-            "attempt" => {
-                let outcome = match tag(step.pick("outcome")) {
-                    "Succeeded" => Outcome::Succeeded,
-                    "Failed" => {
-                        Outcome::Failed { cause: cause("failure"), retryable: boolean(&payload(step.pick("outcome"))["retryable"]) }
-                    }
-                    other => panic!("{step}: attempt outcome {other}"),
-                };
-                accept(&mut home, ONE, ensure::Attempted { fulfiller, outcome }, &world, now, &step, tally);
-            }
-            "hold" => accept(&mut home, ONE, ensure::Hold, &world, now, &step, tally),
-            "resume" => accept(&mut home, ONE, ensure::Resume { by: "owner".into(), authority: owner() }, &world, now, &step, tally),
-            "retire" => {
-                let edge = ensure::Retire { by: "owner".into(), authority: owner(), teardown: Ref::new("fulfillers") };
-                accept(&mut home, ONE, edge, &world, now, &step, tally);
-                release_all(&mut fulfillers, &step, now, tally);
-            }
-            "unchanged" => {}
-            other => panic!("{step}: ensure_bind operation {other}"),
-        }
-        check_store(&home, store(step.after, "::ensures"), ensure_value, &step, "Ensure");
-        check_store(&fulfillers, store(step.after, "::resources"), lifecycle_value, &step, "fulfiller");
-        for id in [1, 2] {
-            if ended(&fulfillers, &id.to_string()) {
-                lifecycle_end_refuses(&mut fulfillers, &id.to_string(), "model", now, &step, tally);
-            }
-        }
-        probe_ensure(&mut home, &fulfillers, step.after, now, &step, tally);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// inbox_delivery and controller_delivery: Message and consumer session stores
+// inbox_delivery and service_delivery: Message and consumer session stores
 
 /// These engine compositions differ in their consumers, stream and evidence.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Feed {
     /// Two consumer sessions, a binding that changes, no authority.
     Inbox,
-    /// Agent session 1 and controller 2 bound together; a delivery condition
+    /// Agent session 1 and service 2 bound together; a delivery condition
     /// that may lapse, no authority.
-    Controller,
+    Service,
 }
 
-/// The controller of `controller_delivery`.
+/// The service of `service_delivery`.
 const ROBOT: i64 = 2;
 
 impl Feed {
     fn stream(self, state: &Value) -> &Value {
         match self {
-            Feed::Inbox | Feed::Controller => &state["stream"],
+            Feed::Inbox | Feed::Service => &state["stream"],
         }
     }
 
@@ -1474,8 +1314,8 @@ impl Feed {
     /// The consumer the model numbers `who`.
     fn receiver(self, who: i64) -> message::Receiver {
         match self {
-            Feed::Controller if who == ROBOT => {
-                message::Receiver { kind: ConsumerKind::Controller, id: who.to_string(), host: "consumer".into() }
+            Feed::Service if who == ROBOT => {
+                message::Receiver { kind: ConsumerKind::Service, id: who.to_string(), host: "consumer".into() }
             }
             _ => consumer(who.to_string()),
         }
@@ -1485,7 +1325,7 @@ impl Feed {
     fn binding(self, state: &Value) -> InboxBinding {
         let bound: BTreeSet<i64> = match self {
             Feed::Inbox => [number(&state["bound"])].into_iter().filter(|who| *who != 0).collect(),
-            Feed::Controller => set(&state["bound"]).iter().map(number).collect(),
+            Feed::Service => set(&state["bound"]).iter().map(number).collect(),
         };
         if bound.is_empty() {
             InboxBinding::Unbound { since: moment(number(&state["unboundAt"])) }
@@ -1539,14 +1379,14 @@ impl<'a> MessageReplay<'a> {
         let applied = stream.sessions("receipt");
         let receipts = match &self.sessions {
             // The entries about the message whose rows the message's home has applied.
-            // A controller's rows stand for its entries: its kind has no machine here.
+            // A service's rows stand for its entries: its records are not composed here.
             Some(sessions) => {
                 let about = receipts_about(sessions, ONE);
                 applied
                     .iter()
                     .map(|who| {
                         let receiver = self.feed.receiver(*who);
-                        if receiver.kind == ConsumerKind::Controller {
+                        if receiver.kind == ConsumerKind::Service {
                             return (receiver, Transport::Turn);
                         }
                         let entries =
@@ -1557,7 +1397,7 @@ impl<'a> MessageReplay<'a> {
             }
             None => applied.iter().map(|who| (self.feed.receiver(*who), Transport::Turn)).collect(),
         };
-        let condition = (self.feed == Feed::Controller).then(|| boolean(&state["conditionHolds"]));
+        let condition = (self.feed == Feed::Service).then(|| boolean(&state["conditionHolds"]));
         flotilla_quint_testkit::message::observed_world(ONE, &stream, self.feed.binding(state), receipts, condition, witness)
     }
 
@@ -1565,7 +1405,7 @@ impl<'a> MessageReplay<'a> {
         tally.steps += 1;
         let now = moment(number(&step.before["now"]));
         let who = match self.feed {
-            Feed::Inbox | Feed::Controller => step.chosen("who"),
+            Feed::Inbox | Feed::Service => step.chosen("who"),
         };
         let world = self.world(step.before, false);
         let edge: Option<MessageEdge> = match (self.feed, step.action()) {
@@ -1581,7 +1421,7 @@ impl<'a> MessageReplay<'a> {
                 assert_eq!(tag(model), "Dropped", "{step}: a drop drops");
                 let reason = &payload(model)["reason"];
                 let reason = match (self.feed, tag(reason)) {
-                    (Feed::Controller, "Withdrawn") => withdrawn_by_turn_rules(),
+                    (Feed::Service, "Withdrawn") => withdrawn_by_turn_rules(),
                     _ => drop_reason(reason),
                 };
                 Some(message::DropMessage { reason }.into())
@@ -1601,7 +1441,7 @@ impl<'a> MessageReplay<'a> {
                 accept(sessions, &who.to_string(), End { reason: EndReason::Completed, observed }, &ends, now, step, tally);
                 None
             }
-            (Feed::Controller, "endAgent") => {
+            (Feed::Service, "endAgent") => {
                 let observed = Ref::new("1");
                 let mut ends = MemoryAgentSessionWorld::default();
                 ends.ends.put(&observed, EndReason::Completed);
@@ -1611,8 +1451,8 @@ impl<'a> MessageReplay<'a> {
             }
             // A receipt is the consumer session's Receive edge about the message;
             // its row then travels the stream to the message's home.
-            (Feed::Inbox, "receive") | (Feed::Controller, "receiveAgent") => {
-                let name = if self.feed == Feed::Controller { "1".to_owned() } else { who.to_string() };
+            (Feed::Inbox, "receive") | (Feed::Service, "receiveAgent") => {
+                let name = if self.feed == Feed::Service { "1".to_owned() } else { who.to_string() };
                 let sessions = self.sessions.as_mut().expect("sessions");
                 let receive = Receive { message: ONE.into(), transport: Transport::Turn };
                 accept(sessions, &name, receive, &MemoryAgentSessionWorld::default(), now, step, tally);
@@ -1624,7 +1464,7 @@ impl<'a> MessageReplay<'a> {
                 "turn" | "publish" | "bind" | "unbindEndedWorld" | "unbindSilentWorld" | "applySource" | "applyHome" | "disconnect"
                 | "connect" | "die" | "recover" | "tick",
             )
-            | (Feed::Controller, "take" | "receiveRobot" | "bringAbout" | "retireRobot" | "applyStream" | "tick" | "lapse") => None,
+            | (Feed::Service, "take" | "receiveRobot" | "bringAbout" | "retireRobot" | "applyStream" | "tick" | "lapse") => None,
             (_, other) => panic!("{step}: message operation {other}"),
         };
         if let Some(edge) = edge {
@@ -1690,10 +1530,10 @@ impl<'a> MessageReplay<'a> {
             }
         }
         // `receiverTurned`, `receiverTookIt`: a receipt exists only after the
-        // consumer's turn, or the controller's run.
+        // consumer's turn, or the service's run.
         let took = match self.feed {
             Feed::Inbox => Some(&state["turned"]),
-            Feed::Controller => Some(&state["took"]),
+            Feed::Service => Some(&state["took"]),
         };
         if let Some(took) = took {
             let took: BTreeSet<i64> = set(took).iter().map(number).collect();
@@ -1704,7 +1544,7 @@ impl<'a> MessageReplay<'a> {
             }
         }
         // `withdrawnAfterLapse`: the turn-rules role withdraws only a lapsed message.
-        if self.feed == Feed::Controller
+        if self.feed == Feed::Service
             && would_accept(&self.home, ONE, message::DropMessage { reason: withdrawn_by_turn_rules() }, &world, now, tally)
         {
             assert!(!boolean(&state["conditionHolds"]), "{step}: withdrawn while its delivery condition holds");
@@ -1719,8 +1559,8 @@ fn inbox_delivery(trace: &Trace, tally: &mut Tally) {
     }
 }
 
-fn controller_delivery(trace: &Trace, tally: &mut Tally) {
-    let mut replay = MessageReplay::new(trace, Feed::Controller);
+fn service_delivery(trace: &Trace, tally: &mut Tally) {
+    let mut replay = MessageReplay::new(trace, Feed::Service);
     for step in trace.steps() {
         replay.step(&step, tally);
     }
@@ -1763,6 +1603,10 @@ fn awaiting_spec(record: &Value) -> AwaitingReplySpec {
             "At" => Some(moment(number(payload(&request["deadline"])))),
             other => panic!("deadline {other}"),
         },
+        // A stall's evidence is data no rule reads, so the spec does not model it.
+        report: None,
+        stall_reason: None,
+        proposed_disposition: None,
     }
 }
 
@@ -1902,17 +1746,16 @@ fn scenario_of<'a>(file: &str, prefix: &'a str) -> Option<&'a str> {
 fn replay_quint_itf_traces() {
     let directory =
         std::env::var("QUINT_TRACE_DIR").expect("QUINT_TRACE_DIR names a directory of ITF traces from specs/primitives/check.sh");
-    let scenarios: [(&str, Scenario); 8] = [
+    let scenarios: [(&str, Scenario); 7] = [
         ("convoy_deliver", convoy_deliver),
-        ("ensure_bind", ensure_bind),
         ("inbox_delivery", inbox_delivery),
         ("message_race", message_race::<BareMessage>),
-        ("controller_delivery", controller_delivery),
+        ("service_delivery", service_delivery),
         ("machine_edges", machine_edges),
         ("admission_placement", admission_placement),
         ("reply_exchange", reply_exchange),
     ];
-    let mut tallies = [Tally::default(); 8];
+    let mut tallies = [Tally::default(); 7];
     let mut paths: Vec<_> = fs::read_dir(Path::new(&directory))
         .unwrap_or_else(|error| panic!("read {directory}: {error}"))
         .map(|entry| entry.expect("entry").path())

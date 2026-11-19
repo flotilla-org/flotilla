@@ -20,31 +20,12 @@ pub(crate) struct TestProjectOperations {
     pub identity_resolutions: AtomicUsize,
     pub available: AtomicBool,
     pub inspections: AtomicUsize,
+    /// The remote every inspected checkout reports; without one, inspection is unexpected.
+    pub checkout_remote: Option<String>,
     pub tasks: std::sync::Mutex<Vec<ConvoyStartTask>>,
 }
 #[async_trait]
 impl crate::project_ops::ProjectOperations for TestProjectOperations {
-    // Stand-in for Git inspection I/O; checkout persistence uses real stores.
-    async fn inspect_adopted_checkout(
-        &self,
-        path: &Path,
-        repository_url: Option<&str>,
-        git_ref: Option<&str>,
-    ) -> Result<RepositoryInspection, String> {
-        self.inspections.fetch_add(1, Ordering::SeqCst);
-        let url = repository_url.expect("explicit repository");
-        Ok(RepositoryInspection {
-            spec: RepositorySpec::remote(url)?,
-            checkout: crate::repository_inspection::LocalCheckoutInspection {
-                path: path.into(),
-                host_ref: "host".into(),
-                git_ref: git_ref.unwrap().into(),
-                is_main: false,
-            },
-            transport_url: Some(url.into()),
-            replaces_prior_repository: false,
-        })
-    }
     async fn project_add(&self, _: &str, _: Option<&str>, _: Option<&str>, _: Option<&str>) -> Result<String, String> {
         panic!("no project edits")
     }
@@ -59,6 +40,9 @@ impl crate::project_ops::ProjectOperations for TestProjectOperations {
         _: &flotilla_protocol::image_check::ImageCheckRequest,
     ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
         panic!("no image checks")
+    }
+    async fn image_build_retry(&self, _: &str) -> Result<String, String> {
+        panic!("no image build retries")
     }
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(remote)
@@ -80,8 +64,21 @@ impl crate::project_ops::ProjectOperations for TestProjectOperations {
     async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
         self.inspector.clone().ok_or_else(|| "unexpected repository_inspector".into())
     }
-    async fn inspect_repository_path(&self, _path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
-        Err("unexpected inspect_repository_path".into())
+    // Stand-in for Git inspection I/O; checkout persistence uses real stores.
+    async fn inspect_repository_path(&self, path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        let url = self.checkout_remote.as_deref().ok_or_else(|| "unexpected inspect_repository_path".to_string())?;
+        self.inspections.fetch_add(1, Ordering::SeqCst);
+        Ok(RepositoryInspection {
+            spec: RepositorySpec::remote(url)?,
+            checkout: crate::repository_inspection::LocalCheckoutInspection {
+                path: path.into(),
+                host_ref: "host".into(),
+                git_ref: "main".into(),
+                is_main: true,
+            },
+            transport_url: Some(url.into()),
+            replaces_prior_repository: false,
+        })
     }
     async fn resolve_forge_identity_in(&self, _namespace: &str, spec: RepositorySpec) -> Result<RepositorySpec, String> {
         self.identity_resolutions.fetch_add(1, Ordering::SeqCst);
@@ -96,4 +93,11 @@ impl TestProjectOperations {
     pub fn with_inspector(inspector: Arc<dyn RepositoryInspector>) -> Self {
         Self { inspector: Some(inspector), ..Self::default() }
     }
+}
+
+/// The engine's readings as a daemon installs them, its environments, clones and checkouts with
+/// none held, shared: building a store per table or hegel case is slow.
+pub(crate) fn no_held_checkouts() -> &'static Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads> {
+    static READS: std::sync::OnceLock<Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>> = std::sync::OnceLock::new();
+    READS.get_or_init(|| flotilla_provisioning_testkit::EngineFixture::default().reads())
 }

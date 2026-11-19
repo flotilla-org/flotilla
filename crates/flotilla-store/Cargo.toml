@@ -14,6 +14,7 @@ skip-no-sandbox-tests = []
 flotilla-address = { path = "../flotilla-address" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-schema = { path = "../flotilla-schema" }
 flotilla-verbs = { path = "../flotilla-verbs" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -28,7 +29,6 @@ base64 = "0.22"
 bytes = { workspace = true }
 tracing = "0.1"
 sha2 = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
 serde_path_to_error = "0.1.20"
 
 [dev-dependencies]
@@ -41,6 +41,7 @@ hegeltest = "=0.48.1"
 rstest = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [lints]
 workspace = true

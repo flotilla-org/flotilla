@@ -9,7 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_schema::{Address, Timestamp};
+use flotilla_schema::{reads::carry, Address, Timestamp};
 use flotilla_state_machines::{machines::message::*, Home, MemoryLog, Ref, Resource, Source, Transport, Version, WriteError};
 use futures::{stream, Stream};
 use tokio::sync::Notify;
@@ -49,6 +49,8 @@ pub enum Error {
     /// The authoritative log can no longer bridge this cursor; take a new baseline.
     CursorExpired,
     CursorAhead,
+    /// A message already holds this name with a different intent.
+    DifferentIntent(String),
 }
 
 impl std::fmt::Display for Error {
@@ -59,6 +61,7 @@ impl std::fmt::Display for Error {
             Self::Storage(error) => write!(f, "inbox storage: {error}"),
             Self::CursorExpired => f.write_str("watch cursor expired; obtain a new pending baseline"),
             Self::CursorAhead => f.write_str("watch cursor is ahead of this home"),
+            Self::DifferentIntent(name) => write!(f, "message `{name}` already holds a different intent"),
         }
     }
 }
@@ -541,7 +544,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         // Serialize this source handle before submitting blocking work. Waiting
         // watchers occupy futures, never blocked pool threads or the writer.
         let mut reader = self.reader.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || operation(reader.as_mut())).await.map_err(|error| Error::Storage(error.to_string()))?
+        tokio::task::spawn_blocking(carry(move || operation(reader.as_mut()))).await.map_err(|error| Error::Storage(error.to_string()))?
     }
 
     async fn access<T: Send + 'static>(
@@ -552,7 +555,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
         // blocking work, with no arbitrary 64-operation pool reservation.
         let writer = self.worker.clone().lock_owned().await;
         let backend = self.clone();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(carry(move || {
             let _writer = writer;
             let mut state = backend.state.lock().expect("inbox writer");
             let previous = state.sequence;
@@ -562,7 +565,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
                 backend.changed.notify_waiters();
             }
             result
-        })
+        }))
         .await
         .map_err(|error| Error::Storage(error.to_string()))?
     }
@@ -937,6 +940,16 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
         let name = message_address(&spec.inbox, id)?;
         self.access(move |backend, state| {
             if state.home.get(&name).is_some() || state.home.log_mut().exists(&name)? {
+                // The same intent again is the message already admitted; another intent under its
+                // name is refused. One no longer held here (archived) is taken as admitted.
+                if Self::load(state, &name)? {
+                    let held = state.home.get(&name).ok_or_else(|| Error::Storage("loaded message missing from Home".into()))?.spec();
+                    let mut again = spec;
+                    again.admitted_seq = held.admitted_seq;
+                    if *held != again {
+                        return Err(Error::DifferentIntent(name));
+                    }
+                }
                 return Ok(name);
             }
             backend.enqueue_named(state, spec, Some(name))

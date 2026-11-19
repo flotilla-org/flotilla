@@ -19,6 +19,71 @@ pub fn live_convoys_query() -> crate::StoreQuery {
     }
 }
 
+/// The abandoned convoys still held, failed ones included: the views hold a launch until it
+/// retires. Only these can hold a submitted PR (#3108 ruling 1); a landed one delivered with
+/// nothing open.
+pub fn abandoned_convoys_query() -> crate::StoreQuery {
+    crate::StoreQuery {
+        field_values: BTreeMap::from([("status.phase".into(), ["Failed", "Abandoned"].map(String::from).to_vec())]),
+        include_replicas: true,
+        ..Default::default()
+    }
+}
+
+/// The ended convoys still held, landed ones as well as abandoned and failed: the engine's views
+/// hold a launch until it retires, so a landed one listed may still hold a checkout to be
+/// released. The old store keeps every landed convoy, so only a reader of the engine's launches
+/// lists these.
+pub fn ended_convoys_query() -> crate::StoreQuery {
+    crate::StoreQuery {
+        field_values: BTreeMap::from([("status.phase".into(), ["Landed", "Failed", "Abandoned"].map(String::from).to_vec())]),
+        include_replicas: true,
+        ..Default::default()
+    }
+}
+
+/// Each named standing role's current generation: its newest live convoy, by the ConvoyEnsure name
+/// the convoy was ensured from. A role with no live generation is absent. Every host reads the same
+/// generations, so the answer needs no status of the ensure's own (#3108).
+pub async fn current_generations(
+    backend: &crate::ResourceBackend,
+    namespace: &str,
+    ensures: impl IntoIterator<Item = String>,
+) -> Result<BTreeMap<String, flotilla_resources::ResourceObject<flotilla_resources::Convoy>>, flotilla_resources::ResourceError> {
+    let names: Vec<String> = ensures.into_iter().collect();
+    if names.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let rows = backend.query_declared::<flotilla_resources::Convoy>(namespace, &generations_query(names)).await?.items;
+    Ok(newest_live_generations(rows.iter().map(|row| &row.object)).into_iter().map(|(ensure, convoy)| (ensure, convoy.clone())).collect())
+}
+
+/// The live convoys ensured from the named ConvoyEnsures: what [`current_generations`] reads, for
+/// a reader that folds it into a wider query.
+pub fn generations_query(ensures: Vec<String>) -> crate::StoreQuery {
+    let mut query = live_convoys_query();
+    query.field_values.insert(format!("metadata.annotations.\"{}\"", flotilla_resources::ENSURED_FROM_ANNOTATION), ensures);
+    query
+}
+
+/// Each standing role's current generation among `convoys`: its newest live convoy, by the
+/// ConvoyEnsure name it was ensured from.
+pub fn newest_live_generations<'a>(
+    convoys: impl IntoIterator<Item = &'a flotilla_resources::ResourceObject<flotilla_resources::Convoy>>,
+) -> BTreeMap<String, &'a flotilla_resources::ResourceObject<flotilla_resources::Convoy>> {
+    let mut current = BTreeMap::<String, &flotilla_resources::ResourceObject<flotilla_resources::Convoy>>::new();
+    for convoy in convoys {
+        let Some(ensure) = convoy.metadata.annotations.get(flotilla_resources::ENSURED_FROM_ANNOTATION) else { continue };
+        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            continue;
+        }
+        if current.get(ensure).is_none_or(|held| held.spec.generation < convoy.spec.generation) {
+            current.insert(ensure.clone(), convoy);
+        }
+    }
+    current
+}
+
 /// What a convoy address names exactly (#4272): the convoy holding role `name` in `project`, or
 /// in no project when `project` is `None`; failing that, the record `name`, which is how a convoy
 /// row's own address names it. Nothing is completed: a role without a project names a convoy of
@@ -105,15 +170,85 @@ impl<'a> ConvoyName<'a> {
         Ok(candidates)
     }
 
-    /// The convoy this name answers with in `namespace`, read through one indexed query.
+    /// The convoy this plain name answers with in `namespace`: [`Self::lookup_address`]'s, else
+    /// [`Self::newest_launch`], so a name whose launches have all retired still names its last.
     pub async fn lookup(
+        &self,
+        backend: &crate::ResourceBackend,
+        namespace: &str,
+    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>, String> {
+        let project = self.placed(backend, namespace).await?;
+        let placed = ConvoyName { project: project.as_deref(), name: self.name };
+        match placed.lookup_address(backend, namespace).await? {
+            Some(found) => Ok(Some(found)),
+            None => placed.newest_launch(backend, namespace).await,
+        }
+    }
+
+    /// The project this name names its role in (run 3 F6): its own, or for a plain name the one
+    /// project whose convoys hold the role, live, ended or retired; `None` where none does, so it
+    /// can name only a record. `Err` naming each `<name>@<project>` when several projects do.
+    /// It reads every launch (no index names a launch by its role): plain names are typed reads.
+    pub async fn placed(&self, backend: &crate::ResourceBackend, namespace: &str) -> Result<Option<String>, String> {
+        if let Some(project) = self.project {
+            return Ok(Some(project.to_owned()));
+        }
+        let rows =
+            backend.query_declared::<flotilla_resources::Convoy>(namespace, &self.query()).await.map_err(|error| error.to_string())?;
+        let mut projects: std::collections::BTreeSet<String> = rows
+            .items
+            .iter()
+            .map(|row| ConvoyIdentity::of(&row.object))
+            .filter(|identity| identity.role == Some(self.name))
+            .filter_map(|identity| identity.project.filter(|project| !project.is_empty()).map(str::to_owned))
+            .collect();
+        if let Some(newest) = self.newest_launch(backend, namespace).await? {
+            projects.extend(ConvoyIdentity::of(&newest.object).project.filter(|project| !project.is_empty()).map(str::to_owned));
+        }
+        if projects.len() > 1 {
+            return Err(flotilla_resources::convoy_records::several_projects(self.name, &projects));
+        }
+        Ok(projects.pop_first())
+    }
+
+    /// The newest launch holding this name's role in its project, a retired one included: what a
+    /// plain name names once no live or unretired launch answers for it.
+    pub async fn newest_launch(
+        &self,
+        backend: &crate::ResourceBackend,
+        namespace: &str,
+    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>, String> {
+        let mut labels = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_owned(), self.name.to_owned())]);
+        if let Some(project) = self.project {
+            labels.insert(flotilla_resources::PROJECT_LABEL.to_owned(), project.to_owned());
+        }
+        backend
+            .including_replicas::<flotilla_resources::Convoy>(namespace)
+            .newest_labelled(&labels)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// What a convoy address names in `namespace`, read through one indexed query: a live or
+    /// unretired holder of the role, never a retired one; where that selects none, the record of
+    /// the name read by name, which gives a retired one too.
+    pub async fn lookup_address(
         &self,
         backend: &crate::ResourceBackend,
         namespace: &str,
     ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>, String> {
         let rows =
             backend.query_declared::<flotilla_resources::Convoy>(namespace, &self.query()).await.map_err(|error| error.to_string())?;
-        Ok(self.select(&rows.items)?.cloned())
+        if let Some(selected) = self.select(&rows.items)? {
+            return Ok(Some(selected.clone()));
+        }
+        let copies = backend
+            .including_replicas::<flotilla_resources::Convoy>(namespace)
+            .get_all(self.name)
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        Ok(self.select(&copies)?.cloned())
     }
 }
 
@@ -207,10 +342,22 @@ pub async fn subject_record_name(
     address: &flotilla_address::Address,
 ) -> Result<Option<String>, String> {
     if address.kind() == flotilla_address::Kind::Convoy {
-        let convoy = ConvoyName::of(address).lookup(backend, namespace).await?;
+        let convoy = ConvoyName::of(address).lookup_address(backend, namespace).await?;
         return Ok(convoy.map(|convoy| convoy.object.metadata.name));
     }
     Ok(flotilla_address::record_name(address))
+}
+
+/// Writes `patch` to this home's notes on convoy `name` as its readers now see it (#3108 C3'), and
+/// returns the convoy with the notes as they now stand. See [`flotilla_resources::convoy::engine::note`].
+pub async fn note_convoy<P: flotilla_resources::StatusPatch<flotilla_resources::ConvoyStatus> + ?Sized>(
+    path: &flotilla_resources::convoy::engine::EngineConvoyPath,
+    convoys: &crate::TypedResolver<flotilla_resources::Convoy>,
+    name: &str,
+    patch: &P,
+) -> Result<flotilla_resources::ResourceObject<flotilla_resources::Convoy>, String> {
+    let convoy = convoys.get(name).await.map_err(|error| error.to_string())?;
+    flotilla_resources::convoy::engine::note(path, &convoy, patch)
 }
 
 #[cfg(test)]
@@ -227,7 +374,10 @@ mod live_query_tests {
         let convoys = backend.using::<Convoy>("ns");
         let mut expected = std::collections::BTreeSet::from(["missing".to_string()]);
         convoys
-            .create(&InputMeta::builder().name("missing".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .create(
+                &InputMeta::builder().name("missing".into()).build(),
+                &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("ns".into()).build(),
+            )
             .await
             .expect("missing status");
         for phase in [
@@ -249,7 +399,10 @@ mod live_query_tests {
                 ConvoyPhase::Abandoned => "abandoned",
             };
             let created = convoys
-                .create(&InputMeta::builder().name(name.into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+                .create(
+                    &InputMeta::builder().name(name.into()).build(),
+                    &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("ns".into()).build(),
+                )
                 .await
                 .expect("phase record");
             convoys
@@ -271,17 +424,11 @@ mod lookup_tests {
     use super::*;
     use flotilla_resources::{Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta, PROJECT_LABEL, ROLE_LABEL};
 
-    /// Creates convoy `record` holding `role` in `project`, labelled as admission labels it: a
-    /// convoy of no project carries an empty project label.
-    async fn convoy(backend: &crate::ResourceBackend, record: &str, role: &str, project: Option<&str>, phase: Option<ConvoyPhase>) {
+    /// Creates convoy `record` holding `role` in `project`, labelled as admission labels it.
+    async fn convoy(backend: &crate::ResourceBackend, record: &str, role: &str, project: &str, phase: Option<ConvoyPhase>) {
         let convoys = backend.clone().using::<Convoy>("ns");
-        let labels =
-            BTreeMap::from([(ROLE_LABEL.to_owned(), role.to_owned()), (PROJECT_LABEL.to_owned(), project.unwrap_or_default().to_owned())]);
-        let spec = ConvoySpec::builder()
-            .workflow_ref("workflow".into())
-            .maybe_project_ref(project.map(str::to_owned))
-            .role(role.to_owned())
-            .build();
+        let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), role.to_owned()), (PROJECT_LABEL.to_owned(), project.to_owned())]);
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(project.to_owned()).role(role.to_owned()).build();
         let created = convoys.create(&InputMeta::builder().name(record.into()).labels(labels).build(), &spec).await.unwrap();
         if let Some(phase) = phase {
             let status = ConvoyStatus { phase, ..Default::default() };
@@ -301,12 +448,13 @@ mod lookup_tests {
     #[tokio::test]
     async fn a_convoy_address_names_a_role_or_a_record_in_its_project() {
         let backend = crate::test_store::memory_backend();
-        convoy(&backend, "convoy-0123", "reviewer", Some("flotilla"), None).await;
-        convoy(&backend, "convoy-0456", "lander", None, None).await;
+        convoy(&backend, "convoy-0123", "reviewer", "flotilla", None).await;
+        convoy(&backend, "convoy-0456", "lander", "other", None).await;
         for (address, record) in [
             ("project:flotilla/convoy:reviewer", Some("convoy-0123")),
             ("project:flotilla/convoy:convoy-0123", Some("convoy-0123")),
-            ("convoy:lander", Some("convoy-0456")),
+            ("project:other/convoy:lander", Some("convoy-0456")),
+            ("convoy:lander", None),
             ("convoy:convoy-0456", Some("convoy-0456")),
             ("convoy:reviewer", None),
             ("convoy:convoy-0123", Some("convoy-0123")),
@@ -324,15 +472,15 @@ mod lookup_tests {
     #[tokio::test]
     async fn the_role_answers_ahead_of_a_record_named_like_it() {
         let backend = crate::test_store::memory_backend();
-        convoy(&backend, "lander", "coder", Some("flotilla"), None).await;
-        convoy(&backend, "convoy-1", "lander", Some("flotilla"), Some(ConvoyPhase::Landed)).await;
-        convoy(&backend, "convoy-2", "lander", Some("flotilla"), Some(ConvoyPhase::Active)).await;
+        convoy(&backend, "lander", "coder", "flotilla", None).await;
+        convoy(&backend, "convoy-1", "lander", "flotilla", Some(ConvoyPhase::Landed)).await;
+        convoy(&backend, "convoy-2", "lander", "flotilla", Some(ConvoyPhase::Active)).await;
         assert_eq!(lookup(&backend, "project:flotilla/convoy:lander").await, Ok(Some("convoy-2".into())));
         assert_eq!(lookup(&backend, "project:flotilla/convoy:coder").await, Ok(Some("lander".into())));
 
-        convoy(&backend, "convoy-3", "reviewer", Some("flotilla"), Some(ConvoyPhase::Landed)).await;
+        convoy(&backend, "convoy-3", "reviewer", "flotilla", Some(ConvoyPhase::Landed)).await;
         assert_eq!(lookup(&backend, "project:flotilla/convoy:reviewer").await, Ok(Some("convoy-3".into())));
-        convoy(&backend, "convoy-4", "reviewer", Some("flotilla"), Some(ConvoyPhase::Abandoned)).await;
+        convoy(&backend, "convoy-4", "reviewer", "flotilla", Some(ConvoyPhase::Abandoned)).await;
         let ambiguous = lookup(&backend, "project:flotilla/convoy:reviewer").await.unwrap_err();
         assert_eq!(ambiguous, "convoy `reviewer@flotilla` is held by several records; name one by its record: convoy-3, convoy-4");
     }

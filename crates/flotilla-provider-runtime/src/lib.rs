@@ -6,6 +6,8 @@ pub use observation_error::ObservationError;
 pub mod execution_context;
 mod git_config_guard;
 pub mod host_environment;
+mod lazy_http;
+pub use lazy_http::LazyHttpClient;
 pub mod ssh_runner;
 pub use rigging_http_client::http_execute;
 pub use rigging_http_client::{HttpClient, ReqwestHttpClient};
@@ -17,6 +19,7 @@ pub use rigging_process::{
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
+/// Refuses Git commands that would change the host's shared Git config.
 pub struct GitConfigGuard;
 #[async_trait::async_trait]
 impl rigging_process::CommandGuard for GitConfigGuard {
@@ -24,7 +27,7 @@ impl rigging_process::CommandGuard for GitConfigGuard {
         "flotilla"
     }
     async fn check(&self, cmd: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
-        git_config_guard::guard_host_git_config_async(cmd, args, cwd).await
+        git_config_guard::guard_host_git_config(cmd, args, cwd).await
     }
 }
 /// Guarded Rigging runner. The same-named value below preserves existing unit-struct-style call sites.

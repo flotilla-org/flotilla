@@ -26,6 +26,7 @@ flotilla-config = { path = "../flotilla-config" }
 bytes.workspace = true
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-fake-forge = { path = "../flotilla-fake-forge" }
+flotilla-log-testkit = { path = "../flotilla-log-testkit" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
 hegeltest = "=0.48.1"
 http.workspace = true

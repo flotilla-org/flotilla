@@ -46,6 +46,9 @@ pub struct ChannelTransport {
     // Reference to the remote transport's session_tx_slot — used by sender()
     // to deliver data directly without going through the backbone/forwarding task.
     remote_session_tx_slot: Arc<std::sync::Mutex<Option<mpsc::Sender<PeerWireMessage>>>>,
+    /// Signalled when this side opens a session, and when the remote side does.
+    local_session_opened: Arc<tokio::sync::Notify>,
+    remote_session_opened: Arc<tokio::sync::Notify>,
     // Forwarding task state — only set after subscribe()
     cancel_tx: Option<oneshot::Sender<()>>,
     task_handle: Option<JoinHandle<()>>,
@@ -71,6 +74,8 @@ pub struct ChannelSender {
     session_tx: std::sync::Mutex<Option<mpsc::Sender<PeerWireMessage>>>,
     /// Reference to the remote's session slot for lazy resolution.
     remote_session_tx_slot: Arc<std::sync::Mutex<Option<mpsc::Sender<PeerWireMessage>>>>,
+    /// Signalled when the remote side opens its session.
+    remote_session_opened: Arc<tokio::sync::Notify>,
 }
 
 impl ChannelSender {
@@ -97,7 +102,17 @@ impl PeerSender for ChannelSender {
             return Err("channel sender retired".to_string());
         }
 
-        let tx = self.resolve_session_tx().ok_or_else(|| "channel closed".to_string())?;
+        // A socket's connected end accepts writes before the far end reads them: a send on a
+        // link whose remote has not opened its session yet waits for it to open.
+        let tx = loop {
+            let opened = self.remote_session_opened.notified();
+            tokio::pin!(opened);
+            opened.as_mut().enable();
+            if let Some(tx) = self.resolve_session_tx() {
+                break tx;
+            }
+            opened.await;
+        };
         tx.send(msg).await.map_err(|_| "channel closed".to_string())
     }
 
@@ -184,6 +199,7 @@ impl PeerTransport for ChannelTransport {
         // Create fresh session channel
         let (session_tx, session_rx) = mpsc::channel(CHANNEL_BUFFER);
         self.local_session_tx_slot.lock().expect("session slot lock").replace(session_tx);
+        self.local_session_opened.notify_waiters();
         self.session_rx = Some(session_rx);
 
         // Notify remote side
@@ -279,6 +295,7 @@ impl PeerTransport for ChannelTransport {
             retired: tokio::sync::Mutex::new(false),
             session_tx: std::sync::Mutex::new(session_tx),
             remote_session_tx_slot: Arc::clone(&self.remote_session_tx_slot),
+            remote_session_opened: Arc::clone(&self.remote_session_opened),
         }) as Arc<dyn PeerSender>)
     }
 
@@ -305,6 +322,8 @@ pub fn channel_transport_pair_with_nodes(local_node: NodeInfo, remote_node: Node
     // session channel. The remote's sender() clones from here for direct delivery.
     let a_session_slot: Arc<std::sync::Mutex<Option<mpsc::Sender<PeerWireMessage>>>> = Arc::new(std::sync::Mutex::new(None));
     let b_session_slot: Arc<std::sync::Mutex<Option<mpsc::Sender<PeerWireMessage>>>> = Arc::new(std::sync::Mutex::new(None));
+    let a_session_opened = Arc::new(tokio::sync::Notify::new());
+    let b_session_opened = Arc::new(tokio::sync::Notify::new());
 
     let transport_a = ChannelTransport {
         local_name: HostName::new(local_node.display_name.clone()),
@@ -316,6 +335,8 @@ pub fn channel_transport_pair_with_nodes(local_node: NodeInfo, remote_node: Node
         local_session_tx_slot: Arc::clone(&a_session_slot),
         session_rx: None,
         remote_session_tx_slot: Arc::clone(&b_session_slot),
+        local_session_opened: Arc::clone(&a_session_opened),
+        remote_session_opened: Arc::clone(&b_session_opened),
         cancel_tx: None,
         task_handle: None,
     };
@@ -330,6 +351,8 @@ pub fn channel_transport_pair_with_nodes(local_node: NodeInfo, remote_node: Node
         local_session_tx_slot: Arc::clone(&b_session_slot),
         session_rx: None,
         remote_session_tx_slot: Arc::clone(&a_session_slot),
+        local_session_opened: b_session_opened,
+        remote_session_opened: a_session_opened,
         cancel_tx: None,
         task_handle: None,
     };

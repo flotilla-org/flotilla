@@ -6,11 +6,13 @@
 //! - `Release{teardownComplete}`: the teardown reads `teardownComplete`.
 //! - `Vanish{absent}`: the absence reads `absent`.
 //! - `Attempted(outcome)`: an [`Attempted`] edge with that outcome.
+//! - `FailedEarly{retryable, cause}`: a [`FailedEarly`] edge with that cause.
 //! - `GiveUp{cause}`: a [`GiveUp`] edge with that cause; the probe kind's
 //!   policy gives up after the spec's `MAX_FAILURES` (2) failures.
 //!
 //! State mapping: `Requested(history)` is `Requested { .. }` with `history`
-//! the resource's `Attempted` log entries in order. The state keeps only the
+//! the resource's `Attempted` log entries in order, each `FailedEarly` entry
+//! replacing the failure before it ([`attempt_history`]). The state keeps only the
 //! tally of that history (D2: a decision reads no log), so encoding also
 //! checks the tally against the history's failures since its last success
 //! and its last outcome. `Gone` is one to one, `Realised { identity }` is
@@ -23,8 +25,8 @@
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::lifecycle::{
-        Attempted, GiveUp, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed,
-        Realise, Release, Vanish,
+        attempt_history, Attempted, FailedEarly, GiveUp, Lifecycle, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld,
+        Observed, Realise, Release, Vanish,
     },
     AttemptPolicy, Cause, CauseCategory, Home, Outcome, Ref, Version, WriteError,
 };
@@ -140,6 +142,9 @@ impl Conformance for LifecycleConformance {
                 };
                 outcome(home.apply(NAME, Attempted { outcome: attempted }, &world, at))
             }
+            "FailedEarly" => {
+                outcome(home.apply(NAME, FailedEarly { cause: cause(text(&o["cause"])), retryable: boolean(&o["retryable"]) }, &world, at))
+            }
             "GiveUp" => outcome(home.apply(NAME, GiveUp { cause: cause(text(&o["cause"])) }, &world, at)),
             other => panic!("lifecycle event {other}"),
         }
@@ -147,16 +152,9 @@ impl Conformance for LifecycleConformance {
 
     fn encode(home: &Home<P>) -> Value {
         let resource = home.get(NAME).expect("exists");
-        let attempts: Vec<&Outcome> = home
-            .log()
-            .history(NAME, Version(0), usize::MAX)
-            .into_iter()
-            .filter_map(|(_, event)| match &event.arguments.edge {
-                LifecycleEdge::Attempted(attempted) => Some(&attempted.outcome),
-                _ => None,
-            })
-            .collect();
-        encode_state(resource.state(), &attempts)
+        let attempts =
+            attempt_history(home.log().history(NAME, Version(0), usize::MAX).into_iter().map(|(_, event)| &event.arguments.edge));
+        encode_state(resource.state(), &attempts.iter().collect::<Vec<_>>())
     }
 
     fn version(home: &Home<P>) -> u64 {

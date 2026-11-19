@@ -66,6 +66,7 @@ mod code;
 mod codec;
 mod describe;
 mod descriptor;
+pub mod reads;
 pub use describe::{Describe, DescribeChild, DescribeElement, DescribedRow, RowWriter};
 mod edge;
 mod event;
@@ -111,7 +112,7 @@ pub use registry::{KindRegistry, RegistryError};
 #[doc(hidden)]
 pub use state::StateDelta;
 pub use state::{RowEdit, State};
-pub use time::Timestamp;
+pub use time::{CreatedAt, Timestamp};
 pub use traits::{CodeEnum, Column, Columns, Element, Flat, Intern, KeyColumn, Kind, KindSpec, StateData, SUPPORTED_ATTRIBUTES};
 pub use value::{Hash, Identity, KindCode, Row, Rows, Value};
 pub use view::{column_count, enum_columns, render_table_view, render_view, state_data, WIDE};

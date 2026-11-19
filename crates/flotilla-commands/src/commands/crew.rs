@@ -45,9 +45,6 @@ pub struct CrewNoun {
     /// Machine-readable settlement answer declared by the brief
     #[arg(long)]
     pub disposition: Option<String>,
-    /// Previous-generation completion pointer; accepted only for pinned legacy snapshots.
-    #[arg(long = "decision-ledger-ref", hide = true)]
-    pub decision_ledger_ref: Option<String>,
     /// Admit a ledger-less completion or failure as the connected operator principal
     #[arg(long)]
     pub force: bool,
@@ -78,9 +75,12 @@ pub enum CrewVerb {
     Handoff {
         #[arg(long)]
         message: String,
-        /// Typed Message reference as JSON; repeat for each carried resource/revision.
+        /// A reference as `<address>@<revision>`; repeat for each thing carried.
         #[arg(long = "carry", value_parser = parse_carry)]
-        carries: Vec<flotilla_protocol::MessageReference>,
+        carries: Vec<flotilla_address::Reference>,
+        /// The id of an open promise you own, moved to the target with the work; repeat for each.
+        #[arg(long = "reassign")]
+        reassign: Vec<String>,
     },
     /// Resume stalled crew work, or send mid-turn guidance to working crew as an operator
     Resume {
@@ -99,8 +99,8 @@ pub enum CrewVerb {
     },
 }
 
-fn parse_carry(value: &str) -> Result<flotilla_protocol::MessageReference, String> {
-    serde_json::from_str(value).map_err(|error| format!("invalid typed Message reference: {error}"))
+fn parse_carry(value: &str) -> Result<flotilla_address::Reference, String> {
+    value.parse().map_err(|error| format!("invalid reference `{value}`: {error}"))
 }
 
 impl CrewNoun {
@@ -141,7 +141,7 @@ impl CrewNoun {
         {
             return Err("promise options require crew promise, submit or retract".into());
         }
-        if promise_command && (self.force || self.message.is_some() || self.disposition.is_some() || self.decision_ledger_ref.is_some()) {
+        if promise_command && (self.force || self.message.is_some() || self.disposition.is_some()) {
             return Err("promise operations do not accept completion options".into());
         }
         if promise_command && subject.value != "retract" && self.reason.is_some() {
@@ -185,13 +185,7 @@ impl CrewNoun {
                 if stalls_scope_requested {
                     return Err("`flotilla crew stalls` is fleet-wide and does not accept crew selectors".to_string());
                 }
-                if self.message.is_some()
-                    || self.reason.is_some()
-                    || self.propose.is_some()
-                    || self.disposition.is_some()
-                    || self.decision_ledger_ref.is_some()
-                    || self.force
-                {
+                if self.message.is_some() || self.reason.is_some() || self.propose.is_some() || self.disposition.is_some() || self.force {
                     return Err("`flotilla crew stalls` does not accept completion options".to_string());
                 }
                 CommandAction::QueryCrewStalls { full: self.full }
@@ -201,7 +195,6 @@ impl CrewNoun {
                     && self.reason.is_none()
                     && self.propose.is_none()
                     && self.disposition.is_none()
-                    && self.decision_ledger_ref.is_none()
                     && !self.force =>
             {
                 if subject.value == "capabilities" {
@@ -214,29 +207,22 @@ impl CrewNoun {
                 return Err(format!("`flotilla crew {}` does not accept completion options", subject.value));
             }
             ("complete", SubjectInterpretation::Ordinary, None) => {
+                if !self.force {
+                    return Err(
+                        "`flotilla crew complete` is an operator's forced completion and requires --force; crews report a PR with `flotilla crew submit`"
+                            .to_string(),
+                    );
+                }
                 if self.reason.is_some() {
                     return Err("--reason is only valid with `flotilla crew stall`".to_string());
                 }
                 if self.propose.is_some() {
                     return Err("--propose is only valid with `flotilla crew stall`".to_string());
                 }
-                if self
-                    .decision_ledger_ref
-                    .as_deref()
-                    .is_some_and(|reference| !(reference.starts_with("https://") || reference.starts_with("http://")))
-                {
-                    return Err("--decision-ledger-ref must use an HTTP(S) URL".to_string());
-                }
-                CommandAction::CrewComplete {
-                    context,
-                    message: self.message,
-                    disposition: self.disposition,
-                    decision_ledger_ref: self.decision_ledger_ref,
-                    force: self.force,
-                }
+                CommandAction::CrewComplete { context, message: self.message, disposition: self.disposition }
             }
             ("fail", SubjectInterpretation::Ordinary, None)
-                if self.reason.is_some() || self.propose.is_some() || self.disposition.is_some() || self.decision_ledger_ref.is_some() =>
+                if self.reason.is_some() || self.propose.is_some() || self.disposition.is_some() =>
             {
                 return Err("`flotilla crew fail` does not accept completion options".to_string());
             }
@@ -246,7 +232,7 @@ impl CrewNoun {
                 force: self.force,
             },
             ("stall", SubjectInterpretation::Ordinary, None) => {
-                if self.disposition.is_some() || self.decision_ledger_ref.is_some() || self.force {
+                if self.disposition.is_some() || self.force {
                     return Err("`flotilla crew stall` does not accept completion options".to_string());
                 }
                 let reason = self.reason.ok_or_else(|| "`flotilla crew stall` requires --reason".to_string())?;
@@ -298,8 +284,8 @@ impl CrewNoun {
             (_, _, Some(_)) if self.force => {
                 return Err("--force is only valid with `flotilla crew complete` or `flotilla crew fail`".to_string())
             }
-            (_, _, Some(CrewVerb::Handoff { message, carries })) => {
-                CommandAction::CrewHandoff { context, target: subject.value, message, carries }
+            (_, _, Some(CrewVerb::Handoff { message, carries, reassign })) => {
+                CommandAction::CrewHandoff { context, target: subject.value, message, carries, reassign }
             }
             (_, _, Some(_)) => return Err("resume, fail, and escalate require `flotilla crew supervise`".to_string()),
             (_, _, None) => return Err("crew target requires a verb (for example: handoff)".to_string()),
@@ -348,9 +334,6 @@ impl std::fmt::Display for CrewNoun {
         if let Some(disposition) = &self.disposition {
             write!(f, " --disposition {}", quote_value(disposition))?;
         }
-        if let Some(reference) = &self.decision_ledger_ref {
-            write!(f, " --decision-ledger-ref {}", quote_value(reference))?;
-        }
         if self.full {
             write!(f, " --full")?;
         }
@@ -365,9 +348,12 @@ impl std::fmt::Display for CrewNoun {
                 CrewVerb::Escalate { message } => ("escalate", message),
             };
             write!(f, " {name} --message {}", quote_value(message))?;
-            if let CrewVerb::Handoff { carries, .. } = verb {
+            if let CrewVerb::Handoff { carries, reassign, .. } = verb {
                 for carry in carries {
-                    write!(f, " --carry {}", quote_value(&serde_json::to_string(carry).expect("typed carry")))?;
+                    write!(f, " --carry {}", quote_value(&carry.to_string()))?;
+                }
+                for promise in reassign {
+                    write!(f, " --reassign {}", quote_value(promise))?;
                 }
             }
         }
@@ -521,6 +507,7 @@ mod tests {
             action(noun, Some("crew-123")),
             CommandAction::CrewHandoff {
                 carries: Vec::new(),
+                reassign: Vec::new(),
                 context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                 target: "reviewer".into(),
                 message: "Review commit abc123".into(),
@@ -537,6 +524,7 @@ mod tests {
                 action(noun, Some("crew-123")),
                 CommandAction::CrewHandoff {
                     carries: Vec::new(),
+                    reassign: Vec::new(),
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     target: role.into(),
                     message: "continue".into(),
@@ -562,6 +550,7 @@ mod tests {
             action(noun, Some("crew-123")),
             CommandAction::CrewHandoff {
                 carries: Vec::new(),
+                reassign: Vec::new(),
                 context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                 target: "@reviewer".into(),
                 message: "continue".into(),
@@ -578,75 +567,48 @@ mod tests {
 
     #[test]
     fn complete_uses_ambient_crew_identity() {
-        let noun = CrewNoun::try_parse_from(["crew", "complete", "--message", "ready for review"]).expect("parse complete");
+        let noun = CrewNoun::try_parse_from(["crew", "complete", "--force", "--message", "ready for review"]).expect("parse complete");
         assert_eq!(
             action(noun, Some("crew-123")),
             CommandAction::CrewComplete {
                 context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                 message: Some("ready for review".into()),
                 disposition: None,
-                decision_ledger_ref: None,
-                force: false,
             }
         );
     }
 
     #[test]
     fn complete_preserves_declared_disposition() {
-        let noun = CrewNoun::try_parse_from(["crew", "complete", "--message", "ready for review", "--disposition", "changes-pushed"])
-            .expect("parse complete disposition");
+        let noun =
+            CrewNoun::try_parse_from(["crew", "complete", "--force", "--message", "ready for review", "--disposition", "changes-pushed"])
+                .expect("parse complete disposition");
         assert_eq!(
             action(noun, Some("crew-123")),
             CommandAction::CrewComplete {
                 context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                 message: Some("ready for review".into()),
                 disposition: Some("changes-pushed".into()),
-                decision_ledger_ref: None,
-                force: false,
             }
         );
     }
 
     #[test]
-    fn complete_preserves_decision_ledger_pointer() {
+    fn complete_no_longer_takes_a_decision_ledger_pointer() {
         let url = "https://github.com/flotilla-org/flotilla/pull/1#issuecomment-2";
-        let noun = CrewNoun::try_parse_from(["crew", "complete", "--decision-ledger-ref", url]).expect("parse ledger pointer");
-        assert_eq!(
-            action(noun, Some("crew-123")),
-            CommandAction::CrewComplete {
-                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-                message: None,
-                disposition: None,
-                decision_ledger_ref: Some(url.into()),
-                force: false,
-            }
-        );
+        let error = CrewNoun::try_parse_from(["crew", "complete", "--force", "--decision-ledger-ref", url])
+            .expect_err("the ledger pointer argument is gone");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
+    // Completion is only ever an operator's forced verdict; a crew reports its PR with `crew submit`.
     #[test]
-    fn decision_ledger_pointer_must_be_a_comment_url() {
-        let noun =
-            CrewNoun::try_parse_from(["crew", "complete", "--decision-ledger-ref", "not-a-url"]).expect("parse invalid ledger pointer");
-        assert_eq!(
-            noun.resolve_with_crew_id(Some("crew-123".into())).expect_err("invalid pointer should fail"),
-            "--decision-ledger-ref must use an HTTP(S) URL"
-        );
-    }
-
-    #[test]
-    fn unsupported_verb_error_precedes_decision_ledger_url_validation() {
-        let noun =
-            CrewNoun::try_parse_from(["crew", "list", "--decision-ledger-ref", "not-a-url"]).expect("parse unsupported ledger pointer");
-        assert_eq!(
-            noun.resolve_with_crew_id(Some("crew-123".into())).expect_err("list should reject pointer"),
-            "`flotilla crew list` does not accept completion options"
-        );
-    }
-
-    #[test]
-    fn complete_preserves_operator_force() {
+    fn complete_requires_operator_force() {
         let noun = CrewNoun::try_parse_from(["crew", "complete", "--force"]).expect("parse forced completion");
-        assert!(matches!(action(noun, Some("crew-123")), CommandAction::CrewComplete { force: true, .. }));
+        assert!(matches!(action(noun, Some("crew-123")), CommandAction::CrewComplete { .. }));
+        let noun = CrewNoun::try_parse_from(["crew", "complete", "--message", "PR ready"]).expect("parse unforced completion");
+        let error = noun.resolve_with_crew_id(Some("crew-123".into())).expect_err("unforced completion is refused");
+        assert!(error.contains("--force") && error.contains("flotilla crew submit"), "{error}");
     }
 
     #[test]
@@ -713,22 +675,27 @@ mod tests {
     // Glue: the CLI forwards exactly the shared typed reference and preserves it on round-trip.
     #[test]
     fn handoff_carries_typed_references() {
-        let carry = r#"{"kind":"control_record","resource":{"api_version":"flotilla.work/v1","kind":"Convoy","namespace":"flotilla","name":"demo"},"revision":"rv-1"}"#;
+        let carry = "project:flotilla/convoy:demo@rv-1";
         let args = ["crew", "demo/review/reviewer", "handoff", "--message", "review", "--carry", carry];
         let noun = CrewNoun::try_parse_from(args).expect("typed carry");
         let CommandAction::CrewHandoff { target, carries, .. } = action(noun, Some("crew-123")) else { panic!("handoff action") };
         assert_eq!(target, "demo/review/reviewer");
         assert_eq!(carries.len(), 1);
-        assert_eq!(
-            carries[0],
-            flotilla_protocol::MessageReference::ControlRecord {
-                resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo"),
-                revision: "rv-1".into(),
-            }
-        );
+        assert_eq!(carries[0].address.as_str(), "project:flotilla/convoy:demo");
+        assert_eq!(carries[0].revision.as_str(), "rv-1");
         assert_round_trip::<CrewNoun>(&args);
         CrewNoun::try_parse_from(["crew", "reviewer", "handoff", "--message", "review", "--carry", "scratch.log"])
             .expect_err("untyped paths are not Message references");
+    }
+
+    // Glue: each `--reassign` names one promise the handoff moves, in order, and round-trips.
+    #[test]
+    fn handoff_names_the_promises_it_reassigns() {
+        let args = ["crew", "coder", "handoff", "--message", "fix it", "--reassign", "recovery-work", "--reassign", "template/pr"];
+        let noun = CrewNoun::try_parse_from(args).expect("reassign");
+        let CommandAction::CrewHandoff { reassign, .. } = action(noun, Some("crew-123")) else { panic!("handoff action") };
+        assert_eq!(reassign, ["recovery-work", "template/pr"]);
+        assert_round_trip::<CrewNoun>(&args);
     }
 
     #[test]

@@ -16,9 +16,9 @@ use flotilla_protocol::{
     AgentHookTerminalRef, Command, CommandAction, EnvironmentId, HostName, QueryCursor, QueryId, Request as RpcRequest,
     Response as RpcResponse,
 };
-use flotilla_resources::{Convoy, ConvoySpec, InputMeta};
+use flotilla_resources::{AccessDelivery, Convoy, ConvoySpec, InputMeta};
 use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use futures::{SinkExt, StreamExt};
 use rigging_http_serve::{Authentication, Caller, TcpPolicy};
 use serde_json::{json, Value};
@@ -29,14 +29,20 @@ use tokio_tungstenite::{
 };
 use tower::ServiceExt;
 
-use super::{surface, CallerAuth, HttpRouter, ListenerOrigin, LoginStore};
+use super::{
+    surface,
+    table_tests::{delivery, engine_backend, EngineStore},
+    CallerAuth, HttpRouter, ListenerOrigin, LoginStore,
+};
+use crate::testkits::engine::admit_convoy;
 
 const HOST: &str = "surface.test";
 const WAIT: Duration = Duration::from_secs(10);
 
-fn router(backend: ResourceBackend) -> Router {
+fn router(backend: ResourceBackend, store: &EngineStore) -> Router {
     HttpRouter::builder()
         .backend(backend)
+        .table_store(Arc::clone(&store.service))
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
         .build()
         .into_router()
@@ -156,19 +162,17 @@ fn types(messages: &[&Value]) -> Vec<String> {
 }
 
 fn subscribe(id: &str) -> Value {
-    json!({"type": "subscribe", "id": id, "table": "convoys", "namespace": "test", "columns": ["spec"]})
+    json!({"type": "subscribe", "id": id, "table": "accessdeliveries", "namespace": "test", "columns": ["spec"]})
 }
 
+// The table subscriptions follow AccessDelivery, which the engine's home takes creates and deletes
+// of through the backend (see `engine_backend`).
 async fn create(backend: &ResourceBackend, name: &str) {
-    backend
-        .using::<Convoy>("test")
-        .create(&InputMeta::builder().name(name.into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-        .await
-        .unwrap();
+    backend.using::<AccessDelivery>("test").create(&InputMeta::builder().name(name.into()).build(), &delivery("demo")).await.unwrap();
 }
 
 async fn delete(backend: &ResourceBackend, name: &str) {
-    backend.using::<Convoy>("test").delete(name).await.unwrap();
+    backend.using::<AccessDelivery>("test").delete(name).await.unwrap();
 }
 
 /// A subscriber's copy of its table, built only from the messages it received.
@@ -231,9 +235,9 @@ impl Mirror {
 // subprotocols carry equal content. Two clients on one router see the same source changes.
 #[tokio::test]
 async fn subscriptions_stream_snapshot_then_changes_alike_on_both_subprotocols() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let (backend, store) = engine_backend();
     create(&backend, "a").await;
-    let router = router(backend.clone());
+    let router = router(backend.clone(), &store);
     let mut clients = [user(&router, surface::CBOR).await, user(&router, surface::JSON).await];
     let mut received = Vec::new();
     for client in &mut clients {
@@ -257,14 +261,32 @@ async fn subscriptions_stream_snapshot_then_changes_alike_on_both_subprotocols()
 }
 
 // #3249: a cursor names the incarnation and the last sequence applied. A current one resumes
-// with `synced` alone; an older sequence, the current sequence of another incarnation, or the
-// current position of a subscription with other parameters gets `resync` and a fresh `table`,
-// `rows`, `synced`.
+// with `synced` alone.
+#[tokio::test]
+async fn a_current_cursor_resumes_with_synced_alone() {
+    let (backend, store) = engine_backend();
+    create(&backend, "a").await;
+    let router = router(backend.clone(), &store);
+    let mut client = user(&router, surface::CBOR).await;
+    client.send(subscribe("first")).await;
+    let snapshot = client.until(|message| message["type"] == "synced").await;
+    let incarnation = snapshot[0]["incarnation"].clone();
+    create(&backend, "b").await;
+    let current = client.until(|message| message["type"] == "upsert").await.pop().unwrap()["sequence"].clone();
+    let mut request = subscribe("current");
+    request["cursor"] = json!({"incarnation": incarnation, "sequence": current});
+    client.send(request).await;
+    let messages = client.until(|message| message["id"] == "current" && message["type"] == "synced").await;
+    assert_eq!(types(&of(&messages, "current")), ["synced"]);
+}
+
+// #3249: an older sequence, the current sequence of another incarnation, or the current position
+// of a subscription with other parameters gets `resync` and a fresh `table`, `rows`, `synced`.
 #[tokio::test]
 async fn cursors_resume_only_their_own_current_position() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let (backend, store) = engine_backend();
     create(&backend, "a").await;
-    let router = router(backend.clone());
+    let router = router(backend.clone(), &store);
     let mut client = user(&router, surface::CBOR).await;
     client.send(subscribe("first")).await;
     let snapshot = client.until(|message| message["type"] == "synced").await;
@@ -274,7 +296,6 @@ async fn cursors_resume_only_their_own_current_position() {
     let current = client.until(|message| message["type"] == "upsert").await.pop().unwrap()["sequence"].clone();
     let fresh = vec!["resync", "table", "rows", "synced"];
     for (id, incarnation, sequence, columns, expected) in [
-        ("current", incarnation.clone(), current.clone(), json!(["spec"]), vec!["synced"]),
         ("stale", incarnation.clone(), stale, json!(["spec"]), fresh.clone()),
         ("elsewhere", json!("another-incarnation"), current.clone(), json!(["spec"]), fresh.clone()),
         ("reshaped", incarnation, current, json!(["metadata.name"]), fresh),
@@ -288,13 +309,88 @@ async fn cursors_resume_only_their_own_current_position() {
     }
 }
 
+// #3108: a table's position counts the entries of the kinds its rows are read from, at every home.
+// A write of another kind leaves a cursor current; a write of the table's kind at another home,
+// arriving as that home's next entries, makes it stale.
+#[tokio::test]
+async fn a_cursor_moves_only_with_its_tables_kinds_at_any_home() {
+    use flotilla_provisioning_testkit::other_home::{replicate_home_tail, OtherHome};
+    use flotilla_resources::engine_records::KindRecords as _;
+    let (backend, store) = engine_backend();
+    let other = OtherHome::open("other");
+    let repository = |name: &str| flotilla_resources::RepositorySpec::remote(format!("https://forge.example/o/{name}")).unwrap();
+    let seen = repository("seen");
+    other.repository(&seen.key().0, &seen).await;
+    other.replicate_to(&store.service);
+    create(&backend, "a").await;
+    let router = router(backend.clone(), &store);
+    let mut client = user(&router, surface::CBOR).await;
+    client.send(subscribe("first")).await;
+    let snapshot = client.until(|message| message["type"] == "synced").await;
+    let cursor = json!({"incarnation": snapshot[0]["incarnation"], "sequence": snapshot.last().unwrap()["sequence"]});
+    let another = repository("another");
+    other.repository(&another.key().0, &another).await;
+    replicate_home_tail(other.service(), other.home(), &store.service);
+    assert_eq!(resumed(&mut client, "another-kind", &cursor).await, ["synced"]);
+    let deliveries = flotilla_provisioning::engine::access_deliveries::EngineAccessDeliveries::open(
+        Arc::clone(other.service()),
+        Arc::new(flotilla_resources::SystemClock),
+    )
+    .unwrap();
+    deliveries.apply("remote", None, &BTreeMap::new(), &BTreeMap::new(), &delivery("demo")).await.unwrap();
+    replicate_home_tail(other.service(), other.home(), &store.service);
+    assert_eq!(resumed(&mut client, "table-kind", &cursor).await, ["resync", "table", "rows", "synced"]);
+}
+
+// A table read wholly from the log resumes across a daemon restart. One with state its home holds
+// in memory, as Projects' dispatch judgements are, starts again with each daemon run.
+#[tokio::test]
+async fn a_cursor_from_before_a_restart_resumes_only_a_table_read_wholly_from_the_log() {
+    let (backend, store) = engine_backend();
+    create(&backend, "a").await;
+    let served = router(backend.clone(), &store);
+    let mut client = user(&served, surface::CBOR).await;
+    let tables = [("logged", "accessdeliveries"), ("held", "projects")];
+    let mut cursors = Vec::new();
+    for (id, table) in tables {
+        let mut request = subscribe(id);
+        request["table"] = json!(table);
+        client.send(request).await;
+        let snapshot = client.until(|message| message["id"] == id && message["type"] == "synced").await;
+        let snapshot = of(&snapshot, id);
+        cursors.push(json!({"incarnation": snapshot[0]["incarnation"], "sequence": snapshot.last().unwrap()["sequence"]}));
+    }
+    drop((client, served, backend));
+    let (backend, store) = store.restart("test");
+    let restarted = router(backend, &store);
+    let mut client = user(&restarted, surface::CBOR).await;
+    let [(logged, logged_table), (held, held_table)] = tables;
+    assert_eq!(resumed_on(&mut client, logged, logged_table, &cursors[0]).await, ["synced"]);
+    assert_eq!(resumed_on(&mut client, held, held_table, &cursors[1]).await, ["resync", "table", "rows", "synced"]);
+}
+
+/// The message types a subscription `id` from `cursor` receives up to its `synced`.
+async fn resumed(client: &mut Client, id: &str, cursor: &Value) -> Vec<String> {
+    resumed_on(client, id, "accessdeliveries", cursor).await
+}
+
+/// [`resumed`], subscribing to `table`.
+async fn resumed_on(client: &mut Client, id: &str, table: &str, cursor: &Value) -> Vec<String> {
+    let mut request = subscribe(id);
+    request["table"] = json!(table);
+    request["cursor"] = cursor.clone();
+    client.send(request).await;
+    let messages = client.until(|message| message["id"] == id && message["type"] == "synced").await;
+    types(&of(&messages, id))
+}
+
 // #3249: `unsubscribe` ends a subscription and `cancel` ends any open request by its id; neither
 // sends anything more for it. An id that names no open request is an error, and an id already
 // open cannot be reused.
 #[tokio::test]
 async fn unsubscribe_and_cancel_end_requests_by_id() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let router = router(backend.clone());
+    let (backend, store) = engine_backend();
+    let router = router(backend.clone(), &store);
     let mut client = user(&router, surface::JSON).await;
     for id in ["kept", "unsubscribed", "cancelled"] {
         client.send(subscribe(id)).await;
@@ -320,7 +416,8 @@ async fn unsubscribe_and_cancel_end_requests_by_id() {
 // upgrade, and one offering both gets CBOR.
 #[tokio::test]
 async fn the_upgrade_admits_users_offering_a_surface_subprotocol() {
-    let router = router(ResourceBackend::new(InMemoryBackend::default()));
+    let (backend, store) = engine_backend();
+    let router = router(backend, &store);
     let status = |result: Result<Client, tungstenite::Error>| match result {
         Err(tungstenite::Error::Http(response)) => response.status(),
         Err(other) => panic!("{other}"),
@@ -350,7 +447,8 @@ async fn the_upgrade_admits_users_offering_a_surface_subprotocol() {
 // cookie-authenticated upgrade with no `Origin`; a same-origin one is admitted.
 #[tokio::test]
 async fn the_upgrade_refuses_foreign_and_missing_origins() {
-    let router = router(ResourceBackend::new(InMemoryBackend::default()));
+    let (backend, store) = engine_backend();
+    let router = router(backend, &store);
     let logins = LoginStore::new(Arc::new(flotilla_resources::SystemClock));
     let (session, _) = logins.redeem(&logins.mint_code().unwrap().code).unwrap().unwrap();
     let session = CallerAuth::Session(session);
@@ -376,7 +474,8 @@ async fn the_upgrade_refuses_foreign_and_missing_origins() {
 // oversized frame closes it.
 #[tokio::test]
 async fn malformed_frames_get_errors_and_oversized_frames_close() {
-    let router = router(ResourceBackend::new(InMemoryBackend::default()));
+    let (backend, store) = engine_backend();
+    let router = router(backend, &store);
     let mut client = user(&router, surface::CBOR).await;
     let valid = flotilla_cbor::to_vec(&json!({"type": "cancel", "id": "x"}), &Default::default()).unwrap();
     let duplicate = vec![0xa2, 0x64, b't', b'y', b'p', b'e', 0x61, b'a', 0x64, b't', b'y', b'p', b'e', 0x61, b'b'];
@@ -425,9 +524,9 @@ fn interleaved_subscriptions_and_changes_keep_each_channel_ordered(tc: hegel::Te
         .collect();
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     runtime.block_on(async move {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let convoys = backend.using::<Convoy>("test");
-        let router = router(backend.clone());
+        let (backend, store) = engine_backend();
+        let deliveries = backend.using::<AccessDelivery>("test");
+        let router = router(backend.clone(), &store);
         let mut client = user(&router, surface::CBOR).await;
         let mut mirrors: BTreeMap<String, Mirror> = BTreeMap::new();
         let mut live = Vec::new();
@@ -436,7 +535,7 @@ fn interleaved_subscriptions_and_changes_keep_each_channel_ordered(tc: hegel::Te
             match op {
                 Op::Subscribe => {
                     let id = format!("s{step}");
-                    client.send(json!({"type": "subscribe", "id": id, "table": "convoys", "namespace": "test"})).await;
+                    client.send(json!({"type": "subscribe", "id": id, "table": "accessdeliveries", "namespace": "test"})).await;
                     mirrors.insert(id.clone(), Mirror::default());
                     live.push(id);
                 }
@@ -445,22 +544,22 @@ fn interleaved_subscriptions_and_changes_keep_each_channel_ordered(tc: hegel::Te
                     client.send(json!({"type": "unsubscribe", "id": id})).await;
                 }
                 Op::Unsubscribe(_) => {}
-                Op::Toggle(name) => match convoys.get(&name).await {
-                    Ok(_) => convoys.delete(&name).await.unwrap(),
+                Op::Toggle(name) => match deliveries.get(&name).await {
+                    Ok(_) => deliveries.delete(&name).await.unwrap(),
                     Err(_) => create(&backend, &name).await,
                 },
                 Op::Edit(name) => {
-                    if let Ok(convoy) = convoys.get(&name).await {
-                        let spec = ConvoySpec::builder().workflow_ref(format!("workflow-{step}")).build();
+                    if let Ok(current) = deliveries.get(&name).await {
                         let meta = InputMeta::builder().name(name.clone()).build();
-                        convoys.update(&meta, &convoy.metadata.resource_version, &spec).await.unwrap();
+                        deliveries.update(&meta, &current.metadata.resource_version, &delivery(&format!("demo-{step}"))).await.unwrap();
                     }
                 }
             }
             received.extend(client.fence().await);
         }
         create(&backend, "fence").await;
-        let expected: BTreeSet<String> = convoys.list().await.unwrap().items.into_iter().map(|convoy| convoy.metadata.name).collect();
+        let expected: BTreeSet<String> =
+            deliveries.list().await.unwrap().items.into_iter().map(|delivery| delivery.metadata.name).collect();
         let converged = |mirrors: &BTreeMap<String, Mirror>| live.iter().all(|id| mirrors[id].names() == expected);
         let mut applied = 0;
         loop {
@@ -491,12 +590,14 @@ impl Daemon {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"surface-test\"\n").unwrap();
         let config = Arc::new(flotilla_config::ConfigStore::with_base(temp.path()));
+        // The engine's home, as the daemon composes its backend.
+        let backend = engine_home_backend();
         let daemon = InProcessDaemon::new_with_resource_backend(
             vec![],
             Arc::clone(&config),
             flotilla_discovery_testkit::fake_discovery(false),
             HostName::new("surface-test"),
-            ResourceBackend::new(InMemoryBackend::default()),
+            backend,
             Arc::new(crate::peer::HostPeerOverlay::default()),
         )
         .await;
@@ -532,13 +633,12 @@ impl Daemon {
         serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap()
     }
 
-    async fn convoy(&self, name: &str) {
-        self.daemon
-            .resource_backend()
-            .using::<Convoy>("flotilla")
-            .create(&InputMeta::builder().name(name.into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-            .await
-            .unwrap();
+    /// Admits a launch of convoy `name`, returning the launch.
+    async fn convoy(&self, name: &str) -> String {
+        let spec = ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("workflow".into()).build();
+        let convoy =
+            flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, flotilla_engine_convoys_testkit::single_agent("coder"));
+        admit_convoy(&self.daemon, convoy).await
     }
 
     /// The framed protocol's result set for `query`, as `SubscribeQueries` replays it.
@@ -583,7 +683,10 @@ async fn named_query_tables_carry_the_framed_result_set() {
     daemon.convoy("second").await;
     loop {
         let framed = daemon.framed(&query).await;
-        if framed.seq == mirror.sequence && framed.rows.len() == 2 {
+        // A sequence's changes arrive as several messages carrying it: when both convoys land
+        // after the snapshot in one sequence, the mirror holds that sequence after its first
+        // upsert but holds all of it only after its last.
+        if framed.seq == mirror.sequence && framed.rows.len() == 2 && mirror.rows.len() == 2 {
             let names: BTreeSet<_> = framed.rows.as_convoys().unwrap().iter().map(|row| row.name.clone()).collect();
             let carried: BTreeSet<_> = mirror.rows.values().map(|row| row["name"].as_str().unwrap().to_owned()).collect();
             assert_eq!(carried, names);
@@ -688,11 +791,10 @@ async fn named_query_cursors_resume_only_their_own_materialisation() {
 #[tokio::test]
 async fn waits_fire_once_and_cancelled_waits_do_not() {
     use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
-    use flotilla_resources::{ConvoyPhase, ConvoyStatus};
     let daemon = Daemon::start().await;
-    daemon.convoy("watched").await;
+    let watched = daemon.convoy("watched").await;
     let leaf = Leaf {
-        address: LeafAddress::Convoy { name: "watched".into() },
+        address: LeafAddress::Convoy { name: watched.clone() },
         field_path: ".status.phase".into(),
         operator: LeafOperator::Equal,
         literal: "Failed".into(),
@@ -705,9 +807,9 @@ async fn waits_fire_once_and_cancelled_waits_do_not() {
     client.send(json!({"type": "cancel", "id": "cancelled"})).await;
     assert!(client.fence().await.is_empty());
     let convoys = daemon.daemon.resource_backend().using::<Convoy>("flotilla");
-    let current = convoys.get("watched").await.unwrap();
-    let status = ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() };
-    convoys.update_status("watched", &current.metadata.resource_version, &status).await.unwrap();
+    let current = convoys.get(&watched).await.unwrap();
+    let engine = daemon.daemon.convoy_engine_path();
+    engine.get().expect("the Convoy path").fail(&current, "operator", "failed").await.unwrap();
     let mut received = client.until(|message| message["type"] == "wait_fired").await;
     let fired = received.last().unwrap().clone();
     assert_eq!((fired["id"].as_str(), fired["value"].as_str()), (Some("w"), Some("Failed")));
@@ -719,11 +821,16 @@ async fn waits_fire_once_and_cancelled_waits_do_not() {
 }
 
 // #3249: a consumer that stops reading is closed with 1013 once its queue of 1,024 frames is full,
-// rather than buffered without bound or slowing the producers; it resumes by cursor.
-#[tokio::test]
+// rather than buffered without bound or slowing the producers; it resumes by cursor. The client
+// stops reading after its subscriptions sync. 30 creates under 200 subscriptions make 6,000 change
+// frames; the creates are paced, so the writer drains each into the 64 KiB transport until it is
+// full and the write blocks, and the rest fill the queue behind it. The client reads again only to
+// find the close. Time is paused: the write limit and the client's wait are virtual, so neither can
+// run out while a loaded test host is slow to get there.
+#[tokio::test(start_paused = true)]
 async fn a_consumer_that_falls_behind_is_closed_with_1013() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let router = router(backend.clone());
+    let (backend, store) = engine_backend();
+    let router = router(backend.clone(), &store);
     let mut client = user(&router, surface::CBOR).await;
     for index in 0..200 {
         client.send(subscribe(&format!("s{index}"))).await;
@@ -734,6 +841,7 @@ async fn a_consumer_that_falls_behind_is_closed_with_1013() {
     }
     for index in 0..30 {
         create(&backend, &format!("c{index}")).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
     assert_eq!(client.close_code().await, Some(CloseCode::Again));
 }
@@ -742,15 +850,15 @@ async fn a_consumer_that_falls_behind_is_closed_with_1013() {
 // cannot be written within the write limit closes it, releasing what it holds; under paused time.
 #[tokio::test(start_paused = true)]
 async fn a_client_that_never_reads_is_dropped() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let router = router(backend.clone());
+    let (backend, store) = engine_backend();
+    let router = router(backend.clone(), &store);
     // Few, large frames: the socket's buffer fills long before the send queue would overflow.
     for index in 0..300 {
         create(&backend, &format!("c{index}")).await;
     }
     let mut client = user(&router, surface::CBOR).await;
     for index in 0..10 {
-        client.send(json!({"type": "subscribe", "id": format!("s{index}"), "table": "convoys", "namespace": "test"})).await;
+        client.send(json!({"type": "subscribe", "id": format!("s{index}"), "table": "accessdeliveries", "namespace": "test"})).await;
     }
     tokio::time::sleep(surface::WRITE_LIMIT * 2).await;
     let probe = client.socket.send(Frame::Text("{}".into())).await;
@@ -761,7 +869,8 @@ async fn a_client_that_never_reads_is_dropped() {
 // seconds, under paused time.
 #[tokio::test(start_paused = true)]
 async fn quiet_subscriptions_send_progress_at_least_every_15_seconds() {
-    let router = router(ResourceBackend::new(InMemoryBackend::default()));
+    let (backend, store) = engine_backend();
+    let router = router(backend, &store);
     let mut client = user(&router, surface::CBOR).await;
     client.send(subscribe("quiet")).await;
     client.until(|message| message["type"] == "synced").await;
@@ -784,7 +893,6 @@ async fn commands_started_over_http_report_progress_on_the_socket() {
             kind: "convoy".into(),
             name: None,
             include_replicas: false,
-            replica_sources: false,
             cursor: None,
         })
         .build();
@@ -812,7 +920,8 @@ async fn commands_started_over_http_report_progress_on_the_socket() {
 // refused with `too_many_requests` while the connection stays up.
 #[tokio::test]
 async fn ended_requests_free_their_ids_and_open_requests_are_bounded() {
-    let router = router(ResourceBackend::new(InMemoryBackend::default()));
+    let (backend, store) = engine_backend();
+    let router = router(backend, &store);
     let mut client = user(&router, surface::CBOR).await;
     let query = QueryId::Convoys { scope: None };
     for round in 0..surface::OPEN_LIMIT + 8 {
@@ -837,28 +946,28 @@ async fn ended_requests_free_their_ids_and_open_requests_are_bounded() {
 #[hegel::test(test_cases = 5)]
 fn named_query_summaries_match_fresh_reads(tc: hegel::TestCase) {
     use crate::server::tables::summary_tests::{check_read, clauses, rows, Field};
-    use flotilla_resources::{ConvoyPhase, ConvoyStatus};
     use hegel::generators as gs;
+    // Convoys are admitted on the engine, so their phase is admission's; the workflow varies.
     const FIELDS: &[Field] = &[
         Field { column: "phase", spelling: "phase", literals: &[r#""pending""#, r#""active""#, r#""landed""#], has: false },
         Field { column: "workflow_ref", spelling: "workflow_ref", literals: &[r#""w1""#, r#""w2""#], has: false },
         Field { column: "name", spelling: "name", literals: &[r#""r0""#, r#""r1""#], has: false },
     ];
-    let phases = [ConvoyPhase::Pending, ConvoyPhase::Active, ConvoyPhase::Landed];
-    let convoys: Vec<(usize, usize)> = (0..tc.draw(gs::integers::<usize>().max_value(6)))
-        .map(|_| (tc.draw(gs::integers::<usize>().max_value(2)), tc.draw(gs::integers::<usize>().max_value(1))))
-        .collect();
+    let convoys: Vec<usize> =
+        (0..tc.draw(gs::integers::<usize>().max_value(6))).map(|_| tc.draw(gs::integers::<usize>().max_value(1))).collect();
     let (scope, wheres) = (clauses(&tc, FIELDS, 2), clauses(&tc, FIELDS, 3));
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     runtime.block_on(async move {
         let daemon = Daemon::start().await;
-        let store = daemon.daemon.resource_backend().using::<Convoy>("flotilla");
-        for (index, (phase, workflow)) in convoys.iter().enumerate() {
-            let name = format!("r{index}");
-            let spec = ConvoySpec::builder().workflow_ref(format!("w{}", workflow + 1)).build();
-            let created = store.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.unwrap();
-            let status = ConvoyStatus { phase: phases[*phase], ..ConvoyStatus::default() };
-            store.update_status(&name, &created.metadata.resource_version, &status).await.unwrap();
+        for (index, workflow) in convoys.iter().enumerate() {
+            let spec = ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref(format!("w{}", workflow + 1)).build();
+            let convoy = flotilla_engine_convoys_testkit::convoy(
+                "flotilla",
+                &format!("r{index}"),
+                spec,
+                flotilla_engine_convoys_testkit::single_agent("coder"),
+            );
+            admit_convoy(&daemon.daemon, convoy).await;
         }
         let table = QueryId::Convoys { scope: None }.table_set().tables[0].name.clone();
         let read = |params: Vec<(String, String)>| {
@@ -881,19 +990,21 @@ fn named_query_summaries_match_fresh_reads(tc: hegel::TestCase) {
                     .collect::<Vec<_>>()
             }
         };
-        // The aggregator settles on the written convoys before the reads compare.
-        let expected: BTreeSet<(String, String)> = convoys
-            .iter()
-            .enumerate()
-            .map(|(index, (phase, _))| (format!("r{index}"), format!("{:?}", phases[*phase]).to_lowercase()))
-            .collect();
+        // The aggregator settles on the admitted convoys before the reads compare; a row names its
+        // launch, `r0#n`.
+        let expected: BTreeSet<(String, String)> =
+            convoys.iter().enumerate().map(|(index, workflow)| (format!("r{index}"), format!("w{}", workflow + 1))).collect();
         let mut held = Vec::new();
         let settled = tokio::time::timeout(WAIT, async {
             loop {
                 held = rows(&read(vec![]).await);
                 let names: BTreeSet<(String, String)> = held
                     .iter()
-                    .map(|row| (row["name"].as_str().unwrap_or_default().to_owned(), row["phase"].as_str().unwrap_or_default().to_owned()))
+                    .map(|row| {
+                        let cell = |column: &str| row[column].as_str().unwrap_or_default().to_owned();
+                        let name = cell("name");
+                        (name.split_once('#').map_or(name.clone(), |(plain, _)| plain.to_owned()), cell("workflow_ref"))
+                    })
                     .collect();
                 if names == expected {
                     break;

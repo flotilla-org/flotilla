@@ -1,6 +1,6 @@
 use flotilla_resources::{
-    image_build_name, single_agent_workflow_spec, FulfilmentGrant, FulfilmentRealisation, ImageBuild, ImageDelivery, ImageLayer,
-    ImageLayerSource, ImageLayerSpec, ImageLayerTier, PlacementImageSource, Project, ResourceObject,
+    image_build_name, image_build_records::ImageBuildRecords, single_agent_workflow_spec, FulfilmentGrant, FulfilmentRealisation,
+    ImageDelivery, ImageLayer, ImageLayerSource, ImageLayerSpec, ImageLayerTier, PlacementImageSource, Project, ResourceObject,
 };
 
 use super::*;
@@ -43,24 +43,32 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
     let reference = IssueRef { source: source.clone(), id: "3397".into() };
     let mut hosts = Vec::new();
+    // The daemons' homes, removed when the scenario ends.
+    let mut config_dirs = Vec::new();
     for name in ["image-home", "image-issuer"] {
         let provider = Arc::new(flotilla_discovery_testkit::FakeIssueProvider::new());
         let mut issue = TestIssue::new("Triage label").id("3397").with_labels(vec!["needs:multi-host".into()]).build();
         issue.reference = reference.clone();
         provider.add_issues(vec![(reference.id.clone(), issue)]).await;
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_issue_tracker(provider));
-        let config = test_config_store(tempfile::tempdir().unwrap().keep());
-        hosts.push(
-            InProcessDaemon::new(
-                vec![],
-                config,
-                discovery,
-                HostName::new(name),
-                Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-            )
-            .await,
-        );
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = test_config_store(config_dir.path().to_path_buf());
+        config_dirs.push(config_dir);
+        let daemon = InProcessDaemon::new(
+            vec![],
+            config,
+            discovery,
+            HostName::new(name),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        // Composed with its engine, as the runtime composes a daemon: its convoys are the engine's
+        // launches, read through its views (#3108).
+        engine(&daemon);
+        hosts.push(daemon);
     }
+    // Each daemon reads its image builds on the engine it was composed with above (#3108).
+    let engines: Vec<_> = hosts.iter().map(|host| engine(host.as_ref())).collect();
     let home = Arc::clone(&hosts[0]);
     seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
     home.set_local_placement_capabilities(&BTreeSet::from(["codex".into()]), &["cleat".into()]).await;
@@ -163,9 +171,9 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     if !satisfiable {
         let error = target.expect_err("unresolvable need refuses routing").to_string();
         assert!(error.contains("unresolvable image need `display:missing`"), "{error}");
-        for host in &mesh.hosts {
+        for (host, engine) in mesh.hosts.iter().zip(&engines) {
             assert!(host.resource_backend().using::<Convoy>("flotilla").list().await.expect("convoys").items.is_empty());
-            assert!(host.resource_backend().using::<ImageBuild>("flotilla").list().await.expect("builds").items.is_empty());
+            assert!(engine.image_builds.demands().is_empty());
         }
         return;
     }
@@ -187,10 +195,12 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
         panic!("composed placement freezes a Built source");
     };
     assert_eq!(image_build_ref, image_build_name(&identity, "amd64", &ImageDelivery::Local, &host_id));
-    let builds = backend.using::<ImageBuild>("flotilla").list().await.expect("builds").items;
-    assert_eq!(builds.len(), 1, "admission get-or-creates the identity's build before accepting the convoy");
-    let build = builds[0].spec.current().expect("current build");
-    assert_eq!(builds[0].metadata.name, image_build_ref);
+    assert_eq!(
+        engines[0].image_builds.demands(),
+        std::slice::from_ref(&image_build_ref),
+        "admission demands the identity's build before accepting the convoy"
+    );
+    let build = engines[0].image_builds.builds.demanded(&image_build_ref).expect("read demand").expect("demanded build");
     assert_eq!(
         build.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(),
         ["base-ubuntu-24.04", "display-x11", "crew-utilities", "harness-codex"]
@@ -206,7 +216,7 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
             matches!(frozen_image(&backend, convoy).await, PlacementImageSource::Built { identity: ref other, .. } if *other == identity)
         );
     }
-    assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared build").items.len(), 1);
+    assert_eq!(engines[0].image_builds.demands().len(), 1, "a shared build");
 
     // ConvoyCreate freezes the same composition: the leg's need matches the
     // dispatched need, so it reuses the identity's build.
@@ -215,9 +225,8 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
         name: "created-composed-work".into(),
         workflow_ref: "display-workflow".into(),
         inputs: Vec::new(),
-        repository_url: None,
         r#ref: Some("test/created-composed-work".into()),
-        project_ref: Some("flotilla".into()),
+        project_ref: "flotilla".into(),
         placement_policy: Some("composed-docker".into()),
         adopted_checkout: None,
     };
@@ -234,7 +243,7 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
         .find(|convoy| convoy.spec.role == "created-composed-work")
         .expect("created role");
     assert_eq!(frozen_image(&backend, &created).await, PlacementImageSource::Built { identity, image_build_ref });
-    assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared create build").items.len(), 1);
+    assert_eq!(engines[0].image_builds.demands().len(), 1, "a shared create build");
 
     // Refusal atomicity: admission resolves every vessel before creating any
     // build, so a refused second leg leaves no build for the first.
@@ -253,9 +262,9 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     let command_id = mesh.hosts[0].execute(Command::builder().action(two_legs).build()).await.expect("two-leg admission");
     let result = await_command_result(&mut two_leg_events, command_id).await;
     assert!(matches!(result, CommandValue::Error { ref message } if message.contains("display:missing")), "{result:?}");
-    assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("no orphan builds").items.len(), 1);
+    assert_eq!(engines[0].image_builds.demands().len(), 1, "no orphan builds");
 
-    assert!(mesh.hosts[1].resource_backend().using::<ImageBuild>("flotilla").list().await.expect("issuer builds").items.is_empty());
+    assert!(engines[1].image_builds.demands().is_empty(), "the issuer demands no build");
     assert!(mesh.hosts[1].resource_backend().using::<Convoy>("flotilla").list().await.expect("issuer authored convoys").items.is_empty());
 }
 

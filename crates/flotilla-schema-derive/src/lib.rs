@@ -328,7 +328,7 @@ mod tests {
             quote!(index(name = "x", eq(nope))),
             quote!(index(name = "x", eq(e))),
             quote!(index(name = "x", eq(f))),
-            quote!(index(name = "x", eq(s))),
+            quote!(index(name = "x", eq(a), when(s_since is_some))),
             quote!(index(name = "x", eq(a), order(a))),
             quote!(index(name = "x", order(b))),
             quote!(index(name = "x", eq(a), when(a in [P]))),
@@ -351,6 +351,7 @@ mod tests {
             assert!(message.contains(SUPPORTED), "{case} was refused without naming the list: {message}");
         }
         assert!(expand(&syn::parse2(kind(quote!(index(name = "x", eq(a, c, g), order(b), when(b is_some))))).expect("parse")).is_ok());
+        assert!(expand(&syn::parse2(kind(quote!(index(name = "x", eq(a, s), order(s_since))))).expect("parse")).is_ok());
         assert!(error(kind(quote!(index(name = "x", order(c))))).contains("cannot order an index"));
         assert!(error(quote! { #[store(index(name = "x", eq(a)))] struct A(String); }).contains("belongs on a kind or a part struct"));
         assert!(error(quote! { #[store(index(name = "x", eq(a)))] enum A { #[store(code = "c1")] B } })
@@ -358,13 +359,15 @@ mod tests {
     }
 
     // Glue: an index adds its descriptor entry to `table_set` with codes read through `CodeEnum`,
-    // and a constructor whose arguments are the `eq` fields' types, inside `Option` when optional.
+    // and a constructor whose arguments are the `eq` fields' types, inside `Option` when optional;
+    // a state field's argument is its label enum, and `<state>_since` is its time column.
     #[test]
     fn indexes_expand_to_descriptors_and_constructors() {
         let expanded = expanded(quote! {
             #[store(kind = "Message", code = "k1",
                 index(name = "open_by_inbox", eq(inbox), order(seq), when(state in [Pending, Awaiting])),
-                index(name = "by_reply", eq(reply, sender), when(reply is_some)))]
+                index(name = "by_reply", eq(reply, sender), when(reply is_some)),
+                index(name = "by_state", eq(inbox, state), order(state_since)))]
             struct Message {
                 inbox: Ref<Inbox>,
                 seq: u64,
@@ -380,6 +383,9 @@ mod tests {
             ":: flotilla_schema :: interned_value :: < Name > (sender)",
             "Ref < Inbox > : :: flotilla_schema :: KeyColumn + :: flotilla_schema :: Element",
             ":: flotilla_schema :: Condition :: NotNull { column : :: std :: string :: String :: from (\"reply\") }",
+            "pub fn by_state (inbox : & Ref < Inbox > , state : & < MessageState as :: flotilla_schema :: Labelled > :: Label)",
+            ":: flotilla_schema :: key_value :: < < MessageState as :: flotilla_schema :: Labelled > :: Label > (state)",
+            "order : :: std :: vec ! [:: std :: string :: String :: from (\"state_since\")]",
         ] {
             assert!(expanded.contains(expected), "missing {expected}");
         }
@@ -620,7 +626,9 @@ mod tests {
     fn specs_declare_a_holders_kind() {
         let spec = expanded(quote! {
             #[store(kind = "Message", code = "ms", state = MessageState,
-                index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])))]
+                index(name = "open_by_inbox", eq(inbox), when(state in [Pending, Awaiting])),
+                index(name = "by_state", eq(inbox, state), order(state_since)),
+                index(name = "delivered", eq(inbox), order(delivered_at), when(delivered_at is_some)))]
             struct MessageSpec {
                 #[store(intern = "ad")] inbox: String,
                 deadline: Option<Timestamp>,
@@ -633,6 +641,11 @@ mod tests {
             "column : :: std :: string :: String :: from (\"state\")",
             "< < MessageState as :: flotilla_schema :: Labelled > :: Label > :: Pending",
             "IndexQuery :: new (< Self as :: flotilla_schema :: KindSpec > :: CODE",
+            "pub fn by_state (inbox : & String , state : & < MessageState as :: flotilla_schema :: Labelled > :: Label)",
+            ":: std :: string :: String :: from (\"state_since\")",
+            "order : :: std :: vec ! [:: std :: string :: String :: from (\"delivered_at\")]",
+            ":: flotilla_schema :: Condition :: NotNull { column : :: std :: string :: String :: from (\"delivered_at\") }",
+            "pub fn delivered (inbox : & String)",
         ] {
             assert!(spec.contains(expected), "missing {expected} in {spec}");
         }
@@ -646,6 +659,9 @@ mod tests {
             (quote! { #[store(kind = "A", code = "k1", state = S)] struct A { state: u8 } }, "rename this field"),
             (quote! { #[store(state = S)] enum A { #[store(code = "c1")] B } }, "spec struct"),
             (quote! { #[store(kind = "A", code = "k1", index(name = "x", eq(a), when(state in [B])))] struct A { a: u8 } }, "not a field"),
+            (quote! { #[store(kind = "A", code = "k1", index(name = "x", eq(nope)))] struct A { a: u8 } }, "not a field"),
+            (quote! { #[store(kind = "A", code = "k1", state = S, index(name = "x", eq(d)))] struct A { a: u8 } }, "not key `eq`"),
+            (quote! { #[store(kind = "A", code = "k1", state = S, index(name = "x", order(d)))] struct A { a: u8 } }, "is_some"),
         ] {
             let message = error(case.clone());
             assert!(message.contains(SUPPORTED) && message.contains(problem), "{case}: {message}");

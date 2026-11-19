@@ -26,12 +26,12 @@ use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::{
     host_direct_environment_name, is_prepared_snapshot, ConditionValue, FulfilmentFacts, FulfilmentKind, FulfilmentRealisation, Host,
-    HostCondition, HostConnection, HostSpec, HostStatus, InputMeta, ModelProbeState, Platform, ResourceError, ResourceObject,
-    AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, DOCKER_POLICY_NAME_PREFIX,
+    HostCondition, HostConnection, HostSpec, HostStatusPatch, InputMeta, ModelProbeState, Platform, ResourceError, ResourceObject,
+    SshVesselSlots, AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, DOCKER_POLICY_NAME_PREFIX,
     HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, SSH_HOST_CAPABILITY,
     TRANSPORT_CAPABILITY,
 };
-use flotilla_store::{ResourceBackend, TypedResolver};
+use flotilla_store::{Listed, ResourceBackend, TypedResolver};
 use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -211,6 +211,7 @@ pub(super) fn vessel_agent_reach(
 
 pub(super) async fn register_ssh_host_resources(
     backend: &ResourceBackend,
+    reads: Arc<dyn flotilla_projections::ports::LifecycleReads>,
     namespace: &str,
     owner_host_id: &str,
     profile: &SshHostProfile,
@@ -242,7 +243,7 @@ pub(super) async fn register_ssh_host_resources(
         }
         Err(error) => return Err(error.to_string()),
     }
-    ensure_host_direct_environment_exists(backend, namespace, provisioning).await?;
+    ensure_host_direct_environment_exists(reads, provisioning).await?;
     let platform = ssh_host_platform(profile.runner.as_ref()).await;
     ensure_default_kinds(backend, namespace, provisioning, &platform).await
 }
@@ -273,7 +274,6 @@ pub(super) async fn apply_ssh_host_observation(
 ) -> Result<(), String> {
     let profile = &ssh.provisioning;
     let hosts = daemon.resource_backend().using::<Host>(namespace);
-    let host = hosts.get(&profile.host_id).await.map_err(|error| error.to_string())?;
     let probe = ssh.runner.run("mkdir", &["-p", &profile.repo_default_dir], Path::new("/"), &ChannelLabel::Default).await;
     let probe_succeeded = probe.is_ok();
     let free_bytes = if probe_succeeded {
@@ -334,32 +334,30 @@ pub(super) async fn apply_ssh_host_observation(
         ready &= takes_vessels;
         conditions.extend(vessel_conditions);
     }
-    let mut fulfilment_facts = if probe_succeeded {
-        let observed = ssh.fulfilment_facts.read().await.clone();
-        if observed.is_empty() {
-            host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
-        } else {
-            observed
-        }
-    } else {
-        BTreeMap::new()
+    // The probe's facts, which the patch keeps where the Host holds facts already: the probe writes
+    // them itself.
+    let probed_facts = match probe_succeeded {
+        true => Some(ssh.fulfilment_facts.read().await.clone()),
+        false => None,
     };
-    for facts in fulfilment_facts.values_mut() {
-        for harness in facts.harnesses.values_mut() {
-            harness.models.clear();
-        }
-    }
     // The owning daemon is the only placer here, so it alone counts the
     // vessels held against the host's cap (#3793).
-    if let Some(cap) = profile.max_vessels {
-        let occupancy = flotilla_admission::support::host_occupancy(&daemon.resource_backend(), namespace, &profile.host_id).await?;
-        let probed = ssh.fulfilment_facts.read().await;
-        for (kind, facts) in fulfilment_facts.iter_mut() {
-            // A probe that found the kind's terminal pool missing keeps it full.
-            let pool_missing = probed.get(kind).is_some_and(|probed| probed.free_vessel_slots == Some(0));
-            facts.free_vessel_slots = Some(if pool_missing { 0 } else { occupancy.free_slots(cap) });
+    let vessel_slots = match profile.max_vessels {
+        Some(cap) => {
+            let occupancy = flotilla_store::occupancy::host_occupancy(&daemon.resource_backend(), namespace, &profile.host_id).await?;
+            // A probe that found a kind's terminal pool missing keeps it full.
+            let pool_missing = ssh
+                .fulfilment_facts
+                .read()
+                .await
+                .iter()
+                .filter(|(_, probed)| probed.free_vessel_slots == Some(0))
+                .map(|(kind, _)| kind.clone())
+                .collect();
+            Some(SshVesselSlots { free: occupancy.free_slots(cap), pool_missing })
         }
-    }
+        None => None,
+    };
     let providers = match daemon.environment_registry_for_environment(&ssh.environment_id) {
         Some(registry) => observe_provider_advertisements(&registry).await,
         None => profile
@@ -374,13 +372,12 @@ pub(super) async fn apply_ssh_host_observation(
             .collect(),
     };
     let codex_central_login = flotilla_credentials::has_codex_central_login(&*daemon.discovery_runtime().env).await;
-    let status = HostStatus {
+    let patch = HostStatusPatch::SshHost {
         capabilities: BTreeMap::from([
             (flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(), json!(providers)),
             (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
             (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
             (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(credential_expiry)),
-            ("terminal_pools".to_string(), json!(profile.available_pools)),
             (SSH_HOST_CAPABILITY.to_string(), json!(true)),
             (TRANSPORT_CAPABILITY.to_string(), json!("ssh")),
             (PLACEMENT_CAPABILITY.to_string(), json!("host_direct_only")),
@@ -388,20 +385,18 @@ pub(super) async fn apply_ssh_host_observation(
             // #4037: the host's Codex crews take a copy of the owner's central login.
             (CODEX_CENTRAL_LOGIN_CAPABILITY.to_string(), json!(codex_central_login)),
         ]),
-        fulfilment_facts,
-        model_probes: ModelProbeState::default(),
+        probed_facts,
+        vessel_slots,
         // This timestamp is the owning daemon's last successful SSH probe,
         // never a heartbeat emitted by a daemon on the target host.
         heartbeat_at: probe_succeeded.then(Utc::now),
         ready,
-        sleeping_until: host.status.as_ref().and_then(|status| status.sleeping_until),
-        disk_free_bytes: free_bytes,
-        admission_free_space_floor_bytes: Some(daemon.admission_free_space_floor_bytes()?),
+        // The figures themselves change with every reading; only the judgement is the Host's.
+        below_free_space_floor: super::health::below_floor(free_bytes, daemon.admission_free_space_floor_bytes()?),
         conditions,
-        ..HostStatus::default()
     };
-    hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
-    Ok(())
+    // Patched against the Host as its port holds it, so the probe's facts written meanwhile stand.
+    flotilla_store::observe_status(&hosts, &profile.host_id, &patch).await.map_err(|error| error.to_string())
 }
 
 /// #3792: a host this controller cannot run vessel agents on is refused at
@@ -557,17 +552,47 @@ pub(super) struct FulfilmentProbeContext<'a> {
     /// Adapter → version of the pinned harnesses the host's crews are given (#4093);
     /// empty for a host whose crews run what it has installed.
     pub(super) pinned_harnesses: &'a BTreeMap<String, String>,
+    /// What the probe read of the store at its last pass.
+    pub(super) listings: &'a mut ProbeListings,
+}
+
+/// The Hosts and kinds a fulfilment probe reads, held between its ticks and listed again only
+/// once their collections move.
+#[derive(Default)]
+pub(super) struct ProbeListings {
+    hosts: Listed<Host>,
+    kinds: Listed<FulfilmentKind>,
 }
 
 /// The daemon's own host declares its environment through the daemon
 /// process: its probes take that `PATH` and locale as their base layer.
-pub(super) fn local_observation(discovery: &DiscoveryRuntime) -> Result<ObservationContext, String> {
-    let declared = std::iter::once("PATH").chain(LOCALE_VARIABLES.iter().copied());
-    let base = BaseLayer::declared(
-        declared.filter_map(|name| discovery.env.get(name).map(|value| (name.to_string(), value))),
-        &discovery.factories.account_variables(),
-    )?;
-    Ok(ObservationContext::new(base, &discovery.factories.account_variables()))
+/// The context is made again only when those variables change; the account
+/// variables come from the daemon's factories, fixed for its life.
+#[derive(Default)]
+pub(super) struct LocalObservation {
+    made: Option<(DeclaredVariables, Arc<ObservationContext>)>,
+}
+
+/// The variables the daemon's own host declares, by name.
+type DeclaredVariables = Vec<(&'static str, String)>;
+
+impl LocalObservation {
+    pub(super) fn current(&mut self, discovery: &DiscoveryRuntime) -> Result<Arc<ObservationContext>, String> {
+        let declared: DeclaredVariables = std::iter::once("PATH")
+            .chain(LOCALE_VARIABLES.iter().copied())
+            .filter_map(|name| discovery.env.get(name).map(|value| (name, value)))
+            .collect();
+        if let Some((made_from, context)) = &self.made {
+            if *made_from == declared {
+                return Ok(Arc::clone(context));
+            }
+        }
+        let accounts = discovery.factories.account_variables();
+        let base = BaseLayer::declared(declared.iter().map(|(name, value)| (name.to_string(), value.clone())), &accounts)?;
+        let context = Arc::new(ObservationContext::new(base, &accounts));
+        self.made = Some((declared, Arc::clone(&context)));
+        Ok(context)
+    }
 }
 
 pub(super) async fn observe_fulfilment_facts(
@@ -580,16 +605,15 @@ pub(super) async fn observe_fulfilment_facts(
     model_probes: &mut ModelProbeState,
 ) -> Result<BTreeMap<String, FulfilmentFacts>, String> {
     *model_probes = ModelProbeState::default();
-    let hosts = backend.clone().using::<Host>(namespace).list().await.map_err(|error| error.to_string())?;
-    let all_kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items;
+    let listings = &mut *probe.listings;
+    let hosts = listings.hosts.read(&backend.clone().using::<Host>(namespace)).await.map_err(|error| error.to_string())?;
+    let all_kinds = listings.kinds.read(&backend.clone().using::<FulfilmentKind>(namespace)).await.map_err(|error| error.to_string())?;
     let mut kinds = Vec::new();
-    for kind in all_kinds {
-        if kind.metadata.deletion_timestamp.is_some()
-            || is_prepared_snapshot(&kind.metadata.name, &kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
-        {
+    for kind in all_kinds.iter() {
+        if kind.metadata.deletion_timestamp.is_some() || is_prepared_snapshot(&kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND) {
             continue;
         }
-        if kind_belongs_to_host(&hosts.items, &kind, host_ref, "fact observation") {
+        if kind_belongs_to_host(&hosts, kind, host_ref, "fact observation") {
             kinds.push(kind);
         }
     }
@@ -600,9 +624,9 @@ pub(super) async fn observe_fulfilment_facts(
     // host, as admission counts them (#4002). An SSH host's are counted
     // when its observation is published (#3793).
     let host_spec =
-        hosts.items.iter().find(|host| host.metadata.name == host_ref).map(|host| &host.spec).filter(|host| host.connection.is_daemon());
+        hosts.iter().find(|host| host.metadata.name == host_ref).map(|host| &host.spec).filter(|host| host.connection.is_daemon());
     let occupancy = match host_spec.and_then(|host| host.max_vessels) {
-        Some(_) => Some(flotilla_admission::support::host_occupancy(backend, namespace, host_ref).await?),
+        Some(_) => Some(flotilla_store::occupancy::host_occupancy(backend, namespace, host_ref).await?),
         None => None,
     };
     let mut facts = BTreeMap::new();
@@ -643,7 +667,10 @@ pub(super) async fn observe_fulfilment_facts(
             // vessel's layers; resolution, not a probe, covers its image needs
             // (ADR 0062). Publish its capacity facts only.
             FulfilmentRealisation::DockerPerVessel { image: None } => {
-                facts.insert(kind.metadata.name, FulfilmentFacts { observed_at: Utc::now(), free_vessel_slots, ..Default::default() });
+                facts.insert(
+                    kind.metadata.name.clone(),
+                    FulfilmentFacts { observed_at: Utc::now(), free_vessel_slots, ..Default::default() },
+                );
                 continue;
             }
             FulfilmentRealisation::HostDirect => None,
@@ -657,7 +684,7 @@ pub(super) async fn observe_fulfilment_facts(
             // they are.
             let unknown =
                 FulfilmentFacts { image: image.map(Into::into), observed_at: Utc::now(), free_vessel_slots, ..Default::default() };
-            facts.insert(kind.metadata.name, unknown);
+            facts.insert(kind.metadata.name.clone(), unknown);
             continue;
         };
         let name = kind.metadata.name.clone();
@@ -713,7 +740,7 @@ pub(super) async fn observe_fulfilment_facts(
                 harness.models.clear();
             }
             observed.free_vessel_slots = free_vessel_slots;
-            observe_grants(&kind_store, &kind, &observed).await;
+            observe_grants(&kind_store, kind, &observed).await;
             facts.insert(name, observed);
         }
     }

@@ -6,7 +6,7 @@ mod schema_support;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use flotilla_engine_store::StoreLog;
@@ -16,7 +16,7 @@ use flotilla_provisioning::stored::manifest_root::{
 };
 use flotilla_resources::CharterSource;
 use flotilla_schema::{render_view, Kind, Timestamp};
-use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
+use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store, StoreHandle};
 use flotilla_state_machines::{Home, Resource};
 use schema_support::{check, plan};
 
@@ -60,7 +60,7 @@ fn manifest_root_statements_search_by_key() {
 // store holds (its row, its collections and its state data) reads back as the root the home holds.
 #[test]
 fn every_edge_of_a_root_reads_back_from_the_store() {
-    let store = Arc::new(Mutex::new(open()));
+    let store = Arc::new(StoreHandle::new(open()));
     let mut home = Home::<ManifestRoot, StoreLog>::with_log("home", StoreLog::new(Arc::clone(&store))).expect("declaration");
     let at = |seconds: i64| Timestamp::from_micros(seconds * 1_000_000);
     let repository = CharterSource::Repository { repo: "project-map".into(), branch: "main".into(), path: String::new() };

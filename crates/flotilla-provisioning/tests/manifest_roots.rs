@@ -11,8 +11,9 @@ use flotilla_resources::{
     CharterSource, Clock, DocumentKey, DocumentPhase, DocumentState, ResolutionAction, ResolutionOutcome, SystemClock,
 };
 use flotilla_schema_sqlite::stream::Service;
-use flotilla_store::{OldStoreManifestRoots, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_testkit::OldStoreManifestRoots;
 
 const NS: &str = "flotilla";
 const ROOT: &str = "manifest-0011223344556677";

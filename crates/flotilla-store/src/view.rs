@@ -30,6 +30,9 @@ const VIEW_RESTART_BACKOFF: Duration = Duration::from_millis(100);
 #[async_trait]
 pub trait ViewSource<T: Resource>: Send + Sync {
     async fn list_and_watch(&self) -> Result<(ReadResourceList<T>, Events<T>), ResourceError>;
+    /// Returns once every change committed before the call is in the watch's queued events. A
+    /// source whose events are queued as its writes commit has nothing to wait for.
+    async fn catch_up(&self) {}
 }
 
 pub struct StoreViewSource<T: Resource> {
@@ -45,39 +48,34 @@ impl<T: Resource> StoreViewSource<T> {
 #[async_trait]
 impl<T: Resource> ViewSource<T> for StoreViewSource<T> {
     async fn list_and_watch(&self) -> Result<(ReadResourceList<T>, Events<T>), ResourceError> {
+        // An engine-served kind's records, every home's, then each change to them.
+        if let Some(watch) = self.backend.definitions::<T>(&self.namespace).engine_watch().await {
+            let (items, events) = watch?;
+            return Ok((ReadResourceList { items }, events));
+        }
         let store = self.backend.store();
         let replicas = if T::REPLICATION_CLASS == ReplicationClass::None {
             futures::stream::pending().boxed()
-        } else if self.backend.serves_read_views() {
-            crate::retry_store_read(|| store.watch_replica_sources_typed::<T>(&self.namespace))
-                .await?
-                .filter_map(|event| async move {
-                    match event {
-                        Ok(ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item))
-                            if matches!(item.provenance, ResourceProvenance::Local) =>
-                        {
-                            None
-                        }
-                        Ok(ReadWatchEvent::DeletedByName { provenance: ResourceProvenance::Local, .. }) => None,
-                        event => Some(event),
-                    }
-                })
-                .boxed()
         } else {
-            crate::retry_store_read(|| store.watch_replicas_typed::<T>(&self.namespace)).await?
+            store.watch_replicas_typed::<T>(&self.namespace).await?
         };
         let query = StoreQuery { include_replicas: true, suppress_self_origin: false, ..StoreQuery::default() };
-        let listed = crate::retry_store_read(|| store.query_decoded(ResourceKind::of::<T>(), &self.namespace, &query)).await?;
+        let listed = store.query_decoded(ResourceKind::of::<T>(), &self.namespace, &query).await?;
         let position = listed.position.clone();
         let start = match position.generation {
             Some(generation) => WatchStart::FromVersionInGeneration { generation, resource_version: position.resource_version },
             None => WatchStart::FromVersion(position.resource_version),
         };
-        let local = crate::retry_store_read(|| store.watch_typed::<T>(&self.namespace, start.clone()))
-            .await?
-            .map(|event| event.map(ReadWatchEvent::local));
+        let local = store.watch_typed::<T>(&self.namespace, start).await?.map(|event| event.map(ReadWatchEvent::local));
         let items = ReadResourceList { items: listed.into_typed()? };
         Ok((items, futures::stream::select(local, replicas).boxed()))
+    }
+    /// An engine kind's changes reach its watches through the shared listing, which is taken
+    /// after the write: wait for it.
+    async fn catch_up(&self) {
+        if let Some(feed) = self.backend.held_engine_feed::<T>() {
+            feed.catch_up().await;
+        }
     }
 }
 
@@ -178,9 +176,8 @@ impl<T: Resource> ViewState<T> {
             Arc::make_mut(snapshot).index = Arc::new(QueryIndex::default());
         }
         if let Some(object) = merged.into_iter().next() {
-            let value = serde_json::to_value(object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?;
+            Arc::make_mut(index).update_object(&key, Some(&object))?;
             let item = ReadResourceObject { object, provenance: ResourceProvenance::Local };
-            Arc::make_mut(index).update(&key, Some(&value));
             if let Some(snapshot) = &mut self.snapshot {
                 let serialized = serialize_read(&item)?;
                 let snapshot = Arc::make_mut(snapshot);
@@ -249,8 +246,7 @@ impl<T: Resource> ViewState<T> {
         match event {
             ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) => {
                 let key = Self::key(&item.object.metadata.namespace, &item.object.metadata.name, &item.provenance);
-                let value = serde_json::to_value(item.object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?;
-                Arc::make_mut(&mut self.index).update(&key, Some(&value));
+                Arc::make_mut(&mut self.index).update_object(&key, Some(&item.object))?;
                 if let Some(snapshot) = self.snapshot.as_mut().filter(|_| snapshots_source_rows) {
                     let serialized = serialize_read(&item)?;
                     let snapshot = Arc::make_mut(snapshot);
@@ -333,9 +329,6 @@ impl<T: Resource> ViewState<T> {
         if query.message.is_some() {
             return Err(ResourceError::invalid("view queries support labels, declared fields and owners"));
         }
-        if query.replica_shadowing.is_some() {
-            return Err(ResourceError::invalid("view owns its replica shadowing scope"));
-        }
         let resolved = self.resolve_query(query)?;
         let query = &resolved;
         let (objects, index) = self.definitions.as_ref().map(|(objects, index)| (objects, index)).unwrap_or((&self.objects, &self.index));
@@ -344,9 +337,6 @@ impl<T: Resource> ViewState<T> {
             .into_iter()
             .filter_map(|key| objects.get(&key))
             .filter(|item| {
-                if query.replicas_only && matches!(item.provenance, ResourceProvenance::Local) {
-                    return false;
-                }
                 if !query.include_replicas && !matches!(item.provenance, ResourceProvenance::Local) {
                     return false;
                 }
@@ -505,11 +495,6 @@ impl<T: Resource> WatchView<T> {
     }
     pub async fn start(backend: ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
         let root = backend.local_root()?;
-        Self::start_at_root(backend, namespace, root).await
-    }
-    /// HTTP stores do not expose the serving root through Store::local_root;
-    /// callers supply that identity to preserve self-origin replica shadowing.
-    pub async fn start_at_root(backend: ResourceBackend, namespace: &str, root: NodeId) -> Result<Self, ResourceError> {
         Self::from_source(Arc::new(StoreViewSource::<T>::new(backend, namespace)), Some(root)).await
     }
     /// Initial setup retries expired handoffs but fails fast on other errors,
@@ -540,6 +525,7 @@ impl<T: Resource> WatchView<T> {
                     }
                     request = flush_rx.recv() => {
                         let Some(request) = request else { break };
+                        source.catch_up().await;
                         let mut changed = false;
                         while let Some(event) = events.next().now_or_never() {
                             let local = event.as_ref().and_then(|event| event.as_ref().ok()).is_some_and(event_is_local);
@@ -563,7 +549,8 @@ impl<T: Resource> WatchView<T> {
         });
         Ok(Self { state, changes, task: Arc::new(ViewTask(task)), flush, materialized: Arc::default(), keys, local_keys })
     }
-    /// Drain queued events before reading, stopping at a fresh resync snapshot.
+    /// Drain queued events before reading, stopping at a fresh resync snapshot,
+    /// once the source has queued every change committed before the call.
     /// This avoids scheduler-dependent
     /// read-your-writes behavior, at the cost of a worker round-trip; reads wait
     /// behind event handling and resync rather than returning an incomplete view.
@@ -654,17 +641,17 @@ pub trait LocalViewSource<T: Resource>: Send + Sync {
 #[async_trait]
 impl<T: Resource> LocalViewSource<T> for crate::TypedResolver<T> {
     async fn list(&self) -> Result<ResourceList<T>, ResourceError> {
-        crate::retry_store_read(|| self.list()).await
+        self.list().await
     }
     async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
-        crate::retry_store_read(|| self.watch(start.clone())).await
+        self.watch(start).await
     }
 }
 #[async_trait]
 impl<T: Resource> ViewSource<T> for crate::ReplicaReadResolver<T> {
     async fn list_and_watch(&self) -> Result<(ReadResourceList<T>, Events<T>), ResourceError> {
-        let watch = crate::retry_store_read(|| self.watch()).await?;
-        let listed = crate::retry_store_read(|| self.list()).await?;
+        let watch = self.watch().await?;
+        let listed = self.list().await?;
         Ok((listed, watch))
     }
 }
@@ -675,8 +662,8 @@ pub async fn recover_local_view<T: Resource>(source: &dyn LocalViewSource<T>) ->
     let mut warnings = RecoveryWarnings::default();
     loop {
         let result = async {
-            let listed = crate::retry_store_read(|| source.list()).await?;
-            let events = crate::retry_store_read(|| source.watch(WatchStart::resuming_from(&listed))).await?;
+            let listed = source.list().await?;
+            let events = source.watch(WatchStart::resuming_from(&listed)).await?;
             Ok((listed, events))
         }
         .await;
@@ -853,7 +840,7 @@ mod tests {
                 "metadata": {"name": format!("object-{name}"), "namespace": "test", "resourceVersion": "1",
                     "creationTimestamp": "2026-01-01T00:00:00Z", "labels": {"team": format!("team-{team}")},
                     "ownerReferences": [{"apiVersion":"flotilla.work/v1", "kind":"Project", "name":format!("owner-{owner}"), "controller":false}]},
-                "spec": ConvoySpec::builder().workflow_ref("test".into()).build(),
+                "spec": ConvoySpec::builder().workflow_ref("test".into()).project_ref("test".into()).build(),
                 "status": {"phase": if phase == 0 { "Active" } else { "Pending" }},
             });
             if team == 2 {

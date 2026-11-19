@@ -23,7 +23,9 @@ pub use clone_delivery::CloneDelivery;
 pub use codex_central::{
     codex_central_auth_path, has_codex_central_login, CodexCentralRefresher, CodexRefreshFailure, CodexRefreshSuccess,
 };
-pub use credential::{BuildSecretError, BuildSecretMaterial, CredentialRefreshError, CredentialStore, GithubAppScope};
+pub use credential::{
+    BuildSecretError, BuildSecretMaterial, CredentialRefreshError, CredentialStore, GithubAppRefresh, GithubAppRefreshWake, GithubAppScope,
+};
 pub use skill_archive::{ArchiveFile, SkillArchive};
 pub use skill_trees::{
     validate_frozen_vessel_skills, SkillSourceTokens, SkillTree, SkillTreeError, SkillTrees, TokenFiles, SKILL_TREE_MANIFEST,

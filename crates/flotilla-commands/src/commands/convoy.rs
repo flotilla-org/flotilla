@@ -72,8 +72,6 @@ pub struct ConvoyDeleteArgs {
 pub struct ConvoyLinkArgs {
     pub name: String,
     pub reference: String,
-    #[arg(long = "as", value_parser = parse_relationship)]
-    pub relationship: flotilla_protocol::Relationship,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
@@ -209,15 +207,12 @@ pub struct ConvoyCreateArgs {
     /// Input value (repeatable): --input key=value
     #[arg(long = "input", value_parser = parse_input_kv)]
     pub inputs: Vec<(String, String)>,
-    /// Repository URL the workflow operates on
-    #[arg(long = "repo")]
-    pub repository_url: Option<String>,
     /// Git ref (branch/tag/commit) within the repository
     #[arg(long = "ref")]
     pub r#ref: Option<String>,
-    /// Project this convoy belongs to (metadata grouping)
-    #[arg(long = "project")]
-    pub project_ref: Option<String>,
+    /// Project this convoy belongs to; its repositories come from the project
+    #[arg(long = "project", value_name = "NAME")]
+    pub project_ref: String,
     /// Pin a fulfilment kind for vessel provisioning
     #[arg(long = "fulfilment")]
     pub placement_policy: Option<String>,
@@ -265,10 +260,6 @@ fn parse_pr_number(raw: &str) -> Result<String, String> {
         Ok(number) if number > 0 => Ok(number.to_string()),
         _ => Err(format!("pull request number must be a positive integer: {raw}")),
     }
-}
-
-fn parse_relationship(raw: &str) -> Result<flotilla_protocol::Relationship, String> {
-    raw.parse()
 }
 
 fn resolve_adopted_checkout(path: PathBuf) -> Result<Box<PathBuf>, String> {
@@ -408,12 +399,12 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
-            ConvoyVerb::Link(ConvoyLinkArgs { name, reference, relationship }) => Ok(Resolved::NeedsContext {
+            ConvoyVerb::Link(ConvoyLinkArgs { name, reference }) => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
                     provisioning_target: None,
                     context_repo: None,
-                    action: CommandAction::ConvoyLink { namespace: None, name, reference, relationship },
+                    action: CommandAction::ConvoyLink { namespace: None, name, reference },
                 },
                 repo: RepoContext::None,
                 host: HostResolution::Local,
@@ -570,17 +561,9 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
-            ConvoyVerb::Create(ConvoyCreateArgs {
-                template,
-                inputs,
-                repository_url,
-                r#ref,
-                project_ref,
-                placement_policy,
-                adopted_checkout,
-            }) => {
+            ConvoyVerb::Create(ConvoyCreateArgs { template, inputs, r#ref, project_ref, placement_policy, adopted_checkout }) => {
                 let name = self.subject.ok_or_else(|| "convoy role is required before `create`".to_string())?;
-                if let Some(project_ref) = project_ref.as_ref().filter(|_| repository_url.is_none() && adopted_checkout.is_none()) {
+                if adopted_checkout.is_none() {
                     return Ok(Resolved::NeedsContext {
                         command: Command {
                             node_id: None,
@@ -591,7 +574,7 @@ impl ConvoyNoun {
                                     continuation: None,
                                     standing_role: None,
                                     namespace: None,
-                                    project_ref: project_ref.clone(),
+                                    project_ref,
                                     change_request: None,
                                     issues: Vec::new(),
                                     name: Some(name),
@@ -624,7 +607,6 @@ impl ConvoyNoun {
                             name,
                             workflow_ref: template,
                             inputs,
-                            repository_url,
                             r#ref,
                             project_ref,
                             placement_policy,
@@ -680,8 +662,8 @@ impl std::fmt::Display for ConvoyNoun {
                     write!(f, " --force")?;
                 }
             }
-            ConvoyVerb::Link(ConvoyLinkArgs { name, reference, relationship }) => {
-                write!(f, " link {} {} --as {}", quote_value(name), quote_value(reference), relationship.as_str())?;
+            ConvoyVerb::Link(ConvoyLinkArgs { name, reference }) => {
+                write!(f, " link {} {}", quote_value(name), quote_value(reference))?;
             }
             ConvoyVerb::Unlink(ConvoyUnlinkArgs { name, reference }) => {
                 write!(f, " unlink {} {}", quote_value(name), quote_value(reference))?;
@@ -804,28 +786,15 @@ impl std::fmt::Display for ConvoyNoun {
                     write!(f, " --attach")?;
                 }
             }
-            ConvoyVerb::Create(ConvoyCreateArgs {
-                template,
-                inputs,
-                repository_url,
-                r#ref,
-                project_ref,
-                placement_policy,
-                adopted_checkout,
-            }) => {
+            ConvoyVerb::Create(ConvoyCreateArgs { template, inputs, r#ref, project_ref, placement_policy, adopted_checkout }) => {
                 write!(f, " create --template {}", quote_value(template))?;
                 for (k, v) in inputs {
                     write!(f, " --input {}", quote_value(&format!("{k}={v}")))?;
                 }
-                if let Some(url) = repository_url {
-                    write!(f, " --repo {}", quote_value(url))?;
-                }
                 if let Some(reference) = r#ref {
                     write!(f, " --ref {}", quote_value(reference))?;
                 }
-                if let Some(project) = project_ref {
-                    write!(f, " --project {}", quote_value(project))?;
-                }
+                write!(f, " --project {}", quote_value(project_ref))?;
                 if let Some(placement_policy) = placement_policy {
                     write!(f, " --fulfilment {}", quote_value(placement_policy))?;
                 }
@@ -843,7 +812,7 @@ mod tests {
     use clap::Parser;
     use flotilla_protocol::{
         AgentOverride, Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, DispatchPromiseRequest, IssueRef, IssueSelector,
-        IssueSource, PromiseOwner, Relationship,
+        IssueSource, PromiseOwner,
     };
 
     use super::ConvoyNoun;
@@ -896,20 +865,14 @@ mod tests {
 
     #[test]
     fn convoy_subject_link_and_unlink_resolve() {
-        let link =
-            parse(&["convoy", "link", "work@lab", "lab:robert/project-map!12", "--as", "supersedes"]).resolve().expect("link command");
+        let link = parse(&["convoy", "link", "work@lab", "lab:robert/project-map!12"]).resolve().expect("link command");
         crate::test_utils::assert_needs_context(
             link,
-            CommandAction::ConvoyLink {
-                namespace: None,
-                name: "work@lab".into(),
-                reference: "lab:robert/project-map!12".into(),
-                relationship: Relationship::Supersedes,
-            },
+            CommandAction::ConvoyLink { namespace: None, name: "work@lab".into(), reference: "lab:robert/project-map!12".into() },
             RepoContext::None,
             HostResolution::Local,
         );
-        assert_round_trip::<ConvoyNoun>(&["convoy", "link", "work@lab", "lab:robert/project-map!12", "--as", "supersedes"]);
+        assert_round_trip::<ConvoyNoun>(&["convoy", "link", "work@lab", "lab:robert/project-map!12"]);
         let unlink = parse(&["convoy", "unlink", "work@lab", "lab:robert/project-map!12"]).resolve().expect("unlink command");
         crate::test_utils::assert_needs_context(
             unlink,
@@ -1457,59 +1420,27 @@ mod tests {
     }
 
     #[test]
-    fn convoy_create_resolves() {
-        let resolved = parse(&[
-            "convoy",
-            "my-convoy",
-            "create",
-            "--template",
-            "scratch",
-            "--input",
-            "topic=demo",
-            "--input",
-            "branch=foo",
-            "--repo",
-            "https://github.com/flotilla-org/flotilla.git",
-            "--ref",
-            "main",
-        ])
-        .resolve()
-        .expect("resolve");
-        crate::test_utils::assert_needs_context(
-            resolved,
-            CommandAction::ConvoyCreate {
-                name: "my-convoy".into(),
-                workflow_ref: "scratch".into(),
-                inputs: vec![("topic".into(), "demo".into()), ("branch".into(), "foo".into())],
-                repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
-                r#ref: Some("main".into()),
-                project_ref: None,
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-            RepoContext::None,
-            HostResolution::Local,
-        );
+    fn convoy_create_requires_a_project() {
+        let error = ConvoyNoun::try_parse_from(["convoy", "scratch-1", "create", "--template", "scratch"])
+            .expect_err("a create that names no project must not parse");
+        assert!(error.to_string().contains("--project <NAME>"), "{error}");
     }
 
     #[test]
-    fn convoy_create_minimal_resolves() {
-        let resolved = parse(&["convoy", "scratch-1", "create", "--template", "scratch"]).resolve().expect("resolve");
-        crate::test_utils::assert_needs_context(
-            resolved,
-            CommandAction::ConvoyCreate {
-                name: "scratch-1".into(),
-                workflow_ref: "scratch".into(),
-                inputs: vec![],
-                repository_url: None,
-                r#ref: None,
-                project_ref: None,
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-            RepoContext::None,
-            HostResolution::Local,
-        );
+    fn convoy_create_takes_no_repository() {
+        let error = ConvoyNoun::try_parse_from([
+            "convoy",
+            "scratch-1",
+            "create",
+            "--template",
+            "scratch",
+            "--project",
+            "flotilla",
+            "--repo",
+            "https://github.com/flotilla-org/flotilla.git",
+        ])
+        .expect_err("the repository comes from the project");
+        assert!(error.to_string().contains("--repo"), "{error}");
     }
 
     #[test]
@@ -1551,7 +1482,32 @@ mod tests {
 
     #[test]
     fn convoy_create_with_placement_policy_resolves() {
-        let resolved = parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--fulfilment", "host-direct-local"])
+        let resolved = parse(&[
+            "convoy",
+            "scratch-1",
+            "create",
+            "--template",
+            "scratch",
+            "--project",
+            "flotilla",
+            "--input",
+            "topic=demo",
+            "--fulfilment",
+            "host-direct-local",
+        ])
+        .resolve()
+        .expect("resolve");
+        let Resolved::NeedsContext { command, .. } = resolved else { panic!("expected daemon command") };
+        let CommandAction::ConvoyStart { intent } = command.action else { panic!("expected start admission: {:?}", command.action) };
+        assert_eq!(intent.project_ref, "flotilla");
+        assert_eq!(intent.inputs, vec![("topic".to_string(), "demo".to_string())]);
+        assert_eq!(intent.placement_policy.as_deref(), Some("host-direct-local"));
+    }
+
+    #[test]
+    fn convoy_create_with_adopted_checkout_resolves() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let resolved = parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--project", "flotilla", "--adopt-checkout", "."])
             .resolve()
             .expect("resolve");
         crate::test_utils::assert_needs_context(
@@ -1560,31 +1516,8 @@ mod tests {
                 name: "scratch-1".into(),
                 workflow_ref: "scratch".into(),
                 inputs: vec![],
-                repository_url: None,
                 r#ref: None,
-                project_ref: None,
-                placement_policy: Some("host-direct-local".into()),
-                adopted_checkout: None,
-            },
-            RepoContext::None,
-            HostResolution::Local,
-        );
-    }
-
-    #[test]
-    fn convoy_create_with_adopted_checkout_resolves() {
-        let cwd = std::env::current_dir().expect("current dir");
-        let resolved =
-            parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--adopt-checkout", "."]).resolve().expect("resolve");
-        crate::test_utils::assert_needs_context(
-            resolved,
-            CommandAction::ConvoyCreate {
-                name: "scratch-1".into(),
-                workflow_ref: "scratch".into(),
-                inputs: vec![],
-                repository_url: None,
-                r#ref: None,
-                project_ref: None,
+                project_ref: "flotilla".into(),
                 placement_policy: None,
                 adopted_checkout: Some(Box::new(cwd)),
             },
@@ -1595,9 +1528,19 @@ mod tests {
 
     #[test]
     fn convoy_create_with_missing_adopted_checkout_fails_resolution() {
-        let err = parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--adopt-checkout", "/tmp/flotilla-missing-checkout"])
-            .resolve()
-            .expect_err("missing checkout should fail before daemon handoff");
+        let err = parse(&[
+            "convoy",
+            "scratch-1",
+            "create",
+            "--template",
+            "scratch",
+            "--project",
+            "flotilla",
+            "--adopt-checkout",
+            "/tmp/flotilla-missing-checkout",
+        ])
+        .resolve()
+        .expect_err("missing checkout should fail before daemon handoff");
         assert!(err.contains("adopted checkout path /tmp/flotilla-missing-checkout cannot be resolved"), "{err}");
     }
 
@@ -1612,10 +1555,10 @@ mod tests {
             "scratch",
             "--input",
             "topic=my work",
-            "--repo",
-            "https://example.com/repo.git",
             "--ref",
             "main",
+            "--project",
+            "flotilla",
             "--fulfilment",
             "host-direct-local",
             "--adopt-checkout",
@@ -1633,12 +1576,14 @@ mod tests {
             "scratch",
             "--input",
             "topic=my work",
-            "--repo",
-            "https://example.com/path with space.git",
+            "--project",
+            "flotilla",
+            "--adopt-checkout",
+            "/tmp/my repo",
         ]);
         let displayed = parsed.to_string();
         assert!(displayed.contains("--input \"topic=my work\""), "expected quoted input in {displayed:?}");
-        assert!(displayed.contains("--repo \"https://example.com/path with space.git\""), "expected quoted repo in {displayed:?}");
+        assert!(displayed.contains("--adopt-checkout \"/tmp/my repo\""), "expected quoted checkout in {displayed:?}");
     }
     #[test]
     fn explicit_skills_round_trip_into_the_dispatch_intent() {

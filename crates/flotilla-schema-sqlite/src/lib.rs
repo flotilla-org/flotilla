@@ -29,20 +29,22 @@
 //! resource keeps its identity row so cached `ResourceId`s and references to it stay valid.
 //! Collecting unused string rows is separate work (#3320 out of scope).
 //!
-//! `Store::open` creates missing tables and indexes, adds columns that declare a previous-generation
+//! `Store::open` creates missing tables and indexes, recreates a kind index whose definition changed
+//! and drops one no longer declared, adds columns that declare a previous-generation
 //! default, and rebuilds a kind table whose only difference is fewer allowed codes (#3972); any
 //! other difference in a kind table's columns or codes refuses to open.
 
 mod ddl;
 pub use ddl::{
-    code_field, code_literal, quote_ident, render_ddl, render_ddl_with, render_views, ConditionSql, DdlMode, GuardSql, IndexPredicateSql,
-    CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD, VIEW_SUFFIX,
+    code_field, code_literal, quote_ident, render_ddl, render_ddl_with, render_indexes, render_views, ConditionSql, DdlMode, GuardSql,
+    IndexPredicateSql, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD, VIEW_SUFFIX,
 };
 
 mod audit;
 mod cache;
 mod effect;
 mod error;
+mod handle;
 mod query;
 mod shared;
 mod sql;
@@ -50,14 +52,18 @@ mod store;
 
 pub mod stream;
 
-pub use audit::audit_domains;
+pub use audit::{audit_domains, stored_last_sequence};
 pub use error::{Malformed, StoreError, StreamResourceLimit};
+pub use handle::{Hold, HoldTimer, StoreGuard, StoreHandle};
 pub use query::{Cursor, Page, MAX_PAGE};
 pub use shared::{schema_ddl, SORTED_STATEMENTS};
 pub use store::{
-    AboutCursor, AboutPage, Applied, ChangeId, InChange, Loaded, Read, ResourceId, Snapshot, Stamp, Store, StoreOptions, Write,
-    MAX_CHANGES_PAGE_BYTES,
+    AboutCursor, AboutPage, Applied, CarriedEdges, CarriedEntry, ChangeId, InChange, Loaded, Observed, Observer, Read, ResourceId,
+    Snapshot, Staged, Stamp, Store, StoreOptions, Write, MAX_CHANGES_PAGE_BYTES,
 };
 
 mod table_read;
 pub use table_read::TableRead;
+
+mod wal;
+pub use wal::{WalCheckpoints, WalPolicy, WalReading};

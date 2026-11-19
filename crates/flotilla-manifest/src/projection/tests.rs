@@ -169,7 +169,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Required)
             .actionable(false)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::ReviewRequired)
             .build(),
         ReadinessCase::builder()
             .name("approved")
@@ -199,7 +199,38 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Approved)
             .actionable(false)
             .landed(false)
+            .expected(Readiness::ChecksPending)
+            .build(),
+        // Run 4 R4-4: Forgejo's unknown mergeability while checks run names no review.
+        ReadinessCase::builder()
+            .name("pending checks, unknown mergeability, no review")
+            .state(State::Open)
+            .checks(Checks::Pending)
+            .maybe_mergeable(None)
+            .review_decision(Review::None)
+            .actionable(false)
+            .landed(false)
+            .expected(Readiness::ChecksPending)
+            .build(),
+        ReadinessCase::builder()
+            .name("a review response beats pending checks")
+            .state(State::Open)
+            .checks(Checks::Pending)
+            .maybe_mergeable(None)
+            .review_decision(Review::Approved)
+            .actionable(true)
+            .landed(false)
             .expected(Readiness::AwaitingReviewResponse)
+            .build(),
+        ReadinessCase::builder()
+            .name("pending checks beat a required review")
+            .state(State::Open)
+            .checks(Checks::Pending)
+            .mergeable(Mergeability::Mergeable)
+            .review_decision(Review::Required)
+            .actionable(false)
+            .landed(false)
+            .expected(Readiness::ChecksPending)
             .build(),
         ReadinessCase::builder()
             .name("unknown checks")
@@ -209,7 +240,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Approved)
             .actionable(false)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::Unknown)
             .build(),
         ReadinessCase::builder()
             .name("unknown mergeability")
@@ -219,7 +250,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Approved)
             .actionable(false)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::Unknown)
             .build(),
         ReadinessCase::builder()
             .name("unknown review decision")
@@ -229,7 +260,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .maybe_review_decision(None)
             .actionable(false)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::Unknown)
             .build(),
         ReadinessCase::builder()
             .name("unknown feedback")
@@ -239,7 +270,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Approved)
             .maybe_actionable(None)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::Unknown)
             .build(),
         ReadinessCase::builder()
             .name("unknown state")
@@ -249,7 +280,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Approved)
             .actionable(false)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::Unknown)
             .build(),
     ];
     for case in cases {
@@ -275,6 +306,9 @@ fn change_request_readiness_uses_adr_wire_values() {
     for (readiness, expected) in [
         (Readiness::ReadyToMerge, "ready_to_merge"),
         (Readiness::AwaitingReviewResponse, "awaiting_review_response"),
+        (Readiness::ChecksPending, "checks_pending"),
+        (Readiness::ReviewRequired, "review_required"),
+        (Readiness::Unknown, "unknown"),
         (Readiness::CiFailing, "ci_failing"),
         (Readiness::Conflicting, "conflicting"),
         (Readiness::Draft, "draft"),
@@ -296,6 +330,7 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("remote")
+        .project_ref("flotilla")
         .workflow_ref("implement")
         .phase(ConvoyPhase::Active)
         .message("waiting for a reviewer")
@@ -385,6 +420,7 @@ fn vessel_on_another_machine_attaches_through_its_acting_daemon_only() {
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("ssh")
+        .project_ref("flotilla")
         .workflow_ref("implement")
         .phase(ConvoyPhase::Active)
         .vessels(vec![terminal])
@@ -776,7 +812,13 @@ fn awareness_children_use_their_convoys_canonical_origin() {
         .entries(vec![issue])
         .build();
     let reference = convoy_ref("dev", "cutover");
-    let convoy = ConvoyRow::builder().resource(reference).name("cutover").workflow_ref("implement").phase(ConvoyPhase::Active).build();
+    let convoy = ConvoyRow::builder()
+        .resource(reference)
+        .name("cutover")
+        .project_ref("flotilla")
+        .workflow_ref("implement")
+        .phase(ConvoyPhase::Active)
+        .build();
 
     let patches = project_catalog(
         &CatalogInput {
@@ -871,12 +913,18 @@ fn catalog_diff_unsets_removed_entity_facts() {
     let with_message = ConvoyRow::builder()
         .resource(reference.clone())
         .name("cutover")
+        .project_ref("flotilla")
         .workflow_ref("implement")
         .phase(ConvoyPhase::Failed)
         .message("boom")
         .build();
-    let without_message =
-        ConvoyRow::builder().resource(reference).name("cutover").workflow_ref("implement").phase(ConvoyPhase::Active).build();
+    let without_message = ConvoyRow::builder()
+        .resource(reference)
+        .name("cutover")
+        .project_ref("flotilla")
+        .workflow_ref("implement")
+        .phase(ConvoyPhase::Active)
+        .build();
     let previous = project_catalog(
         &CatalogInput {
             subjects: None,
@@ -906,11 +954,30 @@ fn catalog_diff_unsets_removed_entity_facts() {
 
 #[test]
 fn badges_preserve_normalized_status_and_attention() {
-    assert_eq!(convoy_badge(ConvoyPhase::Pending, false), Badge { state: BadgeState::Waiting, attention: false });
-    assert_eq!(convoy_badge(ConvoyPhase::Active, false), Badge { state: BadgeState::Active, attention: false });
-    assert_eq!(convoy_badge(ConvoyPhase::Failed, false), Badge { state: BadgeState::Failed, attention: true });
+    assert_eq!(convoy_badge(Some(ConvoyPhase::Pending), false), Badge { state: BadgeState::Waiting, attention: false });
+    assert_eq!(convoy_badge(Some(ConvoyPhase::Active), false), Badge { state: BadgeState::Active, attention: false });
+    assert_eq!(convoy_badge(Some(ConvoyPhase::Failed), false), Badge { state: BadgeState::Failed, attention: true });
+    assert_eq!(convoy_badge(None, false), Badge { state: BadgeState::Waiting, attention: true });
     assert_eq!(work_badge(WorkPhase::Ready), Badge { state: BadgeState::Waiting, attention: true });
     assert_eq!(session_badge(SessionPhase::Running), Badge { state: BadgeState::Active, attention: false });
+}
+
+#[test]
+fn an_unreadable_convoy_asks_for_attention_with_its_reason_and_no_phase() {
+    let unreadable = ConvoyRow::builder()
+        .resource(convoy_ref("dev", "broken"))
+        .name("broken")
+        .project_ref("flotilla")
+        .workflow_ref("implement")
+        .unreadable("admission document does not decode")
+        .build();
+    let patches = project_catalog(&catalog_input(&[unreadable]), &mint()).reassert_patches();
+    let patch = find_entity(&patches, &entity::convoy("dev", "broken", "kiwi"));
+
+    assert_eq!(text(patch, KEY_STATUS_STATE), "waiting");
+    assert_eq!(patch.set.get(KEY_STATUS_ATTENTION).map(|fact| &fact.value), Some(&MetadataValue::Bool(true)));
+    assert_eq!(text(patch, KEY_SUMMARY_TEXT), "unreadable: admission document does not decode");
+    assert!(!patch.set.contains_key(crate::keys::KEY_CONVOY_PHASE), "{patch:?}");
 }
 
 #[test]
@@ -919,6 +986,7 @@ fn convoy_summary_surfaces_status_message_ahead_of_progress() {
     let convoy = ConvoyRow::builder()
         .resource(reference.clone())
         .name("waiting")
+        .project_ref("flotilla")
         .workflow_ref("implement")
         .phase(ConvoyPhase::Pending)
         .message("2 in pool, all leased")
@@ -954,10 +1022,12 @@ fn crew_roles_remain_a_flat_fact() {
         command_preview: "codex".to_owned(),
         requested_stance: None,
         effective_stance: None,
+        agent_session: None,
     }];
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("cutover")
+        .project_ref("flotilla")
         .workflow_ref("implement")
         .phase(ConvoyPhase::Active)
         .vessels(vec![coder])
@@ -985,6 +1055,7 @@ fn awareness_retains_exact_convoy_phase_for_visibility_controls() {
         let convoy = ConvoyRow::builder()
             .resource(reference.clone())
             .name("governor".to_owned())
+            .project_ref("flotilla")
             .workflow_ref("standing-governor")
             .phase(phase)
             .build();
@@ -1454,14 +1525,14 @@ fn live_role_carries_its_attempts_vessel_attention() {
     let quiet = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live)).reassert_patches();
     assert!(!find_entity(&quiet, &role_entity_for("p", "governor")).set.contains_key(KEY_STATUS_ATTENTION));
 
-    live.phase = ConvoyPhase::Interrupted;
+    live.phase = Some(ConvoyPhase::Interrupted);
     let interrupted = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live)).reassert_patches();
     let interrupted_role = find_entity(&interrupted, &role_entity_for("p", "governor"));
     let interrupted_convoy = find_entity(&interrupted, &entity::convoy("dev", "convoy-a", "kiwi"));
     assert!(!interrupted_role.set.contains_key(KEY_STATUS_ATTENTION));
     assert!(!interrupted_convoy.set.contains_key(KEY_STATUS_ATTENTION));
     assert_eq!(text(interrupted_role, KEY_STATUS_STATE), "waiting");
-    live.phase = ConvoyPhase::Active;
+    live.phase = Some(ConvoyPhase::Active);
 
     live.vessels[0].surface_state =
         flotilla_protocol::result_set::SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Nudge };
@@ -1531,6 +1602,7 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     let mut convoy = ConvoyRow::builder()
         .resource(convoy_ref("flotilla", "ship-it"))
         .name("ship-it")
+        .project_ref("flotilla")
         .workflow_ref("workflow/dev")
         .phase(ConvoyPhase::Active)
         .build();
@@ -1567,7 +1639,7 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     assert!(!patch.set.contains_key("flotilla.change_request.state"));
     assert_eq!(text(patch, KEY_DISPLAY_LABEL), "f!42");
     assert_eq!(text(patch, KEY_DISPLAY_LABEL_SHORT), "f!42");
-    assert_eq!(text(patch, "flotilla.change_request.readiness"), "awaiting_review_response");
+    assert_eq!(text(patch, "flotilla.change_request.readiness"), "unknown");
     let convoy = find_entity(&patches, &entity::convoy("flotilla", "ship-it", "kiwi"));
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL), "ship-it");
     assert_eq!(convoy.set["flotilla.subject.produces"].value, MetadataValue::EntityRefs(vec![cr]));
@@ -1613,6 +1685,7 @@ fn subject_window_and_successive_role_attempts_exclude_unlinked_records() {
     let mut old = ConvoyRow::builder()
         .resource(convoy_ref("flotilla", "old"))
         .name("old")
+        .project_ref("flotilla")
         .workflow_ref("workflow/dev")
         .phase(ConvoyPhase::Landed)
         .finished_at("2026-10-01T12:00:00Z".parse().expect("time"))
@@ -1654,7 +1727,7 @@ fn subject_window_and_successive_role_attempts_exclude_unlinked_records() {
     let mut current = old;
     current.resource = convoy_ref("flotilla", "new");
     current.name = "new".into();
-    current.phase = ConvoyPhase::Active;
+    current.phase = Some(ConvoyPhase::Active);
     current.generation = 2;
     let rows = [rows[0].clone(), current];
     let roles = [StandingRoleRow::builder()
@@ -1692,7 +1765,7 @@ fn standing_attempt_edges_and_crew_sessions_survive_re_admission() {
     assert_eq!(facts.set["flotilla.role.restart_count"].value, MetadataValue::Integer(2));
     assert_eq!(text(facts, "flotilla.role.desired_state"), "running");
     let mut old = live_old;
-    old.phase = ConvoyPhase::Failed;
+    old.phase = Some(ConvoyPhase::Failed);
     let new = attempt().name("new").role("governor").generation(2).phase(ConvoyPhase::Active).ensured_from("ensure-p-governor").call();
     let after = role_catalog(std::slice::from_ref(&role), &[new, old.clone()]);
     let diff = after.diff_patches(&before);
@@ -1845,6 +1918,7 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
         "ship-it",
         &ConvoySpec::builder()
             .workflow_ref("dev".into())
+            .project_ref("flotilla".into())
             .subjects(vec![
                 DeclaredSubject { subject: first.clone(), relationship: Relationship::Produces, issue: None, change_request: None },
                 DeclaredSubject { subject: issue.clone(), relationship: Relationship::WorksOn, issue: None, change_request: None },
@@ -2011,7 +2085,7 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
     let mut expected = std::collections::BTreeSet::new();
     let mut convoys = Vec::new();
     for index in 0..count {
-        let project = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let project = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
         let relationship =
             [Relationship::Produces, Relationship::Adopts, Relationship::WorksOn, Relationship::Supersedes, Relationship::References]
                 [tc.draw(gs::integers::<usize>().min_value(0).max_value(4))];
@@ -2019,12 +2093,14 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
         if tc.draw(gs::booleans()) {
             resource.host = None;
         }
-        let mut convoy =
-            ConvoyRow::builder().resource(resource).name(format!("convoy-{index}")).workflow_ref("dev").phase(ConvoyPhase::Active).build();
-        if project < 3 {
-            convoy.project_ref = Some(format!("project/dev/p{project}"));
-            expected.insert(format!("dev/p{project}@fleet"));
-        }
+        let mut convoy = ConvoyRow::builder()
+            .resource(resource)
+            .name(format!("convoy-{index}"))
+            .project_ref(format!("project/dev/p{project}"))
+            .workflow_ref("dev")
+            .phase(ConvoyPhase::Active)
+            .build();
+        expected.insert(format!("dev/p{project}@fleet"));
         convoy.subjects = subjects
             .iter()
             .map(|subject| ConvoySubjectRow {
@@ -2211,8 +2287,13 @@ fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
         );
     }
     let convoys = [42, 43].map(|number| {
-        let mut row =
-            ConvoyRow::builder().resource(convoy_ref("dev", "live")).name("live").workflow_ref("dev").phase(ConvoyPhase::Active).build();
+        let mut row = ConvoyRow::builder()
+            .resource(convoy_ref("dev", "live"))
+            .name("live")
+            .project_ref("flotilla")
+            .workflow_ref("dev")
+            .phase(ConvoyPhase::Active)
+            .build();
         row.subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
             subject: flotilla_protocol::Subject {
                 kind: flotilla_protocol::SubjectKind::ChangeRequest,
@@ -2335,7 +2416,7 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
     let number = tc.draw(gs::integers::<u32>().min_value(1).max_value(u32::MAX));
     // Forge resource IDs are DNS labels, so github.com cannot be an exact ID.
-    // Exercise every valid covering mode on every generated input.
+    // Every valid covering mode is drawn.
     #[derive(Clone, Copy, Debug)]
     enum Coverage {
         Absent,
@@ -2343,142 +2424,147 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
         InstallationUrl,
         HostAlias,
     }
-    for mode in [Coverage::Absent, Coverage::Unrelated, Coverage::InstallationUrl, Coverage::HostAlias] {
-        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut observations = runtime.block_on(async {
-            SubjectCatalogInput {
-                change_requests: vec![backend
-                    .using::<ChangeRequest>("dev")
-                    .create(
-                        &InputMeta::builder().name("cr".into()).build(),
-                        &ChangeRequestSpec::builder()
-                            .service("github.com".into())
-                            .scope("org/repo".into())
-                            .number(number.into())
-                            .observing_authority("kiwi".into())
-                            .build(),
-                    )
-                    .await
-                    .expect("change request")],
-                issues: vec![backend
-                    .using::<Issue>("dev")
-                    .create(
-                        &InputMeta::builder().name("issue".into()).build(),
-                        &IssueSpec::builder()
-                            .service("github.com".into())
-                            .scope("org/repo".into())
-                            .number(number.into())
-                            .observing_authority("kiwi".into())
-                            .build(),
-                    )
-                    .await
-                    .expect("issue")],
-                ..Default::default()
-            }
-        });
-        let source = IssueSource { service: "github.com".into(), scope: "org/repo".into() };
-        let subjects = [
-            Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: number.to_string() },
-            Subject { kind: SubjectKind::Issue, source, id: number.to_string() },
-        ];
-        let mut convoy =
-            ConvoyRow::builder().resource(convoy_ref("dev", "work")).name("work").workflow_ref("dev").phase(ConvoyPhase::Active).build();
-        convoy.subjects = (0..count)
-            .flat_map(|_| {
-                subjects.iter().map(|subject| ConvoySubjectRow {
-                    subject: subject.clone(),
-                    relationship: Relationship::Produces,
-                    declared: false,
-                    short: subject.id.clone(),
-                    url: None,
-                    repository_key: None,
-                })
+    let mode = [Coverage::Absent, Coverage::Unrelated, Coverage::InstallationUrl, Coverage::HostAlias]
+        [tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
+    let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut observations = runtime.block_on(async {
+        SubjectCatalogInput {
+            change_requests: vec![backend
+                .using::<ChangeRequest>("dev")
+                .create(
+                    &InputMeta::builder().name("cr".into()).build(),
+                    &ChangeRequestSpec::builder()
+                        .service("github.com".into())
+                        .scope("org/repo".into())
+                        .number(number.into())
+                        .observing_authority("kiwi".into())
+                        .build(),
+                )
+                .await
+                .expect("change request")],
+            issues: vec![backend
+                .using::<Issue>("dev")
+                .create(
+                    &InputMeta::builder().name("issue".into()).build(),
+                    &IssueSpec::builder()
+                        .service("github.com".into())
+                        .scope("org/repo".into())
+                        .number(number.into())
+                        .observing_authority("kiwi".into())
+                        .build(),
+                )
+                .await
+                .expect("issue")],
+            ..Default::default()
+        }
+    });
+    let source = IssueSource { service: "github.com".into(), scope: "org/repo".into() };
+    let subjects = [
+        Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: number.to_string() },
+        Subject { kind: SubjectKind::Issue, source, id: number.to_string() },
+    ];
+    let mut convoy = ConvoyRow::builder()
+        .resource(convoy_ref("dev", "work"))
+        .name("work")
+        .project_ref("flotilla")
+        .workflow_ref("dev")
+        .phase(ConvoyPhase::Active)
+        .build();
+    convoy.subjects = (0..count)
+        .flat_map(|_| {
+            subjects.iter().map(|subject| ConvoySubjectRow {
+                subject: subject.clone(),
+                relationship: Relationship::Produces,
+                declared: false,
+                short: subject.id.clone(),
+                url: None,
+                repository_key: None,
             })
-            .collect();
-        let convoys = [convoy];
-        let build = |observations: &SubjectCatalogInput| {
-            let mut input = catalog_input(&convoys);
-            input.subjects = Some(observations);
-            if awareness {
-                input.awareness = Some(&[]);
-            }
-            project_catalog(&input, &mint())
-        };
-        let implicit = build(&observations);
-        let declaration = match mode {
-            Coverage::Absent => None,
-            Coverage::Unrelated => Some(("lab", "https://lab.example", "lab.example", ForgeKind::Github)),
-            Coverage::InstallationUrl => Some(("declared", "https://github.com/", "declared.example", ForgeKind::Github)),
-            Coverage::HostAlias => Some(("declared", "https://declared.example", "github.com", ForgeKind::Forgejo)),
-        };
-        if let Some((id, url, host, kind)) = declaration {
-            observations.forges.push(runtime.block_on(async {
-                backend
-                    .using::<Forge>("dev")
-                    .create(
-                        &InputMeta::builder().name(id.into()).build(),
-                        &ForgeSpec::builder()
-                            .forge_id(id.into())
-                            .kind(kind)
-                            .hosts([host.into()].into_iter().collect())
-                            .https_url(url.into())
-                            .git_ssh_host(host.into())
-                            .build(),
-                    )
-                    .await
-                    .expect("forge")
-            }));
+        })
+        .collect();
+    let convoys = [convoy];
+    let build = |observations: &SubjectCatalogInput| {
+        let mut input = catalog_input(&convoys);
+        input.subjects = Some(observations);
+        if awareness {
+            input.awareness = Some(&[]);
         }
-        let catalog = build(&observations);
-        let patches = catalog.reassert_patches();
-        let expected_id = if matches!(mode, Coverage::Absent | Coverage::Unrelated) { "github.com" } else { "declared" };
-        let forge = entity::forge(expected_id);
-        let facts = find_entity(&patches, &forge);
-        assert_eq!(text(facts, "flotilla.forge.kind"), if matches!(mode, Coverage::HostAlias) { "forgejo" } else { "github" }, "{mode:?}");
-        assert_eq!(
-            text(facts, "flotilla.forge.web_url"),
-            if matches!(mode, Coverage::HostAlias) { "https://declared.example" } else { "https://github.com" },
-            "{mode:?}"
-        );
-        assert_eq!(
-            text(facts, "flotilla.forge.change_request_url_template"),
-            if matches!(mode, Coverage::HostAlias) { "{web_url}/{scope}/pulls/{number}" } else { "{web_url}/{scope}/pull/{number}" },
-            "{mode:?}"
-        );
-        assert_eq!(text(facts, "flotilla.forge.issue_url_template"), "{web_url}/{scope}/issues/{number}", "{mode:?}");
-        for subject in &subjects {
-            let target = match subject.kind {
-                SubjectKind::ChangeRequest => entity::change_request("github.com", "org/repo", &subject.id),
-                SubjectKind::Issue => entity::issue(&IssueRef { source: subject.source.clone(), id: subject.id.clone() }),
-            };
-            if count == 0 {
-                assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(target.clone())));
-                continue;
-            }
-            let patch = find_entity(&patches, &target);
-            assert_eq!(text(patch, "flotilla.subject.service"), "github.com", "{mode:?}");
-            assert_eq!(text(patch, "flotilla.subject.scope"), "org/repo", "{mode:?}");
-            assert_eq!(text(patch, "flotilla.subject.number"), subject.id, "{mode:?}");
-            // The serialized PM connector payload is the consumer's contract.
-            let wire = serde_json::to_value(patch).expect("wire patch");
-            assert_eq!(
-                wire["set"]["flotilla.forge"]["value"],
-                serde_json::json!({
-                    "type": "entity-refs", "value": [{"provider": "", "kind": "forge", "id": expected_id}]
-                }),
-                "{mode:?}"
-            );
-        }
-        if matches!(mode, Coverage::InstallationUrl | Coverage::HostAlias) {
-            assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(entity::forge("github.com"))));
-            let diff = catalog.diff_patches(&implicit);
-            assert!(find_entity(&diff, &entity::forge("github.com")).unset.contains(&"flotilla.forge.kind".into()));
-        }
-        // Projection never creates a Forge resource for the fallback.
-        let stored = runtime.block_on(backend.using::<Forge>("dev").list()).expect("stored forges");
-        assert_eq!(stored.items.len(), usize::from(!matches!(mode, Coverage::Absent)), "{mode:?}");
+        project_catalog(&input, &mint())
+    };
+    let implicit = build(&observations);
+    let declaration = match mode {
+        Coverage::Absent => None,
+        Coverage::Unrelated => Some(("lab", "https://lab.example", "lab.example", ForgeKind::Github)),
+        Coverage::InstallationUrl => Some(("declared", "https://github.com/", "declared.example", ForgeKind::Github)),
+        Coverage::HostAlias => Some(("declared", "https://declared.example", "github.com", ForgeKind::Forgejo)),
+    };
+    if let Some((id, url, host, kind)) = declaration {
+        observations.forges.push(runtime.block_on(async {
+            backend
+                .using::<Forge>("dev")
+                .create(
+                    &InputMeta::builder().name(id.into()).build(),
+                    &ForgeSpec::builder()
+                        .forge_id(id.into())
+                        .kind(kind)
+                        .hosts([host.into()].into_iter().collect())
+                        .https_url(url.into())
+                        .git_ssh_host(host.into())
+                        .build(),
+                )
+                .await
+                .expect("forge")
+        }));
     }
+    let catalog = build(&observations);
+    let patches = catalog.reassert_patches();
+    let expected_id = if matches!(mode, Coverage::Absent | Coverage::Unrelated) { "github.com" } else { "declared" };
+    let forge = entity::forge(expected_id);
+    let facts = find_entity(&patches, &forge);
+    assert_eq!(text(facts, "flotilla.forge.kind"), if matches!(mode, Coverage::HostAlias) { "forgejo" } else { "github" }, "{mode:?}");
+    assert_eq!(
+        text(facts, "flotilla.forge.web_url"),
+        if matches!(mode, Coverage::HostAlias) { "https://declared.example" } else { "https://github.com" },
+        "{mode:?}"
+    );
+    assert_eq!(
+        text(facts, "flotilla.forge.change_request_url_template"),
+        if matches!(mode, Coverage::HostAlias) { "{web_url}/{scope}/pulls/{number}" } else { "{web_url}/{scope}/pull/{number}" },
+        "{mode:?}"
+    );
+    assert_eq!(text(facts, "flotilla.forge.issue_url_template"), "{web_url}/{scope}/issues/{number}", "{mode:?}");
+    for subject in &subjects {
+        let target = match subject.kind {
+            SubjectKind::ChangeRequest => entity::change_request("github.com", "org/repo", &subject.id),
+            SubjectKind::Issue => entity::issue(&IssueRef { source: subject.source.clone(), id: subject.id.clone() }),
+        };
+        if count == 0 {
+            assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(target.clone())));
+            continue;
+        }
+        let patch = find_entity(&patches, &target);
+        assert_eq!(text(patch, "flotilla.subject.service"), "github.com", "{mode:?}");
+        assert_eq!(text(patch, "flotilla.subject.scope"), "org/repo", "{mode:?}");
+        assert_eq!(text(patch, "flotilla.subject.number"), subject.id, "{mode:?}");
+        // The serialized PM connector payload is the consumer's contract.
+        let wire = serde_json::to_value(patch).expect("wire patch");
+        assert_eq!(
+            wire["set"]["flotilla.forge"]["value"],
+            serde_json::json!({
+                "type": "entity-refs", "value": [{"provider": "", "kind": "forge", "id": expected_id}]
+            }),
+            "{mode:?}"
+        );
+    }
+    if matches!(mode, Coverage::InstallationUrl | Coverage::HostAlias) {
+        assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(entity::forge("github.com"))));
+        let diff = catalog.diff_patches(&implicit);
+        assert!(find_entity(&diff, &entity::forge("github.com")).unset.contains(&"flotilla.forge.kind".into()));
+    }
+    // Projection never creates a Forge resource for the fallback.
+    let stored = runtime.block_on(backend.using::<Forge>("dev").list()).expect("stored forges");
+    assert_eq!(stored.items.len(), usize::from(!matches!(mode, Coverage::Absent)), "{mode:?}");
 }
 
 // #1961: PM facts keep Active lifecycle, structured blockers and attachment
@@ -2527,6 +2613,7 @@ fn catalog_readiness_explains_unavailable_attachment_and_clears_on_recovery(tc: 
     let mut convoy = ConvoyRow::builder()
         .resource(reference)
         .name("governor")
+        .project_ref("flotilla")
         .workflow_ref("governor")
         .phase(ConvoyPhase::Active)
         .vessels(vec![work])
@@ -2575,6 +2662,7 @@ fn catalog_readiness_multi_vessel_attachment_and_unknown_evidence() {
     let mut convoy = ConvoyRow::builder()
         .resource(reference)
         .name("governor")
+        .project_ref("flotilla")
         .workflow_ref("governor")
         .phase(ConvoyPhase::Active)
         .vessels(vec![work])
@@ -2679,10 +2767,12 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
         session: Some("feta/dev/session-work".into()),
         adapter: Some("codex".into()),
         model: known_model.then(|| "gpt-6.1-sol".into()),
+        agent_session: None,
     }];
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("placement")
+        .project_ref("flotilla")
         .workflow_ref("code")
         .phase(ConvoyPhase::Active)
         .placement_decision(row.placement_decision.clone().expect("recorded placement decision"))
@@ -2743,6 +2833,7 @@ fn placement_catalog_omits_unknown_facts() {
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("unknown")
+        .project_ref("flotilla")
         .workflow_ref("code")
         .phase(ConvoyPhase::Pending)
         .vessels(vec![row])
@@ -2862,9 +2953,9 @@ fn running_governor_survives_two_abandoned_namesakes(tc: hegel::TestCase) {
                     .kind(AwarenessKind::Convoy)
                     .label("governor".to_owned())
                     .refs(vec![row.resource.clone()])
-                    .phase(AwarenessPhase::Convoy(row.phase))
+                    .maybe_phase(row.phase.map(AwarenessPhase::Convoy))
                     .annotations(std::collections::HashMap::from([(KEY_CONVOY_NAME.to_owned(), row.name.clone())]))
-                    .state(if row.phase.is_terminal() { AwarenessState::Cancelled } else { AwarenessState::Active })
+                    .state(if row.is_ended() { AwarenessState::Cancelled } else { AwarenessState::Active })
                     .as_of(Timestamp::UNIX_EPOCH)
                     .build()
             })
@@ -3006,20 +3097,17 @@ fn structured_recipe_mint_refuses_ambiguous_hosts() {
 }
 
 // #2758: the catalog exposes raw holds, latest ledger and pending/stuck messages;
-// empty input retracts the facts. Generate absent/present hold and ledger, every
-// message phase, duplicate observation order and unrelated convoy/namespace records.
-#[hegel::test]
-fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
+// empty input retracts the facts. Every combination of absent/present hold and
+// ledger, waiting reason and message phase, with duplicate observation order and
+// unrelated convoy/namespace records.
+#[tokio::test]
+async fn convoy_inbox_facts_are_raw_and_retractable() {
     use crate::keys::{KEY_CONVOY_HELD, KEY_CONVOY_HOLDS, KEY_CONVOY_LEDGER, KEY_CONVOY_PENDING_MESSAGES, KEY_CONVOY_STUCK_MESSAGES};
     use flotilla_resources::{
         Artifact, ArtifactSpec, Convoy, ConvoyAttention, ConvoySpec, ConvoyStatus, InputMeta, Message, MessagePhase, MessageRelation,
         MessageSpec, MessageStatus,
     };
     use flotilla_store::ResourceBackend;
-    use hegel::generators as gs;
-    let held = tc.draw(gs::booleans());
-    let ledger = tc.draw(gs::booleans());
-    let waiting_reason = tc.draw(gs::booleans());
     let phases = [
         MessagePhase::Accepted,
         MessagePhase::WaitingOnReferences,
@@ -3032,13 +3120,24 @@ fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
         MessagePhase::Superseded,
         MessagePhase::DeadLettered,
     ];
-    let phase = phases[tc.draw(gs::integers::<usize>().min_value(0).max_value(phases.len() - 1))];
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(async {
+    let mut cases = Vec::new();
+    for held in [false, true] {
+        for ledger in [false, true] {
+            for waiting_reason in [false, true] {
+                for phase in phases {
+                    cases.push((held, ledger, waiting_reason, phase));
+                }
+            }
+        }
+    }
+    for (held, ledger, waiting_reason, phase) in cases {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut convoy = backend
             .using::<Convoy>("dev")
-            .create(&InputMeta::builder().name("inbox".into()).build(), &ConvoySpec::builder().workflow_ref("single-agent".into()).build())
+            .create(
+                &InputMeta::builder().name("inbox".into()).build(),
+                &ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref("dev".into()).build(),
+            )
             .await
             .expect("convoy");
         let mut status = ConvoyStatus::default();
@@ -3068,6 +3167,7 @@ fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
         let row = ConvoyRow::builder()
             .resource(convoy_ref("dev", "inbox"))
             .name("inbox")
+            .project_ref("flotilla")
             .workflow_ref("single-agent")
             .phase(ConvoyPhase::Active)
             .build();
@@ -3084,7 +3184,7 @@ fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
                             .producer("coder".into())
                             .kind("decision-ledger".into())
                             .subject("inbox".into())
-                            .digest("digest".into())
+                            .digest(flotilla_resources::artifact::blob_digest_of(b"ledger"))
                             .size(1)
                             .media_type("text/markdown".into())
                             .recorded_at(at)
@@ -3143,5 +3243,5 @@ fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
         }
         let cleared_patches = cleared.reassert_patches();
         assert_eq!(find_entity(&cleared_patches, &target).set[KEY_CONVOY_HELD].value, MetadataValue::Bool(false));
-    });
+    }
 }

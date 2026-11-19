@@ -1,162 +1,62 @@
 use super::*;
 use crate::runtime::tasks::AGGREGATOR_CONTROLLER;
-use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
+use crate::testkits::engine::{admit_convoy, engine};
+use flotilla_engine_convoys_testkit::single_agent;
+use flotilla_resources::clone_records::CloneRecords as _;
 
+// Behaviour (#3108): reconcile-now on a convoy queues its launch at the Convoy controller and
+// writes nothing; a launch this home does not hold is refused as not found.
 #[tokio::test]
-async fn reconcile_now_wakes_convoy_controller_resource() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("teardown"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
-        .await
-        .expect("create convoy");
+async fn reconcile_now_queues_the_launch_at_the_convoy_controller() {
+    use flotilla_executor::executor_actions::ExecutorActionPort;
 
-    assert_eq!(wake_controller_resource::<Convoy>(&backend, NAMESPACE, "teardown").await.expect("wake convoy"), "Convoy/teardown woken");
-    assert_ne!(convoys.get("teardown").await.expect("updated convoy").metadata.resource_version, convoy.metadata.resource_version);
-}
-
-#[tokio::test]
-async fn connected_peer_with_replicable_resources_and_zero_cursors_is_degraded() {
     let temp = TempDir::new().expect("tempdir");
-    let config_base = temp.path().join("feta");
-    fs::create_dir_all(&config_base).expect("config directory");
-    fs::write(config_base.join("daemon.toml"), "machine_id = \"feta-degraded-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(config_base));
-    let feta = in_memory_daemon(Vec::new(), config).await;
-    let kiwi_node = NodeId::new("kiwi-root");
-    let kiwi = NodeInfo::new(kiwi_node.clone(), "kiwi");
-    feta.set_configured_peers(vec![kiwi.clone()]).await;
-    feta.publish_peer_summary(
-        HostSummary::builder()
-            .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("kiwi-host")))
-            .host_name(flotilla_protocol::HostName::new("kiwi"))
-            .node(kiwi.clone())
-            .system(flotilla_protocol::SystemInfo::default())
-            .providers(Vec::new())
-            .build(),
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("config directory");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"reconcile-now-test\"\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(config_base))).await;
+    engine(&daemon);
+    let launch = admit_convoy(
+        &daemon,
+        flotilla_engine_convoys_testkit::convoy(
+            NAMESPACE,
+            "teardown",
+            ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("workflow".to_string()).build(),
+            single_agent("coder"),
+        ),
     )
     .await;
-    feta.publish_peer_connection_status(&kiwi, PeerConnectionState::Connected).await;
+    let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
+    let admitted = convoys.get(&launch).await.expect("admitted convoy");
+    let (sender, mut queue) = flotilla_store::controller::WorkQueueSender::channel();
+    let _watch = tokio::spawn(daemon.convoy_wake_watch().spawn(daemon.resource_backend(), NAMESPACE.to_owned(), sender));
 
-    let kiwi_store = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let kiwi_hosts = kiwi_store.using::<Host>(NAMESPACE);
-    kiwi_hosts
-        .create(
-            &empty_meta("kiwi-host"),
-            &HostSpec { display_name: "kiwi".to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("kiwi holds a replicable Host");
+    assert_eq!(daemon.reconcile_now(NAMESPACE, "Convoy", &launch).await.expect("wake convoy"), format!("Convoy/{launch} woken"));
+    let queued = tokio::time::timeout(Duration::from_secs(5), queue.recv()).await.expect("queued in time").expect("queue open");
+    assert_eq!(queued, launch.to_string());
+    assert_eq!(convoys.get(&launch).await.expect("convoy").metadata.resource_version, admitted.metadata.resource_version);
 
-    let degraded = resource_replication_content_condition(&feta, NAMESPACE)
-        .await
-        .expect("diagnose empty follower replica store")
-        .expect("zero cursors must be degraded");
-    assert_eq!(degraded.condition_type, "ResourceReplication");
-    assert_eq!(degraded.reason, "ReplicaCursorsMissing");
-    assert!(degraded.message.contains("zero replica cursors"));
-
-    let feta_host_id = feta.local_host_id().expect("feta Host identity").to_string();
-    let profile = manual_profile(&feta_host_id, false);
-    ensure_host_exists(&feta.resource_backend(), NAMESPACE, &feta_host_id, "feta", None).await.expect("register feta Host");
-    apply_host_heartbeat(&feta, NAMESPACE, &profile, &test_health_identity()).await.expect("publish degraded heartbeat");
-    let fleet = feta.fleet_health_internal().await.expect("feta fleet health");
-    let feta_row = fleet.hosts.iter().find(|host| host.is_local).expect("local feta fleet row");
-    assert!(
-        feta_row.degraded_conditions.iter().any(|condition| condition.contains("zero replica cursors")),
-        "fleet diagnosis must expose the empty replica store: {:?}",
-        feta_row.degraded_conditions
-    );
-
-    feta.resource_backend()
-        .replica_writer::<Host>(kiwi_node, NAMESPACE)
-        .replace(&kiwi_hosts.list().await.expect("list kiwi Hosts"), Utc::now())
-        .await
-        .expect("bootstrap one replica cursor");
-
-    assert!(
-        resource_replication_content_condition(&feta, NAMESPACE).await.expect("diagnose bootstrapped follower").is_none(),
-        "the zero-cursor diagnosis must clear once resource replication bootstraps"
-    );
-    apply_host_heartbeat(&feta, NAMESPACE, &profile, &test_health_identity()).await.expect("publish healthy heartbeat");
-    let fleet = feta.fleet_health_internal().await.expect("healthy feta fleet");
-    let feta_row = fleet.hosts.iter().find(|host| host.is_local).expect("local feta fleet row");
-    assert!(
-        feta_row.degraded_conditions.iter().all(|condition| !condition.contains("replica cursors")),
-        "fleet diagnosis must clear after bootstrap: {:?}",
-        feta_row.degraded_conditions
-    );
+    let missing = daemon.reconcile_now(NAMESPACE, "Convoy", "never-admitted").await.expect_err("an unknown launch");
+    assert!(missing.contains("not found"), "{missing}");
+    assert!(queue.try_recv().is_err(), "a refused wake queues nothing");
 }
 
-#[tokio::test]
-async fn home_bound_authorship_collision_is_advisory_and_clears_after_removal() {
-    let temp = TempDir::new().expect("tempdir");
-    let config_base = temp.path().join("local");
-    fs::create_dir_all(&config_base).expect("config directory");
-    fs::write(config_base.join("daemon.toml"), "machine_id = \"collision-local-root\"\n").expect("daemon config");
-    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(config_base))).await;
-    let local_root = daemon.node_id().clone();
-    let remote_root = NodeId::new("collision-remote-root");
-    let local_convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
-    local_convoys
-        .create(&empty_meta("command-builder"), &ConvoySpec::builder().workflow_ref("scratch".to_string()).build())
-        .await
-        .expect("create local authored convoy");
-    let remote_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(remote_root.clone());
-    let remote_convoys = remote_backend.using::<Convoy>(NAMESPACE);
-    remote_convoys
-        .create(&empty_meta("command-builder"), &ConvoySpec::builder().workflow_ref("scratch".to_string()).build())
-        .await
-        .expect("create remote authored convoy");
-    let writer = daemon.resource_backend().replica_writer::<Convoy>(remote_root.clone(), NAMESPACE);
-    writer.replace(&remote_convoys.list().await.expect("list remote convoys"), Utc::now()).await.expect("inject colliding replica");
+/// Refuses every clone as a forge that has no such repository.
+struct MissingRepositoryCloneRuntime;
 
-    let collision = resource_authorship_collision_condition(&daemon, NAMESPACE)
-        .await
-        .expect("inspect collision")
-        .expect("collision must degrade the host");
-    assert_eq!(collision.condition_type, "ResourceReplication/AuthorshipCollision");
-    assert_eq!(collision.reason, "HomeBoundRecordAuthoredAtMultipleRoots");
-    assert!(collision.message.contains("Convoy/flotilla/command-builder"), "unexpected diagnosis: {}", collision.message);
-    assert!(collision.message.contains(local_root.as_str()), "local root missing from diagnosis: {}", collision.message);
-    assert!(collision.message.contains(remote_root.as_str()), "remote root missing from diagnosis: {}", collision.message);
-    assert!(
-        collision.message.contains("natural home") && collision.message.contains("delete the other authored copy"),
-        "remediation direction missing from diagnosis: {}",
-        collision.message
-    );
+#[async_trait]
+impl CloneRuntime for MissingRepositoryCloneRuntime {
+    async fn clone_and_inspect(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+        Err("authentication failed: repository not found".into())
+    }
 
-    let host_id = daemon.local_host_id().expect("local Host identity").to_string();
-    let profile = manual_profile(&host_id, false);
-    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "local", None).await.expect("register local Host");
-    apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("publish degraded heartbeat");
-    let degraded = daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("read degraded Host");
-    let status = degraded.status.expect("degraded Host status");
-    assert!(status.ready, "an authorship collision must not make the host unavailable for placement");
-    assert!(status.conditions.iter().any(|condition| {
-        condition.condition_type == "ResourceReplication/AuthorshipCollision"
-            && condition.message.contains("Convoy/flotilla/command-builder")
-    }));
-
-    writer
-        .replace(&ResourceList { items: Vec::new(), resource_version: "2".to_string(), generation: None }, Utc::now())
-        .await
-        .expect("remove colliding replica");
-    assert!(
-        resource_authorship_collision_condition(&daemon, NAMESPACE).await.expect("inspect cleared collision").is_none(),
-        "removing the replica must clear the diagnosis without restart"
-    );
-    apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("publish recovered heartbeat");
-    let recovered = daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("read recovered Host");
-    assert!(recovered
-        .status
-        .expect("recovered Host status")
-        .conditions
-        .iter()
-        .all(|condition| { condition.condition_type != "ResourceReplication/AuthorshipCollision" }));
+    async fn inspect_existing(&self, _: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
+// Behaviour (#3108): a clone the Clone controller gives up on shows its cause in convoy explain,
+// on the checkout made from it, beside the convoy controller's own events.
 #[tokio::test]
 async fn clone_controller_failure_is_visible_in_convoy_explain() {
     let temp = TempDir::new().expect("tempdir");
@@ -165,78 +65,112 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     fs::write(config_base.join("daemon.toml"), "machine_id = \"clone-failure-explain-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let daemon = in_memory_daemon(Vec::new(), config).await;
+    let engine = flotilla_provisioning_testkit::clones::RunningClones::start("local", Arc::new(MissingRepositoryCloneRuntime));
+    // The clones' readings, with the vessels explain reads beside them, on the same store.
+    let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&engine.service);
+    let reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads> = Arc::new(
+        flotilla_provisioning::engine::reads::LifecycleReadPort::new(
+            flotilla_provisioning::engine::reads::StoreReads::new(engine.service.store()),
+            "local".to_owned(),
+        )
+        .with_environments(Arc::clone(&engine.environments.environments) as _)
+        .with_clones(Arc::clone(&engine.clones) as _)
+        .with_checkouts(Arc::clone(&engine.checkouts.checkouts) as _)
+        .with_terminals(Arc::clone(&engine.terminals.terminals) as _)
+        .with_vessels(Arc::clone(&vessels.vessels) as _),
+    );
+    daemon.install_lifecycle_reads(Arc::clone(&reads)).expect("engine reads");
+    // Explain reads the convoy's messages too.
+    daemon.open_message_primitives().expect("message path");
+    let clone_path = temp.path().join("clone").display().to_string();
+    engine.environments.put_ready(
+        "host-direct-test",
+        &EnvironmentSpec {
+            cloud_sandbox: None,
+            provider_address: None,
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: clone_path.clone() }),
+            docker: None,
+        },
+        None,
+        &clone_path,
+        Default::default(),
+    );
     let backend = daemon.resource_backend();
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
     let repository_key = repository_spec.key();
     flotilla_store::ensure_repository(&backend.using::<Repository>(NAMESPACE), &repository_key, &repository_spec)
         .await
         .expect("repository");
-    backend
-        .using::<Convoy>(NAMESPACE)
-        .create(
-            &InputMeta::builder()
-                .name("clone-failure-convoy".to_string())
-                .labels(BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "clone-failure-convoy".to_string())]))
-                .build(),
-            &ConvoySpec::builder().workflow_ref("missing-workflow".to_string()).build(),
-        )
-        .await
-        .expect("convoy");
-    backend
-        .using::<Clone>(NAMESPACE)
-        .create(
-            &InputMeta::builder()
-                .name("incorrect-clone-name".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "clone-failure-convoy".to_string())]))
-                .build(),
+    // The convoy, admitted with its adopted checkout.
+    let status = ConvoyStatus {
+        observed_workflow_ref: Some("missing-workflow".into()),
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+            vessels: vec![VesselRequirement::builder()
+                .name("work".into())
+                .repository_refs(vec![repository_key.clone()])
+                .crew(vec![CrewSpec::builder()
+                    .role("shell".into())
+                    .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("shell")])
+                    .source(CrewSource::Tool { command: "true".into() })
+                    .build()])
+                .build()],
+        }),
+        ..Default::default()
+    };
+    let spec = ConvoySpec::builder()
+        .project_ref(NAMESPACE.into())
+        .workflow_ref("missing-workflow".to_string())
+        .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "clone-failure-checkout".to_string())]))
+        .build();
+    // The convoys are on the clones' store too, so the checkout's holder is open where it is held.
+    let convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
+        &engine.service,
+        NAMESPACE,
+        &backend,
+        Arc::new(flotilla_resources::SystemClock),
+        Arc::clone(&reads),
+    );
+    let convoy = convoys.launch(flotilla_engine_convoys_testkit::convoy(NAMESPACE, "clone-failure-convoy", spec, status)).await;
+    let launch = engine
+        .clones
+        .request(
+            &repository_spec,
             &CloneSpec {
-                repo_ref: repository_key,
+                repo_ref: repository_key.clone(),
                 url: "https://github.com/flotilla-org/flotilla.git".to_string(),
                 env_ref: "host-direct-test".to_string(),
-                path: temp.path().join("clone").display().to_string(),
+                path: clone_path.clone(),
             },
+            false,
         )
-        .await
-        .expect("clone intent");
-
-    let controller = tokio::spawn(
-        ControllerLoop {
-            primary: backend.using::<Clone>(NAMESPACE),
-            secondaries: Vec::new(),
-            reconciler: CloneReconciler::new(
-                Arc::new(CloneControllerRuntime::new(
-                    Arc::new(ProcessCommandRunner),
-                    Some(test_controller_vcs(Arc::new(ProcessCommandRunner), &temp.path().join("clone").to_string_lossy())),
-                    Arc::new(CloneFlights::default()),
-                    vec![],
-                )),
-                backend.using::<Repository>(NAMESPACE),
-            ),
-            resync_interval: Duration::from_secs(60),
-            backend: backend.clone(),
-        }
-        .run(),
+        .expect("clone request");
+    // The convoy's checkout, held for its launch, made from the clone.
+    engine.checkouts.request(
+        "clone-failure-checkout",
+        &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+            repo_ref: repository_key,
+            env_ref: "host-direct-test".to_string(),
+            r#ref: "main".to_string(),
+            base_ref: None,
+            target_path: temp.path().join("checkout").display().to_string(),
+            clone_ref: launch.clone(),
+        }),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy.clone())),
     );
-    let convoy_controller = tokio::spawn(
-        ControllerLoop {
-            primary: backend.using::<Convoy>(NAMESPACE),
-            secondaries: Vec::new(),
-            reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE)),
-            resync_interval: Duration::from_secs(60),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
-
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let events = backend.using::<flotilla_resources::Event>(NAMESPACE).list().await.expect("events").items;
-            if events.iter().any(|event| event.spec.reason == "CloneFailed")
-                && events.iter().any(|event| event.spec.reason == "WorkflowTemplateNotFound")
-            {
+            if matches!(
+                engine.clones.get(&launch, None).ok().flatten().map(|clone| clone.reading),
+                Some(flotilla_protocol::LifecycleReading::GaveUp { .. })
+            ) {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -244,10 +178,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     let result = daemon
         .execute_query(
             Command::builder()
-                .action(CommandAction::QueryExplainConvoy {
-                    namespace: Some(NAMESPACE.to_string()),
-                    name: "clone-failure-convoy".to_string(),
-                })
+                .action(CommandAction::QueryExplainConvoy { namespace: Some(NAMESPACE.to_string()), name: convoy.clone() })
                 .build(),
             uuid::Uuid::new_v4(),
         )
@@ -256,16 +187,14 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     let CommandValue::ConvoyExplanation(explanation) = result else {
         panic!("explain should return a convoy explanation, got {result:?}");
     };
-    assert!(explanation
-        .recent_events
-        .iter()
-        .any(|event| { event.reason == "CloneFailed" && event.message.contains("clone name mismatch") }));
-    assert!(explanation
-        .recent_events
-        .iter()
-        .any(|event| { event.reason == "WorkflowTemplateNotFound" && event.message.contains("missing-workflow") }));
-    controller.abort();
-    convoy_controller.abort();
+    let checkout = explanation.checkouts.iter().find(|checkout| checkout.name == "clone-failure-checkout").expect("explained checkout");
+    let clone = checkout.clone.as_ref().expect("the checkout's clone is explained");
+    assert_eq!(clone.name, launch);
+    assert!(
+        matches!(&clone.reading, flotilla_protocol::LifecycleReading::GaveUp { cause } if cause.contains("repository not found")),
+        "explain shows the clone's cause: {:?}",
+        clone.reading
+    );
 }
 
 #[tokio::test]
@@ -283,7 +212,7 @@ async fn fleet_health_surfaces_an_expired_ambient_claude_login_without_any_crew_
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"expired-ambient-claude-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
-    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    engine(&daemon);
     let credential_store = CredentialStore::new(
         daemon.resource_backend(),
         NAMESPACE,
@@ -295,7 +224,7 @@ async fn fleet_health_surfaces_an_expired_ambient_claude_login_without_any_crew_
     apply_host_heartbeat_with_credentials(
         &daemon,
         NAMESPACE,
-        &manual_profile(&host_id, false),
+        &own_host_profile(&daemon, false),
         Some(&credential_store),
         &test_health_identity(),
         &RuntimeHealth::default(),
@@ -314,238 +243,6 @@ async fn fleet_health_surfaces_an_expired_ambient_claude_login_without_any_crew_
     );
 }
 
-// #2736: sequential admissions to one placement succeed without sleeps,
-// even when its local aggregator has not projected any admitted convoys.
-#[hegel::test]
-fn projection_parity_sequential_admissions(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    // Cover empty batches, one admission, and batches larger than the
-    // reported three-dispatch failure; no controller or projection sleeps.
-    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(async {
-        let temp = TempDir::new().expect("tempdir");
-        fs::write(temp.path().join("daemon.toml"), "machine_id = \"projection-admission-test\"\n").expect("config");
-        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
-        let host_id = daemon.local_host_id().expect("host identity").to_string();
-        let profile = LocalProvisioningProfile { repo_default_dir: temp.path().display().to_string(), ..manual_profile(&host_id, false) };
-        let backend = daemon.resource_backend();
-        register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("register placement");
-        backend
-            .using::<WorkflowTemplate>(NAMESPACE)
-            .create(
-                &empty_meta("parity-workflow"),
-                &WorkflowTemplateSpec::builder()
-                    .vessels(vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .crew(vec![CrewSpec::builder()
-                            .role("coder".to_string())
-                            .source(CrewSource::Tool { command: "true".to_string() })
-                            .build()])
-                        .build()])
-                    .build(),
-            )
-            .await
-            .expect("workflow");
-        backend
-            .using::<Project>(NAMESPACE)
-            .create(
-                &empty_meta("parity-project"),
-                &flotilla_resources::ProjectSpec::builder()
-                    .display_name("Parity".to_string())
-                    .default_workflow_ref("parity-workflow".to_string())
-                    .build(),
-            )
-            .await
-            .expect("project");
-        let projection = AggregatorProjectionState::new();
-        let health = RuntimeHealth::default();
-        let identity = test_health_identity();
-        let clock = flotilla_store_testkit::VirtualClock::new(Utc::now());
-        for index in 0..count {
-            // Store timestamps come from its real clock; pin the decision
-            // clock to the newest write so test scheduling cannot age it.
-            if let Some(newest) = backend
-                .using::<Convoy>(NAMESPACE)
-                .list()
-                .await
-                .expect("convoys")
-                .items
-                .iter()
-                .map(|convoy| convoy.metadata.creation_timestamp)
-                .max()
-            {
-                clock.set(newest);
-            }
-            health.report_projection_parity(
-                projection_parity_condition(&backend, NAMESPACE, &projection, &clock).await.expect("parity before admission"),
-            );
-            apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &identity, &health).await.expect("publish readiness");
-            let mut events = daemon.subscribe();
-            let command_id = daemon
-                .execute(
-                    Command::builder()
-                        .action(CommandAction::ConvoyStart {
-                            intent: Box::new(
-                                flotilla_protocol::ConvoyStartIntent::builder()
-                                    .project_ref("parity-project".to_string())
-                                    .name(format!("batch-{index}"))
-                                    .branch(format!("test/batch-{index}"))
-                                    .placement_policy(format!("host-direct-{host_id}"))
-                                    .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                                    .build(),
-                            ),
-                        })
-                        .build(),
-                )
-                .await
-                .expect("dispatch");
-            let result = wait_for_command_result(&mut events, command_id).await;
-            assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "admission {index}: {result:?}");
-            assert_eq!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.len(), index + 1);
-        }
-        if count > 0 {
-            let newest = backend
-                .using::<Convoy>(NAMESPACE)
-                .list()
-                .await
-                .expect("convoys")
-                .items
-                .iter()
-                .map(|convoy| convoy.metadata.creation_timestamp)
-                .max()
-                .expect("admitted rows");
-            clock.set(newest + PROJECTION_PARITY_GRACE);
-            health.report_projection_parity(
-                projection_parity_condition(&backend, NAMESPACE, &projection, &clock).await.expect("expired parity"),
-            );
-            apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &identity, &health)
-                .await
-                .expect("publish divergence");
-            // Projection lag blocks new admission, while existing convoys still
-            // need this live daemon to observe their forge completion evidence.
-            let host = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("host");
-            let status = host.status.expect("status");
-            assert!(!status.ready, "projection lag must still block admission");
-            assert!(status.heartbeat_is_fresh(Utc::now()), "observer loss must not be heartbeat expiry");
-            let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "test/repo".into() };
-            assert_eq!(
-                flotilla_observation::forge_observation::source_owner(&backend, NAMESPACE, &source).await.expect("live forge observer"),
-                Some(backend.local_root().expect("local root")),
-            );
-            let mut events = daemon.subscribe();
-            let command_id = daemon
-                .execute(
-                    Command::builder()
-                        .action(CommandAction::ConvoyStart {
-                            intent: Box::new(
-                                flotilla_protocol::ConvoyStartIntent::builder()
-                                    .project_ref("parity-project".to_string())
-                                    .name("after-bound".to_string())
-                                    .branch("test/after-bound".to_string())
-                                    .placement_policy(format!("host-direct-{host_id}"))
-                                    .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                                    .build(),
-                            ),
-                        })
-                        .build(),
-                )
-                .await
-                .expect("dispatch with divergence");
-            let result = wait_for_command_result(&mut events, command_id).await;
-            assert!(
-                matches!(result, CommandValue::Error { ref message } if message.contains("LocalRowsMissing")),
-                "old missing rows must refuse admission: {result:?}"
-            );
-            assert_eq!(
-                backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.len(),
-                count,
-                "refusal must not write another convoy"
-            );
-        }
-    });
-}
-
-// #2736: only rows younger than ten seconds get grace. The boundary is
-// inclusive for divergence, and future timestamps fail closed. Each case
-// also checks that catching up clears the diagnosis at that same instant.
-#[tokio::test]
-async fn projection_parity_creation_age_boundaries() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let created = backend
-        .using::<Convoy>(NAMESPACE)
-        .create(&empty_meta("recent"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
-        .await
-        .expect("create local convoy");
-    for age_ms in [-1, 0, 1, 9_999, 10_000, 10_001, 60_000] {
-        let clock = flotilla_store_testkit::VirtualClock::new(created.metadata.creation_timestamp + chrono::Duration::milliseconds(age_ms));
-        let projection = AggregatorProjectionState::new();
-        let condition = projection_parity_condition(&backend, NAMESPACE, &projection, &clock).await.expect("evaluate missing row");
-        assert_eq!(condition.is_some(), !(0..10_000).contains(&age_ms), "row age {age_ms}ms");
-        if let Some(condition) = condition {
-            assert_eq!(condition.reason, "LocalRowsMissing");
-            assert_eq!(condition.message, "durable store has 1 convoys but the local aggregator projection has 0; missing: recent");
-        }
-        let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NAMESPACE, "recent");
-        projection.write().await.local_rows.insert(
-            resource.clone(),
-            flotilla_protocol::ConvoyRow::builder()
-                .resource(resource)
-                .name("recent")
-                .workflow_ref("workflow")
-                .phase(flotilla_protocol::ConvoyPhase::Pending)
-                .build(),
-        );
-        assert!(
-            projection_parity_condition(&backend, NAMESPACE, &projection, &clock).await.expect("evaluate caught-up row").is_none(),
-            "caught-up row age {age_ms}ms"
-        );
-    }
-}
-
-#[tokio::test]
-async fn projection_parity_reports_and_clears_missing_local_convoys() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let meta = InputMeta::builder().name("convoy-a".to_string()).finalizers(vec!["flotilla.work/test-finalizer".to_string()]).build();
-    let created =
-        convoys.create(&meta, &ConvoySpec::builder().workflow_ref("workflow".to_string()).build()).await.expect("create durable convoy");
-    let failed = convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
-        )
-        .await
-        .expect("mark durable convoy failed");
-    convoys.delete(&failed.metadata.name).await.expect("begin durable convoy reaping");
-    let projection = AggregatorProjectionState::new();
-    let clock = flotilla_store_testkit::VirtualClock::new(created.metadata.creation_timestamp + PROJECTION_PARITY_GRACE);
-
-    let degraded = projection_parity_condition(&backend, NAMESPACE, &projection, &clock)
-        .await
-        .expect("evaluate parity")
-        .expect("missing projection should degrade the host");
-    assert_eq!(degraded.condition_type, "ProjectionParity");
-    assert_eq!(degraded.reason, "LocalRowsMissing");
-    assert!(degraded.message.contains("convoy-a"));
-
-    let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NAMESPACE, "convoy-a");
-    projection.write().await.local_rows.insert(
-        resource.clone(),
-        flotilla_protocol::ConvoyRow::builder()
-            .resource(resource)
-            .name("convoy-a")
-            .workflow_ref("workflow")
-            .phase(flotilla_protocol::ConvoyPhase::Pending)
-            .build(),
-    );
-    assert!(
-        projection_parity_condition(&backend, NAMESPACE, &projection, &clock).await.expect("evaluate restored parity").is_none(),
-        "restored parity should clear the degraded condition"
-    );
-}
-
 // Fleet health consumes the persisted Host heartbeat. Exhaustion must be
 // visible through that public query, and recovery must remove the diagnosis.
 #[tokio::test]
@@ -553,8 +250,8 @@ async fn controller_exhaustion_alarm_is_visible_in_fleet_health() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"controller-exhaustion-health-test\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
-    let host_id = daemon.local_host_id().expect("local host").to_string();
-    let profile = manual_profile(&host_id, false);
+    engine(&daemon);
+    let profile = own_host_profile(&daemon, false);
     let health = RuntimeHealth::default();
     health.report_restart_budget_exhausted(RestartBudgetExhausted {
         controller: "Convoy",
@@ -584,8 +281,9 @@ async fn resource_controller_restart_budget_exhaustion_recovers() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let (recovered, recovery) = tokio::sync::oneshot::channel();
     let signal = Arc::new(StdMutex::new(Some(recovered)));
-    let task = spawn_resource_controller::<Checkout, _, _>(
-        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+    let task = spawn_named_controller(
+        Checkout::API_PATHS.kind,
+        flotilla_store_memory::engine_home_backend(),
         NAMESPACE.to_string(),
         ControllerSupervision {
             max_consecutive_failures: 1,
@@ -692,164 +390,6 @@ async fn issue_budget_backoff_surfaces_a_nonblocking_host_condition() {
     assert!(condition.message.contains(&reset));
 }
 
-#[test]
-fn fleet_diagnosis_surfaces_event_decode_quarantines() {
-    let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
-    diagnostics.event_decode_quarantines.push(
-        flotilla_resources::ResourceEventDecodeQuarantine::builder()
-            .kind("CredentialSpec".to_string())
-            .namespace("flotilla".to_string())
-            .name("forgejo-token".to_string())
-            .event_version(17)
-            .error("missing field `username`".to_string())
-            .quarantined_at(Utc::now())
-            .build(),
-    );
-
-    let condition = resource_decode_quarantine_condition(Some(&diagnostics)).expect("quarantine should degrade fleet health");
-    assert_eq!(condition.condition_type, "ResourceStore/DecodeQuarantine");
-    assert_eq!(condition.reason, "StoredEventDecodeFailed");
-    assert!(condition.message.contains("CredentialSpec/forgejo-token@17"), "unexpected diagnosis: {}", condition.message);
-    assert!(condition.message.contains("missing field `username`"), "unexpected diagnosis: {}", condition.message);
-}
-
-#[test]
-fn field_ownership_violation_degrades_without_blocking_admission() {
-    let now = Utc::now();
-    let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
-    diagnostics.field_ownership_violations.push(
-        flotilla_resources::FieldOwnershipViolation::builder()
-            .kind("PlacementPolicy".to_string())
-            .namespace("flotilla".to_string())
-            .name("docker".to_string())
-            .writer(flotilla_resources::WriterIdentity::operator())
-            .field("spec.docker_per_vessel.host_ref".to_string())
-            .attempted_value(serde_json::json!("other-host"))
-            .rule("spec.docker_per_vessel.host_ref is owned by ReconcileLoop".to_string())
-            .observed_at(now)
-            .build(),
-    );
-    let condition = resource_field_ownership_condition(Some(&diagnostics)).expect("violation must be diagnosed");
-    assert_eq!(condition.value, ConditionValue::False);
-    assert!(!condition.blocks_readiness(), "historical rejected writes must not block admission");
-}
-
-#[tokio::test]
-async fn daemon_boot_quarantines_every_undecodable_replicated_kind_and_reports_them() {
-    let temp = TempDir::new().expect("tempdir");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"boot-quarantine-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(temp.path()));
-    let sqlite_path = config.state_dir().join("resources.sqlite");
-    drop(SqliteBackend::open(&sqlite_path).expect("initialize sqlite store"));
-    let connection = rusqlite::Connection::open(&sqlite_path).expect("open raw sqlite store");
-    insert_undecodable_resource::<Project>(&connection, "poisoned-project");
-    insert_undecodable_resource::<Convoy>(&connection, "poisoned-convoy");
-    insert_undecodable_resource::<CredentialGrant>(&connection, "poisoned-credential-grant");
-    insert_undecodable_resource::<CredentialSpec>(&connection, "poisoned-credential-spec");
-    insert_undecodable_resource::<Host>(&connection, "poisoned-host");
-    insert_undecodable_resource::<Vessel>(&connection, "poisoned-vessel");
-    insert_undecodable_resource::<TerminalSession>(&connection, "poisoned-terminal-session");
-    drop(connection);
-
-    let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
-    let runtime = DaemonRuntime::start_with_options(
-        Arc::clone(&daemon),
-        config,
-        None,
-        RuntimeOptions {
-            heartbeat_interval: Duration::from_secs(300),
-            controller_resync_interval: Duration::from_secs(300),
-            start_controllers: false,
-            ..RuntimeOptions::default()
-        },
-    )
-    .await
-    .expect("daemon should boot with undecodable stored resources");
-
-    daemon.list_projects_internal().await.expect("daemon should serve project queries");
-    let health = daemon.fleet_health_internal().await.expect("daemon should serve fleet health");
-    let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
-    let diagnosis = local.degraded_conditions.join("; ");
-    for identity in [
-        "Project/poisoned-project",
-        "Convoy/poisoned-convoy",
-        "CredentialGrant/poisoned-credential-grant",
-        "CredentialSpec/poisoned-credential-spec",
-        "Host/poisoned-host",
-        "Vessel/poisoned-vessel",
-        "TerminalSession/poisoned-terminal-session",
-    ] {
-        assert!(diagnosis.contains(identity), "fleet diagnosis should name {identity}: {diagnosis}");
-    }
-
-    runtime.shutdown();
-}
-
-#[tokio::test]
-async fn deleting_the_last_quarantined_object_recovers_host_readiness_without_restart() {
-    let temp = TempDir::new().expect("tempdir");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"quarantine-recovery-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(temp.path()));
-    let sqlite_path = config.state_dir().join("resources.sqlite");
-    drop(SqliteBackend::open(&sqlite_path).expect("initialize sqlite store"));
-    let connection = rusqlite::Connection::open(&sqlite_path).expect("open raw sqlite store");
-    insert_undecodable_resource::<ConvoyEnsure>(&connection, "governor");
-    drop(connection);
-
-    let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
-    let runtime = DaemonRuntime::start_with_options(
-        Arc::clone(&daemon),
-        config,
-        None,
-        RuntimeOptions {
-            heartbeat_interval: Duration::from_millis(10),
-            controller_resync_interval: Duration::from_secs(300),
-            start_controllers: false,
-            ..RuntimeOptions::default()
-        },
-    )
-    .await
-    .expect("daemon should boot with an undecodable stored resource");
-
-    let health = daemon.fleet_health_internal().await.expect("daemon should serve fleet health");
-    let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
-    assert!(
-        local.degraded_conditions.iter().any(|condition| condition.contains("ConvoyEnsure/governor")),
-        "fleet diagnosis should identify the quarantined resource: {:?}",
-        local.degraded_conditions
-    );
-    let hosts = daemon.resource_backend().using::<Host>(NAMESPACE).list().await.expect("local host resource should exist");
-    let [host] = hosts.items.as_slice() else { panic!("expected exactly one local host resource, got {:?}", hosts.items) };
-    let host_id = host.metadata.name.clone();
-    assert!(
-        !host.status.as_ref().expect("startup heartbeat should publish host status").ready,
-        "decode quarantine should degrade readiness"
-    );
-
-    delete_resource_kind(&daemon.resource_backend(), NAMESPACE, ConvoyEnsure::API_PATHS.kind, "governor")
-        .await
-        .expect("operator delete should resolve the quarantined identity");
-
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let host = daemon
-                .resource_backend()
-                .using::<Host>(NAMESPACE)
-                .get(&host_id)
-                .await
-                .expect("local host resource should remain available");
-            if host.status.is_some_and(|status| status.ready) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("host readiness should recover after the final quarantine is deleted");
-
-    runtime.shutdown();
-}
-
 #[tokio::test]
 async fn daemon_reports_recent_abnormal_restart_frequency_in_fleet_health() {
     let temp = TempDir::new().expect("tempdir");
@@ -885,18 +425,14 @@ async fn daemon_reports_recent_abnormal_restart_frequency_in_fleet_health() {
     .await
     .expect("daemon should start");
 
-    let health = daemon.fleet_health_internal().await.expect("fleet health");
-    let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
-    assert!(
-        local.degraded_conditions.iter().any(|condition| condition.contains("daemon restarted 3× after abnormal exits in 30m")),
-        "fleet diagnosis should surface the restart window: {:?}",
-        local.degraded_conditions
-    );
+    // The restart window is a diagnostic condition, which the engine Host does not keep
+    // (`host_import.rs`), so fleet health no longer carries it; placement is what it must
+    // leave alone.
     let host_id = daemon.local_host_id().expect("local Host identity");
     let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id.as_str()).await.expect("local Host");
     assert!(host.status.expect("local Host status").ready, "historical abnormal exits must not block placement after recovery");
 
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 
 // Losing an agent adapter blocks placement, while the same live daemon can
@@ -938,74 +474,4 @@ async fn capability_regression_keeps_live_forge_observer() {
         flotilla_observation::forge_observation::source_owner(&backend, NAMESPACE, &source).await.unwrap_err(),
         flotilla_observation::forge_observation::NO_READY_FORGE_OBSERVER
     );
-}
-
-// Quarantine of an unrelated actuator is admission-only; corrupt observation
-// inputs/results withdraw the forge reader. Exercise objects and event records.
-#[hegel::test]
-fn quarantine_withdraws_only_for_observation_records(tc: hegel::TestCase) {
-    let kind = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(6));
-    let event = tc.draw(hegel::generators::booleans());
-    let kinds = ["Convoy", "Host", "Forge", "Project", "Repository", "Issue", "ChangeRequest"];
-    let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
-    if event {
-        diagnostics.event_decode_quarantines.push(
-            flotilla_resources::ResourceEventDecodeQuarantine::builder()
-                .kind(kinds[kind].to_string())
-                .namespace("flotilla".to_string())
-                .name("bad".to_string())
-                .event_version(1)
-                .error("decode failed".to_string())
-                .quarantined_at(Utc::now())
-                .build(),
-        );
-    } else {
-        diagnostics.decode_quarantines.push(
-            flotilla_resources::ResourceDecodeQuarantine::builder()
-                .kind(kinds[kind].to_string())
-                .namespace("flotilla".to_string())
-                .name("bad".to_string())
-                .error("decode failed".to_string())
-                .quarantined_at(Utc::now())
-                .build(),
-        );
-    }
-    let condition = resource_decode_quarantine_condition(Some(&diagnostics)).expect("quarantine condition");
-    assert!(condition.blocks_readiness());
-    assert_eq!(condition.blocks_forge_observation(), kind != 0);
-}
-
-// Heartbeats publish a JSON object with exactly three consumer-class keys and
-// numeric counters/gauges. Glue: one real heartbeat pins this serialization seam.
-#[tokio::test]
-async fn heartbeat_publishes_store_read_retry_capability_shape() {
-    let temp = TempDir::new().expect("tempdir");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"read-retry-capability-root\"\n").expect("daemon config");
-    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path().to_path_buf()))).await;
-    let host_id = daemon.local_host_id().expect("Host identity").to_string();
-    let backend = daemon.resource_backend();
-    ensure_host_exists(&backend, NAMESPACE, &host_id, "local", None).await.expect("register Host");
-    apply_host_heartbeat(&daemon, NAMESPACE, &manual_profile(&host_id, false), &test_health_identity()).await.expect("heartbeat");
-    let host = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("Host");
-    let status = host.status.expect("Host status");
-    let retries = status.capabilities["store_read_retries"].as_object().expect("retry metrics object");
-    assert_eq!(retries.keys().map(String::as_str).collect::<BTreeSet<_>>(), BTreeSet::from(["controller", "watch_view", "replication"]));
-    for metrics in retries.values() {
-        let metrics = metrics.as_object().expect("class metrics object");
-        assert_eq!(
-            metrics.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "retries",
-                "recoveries",
-                "failures",
-                "cancellations",
-                "peak_consecutive",
-                "active",
-                "prolonged",
-                "consecutive",
-                "oldest_millis"
-            ])
-        );
-        assert!(metrics.values().all(|value| value.as_u64().is_some()), "counters and gauges must be unsigned integers");
-    }
 }

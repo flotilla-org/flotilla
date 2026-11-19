@@ -40,7 +40,8 @@ impl IssueObservationSource for UnavailableIssues {
 /// crosses hosts; transport requests are not a wire protocol.
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct CrewTurnIntent {
-    pub receiver: Option<String>,
+    /// Who the turn goes to when it names them; otherwise the crew member `role` of `convoy`.
+    pub receiver: Option<Party>,
     pub namespace: String,
     pub convoy: String,
     pub source: String,
@@ -49,17 +50,74 @@ pub struct CrewTurnIntent {
     pub brief: String,
     pub subject_revision: String,
     pub subject: Option<flotilla_protocol::Subject>,
-    pub sender: String,
+    pub sender: Party,
     #[builder(default = flotilla_resources::MessageRelation::System)]
     pub relation: flotilla_resources::MessageRelation,
+    /// What the turn refers to; at most one is its subject.
     #[builder(default)]
-    pub references: Vec<flotilla_resources::MessageReference>,
-    pub message_subject: Option<flotilla_resources::MessageReference>,
-    pub delivery_condition: Option<Leaf>,
+    pub references: Vec<flotilla_messaging::IntentReference>,
+    pub delivery_condition: Option<flotilla_address::Condition>,
     #[builder(default)]
-    pub expectation: flotilla_resources::MessageExpectation,
-    /// The stalled crew role or canonical convoy address this supervision is about.
-    pub stall_of: Option<String>,
+    pub expectation: flotilla_messaging::IntentExpectation,
+    /// The stall this supervision is about, with its evidence.
+    pub stall_of: Option<flotilla_messaging::StallOf>,
+}
+
+/// One end of a crew message: whom it is from or to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Party {
+    /// A person, by their principal's name: they send and receive as the role they hold in the
+    /// project the message concerns.
+    Person(String),
+    /// A crew member: role `role` of convoy `convoy` in `project`.
+    Seat { project: String, convoy: String, role: String },
+    /// A fleet role, by name: read on the FleetDesignation where the message is sent.
+    Fleet(String),
+    /// An inbox already named.
+    Inbox(flotilla_address::Address),
+}
+
+impl Party {
+    /// A fleet role, by name.
+    pub fn fleet(role: &str) -> Self {
+        Self::Fleet(role.to_owned())
+    }
+
+    /// The party a supervision policy's address names: a person by `principal:<name>`, else the
+    /// role inbox a crew role address names.
+    pub fn of_policy_address(address: &str) -> Result<Self, String> {
+        match address.strip_prefix("principal:") {
+            Some(principal) => Ok(Self::Person(principal.to_owned())),
+            None => flotilla_resources::convoy::engine::role_inbox(address).map(Self::Inbox),
+        }
+    }
+
+    /// The inbox this party sends and receives at, read through `messages` in `namespace`; a
+    /// person's is the role they hold in `project`, and a fleet role's is read on the
+    /// FleetDesignation by its name.
+    pub async fn inbox(
+        &self,
+        messages: &dyn flotilla_messaging::EngineMessages,
+        namespace: &str,
+        project: &str,
+    ) -> Result<flotilla_address::Address, String> {
+        match self {
+            Self::Person(principal) => messages.person(namespace, principal, Some(project)).await.map_err(|error| error.to_string()),
+            Self::Fleet(role) => messages.fleet_role(namespace, role).await.map_err(|error| error.to_string()),
+            Self::Seat { project, convoy, role } => flotilla_address::Address::project(project)
+                .map_err(|error| error.to_string())
+                .and_then(|project| flotilla_resources::convoy::engine::seat_address(&project, convoy, role)),
+            Self::Inbox(inbox) => Ok(inbox.clone()),
+        }
+    }
+
+    /// The person who sends as this party, when one does: admission traces them.
+    pub fn principal(&self) -> Option<String> {
+        match self {
+            Self::Person(principal) => Some(principal.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// Canonical receiver admission is a workflow latch, not a delivery receipt.
@@ -84,16 +142,6 @@ pub trait ResourceIntentPublisher: Send + Sync {
     ) -> Result<(flotilla_protocol::ResourceRef, Option<String>), String> {
         Ok((self.publish(namespace, document).await?, None))
     }
-    async fn patch_status(
-        self: Arc<Self>,
-        _namespace: &str,
-        _kind: &str,
-        _name: &str,
-        _status: serde_json::Value,
-        _expected_resource_version: &str,
-    ) -> Result<(), String> {
-        Err("resource status mutation router unavailable".into())
-    }
 }
 
 #[async_trait]
@@ -112,8 +160,7 @@ struct LeafSubscriptionTableInner {
     clock: Arc<dyn flotilla_resources::Clock>,
     backend: ResourceBackend,
     watch_views: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<wake::LeafViews>>>>,
-    message_inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>,
-    /// The `[primitives]` Message path; empty while the switch is off.
+    /// The Message path, installed at startup.
     message_path: crate::ports::MessagePath,
     /// The `[primitives]` Convoy path: promises are read from the engine when it holds a convoy.
     convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
@@ -136,7 +183,8 @@ struct LeafSubscriptionTableInner {
     /// Turn-delivery failures awaiting their convoy's single status write (#3455).
     pending_failures: turn_delivery::PendingFailureMap,
     decisions: crate::decision_log::DecisionLog,
-    supervisor_context: Mutex<HashMap<(String, String), String>>,
+    supervisor_context: Mutex<HashMap<stalls::SupervisorContextKey, String>>,
+    operator_told: Mutex<stalls::OperatorTold>,
     #[cfg(test)]
     snapshot_loads: AtomicUsize,
     #[cfg(test)]
@@ -152,10 +200,11 @@ enum UnableEvidenceKey {
 }
 
 impl LeafSubscriptionTable {
-    /// Configure the read port before cloning or registering subscriptions, like the other
-    /// composition setters. An unconfigured table intentionally serves the primitives-off path.
-    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>) -> Self {
-        Arc::get_mut(&mut self.inner).expect("configure lifecycle reads before sharing subscriptions").lifecycle_reads = reads;
+    /// A restarted daemon's table: these subscriptions, read through the restarted daemon's
+    /// `reads`. Before the table is shared.
+    #[cfg(test)]
+    pub(crate) fn restarted_with(mut self, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>) -> Self {
+        Arc::get_mut(&mut self.inner).expect("restart before sharing subscriptions").lifecycle_reads = reads;
         self
     }
 
@@ -180,28 +229,29 @@ impl LeafSubscriptionTable {
         self
     }
 
-    pub(crate) fn message_primitives(&self) -> Option<Arc<dyn crate::ports::EngineMessages>> {
-        self.inner.message_path.get().cloned()
+    pub(crate) fn message_primitives(&self) -> Result<Arc<dyn flotilla_messaging::EngineMessages>, flotilla_resources::ResourceError> {
+        crate::ports::installed_messages(&self.inner.message_path)
     }
 
-    pub fn with_message_inboxes(mut self, inboxes: Arc<Mutex<HashMap<String, flotilla_messaging::MessageInbox>>>) -> Self {
-        Arc::get_mut(&mut self.inner).expect("configure inboxes before sharing subscriptions").message_inboxes = inboxes;
-        self
-    }
-
-    pub fn new(backend: ResourceBackend, event_sink: Arc<dyn EventSink>, change_requests: ChangeRequestRefresher) -> Self {
-        Self::with_episode_limit(backend, event_sink, change_requests, 3)
+    pub fn new(
+        backend: ResourceBackend,
+        event_sink: Arc<dyn EventSink>,
+        change_requests: ChangeRequestRefresher,
+        lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+    ) -> Self {
+        Self::with_episode_limit(backend, event_sink, change_requests, lifecycle_reads, 3)
     }
 
     pub fn with_episode_limit(
         backend: ResourceBackend,
         event_sink: Arc<dyn EventSink>,
         change_requests: ChangeRequestRefresher,
+        lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
         episode_limit: u32,
     ) -> Self {
         let issues =
             IssueRefresher::new(backend.clone(), "unavailable".into(), Arc::new(UnavailableIssues), IssueRefreshCadence::default());
-        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, episode_limit)
+        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, lifecycle_reads, episode_limit)
     }
 
     pub fn with_issues(
@@ -209,8 +259,9 @@ impl LeafSubscriptionTable {
         event_sink: Arc<dyn EventSink>,
         change_requests: ChangeRequestRefresher,
         issues: IssueRefresher,
+        lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     ) -> Self {
-        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, 3)
+        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, lifecycle_reads, 3)
     }
 
     fn with_issues_and_episode_limit(
@@ -218,6 +269,7 @@ impl LeafSubscriptionTable {
         event_sink: Arc<dyn EventSink>,
         change_requests: ChangeRequestRefresher,
         issues: IssueRefresher,
+        lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
         episode_limit: u32,
     ) -> Self {
         // The limit judges the latest run of retained episodes (at most limit+1).
@@ -228,11 +280,10 @@ impl LeafSubscriptionTable {
         let (reconciler_tx, _) = broadcast::channel(32);
         Self {
             inner: Arc::new(LeafSubscriptionTableInner {
-                lifecycle_reads: Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+                lifecycle_reads,
                 clock: Arc::new(flotilla_resources::SystemClock),
                 backend,
                 watch_views: Default::default(),
-                message_inboxes: Default::default(),
                 message_path: Default::default(),
                 convoy_engine: Default::default(),
                 charter_brief_renderer: Arc::new(flotilla_messaging::CharterProseRenderer),
@@ -254,6 +305,7 @@ impl LeafSubscriptionTable {
                 pending_failures: Default::default(),
                 decisions: Default::default(),
                 supervisor_context: Default::default(),
+                operator_told: Default::default(),
                 #[cfg(test)]
                 snapshot_loads: AtomicUsize::new(0),
                 #[cfg(test)]
@@ -340,6 +392,7 @@ impl LeafSubscriptionTable {
 }
 
 mod routing;
+mod schedule;
 mod sources;
 mod stalls;
 mod subscriptions;
@@ -350,7 +403,8 @@ mod wake;
 
 pub use stalls::NO_EXIT_STALL_EVIDENCE;
 pub(crate) use stalls::{crew_role_address, supervision_message_source};
-pub(crate) use turn_delivery::{durable_message_evidence, turn_message_producer_key};
+pub use supervision::supervises;
+pub(crate) use turn_delivery::turn_message_producer_key;
 
 #[cfg(test)]
 mod tests;

@@ -365,9 +365,6 @@ pub struct DaemonConfig {
     /// OTLP tracing export; absent means no network export.
     #[serde(default)]
     pub tracing: Option<DaemonTracingConfig>,
-    /// Compact terminal Message bodies after this many days; zero disables compaction.
-    #[serde(default = "default_message_audit_retention_days")]
-    pub message_audit_retention_days: u64,
     #[serde(default)]
     pub machine_id: Option<String>,
     pub host_name: Option<String>,
@@ -400,11 +397,9 @@ pub struct DaemonConfig {
     /// Opt-in dummy providers for load testing (#3206); absent in real fleets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dummy_fleet: Option<dummy_fleet::DummyFleetConfig>,
-    /// ADR 0064 primitives behind the composition-root switch (#3317): its
-    /// presence moves Message onto the engine and the new store. Refused
-    /// without `[dummy_fleet]` until the cut-over checklist is done.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primitives: Option<PrimitivesConfig>,
+    // The retired `[primitives]` switch (ADR 0064 cut-over, #3108): every daemon runs on the engine,
+    // and a `daemon.toml` that still carries the section loads, its section ignored as an unknown
+    // key. The fleet's configs drop it with the roll; nothing to remove here after that.
     /// The optional loopback HTTP listener (ADR 0065); absent means none.
     #[serde(default)]
     pub http: HttpListenerConfig,
@@ -440,22 +435,6 @@ fn default_trace_sampling() -> f64 {
     1.0
 }
 
-/// The `[primitives]` section. It has no keys: it moves Message, and opens the
-/// decided store with the provisioning lifecycle kinds (#3629), as one switch.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PrimitivesConfig {}
-
-impl DaemonConfig {
-    /// The `[primitives]` switch, refused unless the dummy fleet runs too.
-    pub fn primitives(&self) -> Result<Option<&PrimitivesConfig>, String> {
-        match (&self.primitives, &self.dummy_fleet) {
-            (Some(_), None) => Err("[primitives] needs [dummy_fleet] until the ADR 0064 cut-over checklist is done (#3317)".into()),
-            (primitives, _) => Ok(primitives.as_ref()),
-        }
-    }
-}
-
 /// `[http]` in `daemon.toml`. `flotillad --http-listen` overrides `listen`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -485,7 +464,6 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             tracing: None,
-            message_audit_retention_days: default_message_audit_retention_days(),
             machine_id: None,
             host_name: None,
             admission: AdmissionConfig::default(),
@@ -500,17 +478,12 @@ impl Default for DaemonConfig {
             checkout_archive_retention_days: default_checkout_archive_retention_days(),
             checkout_removal_concurrency: default_checkout_removal_concurrency(),
             dummy_fleet: None,
-            primitives: None,
             http: HttpListenerConfig::default(),
             web: WebConfig::default(),
             max_vessels: None,
             docker_vessels: None,
         }
     }
-}
-
-fn default_message_audit_retention_days() -> u64 {
-    30
 }
 
 fn default_checkout_archive_retention_days() -> u64 {

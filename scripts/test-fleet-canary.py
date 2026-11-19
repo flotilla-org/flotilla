@@ -61,6 +61,51 @@ class Processes:
                 raise AssertionError('daemon directory escaped the canary root')
         return Process()
 
+    # The engine's records of one probe convoy: what each table lists and the states its log shows.
+    LAUNCH, VESSEL = 'convoy-1f#7', 'convoy-1f-work#9'
+    ENVIRONMENT, SESSION, CHECKOUT = 'env-convoy-1f-work-9', 'convoy-1f-work-probe#11', 'checkout-convoy-1f#7-ab#8'
+
+    def records(self):
+        """Each table's rows as (row, states its log passed through), by table."""
+        done, failure = self.completed, self.failure
+
+        def lifecycle(name, ended, **fields):
+            # Realised while the probe runs; once released, Gone and Released unless `ended` says otherwise.
+            if not done:
+                return {'resource.name': name, 'state': 'Realised', **fields}, ['Realised']
+            state, ending = ended
+            return {'resource.name': name, 'state': state, 'ending': ending, **fields}, ['Realised', state]
+
+        released = ('Gone', 'Released')
+        convoy_states = ['Open'] + ([] if not done or failure == 'settlement' else
+                                    ['Abandoned', 'Retired'] if failure == 'abandoned' else
+                                    ['Delivered'] if failure == 'retirement' else ['Delivered', 'Retired'])
+        convoy = {'resource.name': self.LAUNCH, 'project': 'project:fleet-canary', 'state': convoy_states[-1],
+                  'cause': 'Operator' if failure == 'abandoned' else None,
+                  'reason': 'abandoned by test' if failure == 'abandoned' else None}
+        session = lifecycle(self.SESSION, released, holder='vessel:' + self.VESSEL)
+        if failure == 'terminal':
+            session = ({'resource.name': self.SESSION, 'state': 'GaveUp', 'holder': 'vessel:' + self.VESSEL,
+                        'cause_detail': 'cleat refused the launch'}, [])
+        return {
+            'convoy': [(convoy, convoy_states)],
+            'vessel': [lifecycle(self.VESSEL, ('Realised', None) if failure == 'resources' else
+                                 ('Gone', 'Lost') if failure == 'lost' else released, convoy=self.LAUNCH)],
+            'environment': [lifecycle(self.ENVIRONMENT, released, holder='vessel:' + self.VESSEL, identity='canary-container')],
+            'terminal_session': [session],
+            'checkout': [lifecycle(self.CHECKOUT, released, holder='convoy:' + self.LAUNCH)],
+        }
+
+    def rows(self, daemon_socket, table):
+        self.calls.append(['GET', str(daemon_socket), table])
+        if daemon_socket != self.root / 'config/run/flotilla.sock':
+            raise AssertionError('probe must read only its own daemon')
+        kind, _, log = table.partition('.')
+        records = self.records()[kind]
+        if log != 'log':
+            return [row for row, _ in records]
+        return [{'name': row['resource.name'], 'to': state} for row, states in records for state in states]
+
     def reap_host_cleat(self, root, binary):
         if root != self.root:
             raise AssertionError('cleanup escaped the canary root')
@@ -96,20 +141,9 @@ class Processes:
                     'held_credentials': [] if self.failure == 'credential-observation' else [canary.REGISTRY_CREDENTIAL]},
                     'fulfilment_facts': {'fleet-canary': {'harnesses': {} if self.failure == 'harness-observation' else {
                         'fleet-canary': {'version': '5.2.21'}}}}}}],
-                'vessels': [] if self.completed else [{'status': {'phase': 'Ready'}}],
-                'terminalsessions': [] if self.completed else [{'status': {'phase': 'Running'}}],
-                'environments': [] if self.completed else [{'spec': {'docker': {'image': 'pinned-image'}},
-                                                          'status': {'docker_container_id': 'canary-container'}}],
-                'convoys': [{'status': {'phase': 'Landed' if self.completed else 'Running'}}],
             }
             if kind == 'hosts' and self.failure == 'federated':
                 resources[kind].append({'metadata': {'name': 'fleet-host'}})
-            if kind == 'terminalsessions' and self.failure == 'terminal':
-                resources[kind][0]['status']['phase'] = 'Failed'
-            if self.failure == 'settlement' and kind == 'convoys':
-                resources[kind][0]['status']['phase'] = 'Running'
-            if self.failure == 'resources' and kind == 'vessels':
-                resources[kind] = [{'status': {'phase': 'Ready'}}]
             return json.dumps({'records': [{'object': item} for item in resources[kind]]})
         if command[:2] == ['resource', 'apply']:
             path = Path(command[3])
@@ -178,10 +212,11 @@ class Contract(unittest.TestCase):
     def test_live_canary_image_uses_newest_ready_identity_without_fallback(self):
         # A concrete placed image is independent of the candidate's retired
         # baseline payload. Malformed newest evidence must not pick an older tag.
-        old = {'metadata': {'name': 'old', 'creation_timestamp': '2026-01-01'},
+        # Records name their creation time creationTimestamp; the name alone would pick 'old'.
+        old = {'metadata': {'name': 'old', 'creationTimestamp': '2026-01-01'},
                'spec': {'docker': {'image': 'old:tag'}}, 'status': {'phase': 'Ready', 'local_image_id': 'sha256:' + 'a' * 64}}
         newest = copy.deepcopy(old)
-        newest['metadata'] = {'name': 'new', 'creation_timestamp': '2026-02-01'}
+        newest['metadata'] = {'name': 'new', 'creationTimestamp': '2026-02-01'}
         newest['status']['local_image_id'] = 'sha256:' + 'b' * 64
         with patch.dict(os.environ, {}, clear=True):
             for records in [[old, newest], [newest, old]]:
@@ -319,6 +354,11 @@ class Contract(unittest.TestCase):
     def test_no_ambient_docker_config(self):
         with patch.dict(os.environ, {'DOCKER_CONFIG': '/ambient/docker'}):
             self.assertNotIn('DOCKER_CONFIG', canary.isolated_environment(Path('/release'), Path('/probe')))
+            self.assertNotIn('DOCKER_HOST', canary.isolated_environment(Path('/release'), Path('/probe')))
+        # The private HOME hides Docker contexts; an operator's endpoint (rootless Docker) carries over.
+        with patch.dict(os.environ, {'DOCKER_HOST': 'unix:///run/user/1000/docker.sock'}):
+            self.assertEqual(canary.isolated_environment(Path('/release'), Path('/probe'))['DOCKER_HOST'],
+                             'unix:///run/user/1000/docker.sock')
 
     # CLI failures may put structured diagnostics on stdout, stderr, or both.
     # Exercise the actual subprocess boundary, including empty streams.
@@ -385,8 +425,10 @@ class Contract(unittest.TestCase):
         for failure, diagnostic in [('federated', 'unfederated'), ('admission', 'admission'),
                                     ('credential-observation', 'host observes registry credential'),
                                     ('harness-observation', 'host probes the canary image for its harness'),
-                                    ('terminal', 'Running'), ('skills', 'crew skills'),
-                                    ('settlement', 'convoy settles'), ('resources', 'resources are reaped'),
+                                    ('terminal', 'cleat refused the launch'), ('skills', 'crew skills'),
+                                    ('settlement', 'convoy settles'), ('abandoned', 'abandoned by test'),
+                                    ('resources', 'vessel not yet released: convoy-1f-work#9 Realised'),('lost', 'ended Gone Lost'),
+                                    ('retirement', 'convoy retires'),
                                     ('container', 'containers were not reaped')]:
             with self.subTest(failure=failure):
                 message, _ = self.exercise(failure)

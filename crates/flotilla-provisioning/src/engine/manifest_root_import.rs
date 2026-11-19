@@ -134,7 +134,7 @@ pub fn import_roots(roots: &[(ResourceObject<OldRoot>, String)], target: &mut im
             }
         };
         match target.write(home, &old.metadata.name, &created(old), &resource) {
-            Ok(()) => *report.imported.entry(("ManifestRoot", "bound")).or_default() += 1,
+            Ok(()) => report.import_row("ManifestRoot", "bound"),
             Err(reason) => report.refused.push(refuse(reason)),
         }
     }

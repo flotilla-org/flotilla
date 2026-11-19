@@ -4,7 +4,9 @@
 //! image builds and terminal sessions. A thing is requested, realised once its
 //! home observes it under the expected identity, and gone once released or
 //! observed absent. Each try at realising it is an [`Attempted`] edge (R4);
-//! a request that never realises gives up when its attempts are spent.
+//! a request that never realises gives up when its attempts are spent. A
+//! try made before the pending retry was due is a [`FailedEarly`] edge, which
+//! counts nothing, so the limit counts the retry schedule rather than wakes.
 //! [`Lifecycle<K>`] is that machine, with each kind's opaque request as its
 //! spec; the state carries the attempt tally while Requested, the realised
 //! identity, the ending once Gone, and the cause given up with.
@@ -33,9 +35,19 @@ pub trait LifecycleKind: 'static {
     const NAME: &'static str;
     /// What a caller asks for; the resource's immutable spec. Opaque here.
     type Request: Clone;
+    /// The kind's ADR 0047 additive column defaults, as [`Machine::STORED_DEFAULTS`].
+    const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = &[];
     /// The policy `give_up` judges the attempts against.
     fn policy() -> AttemptPolicy {
         DEFAULT_POLICY
+    }
+    /// For a kind whose resources are launches of a name: [`Machine::launch`].
+    fn launch(_request: &Self::Request) -> Option<(&str, u64)> {
+        None
+    }
+    /// [`Machine::numbered`].
+    fn numbered(request: Self::Request, _n: u64) -> Self::Request {
+        request
     }
 }
 
@@ -60,16 +72,72 @@ pub enum Ending {
 }
 
 /// The observation that ended a realised lifecycle.
+///
+/// A lost thing may carry why its home lost it (`cgroup_oom`, say): the
+/// reason travels in the `Vanish` edge's arguments, so readers find it in the
+/// log entry that ended the record, and the stored [`Ending`] stays `Lost`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "VanishCauseRecord")]
 pub enum VanishCause {
-    Lost,
+    Lost { reason: Option<String> },
     Failed { reason: String },
+}
+
+impl VanishCause {
+    /// Lost, with no reason known.
+    pub const fn lost() -> Self {
+        VanishCause::Lost { reason: None }
+    }
+
+    /// Why the thing vanished, when the home said.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            VanishCause::Lost { reason } => reason.as_deref(),
+            VanishCause::Failed { reason } => Some(reason),
+        }
+    }
+}
+
+/// Every `Vanish` cause the log holds: the current shape, and the bare `Lost`
+/// the previous generation wrote before a lost thing carried its reason.
+/// Remove the bare form one fleet roll after this lands (ADR 0047 N→N+1).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum VanishCauseRecord {
+    Current(CurrentVanishCause),
+    Bare(BareVanishCause),
+}
+
+#[derive(Deserialize)]
+enum CurrentVanishCause {
+    Lost {
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+#[derive(Deserialize)]
+enum BareVanishCause {
+    Lost,
+}
+
+impl From<VanishCauseRecord> for VanishCause {
+    fn from(record: VanishCauseRecord) -> Self {
+        match record {
+            VanishCauseRecord::Current(CurrentVanishCause::Lost { reason }) => VanishCause::Lost { reason },
+            VanishCauseRecord::Current(CurrentVanishCause::Failed { reason }) => VanishCause::Failed { reason },
+            VanishCauseRecord::Bare(BareVanishCause::Lost) => VanishCause::lost(),
+        }
+    }
 }
 
 impl From<&VanishCause> for Ending {
     fn from(cause: &VanishCause) -> Self {
         match cause {
-            VanishCause::Lost => Self::Lost,
+            VanishCause::Lost { .. } => Self::Lost,
             VanishCause::Failed { reason } => Self::Failed { reason: reason.clone() },
         }
     }
@@ -157,6 +225,15 @@ pub struct Attempted {
     pub outcome: Outcome,
 }
 
+/// A try made before the pending retry was due failed (spec `FailedEarly`). It is not counted:
+/// its cause replaces the last failure's, which keeps its time, so the retry stays when it was.
+/// When a try is early is the caller's judgement: backoff timing is outside this machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedEarly {
+    pub cause: Cause,
+    pub retryable: bool,
+}
+
 /// The request's attempts are spent, the last failing with `cause` (spec `GiveUp`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GiveUp {
@@ -170,6 +247,7 @@ edges! {
         Vanish(Vanish) = "va",
         GiveUp(GiveUp) = "gu",
         Attempted(Attempted) = "at",
+        FailedEarly(FailedEarly) = "fe",
     }
 }
 
@@ -253,6 +331,7 @@ impl Source<Absence> for MemoryLifecycleWorld {
 
 impl<K: LifecycleKind> Machine for Lifecycle<K> {
     const NAME: &'static str = K::NAME;
+    const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = K::STORED_DEFAULTS;
     type Request = K::Request;
     type Spec = K::Request;
     type State = LifecycleState;
@@ -260,6 +339,14 @@ impl<K: LifecycleKind> Machine for Lifecycle<K> {
     type Write = NoRecords;
     type Refusal = LifecycleRefusal;
     type World = dyn LifecycleWorld;
+
+    fn launch(spec: &K::Request) -> Option<(&str, u64)> {
+        K::launch(spec)
+    }
+
+    fn numbered(spec: K::Request, n: u64) -> K::Request {
+        K::numbered(spec, n)
+    }
 
     fn definition() -> MachineDef<Self> {
         use LifecycleLabel::*;
@@ -295,6 +382,14 @@ impl<K: LifecycleKind> Machine for Lifecycle<K> {
                     .changes(["failures", "last_failure"])
                     .ungated("an attempt reports how a try ended; giving up judges the tally it leaves")
                     .effect(attempted),
+            )
+            .edge(
+                EdgeDef::<Self, FailedEarly>::new()
+                    .from([Requested])
+                    .to([Requested])
+                    .changes(["last_failure"])
+                    .gate("a counted, retryable failure is pending and the attempts are not exhausted", gate_failed_early)
+                    .effect(failed_early),
             )
             .edge(
                 EdgeDef::<Self, GiveUp>::new()
@@ -347,6 +442,47 @@ fn attempted<K: LifecycleKind>(h: &mut Handle<'_, Lifecycle<K>>, state: Lifecycl
         _ => attempt::tally(0, &edge.outcome, h.now()),
     };
     LifecycleState::Requested { failures, last_failure }
+}
+
+/// The spec's attempt history from a lifecycle's log edges, in order: an `Attempted` edge
+/// appends its outcome, and a `FailedEarly` edge replaces the last failure's.
+pub fn attempt_history<'a>(edges: impl IntoIterator<Item = &'a LifecycleEdge>) -> Vec<Outcome> {
+    let mut history = Vec::new();
+    for edge in edges {
+        match edge {
+            LifecycleEdge::Attempted(attempted) => history.push(attempted.outcome.clone()),
+            LifecycleEdge::FailedEarly(early) => {
+                if let Some(last) = history.last_mut() {
+                    *last = Outcome::Failed { cause: early.cause.clone(), retryable: early.retryable };
+                }
+            }
+            _ => {}
+        }
+    }
+    history
+}
+
+// Spec: `pending(h)`: the last attempt failed, may be retried, and the failures are not spent.
+fn gate_failed_early<K: LifecycleKind>(h: &mut Handle<'_, Lifecycle<K>>, _: &FailedEarly) -> Result<(), LifecycleRefusal> {
+    match h.state() {
+        LifecycleState::Requested { failures, last_failure: Some(last) }
+            if last.retryable && *failures > 0 && *failures < K::policy().max_failures.max(1) =>
+        {
+            Ok(())
+        }
+        _ => Err(LifecycleRefusal::MissingEvidence),
+    }
+}
+
+fn failed_early<K: LifecycleKind>(_: &mut Handle<'_, Lifecycle<K>>, state: LifecycleState, edge: &FailedEarly) -> LifecycleState {
+    match state {
+        LifecycleState::Requested { failures, last_failure: Some(last) } => LifecycleState::Requested {
+            failures,
+            last_failure: Some(Failure { at: last.at, cause: edge.cause.clone(), retryable: edge.retryable }),
+        },
+        // The gate admits only a pending failure.
+        other => other,
+    }
 }
 
 // Spec: `exhausted(h) and lastCauseIs(h, o.cause)`, judged by the shared

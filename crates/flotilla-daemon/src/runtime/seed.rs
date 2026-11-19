@@ -8,11 +8,11 @@ use std::{
 use flotilla_core::in_process::InProcessDaemon;
 
 use flotilla_resources::{
-    canonical_host_id, definition_provenance::SEEDING_MANAGER, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec, Environment,
-    EnvironmentSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec,
-    InputMeta, PlacementImageSource, Platform, Repository, ResourceError, ResourceObject, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
+    canonical_host_id, definition_provenance::SEEDING_MANAGER, is_prepared_snapshot, CloneSpec, EnvironmentSpec, FulfilmentGrant,
+    FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec, InputMeta, PlacementImageSource,
+    Platform, Repository, ResourceError, ResourceObject, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{ResourceBackend, TypedResolver};
 use tracing::warn;
 
 use super::discovery::{LocalProvisioningProfile, DEFAULT_DOCKER_IMAGE};
@@ -26,7 +26,7 @@ pub(super) async fn register_startup_resources(
     ensure_host_exists(&backend, namespace, &profile.host_id, &profile.display_name, profile.max_vessels)
         .await
         .map_err(|error| format!("ensure_host_exists: {error}"))?;
-    ensure_host_direct_environment_exists(&backend, namespace, profile)
+    ensure_host_direct_environment_exists(daemon.lifecycle_reads(), profile)
         .await
         .map_err(|error| format!("ensure_host_direct_environment_exists: {error}"))?;
     discover_local_clones(daemon, &backend, namespace, profile).await.map_err(|error| format!("discover_local_clones: {error}"))?;
@@ -44,77 +44,79 @@ pub(super) async fn ensure_host_exists(
     max_vessels: Option<u32>,
 ) -> Result<(), String> {
     let hosts = backend.clone().using::<Host>(namespace);
-    match hosts.get(host_name).await {
-        Ok(existing) if existing.spec.display_name == display_name && existing.spec.max_vessels == max_vessels => return Ok(()),
-        Ok(existing) => {
-            return hosts
-                .update(
-                    &InputMeta::from(&existing.metadata),
-                    &existing.metadata.resource_version,
-                    &HostSpec {
-                        display_name: display_name.to_string(),
-                        connection: Default::default(),
-                        expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
-                        image_build_capacity: existing.spec.image_build_capacity.clone(),
-                        // This path seeds the local daemon Host only, whose cap
-                        // bounds its Docker placements and which is never a
-                        // single-tenant SSH host box (#4002). SSH hosts,
-                        // their cap and tenancy are written by
-                        // `register_ssh_host_resources`.
-                        max_vessels,
-                        single_tenant: false,
-                    },
-                )
-                .await
-                .map(|_| ())
-                .map_err(|err| err.to_string());
-        }
-        Err(ResourceError::NotFound { .. }) => {}
+    let existing = match hosts.get(host_name).await {
+        Ok(existing) => Some(existing),
+        Err(ResourceError::NotFound { .. }) => None,
         Err(err) => return Err(format!("check host {host_name}: {err}")),
-    }
-    hosts
-        .create(
-            &empty_meta(host_name),
-            &HostSpec { display_name: display_name.to_string(), connection: Default::default(), max_vessels, ..HostSpec::default() },
-        )
-        .await
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+    };
+    ensure_host_matches(&hosts, existing.as_ref(), host_name, display_name, max_vessels).await.map(|_| ())
 }
 
+/// Brings this daemon's Host, `existing` as its caller last read it, in line with its profile;
+/// whether it wrote.
+pub(super) async fn ensure_host_matches(
+    hosts: &TypedResolver<Host>,
+    existing: Option<&ResourceObject<Host>>,
+    host_name: &str,
+    display_name: &str,
+    max_vessels: Option<u32>,
+) -> Result<bool, String> {
+    match existing {
+        Some(existing) if existing.spec.display_name == display_name && existing.spec.max_vessels == max_vessels => Ok(false),
+        Some(existing) => hosts
+            .update(
+                &InputMeta::from(&existing.metadata),
+                &existing.metadata.resource_version,
+                &HostSpec {
+                    display_name: display_name.to_string(),
+                    connection: Default::default(),
+                    expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
+                    image_build_capacity: existing.spec.image_build_capacity.clone(),
+                    // This path seeds the local daemon Host only, whose cap
+                    // bounds its Docker placements and which is never a
+                    // single-tenant SSH host box (#4002). SSH hosts,
+                    // their cap and tenancy are written by
+                    // `register_ssh_host_resources`.
+                    max_vessels,
+                    single_tenant: false,
+                },
+            )
+            .await
+            .map(|_| true)
+            .map_err(|err| err.to_string()),
+        None => hosts
+            .create(
+                &empty_meta(host_name),
+                &HostSpec { display_name: display_name.to_string(), connection: Default::default(), max_vessels, ..HostSpec::default() },
+            )
+            .await
+            .map(|_| true)
+            .map_err(|err| err.to_string()),
+    }
+}
+
+/// Requests the host's direct environment from the engine, once: one already held is left as it is.
 pub(super) async fn ensure_host_direct_environment_exists(
-    backend: &ResourceBackend,
-    namespace: &str,
+    reads: Arc<dyn flotilla_projections::ports::LifecycleReads>,
     profile: &LocalProvisioningProfile,
 ) -> Result<(), String> {
     let name = profile.host_direct_environment_name();
-    let environments = backend.clone().using::<Environment>(namespace);
-    match environments.get(&name).await {
-        Ok(_) => return Ok(()),
-        Err(ResourceError::NotFound { .. }) => {}
-        Err(err) => return Err(format!("check environment {name}: {err}")),
-    }
-
     let address = flotilla_address::Address::root(flotilla_address::Kind::Host, &profile.host_id)
         .and_then(|place| place.child(flotilla_address::Kind::Provider, &profile.host_direct_provider))
         .map_err(|error| error.to_string())?;
 
-    environments
-        .create(
-            &empty_meta(&name),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: Some(address),
-                host_direct: Some(HostDirectEnvironmentSpec {
-                    host_ref: profile.host_id.clone(),
-                    repo_default_dir: profile.repo_default_dir.clone(),
-                }),
-                docker: None,
-            },
-        )
+    let spec = EnvironmentSpec {
+        cloud_sandbox: None,
+        provider_address: Some(address),
+        host_direct: Some(HostDirectEnvironmentSpec {
+            host_ref: profile.host_id.clone(),
+            repo_default_dir: profile.repo_default_dir.clone(),
+        }),
+        docker: None,
+    };
+    tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.environments()?.request(&name, &spec, None).map(drop)))
         .await
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+        .map_err(|error| format!("request environment: {error}"))?
 }
 
 pub(super) async fn discover_local_clones(
@@ -123,7 +125,6 @@ pub(super) async fn discover_local_clones(
     namespace: &str,
     profile: &LocalProvisioningProfile,
 ) -> Result<(), String> {
-    let clones = backend.clone().using::<Clone>(namespace);
     let host_direct_env_ref = profile.host_direct_environment_name();
 
     for repo_path in daemon.tracked_repo_paths().await {
@@ -150,8 +151,6 @@ pub(super) async fn discover_local_clones(
         flotilla_store::ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, &repository_spec)
             .await
             .map_err(|error| error.to_string())?;
-        let repo_key_value = repository_key.to_string();
-        let name = format!("clone-{}", repository_spec.clone_key(&host_direct_env_ref)?);
         let expected_spec = CloneSpec {
             repo_ref: repository_key.clone(),
             url: if matches!(repository_spec.identity(), flotilla_resources::RepositoryIdentity::Forge { .. }) {
@@ -162,35 +161,16 @@ pub(super) async fn discover_local_clones(
             env_ref: host_direct_env_ref.clone(),
             path: repo_path.display().to_string(),
         };
-        let expected_labels = BTreeMap::from([
-            ("flotilla.work/discovered".to_string(), "true".to_string()),
-            ("flotilla.work/repo-key".to_string(), repo_key_value),
-            ("flotilla.work/env".to_string(), host_direct_env_ref.clone()),
-            ("flotilla.work/repo".to_string(), descriptive_repo_slug(&canonical_url)),
-        ]);
-
-        match clones.get(&name).await {
-            Ok(existing) => {
-                if existing.metadata.deletion_timestamp.is_some() {
-                    continue;
-                }
-                if existing.spec.repo_ref != repository_key || existing.spec.env_ref != host_direct_env_ref {
-                    warn!(clone = %name, "leaving discovered clone untouched because the existing resource does not match the expected repo/env tuple");
-                    continue;
-                }
-
-                let merged_labels = merged_labels(&existing.metadata.labels, &expected_labels);
-                if existing.spec != expected_spec || existing.metadata.labels != merged_labels {
-                    clones
-                        .update(&meta_from_existing(&existing, merged_labels), &existing.metadata.resource_version, &expected_spec)
-                        .await
-                        .map_err(|err| err.to_string())?;
-                }
-            }
-            Err(ResourceError::NotFound { .. }) => {
-                clones.create(&empty_meta_with_labels(&name, expected_labels), &expected_spec).await.map_err(|err| err.to_string())?;
-            }
-            Err(err) => return Err(err.to_string()),
+        // The engine's request says the clone was found here, not cloned. A clone already held
+        // is served as it is; one held for another repository or environment is left alone.
+        let reads = daemon.lifecycle_reads();
+        let requested = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+            reads.clones()?.request(&repository_spec, &expected_spec, true)
+        }))
+        .await
+        .map_err(|error| format!("request discovered clone: {error}"))?;
+        if let Err(error) = requested {
+            warn!(%error, path = %repo_path.display(), "leaving discovered clone as the engine holds it");
         }
     }
 
@@ -284,16 +264,26 @@ pub(super) fn kind_belongs_to_host(
 /// Repairs this host's kinds whose host ref names it other than by its Host's name.
 pub(super) async fn canonicalize_kind_hosts(backend: &ResourceBackend, namespace: &str, host_ref: &str) -> Result<(), String> {
     let hosts = backend.clone().using::<Host>(namespace).list().await.map_err(|error| error.to_string())?.items;
+    canonicalize_kinds_for(backend, namespace, &hosts, host_ref).await
+}
+
+/// [`canonicalize_kind_hosts`], with the Hosts its caller has read.
+pub(super) async fn canonicalize_kinds_for(
+    backend: &ResourceBackend,
+    namespace: &str,
+    hosts: &[ResourceObject<Host>],
+    host_ref: &str,
+) -> Result<(), String> {
     let kinds = backend.clone().using::<FulfilmentKind>(namespace);
     // Idempotent: after the first successful pass the stored ref is the Host's name.
     for kind in kinds.list().await.map_err(|error| error.to_string())?.items {
         if kind.metadata.deletion_timestamp.is_some()
             || kind.spec.host_ref == host_ref
-            || is_prepared_snapshot(&kind.metadata.name, &kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
+            || is_prepared_snapshot(&kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
         {
             continue;
         }
-        if kind_belongs_to_host(&hosts, &kind, host_ref, "kind canonicalization") {
+        if kind_belongs_to_host(hosts, &kind, host_ref, "kind canonicalization") {
             let mut spec = kind.spec.clone();
             spec.host_ref = host_ref.to_string();
             kinds

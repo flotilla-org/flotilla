@@ -1,11 +1,11 @@
 //! The storage port (#3317): the engine's Log over one Store, and receipts
 //! served from `Read::about`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use flotilla_engine_store::{registry, MessageLog, StoreLog};
 use flotilla_schema::{Address, Kind, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     machines::{
         agent_session::{AgentSession, MemoryAgentSessionWorld, Receive},
@@ -21,8 +21,10 @@ use rusqlite::Connection;
 
 const HOME: &str = "alpha";
 
-fn store() -> Arc<Mutex<Store>> {
-    Arc::new(Mutex::new(Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry().expect("registry")).expect("store")))
+fn store() -> Arc<StoreHandle> {
+    Arc::new(StoreHandle::new(
+        Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry().expect("registry")).expect("store"),
+    ))
 }
 
 fn inbox() -> Address {
@@ -50,11 +52,11 @@ fn session() -> Receiver {
     Receiver { kind: ConsumerKind::AgentSession, id: "terminal-demo-coder".into(), host: HOME.into() }
 }
 
-fn last_sequence(store: &Arc<Mutex<Store>>) -> u64 {
+fn last_sequence(store: &Arc<StoreHandle>) -> u64 {
     store.lock().expect("store").read().expect("read").last_sequence(HOME).expect("sequence")
 }
 
-fn stored(store: &Arc<Mutex<Store>>, name: &str) -> Resource<Message> {
+fn stored(store: &Arc<StoreHandle>, name: &str) -> Resource<Message> {
     let mut store = store.lock().expect("store");
     let mut read = store.read().expect("read");
     let id = read.resolve(Resource::<Message>::CODE, name, HOME).expect("resolve").expect("stored");
@@ -107,7 +109,10 @@ fn port_round_trips_every_message_edge_at_the_home_sequence() {
 
     messages.apply(&answered, Deliver { receiver: session(), transport: Transport::Turn }, &world, Timestamp(4)).expect("deliver");
     assert_eq!(messages.get(&answered).expect("message").version().0, last_sequence(&store));
-    assert_eq!(*messages.get(&answered).expect("message").state(), MessageState::Awaiting { receiver: session() });
+    assert_eq!(
+        *messages.get(&answered).expect("message").state(),
+        MessageState::Awaiting { receiver: session(), delivered_at: Timestamp(4) }
+    );
 
     world.reply.put(&Ref::new(answered.as_str()), ());
     messages.apply(&answered, Settle { by: Settlement::Answered }, &world, Timestamp(5)).expect("settle");
@@ -120,65 +125,6 @@ fn port_round_trips_every_message_edge_at_the_home_sequence() {
     assert_eq!(resource.version().0, last_sequence(&store));
     assert!(matches!(resource.state(), MessageState::Dropped { reason: DropReason::Undeliverable, .. }));
     assert_eq!(&stored(&store, &dropped), resource);
-}
-
-// The documented one-roll additive upgrade preserves a six-column session row;
-// the new observation stays absent until its first hook edge is written.
-#[test]
-fn legacy_session_rows_decode_after_the_documented_activity_upgrade() {
-    use flotilla_schema::{NewChange, State};
-    use flotilla_state_machines::{
-        machines::agent_session::{Activity, AgentSessionSpec, AgentSessionState, Channel, Observe},
-        Version,
-    };
-    let mut store = Store::open(Connection::open_in_memory().unwrap(), HOME, registry().unwrap()).unwrap();
-    let session = Resource::<AgentSession>::stored(
-        "legacy",
-        AgentSessionSpec {},
-        State::new(AgentSessionState::live(Channel::Detached), Timestamp(0)),
-        Version(0),
-    );
-    let mut write = store.write().unwrap();
-    let stamp = write.insert("legacy", &session, &NewChange::new("test", Timestamp(0))).unwrap();
-    write.commit().unwrap();
-    let connection = store.into_connection();
-    // Reconstruct the previous generation's six-column root table around its row.
-    connection
-        .execute_batch(
-            "DROP VIEW agent_session_view;
-         ALTER TABLE agent_session DROP COLUMN activity;
-         ALTER TABLE agent_session DROP COLUMN activity_since;
-         ALTER TABLE agent_session DROP COLUMN activity_cause;",
-        )
-        .unwrap();
-    assert_eq!(connection.query_row("SELECT count(*) FROM pragma_table_info('agent_session')", [], |row| row.get::<_, u32>(0)).unwrap(), 6);
-    // This is the exact explicit upgrade from the PR rollout instructions.
-    connection
-        .execute_batch(
-            "ALTER TABLE agent_session ADD COLUMN activity TEXT CHECK (activity IN ('id', 'in', 'wo'));
-         ALTER TABLE agent_session ADD COLUMN activity_since INTEGER;
-         ALTER TABLE agent_session ADD COLUMN activity_cause TEXT;",
-        )
-        .unwrap();
-    let mut store = Store::open(connection, HOME, registry().unwrap()).unwrap();
-    let loaded = store.read().unwrap().load::<Resource<AgentSession>>(stamp.id).unwrap().unwrap();
-    assert!(loaded.value.state().observation().is_none());
-    let store = Arc::new(Mutex::new(store));
-    let mut home = Home::<AgentSession, StoreLog>::with_log(HOME, StoreLog::new(Arc::clone(&store))).unwrap();
-    home.restore(loaded.value).unwrap();
-    home.apply(
-        "legacy",
-        Observe { activity: Activity::Working, cause: "UserPromptSubmit".into() },
-        &MemoryAgentSessionWorld::default(),
-        Timestamp(2),
-    )
-    .unwrap();
-    let mut store = store.lock().unwrap();
-    let current = store.read().unwrap().load::<Resource<AgentSession>>(stamp.id).unwrap().unwrap();
-    let observation = current.value.state().observation().unwrap();
-    assert_eq!(observation.activity, Activity::Working);
-    assert_eq!(observation.activity_since, Timestamp(2));
-    assert_eq!(observation.activity_cause, "UserPromptSubmit");
 }
 
 // Behaviour (#3755): a panic in one writer rolls back its rows and cached IDs;

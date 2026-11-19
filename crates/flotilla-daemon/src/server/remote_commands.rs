@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex, OnceLock,
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -16,10 +16,10 @@ use flotilla_core::{
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
-    Command, CommandAction, CommandPeerEvent, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, NodeId,
-    PeerWireMessage, RepoIdentity, RepoSelector, RoutedPeerMessage, Step, StepStatus,
+    Command, CommandAction, CommandPeerEvent, CommandValue, DaemonEvent, EnvironmentId, NodeId, PeerWireMessage, RepoIdentity,
+    RepoSelector, RoutedPeerMessage, Step, StepStatus,
 };
-use flotilla_resources::CrewCompletionPending;
+use flotilla_store::off_frame;
 use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, Instrument};
@@ -97,27 +97,6 @@ pub(super) struct PendingRemoteCommand {
     /// than a broadcast `CommandFinished` event. `complete_remote_command`
     /// resolves this instead of broadcasting.
     pub(super) query_completion: Option<oneshot::Sender<CommandValue>>,
-    pub(super) crew_completion: Option<PendingCrewCompletionRoute>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct PendingCrewCompletionRoute {
-    namespace: String,
-    convoy: String,
-    session_name: String,
-    context: CrewCommandContext,
-    message: Option<String>,
-    disposition: Option<String>,
-    decision_ledger_ref: Option<String>,
-    force: bool,
-    principal_ref: Option<flotilla_protocol::PrincipalRef>,
-    authority: Option<HostName>,
-}
-
-#[derive(Clone)]
-struct CrewCompletionRetryState {
-    completion: PendingCrewCompletionRoute,
-    generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -214,8 +193,6 @@ pub struct RemoteCommandRouterInner {
     pending_remote_step_cancels: PendingRemoteStepCancelMap,
     forwarded_remote_step_batches: ForwardedRemoteStepBatchMap,
     next_remote_command_id: Arc<AtomicU64>,
-    /// Session name -> latest completion intent and its update generation.
-    retrying_crew_completions: Arc<StdMutex<HashMap<String, CrewCompletionRetryState>>>,
     blob_store: Arc<OnceLock<Arc<TieredBlobStore>>>,
 }
 
@@ -227,77 +204,64 @@ impl std::ops::Deref for RemoteCommandRouter {
     }
 }
 
+/// Where a routed query or acknowledged mutation runs.
+struct QueryRoute {
+    target_node_id: NodeId,
+    /// The convoy authority the command addresses, named when it is unreachable.
+    existing_convoy_target: Option<flotilla_core::in_process::ExistingConvoyTarget>,
+    crew_convoy: Option<String>,
+}
+
 #[async_trait]
 impl flotilla_crew::leaf_engine::ResourceIntentPublisher for RemoteCommandRouterInner {
     async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
-        let router = RemoteCommandRouter { inner: self };
-        let command = Command::builder().action(CommandAction::ResourceApply { namespace: namespace.to_string(), document }).build();
-        match router.dispatch_and_wait(command, uuid::Uuid::nil()).await? {
-            CommandValue::ResourceObject(object) => Ok(flotilla_protocol::ResourceRef::new(
-                object.value.get("apiVersion").and_then(serde_json::Value::as_str).unwrap_or("flotilla.work/v1"),
-                &object.kind,
-                &object.namespace,
-                object
-                    .value
-                    .pointer("/metadata/name")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("resource admission response has no name")?,
-            )),
-            CommandValue::Error { message } => Err(message),
-            value => Err(format!("unexpected resource intent admission result: {value:?}")),
-        }
+        Ok(self.publish_admitted(namespace, document).await?.0)
     }
+    /// Admits a Message at its receiver's home. Routing names the home; at this home the
+    /// admission is called directly, and only another home is sent the command.
     async fn publish_admitted(
         self: Arc<Self>,
         namespace: &str,
         document: serde_json::Value,
     ) -> Result<(flotilla_protocol::ResourceRef, Option<String>), String> {
         let router = RemoteCommandRouter { inner: self };
-        let command = Command::builder().action(CommandAction::ResourceApply { namespace: namespace.to_string(), document }).build();
-        match router.dispatch_and_wait(command, uuid::Uuid::nil()).await? {
-            CommandValue::ResourceObject(object) => {
-                let name = object
-                    .value
-                    .pointer("/metadata/name")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("resource admission response has no name")?;
-                let home = object
-                    .value
-                    .pointer("/metadata/annotations")
-                    .and_then(|annotations| annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-                let api_version = object.value.get("apiVersion").and_then(serde_json::Value::as_str).unwrap_or("flotilla.work/v1");
-                Ok((flotilla_protocol::ResourceRef::new(api_version, &object.kind, &object.namespace, name), home))
-            }
+        let mut command = Command::builder().action(CommandAction::ResourceApply { namespace: namespace.to_string(), document }).build();
+        let route = off_frame(|| router.query_route(&mut command)).instrument(tracing::info_span!("message_publish.route")).await?;
+        if route.target_node_id == *router.daemon.node_id() {
+            let CommandAction::ResourceApply { namespace, document } = &command.action else {
+                unreachable!("the routed command is the Message apply")
+            };
+            let object = off_frame(|| router.daemon.admit_message_document(namespace, document))
+                .instrument(tracing::info_span!("message_publish.admit"))
+                .await
+                .map_err(|error| error.to_string())?;
+            return admitted_message(&object.kind, &object.namespace, &object.value);
+        }
+        let answer = off_frame(|| router.send_query_to_target(command, Some(uuid::Uuid::nil()), route))
+            .instrument(tracing::info_span!("message_publish.remote"))
+            .await?;
+        match answer {
+            CommandValue::ResourceObject(object) => admitted_message(&object.kind, &object.namespace, &object.value),
             CommandValue::Error { message } => Err(message),
             value => Err(format!("unexpected resource intent admission result: {value:?}")),
         }
     }
-    async fn patch_status(
-        self: Arc<Self>,
-        namespace: &str,
-        kind: &str,
-        name: &str,
-        status: serde_json::Value,
-        expected_resource_version: &str,
-    ) -> Result<(), String> {
-        let router = RemoteCommandRouter { inner: self };
-        let command = Command::builder()
-            .action(CommandAction::ResourceStatusPatch {
-                namespace: namespace.into(),
-                kind: kind.into(),
-                name: name.into(),
-                status,
-                expected_resource_version: Some(expected_resource_version.into()),
-            })
-            .build();
-        match router.dispatch_and_wait(command, uuid::Uuid::nil()).await? {
-            CommandValue::ResourceObject(_) => Ok(()),
-            CommandValue::Error { message } => Err(message),
-            value => Err(format!("unexpected resource status mutation result: {value:?}")),
-        }
-    }
+}
+
+/// The admitted Message an admission answered with, and the home holding it.
+fn admitted_message(
+    kind: &str,
+    namespace: &str,
+    value: &serde_json::Value,
+) -> Result<(flotilla_protocol::ResourceRef, Option<String>), String> {
+    let name = value.pointer("/metadata/name").and_then(serde_json::Value::as_str).ok_or("resource admission response has no name")?;
+    let home = value
+        .pointer("/metadata/annotations")
+        .and_then(|annotations| annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let api_version = value.get("apiVersion").and_then(serde_json::Value::as_str).unwrap_or("flotilla.work/v1");
+    Ok((flotilla_protocol::ResourceRef::new(api_version, kind, namespace, name), home))
 }
 
 impl RemoteCommandRouter {
@@ -320,7 +284,6 @@ impl RemoteCommandRouter {
             pending_remote_step_cancels: Arc::new(Mutex::new(HashMap::new())),
             forwarded_remote_step_batches: Arc::new(Mutex::new(HashMap::new())),
             next_remote_command_id,
-            retrying_crew_completions: Arc::new(StdMutex::new(HashMap::new())),
             blob_store: Arc::new(OnceLock::new()),
         });
         let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> = inner.clone();
@@ -360,33 +323,18 @@ impl RemoteCommandRouter {
         self.dispatch_execute_for_caller(command, None).await
     }
 
-    pub(super) async fn dispatch_execute_for_principal(
-        &self,
-        command: Command,
-        dispatching_principal_ref: Option<flotilla_protocol::PrincipalRef>,
-    ) -> Result<u64, String> {
-        let caller =
-            dispatching_principal_ref.map(|principal_ref| flotilla_protocol::CommandCaller { principal_ref, process: None, crew: None });
-        self.dispatch_execute_for_caller(command, caller).await
-    }
-
     #[tracing::instrument(skip_all)]
     async fn dispatch_remote_command(
         &self,
         command: Command,
         caller: Option<flotilla_protocol::CommandCaller>,
         target: &flotilla_core::command_target::CommandTarget,
-        crew_completion: Option<PendingCrewCompletionRoute>,
         target_node_id: NodeId,
     ) -> Result<u64, String> {
         let existing_convoy_target = match &target.host {
             TargetHost::ConvoyHome(home) => Some(home.clone()),
             _ => None,
         };
-        if let (Some(completion), Some(target)) = (&crew_completion, &existing_convoy_target) {
-            self.persist_crew_completion(completion, &target.home, &format!("authority acknowledgement pending for {}", completion.convoy))
-                .await;
-        }
         let request_id = {
             let mut pm = self.peer_manager.lock().await;
             pm.next_request_id()
@@ -399,7 +347,6 @@ impl RemoteCommandRouter {
                 .target_node_id(target_node_id.clone())
                 .maybe_repo_identity(extract_command_repo_identity(&command))
                 .finished_via_event(false)
-                .maybe_crew_completion(crew_completion.clone())
                 .build(),
         );
 
@@ -431,15 +378,9 @@ impl RemoteCommandRouter {
             Ok(()) => Ok(command_id),
             Err(err) => {
                 self.pending_remote_commands.lock().await.remove(&request_id);
-                match (crew_completion, existing_convoy_target) {
-                    (Some(completion), Some(target)) => {
-                        let message = self.authority_unreachable_message(&completion.convoy, &target.home, &err);
-                        self.persist_crew_completion(&completion, &target.home, &message).await;
-                        self.spawn_crew_completion_retry(completion);
-                        Err(format!("completion pending: {message}"))
-                    }
-                    (_, Some(target)) => Err(target.unreachable_message(&err)),
-                    _ => Err(err),
+                match existing_convoy_target {
+                    Some(target) => Err(target.unreachable_message(&err)),
+                    None => Err(err),
                 }
             }
         }
@@ -458,29 +399,9 @@ impl RemoteCommandRouter {
         mut command: Command,
         caller: Option<flotilla_protocol::CommandCaller>,
     ) -> Result<u64, flotilla_protocol::DispatcherError> {
-        let dispatching_principal_ref = caller.as_ref().map(|caller| caller.principal_ref.clone());
-        let mut crew_completion = self.resolve_crew_command_routing(&mut command.action).await?;
-        if let Some(completion) = &mut crew_completion {
-            completion.principal_ref = dispatching_principal_ref.clone();
-        }
+        self.resolve_crew_command_routing(&mut command.action).await?;
         let target =
             self.daemon.resolve_command_target(&command.action, command.node_id.as_ref()).await.map_err(|error| error.to_string())?;
-        let existing_convoy_target = match &target.host {
-            TargetHost::ConvoyHome(home) => Some(home.clone()),
-            _ => None,
-        };
-        if let (Some(completion), Some(target)) = (&mut crew_completion, &existing_convoy_target) {
-            completion.authority = Some(target.home.clone());
-        }
-        if let (Some(completion), None) = (&crew_completion, &existing_convoy_target) {
-            if !self.daemon.has_authoritative_convoy(&completion.namespace, &completion.convoy).await? {
-                let authority = HostName::new("unknown");
-                let message = format!("authority unreachable for {}: no authority route is available", completion.convoy);
-                self.persist_crew_completion(completion, &authority, &message).await;
-                self.spawn_crew_completion_retry(completion.clone());
-                return Err(format!("completion pending: {message}").into());
-            }
-        }
         let target_node_id = self.target_node_id(&target.host).await.map_err(|error| error.to_string())?;
         command.node_id = if matches!(&target.host, TargetHost::Local) { None } else { Some(target_node_id.clone()) };
         let local = self.daemon.node_id();
@@ -491,7 +412,7 @@ impl RemoteCommandRouter {
         info!(%target_node_id, %local, %caller_label, %action, %subject, %desc, reason = ?target.reason, "dispatch_execute");
         if target_node_id != *self.daemon.node_id() {
             if target.delivery == RemoteDelivery::Command {
-                Box::pin(self.dispatch_remote_command(command, caller, &target, crew_completion, target_node_id)).await.map_err(Into::into)
+                Box::pin(self.dispatch_remote_command(command, caller, &target, target_node_id)).await.map_err(Into::into)
             } else {
                 let remote_executor: Arc<dyn RemoteStepExecutor> = Arc::new(self.clone());
                 Box::pin(self.daemon.execute_with_remote_executor(command, remote_executor)).await.map_err(Into::into)
@@ -524,13 +445,26 @@ impl RemoteCommandRouter {
         if matches!(command.action, CommandAction::QueryChangeStream { .. }) {
             return Err("change-stream queries require peer replication transport".into());
         }
-        self.dispatch_with_query_origin(command, Some(session_id)).await
+        off_frame(|| self.dispatch_with_query_origin(command, Some(session_id))).await
     }
 
+    /// Runs a query or acknowledged mutation at its target node. Each step is its own function run
+    /// off this frame: a debug build's poll frame holds every local of its function, and
+    /// resource intents route deep from crew turn delivery (#3108).
     async fn dispatch_with_query_origin(&self, mut command: Command, session_id: Option<uuid::Uuid>) -> Result<CommandValue, String> {
+        let route = off_frame(|| self.query_route(&mut command)).await?;
+        if route.target_node_id == *self.daemon.node_id() {
+            return off_frame(|| self.answer_query_locally(command, session_id)).await;
+        }
+        off_frame(|| self.send_query_to_target(command, session_id, route)).await
+    }
+
+    /// Where a query or acknowledged mutation runs, recorded on the command.
+    async fn query_route(&self, command: &mut Command) -> Result<QueryRoute, String> {
         self.resolve_crew_command_routing(&mut command.action).await?;
-        let target =
-            self.daemon.resolve_command_target(&command.action, command.node_id.as_ref()).await.map_err(|error| error.to_string())?;
+        let target = off_frame(|| self.daemon.resolve_command_target(&command.action, command.node_id.as_ref()))
+            .await
+            .map_err(|error| error.to_string())?;
         let existing_convoy_target = match &target.host {
             TargetHost::ConvoyHome(home) => Some(home.clone()),
             _ => None,
@@ -541,31 +475,42 @@ impl RemoteCommandRouter {
         };
         let target_node_id = self.target_node_id(&target.host).await.map_err(|error| error.to_string())?;
         command.node_id = if matches!(&target.host, TargetHost::Local) { None } else { Some(target_node_id.clone()) };
+        Ok(QueryRoute { target_node_id, existing_convoy_target, crew_convoy })
+    }
 
-        if target_node_id == *self.daemon.node_id() {
-            if command.action.is_query() {
-                if let CommandAction::QueryChangeStream { after, session } = &command.action {
-                    return self.daemon.next_change_stream_frame(self.daemon.node_id().as_str(), *after, session.clone()).await;
-                }
-                return self.execute_projected_query(command, session_id.unwrap_or(uuid::Uuid::nil())).await;
+    /// Answers a query here, or awaits this daemon's acknowledgement of a mutation.
+    async fn answer_query_locally(&self, command: Command, session_id: Option<uuid::Uuid>) -> Result<CommandValue, String> {
+        if command.action.is_query() {
+            if let CommandAction::QueryChangeStream { home, after, session } = &command.action {
+                return self.daemon.next_change_stream_frame(self.daemon.node_id().as_str(), home.clone(), *after, session.clone()).await;
             }
-            let mut events = self.daemon.subscribe();
-            let command_id = self.daemon.execute_for_caller(command, None).await?;
-            return tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    match events.recv().await {
-                        Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => return Ok(result),
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            return Err("local resource acknowledgement channel closed".into())
-                        }
+            return self.execute_projected_query(command, session_id.unwrap_or(uuid::Uuid::nil())).await;
+        }
+        let mut events = self.daemon.subscribe();
+        let command_id = self.daemon.execute_for_caller(command, None).await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match events.recv().await {
+                    Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => return Ok(result),
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err("local resource acknowledgement channel closed".into())
                     }
                 }
-            })
-            .await
-            .map_err(|_| "timed out waiting for local resource acknowledgement".to_string())?;
-        }
+            }
+        })
+        .await
+        .map_err(|_| "timed out waiting for local resource acknowledgement".to_string())?
+    }
 
+    /// Sends a query or mutation to its target node and awaits the answer.
+    async fn send_query_to_target(
+        &self,
+        command: Command,
+        session_id: Option<uuid::Uuid>,
+        route: QueryRoute,
+    ) -> Result<CommandValue, String> {
+        let QueryRoute { target_node_id, existing_convoy_target, crew_convoy } = route;
         let request_id = {
             let mut pm = self.peer_manager.lock().await;
             pm.next_request_id()
@@ -620,10 +565,6 @@ impl RemoteCommandRouter {
             self.peer_manager.lock().await.project_host_list(response);
         }
         Ok(value)
-    }
-
-    pub(super) async fn dispatch_cancel(&self, command_id: u64) -> Result<(), String> {
-        self.dispatch_cancel_typed(command_id).await.map_err(|error| error.message)
     }
 
     #[tracing::instrument(skip_all)]
@@ -801,10 +742,6 @@ impl RemoteCommandRouter {
         };
         drop(pending);
 
-        if let Some(completion) = entry.crew_completion.clone() {
-            self.finish_crew_completion(completion, &result).await;
-        }
-
         // Query commands: resolve the oneshot directly without broadcasting
         // a CommandFinished event.
         if let Some(tx) = entry.query_completion {
@@ -938,16 +875,7 @@ impl RemoteCommandRouter {
             pending.extract_if(|_, entry| entry.target_node_id == *node_id).map(|(_, entry)| entry).collect::<Vec<_>>()
         };
         for entry in failed {
-            let transport_error = format!("remote command peer disconnected: {node_id}");
-            let message = if let Some(completion) = entry.crew_completion.clone() {
-                let authority = HostName::new(node_id.to_string());
-                let pending_message = self.authority_unreachable_message(&completion.convoy, &authority, &transport_error);
-                self.persist_crew_completion(&completion, &authority, &pending_message).await;
-                self.spawn_crew_completion_retry(completion);
-                format!("completion pending: {pending_message}")
-            } else {
-                transport_error
-            };
+            let message = format!("remote command peer disconnected: {node_id}");
             if let Some(completion) = entry.query_completion {
                 let _ = completion.send(CommandValue::Error { message });
                 continue;
@@ -978,11 +906,11 @@ impl RemoteCommandRouter {
         // result back directly without subscribing to the event stream.
         if command.action.is_query() {
             let query_session = origin.session_id.unwrap_or(uuid::Uuid::nil());
-            let query = if let CommandAction::QueryChangeStream { after, session } = &command.action {
+            let query = if let CommandAction::QueryChangeStream { home, after, session } = &command.action {
                 if origin.caller.is_some() || origin.session_id.is_some() {
                     Err("change-stream queries require peer replication transport".into())
                 } else {
-                    self.daemon.next_change_stream_frame(requester_node_id.as_str(), *after, session.clone()).await
+                    self.daemon.next_change_stream_frame(requester_node_id.as_str(), home.clone(), *after, session.clone()).await
                 }
             } else {
                 self.execute_projected_query(command, query_session).await
@@ -1246,136 +1174,22 @@ impl RemoteStepExecutor for RemoteCommandRouter {
 }
 
 impl RemoteCommandRouter {
-    async fn resolve_crew_command_routing(&self, action: &mut CommandAction) -> Result<Option<PendingCrewCompletionRoute>, String> {
-        let (context, completion) = match action {
-            CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref, force } => {
-                (context, Some((message.clone(), disposition.clone(), decision_ledger_ref.clone(), *force)))
-            }
-            CommandAction::CrewPromise { context, .. }
+    /// Resolves a crew command's context to its routing context, so the command reaches the
+    /// crew's convoy home.
+    async fn resolve_crew_command_routing(&self, action: &mut CommandAction) -> Result<(), String> {
+        let context = match action {
+            CommandAction::CrewComplete { context, .. }
+            | CommandAction::CrewPromise { context, .. }
             | CommandAction::CrewFail { context, .. }
             | CommandAction::CrewStall { context, .. }
             | CommandAction::CrewHandoff { context, .. }
             | CommandAction::QueryMessageContacts { context }
             | CommandAction::QueryCrewList { context }
-            | CommandAction::QueryCrewCapabilities { context } => (context, None),
-            _ => return Ok(None),
+            | CommandAction::QueryCrewCapabilities { context } => context,
+            _ => return Ok(()),
         };
-        let routing = self.daemon.resolve_crew_routing_context(context).await?;
-        *context = routing.command_context.clone();
-        let Some((message, disposition, decision_ledger_ref, force)) = completion else { return Ok(None) };
-        let Some(session_name) = routing.session_name else { return Ok(None) };
-        Ok(Some(PendingCrewCompletionRoute {
-            namespace: context.namespace.clone().expect("resolved crew context has namespace"),
-            convoy: routing.convoy,
-            session_name,
-            context: context.clone(),
-            message,
-            disposition,
-            decision_ledger_ref,
-            force,
-            principal_ref: None,
-            authority: None,
-        }))
-    }
-
-    fn authority_unreachable_message(&self, convoy: &str, authority: &HostName, cause: &str) -> String {
-        format!("authority unreachable for {convoy} at {authority}: {cause}")
-    }
-
-    async fn persist_crew_completion(&self, completion: &PendingCrewCompletionRoute, authority: &HostName, last_error: &str) {
-        let pending = CrewCompletionPending {
-            message: completion.message.clone(),
-            disposition: completion.disposition.clone(),
-            decision_ledger_ref: completion.decision_ledger_ref.clone(),
-            force: completion.force,
-            principal_ref: completion.principal_ref.clone(),
-            attempted_at: chrono::Utc::now(),
-            authority: authority.to_string(),
-            last_error: last_error.to_string(),
-        };
-        if let Err(error) = self.daemon.mark_crew_completion_pending(&completion.namespace, &completion.session_name, pending).await {
-            tracing::warn!(session = %completion.session_name, %error, "failed to persist pending crew completion");
-        }
-    }
-
-    async fn finish_crew_completion(&self, completion: PendingCrewCompletionRoute, result: &CommandValue) {
-        match result {
-            CommandValue::Ok | CommandValue::CrewCompletionAdvisory { .. } | CommandValue::Error { .. } => {
-                if let Err(error) = self.daemon.clear_crew_completion_pending(&completion.namespace, &completion.session_name).await {
-                    tracing::warn!(session = %completion.session_name, %error, "failed to clear acknowledged crew completion");
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn spawn_crew_completion_retry(&self, completion: PendingCrewCompletionRoute) {
-        let session_name = completion.session_name.clone();
-        {
-            let mut retrying = self.retrying_crew_completions.lock().expect("crew completion retry lock");
-            if let Some(state) = retrying.get_mut(&session_name) {
-                state.completion = completion;
-                state.generation = state.generation.wrapping_add(1);
-                return;
-            }
-            retrying.insert(session_name.clone(), CrewCompletionRetryState { completion, generation: 0 });
-        }
-        let router = self.clone();
-        tokio::spawn(async move {
-            let mut delay = Duration::from_secs(1);
-            loop {
-                tokio::time::sleep(delay).await;
-                let Some(state) = router.retrying_crew_completions.lock().expect("crew completion retry lock").get(&session_name).cloned()
-                else {
-                    return;
-                };
-                let command = Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::CrewComplete {
-                        context: state.completion.context.clone(),
-                        message: state.completion.message.clone(),
-                        disposition: state.completion.disposition.clone(),
-                        decision_ledger_ref: state.completion.decision_ledger_ref.clone(),
-                        force: state.completion.force,
-                    },
-                };
-                if router.dispatch_execute_for_principal(command, state.completion.principal_ref.clone()).await.is_ok() {
-                    let mut retrying = router.retrying_crew_completions.lock().expect("crew completion retry lock");
-                    if retrying.get(&session_name).is_some_and(|current| current.generation == state.generation) {
-                        retrying.remove(&session_name);
-                        return;
-                    }
-                }
-                delay = (delay * 2).min(Duration::from_secs(30));
-            }
-        });
-    }
-
-    pub(super) async fn resume_pending_crew_completions(&self) {
-        let completions = match self.daemon.pending_crew_completions().await {
-            Ok(completions) => completions,
-            Err(error) => {
-                tracing::warn!(%error, "failed to load pending crew completions");
-                return;
-            }
-        };
-        for (session_name, pending, context) in completions {
-            let convoy = context.convoy.clone().unwrap_or_else(|| "unknown-convoy".to_string());
-            self.spawn_crew_completion_retry(PendingCrewCompletionRoute {
-                namespace: context.namespace.clone().unwrap_or_else(|| "flotilla".to_string()),
-                convoy,
-                session_name,
-                context,
-                message: pending.message,
-                disposition: pending.disposition,
-                decision_ledger_ref: pending.decision_ledger_ref,
-                force: pending.force,
-                principal_ref: pending.principal_ref,
-                authority: Some(HostName::new(pending.authority)),
-            });
-        }
+        *context = self.daemon.resolve_crew_routing_context(context).await?.command_context;
+        Ok(())
     }
 
     async fn send_routed_to_convoy_home(

@@ -71,8 +71,8 @@ fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_widened_at_open()
     use flotilla_schema_sqlite::{Store, StoreError};
     let current = schema_ddl(&registry().expect("registry"), DdlMode::IfNotExists);
     let previous = current.replace(
-        r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co', 'pe'))"#,
-        r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co'))"#,
+        r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'pe', 'sv'))"#,
+        r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'sv'))"#,
     );
     assert_ne!(previous, current, "the previous generation's CHECK is reconstructed");
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
@@ -82,9 +82,9 @@ fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_widened_at_open()
         .into_connection()
         .query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'message'", [], |row| row.get(0))
         .expect("message table");
-    assert!(sql.contains(r#"CHECK ("receiver_kind" IN ('as', 'co', 'pe'))"#), "widened to the Person consumer: {sql}");
+    assert!(sql.contains(r#"CHECK ("receiver_kind" IN ('as', 'pe', 'sv'))"#), "widened to the Person consumer: {sql}");
     // A CHECK that cannot be read fails closed rather than passing as current.
-    let unchecked = current.replace(r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co', 'pe'))"#, r#""receiver_kind" TEXT"#);
+    let unchecked = current.replace(r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'pe', 'sv'))"#, r#""receiver_kind" TEXT"#);
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     connection.execute_batch(&unchecked).expect("unchecked schema");
     match Store::open(connection, "home", registry().expect("registry")) {
@@ -96,4 +96,76 @@ fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_widened_at_open()
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     connection.execute_batch(&current).expect("current schema");
     Store::open(connection, "home", registry().expect("registry")).expect("a current store opens");
+}
+
+// Behaviour (#3108, TL-3 `br`): a decided store created before LinkSource::Branch keeps the old
+// CHECK on `convoy_subjects.source`. Opening rebuilds the table with `br` rather than letting a
+// convoy's first branch link fail later, and a Branch link is then written.
+#[test]
+fn a_store_whose_link_sources_predate_branch_is_widened_at_open() {
+    use flotilla_engine_store::StoreLog;
+    use flotilla_schema::{Frozen, Timestamp};
+    use flotilla_schema_sqlite::{Store, StoreHandle};
+    use flotilla_state_machines::{machines::convoy::*, Home, Ref};
+    use std::{collections::BTreeMap, sync::Arc};
+    let current = schema_ddl(&convoy_registry().expect("registry"), DdlMode::IfNotExists);
+    let previous = current
+        .replace(
+            r#""source" TEXT NOT NULL CHECK ("source" IN ('br', 'cl', 'op', 'rl'))"#,
+            r#""source" TEXT NOT NULL CHECK ("source" IN ('cl', 'op', 'rl'))"#,
+        )
+        .replace("  ('cv', 'subjects.source', 'br', 'Branch'),\n", "");
+    assert_ne!(previous, current, "the previous generation's CHECK is reconstructed");
+    let connection = rusqlite::Connection::open_in_memory().expect("connection");
+    connection.execute_batch(&previous).expect("previous schema");
+    let store = Store::open(connection, "home", convoy_registry().expect("registry")).expect("the previous generation opens");
+    let store = Arc::new(StoreHandle::new(store));
+    let sql: String = store
+        .lock()
+        .expect("store")
+        .connection()
+        .query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'convoy_subjects'", [], |row| row.get(0))
+        .expect("subjects table");
+    assert!(sql.contains(r#"CHECK ("source" IN ('br', 'cl', 'op', 'rl'))"#), "widened to Branch: {sql}");
+
+    let mut home = Home::<Convoy, _>::with_log("home", StoreLog::new(Arc::clone(&store))).expect("home");
+    let project: flotilla_schema::Address = "project:flotilla".parse().expect("project");
+    let authority = Ref::new("ensure");
+    let mut world = MemoryConvoyWorld::default().with_project(&project).with_limits(3, 1);
+    world.authority.put(&authority, true);
+    let name = "project:flotilla/convoy:fix";
+    let by = SeatName::new("coder", "");
+    let launch = home
+        .create(
+            name,
+            ConvoyRequest {
+                launch_of: name.into(),
+                workflow_ref: "w".into(),
+                admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
+                project,
+                priority: Priority(0),
+                kinds: Frozen::new(PromiseKinds::default()).expect("kinds"),
+                seats: vec![Seat {
+                    role: by.role.clone(),
+                    seat: by.seat.clone(),
+                    parent: None,
+                    supervised_by: name.parse().expect("address"),
+                    failed: None,
+                    retired: false,
+                    replacements: 0,
+                }],
+                promises: BTreeMap::new(),
+                duties: BTreeMap::from([(DutyId(0), Duty { owner: by.clone(), scope: DutyScope::Lifetime, terms: Terms::default() })]),
+            },
+            &world,
+            Timestamp(0),
+        )
+        .expect("launch")
+        .resource
+        .name()
+        .to_owned();
+    let link = Link { subject: "project:change".parse().expect("subject"), source: LinkSource::Branch, by, authority };
+    home.apply(&launch, link, &world, Timestamp(1)).expect("a branch link is written");
+    let held = home.get(&launch).expect("held");
+    assert_eq!(held.spec().subjects.iter().map(|row| row.record.source).collect::<Vec<_>>(), [LinkSource::Branch]);
 }

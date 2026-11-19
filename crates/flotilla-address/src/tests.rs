@@ -62,8 +62,12 @@ fn address(tc: &hegel::TestCase) -> Address {
     };
     let depth = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
     for _ in 0..depth {
-        let children =
-            Kind::ALL.into_iter().filter(|kind| *kind != Kind::Repo && kind.may_follow(Some(address.kind()))).collect::<Vec<_>>();
+        // A host's role has no artifact slots, which `may_follow` alone cannot tell.
+        let host_role = address.kind() == Kind::Role && address.parent().is_some_and(|parent| parent.kind() == Kind::Host);
+        let children = Kind::ALL
+            .into_iter()
+            .filter(|kind| *kind != Kind::Repo && kind.may_follow(Some(address.kind())) && !(host_role && *kind == Kind::Artifact))
+            .collect::<Vec<_>>();
         if children.is_empty() || address.kind() == Kind::Artifact {
             break;
         }
@@ -559,6 +563,10 @@ mod shape {
             "forge:github/repo:flotilla-org%2Fflotilla/issue:7",
             "forge:github/repo:flotilla-org%2Fflotilla/commit:0123456789abcdef0123456789abcdef01234567",
             "usage:claude/account:team",
+            "host:kiwi/role:checkout-inspector",
+            "host:kiwi/role:checkout-inspector/message:m1",
+            "host:kiwi/checkout:feature-x",
+            "host:kiwi/provider:docker",
         ] {
             assert_eq!(text.parse::<Address>().map(|a| a.to_string()).as_deref(), Ok(text));
         }
@@ -631,6 +639,63 @@ fn fleet_shape_and_short_input() {
         assert!(invalid.parse::<Address>().is_err(), "{invalid}");
     }
     assert_eq!(record_name(&Address::fleet("lab").expect("fleet")), None);
+}
+
+// ADR 0066 amendment: a host has roles, its daemon's own inboxes, and
+// checkouts, by name; a checkout sits only directly under its host.
+#[hegel::test]
+fn host_roles_and_checkouts_round_trip(tc: hegel::TestCase) {
+    let host = value(&tc, 1);
+    let name = value(&tc, 1);
+    let place = Address::root(Kind::Host, &host).expect("host");
+    let role = place.child(Kind::Role, &name).expect("role");
+    let checkout = place.child(Kind::Checkout, &name).expect("checkout");
+    for address in [role.clone(), Address::message(&role, &name).expect("message"), checkout.clone()] {
+        assert_eq!(address.get(Kind::Host), Some(host.as_str()));
+        assert_eq!(address.to_string().parse::<Address>().expect("canonical"), address);
+        assert_eq!(resolve(&address.to_string(), &BuiltinForges).expect("lenient"), address);
+    }
+    assert_eq!(record_name(&checkout), Some(name.clone()));
+    assert_eq!(record_name(&role), None);
+}
+
+// A convoy at its home: the holder a checkout names, its `#` encoded, its home and name read back.
+#[test]
+fn a_convoy_sits_under_its_home() {
+    let convoy = Address::root(Kind::Host, "kiwi").and_then(|host| host.child(Kind::Convoy, "coder#5")).expect("convoy at its home");
+    assert_eq!(convoy.to_string(), "host:kiwi/convoy:coder%235");
+    let parsed = "host:kiwi/convoy:coder%235".parse::<Address>().expect("canonical");
+    assert_eq!(parsed, convoy);
+    assert_eq!((parsed.get(Kind::Host), parsed.name()), (Some("kiwi"), "coder#5"));
+    assert_eq!(record_name(&parsed), Some("coder#5".to_owned()));
+}
+
+#[test]
+fn a_checkout_sits_only_under_its_host() {
+    for invalid in [
+        "checkout:x",
+        "project:p/checkout:x",
+        "fleet:f/checkout:x",
+        "host:h/role:r/checkout:x",
+        "host:h/checkout:x/role:r",
+        "host:h/checkout:x/checkout:y",
+        "host:h/provider:p/role:r",
+    ] {
+        assert!(invalid.parse::<Address>().is_err(), "{invalid}");
+    }
+}
+
+// Behaviour: a host's role is an inbox, so messages sit under it, but it has no artifact slots;
+// the roles that have them keep them.
+#[test]
+fn a_hosts_role_has_no_artifact_slots() {
+    assert_eq!("host:h/role:r/artifact:k/of:s".parse::<Address>(), Err(Error::ArtifactUnderHostRole));
+    let role = Address::root(Kind::Host, "h").and_then(|host| host.child(Kind::Role, "r")).expect("host role");
+    assert_eq!(role.artifact("k", "s"), Err(Error::ArtifactUnderHostRole));
+    assert!(Address::message(&role, "m1").is_ok());
+    for valid in ["convoy:c/role:r/artifact:k/of:s", "project:p/role:r/artifact:k/of:s", "fleet:f/role:r/artifact:k/of:s"] {
+        assert!(valid.parse::<Address>().is_ok(), "{valid}");
+    }
 }
 
 /// `address` cut after its first `at` segments: the head, and the tail when the tail is an

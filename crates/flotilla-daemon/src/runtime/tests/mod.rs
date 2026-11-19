@@ -1,9 +1,9 @@
-use super::message::keystroke_router;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
-use flotilla_resources::Actuation;
+use flotilla_protocol::LifecycleReading;
+use flotilla_resources::vessel_records::VesselRecords;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
     },
     time::Duration,
@@ -32,11 +32,7 @@ use flotilla_credentials::CredentialStore;
 use flotilla_credentials::CONTAINER_CODEX_HOME;
 use flotilla_credentials::FLOTILLA_SKILLS_DIR_ENV;
 use flotilla_crew::convoy::ConvoyReconciler;
-use flotilla_crew::reconcilers::terminal_session::{
-    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalRuntime,
-    TerminalSessionReconciler,
-};
-use flotilla_crew::reconcilers::vessel::VesselReconciler;
+use flotilla_crew::reconcilers::vessel::VesselPlanning;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery_testkit::fake_discovery_with_provider_set;
@@ -57,7 +53,6 @@ use flotilla_environment::environment::ProvisionedEnvironment;
 use flotilla_environment::environment::ProvisionedMount;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_protocol::ChangeRequest as ProviderChangeRequest;
 use flotilla_protocol::{
     CanonicalHostId, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, HostSummary, ImageId,
@@ -68,35 +63,29 @@ use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_provider_runtime::ProcessCommandRunner;
-use flotilla_provisioning::reconcilers::clone::runtime::{CloneControllerRuntime, CloneFlights};
-use flotilla_provisioning::reconcilers::{
-    checkout::runtime::CheckoutControllerRuntime, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime,
-    CloneReconciler, CloneRuntime, EnvironmentReconciler, EnvironmentRuntime,
+use flotilla_provisioning::checkout_runtime::{
+    ChangeRequestObservations, CheckoutControllerRuntime, CheckoutRemoval, CheckoutRemovalOutcome,
 };
+use flotilla_provisioning::engine::terminal_actuator::TerminalLiveness;
+use flotilla_provisioning::reconcilers::{CloneRuntime, EnvironmentRuntime};
 use flotilla_replay_testkit::Masks;
 use flotilla_replay_testkit::ReplayHttpClient;
 use flotilla_replay_testkit::Session;
+use flotilla_resources::environment_records::EnvironmentRecords;
 use flotilla_resources::{
-    clone_key, Checkout, Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec,
-    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, Clone, CloneSpec, ConditionValue,
-    ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyPhase, ConvoyProvisioningState,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CredentialConsumer, CredentialGrant, CredentialLifecycle,
-    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, Demand, Environment,
-    EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec,
-    FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, InputMeta, LifecycleAuthority,
-    ModelProbeState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementStatus, Project, Repository, RepositoryKey,
-    RepositorySpec, RepositoryTrust, Resource, ResourceError, ResourceList, Selector, StatusPatch, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-    TerminalSessionStatusPatch, Vessel, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowTemplate,
-    WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
+    clone_key, Checkout, CheckoutSpec, CheckoutSpec as ResourceCheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, ConditionValue,
+    Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+    CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
+    CrewSource, CrewSpec, EnvironmentSpec, Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
+    Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, InputMeta, ModelProbeState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource,
+    ResourceError, Selector, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    Vessel, VesselRequirement, WorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
 };
-use flotilla_store::{
-    controller::{ControllerLoop, Reconciler},
-    delete_resource_kind, watch_resource_kind, watch_resource_kind_including_replicas, ResourceBackend,
-};
+use flotilla_store::{controller::Reconciler, watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_terminal::{
     ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession as ProviderTerminalSession, TerminalSessionLiveness, TerminalSessionTag,
-    TerminalSize,
 };
 use futures::StreamExt;
 use serde_json::json;
@@ -104,11 +93,9 @@ use tempfile::TempDir;
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use super::{
-    credentials::*, discovery::*, docker::*, environments::*, health::*, ports::*, seed::*, tasks::*, terminal::*,
-    test_git_repo::TestGitRepo, *,
+    credentials::*, discovery::*, docker::*, environments::*, health::*, seed::*, tasks::*, terminal::*, test_git_repo::TestGitRepo, *,
 };
 use crate::{
-    blob_store::{BlobStore, MemoryBlobStore, TieredBlobStore},
     environment_tools::{
         tests::with_fourth_tool, EnvironmentToolProvisioner, CONTAINED_CARGO_SHIM_DIRECTORY, CONTAINED_CARGO_SHIM_PATH,
         CONTAINED_RUSTC_WRAPPER_PATH, ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH, ENVIRONMENT_CLEAT_LIBRARY_DIR, ENVIRONMENT_CLEAT_PATH,
@@ -126,6 +113,7 @@ use placement_support::*;
 use recovery_scenario::*;
 use terminal_support::*;
 
+mod account_binding;
 mod adopted_checkouts;
 mod clone_credentials;
 mod clone_reads;
@@ -135,12 +123,16 @@ mod discovery;
 mod docker;
 #[cfg(unix)]
 mod drydock_launch;
+mod engine_turns;
 mod environment_reads;
 mod environments;
+mod forge_identity;
 mod health;
 mod heartbeat;
 mod memory_tests;
 mod message;
+mod periodic;
+mod retention;
 mod seed;
 mod ssh_host_harness;
 mod supervisor_turns;

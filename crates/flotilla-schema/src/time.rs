@@ -55,12 +55,51 @@ impl fmt::Display for Timestamp {
     }
 }
 
+/// A resource's creation time: nanoseconds since the Unix epoch.
+///
+/// Finer than [`Timestamp`] because the old store stamped records to the nanosecond and a managed
+/// checkout's name hashes that stamp's RFC 3339 string: an imported record keeps it exactly. A
+/// record created here is created at its change's time, widened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CreatedAt(pub i64);
+
+impl CreatedAt {
+    /// `time`, saturating at the nanosecond range (years 1677 to 2262).
+    pub fn from_datetime(time: &DateTime<Utc>) -> CreatedAt {
+        CreatedAt(time.timestamp_nanos_opt().unwrap_or(if time.timestamp() < 0 { i64::MIN } else { i64::MAX }))
+    }
+
+    pub fn to_datetime(self) -> DateTime<Utc> {
+        DateTime::from_timestamp_nanos(self.0)
+    }
+
+    pub const fn nanos(self) -> i64 {
+        self.0
+    }
+}
+
+impl From<Timestamp> for CreatedAt {
+    /// The same instant, saturating at the nanosecond range.
+    fn from(at: Timestamp) -> CreatedAt {
+        CreatedAt(at.0.saturating_mul(1_000))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
     use hegel::generators as gs;
 
-    use super::Timestamp;
+    use super::{CreatedAt, Timestamp};
+
+    #[test]
+    fn a_creation_time_keeps_nanoseconds_and_widens_a_timestamp() {
+        let time = DateTime::parse_from_rfc3339("2026-11-05T10:11:12.123456789Z").expect("parses").to_utc();
+        let created = CreatedAt::from_datetime(&time);
+        assert_eq!(created.to_datetime().to_rfc3339(), time.to_rfc3339());
+        assert_eq!(CreatedAt::from(Timestamp::from_datetime(&time)).to_datetime(), Timestamp::from_datetime(&time).to_datetime().unwrap());
+    }
 
     // Behaviour: a stored time is the input floored to whole microseconds, and converting that back
     // to a DateTime and storing it again is the identity. The generator spans times before and after

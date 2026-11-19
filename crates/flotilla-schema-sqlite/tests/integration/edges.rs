@@ -19,7 +19,7 @@ use crate::fixtures::{
     synthetic::{
         Deliverable, DeliverableState, DossierEdge, DossierEvent, DossierState, Evidence, PlacementSnapshot, PromiseKind, PromiseSource,
     },
-    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Payload, Person, Pick, Referral, Resource, TerminalSession,
+    AgentSession, AwaitingReply, Convoy, Dossier, Fixture, Message, Payload, Person, Pick, Referral, Resource, Service, TerminalSession,
     Vessel, LOCAL,
 };
 
@@ -261,6 +261,11 @@ fn an_edge_touches_exactly_its_declared_rows_person(tc: TestCase) {
 }
 
 #[hegel::test(test_cases = 60)]
+fn an_edge_touches_exactly_its_declared_rows_service(tc: TestCase) {
+    touches_only_declared_rows::<Resource<Service>>(&tc);
+}
+
+#[hegel::test(test_cases = 60)]
 fn an_edge_touches_exactly_its_declared_rows_awaiting_reply(tc: TestCase) {
     touches_only_declared_rows::<Resource<AwaitingReply>>(&tc);
 }
@@ -268,11 +273,6 @@ fn an_edge_touches_exactly_its_declared_rows_awaiting_reply(tc: TestCase) {
 #[hegel::test(test_cases = 60)]
 fn an_edge_touches_exactly_its_declared_rows_convoy(tc: TestCase) {
     touches_only_declared_rows::<Resource<Convoy>>(&tc);
-}
-
-#[hegel::test(test_cases = 60)]
-fn an_edge_touches_exactly_its_declared_rows_ensure(tc: TestCase) {
-    touches_only_declared_rows::<Resource<Ensure>>(&tc);
 }
 
 #[hegel::test(test_cases = 60)]

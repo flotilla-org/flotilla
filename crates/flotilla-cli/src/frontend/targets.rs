@@ -315,6 +315,7 @@ mod tests {
 
     // #1769: CLI preflight resolves aliases and slugs to the same Repository key,
     // and cwd is optional outside observed checkouts; no path is adopted by lookup.
+    #[cfg(unix)]
     #[tokio::test]
     async fn cli_repository_preflight_uses_durable_identity() {
         use std::sync::Arc;
@@ -327,8 +328,7 @@ mod tests {
         use flotilla_paths::path_context::ExecutionEnvironmentPath;
         use flotilla_protocol::{Command, CommandAction, DaemonEvent, RepoSelector};
         use flotilla_resources::{
-            Checkout, CheckoutSpec, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
-            Repository, RepositorySpec,
+            InputMeta, ObservedCheckoutSpec, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec,
         };
 
         let temp = tempfile::tempdir().expect("config");
@@ -344,6 +344,8 @@ mod tests {
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
+        // Path lookups read the engine's checkouts, as a composed daemon's do.
+        flotilla_daemon_testkit::engine::engine(&daemon);
         let backend = daemon.resource_backend();
         let spec = RepositorySpec::remote("https://github.com/acme/widgets").expect("repository");
         let key = spec.key();
@@ -411,21 +413,20 @@ mod tests {
             })
             .build();
         assert!(super::resolve_command_repositories(&*daemon, &mut required).await.is_err());
-        let observed = daemon.observed_resource_backend();
-        let checkout = CheckoutSpec::Observed(
-            ObservedCheckoutSpec::builder()
-                .r#ref("main".into())
-                .path("/work/widgets".into())
-                .repo_ref(key.clone())
-                .host_ref(daemon.local_host_id().expect("host id").to_string())
-                .is_main(true)
-                .build(),
+        daemon.discovered_checkouts().replace(
+            &key,
+            vec![flotilla_resources::discovered_checkouts::DiscoveredCheckout {
+                name: "widgets-checkout".into(),
+                repo_slug: key.to_string(),
+                spec: ObservedCheckoutSpec::builder()
+                    .r#ref("main".into())
+                    .path("/work/widgets".into())
+                    .repo_ref(key.clone())
+                    .host_ref(daemon.local_host_id().expect("host id").to_string())
+                    .is_main(true)
+                    .build(),
+            }],
         );
-        observed
-            .using::<Checkout>("flotilla")
-            .create(&InputMeta::builder().name("widgets-checkout".into()).build(), &checkout)
-            .await
-            .expect("observed checkout");
         assert_eq!(
             super::resolve_optional_cwd_repository(&*daemon, "/work/widgets/src".into()).await.expect("cwd identity"),
             Some(RepoSelector::Repository(key.clone()))

@@ -1,7 +1,7 @@
 //! Fixture kinds and helpers.
 //!
 //! The stored kinds are the engine's machine declarations (#3319, #3373 ruling 4): Message,
-//! AgentSession, Person, Convoy, Vessel, Ensure and AwaitingReply from
+//! AgentSession, Person, Convoy, Vessel and AwaitingReply from
 //! `flotilla_state_machines::machines`, registered through the engine's production registry, and
 //! `TerminalSession`, a lifecycle kind whose request is declared here (`terminal`); each is stored
 //! as the engine's `Resource`, declared by its spec (#3392 ruling D5). Their edges are real transitions: each fixture's [`Fixture::edge`] builds a
@@ -29,9 +29,9 @@ pub mod agent_session;
 pub mod awaiting_reply;
 pub mod convoy;
 pub mod engine;
-pub mod ensure;
 pub mod message;
 pub mod person;
+pub mod service;
 pub mod synthetic;
 pub mod terminal;
 pub mod ticket;
@@ -46,7 +46,7 @@ use flotilla_schema::{
 use flotilla_schema_sqlite::{Store, Write};
 pub use flotilla_state_machines::{
     machines::{
-        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
+        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, message::Message, person::Person, service::Service,
         vessel::Vessel,
     },
     Resource,

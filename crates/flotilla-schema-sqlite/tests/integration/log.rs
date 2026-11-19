@@ -15,7 +15,7 @@ use flotilla_state_machines::machines::message::MessageSpec;
 use crate::fixtures::{
     addr, carry_changes, message as messages, origin, registry, store,
     synthetic::{workflow, InputValue},
-    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource, TerminalSession, Ticket,
+    AgentSession, AwaitingReply, Convoy, Dossier, Fixture, Message, Person, Pick, Referral, Resource, Service, TerminalSession, Ticket,
     Vessel, LOCAL,
 };
 
@@ -104,9 +104,9 @@ fn slots() -> Vec<(KindCode, String)> {
         Resource::<Message>::CODE,
         Resource::<AgentSession>::CODE,
         Resource::<Person>::CODE,
+        Resource::<Service>::CODE,
         Resource::<AwaitingReply>::CODE,
         Resource::<Convoy>::CODE,
-        Resource::<Ensure>::CODE,
         TerminalSession::CODE,
         Resource::<Vessel>::CODE,
         Ticket::CODE,
@@ -174,9 +174,9 @@ fn the_log_replays_into_another_store(tc: TestCase) {
             Resource::<Message>::CODE => step::<Resource<Message>>(&tc, &mut write, live, name, last),
             Resource::<AgentSession>::CODE => step::<Resource<AgentSession>>(&tc, &mut write, live, name, last),
             Resource::<Person>::CODE => step::<Resource<Person>>(&tc, &mut write, live, name, last),
+            Resource::<Service>::CODE => step::<Resource<Service>>(&tc, &mut write, live, name, last),
             Resource::<AwaitingReply>::CODE => step::<Resource<AwaitingReply>>(&tc, &mut write, live, name, last),
             Resource::<Convoy>::CODE => step::<Resource<Convoy>>(&tc, &mut write, live, name, last),
-            Resource::<Ensure>::CODE => step::<Resource<Ensure>>(&tc, &mut write, live, name, last),
             Ticket::CODE => step::<Ticket>(&tc, &mut write, live, name, last),
             Referral::CODE => step::<Referral>(&tc, &mut write, live, name, last),
             Dossier::CODE => step::<Dossier>(&tc, &mut write, live, name, last),
@@ -474,6 +474,11 @@ fn a_snapshot_plus_its_tail_is_the_newest_snapshot_person(tc: TestCase) {
 }
 
 #[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_service(tc: TestCase) {
+    snapshot_plus_tail::<Resource<Service>>(&tc);
+}
+
+#[hegel::test]
 fn a_snapshot_plus_its_tail_is_the_newest_snapshot_awaiting_reply(tc: TestCase) {
     snapshot_plus_tail::<Resource<AwaitingReply>>(&tc);
 }
@@ -481,11 +486,6 @@ fn a_snapshot_plus_its_tail_is_the_newest_snapshot_awaiting_reply(tc: TestCase) 
 #[hegel::test]
 fn a_snapshot_plus_its_tail_is_the_newest_snapshot_convoy(tc: TestCase) {
     snapshot_plus_tail::<Resource<Convoy>>(&tc);
-}
-
-#[hegel::test]
-fn a_snapshot_plus_its_tail_is_the_newest_snapshot_ensure(tc: TestCase) {
-    snapshot_plus_tail::<Resource<Ensure>>(&tc);
 }
 
 #[hegel::test]

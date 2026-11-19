@@ -38,27 +38,28 @@ pub mod environment;
 pub mod forge_observation;
 pub mod host;
 pub mod image_build;
+pub mod launch_facts;
 pub mod manifest_root;
 pub mod placement;
 pub mod project;
 pub mod repository;
+pub mod standing_role;
+pub mod terminal_facts;
 pub mod terminal_session;
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Kind, KindRegistry, RegistryError, Stored};
+use flotilla_schema::{IndexQuery, Kind, KindRegistry, RegistryError, Stored};
 use flotilla_state_machines::{
-    machines::{ensure::Ensure, vessel::Vessel},
+    machines::{lifecycle::LifecycleKind, vessel::Vessel},
     Diagram, Machine, Resource,
 };
 
-/// Who a resource is held for: `convoy:<name>`, `ensure:<name>` or
-/// `vessel:<name>`. Interned text in its own domain (`hl`), indexed, with no
+/// Who a resource is held for: `convoy:<name>` or `vessel:<name>`. Interned text in its own domain (`hl`), indexed, with no
 /// foreign key and no ownership semantics: nothing cascades from it and nothing
 /// checks that the holder exists (owner's look-over, 2026-10-22, ruling 4). It
 /// is one known field, not a label mechanism. Its text uses ADR 0066's segment
-/// form, but it is not an Address: there is no `ensure` address kind, and a
-/// vessel's address nests under its convoy.
+/// form, but it is not an Address: a vessel's address nests under its convoy.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
 #[store(intern = "hl")]
 pub struct Holder(pub String);
@@ -69,15 +70,20 @@ impl Holder {
         Holder(format!("convoy:{name}"))
     }
 
-    /// A standing role's Ensure: its checkouts.
-    pub fn ensure(name: &str) -> Holder {
-        Holder(format!("ensure:{name}"))
-    }
-
     /// A vessel's: its environment.
     pub fn vessel(name: &str) -> Holder {
         Holder(format!("vessel:{name}"))
     }
+}
+
+/// A lifecycle kind whose resources are launches of a name (`<of>#<n>`, owner's ruling, #3108):
+/// Clone, Checkout and TerminalSession. `n` is the home sequence the launch's create took, which
+/// its log assigns ([`flotilla_state_machines::Machine::launch`]), so it is unique for all time at
+/// its home and rises with each launch of one name, with gaps. Numbers are ordered within one
+/// home only: a name's newest launch is read at a home, through its `by_launch` index.
+pub trait Launches: LifecycleKind {
+    /// The kind's `by_launch` index for the launches of `of`, in launch order.
+    fn by_launch(of: &str) -> IndexQuery<Self::Request>;
 }
 
 /// One second, in the engine's microseconds: the unit of an `AttemptPolicy`'s delays.
@@ -85,13 +91,15 @@ const SECOND: i64 = 1_000_000;
 
 /// Registers the kinds declared here into `registry`, each under the code it
 /// holds for good: Environment `ev`, ImageBuild `ib`, Clone `cl`, Checkout
-/// `ck` and TerminalSession `ts`.
+/// `ck`, TerminalSession `ts` and its launch facts `tf`.
 pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     register_provisioning(registry)?;
     registry.register::<Resource<terminal_session::TerminalSession>>()?;
+    registry.register::<terminal_facts::TerminalLaunchFacts>()?;
     account::register(registry)?;
     manifest_root::register(registry)?;
     definition::register(registry)?;
+    standing_role::register(registry)?;
     repository::register(registry)?;
     project::register(registry)?;
     artifact::register(registry)?;
@@ -104,9 +112,14 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
 
 fn register_provisioning(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     registry.register::<Resource<environment::Environment>>()?;
+    registry.register::<launch_facts::EnvironmentLaunchFacts>()?;
     registry.register::<Resource<image_build::ImageBuild>>()?;
+    registry.register::<image_build::ImageBuildDemand>()?;
     registry.register::<Resource<clone::Clone>>()?;
+    registry.register::<clone::CloneFacts>()?;
     registry.register::<Resource<checkout::Checkout>>()?;
+    registry.register::<checkout::CheckoutFacts>()?;
+    registry.register::<checkout::CheckoutIntegration>()?;
     Ok(())
 }
 
@@ -138,13 +151,13 @@ pub fn registry() -> Result<KindRegistry, RegistryError> {
     Ok(registry)
 }
 
-/// The crew kinds (Track B): Vessel and Ensure, declared by the engine, and
-/// TerminalSession, for their DDL snapshot.
+/// The crew kinds (Track B): Vessel, declared by the engine, and TerminalSession with its launch
+/// facts, for their DDL snapshot.
 pub fn crew_registry() -> Result<KindRegistry, RegistryError> {
     let mut registry = KindRegistry::new();
     registry.register::<Resource<Vessel>>()?;
-    registry.register::<Resource<Ensure>>()?;
     registry.register::<Resource<terminal_session::TerminalSession>>()?;
+    registry.register::<terminal_facts::TerminalLaunchFacts>()?;
     Ok(registry)
 }
 
@@ -155,4 +168,22 @@ pub fn production_kinds() -> Result<KindRegistry, RegistryError> {
     let mut registry = flotilla_state_machines::kinds()?;
     register(&mut registry)?;
     Ok(registry)
+}
+
+/// Every kind the daemon's decided store holds (ADR 0064, #3108): Message and AgentSession
+/// (#3317), the kinds registered by [`register`], and the engine's Vessel (#3629), each under its
+/// production code.
+pub fn decided_registry() -> Result<KindRegistry, RegistryError> {
+    let mut registry = flotilla_engine_store::registry()?;
+    register(&mut registry)?;
+    flotilla_engine_store::register_crew(&mut registry)?;
+    Ok(registry)
+}
+
+/// The machine diagram of each kind in [`decided_registry`], by kind name.
+pub fn decided_diagrams() -> Result<BTreeMap<String, String>, RegistryError> {
+    let mut all = flotilla_engine_store::machine_registry()?.diagrams;
+    all.extend(diagrams());
+    all.extend(flotilla_engine_store::crew_diagrams());
+    Ok(all)
 }

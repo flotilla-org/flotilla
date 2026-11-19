@@ -1,8 +1,8 @@
 //! Checkouts inside a dummy environment, and a host's clones and worktrees of
 //! repositories on the dummy forge. Materialising a clone or worktree
 //! succeeds at once with a revision derived from the target path; the work is
-//! always clean and pushed, and its head is in the history of any merged
-//! request. A checkout holds no commits beyond its base: a crew's work lives
+//! clean and pushed but for the configured shares, which removal refuses as Git
+//! does, and its head is in the history of any merged request. A checkout holds no commits beyond its base: a crew's work lives
 //! in the change request it opens on the dummy forge. Nothing is read from or
 //! written to disk beyond the empty directory each clone or checkout is.
 
@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::DummyFleet;
+use crate::{state::Event, DummyFleet};
 use async_trait::async_trait;
 use flotilla_discovery_api::{
     provider_config::ProviderConfigView, EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement,
@@ -23,8 +23,8 @@ use flotilla_protocol::{Checkout, CheckoutIntent};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 use flotilla_resources::CheckoutBranchProvenance;
 use flotilla_vcs::vcs::{
-    CheckoutMaterialisation, CheckoutMaterialisationError, CheckoutRemoval, EnumeratedCheckout, RepositoryRead, Vcs, VcsCheck,
-    WorktreeMetadata,
+    CheckoutMaterialisation, CheckoutMaterialisationError, CheckoutPreservationReason, CheckoutRemoval, EnumeratedCheckout, RepositoryRead,
+    Vcs, VcsCheck, WorktreeMetadata,
 };
 
 pub struct DummyVcs {
@@ -44,7 +44,8 @@ const HOST_CHECKOUTS: &str = "host";
 pub(crate) struct DummyCheckouts(Mutex<HashMap<(String, PathBuf), String>>);
 
 impl DummyCheckouts {
-    pub(crate) fn destroy_environment(&self, environment: &str) {
+    pub(crate) fn destroy_environment(&self, fleet: &DummyFleet, environment: &str) {
+        fleet.record(&Event::CheckoutsDestroyed { environment: environment.into() });
         self.lock().retain(|(owner, _), _| owner != environment);
     }
 
@@ -57,7 +58,7 @@ impl DummyCheckouts {
             .collect()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, PathBuf), String>> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, PathBuf), String>> {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
@@ -66,7 +67,21 @@ impl DummyVcs {
     /// A checkout is an empty directory at its target: its host or environment sees it there.
     async fn record(&self, branch: &str, target: &str) -> Result<(), String> {
         self.run(&["mkdir", "-p", target]).await?;
-        self.fleet.checkouts.lock().insert((self.environment.clone(), PathBuf::from(target)), branch.to_string());
+        let (environment, path) = (self.environment.clone(), PathBuf::from(target));
+        self.fleet.record(&Event::Checkout { environment: environment.clone(), path: path.clone(), branch: branch.into() });
+        self.fleet.checkouts.lock().insert((environment, path), branch.to_string());
+        Ok(())
+    }
+
+    /// Whether a checkout is recorded at `path` here.
+    fn recorded(&self, path: &Path) -> bool {
+        self.fleet.checkouts.lock().contains_key(&(self.environment.clone(), path.to_path_buf()))
+    }
+
+    async fn remove(&self, target: &str) -> Result<(), String> {
+        self.run(&["rm", "-rf", "--", target]).await?;
+        self.fleet.record(&Event::CheckoutRemoved { environment: self.environment.clone(), path: target.into() });
+        self.fleet.checkouts.lock().remove(&(self.environment.clone(), PathBuf::from(target)));
         Ok(())
     }
 
@@ -84,6 +99,52 @@ impl DummyVcs {
 
     fn materialised(target: &str, provenance: CheckoutBranchProvenance) -> CheckoutMaterialisation {
         CheckoutMaterialisation { commit: Some(Self::revision(target)), provenance }
+    }
+
+    /// This VCS's checkouts, as `git worktree list` gives a repository's: the root, then those
+    /// it made, by path.
+    fn checkouts(&self) -> Vec<EnumeratedCheckout> {
+        let recorded = self.fleet.checkouts.lock();
+        let mut paths = recorded
+            .iter()
+            .filter(|((environment, _), _)| *environment == self.environment)
+            .map(|((_, path), branch)| (path.clone(), branch.clone()))
+            .collect::<Vec<_>>();
+        if !paths.iter().any(|(path, _)| *path == self.root) {
+            paths.push((
+                self.root.clone(),
+                recorded.get(&(self.environment.clone(), self.root.clone())).cloned().unwrap_or_else(|| "main".into()),
+            ));
+        }
+        drop(recorded);
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|(path, branch)| EnumeratedCheckout {
+                is_main: path == self.root,
+                path: ExecutionEnvironmentPath::new(path),
+                git_ref: branch,
+            })
+            .collect()
+    }
+
+    /// Whether the checkout at `path` is one the configured share left with uncommitted changes.
+    fn dirty(&self, path: &Path) -> bool {
+        dummy_draw(self.fleet.config.seed, "checkout-dirty", &path.to_string_lossy()) < self.fleet.config.vcs.dirty_rate
+    }
+
+    /// Whether the checkout at `path` is one the configured share left with unpushed commits.
+    fn unpushed(&self, path: &Path) -> bool {
+        dummy_draw(self.fleet.config.seed, "checkout-unpushed", &path.to_string_lossy()) < self.fleet.config.vcs.unpushed_rate
+    }
+
+    /// The working tree at `path`, as `git status --porcelain` reads it.
+    fn status(&self, path: &Path) -> VcsCheck {
+        if self.dirty(path) {
+            VcsCheck::False(vec![" M src/dummy_change.rs".into()])
+        } else {
+            VcsCheck::True(Vec::new())
+        }
     }
 }
 
@@ -103,11 +164,11 @@ impl Vcs for DummyVcs {
     }
 
     async fn enumerate_checkouts(&self) -> Result<Vec<EnumeratedCheckout>, String> {
-        Ok(Vec::new())
+        Ok(self.checkouts())
     }
 
     async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
-        Ok(Vec::new())
+        Ok(self.checkouts().into_iter().map(EnumeratedCheckout::into_provider_checkout).collect())
     }
 
     async fn create_checkout(&self, _branch: &str, _create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
@@ -155,21 +216,51 @@ impl Vcs for DummyVcs {
         Ok(Self::materialised(target, CheckoutBranchProvenance::CreatedForConvoy))
     }
 
-    async fn remove_materialised_checkout(&self, _branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
-        self.run(&["rm", "-rf", "--", target]).await?;
-        self.fleet.checkouts.lock().remove(&(self.environment.clone(), PathBuf::from(target)));
-        Ok(CheckoutRemoval::Removed)
+    /// As the Git worktree provider removes one: a checkout with uncommitted changes stays,
+    /// and a branch with commits past its base outlives its removed checkout.
+    async fn remove_materialised_checkout(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
+        let path = Path::new(target);
+        if self.recorded(path) && self.dirty(path) {
+            return Ok(CheckoutRemoval::PreservedCheckout { path: target.into(), reason: CheckoutPreservationReason::DirtyCheckout });
+        }
+        let advanced = self.recorded(path) && self.unpushed(path);
+        self.remove(target).await?;
+        Ok(match advanced {
+            true => CheckoutRemoval::PreservedBranch { branch: branch.into(), reason: CheckoutPreservationReason::CommitsPastBase },
+            false => CheckoutRemoval::Removed,
+        })
     }
 
+    /// As the Git worktree provider forces one: a checkout still there is archived first, and
+    /// a branch with commits past its base outlives it.
     async fn force_remove_materialised_checkout(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
-        self.remove_materialised_checkout(branch, target).await
+        let path = Path::new(target);
+        if !self.recorded(path) {
+            return self.remove_materialised_checkout(branch, target).await;
+        }
+        let advanced = self.unpushed(path);
+        let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let archive = path.parent().unwrap_or(path).join(".flotilla-archives").join(format!("{name}-dummy"));
+        self.remove(target).await?;
+        Ok(CheckoutRemoval::ArchivedAndRemoved {
+            archive_path: archive.to_string_lossy().into_owned(),
+            preserved_branch: advanced.then(|| (branch.to_owned(), CheckoutPreservationReason::CommitsPastBase)),
+        })
     }
 
     async fn is_clean(&self) -> VcsCheck {
-        VcsCheck::True(Vec::new())
+        self.status(&self.root)
     }
 
-    async fn unpushed_commits(&self, _merged_head: Option<&str>) -> VcsCheck {
+    async fn unpushed_commits(&self, merged_head: Option<&str>) -> VcsCheck {
+        // Every dummy head is in the history of a merged request, as `head_in_history_of` says.
+        if let Some(head_sha) = merged_head {
+            return VcsCheck::True(vec![format!("HEAD is preserved by merged change request head {head_sha}")]);
+        }
+        if self.unpushed(&self.root) {
+            let branch = self.branch(&self.root);
+            return VcsCheck::False(vec![format!("1 commit on {branch} is not pushed to origin/{branch}")]);
+        }
         VcsCheck::True(Vec::new())
     }
 
@@ -197,11 +288,18 @@ impl Vcs for DummyVcs {
         Ok(Some("main".into()))
     }
 
-    async fn local_clone_is_clean(&self, _target: &str) -> VcsCheck {
-        VcsCheck::True(Vec::new())
+    async fn local_clone_is_clean(&self, target: &str) -> VcsCheck {
+        self.status(Path::new(target))
     }
 
-    async fn verify_local_clone_reclaimable(&self, _target: &str) -> Result<(), String> {
+    async fn verify_local_clone_reclaimable(&self, target: &str) -> Result<(), String> {
+        let target = Path::new(target);
+        if self.dirty(target) {
+            return Err(format!("{} has uncommitted changes", target.display()));
+        }
+        if self.unpushed(target) {
+            return Err(format!("{} has a local branch not pushed to origin", target.display()));
+        }
         Ok(())
     }
 
@@ -249,7 +347,8 @@ impl Factory for DummyVcsFactory {
             let origin = format!("{}/{owner}/{name}", self.fleet.config.forge_service_url.trim_end_matches('/'));
             return Ok(Arc::new(DummyVcs {
                 fleet: Arc::clone(&self.fleet),
-                environment: HOST_CHECKOUTS.into(),
+                // A host's checkouts are recorded by repository, so each lists only its own.
+                environment: format!("{HOST_CHECKOUTS}:{owner}/{name}"),
                 root,
                 runner,
                 origin: Some(origin),
@@ -270,12 +369,13 @@ mod cleanup_tests {
     // Destroying one container removes all its checkouts while preserving others.
     #[test]
     fn environment_destruction_removes_only_its_checkouts() {
-        let checkouts = DummyCheckouts::default();
+        let fleet = DummyFleet::new(flotilla_config::dummy_fleet::DummyFleetConfig::default());
+        let checkouts = &fleet.checkouts;
         checkouts.lock().insert(("one".into(), "/workspace/one".into()), "dummy/convoy-a/main".into());
         checkouts.lock().insert(("two".into(), "/workspace/two".into()), "dummy/convoy-b/main".into());
         assert_eq!(checkouts.remaining_for("convoy-a", &HashSet::new()).len(), 1);
-        checkouts.destroy_environment("one");
-        checkouts.destroy_environment("one");
+        checkouts.destroy_environment(&fleet, "one");
+        checkouts.destroy_environment(&fleet, "one");
         assert!(checkouts.remaining_for("convoy-a", &HashSet::new()).is_empty());
         assert_eq!(checkouts.remaining_for("convoy-b", &HashSet::new()).len(), 1);
     }
@@ -296,8 +396,8 @@ mod ownership_tests {
         let convoy = format!("load-{number}");
         let other = format!("{convoy}-2");
         let fleet = DummyFleet::new(DummyFleetConfig::default());
-        fleet.checkouts.lock().insert((format!("env-{convoy}-implement"), "/own".into()), "main".into());
-        fleet.checkouts.lock().insert((format!("env-{other}-implement"), "/other".into()), "main".into());
+        fleet.checkouts.lock().insert((format!("env-{convoy}-coder"), "/own".into()), "main".into());
+        fleet.checkouts.lock().insert((format!("env-{other}-coder"), "/other".into()), "main".into());
         let remaining = fleet.remaining_for(&convoy);
         assert_eq!(remaining.len(), 1, "{remaining:?}");
         assert!(remaining[0].ends_with(":/own"));
@@ -332,5 +432,111 @@ mod host_tests {
         assert!(runner.path_exists(Path::new("/repos/convoy/work")).await.expect("exists"));
         vcs.remove_materialised_checkout("dummy/convoy/work", "/repos/convoy/work").await.expect("removed");
         assert!(!runner.path_exists(Path::new("/repos/convoy/work")).await.expect("exists"));
+    }
+
+    fn vessel_bag(environment: &str) -> EnvironmentBag {
+        EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var(flotilla_environment::environment::dummy::DUMMY_FLEET_ENV, "1"))
+            .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", environment))
+    }
+
+    // The dummy VCS lists its repository's checkouts as `git worktree list` does: the root, marked
+    // main, then those it made there, and none of another environment's or another repository's.
+    #[tokio::test]
+    async fn the_dummy_vcs_lists_its_own_checkouts() {
+        let fleet = DummyFleet::new(DummyFleetConfig::default());
+        let factory = DummyVcsFactory { fleet: Arc::clone(&fleet) };
+        let directory = tempfile::tempdir().expect("configuration");
+        let config = ConfigStore::with_base(directory.path().to_path_buf());
+        let runner = Arc::new(DummyCommandRunner::default());
+        let probe = |bag: EnvironmentBag, root: &'static str| {
+            let (factory, config, runner) = (&factory, &config, runner.clone());
+            async move { factory.probe(&bag, config, &ExecutionEnvironmentPath::new(root), runner).await.unwrap_or_else(|_| panic!("claimed")) }
+        };
+        let one = probe(vessel_bag("one"), "/workspace/fleet").await;
+        let two = probe(vessel_bag("two"), "/workspace/fleet").await;
+        one.continue_fresh_clone("https://forge.dummy.invalid/dummy/fleet", "dummy/convoy-a/coder", "/workspace/fleet")
+            .await
+            .expect("clone");
+        one.materialise_checkout("dummy/convoy-a/aide", Some("main"), "/workspace/aide", "test").await.expect("worktree");
+        two.materialise_checkout("dummy/convoy-b/coder", Some("main"), "/workspace/other", "test").await.expect("worktree");
+
+        let listed = one.enumerate_checkouts().await.expect("listed");
+        let summary =
+            listed.iter().map(|c| (c.path.as_path().to_string_lossy().into_owned(), c.git_ref.clone(), c.is_main)).collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                ("/workspace/aide".into(), "dummy/convoy-a/aide".into(), false),
+                ("/workspace/fleet".into(), "dummy/convoy-a/coder".into(), true),
+            ]
+        );
+        assert_eq!(one.list_checkouts().await.expect("listed").len(), 2);
+
+        // On a host, two repositories' checkouts are each listed by their own repository.
+        let host =
+            |name: &str| EnvironmentBag::new().with(EnvironmentAssertion::remote_host("forge.dummy.invalid", "dummy", name, "origin"));
+        let fleet_repo = probe(host("fleet"), "/repos/fleet").await;
+        let other_repo = probe(host("other"), "/repos/other").await;
+        fleet_repo.materialise_checkout("dummy/convoy-c/coder", Some("main"), "/repos/convoy-c", "test").await.expect("worktree");
+        let paths = |listed: Vec<EnumeratedCheckout>| listed.into_iter().map(|c| c.path.as_path().to_path_buf()).collect::<Vec<_>>();
+        assert_eq!(
+            paths(fleet_repo.enumerate_checkouts().await.expect("fleet")),
+            vec![PathBuf::from("/repos/convoy-c"), "/repos/fleet".into()]
+        );
+        assert_eq!(paths(other_repo.enumerate_checkouts().await.expect("other")), vec![PathBuf::from("/repos/other")]);
+    }
+
+    // At the configured shares a checkout reports uncommitted changes and unpushed commits, as
+    // `git status` and a branch ahead of its own name on origin do, for the checkout's life; a
+    // merged request's head still holds an unpushed branch, and reclaiming refuses either.
+    #[tokio::test]
+    async fn checkouts_report_dirt_and_unpushed_commits_at_the_configured_shares() {
+        let check = |check: VcsCheck| match check {
+            VcsCheck::True(_) => Some(true),
+            VcsCheck::False(details) => {
+                assert!(!details.is_empty(), "a failed check says why");
+                Some(false)
+            }
+            VcsCheck::Unknown(_) => None,
+        };
+        let directory = tempfile::tempdir().expect("configuration");
+        let config = ConfigStore::with_base(directory.path().to_path_buf());
+        let root = ExecutionEnvironmentPath::new("/workspace/fleet");
+        for (dirty_rate, unpushed_rate) in [(0.0, 0.0), (1.0, 1.0)] {
+            let settings = DummyFleetConfig {
+                vcs: flotilla_config::dummy_fleet::DummyVcsConfig { dirty_rate, unpushed_rate },
+                ..DummyFleetConfig::default()
+            };
+            let factory = DummyVcsFactory { fleet: DummyFleet::new(settings) };
+            let runner = Arc::new(DummyCommandRunner::default());
+            let vcs = factory.probe(&vessel_bag("one"), &config, &root, runner).await.unwrap_or_else(|_| panic!("claimed"));
+            let clean = dirty_rate == 0.0;
+            assert_eq!(check(vcs.is_clean().await), Some(clean));
+            assert_eq!(check(vcs.is_clean().await), Some(clean), "the same checkout answers the same");
+            assert_eq!(check(vcs.unpushed_commits(None).await), Some(clean));
+            assert_eq!(check(vcs.unpushed_commits(Some("abc123")).await), Some(true));
+            assert_eq!(check(vcs.local_clone_is_clean("/workspace/fleet").await), Some(clean));
+            assert_eq!(vcs.verify_local_clone_reclaimable("/workspace/fleet").await.is_ok(), clean);
+
+            // Removal refuses as `git worktree remove` and `git branch -d` do; forcing archives.
+            let (branch, target) = ("dummy/convoy/aide", "/workspace/aide");
+            vcs.materialise_checkout(branch, Some("main"), target, "test").await.expect("worktree");
+            let removed = vcs.remove_materialised_checkout(branch, target).await.expect("removal");
+            if clean {
+                assert_eq!(removed, CheckoutRemoval::Removed);
+                continue;
+            }
+            let dirty = CheckoutRemoval::PreservedCheckout { path: target.into(), reason: CheckoutPreservationReason::DirtyCheckout };
+            assert_eq!(removed, dirty);
+            assert_eq!(vcs.remove_materialised_checkout(branch, target).await.expect("removal"), dirty, "it stays dirty");
+            let CheckoutRemoval::ArchivedAndRemoved { preserved_branch, .. } =
+                vcs.force_remove_materialised_checkout(branch, target).await.expect("forced")
+            else {
+                panic!("a forced removal archives the checkout")
+            };
+            assert_eq!(preserved_branch, Some((branch.into(), CheckoutPreservationReason::CommitsPastBase)));
+            assert_eq!(vcs.remove_materialised_checkout(branch, target).await.expect("removal"), CheckoutRemoval::Removed);
+        }
     }
 }

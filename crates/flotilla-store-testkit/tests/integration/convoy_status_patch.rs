@@ -5,8 +5,8 @@ use chrono::{TimeZone, Utc};
 use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     controller_patches, external_patches, provisioning_patches, ConvoyPhase, ConvoyProvisioningState, ConvoyStatus, ConvoyStatusPatch,
-    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, PendingBrief, Selector, StatusPatch, VesselRequirement, WorkCompletionAuthority,
-    WorkPhase, WorkState, WorkflowSnapshot,
+    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Selector, StatusPatch, VesselRequirement, WorkCompletionAuthority, WorkPhase,
+    WorkState, WorkflowSnapshot,
 };
 
 fn ts(seconds: i64) -> chrono::DateTime<Utc> {
@@ -88,7 +88,6 @@ fn sample_snapshot() -> WorkflowSnapshot {
 
 fn pending_work() -> WorkState {
     WorkState {
-        provisioning_retry: None,
         phase: WorkPhase::Pending,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: None,
@@ -103,33 +102,25 @@ fn crew_work(phase: CrewWorkPhase) -> CrewWorkState {
     CrewWorkState::builder().phase(phase).started_at(ts(10)).build()
 }
 
-fn queue_pending_brief(status: &mut ConvoyStatus, role: &str) {
-    // Seed a previous-generation record; current writers cannot queue PendingBrief.
-    status.turn_deliveries.entry("operator".into()).or_default().pending_brief = Some(
-        PendingBrief::builder().vessel("implement".into()).role(role.into()).content("address review".into()).queued_at(ts(15)).build(),
-    );
-}
-
 #[test]
-fn crew_failure_clears_its_pending_brief() {
+fn crew_failure_marks_the_crew_failed() {
     let mut status = ConvoyStatus {
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         phase: ConvoyPhase::Active,
         crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), crew_work(CrewWorkPhase::Working))]))]),
         ..ConvoyStatus::default()
     };
-    queue_pending_brief(&mut status, "coder");
 
     external_patches::mark_crew_failed("implement".to_string(), "coder".to_string(), ts(20), "session failed".to_string())
         .apply(&mut status);
 
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Failed);
-    assert!(status.pending_brief().is_none());
 }
 
 #[test]
-fn crew_handoff_clears_the_senders_pending_brief() {
+fn crew_handoff_hands_the_sender_back() {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Active,
         crew_work: BTreeMap::from([(
@@ -141,7 +132,6 @@ fn crew_handoff_clears_the_senders_pending_brief() {
         )]),
         ..ConvoyStatus::default()
     };
-    queue_pending_brief(&mut status, "coder");
 
     external_patches::handoff_crew_work(
         "implement".to_string(),
@@ -154,11 +144,10 @@ fn crew_handoff_clears_the_senders_pending_brief() {
 
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::HandedBack);
     assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Working);
-    assert!(status.pending_brief().is_none());
 }
 
 #[test]
-fn kickoff_handoff_preserves_the_working_senders_pending_brief() {
+fn kickoff_handoff_keeps_the_sender_working() {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Active,
         crew_work: BTreeMap::from([(
@@ -170,7 +159,6 @@ fn kickoff_handoff_preserves_the_working_senders_pending_brief() {
         )]),
         ..ConvoyStatus::default()
     };
-    queue_pending_brief(&mut status, "coder");
 
     external_patches::handoff_crew_work(
         "implement".to_string(),
@@ -183,18 +171,15 @@ fn kickoff_handoff_preserves_the_working_senders_pending_brief() {
 
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Working);
-    assert_eq!(status.pending_brief().map(|brief| brief.role.as_str()), Some("coder"));
 }
 
 #[test]
-fn terminal_convoy_phase_clears_pending_brief() {
+fn terminal_convoy_phase_rolls_up() {
     let mut status = ConvoyStatus { phase: ConvoyPhase::Active, ..ConvoyStatus::default() };
-    queue_pending_brief(&mut status, "coder");
 
     controller_patches::roll_up_phase(ConvoyPhase::Landed, None, Some(ts(20))).apply(&mut status);
 
     assert_eq!(status.phase, ConvoyPhase::Landed);
-    assert!(status.pending_brief().is_none());
 }
 
 #[test]
@@ -290,13 +275,13 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -307,6 +292,7 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
             ("review".to_string(), WorkState { phase: WorkPhase::Complete, finished_at: Some(ts(20)), ..pending_work() }),
         ]),
         crew_work: BTreeMap::new(),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -316,7 +302,6 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     external_patches::mark_convoy_abandoned(
@@ -470,13 +455,13 @@ fn crew_completion_updates_only_the_calling_agent() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -485,7 +470,6 @@ fn crew_completion_updates_only_the_calling_agent() {
         work: BTreeMap::from([(
             "implement".to_string(),
             WorkState {
-                provisioning_retry: None,
                 phase: WorkPhase::Running,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(8)),
@@ -502,6 +486,7 @@ fn crew_completion_updates_only_the_calling_agent() {
                 ("reviewer".to_string(), crew_work(CrewWorkPhase::Working)),
             ]),
         )]),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -511,7 +496,6 @@ fn crew_completion_updates_only_the_calling_agent() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     external_patches::mark_crew_completed(
@@ -550,13 +534,13 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -565,7 +549,6 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
         work: BTreeMap::from([(
             "implement".to_string(),
             WorkState {
-                provisioning_retry: None,
                 phase: WorkPhase::Running,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(8)),
@@ -576,6 +559,7 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
             },
         )]),
         crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), crew_work(CrewWorkPhase::Working))]))]),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -585,7 +569,6 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     let patch =
@@ -638,13 +621,13 @@ fn crew_failure_records_terminal_state_and_message() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -652,6 +635,7 @@ fn crew_failure_records_terminal_state_and_message() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::new(),
         crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), crew_work(CrewWorkPhase::Working))]))]),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -661,7 +645,6 @@ fn crew_failure_records_terminal_state_and_message() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     external_patches::mark_crew_completed(
@@ -692,13 +675,13 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -707,7 +690,6 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         work: BTreeMap::from([(
             "implement".to_string(),
             WorkState {
-                provisioning_retry: None,
                 phase: WorkPhase::Complete,
                 completion_authority: WorkCompletionAuthority::HumanOverride,
                 ready_at: Some(ts(8)),
@@ -721,6 +703,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
             "implement".to_string(),
             BTreeMap::from([("coder".to_string(), coder), ("reviewer".to_string(), crew_work(CrewWorkPhase::Working))]),
         )]),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -730,7 +713,6 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     external_patches::handoff_crew_work(
@@ -760,13 +742,13 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -775,7 +757,6 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         work: BTreeMap::from([(
             "implement".to_string(),
             WorkState {
-                provisioning_retry: None,
                 phase: WorkPhase::Complete,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(8)),
@@ -786,6 +767,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
             },
         )]),
         crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), coder)]))]),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -795,7 +777,6 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     external_patches::resume_crew_work(
@@ -826,13 +807,13 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -841,7 +822,6 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
         work: BTreeMap::from([(
             "implement".to_string(),
             WorkState {
-                provisioning_retry: None,
                 phase: WorkPhase::Launching,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(8)),
@@ -855,6 +835,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
             "implement".to_string(),
             BTreeMap::from([("coder".to_string(), pending_coder), ("reviewer".to_string(), crew_work(CrewWorkPhase::Done))]),
         )]),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -864,7 +845,6 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     provisioning_patches::work_running("implement".to_string(), ts(12), BTreeSet::from(["coder".to_string()])).apply(&mut status);
@@ -882,13 +862,13 @@ fn running_vessel_work_leaves_latent_agents_pending() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -897,7 +877,6 @@ fn running_vessel_work_leaves_latent_agents_pending() {
         work: BTreeMap::from([(
             "implement".to_string(),
             WorkState {
-                provisioning_retry: None,
                 phase: WorkPhase::Launching,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(8)),
@@ -915,6 +894,7 @@ fn running_vessel_work_leaves_latent_agents_pending() {
                 ("reviewer".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
             ]),
         )]),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -924,7 +904,6 @@ fn running_vessel_work_leaves_latent_agents_pending() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     // The vessel launches only the first agent; `reviewer` has no session until
@@ -952,6 +931,7 @@ fn bootstrap_sets_snapshot_and_initial_work_map() {
         work.clone(),
         BTreeMap::new(),
         Vec::new(),
+        false,
         ConvoyPhase::Pending,
         None,
     );
@@ -976,13 +956,13 @@ fn advance_work_to_ready_updates_only_selected_vessels() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -993,7 +973,6 @@ fn advance_work_to_ready_updates_only_selected_vessels() {
             (
                 "review".to_string(),
                 WorkState {
-                    provisioning_retry: None,
                     phase: WorkPhase::Complete,
                     completion_authority: WorkCompletionAuthority::CrewRollup,
                     ready_at: Some(ts(5)),
@@ -1005,6 +984,7 @@ fn advance_work_to_ready_updates_only_selected_vessels() {
             ),
         ]),
         crew_work: BTreeMap::new(),
+        engine_launch: None,
         message: Some("keep".to_string()),
         started_at: None,
         finished_at: None,
@@ -1014,7 +994,6 @@ fn advance_work_to_ready_updates_only_selected_vessels() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     let patch = controller_patches::advance_work_to_ready(BTreeMap::from([("implement".to_string(), ts(10))]));
@@ -1044,13 +1023,13 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -1060,7 +1039,6 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
             (
                 "implement".to_string(),
                 WorkState {
-                    provisioning_retry: None,
                     phase: WorkPhase::Failed,
                     completion_authority: WorkCompletionAuthority::CrewRollup,
                     ready_at: Some(ts(10)),
@@ -1073,7 +1051,6 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
             (
                 "review".to_string(),
                 WorkState {
-                    provisioning_retry: None,
                     phase: WorkPhase::Running,
                     completion_authority: WorkCompletionAuthority::CrewRollup,
                     ready_at: Some(ts(20)),
@@ -1085,6 +1062,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
             ),
         ]),
         crew_work: BTreeMap::new(),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -1094,7 +1072,6 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     let patch = controller_patches::fail_convoy(BTreeMap::from([("review".to_string(), ts(30))]), ts(30), Some("work failed".to_string()));
@@ -1111,7 +1088,6 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
 #[test]
 fn roll_up_phase_only_touches_convoy_level_fields() {
     let review = WorkState {
-        provisioning_retry: None,
         phase: WorkPhase::Complete,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: Some(ts(10)),
@@ -1125,13 +1101,13 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -1139,6 +1115,7 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("review".to_string(), review.clone())]),
         crew_work: BTreeMap::new(),
+        engine_launch: None,
         message: Some("keep".to_string()),
         started_at: None,
         finished_at: None,
@@ -1148,7 +1125,6 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     let patch = controller_patches::roll_up_phase(ConvoyPhase::Landed, None, Some(ts(40)));
@@ -1167,13 +1143,13 @@ fn forced_work_completion_claim_enters_landing() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -1182,7 +1158,6 @@ fn forced_work_completion_claim_enters_landing() {
         work: BTreeMap::from([(
             "review".to_string(),
             WorkState {
-                provisioning_retry: None,
                 phase: WorkPhase::Running,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(10)),
@@ -1193,6 +1168,7 @@ fn forced_work_completion_claim_enters_landing() {
             },
         )]),
         crew_work: BTreeMap::new(),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -1202,7 +1178,6 @@ fn forced_work_completion_claim_enters_landing() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     let patch =
@@ -1223,13 +1198,13 @@ fn forced_work_completion_preserves_agent_owned_state() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -1238,7 +1213,6 @@ fn forced_work_completion_preserves_agent_owned_state() {
         work: BTreeMap::from([(
             "implement".to_string(),
             WorkState {
-                provisioning_retry: None,
                 phase: WorkPhase::Running,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: None,
@@ -1255,6 +1229,7 @@ fn forced_work_completion_preserves_agent_owned_state() {
                 ("reviewer".to_string(), crew_work(CrewWorkPhase::HandedBack)),
             ]),
         )]),
+        engine_launch: None,
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -1264,7 +1239,6 @@ fn forced_work_completion_preserves_agent_owned_state() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     external_patches::force_work_completed("implement".to_string(), ts(50), Some("human override".to_string())).apply(&mut status);
@@ -1283,13 +1257,13 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -1297,6 +1271,7 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), pending_work())]),
         crew_work: BTreeMap::new(),
+        engine_launch: None,
         message: None,
         started_at: None,
         finished_at: None,
@@ -1306,7 +1281,6 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     };
 
     ConvoyStatusPatch::AdvanceWorkToReady { ready: BTreeMap::from([("implement".to_string(), ts(10))]) }.apply(&mut status);
@@ -1359,7 +1333,6 @@ fn nudge_budget_survives_stall_clear_and_resets_only_for_progress_by_that_actor(
             .maker(LeafMaker::Actor { vessel: "work".into(), role: role.into() })
             .leaves(vec![leaf.clone()])
             .history(vec![StallNudge { at: ts(10), row: leaf }])
-            .quiet_since(ts(10))
             .build()
     };
     let mut status = ConvoyStatus {
@@ -1367,7 +1340,7 @@ fn nudge_budget_survives_stall_clear_and_resets_only_for_progress_by_that_actor(
         nudge_obligations: vec![obligation("coder"), obligation("reviewer")],
         ..Default::default()
     };
-    ConvoyStatusPatch::SetStalled { condition: None }.apply(&mut status);
+    ConvoyStatusPatch::EndStall { seat: None }.apply(&mut status);
     let stored = serde_json::to_string(&status).expect("persist budget");
     status = serde_json::from_str(&stored).expect("restore budget");
     assert_eq!(status.nudge_obligations[0].history.len(), 1, "attention-driven stall clearing preserves accounting");

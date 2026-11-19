@@ -26,6 +26,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::{
     admin, api,
     config::{Config, StartupError},
+    git,
     model::{Clock, FakeForge, SystemClock},
     seed::Seed,
 };
@@ -106,7 +107,11 @@ pub async fn start(config: &Config, forge: Arc<FakeForge>) -> Result<Running, St
     let admin_addr = local_addr(&admin_listener)?;
     let (stop, stopped) = watch::channel(false);
     let mut tasks = JoinSet::new();
-    tasks.spawn(accept_loop("api", api_listener, acceptor.clone(), api::router(Arc::clone(&forge)), stopped.clone()));
+    let api = match &config.git_root {
+        Some(root) => git::router(Arc::clone(&forge), root.clone()).fallback_service(api::router(Arc::clone(&forge))),
+        None => api::router(Arc::clone(&forge)),
+    };
+    tasks.spawn(accept_loop("api", api_listener, acceptor.clone(), api, stopped.clone()));
     tasks.spawn(accept_loop(
         "admin",
         admin_listener,

@@ -199,16 +199,8 @@ impl IssueRefresher {
     }
 
     pub async fn demand(&self, subscription_id: uuid::Uuid, subject: IssueKey, freshness: Option<DateTime<Utc>>) -> Result<(), String> {
-        let name = subject.record_name();
-        match self.inner.backend.including_replicas::<Issue>(&subject.namespace).get(&name).await {
-            Ok(_) => {}
-            Err(flotilla_resources::ResourceError::NotFound { .. }) if self.inner.engine.installed() => {}
-            Err(flotilla_resources::ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
-            Err(error) => return Err(error.to_string()),
-        }
-
-        // Under the engine the record is first written by the refresh loop spawned below, after
-        // the subject is in `active`; `sweep_undemanded` relies on that order.
+        // The record is first written by the refresh loop spawned below, after the subject is in
+        // `active`; `sweep_undemanded` relies on that order.
         let mut active = self.inner.active.lock().await;
         if let Some(refresh) = active.get_mut(&subject) {
             refresh.demands.insert(subscription_id, freshness);
@@ -481,10 +473,6 @@ impl IssueRefresher {
         }
         records.update_status(name, &current.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
         Ok(())
-    }
-
-    async fn ensure_record(&self, subject: &IssueKey, name: &str) -> Result<(), String> {
-        self.get_or_create_record(subject, name).await.map(|_| ())
     }
 
     async fn get_or_create_record(&self, subject: &IssueKey, name: &str) -> Result<flotilla_resources::ResourceObject<Issue>, String> {

@@ -6,6 +6,13 @@
 //! realise and run crews without containers, processes or forges. Without the
 //! section nothing changes. Every rate is a probability in `[0, 1]`, drawn
 //! deterministically from `seed` and the subject's identity.
+//!
+//! The fleet stands in for systems that outlive the daemon (vendors, cleat,
+//! forges), and keeps their state in a file it writes behind by up to 100 ms.
+//! A graceful stop writes it all out; a crash (`kill -9`) may lose that much.
+//!
+//! Dummy crews spend a configured time per turn, so a run on them measures
+//! flotilla's own work at scale, not harness latency.
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -28,6 +35,10 @@ pub struct DummyFleetConfig {
     pub agent: DummyAgentConfig,
     #[serde(default)]
     pub change_request: DummyChangeRequestConfig,
+    #[serde(default)]
+    pub terminal: DummyTerminalConfig,
+    #[serde(default)]
+    pub vcs: DummyVcsConfig,
     /// A forge shared by every host of a rehearsal fleet (#3374). When set,
     /// dummy coders open their change requests there over the Forgejo API,
     /// so change-request numbers are unique across hosts, instead of on this
@@ -44,6 +55,8 @@ impl Default for DummyFleetConfig {
             environment: DummyEnvironmentConfig::default(),
             agent: DummyAgentConfig::default(),
             change_request: DummyChangeRequestConfig::default(),
+            terminal: DummyTerminalConfig::default(),
+            vcs: DummyVcsConfig::default(),
             shared_forge: None,
         }
     }
@@ -51,6 +64,29 @@ impl Default for DummyFleetConfig {
 
 fn default_forge_service_url() -> String {
     DEFAULT_DUMMY_FORGE_SERVICE_URL.to_string()
+}
+
+/// How the dummy terminal pool answers, standing in for cleat's.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct DummyTerminalConfig {
+    /// Probability that a submission is refused before anything is written, as cleat refuses
+    /// one while the composer holds text or a controller is typing. Each attempt draws anew, so
+    /// a retried delivery goes through.
+    #[serde(default, deserialize_with = "deserialize_rate")]
+    pub refusal_rate: f64,
+}
+
+/// What the dummy VCS reports of the checkouts it made. Each checkout's draw is by its path, so a
+/// checkout stays dirty or unpushed for its life.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct DummyVcsConfig {
+    /// Probability that a checkout reports uncommitted changes.
+    #[serde(default, deserialize_with = "deserialize_rate")]
+    pub dirty_rate: f64,
+    /// Probability that a checkout's branch reports commits not pushed to its own name on the
+    /// forge, unless a merged change request's head holds them.
+    #[serde(default, deserialize_with = "deserialize_rate")]
+    pub unpushed_rate: f64,
 }
 
 /// How dummy environments are realised.
@@ -73,6 +109,15 @@ pub struct DummyAgentConfig {
     /// unconfirmed, as they would for a real harness that idled at once.
     #[serde(default = "default_turn_delay_ms")]
     pub turn_delay_ms: u64,
+    /// Up to this much more on each turn, drawn per turn, so turns differ in length as a real
+    /// harness's do. The draw is fake: a run on dummy crews does not measure harness latency, and
+    /// its timings say nothing about a real agent's.
+    #[serde(default)]
+    pub turn_delay_spread_ms: u64,
+    /// How long a crew waits before retrying a refused command, doubling per attempt within
+    /// the turn, as an agent retrying a command does.
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
     /// Probability that a crew stalls instead of finishing its script.
     #[serde(default, deserialize_with = "deserialize_rate")]
     pub stall_rate: f64,
@@ -82,12 +127,47 @@ pub struct DummyAgentConfig {
     /// Turns a long-running (governor-like) crew handles before it completes.
     #[serde(default = "default_long_runner_turns")]
     pub long_runner_turns: u32,
+    /// The mean number of Claude Code hook events a turn sends: its prompt submission, a
+    /// pre- and post-tool-use pair per tool call, and its stop. Each turn draws its count from
+    /// a log-normal spread with this mean and [`Self::hooks_per_turn_median`], at least two.
+    ///
+    /// The defaults come from the fleet's own flotillad logs (`received agent hook event`,
+    /// ClaudeCode, counted from each prompt submission to the next stop per terminal),
+    /// 2026-11-11 to 2026-11-18: feta, 153 turns of 12 sessions, mean 27.0, median 8, p90 58;
+    /// udder, 206 turns of 19 sessions, mean 25.2, median 6, p90 46. The spread these defaults
+    /// give has a p90 of about 56.
+    #[serde(default = "default_hooks_per_turn")]
+    pub hooks_per_turn: f64,
+    /// The median of the per-turn hook count spread; see [`Self::hooks_per_turn`].
+    #[serde(default = "default_hooks_per_turn_median")]
+    pub hooks_per_turn_median: f64,
 }
 
 impl Default for DummyAgentConfig {
     fn default() -> Self {
-        Self { turn_delay_ms: default_turn_delay_ms(), stall_rate: 0.0, fail_rate: 0.0, long_runner_turns: default_long_runner_turns() }
+        Self {
+            turn_delay_ms: default_turn_delay_ms(),
+            turn_delay_spread_ms: 0,
+            retry_backoff_ms: default_retry_backoff_ms(),
+            stall_rate: 0.0,
+            fail_rate: 0.0,
+            long_runner_turns: default_long_runner_turns(),
+            hooks_per_turn: default_hooks_per_turn(),
+            hooks_per_turn_median: default_hooks_per_turn_median(),
+        }
     }
+}
+
+fn default_hooks_per_turn() -> f64 {
+    26.0
+}
+
+fn default_hooks_per_turn_median() -> f64 {
+    7.0
+}
+
+fn default_retry_backoff_ms() -> u64 {
+    1_000
 }
 
 fn default_turn_delay_ms() -> u64 {

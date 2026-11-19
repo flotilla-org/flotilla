@@ -424,7 +424,17 @@ fn render_gitconfig_entry(entry: RenderedEntry<'_>) -> String {
         Some(subsection) => format!("[{} \"{}\"]", key.section, escape_gitconfig_subsection(subsection)),
         None => format!("[{}]", key.section),
     };
-    format!("{comments}{section}\n\t{} = {}\n", key.name, entry.fragment.value)
+    format!("{comments}{section}\n\t{} = {}\n", key.name, escape_gitconfig_value(&entry.fragment.value))
+}
+
+/// `value` as Git reads it back: quoted when it holds a backslash, a double quote, a comment
+/// character or edge whitespace, which Git would otherwise interpret or drop.
+fn escape_gitconfig_value(value: &str) -> String {
+    if value.contains(['\\', '"', '#', ';']) || value.trim() != value {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
 }
 
 fn escape_gitconfig_subsection(value: &str) -> String {

@@ -1,7 +1,7 @@
 //! Explicit integrity diagnostics, usable on a read-only SQLite connection.
 
 use flotilla_schema::{Code, ColumnType, KindRegistry, HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::StoreError;
 
@@ -48,4 +48,22 @@ pub fn audit_domains(conn: &Connection, kinds: &KindRegistry) -> Result<(), Stor
         }
     }
     Ok(())
+}
+
+/// The highest sequence of `home` the database on `conn` holds, read from `home_sequence` alone,
+/// so it answers for a database [`crate::Store::open`] refuses for its shape; 0 when `home` has
+/// none. Never writes: usable on a read-only connection. A database without the domain-tagged
+/// dictionary or the sequence table is an error, not 0, since what it holds is then unknown.
+pub fn stored_last_sequence(conn: &Connection, home: &str) -> Result<u64, StoreError> {
+    if !crate::shared::has_string_domain(conn)? {
+        return Err(StoreError::LegacyDictionarySchema);
+    }
+    let last: Option<i64> = conn
+        .query_row(
+            "SELECT h.last FROM home_sequence AS h JOIN strings AS s ON s.id = h.home WHERE s.domain = ?1 AND s.s = ?2",
+            [HOME_DOMAIN.as_str(), home],
+            |row| row.get(0),
+        )
+        .optional()?;
+    last.map_or(Ok(0), |last| u64::try_from(last).map_err(|_| StoreError::Corrupt { table: "home_sequence".into(), column: "last".into() }))
 }

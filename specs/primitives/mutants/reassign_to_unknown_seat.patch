@@ -1,10 +1,10 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -182,7 +182,6 @@
-           else withPromise(w, a.promise, { ...p, state: Retracted }))
-       | Reassign(a) => onOpen(w, a.promise, p =>
-           if (not(mayReassign(p, a.by, a.authority))) Refused(Unauthorised)
--          else if (not(w.seats.keys().contains(a.to))) Refused(UnknownSeat)
-           else if (w.retiredSeats.contains(a.to)) Refused(SeatRetired)
-           else withPromise(w, a.promise, { ...p, owner: a.to }))
-       | RetireDuty(a) => if (not(a.authorised)) Refused(Unauthorised)
+@@ -193,7 +193,6 @@
+     if (not(mayRetract(p, a.by, a.authority)) or a.reason == "") Refused(Unauthorised) else Accepted)
+   def reassigned(id: int, a: { promise: PromiseId, to: Seat, by: Seat, authority: Authority }): Outcome = onOpen(id, a.promise, p =>
+     if (not(mayReassign(p, a.by, a.authority))) Refused(Unauthorised)
+-    else if (not(known(id, a.to))) Refused(UnknownSeat)
+     else if (seatRetired(id, a.to)) Refused(SeatRetired)
+     else Accepted)
+   def dutyRetired(id: int, a: { duty: DutyId, authorised: bool }): Outcome =

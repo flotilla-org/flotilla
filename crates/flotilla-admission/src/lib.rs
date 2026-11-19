@@ -14,6 +14,7 @@ pub mod random;
 pub mod reconcilers;
 pub mod repository_addressing;
 pub mod repository_inspection;
+pub mod standing;
 pub mod support;
 pub mod surfaces;
 

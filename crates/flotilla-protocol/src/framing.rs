@@ -30,7 +30,6 @@ mod tests {
             connection_role: None,
             surface: None,
             crew_claims: Default::default(),
-            primitives: false,
         };
         let mut buf = Vec::new();
         write_message_line(&mut buf, &msg).await.expect("write should succeed");

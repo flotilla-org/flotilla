@@ -18,6 +18,8 @@ flotilla-crew = { path = "../flotilla-crew" }
 flotilla-observation = { path = "../flotilla-observation" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-engine-convoys = { path = "../flotilla-engine-convoys" }
+flotilla-engine-messages = { path = "../flotilla-engine-messages" }
 flotilla-inbox = { path = "../flotilla-inbox" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 flotilla-schema = { path = "../flotilla-schema" }
@@ -25,7 +27,6 @@ flotilla-verbs = { path = "../flotilla-verbs" }
 rigging-condition = { workspace = true }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-messaging = { path = "../flotilla-messaging" }
-flotilla-agent-connector = { path = "../flotilla-agent-connector" }
 flotilla-executor = { path = "../flotilla-executor" }
 flotilla-config = { path = "../flotilla-config" }
 flotilla-environment = { path = "../flotilla-environment" }
@@ -60,7 +61,6 @@ flotilla-credentials = { path = "../flotilla-credentials" }
 flotilla-capability-contract = { path = "../flotilla-capability-contract" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 rigging-relay-protocol = { workspace = true }
-flotilla-replication = { path = "../flotilla-replication" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-transport = { path = "../flotilla-transport" }
 rigging-ssh = { workspace = true }
@@ -76,6 +76,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { workspace = true, features = ["v4"] }
 url = { workspace = true }
+percent-encoding = "2"
 reqwest = { workspace = true, features = ["json"] }
 futures = "0.3"
 hyper = { version = "1", features = ["http1", "server"] }
@@ -99,6 +100,9 @@ flotilla-drydock = { path = "../flotilla-drydock" }
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-log-testkit = { path = "../flotilla-log-testkit" }
+flotilla-engine-convoys-testkit = { path = "../flotilla-engine-convoys-testkit" }
+flotilla-engine-messages-testkit = { path = "../flotilla-engine-messages-testkit" }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 drydock-agent.workspace = true
 drydock-transport.workspace = true

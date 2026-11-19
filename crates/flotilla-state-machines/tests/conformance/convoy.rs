@@ -8,34 +8,51 @@
 //! - `Declare`, `Reject`, `Keep(Observed)`, `Keep(Verdict)`, `Retract` and
 //!   `Reassign`: those edges, field for field.
 //! - `Submit{durable}`: the `submit` edge, its durability reading `durable`.
-//! - `RetireDuty`, `AddSeat`, `Resupervise`, `Abandon` and `Readmit`: those
-//!   edges, their authority reading `authorised`.
-//! - `Deliver`: the `deliver` edge.
+//! - `RetireDuty`, `AddSeat`, `Resupervise`, `RetireSeat`, `FailSeat`,
+//!   `Link`, `Unlink` and `Abandon`: those edges, their authority
+//!   reading `authorised`.
+//! - `Deliver`: the `deliver` edge, with its disposition.
+//! - `Retire(holds)`: the `retire` edge; `Read(set)` puts the set in the
+//!   world, and `Unread` leaves it absent.
 //!
 //! Value mapping:
 //! - A seat is the [`SeatName`] whose role is the spec's text and whose
 //!   discriminator is empty.
 //! - The project, a promise's target, a submission's reference and a
 //!   supervisor are addresses ([`address`]).
-//! - A vessel class is its number as text.
+//! - A subject is an address; the spec's link source `ByOperator` is
+//!   [`LinkSource::Operator`], and its abandon causes `WorkFailed` and
+//!   `OperatorDecision` are [`AbandonCause::Failed`] and
+//!   [`AbandonCause::Operator`].
 //! - A duty's terms are its note.
 //! - A submission's revision is fixed: the spec's reference is all it compares.
 //!
-//! State mapping: the spec's `Work = {spec, promises, seats, retired, quota}`
-//! is the spec's project, duties and priority, the promise and seat records
-//! keyed by id and name, and the state's retired duties and quota.
-//! `Open { .. }` is `Open(work)`, `Delivered { .. }` is `Delivered(work)` and
-//! `Abandoned { reason, .. }` is `Abandoned({work, reason})`. The frozen
-//! promise kinds and each row's stamps and times are not in the spec.
+//! State mapping: the spec keeps each part of a convoy in its own variable,
+//! keyed by convoy; the harness admits convoy 0. [`spec_nodes`] reads those
+//! parts into one record, `{phase, project, priority, duties, retired,
+//! promises, seats, subjects}`, which [`ConvoyConformance::encode`] builds
+//! field by field from the Rust value:
+//! - `phase`: `Open { .. }` is `Open`, `Delivered { disposition, .. }` is
+//!   `Delivered(disposition)`, `Abandoned { cause, reason, .. }` is
+//!   `Abandoned({cause, reason})` and `Retired` is `Retired`;
+//! - `project`, `priority` and `duties`: the spec's;
+//! - `retired`: the state's retired duties, empty once retired;
+//! - `promises` and `seats`: the records keyed by id and seat name, a seat's
+//!   `retired` its flag;
+//! - `subjects`: every link row in order, with its source and whether it was
+//!   unlinked.
+//!
+//! The frozen promise kinds and each row's stamps and times are not in the spec.
 
 use flotilla_schema::{Frozen, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        Abandon, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyRefusal, ConvoyRequest, ConvoySpec, ConvoyState, Declare, Deliver,
-        Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, Progress, PromiseId, PromiseKinds, PromiseSource, Quota, Readmit,
-        Reassign, Reject, ReplaceSeat, Resupervise, RetireDuty, RetireSeat, Retract, Rollover, Seat, SeatName, Submit, Terms, VesselClass,
+        Abandon, AbandonCause, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyRefusal, ConvoyRequest, ConvoySpec, ConvoyState, Declare,
+        Deliver, Duty, DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress, PromiseId, PromiseKinds,
+        PromiseSource, Reassign, Reject, ReplaceSeat, Resupervise, Retire, RetireDuty, RetireSeat, Retract, Seat, SeatName, Submit, Terms,
+        Unlink,
     },
-    Home, Ref, WriteError,
+    Home, Ref, Resource, WriteError,
 };
 use serde_json::{json, Map, Value};
 
@@ -44,7 +61,8 @@ use crate::{
     itf::{address, boolean, int, list, map_of, normalise, number, pairs, payload, set, set_of, show, tag, text, variant},
 };
 
-const NAME: &str = "c";
+/// The name every request is a launch of; its convoy is that name's newest launch.
+const LAUNCH_OF: &str = "c";
 const DECIDER: &str = "decider";
 const REVISION: &str = "r";
 
@@ -71,18 +89,6 @@ fn named(v: &Value) -> Vec<(&str, &Value)> {
     }
 }
 
-fn class(n: i64) -> VesselClass {
-    VesselClass::new(n.to_string())
-}
-
-fn quota_of(v: &Value) -> Quota {
-    pairs(v).iter().map(|p| (class(number(&p[0])), id(&p[1]))).collect()
-}
-
-fn quota_value(quota: &Quota) -> Value {
-    map_of(quota.iter().map(|(class, count)| (int(class.0.parse().expect("model class")), int((*count).into()))))
-}
-
 fn source_of(v: &Value) -> PromiseSource {
     match tag(v) {
         "Template" => PromiseSource::Template,
@@ -97,6 +103,31 @@ fn source_name(source: PromiseSource) -> &'static str {
         PromiseSource::Template => "Template",
         PromiseSource::Dispatch => "Dispatch",
         PromiseSource::Crew => "Crew",
+    }
+}
+
+fn link_source_of(v: &Value) -> LinkSource {
+    match tag(v) {
+        "Claim" => LinkSource::Claim,
+        "ByOperator" => LinkSource::Operator,
+        "Relay" => LinkSource::Relay,
+        "Branch" => LinkSource::Branch,
+        other => panic!("link source {other}"),
+    }
+}
+
+fn cause_of(v: &Value) -> AbandonCause {
+    match tag(v) {
+        "WorkFailed" => AbandonCause::Failed,
+        "OperatorDecision" => AbandonCause::Operator,
+        other => panic!("abandon cause {other}"),
+    }
+}
+
+fn cause_name(cause: AbandonCause) -> &'static str {
+    match cause {
+        AbandonCause::Failed => "WorkFailed",
+        AbandonCause::Operator => "OperatorDecision",
     }
 }
 
@@ -128,14 +159,16 @@ fn duty_value(duty: &Duty) -> Value {
     json!({ "owner": seat_text(&duty.owner), "scope": scope, "terms": duty.terms.note.as_deref().unwrap_or_default() })
 }
 
+/// A seat as admission takes it: the spec's `{parent, supervisedBy}`.
 fn seat_of(name: &str, v: &Value) -> Seat {
     let parent = match tag(&v["parent"]) {
         "Root" => None,
         _ => Some(seat(payload(&v["parent"]))),
     };
     Seat {
+        failed: None,
         retired: false,
-        replacements: id(&v["replacements"]),
+        replacements: 0,
         role: name.into(),
         seat: String::new(),
         parent,
@@ -148,7 +181,22 @@ fn seat_value(seat: &Seat) -> Value {
         None => bare("Root"),
         Some(parent) => variant("Under", seat_text(parent)),
     };
-    json!({ "parent": parent, "supervisedBy": seat.supervised_by.name(), "replacements": int(seat.replacements.into()) })
+    json!({
+        "parent": parent,
+        "supervisedBy": seat.supervised_by.name(),
+        "replacements": int(seat.replacements.into()),
+        "failed": seat.failed.as_deref().unwrap_or_default(),
+        "retired": seat.retired,
+    })
+}
+
+fn link_source_name(source: LinkSource) -> &'static str {
+    match source {
+        LinkSource::Claim => "Claim",
+        LinkSource::Operator => "ByOperator",
+        LinkSource::Relay => "Relay",
+        LinkSource::Branch => "Branch",
+    }
 }
 
 fn kinds() -> Frozen<PromiseKinds> {
@@ -176,11 +224,14 @@ fn request_of(request: &Value) -> ConvoyRequest {
     let mut seats: Vec<Seat> = named(&request["seats"]).into_iter().map(|(name, v)| seat_of(name, v)).collect();
     seats.sort_by_key(|seat| seat.parent.is_some());
     ConvoyRequest {
+        launch_of: LAUNCH_OF.into(),
+        workflow_ref: "w".into(),
+        admission: flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new()))
+            .expect("freeze"),
         project: address(&request["project"]),
         promises,
         duties,
         seats,
-        quota: quota_of(&request["quota"]),
         priority: Priority(id(&request["priority"])),
         kinds: kinds(),
     }
@@ -194,12 +245,10 @@ fn refusal_of(refusal: ConvoyRefusal) -> Value {
         ConvoyRefusal::DutyHolds(ids) => return variant("DutyHolds", set_of(ids.iter().map(|d| int(d.0.into())))),
         ConvoyRefusal::NoObligations => "NoObligations",
         ConvoyRefusal::UnknownProject => "UnknownProject",
-        ConvoyRefusal::InvalidQuota => "InvalidQuota",
         ConvoyRefusal::NotOpen => "NotOpen",
         ConvoyRefusal::UnknownPromise => "UnknownPromise",
         ConvoyRefusal::PromiseSettled => "PromiseSettled",
         ConvoyRefusal::Unauthorised => "Unauthorised",
-        ConvoyRefusal::QuotaNotIncrease => "QuotaNotIncrease",
         ConvoyRefusal::PromiseExists => "PromiseExists",
         ConvoyRefusal::NotOwner => "NotOwner",
         ConvoyRefusal::NotDurable => "NotDurable",
@@ -211,7 +260,13 @@ fn refusal_of(refusal: ConvoyRefusal) -> Value {
         ConvoyRefusal::SeatRetired => "SeatRetired",
         ConvoyRefusal::SeatsFull => "SeatsFull",
         ConvoyRefusal::ReplacementsExhausted => "ReplacementsExhausted",
+        ConvoyRefusal::SeatFailed => "SeatFailed",
+        ConvoyRefusal::SubjectLinked => "SubjectLinked",
+        ConvoyRefusal::UnknownSubject => "UnknownSubject",
         ConvoyRefusal::SeatCycle => "SeatCycle",
+        ConvoyRefusal::NotEnded => "NotEnded",
+        ConvoyRefusal::Held(holds) => return variant("Held", set_of(holds.iter().map(|hold| json!(hold)))),
+        ConvoyRefusal::HoldsUnread => "HoldsUnread",
     };
     bare(name)
 }
@@ -233,9 +288,16 @@ fn progress_name(progress: Progress) -> &'static str {
     }
 }
 
-/// The spec's `Work`: the spec's fixed fields, the records keyed by id and
-/// name, and the state's retired duties and quota in force.
-fn work(spec: &ConvoySpec, state: &ConvoyState) -> Value {
+/// The spec's parts of a convoy, field by field from the Rust value.
+fn parts(spec: &ConvoySpec, state: &ConvoyState) -> Value {
+    let phase = match state {
+        ConvoyState::Open { .. } => bare("Open"),
+        ConvoyState::Delivered { disposition, .. } => variant("Delivered", json!(disposition)),
+        ConvoyState::Abandoned { cause, reason, .. } => {
+            variant("Abandoned", json!({ "cause": bare(cause_name(*cause)), "reason": reason }))
+        }
+        ConvoyState::Retired => bare("Retired"),
+    };
     let promises = spec.promises.iter().map(|row| {
         let promise = &row.record;
         let submissions: Vec<Value> = promise.submissions.iter().map(|row| json!({ "reference": row.record.address.name() })).collect();
@@ -250,38 +312,86 @@ fn work(spec: &ConvoySpec, state: &ConvoyState) -> Value {
     });
     let seats: Map<String, Value> = spec.seats.iter().map(|row| (row.record.role.clone(), seat_value(&row.record))).collect();
     let duties = spec.duties.iter().map(|(d, duty)| (int(d.0.into()), duty_value(duty)));
+    let subjects: Vec<Value> = spec
+        .subjects
+        .iter()
+        .map(|row| {
+            let link = &row.record;
+            json!({ "subject": link.subject.name(), "source": bare(link_source_name(link.source)), "unlinked": link.unlinked })
+        })
+        .collect();
     json!({
-        "spec": { "project": spec.project.name(), "duties": map_of(duties), "priority": int(spec.priority.0.into()) },
+        "phase": phase,
+        "project": spec.project.name(),
+        "priority": int(spec.priority.0.into()),
+        "duties": map_of(duties),
+        "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
         "promises": map_of(promises),
         "seats": Value::Object(seats),
-        "retiredSeats": set_of(spec.seats.iter().filter(|r| r.record.retired).map(|r| seat_text(&r.record.name()))),
-        "promiseFloor": int(spec.promise_floor.try_into().expect("model floor")),
-        "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
-        "quota": quota_value(state.quota()),
+        "subjects": subjects,
     })
 }
 
-/// The request that admitted an initial `Open(work)`: its fixed fields, its
-/// promises as admitted and its seats, with the quota in force as the
-/// admitted quota.
-fn admitted_request(work: &Value) -> ConvoyRequest {
-    let spec = &work["spec"];
-    let promises: Vec<Value> = pairs(&work["promises"])
+/// The request that admitted an initial open convoy: its fixed fields, its
+/// promises as admitted and its seats.
+fn admitted_request(convoy: &Value) -> ConvoyRequest {
+    let promises: Vec<Value> = pairs(&convoy["promises"])
         .iter()
         .map(|p| {
             assert!(list(&p[1]["submissions"]).is_empty(), "an initial convoy's promises have no submissions");
             json!([p[0], { "promise": p[1]["promise"], "source": p[1]["source"], "owner": p[1]["owner"] }])
         })
         .collect();
+    let seats: Map<String, Value> = named(&convoy["seats"])
+        .into_iter()
+        .map(|(name, v)| (name.to_owned(), json!({ "parent": v["parent"], "supervisedBy": v["supervisedBy"] })))
+        .collect();
     let request = json!({
-        "project": spec["project"],
+        "project": convoy["project"],
         "promises": { "#map": promises },
-        "duties": spec["duties"],
-        "seats": work["seats"],
-        "quota": work["quota"],
-        "priority": spec["priority"],
+        "duties": convoy["duties"],
+        "seats": Value::Object(seats),
+        "priority": convoy["priority"],
     });
     request_of(&request)
+}
+
+/// The harness's convoy, the one each run admits.
+const CONVOY: i64 = 0;
+
+/// Convoy [`CONVOY`]'s parts in `node`, one variable each, read into one record.
+fn spec_parts(node: &Value) -> Value {
+    let mut parts = Map::new();
+    for (name, value) in node.as_object().expect("a graph node is a record") {
+        let Some(part) = name.rsplit_once("_C_").map(|(_, part)| part) else { continue };
+        let entry = pairs(value).iter().find(|pair| number(&pair[0]) == CONVOY).unwrap_or_else(|| panic!("convoy {CONVOY} has no {part}"));
+        parts.insert(part.to_owned(), entry[1].clone());
+    }
+    Value::Object(parts)
+}
+
+/// The harness's graph in the shape [`graph::check`] reads: each probe's
+/// outcome becomes `Moved` to the convoy's parts after it, or the refusal.
+/// The start state, before any admission, is no probe.
+fn spec_nodes(nodes: &[Value]) -> Vec<Value> {
+    let result = |node: &Value, outcome: &Value| match tag(outcome) {
+        "Accepted" => variant("Moved", spec_parts(node)),
+        _ => variant("Refused", payload(outcome).clone()),
+    };
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let probe = &node["probe"];
+            let p = payload(probe);
+            let probe = match tag(probe) {
+                "Unadmitted" => return None,
+                "Admitted" => variant("Admitted", json!({ "request": p["request"], "result": result(node, &p["outcome"]) })),
+                "Stepped" => variant("Stepped", json!({ "from": p["from"], "event": p["event"], "result": result(node, &p["outcome"]) })),
+                other => panic!("unknown probe {other}"),
+            };
+            Some(json!({ "probe": probe }))
+        })
+        .collect()
 }
 
 /// The world admission reads: the request's project exists when the spec's
@@ -295,24 +405,28 @@ fn projects(request: &ConvoyRequest, known: bool) -> MemoryConvoyWorld {
     }
 }
 
+/// The convoy under test: a create names it as a launch of [`LAUNCH_OF`].
+fn convoy(home: &Home<Convoy>) -> &Resource<Convoy> {
+    home.newest_launch(LAUNCH_OF, None).expect("exists")
+}
+
 struct ConvoyConformance;
 
 impl Conformance for ConvoyConformance {
     const MACHINE: &'static str = "convoy";
-    // Quota counts are unsigned, so an invalid quota is unrepresentable.
-    const NEVER_REFUSED: &'static [&'static str] = &["InvalidQuota"];
     type Subject = Home<Convoy>;
 
     fn create(state: &Value) -> Home<Convoy> {
         let mut home = Home::<Convoy>::new("home").expect("valid declaration");
-        let request = admitted_request(payload(state));
+        let request = admitted_request(state);
         // An admitted convoy's project was known.
-        home.create(NAME, request.clone(), &projects(&request, true), Timestamp(0)).expect("admitted");
+        home.create(LAUNCH_OF, request.clone(), &projects(&request, true), Timestamp(0)).expect("admitted");
         home
     }
 
     fn apply(home: &mut Home<Convoy>, event: &Value) -> Step {
         let o = payload(event);
+        let name = convoy(home).name().to_owned();
         let mut world = MemoryConvoyWorld::default().with_limits(4, 1);
         let authority = Ref::new(DECIDER);
         let by = SeatName::new(DECIDER, "");
@@ -332,16 +446,16 @@ impl Conformance for ConvoyConformance {
                     target: address(&definition["target"]),
                     owner: seat(&o["owner"]),
                 };
-                outcome(home.apply(NAME, declare, &world, at))
+                outcome(home.apply(&name, declare, &world, at))
             }
             "Submit" => {
                 let reference = address(&o["reference"]);
                 let durable = Ref::new(reference.as_str());
                 world.durable.put(&durable, boolean(&o["durable"]));
                 let submit = Submit { promise: promise(), by: seat(&o["by"]), address: reference, revision: REVISION.into(), durable };
-                outcome(home.apply(NAME, submit, &world, at))
+                outcome(home.apply(&name, submit, &world, at))
             }
-            "Reject" => outcome(home.apply(NAME, Reject { promise: promise() }, &world, at)),
+            "Reject" => outcome(home.apply(&name, Reject { promise: promise() }, &world, at)),
             "Keep" => {
                 let k = payload(o);
                 let keep = match tag(o) {
@@ -353,7 +467,7 @@ impl Conformance for ConvoyConformance {
                         reason: text(&k["reason"]).into(),
                     },
                 };
-                outcome(home.apply(NAME, keep, &world, at))
+                outcome(home.apply(&name, keep, &world, at))
             }
             "Retract" => {
                 let retract = Retract {
@@ -362,14 +476,14 @@ impl Conformance for ConvoyConformance {
                     authority: authority_of(&o["authority"]),
                     reason: text(&o["reason"]).into(),
                 };
-                outcome(home.apply(NAME, retract, &world, at))
+                outcome(home.apply(&name, retract, &world, at))
             }
             "Reassign" => {
                 let reassign =
                     Reassign { promise: promise(), to: seat(&o["to"]), by: seat(&o["by"]), authority: authority_of(&o["authority"]) };
-                outcome(home.apply(NAME, reassign, &world, at))
+                outcome(home.apply(&name, reassign, &world, at))
             }
-            "RetireDuty" => outcome(home.apply(NAME, RetireDuty { duty: DutyId(id(&o["duty"])), by, authority }, &world, at)),
+            "RetireDuty" => outcome(home.apply(&name, RetireDuty { duty: DutyId(id(&o["duty"])), by, authority }, &world, at)),
             "AddSeat" => {
                 let add = AddSeat {
                     seat: seat(&o["seat"]),
@@ -378,34 +492,47 @@ impl Conformance for ConvoyConformance {
                     by,
                     authority,
                 };
-                outcome(home.apply(NAME, add, &world, at))
+                outcome(home.apply(&name, add, &world, at))
             }
             "Resupervise" => {
                 let change = Resupervise { seat: seat(&o["seat"]), supervised_by: address(&o["supervisedBy"]), by, authority };
-                outcome(home.apply(NAME, change, &world, at))
+                outcome(home.apply(&name, change, &world, at))
             }
-            "RetireSeat" => outcome(home.apply(NAME, RetireSeat { seat: seat(&o["seat"]), by, authority }, &world, at)),
-            "Rollover" => outcome(home.apply(NAME, Rollover { by, authority }, &world, at)),
-            "ReplaceSeat" => outcome(home.apply(NAME, ReplaceSeat(seat(o)), &world, at)),
-            "Deliver" => outcome(home.apply(NAME, Deliver, &world, at)),
-            "Abandon" => outcome(home.apply(NAME, Abandon { by, reason: text(&o["reason"]).into(), authority }, &world, at)),
-            "Readmit" => outcome(home.apply(NAME, Readmit { quota: quota_of(&o["quota"]), by, authority }, &world, at)),
+            "RetireSeat" => outcome(home.apply(&name, RetireSeat { seat: seat(&o["seat"]), by, authority }, &world, at)),
+            "FailSeat" => {
+                let fail = FailSeat { seat: seat(&o["seat"]), reason: text(&o["reason"]).into(), by, authority };
+                outcome(home.apply(&name, fail, &world, at))
+            }
+            "ReplaceSeat" => outcome(home.apply(&name, ReplaceSeat(seat(o)), &world, at)),
+            "Link" => {
+                let link = Link { subject: address(&o["subject"]), source: link_source_of(&o["source"]), by, authority };
+                outcome(home.apply(&name, link, &world, at))
+            }
+            "Unlink" => outcome(home.apply(&name, Unlink { subject: address(&o["subject"]), by, authority }, &world, at)),
+            "Deliver" => outcome(home.apply(&name, Deliver { disposition: text(&o["disposition"]).into() }, &world, at)),
+            "Abandon" => {
+                let abandon = Abandon { by, cause: cause_of(&o["cause"]), reason: text(&o["reason"]).into(), authority };
+                outcome(home.apply(&name, abandon, &world, at))
+            }
+            "Retire" => {
+                // Unread holds are absent from the world.
+                let holds = Ref::new("holds");
+                if tag(o) == "Read" {
+                    world.holds.put(&holds, set(payload(o)).iter().map(|hold| text(hold).to_owned()).collect());
+                }
+                outcome(home.apply(&name, Retire { holds }, &world, at))
+            }
             other => panic!("convoy event {other}"),
         }
     }
 
     fn encode(home: &Home<Convoy>) -> Value {
-        let c = home.get(NAME).expect("exists");
-        let work = work(c.spec(), c.state());
-        match c.state() {
-            ConvoyState::Open { .. } => variant("Open", work),
-            ConvoyState::Delivered { .. } => variant("Delivered", work),
-            ConvoyState::Abandoned { reason, .. } => variant("Abandoned", json!({ "work": work, "reason": reason })),
-        }
+        let c = convoy(home);
+        parts(c.spec(), c.state())
     }
 
     fn version(home: &Home<Convoy>) -> u64 {
-        home.get(NAME).expect("exists").version().0
+        convoy(home).version().0
     }
 }
 
@@ -418,7 +545,7 @@ fn check_admissions(nodes: &[Value], report: &mut Report) {
         let request_value = request;
         let request = request_of(request_value);
         let world = projects(&request, boolean(&request_value["projectKnown"]));
-        let rust = match home.create(NAME, request.clone(), &world, Timestamp(0)) {
+        let rust = match home.create(LAUNCH_OF, request.clone(), &world, Timestamp(0)) {
             Ok(_) => variant("Moved", ConvoyConformance::encode(&home)),
             Err(WriteError::Refused(r)) => variant("Refused", refusal_of(r)),
             Err(other) => panic!("admission of {}: {other:?}", show(request_value)),
@@ -438,7 +565,7 @@ fn check_admissions(nodes: &[Value], report: &mut Report) {
 #[test]
 #[ignore = "export graphs with specs/primitives/check.sh"]
 fn convoy_follows_the_full_graph() {
-    let nodes = graph::load(ConvoyConformance::MACHINE);
+    let nodes = spec_nodes(&graph::load(ConvoyConformance::MACHINE));
     let mut report = Report::new("convoy");
     check_admissions(&nodes, &mut report);
     graph::check::<ConvoyConformance>(&nodes, &mut report);

@@ -3,17 +3,22 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeZone, Utc};
+use flotilla_core::primitives::convert::{AtLaunches, Conversion};
 use flotilla_core::primitives::{
-    convert::Conversion,
-    demand_import::{import_demands, DemandRecords, OldDemand},
+    demand_import::{
+        import_demands,
+        retired::{
+            DemandAddressee, DemandSpec, DemandState, DemandStatus, DemandTransition, RetiredDemand, CREDENTIAL_REFRESH_REASON_ANNOTATION,
+            CREDENTIAL_REFRESH_VESSEL_ANNOTATION,
+        },
+        DemandRecords, OldDemand,
+    },
     import::{check, Imported},
-    roles::FleetRoles,
-    OldStoreRecords,
 };
+use flotilla_engine_messages::{roles::FleetRoles, OldStoreRecords};
 use flotilla_protocol::{PrincipalRef, ResourceRef};
 use flotilla_resources::{
-    Convoy, ConvoyEnsure, ConvoySpec, Demand, DemandKind, DemandSpec, DemandState, DemandStatus, DemandTransition, ObjectMeta,
-    ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION,
+    Convoy, ConvoyEnsure, ConvoySpec, ConvoyStatus, ObjectMeta, ResourceObject, TerminalSession, Vessel, WorkflowSnapshot, CONVOY_LABEL,
     ROLE_LABEL,
 };
 use flotilla_state_machines::machines::message::MessageState;
@@ -78,7 +83,7 @@ struct Drawn {
     verdict: bool,
 }
 
-fn demand(index: usize, drawn: &Drawn) -> ResourceObject<Demand> {
+fn demand(index: usize, drawn: &Drawn) -> RetiredDemand {
     let convoy = |name: &str| ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", name);
     let (name, target) = match drawn.writer {
         Writer::Hold => (format!("ensure-attention-standing-{index}"), convoy("demo")),
@@ -98,22 +103,23 @@ fn demand(index: usize, drawn: &Drawn) -> ResourceObject<Demand> {
         }
         Writer::Unknown => (format!("surprise-{index}"), convoy("demo")),
     };
-    let mut spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, PrincipalRef::implicit_for_namespace("flotilla"));
-    if drawn.options {
-        spec.retired_response_options = Some(json!([{"name": "approve", "title": "Approve"}]));
-    }
+    let spec = DemandSpec {
+        originating_work_ref: target,
+        addressee: DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") },
+        retired_response_options: drawn.options.then(|| json!([{"name": "approve", "title": "Approve"}])),
+        retired_human_gate: None,
+    };
     let status = DemandStatus {
         state: drawn.state,
-        raised: Some(DemandTransition { as_of: at(2_000 + index as i64), authority: "writer".into() }),
+        raised: Some(DemandTransition { as_of: at(2_000 + index as i64) }),
         retired_verdict: drawn.verdict.then(|| json!({"disposition": {"kind": "other"}})),
-        ..DemandStatus::default()
     };
     let mut metadata = meta(&name);
     if drawn.writer == Writer::Credential {
         metadata.annotations.insert(CREDENTIAL_REFRESH_REASON_ANNOTATION.into(), "refused".into());
         metadata.annotations.insert(CREDENTIAL_REFRESH_VESSEL_ANNOTATION.into(), "work".into());
     }
-    ResourceObject { metadata, spec, status: Some(status) }
+    RetiredDemand { metadata, spec, status: Some(status) }
 }
 
 #[hegel::test(test_cases = 200)]
@@ -134,7 +140,18 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
         vec![ResourceObject {
             metadata: meta("demo"),
             spec: ConvoySpec::builder().workflow_ref("w".into()).project_ref("flotilla".into()).build(),
-            status: None,
+            // Bootstrapped, so it imports as a launch.
+            status: Some(ConvoyStatus {
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    vessels: Vec::new(),
+                }),
+                ..Default::default()
+            }),
         }]
     } else {
         Vec::new()
@@ -158,12 +175,15 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
     let roles = FleetRoles::declared("lab").expect("roles");
     let old_store =
         OldStoreRecords::from_records("flotilla", Vec::new(), convoys.clone(), terminals.clone(), Vec::new(), Vec::new(), Vec::new());
-    let conversion = Conversion { roles: &roles, forges: &[], records: &old_store };
+    let launches = flotilla_resources::convoy::engine::ImportedLaunches::number(convoys.iter().map(|convoy| (HOME, convoy)));
+    let launched = AtLaunches { records: &old_store, launches: &launches, namespace: "flotilla" };
+    let conversion = Conversion { roles: &roles, forges: &[], records: &launched };
     let records = DemandRecords {
         convoys: convoys.iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect(),
         ensures: ensures.iter().map(|ensure| (ensure.metadata.name.clone(), ensure)).collect(),
         vessels: vessels.iter().collect(),
         terminals: terminals.iter().map(|terminal| (terminal.metadata.name.clone(), terminal)).collect(),
+        tombstones: Default::default(),
     };
     let old: Vec<_> = demands.iter().map(|record| OldDemand { record, home: HOME.into() }).collect();
     let results = import_demands(&old, &|_| 1, &conversion, &records);
@@ -185,14 +205,19 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
         let resolved = matches!(drawn.state, DemandState::Satisfied | DemandState::Acknowledged);
         let shape_refused = !resolved && (drawn.options || drawn.verdict || drawn.writer == Writer::Unknown);
         let held_by_another_record = matches!(drawn.writer, Writer::TerminalAttention | Writer::DeclarationRefused);
+        // #3108: an open demand about a convoy this host does not hold is refused, never dropped.
+        let convoy_gone = !resolved && !shape_refused && !held_by_another_record && !convoy_held;
         match result {
-            Err(refusal) => assert!(shape_refused, "{name} refused: {}", refusal.reason),
+            Err(refusal) => assert!(
+                shape_refused || (convoy_gone && refusal.reason.contains("names a convoy not in this host's replica")),
+                "{name} refused: {}",
+                refusal.reason
+            ),
             Ok(Imported::Dropped(dropped)) => {
-                assert!(!shape_refused, "{name} dropped as {}", dropped.reason);
+                assert!(!shape_refused && !convoy_gone, "{name} dropped as {}", dropped.reason);
                 assert!(
                     held_by_another_record
                         || resolved
-                        || !convoy_held
                         || (drawn.writer == Writer::Credential && dropped.reason == "folded into its vessel's attention"),
                     "{name} dropped as {}",
                     dropped.reason
@@ -214,6 +239,15 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
                 assert_eq!(message.resource.spec().sender.as_str(), format!("fleet:lab/role:{sender}"));
                 assert_eq!(message.resource.spec().inbox.as_str(), "project:flotilla/role:operator");
                 assert!(message.resource.spec().subject().is_some(), "one subject");
+                // #3108: the convoy is named by the launch it imports as. A standing role's attention
+                // names its generation by the role's launch name instead, which the daemon's import
+                // tests cover with a real generation.
+                let standing = matches!(drawn.writer, Writer::Hold | Writer::Drift);
+                for reference in message.resource.spec().references.iter().filter(|_| !standing) {
+                    if let Some(convoy) = reference.address.get(flotilla_resources::address::AddressKind::Convoy) {
+                        assert_eq!(convoy, "demo#1", "{}", reference.address);
+                    }
+                }
                 credential_messages += usize::from(drawn.writer == Writer::Credential);
                 versions.push(message.resource.version().0);
             }

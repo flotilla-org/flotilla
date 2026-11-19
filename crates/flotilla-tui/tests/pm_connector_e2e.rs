@@ -20,12 +20,15 @@ use flotilla_manifest::{
     sink::{PatchSink, WheelhouseHttpSink},
     wire::{MetadataPatch, MetadataTarget, MetadataValue},
 };
-use flotilla_protocol::{HostName, IssueSource, NodeId, Relationship, Subject, SubjectKind};
+use flotilla_protocol::{HostName, IssueSource, Relationship, Subject, SubjectKind};
+use flotilla_provisioning::engine::observations::EngineObservations;
+use flotilla_provisioning_testkit::other_home::OtherHome;
 use flotilla_resources::{
-    ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy,
-    ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyPhase, ConvoySpec, ConvoyStatus, DeclaredSubject, InputMeta, Observation,
-    ObservedChangeRequestState, Project, ProjectSpec, ResourceObject, WatchEvent, ENSURED_FROM_ANNOTATION,
+    engine_records::KindRecords, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Convoy,
+    ConvoyEnsure, ConvoyEnsureSpec, ConvoySpec, DeclaredSubject, HostSpec, HostStatus, InputMeta, IssueSourceBindingSpec, Observation,
+    ObservedChangeRequestState, ProjectSpec, SystemClock, ENSURED_FROM_ANNOTATION,
 };
+use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::ResourceBackend;
 
 #[derive(Default)]
@@ -95,43 +98,37 @@ fn status(title: &str, time: i64) -> ChangeRequestStatus {
         review_requested_from_owner: Observation::default(),
     }
 }
-async fn seed(backend: &ResourceBackend, namespace: &str) -> ResourceObject<ChangeRequest> {
+/// Admits attempt `name` of the governor's standing role with `spec` at `daemon`'s engine, returning its launch.
+async fn admit_attempt(daemon: &InProcessDaemon, name: &str, spec: ConvoySpec) -> String {
+    let mut convoy =
+        flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, flotilla_engine_convoys_testkit::single_agent("governor"));
+    convoy.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "governor".into());
+    flotilla_daemon_testkit::engine::admit_convoy(daemon, convoy).await
+}
+async fn seed(daemon: &InProcessDaemon, backend: &ResourceBackend, namespace: &str) -> String {
+    let launch = admit_attempt(
+        daemon,
+        "attempt-1",
+        ConvoySpec::builder()
+            .workflow_ref("dev".into())
+            .role("governor".into())
+            .generation(1)
+            .project_ref("platform".into())
+            .subjects(vec![DeclaredSubject {
+                subject: Subject {
+                    kind: SubjectKind::ChangeRequest,
+                    source: IssueSource { service: "github.com".into(), scope: "org/platform".into() },
+                    id: "42".into(),
+                },
+                relationship: Relationship::Produces,
+                issue: None,
+                change_request: None,
+            }])
+            .build(),
+    )
+    .await;
+    // The launch is the role's current generation: its newest live convoy ensured from it.
     backend
-        .using::<Project>(namespace)
-        .create(&meta("platform"), &ProjectSpec::builder().display_name("Platform".into()).default_workflow_ref("dev".into()).build())
-        .await
-        .expect("project");
-    let mut convoy_meta = meta("attempt-1");
-    convoy_meta.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "governor".into());
-    let convoy = backend
-        .using::<Convoy>(namespace)
-        .create(
-            &convoy_meta,
-            &ConvoySpec::builder()
-                .workflow_ref("dev".into())
-                .role("governor".into())
-                .generation(1)
-                .project_ref("platform".into())
-                .subjects(vec![DeclaredSubject {
-                    subject: Subject {
-                        kind: SubjectKind::ChangeRequest,
-                        source: IssueSource { service: "github.com".into(), scope: "org/platform".into() },
-                        id: "42".into(),
-                    },
-                    relationship: Relationship::Produces,
-                    issue: None,
-                    change_request: None,
-                }])
-                .build(),
-        )
-        .await
-        .expect("convoy");
-    backend
-        .using::<Convoy>(namespace)
-        .update_status("attempt-1", &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() })
-        .await
-        .expect("active convoy");
-    let ensure = backend
         .using::<ConvoyEnsure>(namespace)
         .create(
             &meta("governor"),
@@ -144,62 +141,59 @@ async fn seed(backend: &ResourceBackend, namespace: &str) -> ResourceObject<Chan
         )
         .await
         .expect("standing role");
-    let ensure = backend.using::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await.expect("local ensure version");
-    backend
-        .using::<ConvoyEnsure>(namespace)
-        .update_status(
-            "governor",
-            &ensure.metadata.resource_version,
-            &ConvoyEnsureStatus { convoy_ref: Some("attempt-1".into()), ..Default::default() },
-        )
-        .await
-        .expect("current attempt");
-    let cr = backend
-        .using::<ChangeRequest>(namespace)
-        .create(
-            &meta(&cr_name()),
-            &ChangeRequestSpec::builder()
-                .service("github.com".into())
-                .scope("org/platform".into())
-                .number(42)
-                .observing_authority("remote".into())
-                .subject_of(vec![ChangeRequestSubjectHistory {
-                    namespace: namespace.into(),
-                    convoy: "attempt-1".into(),
-                    origin: "local".into(),
-                    relationship: Relationship::Produces,
-                    role: "governor".into(),
-                    project: Some("platform".into()),
-                    last_seen: chrono::Utc::now(),
-                }])
-                .build(),
-        )
-        .await
-        .expect("subject");
-    backend
-        .using::<ChangeRequest>(namespace)
-        .update_status(&cr_name(), &cr.metadata.resource_version, &status("initial", 1))
-        .await
-        .expect("subject status")
+    launch
 }
 
-// #2523 acceptance: local and replica subjects retain project/role edges and
-// opening recipes across bootstrap, updates, deletions and reconnect.
+/// The forge observer of github.com org/platform: another daemon, whose log reaches the daemon
+/// under test. It declared Project platform with that source, so it observes change request 42.
+struct RemoteObserver {
+    home: OtherHome,
+    records: EngineObservations,
+    daemon: Arc<Service>,
+}
+impl RemoteObserver {
+    async fn open(daemon: Arc<Service>) -> Self {
+        let home = OtherHome::open("remote");
+        let heartbeat = HostStatus { heartbeat_at: Some(chrono::Utc::now()), ..Default::default() };
+        home.host("remote", &HostSpec { display_name: "remote".into(), ..Default::default() }, Some(&heartbeat)).await;
+        let source = IssueSource { service: "github.com".into(), scope: "org/platform".into() };
+        let project = ProjectSpec::builder()
+            .display_name("Platform".into())
+            .default_workflow_ref("dev".into())
+            .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source).alias("platform".into()).build()])
+            .build();
+        home.project("platform", &Default::default(), &Default::default(), &project).await;
+        home.replicate_to(&daemon);
+        let records = EngineObservations::open(Arc::clone(home.service()), Arc::new(SystemClock)).expect("remote observations");
+        Self { home, records, daemon }
+    }
+    async fn observe(&self, title: &str, time: i64) {
+        let spec = ChangeRequestSpec::builder()
+            .service("github.com".into())
+            .scope("org/platform".into())
+            .number(42)
+            .observing_authority("remote".into())
+            .build();
+        let records: &dyn KindRecords<ChangeRequest> = &self.records;
+        let written = records.apply(&cr_name(), None, &Default::default(), &Default::default(), &spec).await.expect("observed");
+        records.set_status(&cr_name(), written.version, &status(title, time)).await.expect("observed status");
+        self.home.replicate_to(&self.daemon);
+    }
+    async fn forget(&self) {
+        KindRecords::<ChangeRequest>::delete(&self.records, &cr_name()).await.expect("forgotten");
+        self.home.replicate_to(&self.daemon);
+    }
+}
+
+// #2523 acceptance: an observed subject keeps its project/role edges and opening
+// recipes across bootstrap, updates, deletions and reconnect. The observation is
+// another daemon's, replicated in; the runtime graph is local.
 async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     let _ = tracing_subscriber::fmt().with_env_filter("info").with_test_writer().try_init();
     let tmp = tempfile::tempdir().expect("config");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-e2e-2523\"\n").expect("config");
     let config = Arc::new(ConfigStore::with_base(tmp.path()));
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let source = ResourceBackend::new(InMemoryBackend::default());
-    let remote = seed(&source, "flotilla").await;
-    // Only the observation is replicated; the runtime graph is local.
-    let local = seed(&backend, "flotilla").await;
-    backend
-        .replica_writer::<ChangeRequest>(NodeId::new("remote"), "flotilla")
-        .apply(WatchEvent::Added(remote.clone()), chrono::Utc::now())
-        .await
-        .expect("replica");
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         config.clone(),
@@ -222,6 +216,10 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     )
     .await
     .expect("runtime");
+    // The engine-served kinds are written once the runtime has installed the engine.
+    let remote = RemoteObserver::open(daemon.decided_store().expect("decided store")).await;
+    let first = seed(&daemon, &backend, "flotilla").await;
+    remote.observe("initial", 1).await;
     let query_state = daemon.aggregator_projection_state().await;
     let baseline_queries = query_state.subscribed_queries();
     let sink = Arc::new(Sink { forward, ..Default::default() });
@@ -245,40 +243,17 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     wait("standing-role current attempt", || sink.value(&role, "flotilla.role.current_attempt").is_some()).await;
     assert!(sink.value(&role, "flotilla.role.attempts").is_some(), "attempt history published");
     // Queued writes happen without waiting for the consumer between them.
-    let mut remote = remote;
     for time in 2..=5 {
-        remote.status = Some(status(&format!("replica-{time}"), time));
-        backend
-            .replica_writer::<ChangeRequest>(NodeId::new("remote"), "flotilla")
-            .apply(WatchEvent::Modified(remote.clone()), chrono::Utc::now())
-            .await
-            .expect("replica update");
+        remote.observe(&format!("replica-{time}"), time).await;
     }
     // A second attempt updates the stable role without rebuilding the connection.
-    let previous = backend.using::<Convoy>("flotilla").get("attempt-1").await.expect("previous attempt");
-    let mut second_meta = meta("attempt-2");
-    second_meta.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "governor".into());
+    let previous = backend.using::<Convoy>("flotilla").get(&first).await.expect("previous attempt");
     let mut second_spec = previous.spec;
     second_spec.generation = 2;
-    let second = backend.using::<Convoy>("flotilla").create(&second_meta, &second_spec).await.expect("second attempt");
-    backend
-        .using::<Convoy>("flotilla")
-        .update_status("attempt-2", &second.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() })
-        .await
-        .expect("second active attempt");
-    let ensure = backend.using::<ConvoyEnsure>("flotilla").get("governor").await.expect("standing role version");
-    backend
-        .using::<ConvoyEnsure>("flotilla")
-        .update_status(
-            "governor",
-            &ensure.metadata.resource_version,
-            &ConvoyEnsureStatus { convoy_ref: Some("attempt-2".into()), ..Default::default() },
-        )
-        .await
-        .expect("new current attempt");
+    let second = admit_attempt(&daemon, "attempt-2", second_spec).await;
     wait("new current attempt", || {
         sink.value(&role, "flotilla.role.current_attempt")
-            == Some(MetadataValue::EntityRefs(vec![entity::convoy("flotilla", "attempt-2", "local")]))
+            == Some(MetadataValue::EntityRefs(vec![entity::convoy("flotilla", &second, "local")]))
     })
     .await;
     wait(
@@ -287,35 +262,17 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     )
     .await;
     wait("queued replica updates", || sink.value(&target, "flotilla.change_request.title") == Some(MetadataValue::text("replica-5"))).await;
-    backend
-        .replica_writer::<ChangeRequest>(NodeId::new("remote"), "flotilla")
-        .apply(WatchEvent::Deleted(remote.clone()), chrono::Utc::now())
-        .await
-        .expect("replica deletion");
-    wait("local source survives replica removal", || {
-        sink.value(&target, "flotilla.change_request.title") == Some(MetadataValue::text("initial"))
-    })
-    .await;
-    backend.using::<ChangeRequest>("flotilla").delete(&local.metadata.name).await.expect("local deletion");
-    wait("last source removal", || sink.value(&target, "flotilla.change_request.title").is_none()).await;
-    // Re-add a source, then delete it while disconnected below.
-    remote.status = Some(status("reconnect-source", 6));
-    backend
-        .replica_writer::<ChangeRequest>(NodeId::new("remote"), "flotilla")
-        .apply(WatchEvent::Added(remote.clone()), chrono::Utc::now())
-        .await
-        .expect("reconnect source");
+    remote.forget().await;
+    wait("source removal", || sink.value(&target, "flotilla.change_request.title").is_none()).await;
+    // Re-add the source, then delete it while disconnected below.
+    remote.observe("reconnect-source", 6).await;
     wait("source restored", || sink.value(&target, "flotilla.change_request.title") == Some(MetadataValue::text("reconnect-source"))).await;
     // Stay alive beyond several of the reported ~2-second churn periods.
     tokio::select! { result = &mut connector => panic!("connector exited: {result:?}"), _ = tokio::time::sleep(Duration::from_secs(7)) => {} }
     connector.abort();
     let _ = connector.await;
     wait("query cleanup on cancellation", || query_state.subscribed_queries() == baseline_queries).await;
-    backend
-        .replica_writer::<ChangeRequest>(NodeId::new("remote"), "flotilla")
-        .apply(WatchEvent::Deleted(remote), chrono::Utc::now())
-        .await
-        .expect("offline deletion");
+    remote.forget().await;
     let restarted = start();
     wait("offline deletion retraction", || sink.value(&target, "flotilla.change_request.title").is_none()).await;
     // A fresh bootstrap must retract observations removed while disconnected.
@@ -324,7 +281,7 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     restarted.abort();
     let _ = restarted.await;
     assert_eq!(query_state.subscribed_queries(), baseline_queries, "reconnect cleanup releases named query demand");
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 #[tokio::test]
 async fn connector_real_daemon_subject_lifecycle() {

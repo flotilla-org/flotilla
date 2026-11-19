@@ -7,11 +7,8 @@ use flotilla_protocol::{
     CommandValue, DaemonEvent, EvidenceFreshness, ExplainedCondition, NodeId, RepoIdentity, ResourceCursor, ResourceReadEnvelope,
     ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StepStatus,
 };
-use flotilla_resources::{ConditionValue, IntegrationCondition, ResourceError, ResourceProvenance, WatchStart};
-use flotilla_store::{
-    watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources,
-    ResourceBackend,
-};
+use flotilla_resources::{ConditionValue, IntegrationCondition, ResourceProvenance, WatchStart};
+use flotilla_store::{watch_resource_kind_with, DynamicWatchRequest, ResourceBackend};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +21,6 @@ pub struct ResourceWatchCommandContext {
     kind: String,
     name: Option<String>,
     include_replicas: bool,
-    replica_sources: bool,
     cursor: Option<ResourceCursor>,
     command_id: u64,
     node_id: NodeId,
@@ -42,18 +38,11 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
         }),
         Err(message) => return CommandValue::Error { message },
     };
-    // This routed continuous consumer owns retry; raw registry APIs keep their
-    // bounded read deadline. Cancellation below also drops any partial setup.
-    let setup = flotilla_store::retry_store_read(|| async {
-        match (context.replica_sources, context.include_replicas, start.clone()) {
-            (true, _, Some(_)) => Err(ResourceError::invalid("replica-source watches do not support cursor resume")),
-            (true, _, None) => watch_resource_kind_replica_sources(&context.backend, &context.namespace, &context.kind).await,
-            (false, true, Some(_)) => Err(ResourceError::invalid("include-replicas watches do not support cursor resume")),
-            (false, true, None) => watch_resource_kind_including_replicas(&context.backend, &context.namespace, &context.kind).await,
-            (false, false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
-            (false, false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,
-        }
-    });
+    // Cancellation below also drops any partial setup.
+    // Bookmarks carry the cursor a client resumes from after a drop: an object's resourceVersion
+    // is no position.
+    let request = DynamicWatchRequest { start, include_replicas: context.include_replicas, bookmarks: true };
+    let setup = watch_resource_kind_with(&context.backend, &context.namespace, &context.kind, request);
     let result = tokio::select! {
         biased;
         _ = context.token.cancelled() => return CommandValue::Cancelled,
@@ -109,17 +98,39 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
         ),
     );
 
+    // The newest bookmark's position, or the list's: a resume from it delivers again any change
+    // after it, so each event carries it rather than its object's resourceVersion.
+    let mut cursor = ResourceCursor::from_position(initial_resource_version, generation.clone());
     let mut stream = watch.stream;
     loop {
         tokio::select! {
             _ = context.token.cancelled() => return CommandValue::Cancelled,
             event = stream.next() => {
                 match event {
+                    Some(Ok(event)) if event["type"] == "BOOKMARK" => {
+                        let Some(position) = event["object"]["metadata"]["resourceVersion"].as_str() else {
+                            return CommandValue::Error { message: "resource watch bookmark is missing resourceVersion".to_string() };
+                        };
+                        cursor = ResourceCursor::from_position(position.to_owned(), generation.clone());
+                        send_resource_watch_event(
+                            &context.event_sink,
+                            context.command_id,
+                            &context.node_id,
+                            &context.repo_identity,
+                            resource_read_envelope(
+                                resource_kind.clone(),
+                                plural.clone(),
+                                namespace.clone(),
+                                cursor.clone(),
+                                vec![ResourceReadRecord {
+                                    record_type: ResourceRecordType::Bookmark,
+                                    provenance: ResourceRecordProvenance::Local { node_id: context.node_id.clone() },
+                                    object: None,
+                                }],
+                            ),
+                        );
+                    }
                     Some(Ok(event)) => {
-                        let resource_version = event["object"]["metadata"]["resourceVersion"]
-                            .as_str()
-                            .unwrap_or(&initial_resource_version)
-                            .to_string();
                         let record = match resource_watch_record(event, &context.node_id) {
                             Ok(Some(record)) => record,
                             Ok(None) => continue,
@@ -135,7 +146,7 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
                                     resource_kind.clone(),
                                     plural.clone(),
                                     namespace.clone(),
-                                    ResourceCursor::from_position(resource_version, generation.clone()),
+                                    cursor.clone(),
                                     vec![record],
                                 ),
                             );
@@ -258,6 +269,42 @@ fn resource_record_matches_name(record: &ResourceReadRecord, name: Option<&str>)
     })
 }
 
+/// A checkout's inspected judgement as the explanation shows it: observed when it was last
+/// inspected, and fresh only while that inspection is, so a checkout nothing has re-inspected
+/// since its files changed reads stale rather than fresh at every read (#3108, run 4 R4-3).
+pub fn explain_judgement(
+    judged: Option<bool>,
+    details: &[String],
+    integration: &flotilla_resources::checkout_records::Integration,
+    now: DateTime<Utc>,
+    ttl: Duration,
+) -> ExplainedCondition {
+    ExplainedCondition {
+        value: match judged {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unknown",
+        }
+        .to_string(),
+        observed_at: Some(integration.inspected_at.to_rfc3339()),
+        freshness: if integration.inspected_within(now, ttl) { EvidenceFreshness::Fresh } else { EvidenceFreshness::Stale },
+        details: details.to_vec(),
+    }
+}
+
+/// Where a checkout's record is held: this node, or its home.
+pub fn checkout_provenance(
+    checkout: &flotilla_resources::checkout_records::CheckoutRecord,
+    local_node_id: &NodeId,
+) -> ResourceRecordProvenance {
+    if checkout.home == local_node_id.as_str() {
+        ResourceRecordProvenance::Local { node_id: local_node_id.clone() }
+    } else {
+        let confirmed_at = checkout.integration.as_ref().map_or(checkout.requested_at, |integration| integration.confirmed_at);
+        ResourceRecordProvenance::Replica { origin_root: NodeId::new(checkout.home.clone()), last_synced_at: confirmed_at.to_rfc3339() }
+    }
+}
+
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
@@ -276,7 +323,6 @@ mod cancellation_tests {
             .namespace("flotilla".into())
             .kind("not-a-registered-kind".into())
             .include_replicas(false)
-            .replica_sources(false)
             .command_id(1)
             .node_id(NodeId::new("local"))
             .repo_identity(RepoIdentity { authority: String::new(), path: String::new() })

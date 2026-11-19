@@ -16,20 +16,44 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_schema::{Edge, Frozen, Ref, State, Stored};
 use flotilla_state_machines::{
     machines::lifecycle::{
-        Absence, Attempted, GiveUp, Lifecycle, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld, Observed, Realisation,
-        Realise, Release, Teardown, Vanish,
+        Absence, Attempted, FailedEarly, GiveUp, Lifecycle, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld, Observed,
+        Realisation, Realise, Release, Teardown, Vanish,
     },
     machines::vessel::Vessel,
-    Resource,
+    Cause, CauseCategory, Failure, Outcome, Resource,
 };
 use hegel::{generators as gs, TestCase};
 use serde::{Deserialize, Serialize};
 
 use super::{
+    code_enum,
     engine::{self, resource, Candidate},
-    ensure::{cause, outcome, tally},
     key, list, name, reference, text, timestamp, Fixture, Pick,
 };
+
+fn cause(tc: &TestCase, pick: Pick) -> Cause {
+    use CauseCategory::*;
+    Cause { category: code_enum(tc, pick, &[Transient, Refused, Misconfigured, MissingCapability, External]), detail: text(tc) }
+}
+
+/// A coherent attempt tally: a latest failure (the base 2 digit at `place`), retryable or not (the
+/// next digit), behind one to three consecutive failures, or none. Covering reaches a tally that
+/// a failure that cannot be retried exhausts.
+fn tally(tc: &TestCase, pick: Pick, place: usize) -> (u32, Option<Failure>) {
+    if pick.digit(tc, 2, place) != 0 {
+        return (0, None);
+    }
+    let failure = Failure { at: timestamp(tc), cause: cause(tc, pick), retryable: pick.digit(tc, 2, place * 2) == 0 };
+    (tc.draw(gs::integers::<u32>().min_value(1).max_value(3)), Some(failure))
+}
+
+/// Both outcomes in turn when covering, every cause category across rounds.
+fn outcome(tc: &TestCase, pick: Pick) -> Outcome {
+    match pick.variant(tc, 2, |index| index) {
+        0 => Outcome::Succeeded,
+        _ => Outcome::Failed { cause: cause(tc, pick), retryable: pick.some(tc, 8) },
+    }
+}
 
 /// The test lifecycle kind: its name, request and the default retry policy.
 pub struct Terminal;
@@ -152,8 +176,8 @@ fn boxed(world: MemoryLifecycleWorld) -> Box<dyn LifecycleWorld> {
 }
 
 /// Every edge a live lifecycle resource in `state` may take: realising under an observed identity,
-/// releasing once torn down, vanishing when observed absent, an attempt of either outcome, and
-/// giving up with its last failure's cause.
+/// releasing once torn down, vanishing when observed absent, an attempt of either outcome, an
+/// early failure, and giving up with its last failure's cause.
 pub fn candidates<K: LifecycleKind>(tc: &TestCase, state: &LifecycleState) -> Vec<Candidate<Lifecycle<K>>> {
     let now = timestamp(tc);
     let mut candidates = Vec::new();
@@ -171,7 +195,7 @@ pub fn candidates<K: LifecycleKind>(tc: &TestCase, state: &LifecycleState) -> Ve
     candidates.push((
         Vanish {
             cause: if tc.draw(gs::booleans()) {
-                flotilla_state_machines::machines::lifecycle::VanishCause::Lost
+                flotilla_state_machines::machines::lifecycle::VanishCause::lost()
             } else {
                 flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: text(tc) }
             },
@@ -182,6 +206,8 @@ pub fn candidates<K: LifecycleKind>(tc: &TestCase, state: &LifecycleState) -> Ve
         now,
     ));
     candidates.push((Attempted { outcome: outcome(tc, Pick::Draw) }.into(), boxed(MemoryLifecycleWorld::default()), now));
+    let early = FailedEarly { cause: cause(tc, Pick::Draw), retryable: Pick::Draw.some(tc, 8) };
+    candidates.push((early.into(), boxed(MemoryLifecycleWorld::default()), now));
     let last = match state {
         LifecycleState::Requested { last_failure, .. } => last_failure.as_ref().map(|failure| failure.cause.clone()),
         _ => None,

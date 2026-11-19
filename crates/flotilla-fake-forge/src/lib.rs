@@ -7,6 +7,7 @@
 //! Pull requests and issues share one number sequence per repository, so
 //! every host sees the same numbers.
 //!
+//! With a `git_root`, the API listener also serves [`git`]'s fetch transport.
 //! The binary serves [`api`] and the scenario controls in [`admin`] over HTTPS
 //! from a [`config::Config`], optionally seeded from a [`seed::Seed`]; see
 //! [`serve`].
@@ -15,6 +16,7 @@ pub mod admin;
 pub mod api;
 mod client;
 pub mod config;
+pub mod git;
 pub mod model;
 pub mod recorded;
 mod render;
@@ -24,8 +26,8 @@ pub mod serve;
 pub use client::InProcessClient;
 pub use config::{Config, StartupError};
 pub use model::{
-    CheckState, Clock, FakeForge, ForgeError, ForgeSettings, Item, ItemEdit, ItemState, NewIssue, NewPull, NewReview, Refusal, RepoRef,
-    ReviewState, SystemClock,
+    CheckState, Clock, FakeForge, ForgeError, ForgeSettings, Item, ItemEdit, ItemState, MergeStatus, NewIssue, NewPull, NewReview, Refusal,
+    RepoRef, ReviewState, SystemClock,
 };
 
 #[cfg(test)]

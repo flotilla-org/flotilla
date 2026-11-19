@@ -7,17 +7,21 @@ use std::{
 
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::action_support::empty_repo_identity;
-use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_daemon_api::event_sink::CompletionCapture;
 use flotilla_protocol::{
     CallerCrew, CommandAction, CommandCaller, CrewCommandContext, DaemonEvent, EnvironmentId, Message, PrincipalRef, Request, Response,
     ResponseResult,
 };
-use flotilla_resources::{TerminalSession, TerminalSessionSource, Vessel};
+use flotilla_resources::{terminal_records::launch_of, TerminalSession, TerminalSessionPhase, TerminalSessionSource, Vessel};
 use flotilla_store::StoreQuery;
 use flotilla_transport::message::MessageSession;
 
 use super::{remote_commands::RemoteCommandRouter, request_dispatch::RequestDispatcher};
 
+/// The crews placed in `environment`: each agent session there whose launch has not ended. A
+/// crew's identity is its launch's request, committed before the launch starts its process, so a
+/// crew that calls as soon as it starts is placed; its realise, committed after the process
+/// starts, adds only what the start gave it.
 pub(super) async fn environment_crews(daemon: &InProcessDaemon, environment: &EnvironmentId) -> Result<Vec<CallerCrew>, String> {
     let namespace = daemon.provisioning_namespace().await;
     let backend = daemon.resource_backend();
@@ -32,7 +36,15 @@ pub(super) async fn environment_crews(daemon: &InProcessDaemon, environment: &En
     for session in sessions.items {
         let session = session.object;
         let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { continue };
-        let Some(crew) = session.status.as_ref().and_then(|status| status.crew.as_ref()) else { continue };
+        let Some(status) = session.status.as_ref() else { continue };
+        // A launch that has ended places no crew.
+        if matches!(status.phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed | TerminalSessionPhase::Lost) {
+            continue;
+        }
+        // The crew id is its launch's name, which the request committed.
+        let Some(crew_id) = status.crew.as_ref().map(|crew| crew.id.clone()).or_else(|| launch_of(&session).map(str::to_owned)) else {
+            continue;
+        };
         let vessel = backend.using::<Vessel>(&namespace).get(&context.vessel_ref).await.map_err(|error| error.to_string())?;
         if vessel.spec.convoy_ref != context.convoy || context.namespace != namespace {
             return Err("EnvironmentIdentityInvalid: session ownership disagrees".into());
@@ -43,7 +55,7 @@ pub(super) async fn environment_crews(daemon: &InProcessDaemon, environment: &En
                 .convoy(context.convoy.clone())
                 .vessel(context.vessel_ref.clone())
                 .role(session.spec.role)
-                .crew_id(crew.id.clone())
+                .crew_id(crew_id)
                 .terminal_session(session.metadata.name)
                 .build(),
         );
@@ -68,19 +80,18 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
     // New crew operations are denied until explicitly added to this allowlist
     // with validation against the transport-bound identity.
     match request {
-        Request::Execute { command } => {
+        Request::Execute { command, .. } => {
             if command.node_id.is_some() || command.provisioning_target.is_some() || command.context_repo.is_some() {
                 return Err("EnvironmentCommandDenied: explicit routing is forbidden".into());
             }
             match &mut command.action {
-                CommandAction::CrewComplete { context, force: false, .. }
-                | CommandAction::CrewStall { context, .. }
+                CommandAction::CrewStall { context, .. }
                 | CommandAction::CrewPromise { context, .. }
                 | CommandAction::QueryCrewCapabilities { context }
                 | CommandAction::QueryCrewList { context }
                 | CommandAction::QueryMessageContacts { context } => authorize_context(context, crew),
                 CommandAction::CrewHandoff { context, target, .. } => {
-                    // Short forms are qualified using the caller's convoy by handoff_with_carries,
+                    // Short forms are qualified using the caller's convoy by handoff_with,
                     // which independently rejects a resolved foreign convoy.
                     let parts = target.split('/').collect::<Vec<_>>();
                     if parts.iter().any(|part| part.is_empty())
@@ -120,18 +131,12 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
 }
 
 /// One command is in flight per environment connection. Crew clients are serial;
-/// this avoids subscribing an idle connection to the host's event stream.
-pub(super) async fn command_completion(
-    events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
-    command_id: u64,
-) -> Result<DaemonEvent, String> {
-    loop {
-        match events.recv().await {
-            Ok(event @ DaemonEvent::CommandFinished { command_id: finished, .. }) if finished == command_id => return Ok(event),
-            Ok(_) => {},
-            Err(error) => return Err(format!("EnvironmentCompletionLost: command {command_id} outcome unavailable ({error}); it may have completed, do not retry blindly")),
-        }
-    }
+/// the capture is sent this command's completion only, never the host's event
+/// stream, so other traffic can neither crowd out its outcome nor queue behind it.
+pub(super) async fn command_completion(completion: CompletionCapture, command_id: u64) -> Result<DaemonEvent, String> {
+    completion.finished(command_id).await.ok_or_else(|| {
+        format!("EnvironmentCompletionLost: command {command_id} outcome unavailable (daemon events closed); it may have completed, do not retry blindly")
+    })
 }
 
 pub(super) async fn serve(
@@ -170,7 +175,6 @@ pub(super) async fn serve(
             connection_role: Some(flotilla_protocol::ConnectionRole::Client),
             surface: None,
             crew_claims: Default::default(),
-            primitives: false,
         })
         .await
         .is_err()
@@ -211,7 +215,7 @@ pub(super) async fn serve(
         let caller_namespace = crew.namespace.clone();
         let caller =
             CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&crew.namespace), process: None, crew: Some(crew) };
-        let mut events = daemon.subscribe();
+        let completion = daemon.capture_completion();
         let dispatcher = RequestDispatcher::new_with_caller(
             &daemon,
             &router,
@@ -221,7 +225,9 @@ pub(super) async fn serve(
             caller,
         )
         .with_placed_terminal_hooks();
-        let mut response = dispatcher.dispatch(id, request).await;
+        // One span per served request: its dispatch and, for a command, the wait for its outcome.
+        let span = tracing::info_span!("environment_connection.serve", environment = %environment, request = id);
+        let mut response = tracing::Instrument::instrument(dispatcher.dispatch(id, request), span.clone()).await;
         if let Some(project) = &scope {
             super::environment_supervision::scope_response(&mut response, &caller_namespace, project);
         }
@@ -241,7 +247,10 @@ pub(super) async fn serve(
         // Relay only this request's completion, never the host's event stream.
         if let Some(command_id) = command_id {
             let completion = tokio::select! {
-                result = command_completion(&mut events, command_id) => result,
+                result = tracing::Instrument::instrument(
+                    command_completion(completion, command_id),
+                    tracing::info_span!(parent: &span, "environment_connection.completion_wait", command_id),
+                ) => result,
                 _ = shutdown.changed() => return,
             };
             let lost = completion.is_err();
@@ -327,28 +336,26 @@ mod tests {
             Request::GetTopology,
             Request::ListRepos,
             Request::Execute {
+                request_key: None,
                 command: flotilla_protocol::Command::builder()
-                    .action(CommandAction::CrewComplete {
-                        context: CrewCommandContext::default(),
-                        message: None,
-                        disposition: None,
-                        decision_ledger_ref: None,
-                        force: true,
-                    })
+                    .action(CommandAction::CrewComplete { context: CrewCommandContext::default(), message: None, disposition: None })
                     .build(),
             },
             Request::Execute {
+                request_key: None,
                 command: flotilla_protocol::Command::builder()
                     .action(CommandAction::CrewHandoff {
                         context: CrewCommandContext::default(),
                         target: "flotilla/foreign/work/coder".into(),
                         message: "handoff".into(),
                         carries: Vec::new(),
+                        reassign: Vec::new(),
                     })
                     .build(),
             },
             Request::ArtifactList { convoy: Some("other-convoy".into()), kind: None, subject: None },
             Request::Execute {
+                request_key: None,
                 command: flotilla_protocol::Command::builder()
                     .action(CommandAction::QueryExplainConvoy { namespace: None, name: "other-convoy".into() })
                     .build(),
@@ -360,12 +367,14 @@ mod tests {
         // the core handler qualifies the address.
         for target in ["reviewer", "work/reviewer"] {
             let mut request = Request::Execute {
+                request_key: None,
                 command: flotilla_protocol::Command::builder()
                     .action(CommandAction::CrewHandoff {
                         context: CrewCommandContext::default(),
                         target: target.into(),
                         message: "handoff".into(),
                         carries: Vec::new(),
+                        reassign: Vec::new(),
                     })
                     .build(),
             };
@@ -373,12 +382,14 @@ mod tests {
         }
         for target in ["own-convoy/work/coder", "", "work/", "/coder", "flotilla/own-convoy/work/", "flotilla//work/coder"] {
             let mut request = Request::Execute {
+                request_key: None,
                 command: flotilla_protocol::Command::builder()
                     .action(CommandAction::CrewHandoff {
                         context: CrewCommandContext::default(),
                         target: target.into(),
                         message: "handoff".into(),
                         carries: Vec::new(),
+                        reassign: Vec::new(),
                     })
                     .build(),
             };
@@ -389,11 +400,12 @@ mod tests {
         assert!(matches!(request, Request::ArtifactList { convoy: Some(convoy), .. } if convoy == "own-convoy"));
     }
 
-    // A dropped completion is an unknown outcome, never an infinite wait.
-    // The second real broadcast channel has capacity one to force deterministic
-    // lag; the first has room for unrelated and own completion events.
+    // The relay waits on its own command's completion, not the daemon-wide
+    // broadcast: traffic that lags every broadcast receiver past the outcome
+    // still leaves the outcome deliverable. Only a closed sink is unknown.
     #[tokio::test]
-    async fn command_relay_returns_own_completion_and_refuses_lag() {
+    async fn command_relay_returns_own_completion_after_broadcast_lag() {
+        use flotilla_daemon_api::event_sink::{BroadcastEventSink, EventSink};
         fn finished(id: u64) -> DaemonEvent {
             DaemonEvent::CommandFinished {
                 command_id: id,
@@ -403,15 +415,30 @@ mod tests {
                 result: flotilla_protocol::CommandValue::Ok,
             }
         }
-        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
-        tx.send(finished(99)).expect("unrelated completion");
-        tx.send(finished(1)).expect("own completion");
-        assert!(matches!(command_completion(&mut rx, 1).await.expect("own event"), DaemonEvent::CommandFinished { command_id: 1, .. }));
-        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
-        tx.send(finished(1)).expect("completion that will be lost");
-        tx.send(finished(99)).expect("force lag");
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(1), command_completion(&mut rx, 1)).await.expect("lag must not hang");
+        let capacity = 4;
+        let sink = BroadcastEventSink::new(tokio::sync::broadcast::channel(capacity).0);
+        let mut broadcast = sink.subscribe();
+        let (completion, unfinished) = (sink.capture_completion(), sink.capture_completion());
+        sink.emit(finished(99));
+        sink.emit(finished(1));
+        for _ in 0..capacity * 4 {
+            sink.emit(DaemonEvent::CommandStarted {
+                command_id: 2,
+                node_id: flotilla_protocol::NodeId::new("local"),
+                repo_identity: empty_repo_identity(),
+                repo: None,
+                description: "unrelated traffic".into(),
+            });
+        }
+        assert!(matches!(broadcast.recv().await, Err(tokio::sync::broadcast::error::RecvError::Lagged(_))), "the broadcast lags");
+        let own = tokio::time::timeout(std::time::Duration::from_secs(1), command_completion(completion, 1))
+            .await
+            .expect("own completion is retained")
+            .expect("own outcome");
+        assert!(matches!(own, DaemonEvent::CommandFinished { command_id: 1, .. }));
+
+        drop(sink);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), command_completion(unfinished, 3)).await.expect("no hang");
         assert!(result.expect_err("unknown outcome").starts_with("EnvironmentCompletionLost:"));
     }
 

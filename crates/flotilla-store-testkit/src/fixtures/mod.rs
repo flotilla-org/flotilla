@@ -1,15 +1,15 @@
 #![allow(dead_code)]
 
 pub mod contract;
-pub mod owner_gc;
 
 use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
     ApiPaths, Convoy as RealConvoy, ConvoySpec as RealConvoySpec, ConvoyStatus as RealConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
-    CrewWorkState, ExitDeclaration, InputDefinition, InputMeta, ObjectMeta, OwnerReference, Resource, ResourceObject, Selector,
-    StatusPatch, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
+    CrewWorkState, ExitDeclaration, InputDefinition, InputMeta, ObjectMeta, OwnerReference, Project, ProjectRepositorySpec, ProjectSpec,
+    Repository, RepositoryKey, RepositorySpec, Resource, ResourceObject, Selector, StatusPatch, VesselRequirement, WorkCompletionAuthority,
+    WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -76,6 +76,42 @@ pub fn input_meta(name: &str) -> InputMeta {
         .call()
 }
 
+/// The project `project` with no repositories, for a convoy whose work needs none.
+pub async fn project(backend: &flotilla_store::ResourceBackend, namespace: &str, project: &str) {
+    let spec = ProjectSpec::builder().display_name(project.to_string()).build();
+    backend
+        .clone()
+        .using::<Project>(namespace)
+        .create(&InputMeta::builder().name(project.to_string()).build(), &spec)
+        .await
+        .expect("project");
+}
+
+/// The project `project` on `repository` alone, whose default branch is
+/// `default_branch`: the project a created convoy names, and takes its
+/// repositories from.
+pub async fn project_on_repository(
+    backend: &flotilla_store::ResourceBackend,
+    namespace: &str,
+    project: &str,
+    repository: &RepositorySpec,
+    default_branch: &str,
+) -> RepositoryKey {
+    let key = repository.key();
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(namespace), &key, repository).await.expect("project repository");
+    let spec = ProjectSpec::builder()
+        .display_name(project.to_string())
+        .repositories(vec![ProjectRepositorySpec::builder().repo(key.clone()).default_branch(default_branch.to_string()).build()])
+        .build();
+    backend
+        .clone()
+        .using::<Project>(namespace)
+        .create(&InputMeta::builder().name(project.to_string()).build(), &spec)
+        .await
+        .expect("project");
+    key
+}
+
 pub fn spec(template: &str) -> ConvoySpec {
     ConvoySpec { template: template.to_string() }
 }
@@ -107,7 +143,7 @@ pub async fn seed_convoy_history(
         let convoy = convoys
             .create(
                 &InputMeta::builder().name(format!("history-{index}")).build(),
-                &RealConvoySpec::builder().workflow_ref("workflow".into()).build(),
+                &RealConvoySpec::builder().workflow_ref("workflow".into()).project_ref(namespace.into()).build(),
             )
             .await?;
         convoys
@@ -129,13 +165,13 @@ pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus
         naming: None,
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -144,6 +180,7 @@ pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus
         work: Default::default(),
         promises: Default::default(),
         crew_work: Default::default(),
+        engine_launch: None,
         message: None,
         started_at: None,
         finished_at: None,
@@ -153,7 +190,6 @@ pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     }
 }
 
@@ -262,7 +298,7 @@ pub fn valid_convoy_spec() -> RealConvoySpec {
         placement_policy: Some("laptop-docker".to_string()),
         repositories: Vec::new(),
         r#ref: None,
-        project_ref: None,
+        project_ref: "flotilla".to_string(),
         adopted_checkout_refs: BTreeMap::new(),
         issues: Vec::new(),
         change_request: None,
@@ -289,7 +325,6 @@ pub fn task_provisioning_convoy_spec() -> RealConvoySpec {
 
 pub fn pending_task_state() -> WorkState {
     WorkState {
-        provisioning_retry: None,
         phase: WorkPhase::Pending,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: None,
@@ -369,13 +404,13 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
         naming: None,
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -384,6 +419,7 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
         work,
         promises: Default::default(),
         crew_work,
+        engine_launch: None,
         message: None,
         started_at: None,
         finished_at: None,
@@ -393,7 +429,6 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     }
 }
 
@@ -487,13 +522,13 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
         naming: None,
         landing_entry: None,
         landing_settlement: None,
-        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
@@ -502,6 +537,7 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
         work,
         promises: Default::default(),
         crew_work,
+        engine_launch: None,
         message: None,
         started_at: None,
         finished_at: None,
@@ -511,6 +547,5 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
-        lifecycle_mutations: Vec::new(),
     }
 }

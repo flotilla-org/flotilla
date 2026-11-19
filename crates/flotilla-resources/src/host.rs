@@ -49,6 +49,15 @@ pub const HEARTBEAT_READY_TTL_SECS: i64 = 60;
 /// stays inside [`HEARTBEAT_READY_TTL_SECS`] for any interval under 40 s.
 pub const HEARTBEAT_REFRESH_SECS: i64 = HEARTBEAT_READY_TTL_SECS / 3;
 pub const SLEEP_INHIBITION_CONDITION_TYPE: &str = "SleepInhibition";
+/// The prefix of a host's condition on whether it reaches a remote Git host:
+/// `Remote/<remote host>`. A clone's transport failure records it False at once, and the host's
+/// reachability probe records it True again; a clone of that remote waits while it is False.
+pub const REMOTE_CONDITION_PREFIX: &str = "Remote/";
+
+/// The condition type of whether this host reaches remote Git host `remote`.
+pub fn remote_condition_type(remote: &str) -> String {
+    format!("{REMOTE_CONDITION_PREFIX}{remote}")
+}
 
 /// Resolve a user-authored host resource name or display-name alias to the
 /// stable host resource identity used by comparison surfaces.
@@ -141,10 +150,10 @@ impl HostSpec {
 pub enum HostConnection {
     #[default]
     Daemon,
-    SshHost {
-        owning_daemon: String,
-        destination: String,
-    },
+    // ADR 0047: the frozen fleet (release/73aa22b9b) still stores the pre-#4001 name, which
+    // #4339 retired too early; the cut-over import (#3108) reads it. Remove one roll after it.
+    #[serde(alias = "agentless_ssh")]
+    SshHost { owning_daemon: String, destination: String },
 }
 
 impl HostConnection {
@@ -216,12 +225,13 @@ pub struct HostStatus {
     /// Available bytes on the host-direct checkout root used for convoy admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
-    /// Daemon RSS from the latest heartbeat. Previous-generation Host records
-    /// omit this field; keep the decoder default through the next fleet roll.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub daemon_rss_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_free_space_floor_bytes: Option<u64>,
+    /// Whether free disk is below the admission floor, as the engine holds it: the judgement a
+    /// Host reads back with, in place of figures it does not keep. Writers report the figures;
+    /// none is unknown. ADR 0047: added with a default; earlier records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub below_free_space_floor: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub conditions: Vec<HostCondition>,
@@ -385,25 +395,75 @@ impl HostStatus {
         self.conditions.iter().any(HostCondition::blocks_readiness)
     }
 
-    /// This status with every observation timestamp cleared, so two statuses
-    /// compare equal when they observed the same things at different times.
-    pub fn without_observation_times(&self) -> Self {
-        let mut status = self.clone();
-        status.heartbeat_at = None;
-        for condition in &mut status.conditions {
-            condition.observed_at = DateTime::UNIX_EPOCH;
-        }
-        for facts in status.fulfilment_facts.values_mut() {
-            facts.observed_at = DateTime::UNIX_EPOCH;
-        }
-        status
+    /// Whether two statuses observed the same things, whenever each was observed: the heartbeat
+    /// time and each condition's and fact's observation time are not compared.
+    pub fn same_observations_as(&self, other: &Self) -> bool {
+        let Self {
+            description,
+            capabilities,
+            fulfilment_facts,
+            model_probes,
+            agent_adapter_baseline,
+            heartbeat_at: _,
+            ready,
+            sleeping_until,
+            resource_store,
+            blob_sync,
+            daemon_generation,
+            protocol_fingerprint,
+            daemon_version,
+            daemon_started_at,
+            disk_free_bytes,
+            admission_free_space_floor_bytes,
+            below_free_space_floor,
+            conditions,
+            sleep_inhibition,
+        } = self;
+        *description == other.description
+            && *capabilities == other.capabilities
+            && FulfilmentFacts::same_observations(fulfilment_facts, &other.fulfilment_facts)
+            && *model_probes == other.model_probes
+            && *agent_adapter_baseline == other.agent_adapter_baseline
+            && *ready == other.ready
+            && *sleeping_until == other.sleeping_until
+            && *resource_store == other.resource_store
+            && *blob_sync == other.blob_sync
+            && *daemon_generation == other.daemon_generation
+            && *protocol_fingerprint == other.protocol_fingerprint
+            && *daemon_version == other.daemon_version
+            && *daemon_started_at == other.daemon_started_at
+            && *disk_free_bytes == other.disk_free_bytes
+            && *admission_free_space_floor_bytes == other.admission_free_space_floor_bytes
+            && *below_free_space_floor == other.below_free_space_floor
+            && conditions.len() == other.conditions.len()
+            && conditions.iter().zip(&other.conditions).all(|(left, right)| left.same_observation(right))
+            && *sleep_inhibition == other.sleep_inhibition
+    }
+}
+
+impl HostCondition {
+    /// Whether two conditions report the same thing, whenever each was observed.
+    pub fn same_observation(&self, other: &Self) -> bool {
+        let Self { condition_type, value, reason, message, observed_at: _, blocks_readiness, blocks_forge_observation } = self;
+        *condition_type == other.condition_type
+            && *value == other.value
+            && *reason == other.reason
+            && *message == other.message
+            && *blocks_readiness == other.blocks_readiness
+            && *blocks_forge_observation == other.blocks_forge_observation
     }
 }
 
 impl FulfilmentFacts {
     /// Whether two observations report the same facts, whenever they were made.
     pub fn same_observation(&self, other: &Self) -> bool {
-        Self { observed_at: other.observed_at, ..self.clone() } == *other
+        let Self { harnesses, toolchains, gui_session_logged_in, free_vessel_slots, image, image_present, observed_at: _ } = self;
+        *harnesses == other.harnesses
+            && *toolchains == other.toolchains
+            && *gui_session_logged_in == other.gui_session_logged_in
+            && *free_vessel_slots == other.free_vessel_slots
+            && *image == other.image
+            && *image_present == other.image_present
     }
 
     /// Whether two fulfilment maps report the same facts per kind, whenever
@@ -473,11 +533,6 @@ mod build_parallelism_tests {
         assert_eq!(host.expected_concurrent_rust_crews, 4);
     }
 }
-
-/// Admission degradation that does not withdraw a live forge observer.
-pub const PROJECTION_PARITY_CONDITION: &str = "ProjectionParity";
-/// The local convoy projection has not caught up with durable rows.
-pub const LOCAL_ROWS_MISSING_REASON: &str = "LocalRowsMissing";
 
 /// A daemon-owned liveness invariant published on its [`Host`] resource.
 ///
@@ -608,18 +663,6 @@ impl CredentialExpiry {
     }
 }
 
-/// Latest periodic observations a heartbeat carries into its single write,
-/// so their observers do not each commit the Host object.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FoldedHostObservations {
-    /// Latest blob sync observation. `None` leaves the stored value unchanged.
-    pub blob_sync: Option<flotilla_protocol::BlobSyncStatus>,
-    /// Latest fulfilment observations. The heartbeat only advances the stored
-    /// `observed_at` of facts whose content is unchanged; changed facts are
-    /// published by the fulfilment writer itself.
-    pub fulfilment_refresh: BTreeMap<String, FulfilmentFacts>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStatusPatch {
     FulfilmentFacts {
@@ -633,22 +676,45 @@ pub enum HostStatusPatch {
         ready: bool,
         daemon_generation: Option<String>,
         protocol_fingerprint: Option<String>,
-        daemon_version: Option<String>,
-        daemon_started_at: Option<DateTime<Utc>>,
-        disk_free_bytes: Option<u64>,
-        daemon_rss_bytes: Option<u64>,
-        admission_free_space_floor_bytes: Option<u64>,
+        /// Whether the free disk is below the admission floor, as the observer judged it: the
+        /// figures themselves change with every reading and are the daemon's metrics.
+        below_free_space_floor: Option<bool>,
         agent_adapter_baseline: Option<BTreeSet<String>>,
-        // Keep the in-process patch enum small; HostStatus stores the unboxed value.
-        resource_store: Option<Box<ResourceStoreDiagnostics>>,
         conditions: Vec<HostCondition>,
-        /// Periodic observations folded into the heartbeat's write (#3154).
-        folded: Box<FoldedHostObservations>,
     },
     SleepInhibition {
         health: SleepInhibitionHealth,
         observed_at: DateTime<Utc>,
     },
+    /// The local image caches' inventories: only the `registered` caches' are kept, and
+    /// `observed`, when given, is one cache's held image IDs. With none observed, a Host that holds
+    /// no inventory is left without one.
+    ImageInventory {
+        registered: BTreeSet<String>,
+        observed: Option<(String, BTreeSet<String>)>,
+    },
+    /// An SSH host's observation by its owning daemon, the whole status but for the sleep it
+    /// keeps and the fulfilment facts its probe writes.
+    SshHost {
+        capabilities: BTreeMap<String, serde_json::Value>,
+        /// The facts the owning daemon's probe last wrote, which restore them once a pass the host
+        /// did not answer cleared them; `None` for such a pass.
+        probed_facts: Option<BTreeMap<String, FulfilmentFacts>>,
+        /// The vessel slots free under the host's cap, when it has one.
+        vessel_slots: Option<SshVesselSlots>,
+        heartbeat_at: Option<DateTime<Utc>>,
+        ready: bool,
+        below_free_space_floor: Option<bool>,
+        conditions: Vec<HostCondition>,
+    },
+}
+
+/// The vessel slots free on an SSH host under its cap: each fulfilment kind has `free`, but a kind
+/// whose terminal pool a probe found missing, which stays full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshVesselSlots {
+    pub free: u32,
+    pub pool_missing: BTreeSet<String>,
 }
 
 impl StatusPatch<HostStatus> for HostStatusPatch {
@@ -656,7 +722,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
     /// observation; fold timestamp-only refreshes into the heartbeat, which
     /// still commits often enough to keep `heartbeat_at` fresh.
     fn requires_write(&self, before: &HostStatus, after: &HostStatus) -> bool {
-        if before.without_observation_times() != after.without_observation_times() {
+        if !before.same_observations_as(after) {
             return true;
         }
         match self {
@@ -665,7 +731,13 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 *heartbeat_at < previous
                     || heartbeat_at.signed_duration_since(previous) >= chrono::Duration::seconds(HEARTBEAT_REFRESH_SECS)
             }),
-            Self::FulfilmentFacts { .. } | Self::SleepInhibition { .. } => false,
+            // The owning daemon's last successful probe stands in for an SSH host's heartbeat.
+            Self::SshHost { heartbeat_at: Some(heartbeat_at), .. } => before.heartbeat_at.is_none_or(|previous| {
+                *heartbeat_at < previous
+                    || heartbeat_at.signed_duration_since(previous) >= chrono::Duration::seconds(HEARTBEAT_REFRESH_SECS)
+            }),
+            Self::SshHost { heartbeat_at: None, .. } => before.heartbeat_at.is_some(),
+            Self::FulfilmentFacts { .. } | Self::SleepInhibition { .. } | Self::ImageInventory { .. } => false,
         }
     }
 
@@ -682,15 +754,9 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 ready,
                 daemon_generation,
                 protocol_fingerprint,
-                daemon_version,
-                daemon_started_at,
-                disk_free_bytes,
-                daemon_rss_bytes,
-                admission_free_space_floor_bytes,
+                below_free_space_floor,
                 agent_adapter_baseline,
-                resource_store,
                 conditions,
-                folded,
             } => {
                 // Image inventory is observed independently of heartbeat gathering.
                 // Preserve its latest value atomically when heartbeat has no update.
@@ -721,23 +787,10 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 status.ready = *ready && !status.readiness_blocked();
                 status.daemon_generation.clone_from(daemon_generation);
                 status.protocol_fingerprint.clone_from(protocol_fingerprint);
-                status.daemon_version.clone_from(daemon_version);
-                status.daemon_started_at = *daemon_started_at;
-                status.disk_free_bytes = *disk_free_bytes;
-                status.daemon_rss_bytes = *daemon_rss_bytes;
-                status.admission_free_space_floor_bytes = *admission_free_space_floor_bytes;
+                status.below_free_space_floor = *below_free_space_floor;
+                status.disk_free_bytes = None;
+                status.admission_free_space_floor_bytes = None;
                 status.agent_adapter_baseline.clone_from(agent_adapter_baseline);
-                status.resource_store = resource_store.as_deref().cloned();
-                if let Some(blob_sync) = &folded.blob_sync {
-                    status.blob_sync = Some(blob_sync.clone());
-                }
-                for (kind, observed) in &folded.fulfilment_refresh {
-                    if let Some(stored) = status.fulfilment_facts.get_mut(kind) {
-                        if stored.observed_at < observed.observed_at && stored.same_observation(observed) {
-                            stored.observed_at = observed.observed_at;
-                        }
-                    }
-                }
             }
             Self::SleepInhibition { health, observed_at } => {
                 status.sleep_inhibition.clone_from(health);
@@ -761,6 +814,59 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                     }
                     SleepInhibitionHealth::Acquiring { .. } => {}
                 }
+            }
+            Self::ImageInventory { registered, observed } => {
+                let held = status.capabilities.get(crate::IMAGE_DIGESTS_CAPABILITY);
+                if held.is_none() && observed.is_none() {
+                    return;
+                }
+                let mut inventory = match held.map(|held| serde_json::from_value::<crate::LocalImageInventories>(held.clone())).transpose()
+                {
+                    Ok(inventory) => inventory.unwrap_or_default(),
+                    Err(error) => {
+                        tracing::warn!(%error, "invalid image inventory; replacing it with fresh cache observations");
+                        crate::LocalImageInventories::default()
+                    }
+                };
+                inventory.0.retain(|instance, _| registered.contains(instance));
+                if let Some((instance, held)) = observed {
+                    inventory.0.insert(instance.clone(), held.clone());
+                }
+                match serde_json::to_value(&inventory) {
+                    Ok(value) => {
+                        status.capabilities.insert(crate::IMAGE_DIGESTS_CAPABILITY.into(), value);
+                    }
+                    Err(error) => tracing::warn!(%error, "image inventory does not encode; left as it was"),
+                }
+            }
+            Self::SshHost { capabilities, probed_facts, vessel_slots, heartbeat_at, ready, below_free_space_floor, conditions } => {
+                // The probe writes the facts; the ones held are its latest. A pass the host did not
+                // answer clears them, and the probe's last restores them.
+                let mut fulfilment_facts = match probed_facts {
+                    None => BTreeMap::new(),
+                    Some(probed) if status.fulfilment_facts.is_empty() => probed.clone(),
+                    Some(_) => std::mem::take(&mut status.fulfilment_facts),
+                };
+                for facts in fulfilment_facts.values_mut() {
+                    for harness in facts.harnesses.values_mut() {
+                        harness.models.clear();
+                    }
+                }
+                if let Some(slots) = vessel_slots {
+                    for (kind, facts) in &mut fulfilment_facts {
+                        facts.free_vessel_slots = Some(if slots.pool_missing.contains(kind) { 0 } else { slots.free });
+                    }
+                }
+                *status = HostStatus {
+                    capabilities: capabilities.clone(),
+                    fulfilment_facts,
+                    heartbeat_at: *heartbeat_at,
+                    ready: *ready,
+                    sleeping_until: status.sleeping_until,
+                    below_free_space_floor: *below_free_space_floor,
+                    conditions: conditions.clone(),
+                    ..HostStatus::default()
+                };
             }
         }
     }
@@ -892,5 +998,31 @@ mod tests {
 
         assert_eq!(CredentialExpiry::default().effective_expires_at(), None);
         assert_eq!(CredentialExpiry::default().expired_at(now), None);
+    }
+
+    // Behaviour (two Host writers): an SSH host's observation is patched against the facts its
+    // probe wrote, so facts written after its owning daemon last read them stand; a pass the host
+    // did not answer clears them, and the probe's last restores them.
+    #[test]
+    fn an_ssh_host_observation_keeps_the_probes_facts() {
+        let at = |seconds: i64| DateTime::from_timestamp(1_800_000_000 + seconds, 0).expect("time");
+        let facts = |seconds| BTreeMap::from([("kind".to_owned(), FulfilmentFacts { observed_at: at(seconds), ..Default::default() })]);
+        let observation = |probed_facts| HostStatusPatch::SshHost {
+            capabilities: BTreeMap::new(),
+            probed_facts,
+            vessel_slots: Some(SshVesselSlots { free: 2, pool_missing: BTreeSet::new() }),
+            heartbeat_at: Some(at(0)),
+            ready: true,
+            below_free_space_floor: None,
+            conditions: Vec::new(),
+        };
+        let mut status = HostStatus { fulfilment_facts: facts(20), ..HostStatus::default() };
+        observation(Some(facts(10))).apply(&mut status);
+        assert_eq!(status.fulfilment_facts["kind"].observed_at, at(20), "the probe's later facts stand");
+        assert_eq!(status.fulfilment_facts["kind"].free_vessel_slots, Some(2));
+        observation(None).apply(&mut status);
+        assert!(status.fulfilment_facts.is_empty(), "an unanswered pass clears them");
+        observation(Some(facts(30))).apply(&mut status);
+        assert_eq!(status.fulfilment_facts["kind"].observed_at, at(30), "the probe's last restores them");
     }
 }

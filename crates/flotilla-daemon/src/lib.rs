@@ -5,6 +5,7 @@
 mod agent_attention;
 pub mod artifact;
 pub mod blob_store;
+mod cbor_json;
 mod charter_delegation;
 pub mod cli;
 mod dispatch_reconciler;

@@ -8,6 +8,7 @@ CREATE TABLE resource_identity (
   id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),
   seq INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER,
   UNIQUE (kind, name, home)) STRICT;
 CREATE INDEX resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
@@ -47,18 +48,35 @@ CREATE TABLE stream_watermark (
 CREATE TABLE stream_history (
   home INTEGER PRIMARY KEY REFERENCES strings(id), home_seq INTEGER NOT NULL CHECK (home_seq >= 0)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE snapshot_cause (
+  resource INTEGER PRIMARY KEY REFERENCES resource_identity(id) ON DELETE CASCADE,
+  home INTEGER NOT NULL REFERENCES strings(id),
+  change_seq INTEGER NOT NULL,
+  FOREIGN KEY (home, change_seq) REFERENCES change(home, seq)) STRICT, WITHOUT ROWID;
 CREATE TABLE codes (
   kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
   PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
+CREATE TABLE "clone_facts" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "default_branch" TEXT
+) STRICT;
+CREATE VIEW "clone_facts_view" AS SELECT
+  "clone_facts"."id",
+  "clone_facts"."version",
+  "clone_facts"."default_branch"
+FROM "clone_facts";
 CREATE TABLE "checkout" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "repository" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "environment" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
   "branch" TEXT NOT NULL,
   "base" TEXT,
   "path" TEXT NOT NULL,
-  "source" TEXT NOT NULL CHECK ("source" IN ('fc', 'wt')),
+  "source" TEXT NOT NULL CHECK ("source" IN ('ad', 'fc', 'wt')),
   "source_url" TEXT,
   "clone" INTEGER REFERENCES "resource_identity" ("id"),
   "holder" INTEGER REFERENCES "strings" ("id"),
@@ -79,6 +97,9 @@ CREATE TABLE "checkout" (
       END),
   CHECK (CASE WHEN "source" = 'fc'
       THEN "source_url" IS NOT NULL
+      END),
+  CHECK (CASE WHEN "source" = 'ad'
+      THEN "source_url" IS NULL
       END),
   CHECK (CASE WHEN "last_failure_at" IS NOT NULL
       THEN "last_failure_cause_category" IS NOT NULL
@@ -144,7 +165,10 @@ CREATE TABLE "checkout" (
 CREATE INDEX "checkout_by_clone" ON "checkout" ("clone") WHERE "clone" IS NOT NULL;
 CREATE INDEX "checkout_by_environment" ON "checkout" ("environment");
 CREATE INDEX "checkout_by_holder" ON "checkout" ("holder") WHERE "holder" IS NOT NULL;
+CREATE INDEX "checkout_by_launch" ON "checkout" ("launch_of", "launch");
+CREATE INDEX "checkout_by_repository" ON "checkout" ("repository");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('ck', 'source', 'ad', 'Adopted'),
   ('ck', 'source', 'fc', 'FreshClone'),
   ('ck', 'source', 'wt', 'Worktree'),
   ('ck', 'state', 'go', 'Gone'),
@@ -165,6 +189,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ck', 'cause_category', 'rf', 'Refused'),
   ('ck', 'cause_category', 'tr', 'Transient'),
   ('ck', 'log:edge', 'at', 'Attempted'),
+  ('ck', 'log:edge', 'fe', 'FailedEarly'),
   ('ck', 'log:edge', 'gu', 'GiveUp'),
   ('ck', 'log:edge', 'rl', 'Realise'),
   ('ck', 'log:edge', 'rs', 'Release'),
@@ -176,6 +201,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "checkout_view" AS SELECT
   "checkout"."id",
   "checkout"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "checkout"."launch_of") AS "launch_of",
+  "checkout"."launch",
   (SELECT "s" FROM "strings" WHERE "id" = "checkout"."repository") AS "repository",
   "checkout"."environment",
   "checkout"."branch",
@@ -201,10 +228,13 @@ FROM "checkout";
 CREATE TABLE "clone" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "repository" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "url" TEXT NOT NULL,
   "environment" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
   "path" TEXT NOT NULL,
+  "discovered" INTEGER NOT NULL CHECK ("discovered" IN (0, 1)) DEFAULT 0,
   "state" TEXT NOT NULL CHECK ("state" IN ('go', 'gu', 'rl', 'rq')),
   "state_since" INTEGER NOT NULL,
   "failures" INTEGER,
@@ -279,6 +309,8 @@ CREATE TABLE "clone" (
       END)
 ) STRICT;
 CREATE INDEX "clone_by_environment" ON "clone" ("environment", "repository");
+CREATE INDEX "clone_by_launch" ON "clone" ("launch_of", "launch");
+CREATE INDEX "clone_by_repository" ON "clone" ("repository");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cl', 'state', 'go', 'Gone'),
   ('cl', 'state', 'gu', 'GaveUp'),
@@ -298,6 +330,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cl', 'cause_category', 'rf', 'Refused'),
   ('cl', 'cause_category', 'tr', 'Transient'),
   ('cl', 'log:edge', 'at', 'Attempted'),
+  ('cl', 'log:edge', 'fe', 'FailedEarly'),
   ('cl', 'log:edge', 'gu', 'GiveUp'),
   ('cl', 'log:edge', 'rl', 'Realise'),
   ('cl', 'log:edge', 'rs', 'Release'),
@@ -309,10 +342,13 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "clone_view" AS SELECT
   "clone"."id",
   "clone"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "clone"."launch_of") AS "launch_of",
+  "clone"."launch",
   (SELECT "s" FROM "strings" WHERE "id" = "clone"."repository") AS "repository",
   "clone"."url",
   "clone"."environment",
   "clone"."path",
+  "clone"."discovered",
   (SELECT "name" FROM "codes" WHERE "kind" = 'cl' AND "field" = 'state' AND "code" = "clone"."state") AS "state",
   "clone"."state_since",
   "clone"."failures",
@@ -326,6 +362,30 @@ CREATE VIEW "clone_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'cl' AND "field" = 'cause_category' AND "code" = "clone"."cause_category") AS "cause_category",
   "clone"."cause_detail"
 FROM "clone";
+CREATE TABLE "environment_launch_facts" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "image_ref" TEXT,
+  "local_image_id" TEXT,
+  "registry_digest" TEXT,
+  "configured_limits_cpus" INTEGER,
+  "configured_limits_cpu_shares" INTEGER,
+  "configured_limits_build_jobs" INTEGER,
+  "configured_limits_linker_threads" INTEGER,
+  "provider_descriptor" BLOB REFERENCES "objects" ("hash")
+) STRICT;
+CREATE VIEW "environment_launch_facts_view" AS SELECT
+  "environment_launch_facts"."id",
+  "environment_launch_facts"."version",
+  "environment_launch_facts"."image_ref",
+  "environment_launch_facts"."local_image_id",
+  "environment_launch_facts"."registry_digest",
+  "environment_launch_facts"."configured_limits_cpus",
+  "environment_launch_facts"."configured_limits_cpu_shares",
+  "environment_launch_facts"."configured_limits_build_jobs",
+  "environment_launch_facts"."configured_limits_linker_threads",
+  "environment_launch_facts"."provider_descriptor"
+FROM "environment_launch_facts";
 CREATE TABLE "environment" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -428,6 +488,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ev', 'cause_category', 'rf', 'Refused'),
   ('ev', 'cause_category', 'tr', 'Transient'),
   ('ev', 'log:edge', 'at', 'Attempted'),
+  ('ev', 'log:edge', 'fe', 'FailedEarly'),
   ('ev', 'log:edge', 'gu', 'GiveUp'),
   ('ev', 'log:edge', 'rl', 'Realise'),
   ('ev', 'log:edge', 'rs', 'Release'),
@@ -459,6 +520,8 @@ FROM "environment";
 CREATE TABLE "image_build" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "composition" TEXT NOT NULL,
   "architecture" TEXT NOT NULL CHECK ("architecture" IN ('a6', 'r6')),
   "layers" BLOB NOT NULL REFERENCES "objects" ("hash"),
@@ -546,6 +609,7 @@ CREATE TABLE "image_build" (
       END)
 ) STRICT;
 CREATE INDEX "image_build_by_composition" ON "image_build" ("composition");
+CREATE INDEX "image_build_by_launch" ON "image_build" ("launch_of", "launch");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ib', 'architecture', 'a6', 'Amd64'),
   ('ib', 'architecture', 'r6', 'Arm64'),
@@ -569,6 +633,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ib', 'cause_category', 'rf', 'Refused'),
   ('ib', 'cause_category', 'tr', 'Transient'),
   ('ib', 'log:edge', 'at', 'Attempted'),
+  ('ib', 'log:edge', 'fe', 'FailedEarly'),
   ('ib', 'log:edge', 'gu', 'GiveUp'),
   ('ib', 'log:edge', 'rl', 'Realise'),
   ('ib', 'log:edge', 'rs', 'Release'),
@@ -580,6 +645,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "image_build_view" AS SELECT
   "image_build"."id",
   "image_build"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "image_build"."launch_of") AS "launch_of",
+  "image_build"."launch",
   "image_build"."composition",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ib' AND "field" = 'architecture' AND "code" = "image_build"."architecture") AS "architecture",
   "image_build"."layers",
@@ -600,6 +667,95 @@ CREATE VIEW "image_build_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'ib' AND "field" = 'cause_category' AND "code" = "image_build"."cause_category") AS "cause_category",
   "image_build"."cause_detail"
 FROM "image_build";
+CREATE TABLE "image_build_demand" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "composition" TEXT NOT NULL,
+  "architecture" TEXT NOT NULL CHECK ("architecture" IN ('a6', 'r6')),
+  "layers" BLOB NOT NULL REFERENCES "objects" ("hash"),
+  "builder" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
+  "delivery" TEXT NOT NULL CHECK ("delivery" IN ('lo', 'rg')),
+  "delivery_repository" TEXT,
+  "reservation_cpu" INTEGER NOT NULL,
+  "reservation_disk_bytes" INTEGER NOT NULL,
+  CHECK (CASE WHEN "delivery" = 'rg'
+      THEN "delivery_repository" IS NOT NULL
+      END),
+  CHECK (CASE WHEN "delivery" = 'lo'
+      THEN "delivery_repository" IS NULL
+      END)
+) STRICT;
+CREATE INDEX "image_build_demand_by_builder" ON "image_build_demand" ("builder");
+CREATE INDEX "image_build_demand_by_composition" ON "image_build_demand" ("composition");
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('iq', 'architecture', 'a6', 'Amd64'),
+  ('iq', 'architecture', 'r6', 'Arm64'),
+  ('iq', 'delivery', 'lo', 'Local'),
+  ('iq', 'delivery', 'rg', 'Registry');
+CREATE VIEW "image_build_demand_view" AS SELECT
+  "image_build_demand"."id",
+  "image_build_demand"."version",
+  "image_build_demand"."composition",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'iq' AND "field" = 'architecture' AND "code" = "image_build_demand"."architecture") AS "architecture",
+  "image_build_demand"."layers",
+  "image_build_demand"."builder",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'iq' AND "field" = 'delivery' AND "code" = "image_build_demand"."delivery") AS "delivery",
+  "image_build_demand"."delivery_repository",
+  "image_build_demand"."reservation_cpu",
+  "image_build_demand"."reservation_disk_bytes"
+FROM "image_build_demand";
+CREATE TABLE "checkout_facts" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "degraded" TEXT
+) STRICT;
+CREATE VIEW "checkout_facts_view" AS SELECT
+  "checkout_facts"."id",
+  "checkout_facts"."version",
+  "checkout_facts"."degraded"
+FROM "checkout_facts";
+CREATE TABLE "checkout_integration" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "failing_since" INTEGER,
+  "head_revision" TEXT,
+  "clean" INTEGER CHECK ("clean" IN (0, 1)),
+  "pushed" INTEGER CHECK ("pushed" IN (0, 1)),
+  "landed" INTEGER CHECK ("landed" IN (0, 1)),
+  "clean_details" BLOB NOT NULL,
+  "pushed_details" BLOB NOT NULL,
+  "landed_details" BLOB NOT NULL,
+  "change_request" INTEGER,
+  "landed_evidence_change_request" INTEGER,
+  "landed_evidence_merged_at" INTEGER,
+  "landed_evidence_target_ref" TEXT,
+  "landed_evidence_head_in_merged_head" INTEGER CHECK ("landed_evidence_head_in_merged_head" IN (0, 1)),
+  "remote_digest" TEXT,
+  CHECK (CASE WHEN "landed_evidence_change_request" IS NOT NULL
+      THEN "landed_evidence_head_in_merged_head" IS NOT NULL
+      ELSE "landed_evidence_merged_at" IS NULL
+      AND "landed_evidence_target_ref" IS NULL
+      AND "landed_evidence_head_in_merged_head" IS NULL
+      END)
+) STRICT;
+CREATE VIEW "checkout_integration_view" AS SELECT
+  "checkout_integration"."id",
+  "checkout_integration"."version",
+  "checkout_integration"."failing_since",
+  "checkout_integration"."head_revision",
+  "checkout_integration"."clean",
+  "checkout_integration"."pushed",
+  "checkout_integration"."landed",
+  "checkout_integration"."clean_details",
+  "checkout_integration"."pushed_details",
+  "checkout_integration"."landed_details",
+  "checkout_integration"."change_request",
+  "checkout_integration"."landed_evidence_change_request",
+  "checkout_integration"."landed_evidence_merged_at",
+  "checkout_integration"."landed_evidence_target_ref",
+  "checkout_integration"."landed_evidence_head_in_merged_head",
+  "checkout_integration"."remote_digest"
+FROM "checkout_integration";
 CREATE VIEW "log_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
   "l"."home_seq",

@@ -61,7 +61,7 @@ class SelectionContract(unittest.TestCase):
         # Documentation, specifications, other workflows, CI scripts with their
         # own jobs and unknown non-Rust files are not Rust test inputs.
         files = ["docs/adr/0047-stored-data.md", "CLAUDE.md", "CODING_STANDARDS.md", "README.md",
-                 "specs/primitives/machines/ensure.qnt", ".github/workflows/coverage.yml",
+                 "specs/primitives/machines/message.qnt", ".github/workflows/coverage.yml",
                  "ci/git-boundary/check.py", "scripts/prune-target.sh", "clippy.toml", "rustfmt.toml",
                  "hegel.toml", "prototypes/board.html", "crates/leafish/file", "crates/leaf-notes.md",
                  "tests/integration/test_minimal_topology.py"]
@@ -250,7 +250,7 @@ class SelectionContract(unittest.TestCase):
         # Nothing reads these from Rust: Quint specs are read only through
         # QUINT_GRAPH_DIR/QUINT_TRACE_DIR exports in ignored tests.
         for file in ("CLAUDE.md", "CODING_STANDARDS.md", "docs/adr/0047-stored-data-compatibility.md",
-                     "specs/primitives/machines/ensure.qnt", "ci/git-boundary/check.py",
+                     "specs/primitives/machines/message.qnt", "ci/git-boundary/check.py",
                      ".github/workflows/coverage.yml"):
             with self.subTest(file=file):
                 self.assertEqual(select(metadata, [file], reads), "none")

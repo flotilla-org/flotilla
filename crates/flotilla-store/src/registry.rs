@@ -1,7 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
-
-#[cfg(test)]
-pub(crate) static GC_FULL_KIND_LISTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+use std::collections::BTreeMap;
 
 use chrono::Utc;
 use flotilla_protocol::NodeId;
@@ -14,10 +11,10 @@ use crate::{
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     AccessDelivery, AccountBinding, AccountProvision, Artifact, ChangeRequest, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
-    CredentialGrant, CredentialSpec, CrewDefaults, Demand, Environment, Event, FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild,
-    ImageLayer, InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project, ReadResourceList, ReadWatchEvent, Regard,
-    ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
-    ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    CredentialGrant, CredentialSpec, CrewDefaults, Environment, FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild, ImageLayer,
+    InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project, ReadResourceList, ReadWatchEvent, ReplicaCursor,
+    ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
+    TerminalSession, Vessel, WatchEvent, WatchStart, WatchStream, WorkflowTemplate, WriterIdentity,
 };
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
@@ -45,12 +42,10 @@ enum RegisteredResource {
     CrewDefaults,
     ImageBuild,
     ImageLayer,
-    Demand,
     AccountBinding,
     AccountProvision,
     AccessDelivery,
     Environment,
-    Event,
     FleetDesignation,
     Forge,
     FulfilmentKind,
@@ -58,7 +53,6 @@ enum RegisteredResource {
     ManifestRoot,
     Message,
     Project,
-    Regard,
     Repository,
     TerminalSession,
     Vessel,
@@ -85,15 +79,6 @@ pub struct DynamicResourceObject {
 pub struct DynamicResourceDelete {
     pub object: DynamicResourceObject,
     pub already_deleted: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
-pub struct HomeBoundAuthorshipCollision {
-    pub kind: String,
-    pub namespace: String,
-    pub name: String,
-    pub local_root: NodeId,
-    pub replica_root: NodeId,
 }
 
 #[derive(bon::Builder)]
@@ -126,12 +111,10 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<CrewDefaults>(RegisteredResource::CrewDefaults, &["crew-defaults"]),
     kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
     kind::<ImageLayer>(RegisteredResource::ImageLayer, &["image-layer"]),
-    kind::<Demand>(RegisteredResource::Demand, &[]),
     kind::<AccountBinding>(RegisteredResource::AccountBinding, &["account-binding"]),
     kind::<AccountProvision>(RegisteredResource::AccountProvision, &["account-provision"]),
     kind::<AccessDelivery>(RegisteredResource::AccessDelivery, &["access-delivery"]),
     kind::<Environment>(RegisteredResource::Environment, &[]),
-    kind::<Event>(RegisteredResource::Event, &[]),
     kind::<FleetDesignation>(RegisteredResource::FleetDesignation, &["fleet-designation"]),
     kind::<Forge>(RegisteredResource::Forge, &[]),
     kind::<FulfilmentKind>(
@@ -142,7 +125,6 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<ManifestRoot>(RegisteredResource::ManifestRoot, &["manifest-root", "manifest_root"]),
     kind::<Message>(RegisteredResource::Message, &[]),
     kind::<Project>(RegisteredResource::Project, &[]),
-    kind::<Regard>(RegisteredResource::Regard, &[]),
     kind::<Repository>(RegisteredResource::Repository, &[]),
     kind::<TerminalSession>(
         RegisteredResource::TerminalSession,
@@ -181,6 +163,13 @@ pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
     // Remove one roll after this generation ships, once the corpus is refreshed.
     RetiredResourceKind { kind: "ForgeRead", plural: "forgereads", api_version: "flotilla.work/v1" },
     RetiredResourceKind { kind: "ForgeReadHeartbeat", plural: "forgereadheartbeats", api_version: "flotilla.work/v1" },
+    // Deleted by #3108 (its writers became warnings); remove one roll after this generation ships.
+    RetiredResourceKind { kind: "Event", plural: "events", api_version: "flotilla.work/v1" },
+    // Deleted by #3108 with its salience boost (#3824 layer 8); remove one roll after this generation ships.
+    RetiredResourceKind { kind: "Regard", plural: "regards", api_version: "flotilla.work/v1" },
+    // Retired by #3108: attentions are Messages on the engine and nothing writes a Demand. The
+    // cut-over import converts open demands into attentions; remove one roll after this generation ships.
+    RetiredResourceKind { kind: "Demand", plural: "demands", api_version: "flotilla.work/v1" },
 ];
 
 /// What a stored document decoded as.
@@ -227,12 +216,10 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::CredentialGrant => poll_typed_resource!($body::<CredentialGrant>($($arg),*)),
             RegisteredResource::CredentialSpec => poll_typed_resource!($body::<CredentialSpec>($($arg),*)),
             RegisteredResource::CrewDefaults => poll_typed_resource!($body::<CrewDefaults>($($arg),*)),
-            RegisteredResource::Demand => poll_typed_resource!($body::<Demand>($($arg),*)),
             RegisteredResource::AccountBinding => poll_typed_resource!($body::<AccountBinding>($($arg),*)),
             RegisteredResource::AccountProvision => poll_typed_resource!($body::<AccountProvision>($($arg),*)),
             RegisteredResource::AccessDelivery => poll_typed_resource!($body::<AccessDelivery>($($arg),*)),
             RegisteredResource::Environment => poll_typed_resource!($body::<Environment>($($arg),*)),
-            RegisteredResource::Event => poll_typed_resource!($body::<Event>($($arg),*)),
             RegisteredResource::FleetDesignation => poll_typed_resource!($body::<FleetDesignation>($($arg),*)),
             RegisteredResource::Forge => poll_typed_resource!($body::<Forge>($($arg),*)),
             RegisteredResource::FulfilmentKind => poll_typed_resource!($body::<FulfilmentKind>($($arg),*)),
@@ -243,7 +230,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ManifestRoot => poll_typed_resource!($body::<ManifestRoot>($($arg),*)),
             RegisteredResource::Message => poll_typed_resource!($body::<Message>($($arg),*)),
             RegisteredResource::Project => poll_typed_resource!($body::<Project>($($arg),*)),
-            RegisteredResource::Regard => poll_typed_resource!($body::<Regard>($($arg),*)),
             RegisteredResource::Repository => poll_typed_resource!($body::<Repository>($($arg),*)),
             RegisteredResource::TerminalSession => poll_typed_resource!($body::<TerminalSession>($($arg),*)),
             RegisteredResource::Vessel => poll_typed_resource!($body::<Vessel>($($arg),*)),
@@ -261,12 +247,10 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::CredentialGrant => $body::<CredentialGrant>(),
             RegisteredResource::CredentialSpec => $body::<CredentialSpec>(),
             RegisteredResource::CrewDefaults => $body::<CrewDefaults>(),
-            RegisteredResource::Demand => $body::<Demand>(),
             RegisteredResource::AccountBinding => $body::<AccountBinding>(),
             RegisteredResource::AccountProvision => $body::<AccountProvision>(),
             RegisteredResource::AccessDelivery => $body::<AccessDelivery>(),
             RegisteredResource::Environment => $body::<Environment>(),
-            RegisteredResource::Event => $body::<Event>(),
             RegisteredResource::FleetDesignation => $body::<FleetDesignation>(),
             RegisteredResource::Forge => $body::<Forge>(),
             RegisteredResource::FulfilmentKind => $body::<FulfilmentKind>(),
@@ -277,7 +261,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ManifestRoot => $body::<ManifestRoot>(),
             RegisteredResource::Message => $body::<Message>(),
             RegisteredResource::Project => $body::<Project>(),
-            RegisteredResource::Regard => $body::<Regard>(),
             RegisteredResource::Repository => $body::<Repository>(),
             RegisteredResource::TerminalSession => $body::<TerminalSession>(),
             RegisteredResource::Vessel => $body::<Vessel>(),
@@ -295,12 +278,10 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::CredentialGrant => $body::<CredentialGrant>($($arg),*),
             RegisteredResource::CredentialSpec => $body::<CredentialSpec>($($arg),*),
             RegisteredResource::CrewDefaults => $body::<CrewDefaults>($($arg),*),
-            RegisteredResource::Demand => $body::<Demand>($($arg),*),
             RegisteredResource::AccountBinding => $body::<AccountBinding>($($arg),*),
             RegisteredResource::AccountProvision => $body::<AccountProvision>($($arg),*),
             RegisteredResource::AccessDelivery => $body::<AccessDelivery>($($arg),*),
             RegisteredResource::Environment => $body::<Environment>($($arg),*),
-            RegisteredResource::Event => $body::<Event>($($arg),*),
             RegisteredResource::FleetDesignation => $body::<FleetDesignation>($($arg),*),
             RegisteredResource::Forge => $body::<Forge>($($arg),*),
             RegisteredResource::FulfilmentKind => $body::<FulfilmentKind>($($arg),*),
@@ -311,7 +292,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ManifestRoot => $body::<ManifestRoot>($($arg),*),
             RegisteredResource::Message => $body::<Message>($($arg),*),
             RegisteredResource::Project => $body::<Project>($($arg),*),
-            RegisteredResource::Regard => $body::<Regard>($($arg),*),
             RegisteredResource::Repository => $body::<Repository>($($arg),*),
             RegisteredResource::TerminalSession => $body::<TerminalSession>($($arg),*),
             RegisteredResource::Vessel => $body::<Vessel>($($arg),*),
@@ -322,7 +302,7 @@ macro_rules! dispatch_resource_kind {
 
 /// Inventory every namespace with an authored or replicated record, by kind.
 pub async fn registered_resource_namespaces(backend: &ResourceBackend) -> Result<BTreeMap<String, Vec<String>>, ResourceError> {
-    backend.namespace_inventory().await
+    backend.stored_namespace_inventory().await
 }
 
 /// Dynamic apply writes as `$writer`.
@@ -349,7 +329,8 @@ pub async fn quarantine_undecodable_stored_objects(backend: &ResourceBackend, na
     if !backend.durable_local() {
         return Ok(());
     }
-    for registered in REGISTERED_RESOURCE_KINDS {
+    // A kind an engine port serves holds no old-store records to decode.
+    for registered in REGISTERED_RESOURCE_KINDS.iter().filter(|registered| !backend.engine_serves(registered.kind)) {
         list_resource_kind(backend, namespace, registered.kind).await?;
     }
     Ok(())
@@ -368,20 +349,19 @@ async fn current_position_typed<T: Resource>(backend: &ResourceBackend, namespac
     backend.using::<T>(namespace).current_position().await
 }
 
-pub async fn digest_resource_kind(
-    backend: &ResourceBackend,
-    namespace: &str,
-    kind: &str,
-    query: &crate::DigestQuery,
-) -> Result<crate::PartitionDigest, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, digest_typed(backend, namespace, query).await)
+/// An action on one registered kind, by its resource type.
+pub trait RegisteredKindVisitor {
+    fn visit<R: Resource>(&mut self);
 }
-async fn digest_typed<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    query: &crate::DigestQuery,
-) -> Result<crate::PartitionDigest, ResourceError> {
-    backend.using::<T>(namespace).digest(query).await
+
+/// Runs `visitor` on each kind in [`REGISTERED_RESOURCE_KINDS`].
+pub fn visit_registered_kinds(visitor: &mut impl RegisteredKindVisitor) {
+    fn visit<R: Resource>(visitor: &mut impl RegisteredKindVisitor) {
+        visitor.visit::<R>();
+    }
+    for registered in REGISTERED_RESOURCE_KINDS {
+        dispatch_resource_kind!(registered.resource, visit(visitor));
+    }
 }
 
 pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
@@ -397,12 +377,10 @@ pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
             RegisteredResource::CredentialGrant => crate::ResourceKind::of::<CredentialGrant>(),
             RegisteredResource::CredentialSpec => crate::ResourceKind::of::<CredentialSpec>(),
             RegisteredResource::CrewDefaults => crate::ResourceKind::of::<CrewDefaults>(),
-            RegisteredResource::Demand => crate::ResourceKind::of::<Demand>(),
             RegisteredResource::AccountBinding => crate::ResourceKind::of::<AccountBinding>(),
             RegisteredResource::AccountProvision => crate::ResourceKind::of::<AccountProvision>(),
             RegisteredResource::AccessDelivery => crate::ResourceKind::of::<AccessDelivery>(),
             RegisteredResource::Environment => crate::ResourceKind::of::<Environment>(),
-            RegisteredResource::Event => crate::ResourceKind::of::<Event>(),
             RegisteredResource::FleetDesignation => crate::ResourceKind::of::<FleetDesignation>(),
             RegisteredResource::Forge => crate::ResourceKind::of::<Forge>(),
             RegisteredResource::FulfilmentKind => crate::ResourceKind::of::<FulfilmentKind>(),
@@ -413,7 +391,6 @@ pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
             RegisteredResource::ManifestRoot => crate::ResourceKind::of::<ManifestRoot>(),
             RegisteredResource::Message => crate::ResourceKind::of::<Message>(),
             RegisteredResource::Project => crate::ResourceKind::of::<Project>(),
-            RegisteredResource::Regard => crate::ResourceKind::of::<Regard>(),
             RegisteredResource::Repository => crate::ResourceKind::of::<Repository>(),
             RegisteredResource::TerminalSession => crate::ResourceKind::of::<TerminalSession>(),
             RegisteredResource::Vessel => crate::ResourceKind::of::<Vessel>(),
@@ -429,29 +406,8 @@ pub async fn query_resource_kind(
     query: &crate::StoreQuery,
 ) -> Result<Value, ResourceError> {
     let registered = lookup_resource_kind(requested_kind)?;
-    let descriptor = declared_resource_kinds().into_iter().find(|kind| kind.paths.kind == registered.kind).expect("registered descriptor");
-    let listed = backend.store().query_raw(descriptor, namespace, query).await?;
-    let position = listed.position;
-    let local_root = listed.local_root;
-    let items = listed.items;
-    let items = items
-        .iter()
-        .map(|item| {
-            let mut value = read_object_value(item)?;
-            value["apiVersion"] = json!(api_version(descriptor.paths));
-            value["kind"] = json!(descriptor.paths.kind);
-            Ok(value)
-        })
-        .collect::<Result<Vec<_>, ResourceError>>()?;
-
-    let mut document = json!({"apiVersion": api_version(descriptor.paths), "kind": format!("{}List", descriptor.paths.kind), "metadata": {"resourceVersion":position.resource_version}, "items":items});
-    if let Some(root) = local_root {
-        document["metadata"]["localRoot"] = json!(root);
-    }
-    if let Some(generation) = position.generation {
-        document["metadata"]["generation"] = json!(generation);
-    }
-    Ok(document)
+    // Records are read through their views, as the kind's typed readers read them.
+    dispatch_resource_kind!(registered.resource, query_engine_typed(backend, namespace, query).await)
 }
 
 pub async fn list_resource_kind(
@@ -477,83 +433,6 @@ pub async fn replica_cursor_for_resource_kind(
     origin_root: &NodeId,
 ) -> Result<Option<ReplicaCursor>, ResourceError> {
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, replica_cursor_typed(backend, namespace, origin_root).await)
-}
-
-/// Find same-name records authored both locally and by another root for every
-/// single-home resource kind.
-///
-/// The collision is diagnostic only: callers must surface it rather than
-/// choosing either record as authoritative.
-pub async fn home_bound_authorship_collisions(
-    backend: &ResourceBackend,
-    namespace: &str,
-) -> Result<Vec<HomeBoundAuthorshipCollision>, ResourceError> {
-    let local_root = backend.local_root()?;
-    let mut collisions = Vec::new();
-    for registered in REGISTERED_RESOURCE_KINDS {
-        if registered.replication_class != ReplicationClass::HomeBoundRuntime {
-            continue;
-        }
-        collisions.extend(dispatch_resource_kind!(
-            registered.resource,
-            home_bound_authorship_collisions_typed(backend, namespace, &local_root).await
-        )?);
-    }
-    collisions.sort_by(|left, right| {
-        (&left.kind, &left.namespace, &left.name, &left.replica_root).cmp(&(
-            &right.kind,
-            &right.namespace,
-            &right.name,
-            &right.replica_root,
-        ))
-    });
-    Ok(collisions)
-}
-
-async fn home_bound_authorship_collisions_typed<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    local_root: &NodeId,
-) -> Result<Vec<HomeBoundAuthorshipCollision>, ResourceError> {
-    let sources = backend.including_replicas::<T>(namespace).list_sources().await?;
-    let local_names = sources
-        .items
-        .iter()
-        .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
-        .map(|item| (item.object.metadata.name.as_str(), projected_vessel_source_root::<T>(&item.object)))
-        .collect::<HashMap<_, _>>();
-    Ok(sources
-        .items
-        .iter()
-        .filter_map(|item| {
-            let ResourceProvenance::Replica { origin_root, .. } = &item.provenance else {
-                return None;
-            };
-            let local_source_root = local_names.get(item.object.metadata.name.as_str())?;
-            let replica_source_root = projected_vessel_source_root::<T>(&item.object);
-            // A placed actuator is a local projection of the admitting Vessel.
-            // Match the marker to the counterpart root so an unrelated marker
-            // cannot suppress an independently authored collision.
-            if *local_source_root == Some(origin_root.as_str()) || replica_source_root == Some(local_root.as_str()) {
-                return None;
-            }
-            (origin_root != local_root).then(|| {
-                HomeBoundAuthorshipCollision::builder()
-                    .kind(T::API_PATHS.kind.to_string())
-                    .namespace(namespace.to_string())
-                    .name(item.object.metadata.name.clone())
-                    .local_root(local_root.clone())
-                    .replica_root(origin_root.clone())
-                    .build()
-            })
-        })
-        .collect())
-}
-
-fn projected_vessel_source_root<T: Resource>(object: &ResourceObject<T>) -> Option<&str> {
-    (T::API_PATHS.kind == Vessel::API_PATHS.kind)
-        .then(|| object.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map(String::as_str))
-        .flatten()
 }
 
 async fn replica_cursor_typed<T: Resource>(
@@ -591,93 +470,6 @@ pub async fn get_resource_kind_all_provenances(
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, get_all_typed(backend, namespace, name).await)
 }
 
-/// Collect only children authored here, never replica rows. A deleted owner
-/// filter makes the normal path precise; `None` is restart/backstop recovery.
-pub(crate) async fn collect_owned_resources(
-    backend: &ResourceBackend,
-    namespace: &str,
-    deleted_owner: Option<&OwnerReference>,
-) -> Result<(), ResourceError> {
-    for kind in REGISTERED_RESOURCE_KINDS {
-        dispatch_resource_kind!(kind.resource, collect_owned_typed(backend, namespace, deleted_owner).await)?;
-    }
-    Ok(())
-}
-
-/// Recheck an indexed child against current local state before requesting its
-/// deletion. Watch events are hints: the child may have been reparented since
-/// the event, or a replica may now satisfy the owner reference.
-pub(crate) async fn collect_indexed_child(
-    backend: &ResourceBackend,
-    namespace: &str,
-    kind: &str,
-    name: &str,
-    deleted_owner: &OwnerReference,
-) -> Result<(), ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, collect_indexed_typed(backend, namespace, name, deleted_owner).await)
-}
-
-async fn collect_indexed_typed<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    name: &str,
-    deleted_owner: &OwnerReference,
-) -> Result<(), ResourceError> {
-    let resolver = backend.using::<T>(namespace);
-    let child = match resolver.get(name).await {
-        Ok(child) => child,
-        Err(ResourceError::NotFound { .. }) => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    collect_owned_child(backend, namespace, &resolver, &child, Some(deleted_owner)).await
-}
-
-async fn collect_owned_typed<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    deleted_owner: Option<&OwnerReference>,
-) -> Result<(), ResourceError> {
-    #[cfg(test)]
-    GC_FULL_KIND_LISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let resolver = backend.using::<T>(namespace);
-    for child in resolver.list().await?.items {
-        collect_owned_child(backend, namespace, &resolver, &child, deleted_owner).await?;
-    }
-    Ok(())
-}
-
-async fn collect_owned_child<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    resolver: &crate::TypedResolver<T>,
-    child: &ResourceObject<T>,
-    deleted_owner: Option<&OwnerReference>,
-) -> Result<(), ResourceError> {
-    if matches!(child.metadata.lifecycle_authority()?, Some(crate::LifecycleAuthority::Observed | crate::LifecycleAuthority::Adopted)) {
-        return Ok(());
-    }
-    for owner in &child.metadata.owner_references {
-        if !owner.controller || deleted_owner.is_some_and(|deleted| deleted != owner) {
-            continue;
-        }
-        // Unknown groups/kinds are not evidence of an absent owner.
-        if owner.api_version != "flotilla.work/v1" || !REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.kind == owner.kind) {
-            continue;
-        }
-        match get_resource_kind_including_replicas(backend, namespace, &owner.kind, &owner.name).await {
-            Ok(_) => continue, // Also protects a replacement or another surviving authority.
-            Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
-        match resolver.delete(&child.metadata.name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
-        break;
-    }
-    Ok(())
-}
-
 pub async fn delete_resource_kind(
     backend: &ResourceBackend,
     namespace: &str,
@@ -693,7 +485,8 @@ pub async fn delete_resource_kind(
 /// The stored delete is timestamped and relayed like an ordinary replica
 /// tombstone, so stale copies from other peers cannot immediately resurrect
 /// the object. A later update from the original authority remains newer and
-/// can recreate it.
+/// can recreate it. A kind the engine serves has no copy here to collect: its records are
+/// deleted at their home, and the request is refused naming it.
 pub async fn collect_resource_replica_kind(
     backend: &ResourceBackend,
     namespace: &str,
@@ -714,26 +507,7 @@ pub async fn patch_resource_status(
     name: &str,
     status: Value,
 ) -> Result<DynamicResourceObject, ResourceError> {
-    dispatch_resource_kind!(
-        lookup_resource_kind(requested_kind)?.resource,
-        patch_status_typed(backend, namespace, name, status, None).await
-    )
-}
-
-/// Replace status only while the caller's observed version is still current.
-/// A stale replica must not overwrite receiver-side submission evidence.
-pub async fn patch_resource_status_if_version(
-    backend: &ResourceBackend,
-    namespace: &str,
-    requested_kind: &str,
-    name: &str,
-    status: Value,
-    expected_resource_version: &str,
-) -> Result<DynamicResourceObject, ResourceError> {
-    dispatch_resource_kind!(
-        lookup_resource_kind(requested_kind)?.resource,
-        patch_status_typed(backend, namespace, name, status, Some(expected_resource_version)).await
-    )
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, patch_status_typed(backend, namespace, name, status).await)
 }
 
 pub async fn watch_resource_kind(
@@ -741,7 +515,7 @@ pub async fn watch_resource_kind(
     namespace: &str,
     requested_kind: &str,
 ) -> Result<DynamicResourceWatch, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed(backend, namespace, None).await)
+    watch_resource_kind_with(backend, namespace, requested_kind, DynamicWatchRequest::default()).await
 }
 
 pub async fn watch_resource_kind_from(
@@ -750,19 +524,61 @@ pub async fn watch_resource_kind_from(
     requested_kind: &str,
     start: WatchStart,
 ) -> Result<DynamicResourceWatch, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed(backend, namespace, Some(start)).await)
+    watch_resource_kind_with(backend, namespace, requested_kind, DynamicWatchRequest { start: Some(start), ..Default::default() }).await
+}
+
+/// What a dynamic watch is asked for.
+#[derive(Clone, Debug, Default)]
+pub struct DynamicWatchRequest {
+    /// Where to start; none lists the current members first.
+    pub start: Option<WatchStart>,
+    /// Every home's copies, with their provenance, rather than one per name.
+    pub include_replicas: bool,
+    /// Whether the stream carries `BOOKMARK` events, each with the resourceVersion a reader that
+    /// took every event before it resumes from. Only an engine-served kind sends them; a reader
+    /// that resumes keeps the newest bookmark or list cursor, never an object's resourceVersion.
+    pub bookmarks: bool,
+}
+
+/// A watch of `requested_kind` as `request` asks.
+pub async fn watch_resource_kind_with(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    request: DynamicWatchRequest,
+) -> Result<DynamicResourceWatch, ResourceError> {
+    let DynamicWatchRequest { start, include_replicas, bookmarks } = request;
+    let resource = lookup_resource_kind(requested_kind)?.resource;
+    match include_replicas {
+        true => dispatch_resource_kind!(resource, watch_typed_including_replicas(backend, namespace, start, bookmarks).await),
+        false => dispatch_resource_kind!(resource, watch_typed(backend, namespace, start, bookmarks).await),
+    }
 }
 
 /// A merged-view bootstrap: register local and replica streams before reading
 /// the initial members. Consumers apply `initial` once, then every queued stream
-/// event in order (including deletions). The overlay cursor is descriptive only;
-/// this watch cannot resume from a list cursor. Reconnect with a fresh snapshot.
+/// event in order (including deletions). An engine-served kind's cursor is its
+/// position, which [`watch_resource_kind_including_replicas_from`] resumes from;
+/// any other kind's overlay cursor is descriptive only. Reconnect with a fresh snapshot.
 pub async fn watch_resource_kind_including_replicas(
     backend: &ResourceBackend,
     namespace: &str,
     requested_kind: &str,
 ) -> Result<DynamicResourceWatch, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed_including_replicas(backend, namespace).await)
+    watch_resource_kind_with(backend, namespace, requested_kind, DynamicWatchRequest { include_replicas: true, ..Default::default() }).await
+}
+
+/// [`watch_resource_kind_including_replicas`] resumed from `start`'s cursor, which an engine-served
+/// kind's include-replicas list or watch handed out: no initial members, and first each change
+/// since. Refused for any other kind, whose overlay cursor cannot be resumed from.
+pub async fn watch_resource_kind_including_replicas_from(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    start: WatchStart,
+) -> Result<DynamicResourceWatch, ResourceError> {
+    let request = DynamicWatchRequest { start: Some(start), include_replicas: true, bookmarks: false };
+    watch_resource_kind_with(backend, namespace, requested_kind, request).await
 }
 
 pub async fn list_resource_kind_replica_sources(
@@ -771,14 +587,6 @@ pub async fn list_resource_kind_replica_sources(
     requested_kind: &str,
 ) -> Result<DynamicResourceList, ResourceError> {
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, list_typed_replica_sources(backend, namespace).await)
-}
-
-pub async fn watch_resource_kind_replica_sources(
-    backend: &ResourceBackend,
-    namespace: &str,
-    requested_kind: &str,
-) -> Result<DynamicResourceWatch, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed_replica_sources(backend, namespace).await)
 }
 
 pub async fn apply_resource_document(
@@ -885,52 +693,6 @@ pub fn resource_document_spec_hash(document: &Value) -> Result<String, ResourceE
         .map_err(|error| ResourceError::decode(format!("decode resource labels: {error}")))?
         .unwrap_or_default();
     dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, typed_spec_hash(spec, &labels))
-}
-
-/// Fail the pre-roll gate before retired fields can be dropped by typed decoding.
-/// Inspect raw inventory from every authority and replica, including observed stores.
-pub fn validate_message_migration_complete(document: &Value) -> Result<(), ResourceError> {
-    let mut witnesses = Vec::new();
-    if document["kind"] == "TerminalSession" {
-        if document.pointer("/spec/source/message").is_some_and(|value| !value.is_null()) {
-            witnesses.push("legacy authority queue at spec.source.message");
-        }
-        if document
-            .pointer("/status/legacy_message_receipts")
-            .is_some_and(|value| value.as_object().is_none_or(|receipts| !receipts.is_empty()))
-        {
-            witnesses.push("legacy receipts at status.legacy_message_receipts");
-        }
-    }
-    if document["kind"] == "Convoy" {
-        if let Some(deliveries) = document.pointer("/status/turn_deliveries").and_then(Value::as_object) {
-            for delivery in deliveries.values() {
-                if ["pending_brief", "pending_supervisor_turn"]
-                    .iter()
-                    .any(|field| delivery.get(field).is_some_and(|value| !value.is_null()))
-                {
-                    witnesses.push("legacy authority queue at status.turn_deliveries");
-                }
-            }
-        }
-    }
-    let resolved_launch = document.pointer("/status/resolved_receiver").is_some_and(|value| !value.is_null())
-        || (document.pointer("/status/phase").and_then(Value::as_str) == Some("dead_lettered")
-            && document
-                .pointer("/status/reason")
-                .and_then(Value::as_str)
-                .is_some_and(|reason| reason.starts_with("operator failed batch:")));
-    if document["kind"] == "Message"
-        && !resolved_launch
-        && document.pointer("/status/submission/legacy_launch").is_some_and(|value| !value.is_null())
-    {
-        witnesses.push("unresolved legacy launch at status.submission.legacy_launch");
-    }
-    if witnesses.is_empty() {
-        Ok(())
-    } else {
-        Err(ResourceError::invalid(format!("Message migration incomplete: {}", witnesses.join(", "))))
-    }
 }
 
 /// Decode a complete resource document against this binary's registered types.
@@ -1091,6 +853,34 @@ fn unknown_kind(kind: &str) -> ResourceError {
     ResourceError::invalid(format!("unknown resource kind '{kind}' (supported: {supported})"))
 }
 
+/// [`query_resource_kind`]'s document for a kind the engine serves.
+async fn query_engine_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    query: &crate::StoreQuery,
+) -> Result<Value, ResourceError> {
+    let resource_version = replica_list_version::<T>(backend, namespace).await?;
+    let listed = backend.query_declared::<T>(namespace, query).await?;
+    let items = listed
+        .items
+        .iter()
+        .map(|item| {
+            let mut value = read_object_value(item)?;
+            value["apiVersion"] = json!(api_version(T::API_PATHS));
+            value["kind"] = json!(T::API_PATHS.kind);
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, ResourceError>>()?;
+    // The engine's position, taken before the query, is the version a watch resumes from; it has
+    // no generation. The local root is the authority a remote definitions query merges against.
+    Ok(json!({
+        "apiVersion": api_version(T::API_PATHS),
+        "kind": format!("{}List", T::API_PATHS.kind),
+        "metadata": {"resourceVersion": resource_version, "localRoot": backend.local_root()?},
+        "items": items,
+    }))
+}
+
 async fn list_typed<T: Resource>(backend: &ResourceBackend, namespace: &str) -> Result<DynamicResourceList, ResourceError> {
     let listed = backend.using::<T>(namespace).list().await?;
     Ok(DynamicResourceList {
@@ -1105,6 +895,7 @@ async fn list_typed_including_replicas<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
 ) -> Result<DynamicResourceList, ResourceError> {
+    let resource_version = replica_list_version::<T>(backend, namespace).await?;
     let listed = backend.including_replicas::<T>(namespace).list().await?;
     let items = listed.items.iter().map(read_object_value).collect::<Result<Vec<_>, _>>()?;
     Ok(DynamicResourceList {
@@ -1114,18 +905,23 @@ async fn list_typed_including_replicas<T: Resource>(
         value: json!({
             "apiVersion": api_version(T::API_PATHS),
             "kind": format!("{}List", T::API_PATHS.kind),
-            "metadata": {"resourceVersion": "overlay"},
+            "metadata": {"resourceVersion": resource_version},
             "items": items,
         }),
     })
 }
 
 async fn list_typed_replica_sources<T: Resource>(backend: &ResourceBackend, namespace: &str) -> Result<DynamicResourceList, ResourceError> {
+    let resource_version = replica_list_version::<T>(backend, namespace).await?;
     let listed = backend.including_replicas::<T>(namespace).list_sources().await?;
-    dynamic_read_list::<T>(namespace, listed)
+    dynamic_read_list::<T>(namespace, listed, resource_version)
 }
 
-fn dynamic_read_list<T: Resource>(namespace: &str, listed: ReadResourceList<T>) -> Result<DynamicResourceList, ResourceError> {
+fn dynamic_read_list<T: Resource>(
+    namespace: &str,
+    listed: ReadResourceList<T>,
+    resource_version: String,
+) -> Result<DynamicResourceList, ResourceError> {
     let items = listed.items.iter().map(read_object_value).collect::<Result<Vec<_>, _>>()?;
     Ok(DynamicResourceList {
         kind: T::API_PATHS.kind.to_string(),
@@ -1134,7 +930,7 @@ fn dynamic_read_list<T: Resource>(namespace: &str, listed: ReadResourceList<T>) 
         value: json!({
             "apiVersion": api_version(T::API_PATHS),
             "kind": format!("{}List", T::API_PATHS.kind),
-            "metadata": {"resourceVersion": "overlay"},
+            "metadata": {"resourceVersion": resource_version},
             "items": items,
         }),
     })
@@ -1169,12 +965,37 @@ async fn get_typed_including_replicas<T: Resource>(
 }
 
 async fn get_all_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceList, ResourceError> {
+    // Positioned before the copies, as a listing is.
+    let resource_version = replica_list_version::<T>(backend, namespace).await?;
     let listed = backend.including_replicas::<T>(namespace).get_all(name).await?;
-    dynamic_read_list::<T>(namespace, listed)
+    dynamic_read_list::<T>(namespace, listed, resource_version)
 }
 
 async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceDelete, ResourceError> {
     let resolver = backend.using::<T>(namespace);
+    if let Some(records) = backend.engine_records::<T>() {
+        backend.definitions::<T>(namespace).refuse_write_elsewhere()?;
+        // The engine keeps its own deletions: no old-store tombstone or decode quarantine. Its port
+        // answers a delete of a name it does not list too, refusing it when the kind takes no writes.
+        let object = match resolver.get(name).await {
+            Ok(object) => object,
+            Err(ResourceError::NotFound { .. }) => {
+                records.delete(name).await.map_err(ResourceError::invalid)?;
+                return Err(resolver.not_held_here(name, "delete").await?);
+            }
+            Err(error) => return Err(error),
+        };
+        resolver.delete(name).await?;
+        return Ok(DynamicResourceDelete {
+            object: DynamicResourceObject {
+                kind: T::API_PATHS.kind.to_string(),
+                plural: T::API_PATHS.plural.to_string(),
+                namespace: namespace.to_string(),
+                value: object_value(&object)?,
+            },
+            already_deleted: false,
+        });
+    }
     let (value, already_deleted) = match resolver.get(name).await {
         Ok(object) => {
             resolver.delete(name).await?;
@@ -1276,6 +1097,14 @@ async fn collect_replica_typed<T: Resource>(
                 && matches!(&source.provenance, ResourceProvenance::Replica { origin_root: source_origin, .. } if source_origin == origin_root)
         })
         .ok_or_else(|| ResourceError::not_found(name))?;
+    if backend.engine_serves(T::API_PATHS.kind) {
+        // The engine holds one record at its home and follows it everywhere else: there is no
+        // copy here to collect, and a delete anywhere but the home would not stop the following.
+        return Err(ResourceError::invalid(format!(
+            "{} {name} is held by home {origin_root}; it is deleted at its home, not as a replica here",
+            T::API_PATHS.kind
+        )));
+    }
     let value = read_object_value(&replica)?;
     backend.replica_writer::<T>(origin_root.clone(), namespace).apply(WatchEvent::Deleted(replica.object), Utc::now()).await?;
     Ok(DynamicResourceObject {
@@ -1291,17 +1120,16 @@ async fn patch_status_typed<T: Resource>(
     namespace: &str,
     name: &str,
     status: Value,
-    expected_resource_version: Option<&str>,
 ) -> Result<DynamicResourceObject, ResourceError> {
     validate_observation_decisions::<T>(&status)?;
     let status = serde_json::from_value::<T::Status>(status)
         .map_err(|error| ResourceError::decode(format!("decode {} status: {error}", T::API_PATHS.kind)))?;
     let resolver = backend.using::<T>(namespace);
     for _ in 0..3 {
-        let current = resolver.get(name).await?;
-        if expected_resource_version.is_some_and(|expected| expected != current.metadata.resource_version) {
-            return Err(ResourceError::conflict(name, "guarded status patch refused: status changed since the caller's observation"));
-        }
+        let current = match resolver.get(name).await {
+            Err(ResourceError::NotFound { .. }) => return Err(resolver.not_held_here(name, "write").await?),
+            current => current?,
+        };
         match resolver.update_status(name, &current.metadata.resource_version, &status).await {
             Ok(object) => {
                 return Ok(DynamicResourceObject {
@@ -1311,13 +1139,7 @@ async fn patch_status_typed<T: Resource>(
                     value: object_value(&object)?,
                 });
             }
-            Err(ResourceError::Conflict { .. }) if expected_resource_version.is_none() => continue,
-            Err(error @ ResourceError::Conflict { .. }) => {
-                return Err(ResourceError::conflict(
-                    name,
-                    format!("guarded status patch refused: status changed during the update; {error}"),
-                ));
-            }
+            Err(ResourceError::Conflict { .. }) => continue,
             Err(error) => return Err(error),
         }
     }
@@ -1330,8 +1152,40 @@ async fn watch_typed<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
     requested_start: Option<WatchStart>,
+    bookmarks: bool,
 ) -> Result<DynamicResourceWatch, ResourceError> {
     let resolver = backend.using::<T>(namespace);
+    let definitions = backend.definitions::<T>(namespace);
+    // An engine-served kind's watch carries its position, and bookmarks where asked.
+    let fed = match &requested_start {
+        Some(WatchStart::FromVersion(version) | WatchStart::FromVersionInGeneration { resource_version: version, .. }) => {
+            definitions.engine_watch_from_fed(version).await.map(|fed| fed.map(|stream| (version.clone(), stream)))
+        }
+        Some(WatchStart::Now) | None => definitions.engine_watch_fed().await.map(|fed| fed.map(|(_, position, stream)| (position, stream))),
+    };
+    if let Some(fed) = fed {
+        let (position, stream) = fed?;
+        let stream = fed_values(stream, bookmarks, typed_read_event_value::<T>);
+        let (resource_version, initial) = match requested_start {
+            Some(_) => (position, Vec::new()),
+            // Watched before the list: a change between the two is in the list, the stream or both,
+            // and a resume from the list's position names it again.
+            None => {
+                let listed = resolver.list().await?;
+                let initial = listed.items.iter().map(|object| watch_event_value("ADDED", object)).collect::<Result<Vec<_>, _>>()?;
+                (listed.resource_version, initial)
+            }
+        };
+        return Ok(DynamicResourceWatch {
+            kind: T::API_PATHS.kind.to_string(),
+            plural: T::API_PATHS.plural.to_string(),
+            namespace: namespace.to_string(),
+            resource_version,
+            generation: None,
+            initial,
+            stream,
+        });
+    }
     let (resource_version, generation, initial, start) = match requested_start {
         Some(start) => {
             let resource_version = match &start {
@@ -1352,9 +1206,19 @@ async fn watch_typed<T: Resource>(
         }
     };
     let watch = resolver.watch(start).await?;
+    Ok(dynamic_watch::<T>(namespace, resource_version, generation, initial, watch))
+}
+
+fn dynamic_watch<T: Resource>(
+    namespace: &str,
+    resource_version: String,
+    generation: Option<String>,
+    initial: Vec<Value>,
+    watch: WatchStream<T>,
+) -> DynamicResourceWatch {
     let stream_generation = watch.generation().map(ToOwned::to_owned).or(generation);
     let stream = watch.map(|event| event.and_then(|event| typed_watch_event_value(&event))).boxed();
-    Ok(DynamicResourceWatch {
+    DynamicResourceWatch {
         kind: T::API_PATHS.kind.to_string(),
         plural: T::API_PATHS.plural.to_string(),
         namespace: namespace.to_string(),
@@ -1362,17 +1226,40 @@ async fn watch_typed<T: Resource>(
         generation: stream_generation,
         initial,
         stream,
-    })
+    }
 }
 
 async fn watch_typed_including_replicas<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
+    start: Option<WatchStart>,
+    bookmarks: bool,
 ) -> Result<DynamicResourceWatch, ResourceError> {
+    let definitions = backend.definitions::<T>(namespace);
+    if let Some(WatchStart::FromVersion(resource_version) | WatchStart::FromVersionInGeneration { resource_version, .. }) = start {
+        let Some(stream) = definitions.engine_watch_from_fed(&resource_version).await else {
+            return Err(ResourceError::invalid("include-replicas watches do not support resourceVersion resume"));
+        };
+        let stream = fed_values(stream?, bookmarks, read_watch_event_value::<T>);
+        return Ok(DynamicResourceWatch {
+            kind: T::API_PATHS.kind.to_string(),
+            plural: T::API_PATHS.plural.to_string(),
+            namespace: namespace.to_string(),
+            resource_version,
+            generation: None,
+            initial: Vec::new(),
+            stream,
+        });
+    }
+    // Positioned before the stream and the members: a resume from it names again any change they hold.
+    let resource_version = replica_list_version::<T>(backend, namespace).await?;
     let resolver = backend.including_replicas::<T>(namespace);
     // Subscribe before listing to cover the handoff. WatchChannel is bounded
     // (256 events); overflow reports WatchExpired rather than growing a queue.
-    let stream = resolver.watch().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
+    let stream = match definitions.engine_watch_fed().await {
+        Some(fed) => fed_values(fed?.2, bookmarks, read_watch_event_value::<T>),
+        None => resolver.watch().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed(),
+    };
     let initial = resolver
         .list()
         .await?
@@ -1384,53 +1271,18 @@ async fn watch_typed_including_replicas<T: Resource>(
         kind: T::API_PATHS.kind.to_string(),
         plural: T::API_PATHS.plural.to_string(),
         namespace: namespace.to_string(),
-        resource_version: "overlay".to_string(),
+        resource_version,
         generation: None,
         initial,
         stream,
     })
 }
 
-async fn watch_typed_replica_sources<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-) -> Result<DynamicResourceWatch, ResourceError> {
-    let resolver = backend.including_replicas::<T>(namespace);
-    let stream = resolver.watch_sources().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
-    let mut initial = resolver
-        .list_sources()
-        .await?
-        .items
-        .iter()
-        .map(|object| Ok(json!({"type": "ADDED", "object": read_object_value(object)?})))
-        .collect::<Result<Vec<_>, ResourceError>>()?;
-    // Subscribe before reading both live rows and deletion fences. Events that
-    // race either read are replayed afterwards with their original sync stamp.
-    // Receivers compare those stamps, not arrival order: an older fence cannot
-    // remove a newer recreation, including when it appears later in this batch.
-    for deleted in backend.list_replica_deletions_raw(crate::ResourceKind::of::<T>(), namespace).await? {
-        let event = ReadWatchEvent::<T>::DeletedByName {
-            tombstone: crate::ResourceTombstone {
-                name: deleted.name,
-                namespace: namespace.to_string(),
-                // A relay fence proves no origin log position. Relay apply is
-                // ordered by last-synced-at and never advances the direct cursor.
-                resource_version: "overlay".to_string(),
-                annotations: Default::default(),
-            },
-            provenance: ResourceProvenance::Replica { origin_root: deleted.origin_root, last_synced_at: deleted.last_synced_at },
-        };
-        initial.push(read_watch_event_value(&event)?);
-    }
-    Ok(DynamicResourceWatch {
-        kind: T::API_PATHS.kind.to_string(),
-        plural: T::API_PATHS.plural.to_string(),
-        namespace: namespace.to_string(),
-        resource_version: "overlay".to_string(),
-        generation: None,
-        initial,
-        stream,
-    })
+/// The cursor an include-replicas read of `T` carries, taken before the read: an engine-served
+/// kind's position; for any other kind the local store's version, which an include-replicas watch
+/// refuses to resume from.
+async fn replica_list_version<T: Resource>(backend: &ResourceBackend, namespace: &str) -> Result<String, ResourceError> {
+    Ok(backend.using::<T>(namespace).current_position().await?.resource_version)
 }
 
 async fn apply_typed<T: Resource>(
@@ -1443,8 +1295,12 @@ async fn apply_typed<T: Resource>(
     let spec = serde_json::from_value::<T::Spec>(spec)
         .map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
     if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
-        let meta = match backend.definitions::<T>(namespace).get(&metadata.name).await {
-            Ok(existing) => metadata.input_meta_for_update(&existing.metadata),
+        let meta = match backend.including_replicas::<T>(namespace).get(&metadata.name).await {
+            Ok(existing) if matches!(existing.provenance, ResourceProvenance::Local) => {
+                metadata.input_meta_for_update(&existing.object.metadata)
+            }
+            // A definition another home holds is that home's to write, not a new record here.
+            Ok(_) => return Err(backend.using::<T>(namespace).not_held_here(&metadata.name, "write").await?),
             Err(ResourceError::NotFound { .. }) => metadata.input_meta_for_create(),
             Err(error) => return Err(error),
         };
@@ -1462,7 +1318,11 @@ async fn apply_typed<T: Resource>(
             let meta = metadata.input_meta_for_update(&existing.metadata);
             resolver.update(&meta, &existing.metadata.resource_version, &spec).await?
         }
-        Err(ResourceError::NotFound { .. }) => resolver.create(&metadata.input_meta_for_create(), &spec).await?,
+        // A name another home holds is that home's to write, not a new record here.
+        Err(ResourceError::NotFound { .. }) => match resolver.not_held_here(&metadata.name, "write").await? {
+            ResourceError::NotFound { .. } => resolver.create(&metadata.input_meta_for_create(), &spec).await?,
+            held_elsewhere => return Err(held_elsewhere),
+        },
         Err(error) => return Err(error),
     };
     Ok(DynamicResourceObject {
@@ -1509,6 +1369,46 @@ pub(crate) fn read_object_value<T: Resource>(object: &crate::ReadResourceObject<
         annotations.insert(LAST_SYNCED_AT_ANNOTATION.to_string(), Value::String(last_synced_at.to_rfc3339()));
     }
     Ok(value)
+}
+
+/// An engine watch's events as `event_value` writes them, with its bookmarks where `bookmarks`.
+fn fed_values<T: Resource>(
+    stream: crate::definition::FedStream<T>,
+    bookmarks: bool,
+    event_value: fn(&ReadWatchEvent<T>) -> Result<Value, ResourceError>,
+) -> BoxStream<'static, Result<Value, ResourceError>> {
+    use crate::definition::Fed;
+    stream
+        .filter_map(move |fed| {
+            std::future::ready(match fed {
+                Ok(Fed::Event(event)) => Some(event_value(&event)),
+                Ok(Fed::Bookmark(position)) => bookmarks.then(|| Ok(bookmark_value::<T>(&position))),
+                Err(error) => Some(Err(error)),
+            })
+        })
+        .boxed()
+}
+
+/// A Kubernetes `BOOKMARK` event at `resource_version`.
+fn bookmark_value<T: Resource>(resource_version: &str) -> Value {
+    json!({
+        "type": "BOOKMARK",
+        "object": {
+            "apiVersion": api_version(T::API_PATHS),
+            "kind": T::API_PATHS.kind,
+            "metadata": {"resourceVersion": resource_version},
+        },
+    })
+}
+
+/// A read event written as the one-copy watch writes it: the object, without its provenance.
+fn typed_read_event_value<T: Resource>(event: &ReadWatchEvent<T>) -> Result<Value, ResourceError> {
+    match event {
+        ReadWatchEvent::Added(read) => watch_event_value("ADDED", &read.object),
+        ReadWatchEvent::Modified(read) => watch_event_value("MODIFIED", &read.object),
+        ReadWatchEvent::Deleted(read) => watch_event_value("DELETED", &read.object),
+        ReadWatchEvent::DeletedByName { tombstone, .. } => Ok(json!({"type": "DELETED", "object": tombstone_value::<T>(tombstone)})),
+    }
 }
 
 fn read_watch_event_value<T: Resource>(event: &ReadWatchEvent<T>) -> Result<Value, ResourceError> {
@@ -1590,13 +1490,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::{Duration, Utc};
-    use flotilla_protocol::{NodeId, ResourceRef};
+    use flotilla_protocol::NodeId;
 
     use super::*;
-    use crate::{
-        Convoy, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandSpec, HostSpec, InputMeta, PrincipalRef, Regard, RegardExpiryPolicy,
-        RegardSource, RegardSpec,
-    };
+    use crate::{Convoy, ConvoySpec, HostSpec, InputMeta};
 
     // Finite authoring contract: missing, null and string decisions are invalid;
     // both boolean choices work. Stored legacy records remain readable.
@@ -1643,7 +1540,6 @@ mod tests {
     async fn replica_source_wire_provenance_comes_from_the_store() {
         let backend = ResourceBackend::new(crate::test_store::memory_backend());
         let local = backend.using::<Convoy>("flotilla");
-        let mut watch = watch_resource_kind_replica_sources(&backend, "flotilla", "convoys").await.expect("watch sources");
         let stale_annotations = BTreeMap::from([
             (ORIGIN_ROOT_ANNOTATION.to_string(), "wrong-root".to_string()),
             (LAST_SYNCED_AT_ANNOTATION.to_string(), "not-a-timestamp".to_string()),
@@ -1657,20 +1553,16 @@ mod tests {
             local
                 .create(
                     &InputMeta::builder().name("copied".to_string()).annotations(annotations.clone()).build(),
-                    &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+                    &ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).build(),
                 )
                 .await
                 .expect("author copied manifest");
             let listed = list_resource_kind_replica_sources(&backend, "flotilla", "convoys").await.expect("list sources");
-            let added = watch.stream.next().await.expect("added event").expect("encode added event");
             local.delete("copied").await.expect("delete copied manifest");
-            let deleted = watch.stream.next().await.expect("deleted event").expect("encode deleted event");
-            for object in [&listed.value["items"][0], &added["object"], &deleted["object"]] {
-                let wire = &object["metadata"]["annotations"];
-                assert!(wire.get(ORIGIN_ROOT_ANNOTATION).is_none(), "local records must not masquerade as replicas");
-                assert!(wire.get(LAST_SYNCED_AT_ANNOTATION).is_none(), "partial provenance must not poison relay decoding");
-                assert_eq!(wire.get("example.com/note").and_then(Value::as_str), annotations.get("example.com/note").map(String::as_str));
-            }
+            let wire = &listed.value["items"][0]["metadata"]["annotations"];
+            assert!(wire.get(ORIGIN_ROOT_ANNOTATION).is_none(), "local records must not masquerade as replicas");
+            assert!(wire.get(LAST_SYNCED_AT_ANNOTATION).is_none(), "partial provenance must not poison relay decoding");
+            assert_eq!(wire.get("example.com/note").and_then(Value::as_str), annotations.get("example.com/note").map(String::as_str));
         }
 
         let synced_at = Utc::now();
@@ -1707,7 +1599,10 @@ mod tests {
         let backend = ResourceBackend::new(crate::test_store::memory_backend());
         backend
             .using::<Convoy>("flotilla")
-            .create(&InputMeta::builder().name("demo".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf".to_string()).build())
+            .create(
+                &InputMeta::builder().name("demo".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("wf".to_string()).project_ref("flotilla".to_string()).build(),
+            )
             .await
             .expect("create convoy");
 
@@ -1725,7 +1620,10 @@ mod tests {
         let peer = ResourceBackend::new(crate::test_store::memory_backend());
         let convoys = source.using::<Convoy>("flotilla");
         convoys
-            .create(&InputMeta::builder().name("ghost".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf".to_string()).build())
+            .create(
+                &InputMeta::builder().name("ghost".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("wf".to_string()).project_ref("flotilla".to_string()).build(),
+            )
             .await
             .expect("create source convoy");
         let listed = convoys.list().await.expect("list source convoys");
@@ -1819,144 +1717,64 @@ mod tests {
         assert!(message.contains("convoys"));
     }
 
-    #[tokio::test]
-    async fn attention_resource_kinds_are_registered_for_dynamic_listing() {
-        let backend = ResourceBackend::new(crate::test_store::memory_backend());
-        backend
-            .using::<Regard>("flotilla")
-            .create(
-                &InputMeta::builder().name("principal-default-convoy-demo".to_string()).build(),
-                &RegardSpec::builder()
-                    .principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
-                    .target(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo"))
-                    .source(RegardSource::Expressed)
-                    .expiry(RegardExpiryPolicy::Pin)
-                    .build(),
-            )
-            .await
-            .expect("create regard");
-        backend
-            .using::<Demand>("flotilla")
-            .create(
-                &InputMeta::builder().name("demo-permission".to_string()).build(),
-                &DemandSpec::builder()
-                    .originating_work_ref(ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-implement"))
-                    .kind(DemandKind::Permission)
-                    .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
-                    .build(),
-            )
-            .await
-            .expect("create demand");
-
-        let regards = list_resource_kind(&backend, "flotilla", "regards").await.expect("list regards dynamically");
-        let demands = list_resource_kind(&backend, "flotilla", "demands").await.expect("list demands dynamically");
-
-        assert_eq!(regards.kind, "Regard");
-        assert_eq!(regards.value["items"][0]["kind"], "Regard");
-        assert_eq!(demands.kind, "Demand");
-        assert_eq!(demands.value["items"][0]["kind"], "Demand");
+    /// A Convoy document named `demo` running `workflow`.
+    fn convoy_document(workflow: &str) -> Value {
+        json!({
+            "apiVersion": "flotilla.work/v1",
+            "kind": "Convoy",
+            "metadata": { "name": "demo" },
+            "spec": { "workflow_ref": workflow, "project_ref": "flotilla" }
+        })
     }
 
     #[tokio::test]
     async fn apply_resource_document_creates_registered_resources() {
         let backend = ResourceBackend::new(crate::test_store::memory_backend());
-        let applied = apply_resource_document(
-            &backend,
-            "flotilla",
-            json!({
-                "apiVersion": "flotilla.work/v1",
-                "kind": "Demand",
-                "metadata": {
-                    "name": "demo-review"
-                },
-                "spec": {
-                    "originating_work_ref": {
-                        "api_version": "flotilla.work/v1",
-                        "kind": "Vessel",
-                        "namespace": "flotilla",
-                        "name": "demo-review"
-                    },
-                    "kind": "review",
-                    "addressee": {
-                        "kind": "principal",
-                        "principal_ref": { "namespace": "flotilla", "name": "implicit" }
-                    }
-                }
-            }),
-        )
-        .await
-        .expect("apply demand document");
+        let applied = apply_resource_document(&backend, "flotilla", convoy_document("review")).await.expect("apply convoy document");
 
-        assert_eq!(applied.kind, "Demand");
-        assert_eq!(applied.value["metadata"]["name"], "demo-review");
-        assert_eq!(backend.using::<Demand>("flotilla").get("demo-review").await.expect("stored demand").spec.kind, DemandKind::Review);
+        assert_eq!(applied.kind, "Convoy");
+        assert_eq!(applied.value["metadata"]["name"], "demo");
+        assert_eq!(backend.using::<Convoy>("flotilla").get("demo").await.expect("stored convoy").spec.workflow_ref, "review");
     }
 
     #[tokio::test]
     async fn apply_resource_document_reapply_preserves_existing_metadata_when_omitted() {
         let backend = ResourceBackend::new(crate::test_store::memory_backend());
-        let resolver = backend.using::<Demand>("flotilla");
+        let resolver = backend.using::<Convoy>("flotilla");
         let owner_reference = OwnerReference {
             api_version: "flotilla.work/v1".to_string(),
-            kind: "Vessel".to_string(),
-            name: "demo-implement".to_string(),
+            kind: "ConvoyEnsure".to_string(),
+            name: "standing".to_string(),
             controller: true,
         };
         resolver
             .create(
                 &InputMeta::builder()
-                    .name("demo-review".to_string())
-                    .labels(BTreeMap::from([("controller".to_string(), "attention".to_string())]))
+                    .name("demo".to_string())
+                    .labels(BTreeMap::from([("controller".to_string(), "standing".to_string())]))
                     .owner_references(vec![owner_reference.clone()])
-                    .finalizers(vec!["attention.flotilla.work/finalizer".to_string()])
+                    .finalizers(vec!["standing.flotilla.work/finalizer".to_string()])
                     .build(),
-                &DemandSpec::builder()
-                    .originating_work_ref(ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-implement"))
-                    .kind(DemandKind::Permission)
-                    .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
-                    .build(),
+                &ConvoySpec::builder().workflow_ref("implement".to_string()).project_ref("flotilla".to_string()).build(),
             )
             .await
-            .expect("create demand with metadata");
+            .expect("create convoy with metadata");
 
-        let reapply_review_document = || {
-            json!({
-                "apiVersion": "flotilla.work/v1",
-                "kind": "Demand",
-                "metadata": {
-                    "name": "demo-review"
-                },
-                "spec": {
-                    "originating_work_ref": {
-                        "api_version": "flotilla.work/v1",
-                        "kind": "Vessel",
-                        "namespace": "flotilla",
-                        "name": "demo-implement"
-                    },
-                    "kind": "review",
-                    "addressee": {
-                        "kind": "principal",
-                        "principal_ref": { "namespace": "flotilla", "name": "implicit" }
-                    }
-                }
-            })
-        };
+        apply_resource_document(&backend, "flotilla", convoy_document("review")).await.expect("reapply convoy document");
 
-        apply_resource_document(&backend, "flotilla", reapply_review_document()).await.expect("reapply demand document");
-
-        let updated = resolver.get("demo-review").await.expect("updated demand");
-        assert_eq!(updated.spec.kind, DemandKind::Review);
+        let updated = resolver.get("demo").await.expect("updated convoy");
+        assert_eq!(updated.spec.workflow_ref, "review");
         assert_eq!(updated.metadata.owner_references, vec![owner_reference]);
-        assert_eq!(updated.metadata.labels.get("controller").map(String::as_str), Some("attention"));
-        assert_eq!(updated.metadata.finalizers, vec!["attention.flotilla.work/finalizer"]);
+        assert_eq!(updated.metadata.labels.get("controller").map(String::as_str), Some("standing"));
+        assert_eq!(updated.metadata.finalizers, vec!["standing.flotilla.work/finalizer"]);
 
-        resolver.delete("demo-review").await.expect("mark demand for deletion");
-        let deleting = resolver.get("demo-review").await.expect("deleting demand");
+        resolver.delete("demo").await.expect("mark convoy for deletion");
+        let deleting = resolver.get("demo").await.expect("deleting convoy");
         let deletion_timestamp = deleting.metadata.deletion_timestamp.expect("deletion timestamp should be set");
 
-        apply_resource_document(&backend, "flotilla", reapply_review_document()).await.expect("reapply pending-delete demand document");
+        apply_resource_document(&backend, "flotilla", convoy_document("review")).await.expect("reapply pending-delete convoy document");
 
-        let reapplied = resolver.get("demo-review").await.expect("reapplied pending-delete demand");
+        let reapplied = resolver.get("demo").await.expect("reapplied pending-delete convoy");
         assert_eq!(reapplied.metadata.deletion_timestamp, Some(deletion_timestamp));
     }
 }

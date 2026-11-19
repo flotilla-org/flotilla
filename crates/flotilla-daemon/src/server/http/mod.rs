@@ -9,7 +9,7 @@ mod auth;
 mod commands;
 #[cfg(test)]
 mod hook_tests;
-mod hooks;
+pub(in crate::server) mod hooks;
 mod login;
 pub(in crate::server) mod metrics;
 mod resource_api;
@@ -50,7 +50,7 @@ use resource_api::Reply;
 use rigging_http_serve::Caller;
 
 use crate::server::{
-    tables::{Catalog, DerivedSet, QueryFeed, SubjectTables},
+    tables::{Catalog, DerivedSet, Positions, QueryFeed, SubjectTables},
     verbs::{self, Verbs},
 };
 
@@ -101,6 +101,9 @@ pub(in crate::server) struct HttpRouter {
     /// This daemon run: a named query's sequence numbers restart with it.
     #[builder(skip = uuid::Uuid::new_v4().to_string())]
     incarnation: String,
+    /// The resource tables' positions in the decided store's log, shared by their subscriptions.
+    #[builder(skip)]
+    positions: Arc<Positions>,
 }
 
 /// The TCP listener's origin, known only once it binds (its port may be chosen then). The
@@ -148,6 +151,7 @@ impl HttpRouter {
             subjects: SubjectTables::default(),
             derived: Vec::new(),
             incarnation: uuid::Uuid::new_v4().to_string(),
+            positions: Arc::default(),
         }
     }
 
@@ -161,6 +165,7 @@ impl HttpRouter {
             derived: self.derived.clone(),
             queries: queries.or_else(|| self.daemon.as_ref().map(|daemon| QueryFeed::new(Arc::clone(daemon), self.incarnation.clone()))),
             incarnation: self.incarnation.clone(),
+            positions: Arc::clone(&self.positions),
         }
     }
 

@@ -6,13 +6,13 @@ use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::{
         atomic::{AtomicIsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
 };
 
 use flotilla_inbox::{sqlite::StoreLog, InboxBackend, Rules};
 use flotilla_inbox_testkit::{consumer, inbox, spec, Evidence, SessionPort, Supervisors};
-use flotilla_schema_sqlite::{Store, StoreOptions};
+use flotilla_schema_sqlite::{Store, StoreHandle, StoreOptions};
 use flotilla_state_machines::machines::message::MessageBody;
 use futures::TryStreamExt;
 use rusqlite::Connection;
@@ -60,7 +60,7 @@ async fn bounded_resident_allocation_workload() {
     const BUDGET: usize = 32 * 1024;
     // Small, explicitly bounded source caches isolate the replica plateau.
     // Production Store defaults have the same two-generation policy at 65,536.
-    let store = Arc::new(Mutex::new(
+    let store = Arc::new(StoreHandle::new(
         Store::open_with(
             Connection::open_in_memory().expect("db"),
             "test",
@@ -152,6 +152,9 @@ fn calibrate() {
                 use flotilla_state_machines::machines::convoy::*;
                 let owner = SeatName::new("coder", "");
                 flotilla_schema::Frozen::new(MessageBody::Request(RequestBody::Convoy(Box::new(ConvoyRequest {
+                    launch_of: "c".into(),
+                    workflow_ref: "w".into(),
+                    admission: flotilla_schema::Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
                     project: address("project:test"),
                     promises: [(
                         PromiseId(0),
@@ -166,6 +169,7 @@ fn calibrate() {
                     .into(),
                     duties: [(DutyId(0), Duty { owner, scope: DutyScope::Lifetime, terms: Terms::default() })].into(),
                     seats: vec![Seat {
+                        failed: None,
                         retired: false,
                         replacements: 0,
                         role: "coder".into(),
@@ -173,7 +177,6 @@ fn calibrate() {
                         parent: None,
                         supervised_by: inbox(),
                     }],
-                    quota: [(VesselClass::new("standard"), 2)].into(),
                     priority: Priority(1),
                     kinds: flotilla_schema::Frozen::new(PromiseKinds::default()).unwrap(),
                 }))))

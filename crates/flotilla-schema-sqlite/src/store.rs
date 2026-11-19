@@ -13,9 +13,10 @@ use std::{
 
 use crate::DdlMode;
 use flotilla_schema::{
-    whole_log_topic, Cause, Change, ChangeHeader, ChangeItem, Code, ColumnDef, ColumnType, DecodeError, Decoder, Edge, EdgeParts, EdgeRow,
-    Effect, Encoder, Event, Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry, Named, NewChange, Row, RowEdit, RowPath, Rows,
-    TableRole, Timestamp, Value, HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
+    reads::{self, ReadShape},
+    whole_log_topic, Cause, Change, ChangeHeader, ChangeItem, Code, ColumnDef, ColumnType, CreatedAt, DecodeError, Decoder, Edge,
+    EdgeParts, EdgeRow, Effect, Encoder, Event, Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry, Named, NewChange, Row, RowEdit,
+    RowPath, Rows, TableRole, Timestamp, Value, HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,12 +28,14 @@ use crate::{
     error::{Malformed, StoreError},
     query::{page_limit, Cursor, Page},
     shared::{
-        check_kind_codes, check_kind_columns, has_string_domain, log_predates_changes, schema_ddl, sync_views, CHANGE_APPEND,
-        CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_NAMING, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE, HOME_IDS_RESET,
-        HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE,
-        IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
-        LOG_EXPUNGED_AFTER, LOG_LAST_CHANGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT,
-        SEQUENCE_RAISE, SHARED_STATEMENTS, STRING_ID, STRING_INSERT, WATERMARK_PUT,
+        check_kind_codes, check_kind_columns, has_string_domain, log_predates_changes, schema_ddl, sync_indexes, sync_views, CHANGE_APPEND,
+        CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_NAMED, CHANGE_NAMING, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE,
+        FLOOR_SET, HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_CREATED, IDENTITY_DELETE,
+        IDENTITY_INSERT, IDENTITY_NAMED, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_RESTORE_CREATED, IDENTITY_SEQ, IDENTITY_SET_CREATED,
+        IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
+        LOG_EXPUNGED_AFTER, LOG_LAST_CHANGE, LOG_LAST_EDGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST,
+        SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, SNAPSHOT_CAUSE_DELETE, SNAPSHOT_CAUSE_GET, SNAPSHOT_CAUSE_PUT, STRING_ID,
+        STRING_INSERT, WATERMARK_PUT,
     },
     sql::{KindSql, TableSql},
 };
@@ -105,7 +108,35 @@ pub struct Snapshot {
     pub version: u64,
     /// Rows per table in pre-order, each table sorted by key.
     pub rows: Rows,
+    /// Why the resource is as it is: its newest entry's change, or for a resource this store holds
+    /// from a snapshot, the cause that snapshot carried. A restore records it, so a record that
+    /// crosses hosts by snapshot keeps the reason it was written (#3108).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<ChangeHeader>,
+    /// When the resource was created at its home: a restore records it, so a replica installed
+    /// from a snapshot reads the home's creation time, not the time it was installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<CreatedAt>,
+    /// Earlier entries of the resource its readers need and its rows do not hold, as the kind's
+    /// [`CarriedEdges`] names them (a retired convoy's end), each with its change. A restore
+    /// records each as an entry of the resource, so a replica reads it as the home does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<CarriedEntry>,
 }
+
+/// An earlier entry a [`Snapshot`] carries, with the change it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarriedEntry {
+    pub event: Event,
+    pub change: ChangeHeader,
+}
+
+/// For a snapshot of a resource of one kind, the edges whose newest entry the snapshot carries:
+/// what a reader of the resource needs that its rows do not hold. See [`Store::carry`].
+pub type CarriedEdges = dyn Fn(&Snapshot) -> Result<Vec<Code>, StoreError> + Send + Sync;
+
+/// Each kind's [`CarriedEdges`], shared by a store and the readers its service opens.
+pub(crate) type Carriers = std::sync::Arc<std::sync::RwLock<BTreeMap<KindCode, std::sync::Arc<CarriedEdges>>>>;
 
 impl Snapshot {
     pub fn decode<K: Kind>(&self) -> Result<K, StoreError> {
@@ -144,21 +175,99 @@ impl Default for StoreOptions {
 pub struct Store {
     conn: Connection,
     runtime: Runtime,
+    /// Whether a write transaction began since its handle's guard last looked.
+    wrote: bool,
 }
 
 struct Runtime {
     change_page_bytes: usize,
     watermarks: crate::stream::Watermarks,
     applied: crate::stream::AppliedListeners,
+    commits: crate::stream::Commits,
+    heards: crate::stream::Heards,
     home: String,
     kinds: KindRegistry,
     sql: BTreeMap<KindCode, KindSql>,
     strings: TwoGen<StringKey, i64>,
     identities: TwoGen<Identity, ResourceId>,
     ids: TwoGen<ResourceId, Identity>,
+    /// Told of each write to their kind inside its transaction: see [`Store::observe`].
+    observers: Vec<std::sync::Arc<dyn Observing>>,
+    /// The edges each kind's snapshots carry: see [`Store::carry`].
+    carriers: Carriers,
+    /// The writer's checkpoints, when this store's connection owns its write-ahead log.
+    wal: Option<crate::wal::Checkpointer>,
+}
+
+/// What a write did to a resource of the kind an observer watches, told inside the write's
+/// transaction.
+pub enum Observed<'a, K> {
+    /// Resource `name` homed at `home` was written here, by this home or applied or restored from
+    /// its home: `value` is what it holds now; none once it is deleted.
+    Written { name: &'a str, home: &'a str, value: Option<&'a K> },
+    /// Every resource homed at `home` was dropped here, to be restored from its snapshot.
+    Reset { home: &'a str },
+}
+
+/// What an observer makes of a write: run once the write's transaction commits, still under the
+/// store's lock and before any commit listener is told; dropped when the write is rewound or the
+/// transaction is not committed.
+pub type Staged = Box<dyn FnOnce() + Send>;
+
+/// An observer of one kind's writes: see [`Store::observe`]. It must not block, and reads nothing
+/// but what it is told.
+pub type Observer<K> = dyn Fn(Observed<'_, K>) -> Option<Staged> + Send + Sync;
+
+/// An [`Observer`] of some kind, as the store holds it.
+trait Observing: Send + Sync {
+    fn code(&self) -> KindCode;
+    fn written(&self, ctx: &mut Ctx<'_>, id: ResourceId) -> Result<Option<Staged>, StoreError>;
+    fn reset(&self, home: &str) -> Option<Staged>;
+}
+
+struct Typed<K>(std::sync::Arc<Observer<K>>);
+
+impl<K: Kind + 'static> Observing for Typed<K> {
+    fn code(&self) -> KindCode {
+        K::CODE
+    }
+
+    fn written(&self, ctx: &mut Ctx<'_>, id: ResourceId) -> Result<Option<Staged>, StoreError> {
+        let Some(identity) = ctx.identity_of(id)? else { return Ok(None) };
+        // The write's own value, decoded once more for its observers: no read counted.
+        let loaded = ctx.load::<K>(id)?;
+        Ok((self.0)(Observed::Written { name: &identity.name, home: &identity.home, value: loaded.as_ref().map(|loaded| &loaded.value) }))
+    }
+
+    fn reset(&self, home: &str) -> Option<Staged> {
+        (self.0)(Observed::Reset { home })
+    }
 }
 
 impl Store {
+    /// Tells `observer` of every write to a resource of kind `K` from now on: this home's own,
+    /// another home's applied, and a snapshot's restored, each inside its transaction. What it
+    /// stages runs as the transaction commits, so a projection it keeps moves with the store's
+    /// commits and is never ahead of or behind them for a reader holding the store's lock.
+    pub fn observe<K: Kind + 'static>(&mut self, observer: std::sync::Arc<Observer<K>>) {
+        self.runtime.observers.push(std::sync::Arc::new(Typed(observer)));
+    }
+
+    /// From now on each snapshot of a resource of `kind` carries the newest entry of each edge
+    /// `edges` names for it ([`Snapshot::entries`]), here and in the readers this store's service
+    /// opens to serve snapshots: what a reader needs that the rows do not hold.
+    pub fn carry(&self, kind: KindCode, edges: std::sync::Arc<CarriedEdges>) {
+        self.runtime.carriers.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(kind, edges);
+    }
+
+    pub(crate) fn carriers(&self) -> Carriers {
+        std::sync::Arc::clone(&self.runtime.carriers)
+    }
+
+    /// Takes `carriers` as this store's: a reader serving snapshots for the store that holds them.
+    pub(crate) fn share_carriers(&mut self, carriers: Carriers) {
+        self.runtime.carriers = carriers;
+    }
     /// Read one described table with `filter` applied in SQLite. The filter is checked against the
     /// table's readable description ([`flotilla_schema::Table::filterable`]). Natural identities
     /// replace owner ids; interned strings and object bytes are resolved in the query.
@@ -197,7 +306,8 @@ impl Store {
     }
 
     /// Creates the shared tables and every registered kind's tables if they do not exist, widens
-    /// kind tables' code CHECKs, brings the `codes` rows and readable views up to date, enables
+    /// kind tables' code CHECKs, brings kind tables' indexes, the `codes` rows and readable views
+    /// up to date, enables
     /// foreign keys, and renders each kind's statements once. Foreign keys are off while the
     /// schema is brought up to date, so widening a table can drop it without cascading.
     pub fn open_with(mut conn: Connection, home: &str, kinds: KindRegistry, options: StoreOptions) -> Result<Store, StoreError> {
@@ -212,10 +322,11 @@ impl Store {
         if !has_string_domain(&tx)? {
             return Err(StoreError::LegacyDictionarySchema);
         }
-        // Codes first: a widened table is rebuilt with every column, so it needs no `ADD COLUMN`,
-        // whose change to the stored text would stop the table from widening.
+        // Codes first: a table lacking a column opening adds is rebuilt there with every column,
+        // which the column check then finds.
         check_kind_codes(&tx, &kinds)?;
         check_kind_columns(&tx, &kinds)?;
+        sync_indexes(&tx, &kinds)?;
         sync_views(&tx, &kinds)?;
         tx.commit()?;
         // An early return leaves foreign keys off, which is safe only because it drops `conn`.
@@ -240,6 +351,8 @@ impl Store {
         let runtime = Runtime {
             watermarks: std::sync::Arc::new(std::sync::RwLock::new(watermarks)),
             applied: Default::default(),
+            commits: Default::default(),
+            heards: Default::default(),
             home: home.to_owned(),
             kinds,
             sql,
@@ -247,8 +360,16 @@ impl Store {
             identities: TwoGen::new(options.identity_cache),
             ids: TwoGen::new(options.identity_cache),
             change_page_bytes: options.change_page_bytes,
+            observers: Vec::new(),
+            carriers: Carriers::default(),
+            wal: None,
         };
-        Ok(Store { conn, runtime })
+        Ok(Store { conn, runtime, wrote: false })
+    }
+
+    /// Whether a write transaction began since the last call; for a [`crate::StoreGuard`].
+    pub(crate) fn take_wrote(&mut self) -> bool {
+        std::mem::take(&mut self.wrote)
     }
 
     /// Audits every registered interned column, including child keys, and the shared identity,
@@ -265,6 +386,52 @@ impl Store {
 
     pub(crate) fn applied_listeners(&self) -> crate::stream::AppliedListeners {
         std::sync::Arc::clone(&self.runtime.applied)
+    }
+
+    pub(crate) fn commits(&self) -> crate::stream::Commits {
+        std::sync::Arc::clone(&self.runtime.commits)
+    }
+
+    /// Calls `listener` after each commit to this store, while the caller keeps it alive, as
+    /// [`crate::stream::Service::on_commit`] does.
+    pub fn on_commit(&self, listener: std::sync::Weak<crate::stream::CommitListener>) {
+        self.runtime.commits.listen(listener);
+    }
+
+    /// Calls `counter` after each commit to this store, before any other listener, as
+    /// [`crate::stream::Service::on_count`] does.
+    pub fn on_count(&self, counter: std::sync::Weak<crate::stream::CommitListener>) {
+        self.runtime.commits.count(counter);
+    }
+
+    pub(crate) fn heards(&self) -> crate::stream::Heards {
+        std::sync::Arc::clone(&self.runtime.heards)
+    }
+
+    /// Calls `listener` with each home heard from without a write, while the caller keeps it
+    /// alive, as [`crate::stream::Service::on_heard`] does.
+    pub fn on_heard(&self, listener: std::sync::Weak<crate::stream::HeardListener>) {
+        self.runtime.heards.listen(listener);
+    }
+
+    /// Hears from `home` without a write: raises the heard time of its held watermark in memory,
+    /// where every reader of it looks, and tells the heard listeners when it moved. False where
+    /// `home` is this one, is not held here yet, or `mark` moves its sequence: those are written.
+    pub(crate) fn hear(&mut self, home: &str, mark: crate::stream::Watermark) -> bool {
+        if home == self.runtime.home {
+            return false;
+        }
+        let moved = {
+            let mut marks = self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(held) = marks.get_mut(home).filter(|held| held.home_seq == mark.home_seq) else { return false };
+            let moved = mark.applied_through > held.applied_through;
+            held.applied_through = held.applied_through.max(mark.applied_through);
+            moved
+        };
+        if moved {
+            self.runtime.heards.heard(home);
+        }
+        true
     }
 
     /// Committed local gate input, independent of the store transaction lock.
@@ -306,8 +473,25 @@ impl Store {
 
     /// Begins an immediate write transaction; many writes may share it.
     pub fn write(&mut self) -> Result<Write<'_>, StoreError> {
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Ok(Write { tx, runtime: &mut self.runtime, pending: Pending::default() })
+        self.wrote = true;
+        // Unchecked only to keep the connection beside its transaction, for the checkpoint after
+        // the commit; `&mut self` still rules out a second transaction.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Ok(Write { tx, conn: &self.conn, runtime: &mut self.runtime, pending: Pending::default() })
+    }
+
+    /// Makes this store's writer run its write-ahead log's checkpoints under `policy`, in place of
+    /// SQLite's automatic ones: for a store whose file is in WAL mode, which it writes through
+    /// this connection alone.
+    pub(crate) fn own_wal(
+        &mut self,
+        policy: crate::WalPolicy,
+        readers: std::sync::Arc<crate::wal::Readers>,
+    ) -> Result<std::sync::Arc<crate::WalCheckpoints>, StoreError> {
+        let checkpointer = crate::wal::Checkpointer::own(&self.conn, policy, readers)?;
+        let checkpoints = checkpointer.checkpoints();
+        self.runtime.wal = Some(checkpointer);
+        Ok(checkpoints)
     }
 
     /// Begins a deferred read transaction, for consistent loads across tables.
@@ -323,6 +507,10 @@ pub struct Read<'s> {
 }
 
 impl Read<'_> {
+    /// The home this store writes as.
+    pub fn home(&self) -> &str {
+        &self.runtime.home
+    }
     /// Applied prefix, or zero/epoch for an unseen home.
     pub fn watermark(&mut self, home: &str) -> Result<crate::stream::Watermark, StoreError> {
         self.ctx().watermark(home)
@@ -353,15 +541,29 @@ impl Read<'_> {
     // Reads inside a write journal ids into the overlay without a savepoint mark: they never
     // need rewinding alone, and the whole overlay is dropped if the transaction rolls back.
     pub fn resolve(&mut self, kind: KindCode, name: &str, home: &str) -> Result<Option<ResourceId>, StoreError> {
-        self.ctx().resolve(&Identity { kind, name: name.to_owned(), home: home.to_owned() })
+        let id = self.ctx().resolve(&Identity { kind, name: name.to_owned(), home: home.to_owned() })?;
+        count_read(self.runtime, kind, Some(ReadShape::Keyed), usize::from(id.is_some()));
+        Ok(id)
+    }
+
+    /// The identities of `kind` named `name` at every home this store holds, deleted ones
+    /// included: one keyed read of the (kind, name, home) key's prefix.
+    pub fn resolve_named(&mut self, kind: KindCode, name: &str) -> Result<Vec<ResourceId>, StoreError> {
+        let ids = self.ctx().resolve_named(kind, name)?;
+        count_read(self.runtime, kind, Some(ReadShape::Keyed), ids.len());
+        Ok(ids)
     }
 
     pub fn load<K: Kind>(&mut self, id: ResourceId) -> Result<Option<Loaded<K>>, StoreError> {
-        self.ctx().load(id)
+        let loaded = self.ctx().load(id)?;
+        if loaded.is_some() {
+            reads::decoded(K::KIND, 1);
+        }
+        Ok(loaded)
     }
 
     pub fn load_snapshot(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
-        self.ctx().snapshot(id)
+        self.ctx().snapshot_with_cause(id)
     }
     /// Up to `limit` logged events of resource `id` after `after`, in sequence order: the tail that
     /// follows a snapshot at version `after`, and the resource's history from 0. A limit of 0 is
@@ -385,6 +587,12 @@ impl Read<'_> {
     /// read here once this store holds it. Limits as for [`Read::changes`].
     pub fn about(&mut self, id: ResourceId, after: Option<&AboutCursor>, limit: u32) -> Result<AboutPage, StoreError> {
         self.ctx().about(id, after, limit)
+    }
+
+    /// The newest entry of resource `id` that edge `edge` made, if this store holds it: logged
+    /// here, or carried by the snapshot it was restored from ([`Snapshot::entries`]).
+    pub fn last_edge(&mut self, id: ResourceId, edge: &Code) -> Result<Option<Event>, StoreError> {
+        self.ctx().last_edge(id, edge)
     }
 
     /// The change `seq` homed at `home`, with its items in order, if this store holds it: who
@@ -414,6 +622,23 @@ impl Read<'_> {
         self.ctx().last_change(id)
     }
 
+    /// When resource `id` was last created: its create's change time, widened, or an import's old
+    /// creation time. None for an identity no create has been written for, as one held only as a
+    /// reference's target.
+    pub fn created(&mut self, id: ResourceId) -> Result<Option<CreatedAt>, StoreError> {
+        self.ctx().created(id)
+    }
+
+    /// When held resource `id` was last created: [`Self::created`], where none is an error naming
+    /// the resource, since every held resource was created.
+    pub fn creation_time(&mut self, id: ResourceId) -> Result<CreatedAt, StoreError> {
+        let mut ctx = self.ctx();
+        match ctx.created(id)? {
+            Some(created) => Ok(created),
+            None => Err(StoreError::NotCreated { identity: ctx.identity_of(id)?.ok_or(StoreError::NotFound { id })? }),
+        }
+    }
+
     /// The newest change at `home` naming `record` as an item; none when no change names it.
     pub fn latest_change_naming(&mut self, home: &str, record: &Identity) -> Result<Option<ChangeHeader>, StoreError> {
         self.ctx().latest_change_naming(home, record)
@@ -436,7 +661,18 @@ impl Read<'_> {
     /// seen matches nothing, and the query creates nothing. A `limit` of 0 is refused and one above
     /// [`MAX_PAGE`] lowered to it.
     pub fn page<K>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
-        self.ctx().page(query, after, limit)
+        let page = self.ctx().page(query, after, limit)?;
+        count_read(self.runtime, query.kind(), after.is_none().then_some(ReadShape::Index), page.ids.len());
+        Ok(page)
+    }
+
+    /// [`Self::page`] from the top: up to `limit` resources in `query`'s index below `before`, in
+    /// descending `order..., id` order, so rows tied on the order continue by id across pages. The
+    /// first page (`None`) starts at the highest row; pass `next` back as `before`.
+    pub fn page_back<K>(&mut self, query: &IndexQuery<K>, before: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
+        let page = self.ctx().page_back(query, before, limit)?;
+        count_read(self.runtime, query.kind(), before.is_none().then_some(ReadShape::Index), page.ids.len());
+        Ok(page)
     }
 
     /// Key-only read of a declared single-integer-order index, restricted to one home.
@@ -451,15 +687,47 @@ impl Read<'_> {
         after: i64,
         limit: u32,
     ) -> Result<Vec<(ResourceId, i64)>, StoreError> {
-        self.ctx().integer_index_keys(query, home, after, limit)
+        let keys = self.ctx().integer_index_keys(query, home, after, limit)?;
+        // Paged by a bound, not a cursor: each call counts as a read.
+        count_read(self.runtime, query.kind(), Some(ReadShape::Index), keys.len());
+        Ok(keys)
+    }
+
+    /// [`Self::integer_index_keys`] the other way: one home's ids and order values strictly below
+    /// `before`, highest first. `i64::MAX` reads from the top: the first row is the highest.
+    pub fn integer_index_keys_before<K>(
+        &mut self,
+        query: &IndexQuery<K>,
+        home: &str,
+        before: i64,
+        limit: u32,
+    ) -> Result<Vec<(ResourceId, i64)>, StoreError> {
+        let keys = self.ctx().integer_index_keys_before(query, home, before, limit)?;
+        count_read(self.runtime, query.kind(), Some(ReadShape::Index), keys.len());
+        Ok(keys)
     }
 
     /// The startup scan: up to `limit` resources of kind `K` homed at `home` with ids above `after`,
     /// in id order, through `resource_identity_by_home`. The one sanctioned pass over a whole kind;
     /// everything else reads by key or declared index.
     pub fn scan<K: Kind>(&mut self, home: &str, after: Option<ResourceId>, limit: u32) -> Result<Page<ResourceId>, StoreError> {
-        self.ctx().scan::<K>(home, after, limit)
+        let page = self.ctx().scan::<K>(home, after, limit)?;
+        reads::rows(K::KIND, page.ids.len());
+        if after.is_none() {
+            reads::read(K::KIND, ReadShape::WholeKind);
+        }
+        Ok(page)
     }
+}
+
+/// Counts a read of `code`'s rows for the caller that made it ([`reads`]): the read itself when
+/// `shape` names it (a paged read counts at its first page), and the rows it returned.
+fn count_read(runtime: &Runtime, code: KindCode, shape: Option<ReadShape>, rows: usize) {
+    let kind = runtime.kinds.get(code).map_or(code.as_str(), |set| set.kind.as_str());
+    if let Some(shape) = shape {
+        reads::read(kind, shape);
+    }
+    reads::rows(kind, rows);
 }
 
 /// Ids this transaction created or read, served before the committed caches. The journal
@@ -469,9 +737,15 @@ struct Pending {
     watermarks: HashMap<String, crate::stream::Watermark>,
     /// The kinds of other homes' entries and snapshots applied.
     applied: std::collections::BTreeSet<KindCode>,
+    /// What this transaction changed, told to commit listeners: see [`crate::stream::Committed`].
+    kinds: BTreeSet<KindCode>,
+    moved: BTreeSet<String>,
+    rescan: bool,
     strings: HashMap<StringKey, i64>,
     identities: HashMap<Identity, ResourceId>,
     ids: HashMap<ResourceId, Identity>,
+    /// What observers staged, run in order once the transaction commits.
+    staged: Vec<Staged>,
     journal: Vec<Journal>,
 }
 
@@ -479,6 +753,10 @@ enum Journal {
     Watermark(String, Option<crate::stream::Watermark>),
     String(StringKey),
     Identity(Identity, ResourceId),
+    Kind(KindCode),
+    Moved(String),
+    Rescan,
+    Staged,
 }
 
 impl Pending {
@@ -500,6 +778,14 @@ impl Pending {
                     self.identities.remove(&identity);
                     self.ids.remove(&id);
                 }
+                Journal::Kind(kind) => {
+                    self.kinds.remove(&kind);
+                }
+                Journal::Moved(home) => {
+                    self.moved.remove(&home);
+                }
+                Journal::Rescan => self.rescan = false,
+                Journal::Staged => drop(self.staged.pop()),
             }
         }
     }
@@ -511,15 +797,12 @@ impl Pending {
 /// its writes"; read versions from the stamps writes return.
 pub struct Write<'s> {
     tx: Transaction<'s>,
+    conn: &'s Connection,
     runtime: &'s mut Runtime,
     pending: Pending,
 }
 
 impl Write<'_> {
-    pub(crate) fn stream_watermark(&mut self, home: &str) -> Result<crate::stream::Watermark, StoreError> {
-        self.ctx().watermark(home)
-    }
-
     /// Advances only a completely applied prefix; regression and progress ahead of rows fail.
     pub fn advance_watermark(&mut self, home: &str, mark: crate::stream::Watermark) -> Result<(), StoreError> {
         self.guarded(|ctx| {
@@ -580,6 +863,13 @@ impl Write<'_> {
                 }
             }
             ctx.remember_watermark(home.to_owned(), crate::stream::Watermark::ZERO);
+            ctx.note_rescan();
+            let observers = ctx.runtime.observers.clone();
+            for observer in observers {
+                if let Some(staged) = observer.reset(home) {
+                    ctx.stage(staged);
+                }
+            }
             Ok(())
         })
     }
@@ -602,7 +892,9 @@ impl Write<'_> {
                 return Err(StoreError::OwnHome { home: home.into() });
             }
             // Identities that the replacement did not write remain at zero. Remove obsolete
-            // unreferenced identities too; retain referenced placeholders while other homes lag.
+            // unreferenced identities too; retain referenced placeholders while other homes lag,
+            // and those a held change names: removing one would drop the item from that change,
+            // which a snapshot's cause may be.
             let kinds: Vec<_> = ctx.runtime.kinds.iter().map(|set| set.code).collect();
             for kind in kinds {
                 let mut after = None;
@@ -613,7 +905,7 @@ impl Write<'_> {
                     }
                     after = ids.last().copied();
                     for id in ids {
-                        if ctx.identity_seq(id)? == 0 {
+                        if ctx.identity_seq(id)? == 0 && !ctx.change_named(id)? {
                             if let Some(identity) = ctx.identity_of(id)? {
                                 match ctx.remove_identity(id, &identity) {
                                     Err(StoreError::Referenced { .. }) => {}
@@ -632,6 +924,11 @@ impl Write<'_> {
             let home = ctx.intern(HOME_DOMAIN, home)?;
             let seq = i64::try_from(home_seq).map_err(|_| Malformed::Sequence { home_seq })?;
             ctx.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, seq])?;
+            // The home's sequence is held here from the cut on, never before it: a follower
+            // asking to resume below the cut is served a snapshot, not a tail through the earlier
+            // entries a snapshot carries ([`Snapshot::entries`]) or changes its causes name.
+            ctx.conn.prepare_cached(FLOOR_SET)?.execute(params![home, seq])?;
+            ctx.note_rescan();
             let mark = crate::stream::Watermark { home_seq, ..current };
             ctx.conn.prepare_cached(WATERMARK_PUT)?.execute(params![home, seq, mark.applied_through.micros()])?;
             ctx.remember_watermark(home_name, mark);
@@ -659,15 +956,21 @@ impl Write<'_> {
     }
 
     pub fn resolve(&mut self, kind: KindCode, name: &str, home: &str) -> Result<Option<ResourceId>, StoreError> {
-        self.ctx().resolve(&Identity { kind, name: name.to_owned(), home: home.to_owned() })
+        let id = self.ctx().resolve(&Identity { kind, name: name.to_owned(), home: home.to_owned() })?;
+        count_read(self.runtime, kind, Some(ReadShape::Keyed), usize::from(id.is_some()));
+        Ok(id)
     }
 
     pub fn load<K: Kind>(&mut self, id: ResourceId) -> Result<Option<Loaded<K>>, StoreError> {
-        self.ctx().load(id)
+        let loaded = self.ctx().load(id)?;
+        if loaded.is_some() {
+            reads::decoded(K::KIND, 1);
+        }
+        Ok(loaded)
     }
 
     pub fn load_snapshot(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
-        self.ctx().snapshot(id)
+        self.ctx().snapshot_with_cause(id)
     }
 
     /// Up to `limit` logged events of resource `id` after `after`, in sequence order: the tail that
@@ -706,6 +1009,12 @@ impl Write<'_> {
         self.ctx().about(id, after, limit)
     }
 
+    /// The newest entry of resource `id` that edge `edge` made, if this store holds it: logged
+    /// here, or carried by the snapshot it was restored from ([`Snapshot::entries`]).
+    pub fn last_edge(&mut self, id: ResourceId, edge: &Code) -> Result<Option<Event>, StoreError> {
+        self.ctx().last_edge(id, edge)
+    }
+
     /// The highest sequence of `home` this store has taken or applied; 0 when none.
     pub fn last_sequence(&mut self, home: &str) -> Result<u64, StoreError> {
         self.ctx().last_sequence(home)
@@ -716,14 +1025,21 @@ impl Write<'_> {
     /// seen matches nothing, and the query creates nothing. A `limit` of 0 is refused and one above
     /// [`MAX_PAGE`] lowered to it.
     pub fn page<K>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
-        self.ctx().page(query, after, limit)
+        let page = self.ctx().page(query, after, limit)?;
+        count_read(self.runtime, query.kind(), after.is_none().then_some(ReadShape::Index), page.ids.len());
+        Ok(page)
     }
 
     /// The startup scan: up to `limit` resources of kind `K` homed at `home` with ids above `after`,
     /// in id order, through `resource_identity_by_home`. The one sanctioned pass over a whole kind;
     /// everything else reads by key or declared index.
     pub fn scan<K: Kind>(&mut self, home: &str, after: Option<ResourceId>, limit: u32) -> Result<Page<ResourceId>, StoreError> {
-        self.ctx().scan::<K>(home, after, limit)
+        let page = self.ctx().scan::<K>(home, after, limit)?;
+        reads::rows(K::KIND, page.ids.len());
+        if after.is_none() {
+            reads::read(K::KIND, ReadShape::WholeKind);
+        }
+        Ok(page)
     }
 
     /// Opens a change at this home (#4024): who writes, when, and the records the writes are made
@@ -741,13 +1057,34 @@ impl Write<'_> {
     }
 
     /// Inserts a resource homed here, logged as a `create` entry of `change`. Its version is the
-    /// next local home sequence, which also stamps every `records` and `history` row it holds.
+    /// next local home sequence, which also stamps every `records` and `history` row it holds. It
+    /// is created at a new change's `created` when set, otherwise at its change's time.
     pub fn insert<'c, K: Kind>(&mut self, name: &str, value: &K, change: impl Into<InChange<'c>>) -> Result<Stamp, StoreError> {
-        let rows = Encoder::encode(value)?;
         let change = change.into();
+        let created = match change {
+            InChange::New(change) => change.created,
+            InChange::Opened(_) => None,
+        };
+        self.insert_at(name, value, change, created)
+    }
+
+    /// [`Self::insert`] created at `created`, which its create entry carries: an imported record's
+    /// old creation time, under a change opened before.
+    pub fn insert_created<'c, K: Kind>(
+        &mut self,
+        name: &str,
+        value: &K,
+        change: impl Into<InChange<'c>>,
+        created: CreatedAt,
+    ) -> Result<Stamp, StoreError> {
+        self.insert_at(name, value, change.into(), Some(created))
+    }
+
+    fn insert_at<K: Kind>(&mut self, name: &str, value: &K, change: InChange<'_>, created: Option<CreatedAt>) -> Result<Stamp, StoreError> {
+        let rows = Encoder::encode(value)?;
         self.guarded(|ctx| {
             let change = ctx.change_id(change)?;
-            ctx.insert::<K>(name, rows, change)
+            ctx.insert::<K>(name, rows, change, created)
         })
     }
 
@@ -859,8 +1196,20 @@ impl Write<'_> {
     }
 
     pub fn commit(self) -> Result<(), StoreError> {
+        if let Some(wal) = &self.runtime.wal {
+            wal.committing();
+        }
         self.tx.commit()?;
-        let Pending { strings, identities, ids, watermarks, applied, .. } = self.pending;
+        let Pending { strings, identities, ids, watermarks, applied, kinds, moved, rescan, staged, .. } = self.pending;
+        // First, still under the store's lock: what any listener or later read sees follows them.
+        for staged in staged {
+            staged();
+        }
+        let heard: BTreeSet<String> = watermarks.keys().cloned().collect();
+        // Before anything that wakes a reader: a reader that learns of this commit, from any
+        // listener, reads counts that hold it. A reader passing on the new count waits on the
+        // store's lock, held until this returns, so it reads everything below as well.
+        self.runtime.commits.counted(&crate::stream::Committed { kinds: &kinds, homes: &moved, heard: &heard, rescan });
         self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner).extend(watermarks);
         if !applied.is_empty() {
             for listener in self.runtime.applied.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
@@ -875,6 +1224,12 @@ impl Write<'_> {
         }
         for (id, identity) in ids {
             self.runtime.ids.insert(id, identity);
+        }
+        // Last, so a woken reader sees the new watermarks and interned names.
+        self.runtime.commits.committed(&crate::stream::Committed { kinds: &kinds, homes: &moved, heard: &heard, rescan });
+        // After the listeners, so a woken reader does not wait on the checkpoint's copying.
+        if let Some(wal) = &mut self.runtime.wal {
+            wal.committed(self.conn);
         }
         Ok(())
     }
@@ -989,9 +1344,44 @@ pub(crate) struct Ctx<'a> {
 
 impl Ctx<'_> {
     fn remember_watermark(&mut self, home: String, mark: crate::stream::Watermark) {
+        let held = self.runtime.watermarks.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&home);
         if let Some(pending) = &mut self.pending {
             let previous = pending.watermarks.insert(home.clone(), mark);
+            if previous.is_none() && !held {
+                // A home newly held here: every follower looks at it.
+                if !pending.rescan {
+                    pending.rescan = true;
+                    pending.journal.push(Journal::Rescan);
+                }
+            }
             pending.journal.push(Journal::Watermark(home, previous));
+        }
+    }
+    /// A resource of `kind` was written or restored under `home`.
+    fn note_written(&mut self, kind: KindCode, home: &str) {
+        self.note_moved(home);
+        if let Some(pending) = &mut self.pending {
+            if pending.kinds.insert(kind) {
+                pending.journal.push(Journal::Kind(kind));
+            }
+        }
+    }
+    /// `home`'s sequence moved.
+    fn note_moved(&mut self, home: &str) {
+        if let Some(pending) = &mut self.pending {
+            if !pending.moved.contains(home) {
+                pending.moved.insert(home.to_owned());
+                pending.journal.push(Journal::Moved(home.to_owned()));
+            }
+        }
+    }
+    /// A home's state moved without entries to read: every follower looks.
+    fn note_rescan(&mut self) {
+        if let Some(pending) = &mut self.pending {
+            if !pending.rescan {
+                pending.rescan = true;
+                pending.journal.push(Journal::Rescan);
+            }
         }
     }
     fn watermark(&mut self, home: &str) -> Result<crate::stream::Watermark, StoreError> {
@@ -1089,6 +1479,13 @@ impl Ctx<'_> {
         Ok(id)
     }
 
+    pub(crate) fn resolve_named(&mut self, kind: KindCode, name: &str) -> Result<Vec<ResourceId>, StoreError> {
+        let Some(name) = self.string_id(RESOURCE_NAME_DOMAIN, name)? else { return Ok(Vec::new()) };
+        let mut statement = self.conn.prepare_cached(IDENTITY_NAMED)?;
+        let ids = statement.query_map(params![kind.as_str(), name], |row| row.get::<_, i64>(0).map(ResourceId))?;
+        Ok(ids.collect::<Result<_, _>>()?)
+    }
+
     fn ensure_identity(&mut self, identity: &Identity) -> Result<ResourceId, StoreError> {
         if let Some(id) = self.resolve(identity)? {
             return Ok(id);
@@ -1140,6 +1537,7 @@ impl Ctx<'_> {
     /// Returns it as stored and as a version.
     fn next_sequence(&mut self) -> Result<(i64, u64), StoreError> {
         let home = self.runtime.home.clone();
+        self.note_moved(&home);
         let home = self.intern(HOME_DOMAIN, &home)?;
         let last: i64 = self.conn.prepare_cached(SEQUENCE_NEXT)?.query_row([home], |row| row.get(0))?;
         let version = u64::try_from(last).map_err(|_| StoreError::Corrupt { table: "home_sequence".into(), column: "last".into() })?;
@@ -1205,7 +1603,7 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    fn insert<K: Kind>(&mut self, name: &str, rows: Rows, change: ChangeId) -> Result<Stamp, StoreError> {
+    fn insert<K: Kind>(&mut self, name: &str, rows: Rows, change: ChangeId, created: Option<CreatedAt>) -> Result<Stamp, StoreError> {
         self.sql(K::CODE)?;
         let identity = Identity { kind: K::CODE, name: name.to_owned(), home: self.runtime.home.clone() };
         let id = self.ensure_identity(&identity)?;
@@ -1223,9 +1621,11 @@ impl Ctx<'_> {
             }
         }
         let hashes: BTreeSet<Hash> = rows.tables.iter().flatten().flat_map(|row| set_objects(None, row)).collect();
-        let effect = Effect { changes, objects: carried(hashes, rows.objects)?, expunged: None };
+        let effect = Effect { changes, objects: carried(hashes, rows.objects)?, expunged: None, created };
         let header = Header { topic: whole_log_topic(), cause: Cause::Create, change: change.0, about: None, arguments: None };
         self.write_local(K::CODE, id, header, effect, (sequence, version), None)?;
+        let home = self.runtime.home.clone();
+        self.set_created(id, &home, change.0, created)?;
         Ok(Stamp { id, version })
     }
 
@@ -1307,7 +1707,7 @@ impl Ctx<'_> {
         });
         let root = root_changed.then(|| (Some(&old.tables[0][0]), &new[0][0]));
         let hashes = changed.chain(root).flat_map(|(before, after)| set_objects(before, after)).collect();
-        let effect = Effect { changes, objects: carried(hashes, new_objects)?, expunged: None };
+        let effect = Effect { changes, objects: carried(hashes, new_objects)?, ..Effect::default() };
         // A no-op opens no change: only a write that logs an entry takes a change's sequence.
         let change = self.change_id(change)?;
         let (sequence, version) = self.next_sequence()?;
@@ -1413,8 +1813,8 @@ impl Ctx<'_> {
                 RowEdit::Delete { key } => sql.removed(index, &full(key)),
             });
         }
-        // A rollover drops ended-generation rows before inserting the compacted
-        // live generation. Version/from checks above cover the entire replacement.
+        // A replaced collection drops its old rows before inserting the new ones.
+        // Version/from checks above cover the entire replacement.
         for collection in collections {
             let table = self.child_table(K::CODE, 0, collection.table, collection.role)?;
             let sql = self.sql(K::CODE)?;
@@ -1474,7 +1874,7 @@ impl Ctx<'_> {
         let (sequence, version) = self.next_sequence()?;
         let cause = Cause::Edge { edge: event.edge, from: event.from, to: event.to };
         let header = Header { topic: whole_log_topic(), cause, change: change.0, about: event.about, arguments: Some(event.arguments) };
-        let effect = Effect { changes, objects, expunged: None };
+        let effect = Effect { changes, objects, ..Effect::default() };
         if !self.write_local(K::CODE, current.id, header, effect, (sequence, version), Some(expected))? {
             return Err(self.stale::<K>(current));
         }
@@ -1539,12 +1939,16 @@ impl Ctx<'_> {
         self.remove_identity(id, &identity)?;
         let effect = Effect { expunged: Some(identity.clone()), ..Effect::default() };
         let bytes = effect.encode()?;
-        self.append_log(&identity.home, None, header, prev_seq, sequence, &bytes)?;
+        self.append_log(identity.kind, &identity.home, None, header, prev_seq, sequence, &bytes)?;
         Ok(version)
     }
 
     /// Deletes an identity's log entries, then the identity: entries about it keep their rows,
     /// their `about` set to null. A row of another resource still referencing it is `Referenced`.
+    fn change_named(&mut self, id: ResourceId) -> Result<bool, StoreError> {
+        Ok(self.conn.prepare_cached(CHANGE_NAMED)?.query_row([id.0], |_| Ok(())).optional()?.is_some())
+    }
+
     fn remove_identity(&mut self, id: ResourceId, identity: &Identity) -> Result<(), StoreError> {
         let removed: Option<i64> = self.conn.prepare_cached(REMOVED_MAX)?.query_row([id.0], |row| row.get(0))?;
         if let Some(removed) = removed {
@@ -1610,9 +2014,30 @@ impl Ctx<'_> {
         if !self.execute(code, id, &ops, sequence, expected)? {
             return Ok(false);
         }
-        self.append_log(home, Some(id), header, prev_seq, sequence, bytes)?;
+        self.append_log(code, home, Some(id), header, prev_seq, sequence, bytes)?;
         self.set_identity_seq(id, sequence)?;
+        self.observe_written(code, id)?;
         Ok(true)
+    }
+
+    /// Tells each observer of `code` that resource `id` was written, inside this transaction, and
+    /// stages what each makes of it for the commit.
+    fn observe_written(&mut self, code: KindCode, id: ResourceId) -> Result<(), StoreError> {
+        let observers: Vec<_> = self.runtime.observers.iter().filter(|observer| observer.code() == code).cloned().collect();
+        for observer in observers {
+            if let Some(staged) = observer.written(self, id)? {
+                self.stage(staged);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stages `staged` for this transaction's commit; a write rewound drops it.
+    fn stage(&mut self, staged: Staged) {
+        if let Some(pending) = &mut self.pending {
+            pending.staged.push(staged);
+            pending.journal.push(Journal::Staged);
+        }
     }
 
     /// Applies an event homed elsewhere: see [`Write::apply`].
@@ -1684,6 +2109,11 @@ impl Ctx<'_> {
         if !self.record(event.kind, id, &event.home, header, event.prev_seq, (&event.effect, &bytes), sequence, stored)? {
             return Err(StoreError::NotFound { id });
         }
+        if event.cause == Cause::Create {
+            self.set_created(id, &event.home, event.change, event.effect.created)?;
+        }
+        // The log explains the record again from its first entry here.
+        self.conn.prepare_cached(SNAPSHOT_CAUSE_DELETE)?.execute([id.0])?;
         let home = self.intern(HOME_DOMAIN, &event.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(Applied::Applied(Stamp { id, version: event.home_seq }))
@@ -1723,7 +2153,7 @@ impl Ctx<'_> {
         let header =
             Header { topic: event.topic, cause: Cause::Expunge, change: event.change, about: None, arguments: event.arguments.clone() };
         let bytes = event.effect.encode()?;
-        self.append_log(&event.home, None, header, event.prev_seq, sequence, &bytes)?;
+        self.append_log(event.kind, &event.home, None, header, event.prev_seq, sequence, &bytes)?;
         let home = self.intern(HOME_DOMAIN, &event.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(Applied::Expunged)
@@ -1759,8 +2189,48 @@ impl Ctx<'_> {
         self.check_objects(&ops, &snapshot.rows.objects)?;
         self.execute(snapshot.kind, id, &ops, sequence, None)?;
         self.set_identity_seq(id, sequence)?;
+        if let Some(created_at) = snapshot.created_at {
+            self.conn.prepare_cached(IDENTITY_RESTORE_CREATED)?.execute(params![created_at.0, id.0])?;
+        }
+        if let Some(cause) = &snapshot.cause {
+            // A record's changes are its home's: a cause from elsewhere, or later than the
+            // snapshot's version, is not this record's.
+            if cause.home != snapshot.home || cause.seq > snapshot.version {
+                return Err(Malformed::ChangeMismatch { home: cause.home.clone(), seq: cause.seq }.into());
+            }
+            self.record_change(cause)?;
+            let home = self.intern(HOME_DOMAIN, &cause.home)?;
+            let seq = i64::try_from(cause.seq).map_err(|_| Malformed::Sequence { home_seq: cause.seq })?;
+            self.conn.prepare_cached(SNAPSHOT_CAUSE_PUT)?.execute(params![id.0, home, seq])?;
+        }
+        for CarriedEntry { event, change } in &snapshot.entries {
+            // An entry carried is an earlier one of this resource, at its home, in its change.
+            if event.identity() != identity || event.home_seq >= snapshot.version || change.home != event.home || change.seq != event.change
+            {
+                return Err(Malformed::ChangeMismatch { home: event.home.clone(), seq: event.home_seq }.into());
+            }
+            let seq = i64::try_from(event.home_seq).map_err(|_| Malformed::Sequence { home_seq: event.home_seq })?;
+            let home = self.intern(HOME_DOMAIN, &event.home)?;
+            // Held already, as one this store logged or an earlier restore carried.
+            if self.conn.prepare_cached(LOG_CAUSE)?.query_row(params![home, seq], |_| Ok(())).optional()?.is_some() {
+                continue;
+            }
+            self.record_change(change)?;
+            let header = Header {
+                topic: event.topic,
+                cause: event.cause,
+                change: event.change,
+                about: event.about.clone(),
+                arguments: event.arguments.clone(),
+            };
+            // Recorded, not applied: the rows already hold its effect, and the home's sequence
+            // stays where the snapshot left it.
+            self.append_log(event.kind, &event.home, Some(id), header, event.prev_seq, seq, &event.effect.encode()?)?;
+        }
+        self.note_written(snapshot.kind, &snapshot.home);
         let home = self.intern(HOME_DOMAIN, &snapshot.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
+        self.observe_written(snapshot.kind, id)?;
         Ok(Stamp { id, version: snapshot.version })
     }
 
@@ -1776,8 +2246,10 @@ impl Ctx<'_> {
     }
 
     /// Appends one entry under `home` at `sequence`: `resource` is `None` only for an expunge.
+    #[allow(clippy::too_many_arguments)]
     fn append_log(
         &mut self,
+        kind: KindCode,
         home: &str,
         resource: Option<ResourceId>,
         header: Header,
@@ -1785,6 +2257,7 @@ impl Ctx<'_> {
         sequence: i64,
         effect: &[u8],
     ) -> Result<(), StoreError> {
+        self.note_written(kind, home);
         let home = self.intern(HOME_DOMAIN, home)?;
         let change = i64::try_from(header.change).map_err(|_| Malformed::Sequence { home_seq: header.change })?;
         let about = header.about.as_ref().map(|about| self.ensure_identity(about)).transpose()?.map(|id| id.0);
@@ -1952,6 +2425,11 @@ impl Ctx<'_> {
         self.events(LOG_BY_RESOURCE, params![id.0, after, limit]).map(|events| events.into_iter().map(|(_, _, event)| event).collect())
     }
 
+    /// Resource `id`'s newest entry of `edge`, by `log_by_resource`.
+    fn last_edge(&mut self, id: ResourceId, edge: &Code) -> Result<Option<Event>, StoreError> {
+        Ok(self.events(LOG_LAST_EDGE, params![id.0, edge.as_str()])?.pop().map(|(_, _, event)| event))
+    }
+
     /// Logged events homed at `home` after `after`, in home order, by the primary key.
     fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
         let limit = page_limit(limit)?;
@@ -2066,11 +2544,35 @@ impl Ctx<'_> {
 
     /// The change of resource `id`'s newest entry: why it is as it is.
     fn last_change(&mut self, id: ResourceId) -> Result<Option<ChangeHeader>, StoreError> {
-        let last: Option<(String, i64)> =
-            self.conn.prepare_cached(LOG_LAST_CHANGE)?.query_row([id.0], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+        // A record held from a snapshot has no entry here until its next one arrives: its
+        // snapshot's cause explains it until then.
+        let held: Option<(String, i64)> =
+            self.conn.prepare_cached(SNAPSHOT_CAUSE_GET)?.query_row([id.0], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+        let last = match held {
+            Some(held) => Some(held),
+            None => self.conn.prepare_cached(LOG_LAST_CHANGE)?.query_row([id.0], |row| Ok((row.get(0)?, row.get(1)?))).optional()?,
+        };
         let Some((home, seq)) = last else { return Ok(None) };
         let seq = u64::try_from(seq).map_err(|_| StoreError::Corrupt { table: "log".into(), column: "change".into() })?;
         self.change(&home, seq)
+    }
+
+    fn created(&mut self, id: ResourceId) -> Result<Option<CreatedAt>, StoreError> {
+        let at: Option<Option<i64>> = self.conn.prepare_cached(IDENTITY_CREATED)?.query_row([id.0], |row| row.get(0)).optional()?;
+        Ok(at.flatten().map(CreatedAt))
+    }
+
+    /// Writes on identity `id` that it was created by change `seq` of `home`: at `created` when
+    /// the create carries it, otherwise at that change's time.
+    fn set_created(&mut self, id: ResourceId, home: &str, seq: u64, created: Option<CreatedAt>) -> Result<(), StoreError> {
+        if let Some(created) = created {
+            self.conn.prepare_cached(IDENTITY_RESTORE_CREATED)?.execute(params![created.0, id.0])?;
+            return Ok(());
+        }
+        let home = self.intern(HOME_DOMAIN, home)?;
+        let seq = i64::try_from(seq).map_err(|_| Malformed::Sequence { home_seq: seq })?;
+        self.conn.prepare_cached(IDENTITY_SET_CREATED)?.execute(params![id.0, home, seq])?;
+        Ok(())
     }
 
     /// The newest change at `home` naming `record` as an item.
@@ -2124,12 +2626,18 @@ impl Ctx<'_> {
         if self.conn.prepare_cached(CHANGE_EXISTS)?.query_row(params![home, sequence], |_| Ok(())).optional()?.is_some() {
             // Recorded again, as a stream re-sends a change before an entry naming it: the same
             // change, or the sender's is not the home's.
+            // A home's reset keeps its change rows, so the sequence they took is raised again.
             return match self.change(&change.home, change.seq)? {
-                Some(held) if held == *change => Ok(()),
+                Some(held) if held == *change => {
+                    self.note_moved(&change.home);
+                    self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
+                    Ok(())
+                }
                 _ => Err(Malformed::ChangeMismatch { home: change.home.clone(), seq: change.seq }.into()),
             };
         }
         self.insert_change(&change.home, sequence, &change.writer, change.at, &change.items)?;
+        self.note_moved(&change.home);
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(())
     }
@@ -2208,7 +2716,35 @@ impl Ctx<'_> {
             }
         }
         rows.sort();
-        Ok(Some(Snapshot { kind: identity.kind, name: identity.name, home: identity.home, version, rows }))
+        Ok(Some(Snapshot {
+            kind: identity.kind,
+            name: identity.name,
+            home: identity.home,
+            version,
+            rows,
+            cause: None,
+            created_at: None,
+            entries: Vec::new(),
+        }))
+    }
+
+    /// [`Self::snapshot`] with the resource's cause, creation time and the entries its kind's
+    /// snapshots carry: what a snapshot sends, and what a restore records.
+    fn snapshot_with_cause(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
+        let Some(mut snapshot) = self.snapshot(id)? else { return Ok(None) };
+        snapshot.cause = self.last_change(id)?;
+        snapshot.created_at = self.created(id)?;
+        let carried = self.runtime.carriers.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&snapshot.kind).cloned();
+        if let Some(carried) = carried {
+            for edge in carried(&snapshot)? {
+                let Some(event) = self.last_edge(id, &edge)? else { continue };
+                let change = self
+                    .change(&event.home, event.change)?
+                    .ok_or_else(|| StoreError::Corrupt { table: "change".into(), column: "seq".into() })?;
+                snapshot.entries.push(CarriedEntry { event, change });
+            }
+        }
+        Ok(Some(snapshot))
     }
 
     /// Maps stored values back to logical ones, collecting the objects the row names.

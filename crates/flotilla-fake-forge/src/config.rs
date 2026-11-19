@@ -51,6 +51,9 @@ pub struct Config {
     pub admin_token: String,
     pub auto_merge_after: Option<Duration>,
     pub seed: Option<PathBuf>,
+    /// Where each forge's bare repositories live, as `<forge>/<owner>/<repo>.git`, when Git
+    /// fetches them from the fake.
+    pub git_root: Option<PathBuf>,
     pub forges: BTreeMap<String, ForgeSettings>,
 }
 
@@ -65,6 +68,7 @@ struct RawConfig {
     admin_token_file: PathBuf,
     auto_merge_after_secs: Option<u64>,
     seed: Option<PathBuf>,
+    git_root: Option<PathBuf>,
     #[serde(default)]
     forges: BTreeMap<String, RawForge>,
 }
@@ -131,6 +135,7 @@ impl Config {
             admin_token,
             auto_merge_after,
             seed: raw.seed.map(resolve),
+            git_root: raw.git_root.map(resolve),
             forges,
         })
     }

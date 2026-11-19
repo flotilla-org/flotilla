@@ -4,8 +4,8 @@ use flotilla_schema::{Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     changed,
     machines::lifecycle::{
-        Absence, Attempted, GiveUp, Lifecycle, LifecycleEdgeKind, LifecycleKind, LifecycleLabel, LifecycleRefusal, LifecycleState,
-        MemoryLifecycleWorld, Observed, Realise, Release, Teardown, Vanish,
+        Absence, Attempted, FailedEarly, GiveUp, Lifecycle, LifecycleEdgeKind, LifecycleKind, LifecycleLabel, LifecycleRefusal,
+        LifecycleState, MemoryLifecycleWorld, Observed, Realise, Release, Teardown, Vanish,
     },
     AttemptPolicy, Cause, CauseCategory, Coded, Diagram, Failure, Home, InputRead, Machine, Outcome, Ref, StateValue, Version, WriteError,
 };
@@ -57,7 +57,7 @@ fn release() -> Release {
 }
 
 fn vanish() -> Vanish {
-    Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: Ref::new("r") }
+    Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost(), observed: Ref::new("r") }
 }
 
 fn observed(identity: &str) -> MemoryLifecycleWorld {
@@ -100,7 +100,7 @@ fn codes_and_names_are_pinned() {
     ];
     assert_eq!(labels, expected);
     let edges: Vec<_> = LifecycleEdgeKind::ALL.iter().map(|k| (k.name(), k.code())).collect();
-    let codes = [("realise", "rl"), ("release", "rs"), ("vanish", "va"), ("give_up", "gu"), ("attempted", "at")];
+    let codes = [("realise", "rl"), ("release", "rs"), ("vanish", "va"), ("give_up", "gu"), ("attempted", "at"), ("failed_early", "fe")];
     assert_eq!(edges, codes.map(|(name, code)| (name, Code::new(code))));
 }
 
@@ -127,7 +127,7 @@ stateDiagram-v2
 ";
     let full = labels.replace(
         "  Requested --> GaveUp: give_up [cause]\n",
-        "  Requested --> Requested: attempted [failures, last_failure]\n  Requested --> GaveUp: give_up [cause]\n",
+        "  Requested --> Requested: attempted [failures, last_failure]\n  Requested --> Requested: failed_early [last_failure]\n  Requested --> GaveUp: give_up [cause]\n",
     );
     assert_eq!(P::definition().mermaid(Diagram::Full), full);
     assert_eq!(P::definition().mermaid(Diagram::Labels), labels);
@@ -267,7 +267,46 @@ fn ends_refuse_everything() {
         assert_eq!(h.apply("r", vanish(), &world, at(2)).err(), ended);
         assert_eq!(h.apply("r", GiveUp { cause: cause("boom") }, &world, at(2)).err(), ended);
         assert_eq!(h.apply("r", succeeded(), &world, at(2)).err(), ended);
+        assert_eq!(h.apply("r", early("boom", true), &world, at(2)).err(), ended);
     }
+}
+
+fn early(detail: &str, retryable: bool) -> FailedEarly {
+    FailedEarly { cause: cause(detail), retryable }
+}
+
+// A try before its retry was due fails without counting: it needs a pending retry (a counted,
+// retryable failure with the attempts not spent), replaces that failure's cause and keeps its
+// time, so the retry stays when it was. A non-retryable early failure exhausts the attempts.
+#[test]
+fn an_early_failure_replaces_the_pending_one_without_counting() {
+    let world = MemoryLifecycleWorld::default();
+    let mut h: Home<Lifecycle<Other>> = Home::new("kiwi").expect("valid declaration");
+    h.create("r", (1, 2), &world, Timestamp(0)).expect("created");
+    let state = |h: &Home<Lifecycle<Other>>| h.get("r").expect("exists").state().clone();
+    let pending = |failures, detail, retryable| LifecycleState::Requested {
+        failures,
+        last_failure: Some(Failure { at: at(1), cause: cause(detail), retryable }),
+    };
+    assert_eq!(h.apply("r", early("boom", true), &world, at(1)).err(), Some(WriteError::Refused(LifecycleRefusal::MissingEvidence)));
+    h.apply("r", Attempted { outcome: Outcome::Failed { cause: cause("boom"), retryable: true } }, &world, at(1)).expect("attempted");
+    for n in 2..=101 {
+        h.apply("r", early(if n % 2 == 0 { "other" } else { "boom" }, true), &world, at(n)).expect("failed early");
+    }
+    assert_eq!(state(&h), pending(1, "boom", true), "a hundred early failures count none and keep the first's time");
+    h.apply("r", early("broken", false), &world, at(102)).expect("failed early");
+    assert_eq!(state(&h), pending(1, "broken", false));
+    assert_eq!(h.apply("r", early("boom", true), &world, at(103)).err(), Some(WriteError::Refused(LifecycleRefusal::MissingEvidence)));
+    h.apply("r", GiveUp { cause: cause("broken") }, &world, at(104)).expect("a final early failure gives up");
+
+    // Spent attempts leave nothing pending.
+    let mut h = home();
+    h.apply("r", failed("boom"), &world, at(1)).expect("attempted");
+    assert_eq!(h.apply("r", early("boom", true), &world, at(2)).err(), refused(LifecycleRefusal::MissingEvidence));
+    // Only Requested.
+    let mut h = home();
+    h.apply("r", realise("a"), &observed("a"), at(1)).expect("realised");
+    assert_eq!(h.apply("r", early("boom", true), &world, at(2)).err(), refused(LifecycleRefusal::WrongState));
 }
 
 // Attempts are edges that leave only Requested.
@@ -276,4 +315,26 @@ fn attempts_only_while_requested() {
     let mut h = home();
     h.apply("r", realise("a"), &observed("a"), at(1)).expect("realised");
     assert_eq!(h.apply("r", succeeded(), &MemoryLifecycleWorld::default(), at(2)).err(), refused(LifecycleRefusal::WrongState));
+}
+
+// Behaviour (ADR 0047 N→N+1): a lost thing's reason travels in its Vanish edge's arguments, and the
+// bare `Lost` the previous generation logged still decodes, with no reason.
+#[test]
+fn vanish_causes_decode_with_and_without_a_lost_reason() {
+    use flotilla_state_machines::machines::lifecycle::VanishCause;
+    #[derive(serde::Serialize)]
+    enum PreviousVanishCause {
+        Lost,
+    }
+    let limits = flotilla_schema::INLINE_LIMITS;
+    let bare = flotilla_cbor::to_vec(&PreviousVanishCause::Lost, &limits).expect("encode bare");
+    assert_eq!(flotilla_cbor::from_slice::<VanishCause>(&bare, &limits).expect("decode bare"), VanishCause::lost());
+    for cause in [
+        VanishCause::Lost { reason: Some("cgroup_oom".into()) },
+        VanishCause::lost(),
+        VanishCause::Failed { reason: "image pull refused".into() },
+    ] {
+        let bytes = flotilla_cbor::to_vec(&cause, &limits).expect("encode");
+        assert_eq!(flotilla_cbor::from_slice::<VanishCause>(&bytes, &limits).expect("decode"), cause);
+    }
 }

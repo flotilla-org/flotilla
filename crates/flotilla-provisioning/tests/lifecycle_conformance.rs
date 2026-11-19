@@ -20,10 +20,7 @@
 //! QUINT_GRAPH_DIR=DIR cargo test -p flotilla-provisioning --test lifecycle_conformance -- --ignored
 //! ```
 
-use std::{
-    marker::PhantomData,
-    sync::{Arc, Mutex},
-};
+use std::{marker::PhantomData, sync::Arc};
 
 use flotilla_engine_store::StoreLog;
 use flotilla_provisioning::stored::{
@@ -40,12 +37,12 @@ use flotilla_quint_testkit::{
 };
 use flotilla_resources::{ImageLayerSource, ImageLayerSpec, ImageLayerTier};
 use flotilla_schema::{Address, Frozen, Kind, KindRegistry, Ref as StoredRef, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     edge_event,
     machines::lifecycle::{
-        Attempted, GiveUp, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed,
-        Realise, Release, Vanish,
+        attempt_history, Attempted, FailedEarly, GiveUp, Lifecycle, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld,
+        Observed, Realise, Release, Vanish,
     },
     AttemptPolicy, Cause, CauseCategory, Home, Log, Outcome, Ref, Resource, WriteError,
 };
@@ -94,6 +91,8 @@ impl Sample for ImageBuildKind {
             .probe("true".into())
             .build();
         ImageBuildRequest {
+            launch_of: "image-feed-arm64".into(),
+            launch: 0,
             composition: "sha256:feed".into(),
             architecture: Architecture::Amd64,
             layers: Frozen::new(vec![layer]).expect("freeze"),
@@ -106,10 +105,13 @@ impl Sample for ImageBuildKind {
 impl Sample for CloneKind {
     fn request() -> CloneRequest {
         CloneRequest {
+            launch_of: NAME.into(),
+            launch: 0,
             repository: "repo".into(),
             url: "https://example/repo".into(),
             environment: StoredRef::new("env", HOME),
             path: "/c".into(),
+            discovered: false,
         }
     }
 }
@@ -117,6 +119,8 @@ impl Sample for CloneKind {
 impl Sample for CheckoutKind {
     fn request() -> CheckoutRequest {
         CheckoutRequest {
+            launch_of: NAME.into(),
+            launch: 0,
             repository: "repo".into(),
             environment: StoredRef::new("env", HOME),
             branch: "feature".into(),
@@ -132,6 +136,8 @@ impl Sample for CheckoutKind {
 impl Sample for TerminalSessionKind {
     fn request() -> TerminalSessionRequest {
         TerminalSessionRequest {
+            launch_of: NAME.into(),
+            launch: 0,
             environment: StoredRef::new("env", HOME),
             holder: Some(Holder::vessel("vessel")),
             role: "coder".into(),
@@ -154,7 +160,7 @@ where
     StoreLog: Log<Machine<K>>,
 {
     home: Home<Machine<K>, StoreLog>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreHandle>,
 }
 
 impl<K: Sample> Stored<K>
@@ -162,13 +168,13 @@ where
     Resource<Machine<K>>: Kind,
     StoreLog: Log<Machine<K>>,
 {
-    /// The resource as the store holds it, and the outcomes of its `Attempted` log entries in order.
+    /// The resource as the store holds it, and the attempt history its log entries record.
     fn read_back(&self) -> (Resource<Machine<K>>, u64, Vec<Outcome>) {
         let mut store = self.store.lock().expect("store");
         let mut read = store.read().expect("read");
         let id = read.resolve(Resource::<Machine<K>>::CODE, NAME, HOME).expect("resolve").expect("stored");
         let loaded = read.load::<Resource<Machine<K>>>(id).expect("load").expect("current row");
-        let mut attempts = Vec::new();
+        let mut edges = Vec::new();
         let mut after = 0;
         loop {
             let entries = read.changes(id, after, 64).expect("changes");
@@ -177,13 +183,11 @@ where
             for entry in &entries {
                 let at = read.change(HOME, entry.change).expect("read").expect("its change").at;
                 if let Some(event) = edge_event::<Machine<K>>(entry, at).expect("entry decodes") {
-                    if let LifecycleEdge::Attempted(attempted) = event.arguments {
-                        attempts.push(attempted.outcome);
-                    }
+                    edges.push(event.arguments);
                 }
             }
         }
-        (loaded.value.with_identity(&loaded.name, loaded.version), loaded.version, attempts)
+        (loaded.value.with_identity(&loaded.name, loaded.version), loaded.version, attempt_history(&edges))
     }
 }
 
@@ -243,7 +247,7 @@ where
         let mut registry = KindRegistry::new();
         registry.register::<Resource<Machine<K>>>().expect("registry");
         let connection = rusqlite::Connection::open_in_memory().expect("memory");
-        let store = Arc::new(Mutex::new(Store::open(connection, HOME, registry).expect("store")));
+        let store = Arc::new(StoreHandle::new(Store::open(connection, HOME, registry).expect("store")));
         let mut home = Home::<Machine<K>, StoreLog>::with_log(HOME, StoreLog::new(store.clone())).expect("valid declaration");
         home.create(NAME, K::request(), &MemoryLifecycleWorld::default(), Timestamp(0)).expect("created");
         Stored { home, store }
@@ -285,6 +289,9 @@ where
                     }
                 };
                 outcome(home.apply(NAME, Attempted { outcome: attempted }, &world, at))
+            }
+            "FailedEarly" => {
+                outcome(home.apply(NAME, FailedEarly { cause: cause(text(&o["cause"])), retryable: boolean(&o["retryable"]) }, &world, at))
             }
             "GiveUp" => outcome(home.apply(NAME, GiveUp { cause: cause(text(&o["cause"])) }, &world, at)),
             other => panic!("lifecycle event {other}"),

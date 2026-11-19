@@ -8,44 +8,67 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_core::in_process::InProcessDaemon;
-use flotilla_core::in_process::OperatorReconciler;
+use flotilla_core::in_process::{InProcessDaemon, OperatorReconciler};
 use flotilla_credentials::CloneDelivery;
 use flotilla_crew::reconcilers::vessel::WorktreeMetadataResolver;
 use flotilla_protocol::RepoSelector;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_provisioning::reconcilers::checkout::runtime::{removal_source_path, CheckoutControllerRuntime};
+use flotilla_provisioning::checkout_runtime::{
+    removal_source_path, ChangeRequestObservations, CheckoutControllerRuntime, CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout,
+};
 use flotilla_provisioning::reconcilers::clone::runtime::CloneControllerRuntime;
-use flotilla_provisioning::reconcilers::{
-    CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneRuntime, ForgeDefaultBranchResolver, PreparedCheckout,
-};
-use flotilla_resources::attentions::{Attention, Fact, Sender, Subject};
-use flotilla_resources::checkout_path::checkout_path_from_status_and_spec;
-use flotilla_resources::{
-    canonicalize_repo_url, ChangeRequest, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Clone, CloneCredentials, ClonePhase, Convoy,
-    ConvoyTeardownRuntime, Forge, ForgeIdentity, InputMeta, Resource, ResourceObject,
-};
-use flotilla_store::{ReplicaReadResolver, ResourceBackend};
+use flotilla_provisioning::reconcilers::{CloneRuntime, ForgeDefaultBranchResolver};
+use flotilla_resources::{canonicalize_repo_url, CloneCredentials, Convoy, Forge, ForgeIdentity};
 use flotilla_vcs::vcs::CheckoutMaterialisationError;
 use flotilla_vcs::vcs::CheckoutRegistration;
 use flotilla_vcs::vcs::WorktreeMetadata;
-use tracing::{info, warn};
+use tracing::warn;
 
-use super::credentials::{reconcile_work_credentials_for_environment, record_credential_delivery_retry};
 use super::state::ControllerRuntimeState;
 use crate::resource_manifest::ResourceManifestReconciler;
 
-pub(super) struct DaemonConvoyTeardownRuntime {
+/// The vessel requester's release gate: an ended convoy's vessels are released here once its
+/// teardown gate passes over the checkouts held for it, the same judgement its home's reclaim makes.
+pub(super) struct DaemonVesselReleaseGate {
     pub(super) daemon: Arc<InProcessDaemon>,
-    pub(super) reclaim_refusals: StdMutex<HashMap<String, ReclaimRefusal>>,
+    pub(super) namespace: String,
 }
 
-pub(super) struct ReclaimRefusal {
-    pub(super) error: String,
-    pub(super) attempts: u64,
-    /// When this run of refusals began: the episode its attention tells.
-    pub(super) since: DateTime<Utc>,
+#[async_trait]
+impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for DaemonVesselReleaseGate {
+    async fn may_release(&self, convoy: &str, convoy_home: &str) -> Result<(), String> {
+        // The old store's Convoy, until engine Convoy judges its own reclaim (#3108).
+        let convoys = self.daemon.resource_backend().including_replicas::<Convoy>(&self.namespace);
+        let convoy = convoys
+            .get_all(convoy)
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .find(|source| {
+                source.object.metadata.name == convoy
+                    && match &source.provenance {
+                        flotilla_resources::ResourceProvenance::Local => true,
+                        flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str() == convoy_home,
+                    }
+            })
+            .map(|source| source.object)
+            .ok_or_else(|| format!("convoy {convoy} at {convoy_home} is not read here"))?;
+        let convoy = &convoy;
+        // Held for the engine launch the convoy became; a convoy never admitted holds none.
+        let held = match flotilla_resources::convoy::engine::checkout_holder(convoy) {
+            Some(holder) => {
+                let reads = self.daemon.lifecycle_reads();
+                tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.checkouts()?.held(&holder)))
+                    .await
+                    .map_err(|error| error.to_string())??
+            }
+            None => Vec::new(),
+        };
+        let checkouts = flotilla_resources::checkout_records::latest_launches(held).into_values().collect::<Vec<_>>();
+        self.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, &checkouts, false).await
+    }
 }
 
 pub(super) struct RuntimeOperatorReconciler {
@@ -71,12 +94,11 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                     return Err(format!("manifest root `{name}` does not match the declared source"));
                 }
                 let mut reconciler =
-                    ResourceManifestReconciler::new(self.state.daemon.resource_backend(), namespace, manifests.dir.clone())
+                    ResourceManifestReconciler::new(self.state.daemon.resource_backend(), roots, namespace, manifests.dir.clone())
                         .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone())
                         .with_binding(manifests.binding.clone())
                         .with_vcs(if manifests.binding.is_some() { self.state.daemon.local_charter_vcs()? }
-                            else { self.state.daemon.local_vcs_for_checkout(&manifests.dir).await? })
-                        .with_roots(roots);
+                            else { self.state.daemon.local_vcs_for_checkout(&manifests.dir).await? });
                 let report = reconciler.reconcile_once().await?;
                 Ok(format!(
                     "manifest root {name}: {} created, {} updated, {} unchanged, {} errors",
@@ -91,127 +113,32 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                 Ok(format!("Repository/{name} refreshed"))
             }
             "clone" | "clones" => {
-                let clones = self.state.daemon.resource_backend().using::<Clone>(namespace);
-                let clone = clones.get(name).await.map_err(|error| error.to_string())?;
-                let ready = match self.state.daemon.lifecycle_reads().try_reading(
-                    flotilla_resources::lifecycle_reads::ProvisioningKind::Clone, name, None,
-                )? {
-                    Some(reading) => matches!(reading, flotilla_protocol::LifecycleReading::Ready { .. }),
-                    None => clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Ready),
-                };
-                if ready {
-                    return Ok(format!("Clone/{name} is already ready"));
-                }
-                flotilla_store::apply_status_patch(&clones, name, &flotilla_resources::CloneStatusPatch::MarkCloning)
+                // An ended clone starts its next launch; a live one is tried again when what it
+                // waits on changes, so there is nothing to wake.
+                let reads = self.state.daemon.lifecycle_reads();
+                let clone = flotilla_resources::clone_records::launched(name).to_owned();
+                let renewal = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.clones()?.renew(&clone)))
                     .await
-                    .map_err(|error| error.to_string())?;
-                Ok(format!("Clone/{name} retry requested"))
+                    .map_err(|error| format!("renew clone: {error}"))??;
+                Ok(match renewal {
+                    flotilla_resources::clone_records::CloneRenewal::Started(launch) => format!("Clone/{name}: launch {launch} requested"),
+                    flotilla_resources::clone_records::CloneRenewal::Live(record) if record.is_ready() => {
+                        format!("Clone/{name} is already ready")
+                    }
+                    flotilla_resources::clone_records::CloneRenewal::Live(record) => {
+                        format!("Clone/{name} has not ended ({:?}); it is tried again when what it waits on changes", record.reading)
+                    }
+                })
             }
             "credentialdelivery" | "workcredential" | "workcredentials" => {
-                record_credential_delivery_retry(&self.state.daemon.resource_backend(), namespace, name, None, false).await?;
-                reconcile_work_credentials_for_environment(&self.state, namespace, name).await?;
+                self.state.credential_events.deliver(name).await?;
                 Ok(format!("CredentialDelivery/{name} reconciled"))
             }
-            "convoy" | "convoys" => wake_controller_resource::<Convoy>(&self.state.daemon.resource_backend(), namespace, name).await,
+            // Convoy is woken by the daemon itself (`InProcessDaemon::wake_convoy`).
             _ => Err(format!(
                 "resource kind `{kind}` does not support reconcile-now; expected Clone, Convoy, ConvoyEnsure, CredentialDelivery, ManifestRoot, or Repository"
             )),
         }
-    }
-}
-
-pub(super) async fn wake_controller_resource<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    name: &str,
-) -> Result<String, String> {
-    let resources = backend.clone().using::<T>(namespace);
-    let object = resources.get(name).await.map_err(|error| error.to_string())?;
-    let mut meta = InputMeta::from(&object.metadata);
-    meta.annotations.insert(RECONCILE_NOW_ANNOTATION.to_string(), Utc::now().to_rfc3339());
-    resources.update(&meta, &object.metadata.resource_version, &object.spec).await.map_err(|error| error.to_string())?;
-    Ok(format!("{}/{} woken", T::API_PATHS.kind, name))
-}
-
-impl DaemonConvoyTeardownRuntime {
-    pub(super) fn new(daemon: Arc<InProcessDaemon>) -> Self {
-        Self { daemon, reclaim_refusals: StdMutex::new(HashMap::new()) }
-    }
-
-    pub(super) async fn raise_attention(&self, convoy: &ResourceObject<Convoy>, reason: &str, since: DateTime<Utc>) -> Result<(), String> {
-        let fact = Fact::ReclaimRefused { convoy: convoy.metadata.name.clone() };
-        self.daemon.attentions().raise(&convoy.metadata.namespace, &Attention::new(fact, reason, since)).await
-    }
-
-    pub(super) async fn clear_attention(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
-        self.daemon.attentions().clear(&convoy.metadata.namespace, Sender::Teardown, &Subject::convoy(convoy.metadata.name.clone())).await
-    }
-}
-
-#[async_trait]
-impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
-    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[ResourceObject<Checkout>]) -> Result<(), String> {
-        let result = self.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, checkouts, false).await;
-        let key = format!("{}/{}", convoy.metadata.namespace, convoy.metadata.name);
-        match &result {
-            Err(error) => {
-                let (attempts, since) = {
-                    let mut refusals = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned");
-                    match refusals.get_mut(&key) {
-                        Some(refusal) => {
-                            refusal.error.clone_from(error);
-                            refusal.attempts += 1;
-                            (refusal.attempts, refusal.since)
-                        }
-                        _ => {
-                            let since = Utc::now();
-                            refusals.insert(key, ReclaimRefusal { error: error.clone(), attempts: 1, since });
-                            (1, since)
-                        }
-                    }
-                };
-                if attempts == 1 {
-                    warn!(
-                        namespace = %convoy.metadata.namespace,
-                        convoy = %convoy.metadata.name,
-                        attempts,
-                        %error,
-                        "automatic convoy reclaim refused"
-                    );
-                }
-                if attempts >= RECLAIM_REFUSAL_ATTENTION_AFTER {
-                    if let Err(attention_error) = self.raise_attention(convoy, error, since).await {
-                        warn!(
-                            namespace = %convoy.metadata.namespace,
-                            convoy = %convoy.metadata.name,
-                            %attention_error,
-                            "could not raise persistent reclaim refusal attention"
-                        );
-                    }
-                }
-            }
-            Ok(()) => {
-                if let Some(refusal) = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned").remove(&key) {
-                    if refusal.attempts > 1 {
-                        info!(
-                            namespace = %convoy.metadata.namespace,
-                            convoy = %convoy.metadata.name,
-                            refused_attempts = refusal.attempts,
-                            "automatic convoy reclaim recovered after repeated refusal"
-                        );
-                    }
-                }
-                if let Err(attention_error) = self.clear_attention(convoy).await {
-                    warn!(
-                        namespace = %convoy.metadata.namespace,
-                        convoy = %convoy.metadata.name,
-                        %attention_error,
-                        "could not clear recovered reclaim refusal attention"
-                    );
-                }
-            }
-        }
-        result
     }
 }
 
@@ -295,6 +222,44 @@ impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
     }
 }
 
+/// Any forge's default branch, as its Git remote advertises HEAD to the daemon's identity for the
+/// forge. A fresh host has no checkout or clone of a repository to observe it from, and a project
+/// is not ready to dispatch until its repositories' default branches resolve.
+pub(super) struct GitForgeDefaultBranchResolver {
+    daemon: Arc<InProcessDaemon>,
+    /// Successes by remote URL, kept as long as the GitHub resolver keeps its own.
+    resolved: StdMutex<HashMap<String, (tokio::time::Instant, String)>>,
+}
+
+impl GitForgeDefaultBranchResolver {
+    pub(super) fn new(daemon: Arc<InProcessDaemon>) -> Self {
+        Self { daemon, resolved: Default::default() }
+    }
+}
+
+#[async_trait]
+impl ForgeDefaultBranchResolver for GitForgeDefaultBranchResolver {
+    #[tracing::instrument(name = "repository_default_branch_git", skip_all)]
+    async fn default_branch(&self, forge: &ForgeIdentity) -> Result<Option<String>, String> {
+        let url = format!("{}/{}", forge.service_url.trim_end_matches('/'), forge.repository);
+        let now = tokio::time::Instant::now();
+        {
+            let mut resolved = self.resolved.lock().expect("default branch cache lock");
+            resolved.retain(|_, (expires, _)| *expires > now);
+            if let Some((_, branch)) = resolved.get(&url) {
+                return Ok(Some(branch.clone()));
+            }
+        }
+        let runner = self.daemon.local_forge_git_runner().ok_or("the local environment has no command runner")?;
+        let branch = flotilla_vcs::vcs::remote_default_branch(runner.as_ref(), &url).await?;
+        if let Some(branch) = &branch {
+            let expires = now + std::time::Duration::from_secs(6 * 60 * 60);
+            self.resolved.lock().expect("default branch cache lock").insert(url, (expires, branch.clone()));
+        }
+        Ok(branch)
+    }
+}
+
 /// The first resolver that knows the forge answers. A failing resolver does
 /// not hide a later one's answer; its error is reported only when none answers.
 pub(super) struct ChainedForgeDefaultBranchResolver(pub(super) Vec<Arc<dyn ForgeDefaultBranchResolver>>);
@@ -367,7 +332,7 @@ impl CloneRuntime for RoutingCloneRuntime {
 
 pub(super) struct RoutingCheckoutRuntime {
     pub(super) state: Arc<ControllerRuntimeState>,
-    pub(super) change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
+    pub(super) change_requests: Option<ChangeRequestObservations>,
 }
 
 #[async_trait]
@@ -382,7 +347,7 @@ impl RoutingCheckoutRuntime {
     /// The VCS a fresh clone runs through. A clone whose repository has grants
     /// gets them delivered into its environment first, as a crew session's are,
     /// and its Git runs with the delivered environment (#4218).
-    async fn fresh_clone_vcs(
+    pub(super) async fn fresh_clone_vcs(
         &self,
         env_ref: &str,
         url: &str,
@@ -414,73 +379,19 @@ impl RoutingCheckoutRuntime {
             .resolve_environment_ref(env_ref)
             .ok_or_else(|| format!("checkout environment {env_ref} is unavailable on this host"))?;
         let vcs = self.state.daemon.vcs_for_checkout(&environment.id, Path::new(checkout)).await?;
-        let runner = environment.runner;
-        let namespace = self.state.daemon.provisioning_namespace().await;
-        let forges = self
-            .state
-            .daemon
-            .resource_backend()
-            .definitions::<Forge>(&namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|forge| forge.spec)
-            .collect();
-        Ok(CheckoutControllerRuntime::new(runner, Some(vcs), self.change_requests.clone(), forges))
+        Ok(CheckoutControllerRuntime::new(environment.runner, Some(vcs), self.change_requests.clone()))
     }
 }
 
-#[async_trait]
-impl CheckoutRuntime for RoutingCheckoutRuntime {
-    async fn validate_new_branch(
-        &self,
-        checkout: &ResourceObject<Checkout>,
-    ) -> Result<Option<String>, flotilla_provider_runtime::ObservationError> {
-        let Some(target) = checkout.spec.target_path() else { return Ok(None) };
-        let env_ref = checkout.spec.env_ref().ok_or_else(|| "checkout environment unavailable".to_string())?;
-        let environment = self.state.daemon.resolve_environment_ref(env_ref).ok_or("checkout environment unavailable")?;
-        if environment.runner.path_exists(Path::new(target)).await? {
-            return Ok(None);
-        }
-        self.state.daemon.validate_new_checkout_branch(checkout).await
-    }
-
-    async fn continue_checkout_in(
-        &self,
-        checkout: &ResourceObject<Checkout>,
-        clone_path: Option<&str>,
-        reason: &str,
-    ) -> Result<PreparedCheckout, CheckoutMaterialisationError> {
-        let env_ref = checkout.spec.env_ref().ok_or_else(|| "checkout environment unavailable".to_string())?;
-        let target = checkout.spec.target_path().ok_or_else(|| "checkout target unavailable".to_string())?;
-        let path = clone_path.unwrap_or(target);
-        let runtime = self.runtime_for(env_ref, path).await?;
-        let vcs = runtime.vcs(path)?;
-        let result = match &checkout.spec {
-            CheckoutSpec::Worktree(spec) => vcs.continue_checkout(&spec.r#ref, target, reason).await?,
-            CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_none() => {
-                let credentials = CloneCredentials::from_annotations(&checkout.metadata.annotations)?;
-                let (vcs, delivery) = self.fresh_clone_vcs(env_ref, &spec.url, target, &credentials).await?;
-                let continued = vcs.continue_fresh_clone(&spec.url, &spec.r#ref, target).await;
-                finish_clone_delivery(delivery, target).await;
-                continued.map_err(|error| unauthorised_clone(&spec.url, &credentials, error))?
-            }
-            CheckoutSpec::FreshClone(_) => {
-                return Err("local clones continue through host-local clone preparation with a managed source".to_string().into())
-            }
-            CheckoutSpec::Observed(_) => return Err("observed checkout cannot be continued".to_string().into()),
-        };
-        Ok(PreparedCheckout { commit: result.commit, branch_provenance: result.provenance })
-    }
-
-    async fn protect_worktree_in(&self, env_ref: &str, clone_path: &str, target: &str, reason: &str) -> Result<(), String> {
+/// This host's checkout work in its environments, for the engine's Checkout controller (#3108).
+impl RoutingCheckoutRuntime {
+    pub(super) async fn protect_worktree_in(&self, env_ref: &str, clone_path: &str, target: &str, reason: &str) -> Result<(), String> {
         let runtime = self.runtime_for(env_ref, clone_path).await?;
         let vcs = runtime.vcs(clone_path)?;
         vcs.checkout_registration(target, CheckoutRegistration::Protect { reason }).await
     }
 
-    async fn checkout_path_exists_in(&self, env_ref: &str, path: &str) -> Result<Option<bool>, String> {
+    pub(super) async fn checkout_path_exists_in(&self, env_ref: &str, path: &str) -> Result<Option<bool>, String> {
         if env_ref != self.state.host_direct_environment_name {
             return Ok(None);
         }
@@ -493,45 +404,7 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         }
     }
 
-    async fn create_worktree(
-        &self,
-        clone_path: &str,
-        branch: &str,
-        base_ref: Option<&str>,
-        target_path: &str,
-    ) -> Result<PreparedCheckout, String> {
-        self.runtime_for(&self.state.host_direct_environment_name, clone_path)
-            .await?
-            .create_worktree(clone_path, branch, base_ref, target_path)
-            .await
-    }
-
-    async fn create_fresh_clone(
-        &self,
-        repo_url: &str,
-        branch: &str,
-        base_ref: Option<&str>,
-        target_path: &str,
-    ) -> Result<PreparedCheckout, String> {
-        self.runtime_for(&self.state.host_direct_environment_name, target_path)
-            .await?
-            .create_fresh_clone(repo_url, branch, base_ref, target_path)
-            .await
-    }
-
-    async fn inspect_integration(
-        &self,
-        checkout: &ResourceObject<Checkout>,
-        convoy: Option<&ResourceObject<Convoy>>,
-    ) -> Result<CheckoutIntegrationStatus, String> {
-        self.inspect_integration_in(&self.state.host_direct_environment_name, checkout, convoy).await
-    }
-
-    async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
-        self.remove_checkout_in(&self.state.host_direct_environment_name, removal).await
-    }
-
-    async fn create_worktree_in(
+    pub(super) async fn create_worktree_in(
         &self,
         env_ref: &str,
         clone_path: &str,
@@ -546,15 +419,15 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
-    async fn create_local_clone_in(
+    pub(super) async fn create_local_clone_in(
         &self,
         env_ref: &str,
         request: flotilla_vcs::vcs::LocalCloneRequest<'_>,
     ) -> Result<(PreparedCheckout, Option<String>), String> {
-        self.runtime_for(env_ref, request.source).await?.create_local_clone_in(env_ref, request).await
+        self.runtime_for(env_ref, request.source).await?.create_local_clone(request).await
     }
 
-    async fn create_fresh_clone_in(
+    pub(super) async fn create_fresh_clone_in(
         &self,
         env_ref: &str,
         repo_url: &str,
@@ -570,18 +443,7 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
-    async fn inspect_integration_in(
-        &self,
-        env_ref: &str,
-        checkout: &ResourceObject<Checkout>,
-        convoy: Option<&ResourceObject<Convoy>>,
-    ) -> Result<CheckoutIntegrationStatus, String> {
-        let path = checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec).ok_or("checkout path unavailable")?;
-        let runtime = self.runtime_for(env_ref, path).await?;
-        runtime.inspect_integration(checkout, convoy).await
-    }
-
-    async fn remove_checkout_in(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+    pub(super) async fn remove_checkout_in(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
         // Shared by every namespace and execution environment on this daemon.
         // Hold capacity through archive creation and every deletion in the
         // removal, releasing it on success, failure, or cancellation.
@@ -600,7 +462,7 @@ const GIT_SIGN_IN_REFUSALS: &[&str] =
 const GIT_NOT_FOUND: &str = "Repository not found";
 
 /// The clone's environment file holds raw tokens; it goes once the clone's Git is done.
-async fn finish_clone_delivery(delivery: Option<CloneDelivery>, target: &str) {
+pub(super) async fn finish_clone_delivery(delivery: Option<CloneDelivery>, target: &str) {
     let Some(delivery) = delivery else { return };
     if let Err(error) = delivery.finish().await {
         warn!(%target, %error, "could not remove a clone's credential environment file");
@@ -625,7 +487,7 @@ fn refused_clone_grant(url: &str, credentials: &CloneCredentials, error: &str) -
 
 /// A clone the forge refused for want of a sign-in says which grant is missing
 /// or refused, instead of leaving only Git's prompt failure (#4218).
-fn unauthorised_clone(url: &str, credentials: &CloneCredentials, error: String) -> String {
+pub(super) fn unauthorised_clone(url: &str, credentials: &CloneCredentials, error: String) -> String {
     let refused = if GIT_SIGN_IN_REFUSALS.iter().any(|refusal| error.contains(refusal)) {
         "requires a sign-in"
     } else if error.contains(GIT_NOT_FOUND) {
@@ -640,10 +502,6 @@ fn unauthorised_clone(url: &str, credentials: &CloneCredentials, error: String) 
         format!("cannot clone {url}: {forge} {refused}, and refused the granted credentials {} ({error})", clone_grants(credentials))
     }
 }
-
-pub(super) const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
-
-pub(super) const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-at";
 
 #[cfg(test)]
 mod unauthorised_clone_tests {
@@ -681,6 +539,8 @@ mod unauthorised_clone_tests {
 
 #[cfg(test)]
 mod chained_default_branch_tests {
+    use flotilla_resources::InputMeta;
+
     use super::*;
 
     // Process boundary fake: count only the default-branch gh command.
@@ -724,18 +584,25 @@ mod chained_default_branch_tests {
     }
     async fn default_branch_fixture(
         failures: usize,
-    ) -> (Arc<DefaultBranchRunner>, flotilla_provisioning::reconcilers::RepositoryReconciler, ResourceObject<flotilla_resources::Repository>)
-    {
+    ) -> (
+        Arc<DefaultBranchRunner>,
+        flotilla_provisioning::reconcilers::RepositoryReconciler,
+        flotilla_resources::ResourceObject<flotilla_resources::Repository>,
+    ) {
         let runner = Arc::new(DefaultBranchRunner { calls: Default::default(), failures: failures.into(), error: None });
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let backend = flotilla_provisioning_testkit::EngineBackend::open_in("home", "ops");
         let spec = flotilla_resources::RepositorySpec::remote("https://github.com/org/repo.git").expect("spec");
         let repository = backend
             .using::<flotilla_resources::Repository>("ops")
             .create(&InputMeta::builder().name(spec.key().to_string()).build(), &spec)
             .await
             .expect("repository");
-        let reconciler = flotilla_provisioning::reconcilers::RepositoryReconciler::new(backend.clone(), backend, "ops")
-            .with_forge_default_branch_resolver(Arc::new(GhForgeDefaultBranchResolver::new(runner.clone())));
+        // No clone holds a default branch, so the forge's answer decides.
+        let reconciler = flotilla_provisioning::reconcilers::RepositoryReconciler::new(
+            Default::default(),
+            flotilla_provisioning_testkit::EngineFixture::default().reads(),
+        )
+        .with_forge_default_branch_resolver(Arc::new(GhForgeDefaultBranchResolver::new(runner.clone())));
         (runner, reconciler, repository)
     }
     // #3710: reconciliation resync and repeated prepares reuse six-hour successes.

@@ -41,6 +41,9 @@ pub trait Log<M: Machine> {
     ///
     /// The default preserves existing machines' immutable-spec create behavior.
     /// A specialized adapter must not change fields read by admission or gates.
+    /// A log that gives sequences numbers a launch here, by the sequence the
+    /// create takes ([`Resource::numbered`], [`Machine::launch`]); a log
+    /// wrapping another forwards this call so its inner log can.
     fn create_resource(
         &mut self,
         writer: &str,
@@ -50,6 +53,28 @@ pub trait Log<M: Machine> {
     ) -> Result<Resource<M>, LogError> {
         resource.version = self.create(writer, at, &resource, reads)?;
         Ok(resource)
+    }
+
+    /// Takes the next sequence as a launch number a later [`Log::create_reserved`] carries, by
+    /// `writer` at `at`, writing no entry (a store log records an empty change, so its sequence
+    /// stays gapless to replicas): a launch's name is then known before it is created, and a
+    /// launch never created leaves its number unused, as launch numbers allow. A log that gives
+    /// no sequences refuses.
+    fn reserve(&mut self, _writer: &str, _at: Timestamp) -> Result<u64, LogError> {
+        Err(LogError::new("this log does not reserve launch numbers"))
+    }
+
+    /// Creates launch `resource` numbered `n`, a number [`Log::reserve`] gave this log, under the
+    /// create's own later version. Refused for a number the log never gave as a reservation.
+    fn create_reserved(
+        &mut self,
+        _writer: &str,
+        _at: Timestamp,
+        _resource: Resource<M>,
+        _n: u64,
+        _reads: &[InputRead],
+    ) -> Result<Resource<M>, LogError> {
+        Err(LogError::new("this log does not reserve launch numbers"))
     }
 
     /// Persists `event`, written by `writer`, which moved `next` out of
@@ -157,6 +182,41 @@ impl<M: Machine> Default for MemoryLog<M> {
 impl<M: Machine> Log<M> for MemoryLog<M> {
     fn create(&mut self, _: &str, _: Timestamp, _: &Resource<M>, _: &[InputRead]) -> Result<Version, LogError> {
         Ok(self.next(Version(0)))
+    }
+
+    /// A launch is numbered by the sequence its create takes ([`Machine::launch`]).
+    fn create_resource(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<M>,
+        reads: &[InputRead],
+    ) -> Result<Resource<M>, LogError> {
+        let version = self.create(writer, at, &resource, reads)?;
+        let mut resource = resource.numbered(version.0);
+        resource.version = version;
+        Ok(resource)
+    }
+
+    fn reserve(&mut self, _: &str, _: Timestamp) -> Result<u64, LogError> {
+        Ok(self.next(Version(0)).0)
+    }
+
+    fn create_reserved(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<M>,
+        n: u64,
+        reads: &[InputRead],
+    ) -> Result<Resource<M>, LogError> {
+        if n > self.sequence {
+            return Err(LogError::new(format!("launch number {n} was not given by this log")));
+        }
+        let version = self.create(writer, at, &resource, reads)?;
+        let mut resource = resource.numbered(n);
+        resource.version = version;
+        Ok(resource)
     }
 
     fn edge(&mut self, _: &str, _: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {

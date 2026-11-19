@@ -3,91 +3,78 @@
 mod access_layer;
 mod account_access;
 pub(crate) mod archive;
+mod checkouts;
+mod credential_delivery;
 mod credentials;
 mod discovery;
 mod docker;
 mod environments;
 mod health;
-mod message;
 mod ports;
 mod primitives;
 mod provider_path;
+mod remotes;
+mod role_consumer;
 mod seed;
 pub(crate) mod ssh_host_vessels;
 mod state;
 mod tasks;
 mod terminal;
-use std::{
-    collections::BTreeSet,
-    path::PathBuf,
-    sync::{atomic::AtomicU64, Arc},
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 pub(crate) use terminal::{DELIVERY_CONFIRMATION_POLL, DELIVERY_CONFIRMATION_STABLE_FOR};
 
 use chrono::Utc;
 use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
+use flotilla_credentials::{codex_central_auth_path, AgentMaterialRegistry, CodexCentralRefresher, CredentialStore};
 use flotilla_crew::convoy::ConvoyReconciler;
-use flotilla_crew::reconcilers::terminal_session::TerminalSessionReconciler;
-use flotilla_crew::reconcilers::vessel::VesselReconciler;
+use flotilla_crew::reconcilers::vessel::{ConvoyVesselWake, CrewSeats, VesselPlanning};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
-use flotilla_provisioning::engine::{
-    checkout::CheckoutBinding, clone::CloneBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding,
-    terminal_session::TerminalSessionBinding, vessel::VesselBinding, Engine,
-};
-use flotilla_provisioning::reconcilers::{
-    CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver, RepositoryReconciler,
-};
+use flotilla_provisioning::checkout_runtime::ChangeRequestObservations;
+use flotilla_provisioning::engine::ProvisioningLifecycles;
+use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
-use flotilla_resources::{
-    host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Environment, Forge, Host, Repository, Resource, ResourceError,
-    TerminalSession, Vessel, WorkflowTemplate,
+use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Host, Repository, Resource, ResourceError, Vessel};
+use flotilla_store::{
+    controller::ControllerLoop,
+    load_metrics::{attributed, caller, inherit_or, within, Attributed},
+    ResourceBackend,
 };
-use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
 
-use self::credentials::{
-    reconcile_work_credentials, spawn_codex_central_refresh_task, spawn_codex_credential_redelivery_task, spawn_credential_refresh_task,
-    RuntimeSessionCapabilities, RuntimeWorkCredentialReconciler,
-};
+use self::credential_delivery::CredentialDelivery;
+use self::credentials::{RuntimeSessionCapabilities, RuntimeWorkCredentialReconciler};
 use self::discovery::{
     apply_ssh_host_observation, build_local_profile, discover_ssh_host_profiles, probe_local_provider_registry, register_ssh_host_resources,
 };
 use self::docker::DockerControllerRuntime;
 use self::environments::reconcile_provisioned_environments;
-use self::health::{
-    apply_host_heartbeat_with_credentials, spawn_controller_loop_watchdog, spawn_projection_parity_task, DaemonHealthIdentity,
-    RuntimeHealth,
-};
-use self::message::MessageController;
+use self::health::{apply_host_heartbeat_with_credentials, DaemonHealthIdentity, RuntimeHealth};
 use self::ports::{
-    ChainedForgeDefaultBranchResolver, DaemonConvoyTeardownRuntime, GhForgeDefaultBranchResolver, RoutingCheckoutRuntime,
+    ChainedForgeDefaultBranchResolver, GhForgeDefaultBranchResolver, GitForgeDefaultBranchResolver, RoutingCheckoutRuntime,
     RoutingCloneRuntime, RuntimeOperatorReconciler,
 };
 use self::seed::register_startup_resources;
 use self::state::ControllerRuntimeState;
 use self::tasks::{
-    run_artifact_gc, run_checkout_archive_gc, spawn_adopted_checkout_reconciliation_task, spawn_aggregator_task,
-    spawn_convoy_ensure_reconciler_task, spawn_dispatch_reconciler_task, spawn_environment_orphan_sweep_task, spawn_event_expiry_task,
-    spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task, spawn_liveness_watchdog_task,
+    run_artifact_gc, run_checkout_archive_gc, spawn_aggregator_task, spawn_convoy_ensure_reconciler_task, spawn_dispatch_reconciler_task,
+    spawn_environment_orphan_sweep_task, spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task,
     spawn_local_fulfilment_probe_task, spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task,
-    spawn_provisioned_environment_reconciliation_task, spawn_resource_controller, spawn_sleep_inhibitor_task,
-    spawn_ssh_fulfilment_probe_task, spawn_startup_restoration, spawn_vessel_placement_projector, supervise_controller,
-    CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart, LIVENESS_WATCHDOG_INTERVAL, MANIFEST_RECONCILE_INTERVAL,
+    spawn_provisioned_environment_reconciliation_task, spawn_sleep_inhibitor_task, spawn_ssh_fulfilment_probe_task,
+    spawn_startup_restoration, spawn_vessel_requests, CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart,
+    MANIFEST_RECONCILE_INTERVAL,
 };
 use self::terminal::TerminalControllerRuntime;
 use crate::server::environment_sockets::EnvironmentSocketService;
 use crate::{
     blob_store::TieredBlobStore,
     resource_manifest::manifest_root_name,
-    startup::{phase, result_phase, retry_phase},
+    startup::{phase, result_phase},
     supervisor::ControllerSupervision,
 };
 pub(crate) use tasks::manifest_reconciler_enabled;
@@ -107,7 +94,6 @@ pub struct RuntimeOptions {
     pub fulfilment_probe_interval: Duration,
     pub controller_supervision: ControllerSupervision,
     pub start_controllers: bool,
-    pub codex_central_refresh_interval: Duration,
     /// Socket servers release restoration once their accept loop is ready.
     /// In-process runtimes omit the gate and restore in the background immediately.
     pub startup_ready: Option<watch::Receiver<bool>>,
@@ -133,7 +119,6 @@ impl Default for RuntimeOptions {
             // central login's access token lives far longer than that, so a
             // conservative fixed cadence comfortably inside that window
             // (rather than tracking each token's own `exp`) is sufficient.
-            codex_central_refresh_interval: Duration::from_secs(4 * 60 * 60),
         }
     }
 }
@@ -146,7 +131,16 @@ pub struct DaemonRuntime {
     /// Set by `shutdown` so `Drop` can tell an intended stop from a runtime
     /// that vanished while the daemon was meant to keep working.
     stop_expected: bool,
+    /// Asks message delivery to settle its turns before the tasks are aborted; none without
+    /// controllers.
+    delivery_stop: Option<Arc<primitives::DeliveryStop>>,
+    /// What a graceful stop stops after delivery settles: see [`Self::stop_with_runtime`].
+    process_components: Vec<Arc<dyn ProcessComponent>>,
 }
+
+/// How long a graceful stop waits for message delivery to settle its turns: a typed turn's
+/// confirmation runs within its grace.
+const DELIVERY_SETTLE_WITHIN: Duration = Duration::from_secs(10);
 
 impl DaemonRuntime {
     pub async fn start(
@@ -163,7 +157,10 @@ impl DaemonRuntime {
         daemon_socket_path: Option<PathBuf>,
         options: RuntimeOptions,
     ) -> Result<Self, String> {
-        result_phase("initialize_runtime", Self::initialize_with_options(daemon, config, daemon_socket_path, options)).await
+        // Boxed: initialisation composes the whole daemon, and its future is too large for a
+        // caller's stack (a 2 MiB test thread overflowed polling it in place).
+        let initialize = Self::initialize_with_options(daemon, config, daemon_socket_path, options);
+        result_phase("initialize_runtime", Box::pin(inherit_or(flotilla_core::in_process::DAEMON_STARTUP, initialize))).await
     }
 
     async fn initialize_with_options(
@@ -178,14 +175,12 @@ impl DaemonRuntime {
         phase("set_provisioning_namespace", daemon.set_provisioning_namespace(options.namespace.clone())).await;
         let aggregator_projection_state = phase("aggregator_projection_state", daemon.aggregator_projection_state()).await;
         let daemon_config = config.load_daemon_config()?;
-        // ADR 0064 switch-over (#3317): `[primitives]` moves Message onto the
-        // engine and its store; refused without `[dummy_fleet]`. Absent, nothing changes.
-        let mut provisioning_lifecycles = None;
-        if daemon_config.primitives()?.is_some() {
-            result_phase("open_message_primitives", open_message_primitives(&daemon, &config)).await?;
-            provisioning_lifecycles = Some(open_provisioning_lifecycles(&daemon).await?);
-            daemon.require_lifecycle_reads_installed()?;
-        }
+        // ADR 0064 (#3108): Message and the provisioning lifecycles run on the decided store.
+        result_phase("open_message_primitives", open_message_primitives(&daemon)).await?;
+        let (provisioning, lifecycle_followers) = open_provisioning_lifecycles(&daemon).await?;
+        daemon.require_lifecycle_reads_installed()?;
+        // The Convoy views read every launch once, here, before any request reads them.
+        phase("compose_convoy_views", daemon.convoy_views()?.opened()).await;
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
         let forge_default_branches = crate::dummy_fleet::dummy_forge_default_branches(daemon_config.dummy_fleet.as_ref());
@@ -216,8 +211,8 @@ impl DaemonRuntime {
                 }
             }
         }
-        let local_registry = retry_phase("probe_local_provider_registry", || probe_local_provider_registry(&daemon, &config)).await?;
-        let mut profile = retry_phase("build_local_profile", || build_local_profile(&daemon, &local_registry)).await?;
+        let local_registry = result_phase("probe_local_provider_registry", probe_local_provider_registry(&daemon, &config)).await?;
+        let mut profile = result_phase("build_local_profile", build_local_profile(&daemon, &local_registry)).await?;
         profile.max_vessels = daemon_config.max_vessels;
         let host_direct_environment_name = host_direct_environment_name(&profile.host_id);
         let mut archive_roots = vec![CheckoutArchiveRoot {
@@ -253,11 +248,8 @@ impl DaemonRuntime {
         }
         let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::clone(&daemon.discovery_runtime().env)));
         let health = DaemonHealthIdentity {
-            generation: retry_phase("read_observed_generation", || async {
-                daemon.observed_resource_backend().using::<Checkout>(&options.namespace).list().await
-            })
-            .await?
-            .generation,
+            // Each daemon start is a new generation.
+            generation: Some(uuid::Uuid::new_v4().to_string()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at: Utc::now(),
         };
@@ -266,24 +258,27 @@ impl DaemonRuntime {
             daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools),
         )
         .await;
-        let runtime_health = RuntimeHealth::default()
-            .with_restart_history_dir(config.state_dir().as_path().to_path_buf())
-            .with_blob_store(Arc::clone(&blob_store));
+        daemon.install_local_host_identity(flotilla_core::in_process::local_host::LocalHostIdentity {
+            version: health.version.clone(),
+            started_at: health.started_at,
+            blob_sync: Some(Arc::clone(&blob_store) as Arc<dyn flotilla_core::in_process::local_host::BlobSyncReading>),
+        })?;
+        let runtime_health = RuntimeHealth::default().with_restart_history_dir(config.state_dir().as_path().to_path_buf());
         runtime_health.host_observations.record_provider_advertisements(profile.environment_providers.clone()).await;
 
-        retry_phase("quarantine_undecodable_stored_objects", || async {
+        result_phase("quarantine_undecodable_stored_objects", async {
             flotilla_store::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace).await
         })
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
-        retry_phase("register_startup_resources", || register_startup_resources(&daemon, &options.namespace, &profile)).await?;
+        result_phase("register_startup_resources", register_startup_resources(&daemon, &options.namespace, &profile)).await?;
         let registered_image_caches = local_registry
             .environment_providers
             .iter()
             .filter(|(_, provider)| provider.local_image_cache().is_some())
             .filter_map(|(_, provider)| local_registry.environment_providers.instance_name(provider).map(String::from))
             .collect::<BTreeSet<_>>();
-        retry_phase("prune_unregistered_image_caches", || async {
+        result_phase("prune_unregistered_image_caches", async {
             flotilla_provisioning::image_inventory::prune_unregistered_caches(
                 &daemon.resource_backend(),
                 &options.namespace,
@@ -304,17 +299,25 @@ impl DaemonRuntime {
         });
         let mut registered_ssh_profiles = Vec::new();
         for ssh in ssh_profiles {
-            if let Err(error) = retry_phase("register_ssh_host_resources", || async {
-                register_ssh_host_resources(&daemon.resource_backend(), &options.namespace, &profile.host_id, &ssh).await
+            if let Err(error) = result_phase("register_ssh_host_resources", async {
+                register_ssh_host_resources(
+                    &daemon.resource_backend(),
+                    daemon.lifecycle_reads(),
+                    &options.namespace,
+                    &profile.host_id,
+                    &ssh,
+                )
+                .await
             })
             .await
             {
                 warn!(host = %ssh.provisioning.host_id, %error, "failed to register SSH host; continuing startup");
                 continue;
             }
-            if let Err(error) = retry_phase("apply_ssh_host_observation", || {
-                apply_ssh_host_observation(&daemon, &options.namespace, &ssh, Some(&credential_store), ssh_host_vessels.as_deref())
-            })
+            if let Err(error) = result_phase(
+                "apply_ssh_host_observation",
+                apply_ssh_host_observation(&daemon, &options.namespace, &ssh, Some(&credential_store), ssh_host_vessels.as_deref()),
+            )
             .await
             {
                 warn!(host = %ssh.provisioning.host_id, %error, "failed to observe SSH host; continuing startup");
@@ -322,12 +325,14 @@ impl DaemonRuntime {
             registered_ssh_profiles.push(ssh);
         }
         let ssh_profiles = registered_ssh_profiles;
-        retry_phase("publish_local_host_heartbeat", || {
-            apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health)
-        })
+        result_phase(
+            "publish_local_host_heartbeat",
+            apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health),
+        )
         .await?;
 
-        let mut tasks = vec![
+        let mut tasks = lifecycle_followers;
+        tasks.extend([
             spawn_local_fulfilment_probe_task(
                 Arc::clone(&daemon),
                 options.namespace.clone(),
@@ -337,17 +342,25 @@ impl DaemonRuntime {
                 runtime_health.host_observations.clone(),
                 options.fulfilment_probe_interval,
             ),
-            tokio::spawn(Arc::clone(&blob_store).run_sync()),
-            tokio::spawn(run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store))),
-            tokio::spawn(run_checkout_archive_gc(
-                daemon.resource_backend(),
-                options.namespace.clone(),
-                CheckoutArchiveSweep {
+            tokio::spawn(attributed(caller("blob store sync"), Arc::clone(&blob_store).run_sync())),
+            tokio::spawn(attributed(
+                caller("artifact gc"),
+                run_artifact_gc(
+                    daemon.resource_backend(),
+                    options.namespace.clone(),
+                    Arc::clone(&blob_store),
+                    tasks::BLOB_GRACE,
+                    runtime_health.clone(),
+                ),
+            )),
+            tokio::spawn(attributed(
+                caller("checkout archive gc"),
+                run_checkout_archive_gc(CheckoutArchiveSweep {
                     daemon: Arc::clone(&daemon),
                     catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
                     roots: archive_roots,
                     retention_days: daemon_config.checkout_archive_retention_days,
-                },
+                }),
             )),
             spawn_heartbeat_task_with_credentials(
                 Arc::clone(&daemon),
@@ -358,17 +371,7 @@ impl DaemonRuntime {
                 runtime_health.clone(),
                 options.heartbeat_interval,
             ),
-            spawn_credential_refresh_task(Arc::clone(&daemon), options.namespace.clone(), Arc::clone(&credential_store)),
             spawn_host_description_projection_task(Arc::clone(&daemon), options.namespace.clone(), options.heartbeat_interval),
-            spawn_codex_central_refresh_task(Arc::clone(&daemon.discovery_runtime().env), options.codex_central_refresh_interval),
-            spawn_event_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
-            spawn_projection_parity_task(
-                daemon.resource_backend(),
-                options.namespace.clone(),
-                aggregator_projection_state.clone(),
-                runtime_health.clone(),
-                options.heartbeat_interval,
-            ),
             spawn_sleep_inhibitor_task(
                 daemon.resource_backend(),
                 options.namespace.clone(),
@@ -383,9 +386,9 @@ impl DaemonRuntime {
                 options.controller_supervision.clone(),
                 runtime_health.clone(),
             ),
-        ];
-        if let Some(shipper) = archive_shipper(&daemon, &daemon_config.blob_stores, &runtime_health)? {
-            tasks.push(tokio::spawn(shipper.run(archive::PASS_INTERVAL)));
+        ]);
+        if let Some((shipper, service)) = archive_shipper(&daemon, &daemon_config.blob_stores, &runtime_health)? {
+            tasks.push(tokio::spawn(attributed(caller("archive shipper"), shipper.run(service))));
         }
         if let Some(relay) = relay {
             tasks.push(crate::event_relay::spawn(Arc::clone(&daemon), relay, config.state_dir().as_path().to_path_buf())?);
@@ -397,50 +400,57 @@ impl DaemonRuntime {
             let ssh = ssh.clone();
             let credential_store = Arc::clone(&credential_store);
             let ssh_host_vessels = ssh_host_vessels.clone();
-            tasks.push(spawn_periodic_task(options.heartbeat_interval, PeriodicTaskStart::AfterInterval, move || {
-                let daemon = Arc::clone(&daemon);
-                let namespace = namespace.clone();
-                let ssh = ssh.clone();
-                let credential_store = Arc::clone(&credential_store);
-                let ssh_host_vessels = ssh_host_vessels.clone();
-                async move {
-                    if let Err(error) =
-                        apply_ssh_host_observation(&daemon, &namespace, &ssh, Some(&credential_store), ssh_host_vessels.as_deref()).await
-                    {
-                        warn!(host = %ssh.provisioning.host_id, %error, "failed to publish SSH host observation");
-                    }
-                    // #3792: a removed vessel's agent goes with it, including
-                    // one removed while this daemon was down.
-                    if let Some(vessels) = &ssh_host_vessels {
-                        let retired = async {
-                            let live =
-                                ssh_host_vessels::live_vessels(&daemon.resource_backend(), &namespace, ssh.environment_id.as_str()).await?;
-                            vessels.retire_absent(&ssh, &live).await
+            tasks.push(spawn_periodic_task(
+                "ssh host heartbeat",
+                options.heartbeat_interval,
+                PeriodicTaskStart::AfterInterval,
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    let namespace = namespace.clone();
+                    let ssh = ssh.clone();
+                    let credential_store = Arc::clone(&credential_store);
+                    let ssh_host_vessels = ssh_host_vessels.clone();
+                    async move {
+                        if let Err(error) =
+                            apply_ssh_host_observation(&daemon, &namespace, &ssh, Some(&credential_store), ssh_host_vessels.as_deref())
+                                .await
+                        {
+                            warn!(host = %ssh.provisioning.host_id, %error, "failed to publish SSH host observation");
                         }
-                        .await;
-                        if let Err(error) = retired {
-                            warn!(host = %ssh.provisioning.host_id, %error, "failed to retire removed vessels' agents");
+                        // #3792: a removed vessel's agent goes with it, including
+                        // one removed while this daemon was down.
+                        if let Some(vessels) = &ssh_host_vessels {
+                            let retired = async {
+                                let live =
+                                    ssh_host_vessels::live_vessels(&daemon.resource_backend(), &namespace, ssh.environment_id.as_str())
+                                        .await?;
+                                vessels.retire_absent(&ssh, &live).await
+                            }
+                            .await;
+                            if let Err(error) = retired {
+                                warn!(host = %ssh.provisioning.host_id, %error, "failed to retire removed vessels' agents");
+                            }
                         }
                     }
-                }
-            }));
+                },
+            ));
         }
         let desired_manifest_root = manifests
             .as_ref()
             .filter(|declared| manifest_reconciler_enabled(&declared.reconciler_root, &profile.host_id))
             .map(|declared| manifest_root_name(&declared.reconciler_root, &declared.dir, &declared.source));
         let roots = daemon.manifest_roots();
-        for root in retry_phase("list_manifest_roots", || roots.roots(&options.namespace)).await? {
+        for root in result_phase("list_manifest_roots", roots.roots(&options.namespace)).await? {
             if root.local
                 && root.name.starts_with("manifest-")
                 && root.spec.host == profile.host_id
                 && desired_manifest_root.as_deref() != Some(root.name.as_str())
             {
-                retry_phase("retire_stale_manifest_root", || roots.retire(&options.namespace, &root.name)).await?;
+                result_phase("retire_stale_manifest_root", roots.retire(&options.namespace, &root.name)).await?;
             }
         }
         let charter_daemon = Arc::clone(&daemon);
-        tasks.push(spawn_periodic_task(MANIFEST_RECONCILE_INTERVAL, PeriodicTaskStart::Immediate, move || {
+        tasks.push(spawn_periodic_task("charter manifests", MANIFEST_RECONCILE_INTERVAL, PeriodicTaskStart::Immediate, move || {
             let daemon = Arc::clone(&charter_daemon);
             async move {
                 if let Err(error) = daemon.reconcile_bound_project_charters().await {
@@ -470,35 +480,24 @@ impl DaemonRuntime {
 
         let controller_metrics = Arc::new(flotilla_store::load_metrics::ControllerMetricsRegistry::default());
         let mut controller_state = None;
-        // Behind `[primitives]` the engine's Ensure decides standing-convoy status (#3629 layer 7).
-        let ensure_engine = match provisioning_lifecycles {
-            Some(_) => {
-                let store = daemon.decided_store()?.store();
-                let clock = daemon.clock_for_scenarios();
-                let path = tokio::task::spawn_blocking(move || flotilla_core::primitives::ensures::EngineEnsurePath::open(store, clock))
-                    .await
-                    .map_err(|error| error.to_string())??;
-                Some(Arc::new(path) as Arc<dyn flotilla_admission::convoy_ensure::EngineEnsures>)
-            }
-            None => None,
-        };
+        let mut delivery_stop = None;
         daemon
             .install_convoy_ensure_reconciler(Arc::new(
                 EnsureReconciler::builder()
                     .teardown(daemon.convoy_teardown())
                     .resource_backend(daemon.resource_backend())
                     .clock(daemon.clock_for_scenarios())
-                    .maybe_engine(ensure_engine)
                     .manifest_roots(daemon.manifest_roots())
+                    .standing_roles(daemon.standing_roles())
                     .build(),
             ))
             .await;
         if options.start_controllers {
             // ADR 0062: composed images are built by this host's build
-            // service (the Docker provider's owned BuildKit builder) when the
-            // ImageBuild reconciler finds builds for it; the reconciler
-            // enforces Host.spec.image_build_capacity, including single-host
-            // local mode's undeclared default. This host also publishes its
+            // service (the Docker provider's owned BuildKit builder) when a
+            // home demands a build of it; the ImageBuild controller enforces
+            // Host.spec.image_build_capacity, including single-host local
+            // mode's undeclared default. This host also publishes its
             // cache inventory for placement cost.
             let image_build_service = local_registry
                 .environment_providers
@@ -551,7 +550,7 @@ impl DaemonRuntime {
                 .with_image_build_service(image_build_service)
                 .with_forge_default_branches(forge_default_branches)
                 .with_controller_metrics(Arc::clone(&controller_metrics))
-                .with_provisioning_lifecycles(provisioning_lifecycles.clone()),
+                .with_runtime_health(runtime_health.clone()),
             );
             if state.ssh_host_vessels.is_some() {
                 daemon.set_ssh_host_vessel_access(Arc::new(ssh_host_vessels::VesselSessions { state: Arc::downgrade(&state) }));
@@ -571,6 +570,7 @@ impl DaemonRuntime {
             )
             .await;
             daemon.set_session_capability_source(Arc::new(RuntimeSessionCapabilities { state: Arc::downgrade(&state) })).await;
+            delivery_stop = Some(Arc::clone(&state.delivery_stop));
             controller_state = Some(state);
         }
 
@@ -582,17 +582,13 @@ impl DaemonRuntime {
                 .local_registry(local_registry)
                 .credential_store(credential_store)
                 .maybe_state(controller_state)
+                .provisioning(provisioning)
                 .options(options)
                 .runtime_health(runtime_health)
                 .build(),
         ));
 
-        // +1 for the watchdog's own handle, pushed below, so this count matches
-        // `self.tasks.len()` at drop time.
-        let supervisory_tasks = tasks.len() + 1;
-        tasks.push(spawn_liveness_watchdog_task(supervisory_tasks, LIVENESS_WATCHDOG_INTERVAL));
-
-        Ok(Self { tasks, blob_store, controller_metrics, stop_expected: false })
+        Ok(Self { tasks, blob_store, controller_metrics, stop_expected: false, delivery_stop, process_components: Vec::new() })
     }
 }
 
@@ -604,8 +600,14 @@ struct StartupRestoration {
     local_registry: Arc<ProviderRegistry>,
     credential_store: Arc<CredentialStore>,
     state: Option<Arc<ControllerRuntimeState>>,
+    /// The provisioning kinds' engine homes, the single writer of the resources they hold, for
+    /// their controllers.
+    provisioning: ProvisioningLifecycles,
     options: RuntimeOptions,
     runtime_health: RuntimeHealth,
+    /// The credential delivery controller, once its start pass has run.
+    #[builder(skip)]
+    credential_delivery: std::sync::Mutex<Option<CredentialDelivery>>,
 }
 
 impl StartupRestoration {
@@ -618,13 +620,18 @@ impl StartupRestoration {
         if let Some((_, provider)) =
             local_registry.environment_providers.for_legacy_input(flotilla_environment::environment::EnvironmentInput::Docker)
         {
-            let live =
-                phase("list_environments_for_credential_sweep", daemon.resource_backend().using::<Environment>(&options.namespace).list())
-                    .await;
+            let reads = daemon.lifecycle_reads();
+            let live = phase(
+                "list_environments_for_credential_sweep",
+                tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.environments()?.live())),
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|live| live);
             let running = phase("list_docker_backings_for_credential_sweep", provider.list()).await;
             match (live, running) {
                 (Ok(live), Ok(running)) => {
-                    let live = live.items.into_iter().map(|environment| environment.metadata.name).collect::<BTreeSet<_>>();
+                    let live = live.into_iter().map(|environment| environment.name).collect::<BTreeSet<_>>();
                     let running = running.into_iter().map(|handle| handle.id().to_string()).collect::<BTreeSet<_>>();
                     if let Err(error) =
                         phase("sweep_orphaned_registry_configs", credential_store.sweep_orphaned_registry_configs(&live, &running)).await
@@ -638,9 +645,6 @@ impl StartupRestoration {
         } else if config.state_dir().as_path().join("credential-runtime").exists() {
             warn!("Docker credential cache sweep deferred because Docker backing liveness is unavailable");
         }
-        if let Err(error) = phase("reconcile_adopted_checkouts", daemon.reconcile_adopted_checkouts(&options.namespace)).await {
-            warn!(%error, "failed to restore adopted checkout observations during startup; periodic reconciliation will retry");
-        }
         let Some(state) = self.state.as_ref() else {
             return;
         };
@@ -648,8 +652,11 @@ impl StartupRestoration {
         {
             warn!(%error, "failed to restore provisioned environments during startup; periodic reconciliation will retry");
         }
-        if let Err(error) = phase("reconcile_work_credentials", reconcile_work_credentials(state, &options.namespace)).await {
-            warn!(%error, "failed to reconcile work credentials during startup; periodic reconciliation will retry");
+        if let Some(mut delivery) = CredentialDelivery::new(Arc::clone(state)) {
+            if let Err(error) = phase("reconcile_work_credentials", delivery.start()).await {
+                warn!(%error, "failed to reconcile work credentials during startup; each environment is retried at its backoff");
+            }
+            *self.credential_delivery.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(delivery);
         }
     }
 
@@ -665,97 +672,48 @@ impl StartupRestoration {
         let daemon = &self.daemon;
         let options = &self.options;
         let runtime_health = &self.runtime_health;
-        let mut controller_tasks = vec![AbortOnDropHandle::new(spawn_adopted_checkout_reconciliation_task(
-            Arc::clone(daemon),
-            options.namespace.clone(),
-            options.controller_resync_interval,
-        ))];
+        let mut controller_tasks = Vec::new();
         let observation_daemon = Arc::clone(daemon);
         let observation_namespace = options.namespace.clone();
-        controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
+        controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(attributed(caller("change request demands"), async move {
             observation_daemon.watch_change_request_convoy_demands(&observation_namespace).await;
-        })));
+        }))));
         let Some(state) = self.state.as_ref() else {
             return futures::future::pending::<Result<(), ResourceError>>().await;
         };
-        // Warm all board sources independently of readiness reconciliation and
-        // interactive request cancellation. Reads schedule coalesced refreshes.
-        let board_daemon = Arc::clone(daemon);
-        controller_tasks.push(AbortOnDropHandle::new(spawn_periodic_task(
-            options.controller_resync_interval,
-            PeriodicTaskStart::Immediate,
-            move || {
-                let daemon = Arc::clone(&board_daemon);
-                async move {
-                    if let Err(error) = daemon.refresh_dispatch_boards_internal().await {
-                        tracing::debug!(%error, "dispatch board observation unavailable");
-                    }
-                }
-            },
-        )));
-        let audit_daemon = Arc::clone(daemon);
-        // The old store's audit sweep compacts old Messages; on the engine path there are none.
-        if daemon.message_primitives().is_none() {
-            controller_tasks.push(AbortOnDropHandle::new(spawn_periodic_task(
-                Duration::from_secs(60 * 60),
-                PeriodicTaskStart::Immediate,
-                move || {
-                    let daemon = Arc::clone(&audit_daemon);
-                    async move {
-                        match daemon.resource_backend().local_namespaces::<flotilla_resources::Message>().await {
-                            Ok(namespaces) => {
-                                for namespace in namespaces {
-                                    if let Err(error) = daemon.message_inbox(&namespace).await.compact_audit(Utc::now()).await {
-                                        warn!(%error, %namespace, "Message audit retention sweep failed");
-                                    }
-                                }
-                            }
-                            Err(error) => warn!(%error, "Message retention namespace inventory failed"),
-                        }
-                    }
-                },
-            )));
-        }
-        if let (Some(primitives), Some(state)) = (daemon.message_primitives(), self.state.as_ref()) {
-            let delivery =
-                self::primitives::MessageDelivery::new(Arc::clone(state), primitives, options.namespace.clone(), runtime_health.clone());
-            let interval = options.controller_resync_interval.min(Duration::from_secs(1));
-            controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
-                if let Err(error) = delivery.run(interval).await {
-                    warn!(%error, "engine message delivery stopped");
-                }
-            })));
-        }
-        controller_tasks.push(AbortOnDropHandle::new(spawn_dispatch_reconciler_task(
-            Arc::clone(daemon),
-            options.namespace.clone(),
-            options.controller_resync_interval,
-        )));
+        controller_tasks.push(AbortOnDropHandle::new(spawn_dispatch_reconciler_task(Arc::clone(daemon), options.namespace.clone())));
         controller_tasks.push(AbortOnDropHandle::new(spawn_convoy_ensure_reconciler_task(
             Arc::clone(state),
             options.namespace.clone(),
             options.controller_resync_interval,
             runtime_health.clone(),
         )));
+        let supervisor_turns = Arc::clone(&state.controller_metrics.for_kind("SupervisorTurns").reads);
         let (supervisor_turn_task, _supervisor_turn_ready) =
-            spawn_pending_supervisor_turn_task(Arc::clone(daemon), options.namespace.clone(), options.controller_resync_interval);
+            within(&supervisor_turns, || spawn_pending_supervisor_turn_task(Arc::clone(daemon), options.namespace.clone()));
         controller_tasks.push(AbortOnDropHandle::new(supervisor_turn_task));
         controller_tasks.push(AbortOnDropHandle::new(spawn_provisioned_environment_reconciliation_task(
             Arc::clone(state),
             options.namespace.clone(),
             options.controller_resync_interval,
         )));
-        controller_tasks.push(AbortOnDropHandle::new(spawn_environment_orphan_sweep_task(Arc::clone(state))));
-        controller_tasks.push(AbortOnDropHandle::new(spawn_codex_credential_redelivery_task(
-            Arc::clone(state),
-            options.namespace.clone(),
-            options.controller_resync_interval,
+        if let Some(delivery) = self.credential_delivery.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+            let metrics = state.controller_metrics.for_kind("CredentialDelivery");
+            controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(attributed(Arc::clone(&metrics.reads), delivery.run(metrics)))));
+        }
+        // The central Codex login's sole writer; each rotation wakes credential delivery.
+        let env = Arc::clone(&state.daemon.discovery_runtime().env);
+        let events = Arc::clone(&state.credential_events);
+        controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(
+            CodexCentralRefresher::new(codex_central_auth_path(&*env), &*env).run(move || events.codex_rotated()),
         )));
+        controller_tasks.push(AbortOnDropHandle::new(spawn_environment_orphan_sweep_task(Arc::clone(state))));
+        controller_tasks.push(AbortOnDropHandle::new(remotes::spawn_remote_probe_task(Arc::clone(state), remotes::REMOTE_PROBE_INTERVAL)));
         controller_tasks.extend(
             spawn_controller_loops(
                 Arc::clone(state),
+                &self.provisioning,
                 &options.namespace,
-                options.controller_resync_interval,
                 options.controller_supervision.clone(),
                 runtime_health.clone(),
             )
@@ -772,10 +730,33 @@ impl DaemonRuntime {
     /// SIGTERM, SIGINT, idle timeout, explicit shutdown — should call this, so
     /// that `Drop`'s ERROR path stays reserved for a runtime that disappeared
     /// while the daemon was still meant to be working.
-    pub fn shutdown(mut self) {
+    /// Message delivery settles its turns first, so a turn typed before the stop has its receipt.
+    pub async fn shutdown(mut self) {
+        if let Some(delivery) = &self.delivery_stop {
+            if !delivery.settle(DELIVERY_SETTLE_WITHIN).await {
+                warn!(within = ?DELIVERY_SETTLE_WITHIN, "message delivery did not settle its turns before the stop");
+            }
+        }
+        for component in std::mem::take(&mut self.process_components) {
+            component.stop().await;
+        }
         self.stop_expected = true;
         info!(tasks = self.tasks.len(), "daemon runtime stopping; aborting supervisory tasks");
     }
+
+    /// Stop `component` with this runtime: a graceful [shutdown](Self::shutdown) stops it once
+    /// message delivery has settled and before the supervisory tasks abort, so nothing it is
+    /// doing waits on a controller that has gone.
+    pub fn stop_with_runtime(&mut self, component: Arc<dyn ProcessComponent>) {
+        self.process_components.push(component);
+    }
+}
+
+/// Something that runs inside the daemon's process and ends with it.
+#[async_trait::async_trait]
+pub trait ProcessComponent: Send + Sync {
+    /// End it, returning once what it holds is settled.
+    async fn stop(&self);
 }
 
 impl Drop for DaemonRuntime {
@@ -801,26 +782,27 @@ impl Drop for DaemonRuntime {
     }
 }
 
+/// What the Repository controller reads a forge's default branch from: the dummy fleet's forge when
+/// configured, then GitHub's API for GitHub, then any forge's Git remote.
+fn forge_default_branches(state: &ControllerRuntimeState) -> Arc<dyn ForgeDefaultBranchResolver> {
+    let mut resolvers = Vec::from_iter(state.forge_default_branches.clone());
+    if let Some(runner) = state.daemon.local_command_runner() {
+        resolvers.push(Arc::new(GhForgeDefaultBranchResolver::new(runner)));
+    }
+    resolvers.push(Arc::new(GitForgeDefaultBranchResolver::new(Arc::clone(&state.daemon))));
+    Arc::new(ChainedForgeDefaultBranchResolver(resolvers))
+}
+
 fn spawn_controller_loops(
     state: Arc<ControllerRuntimeState>,
+    provisioning: &ProvisioningLifecycles,
     namespace: &str,
-    controller_resync_interval: Duration,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
     let status_lifecycle_reads = state.daemon.lifecycle_reads();
-    let observed_backend = state.daemon.observed_resource_backend();
-    let gh_default_branches = state
-        .daemon
-        .local_command_runner()
-        .map(|runner| Arc::new(GhForgeDefaultBranchResolver::new(runner)) as Arc<dyn ForgeDefaultBranchResolver>);
-    let forge_default_branch_resolver = match (state.forge_default_branches.clone(), gh_default_branches) {
-        (Some(first), Some(then)) => {
-            Some(Arc::new(ChainedForgeDefaultBranchResolver(vec![first, then])) as Arc<dyn ForgeDefaultBranchResolver>)
-        }
-        (first, then) => first.or(then),
-    };
+    let forge_default_branch_resolver = Some(forge_default_branches(&state));
     let namespace_string = namespace.to_string();
 
     macro_rules! controller {
@@ -830,7 +812,6 @@ fn spawn_controller_loops(
         ($primary:ty, $name:expr, $make_parts:expr) => {{
             let make_parts = $make_parts;
             let write_lifecycle_reads = Arc::clone(&status_lifecycle_reads);
-            let loop_health = runtime_health.clone();
             let loop_metrics = Arc::clone(&state.controller_metrics);
             spawn_named_controller(
                 $name,
@@ -847,190 +828,89 @@ fn spawn_controller_loops(
                             .with_lifecycle_status_reads(Arc::clone(&write_lifecycle_reads)),
                         secondaries,
                         reconciler,
-                        resync_interval: controller_resync_interval,
                         backend,
                     };
-                    let heartbeat = Arc::new(AtomicU64::new(0));
-                    let health = loop_health.clone();
                     let metrics = loop_metrics.for_kind($name);
-                    async move {
-                        let watchdog =
-                            spawn_controller_loop_watchdog($name, Arc::clone(&heartbeat), controller_resync_interval, health.clone());
-                        let result = controller.run_observed(heartbeat, metrics).await;
-                        watchdog.abort();
-                        health.clear_controller_loop_stall($name);
-                        result
-                    }
+                    async move { controller.run_observed(metrics).await }
                 },
             )
         }};
     }
 
-    let gc_backend = backend.clone();
-    let gc_namespace = namespace_string.clone();
-    let gc_supervision = supervision.clone();
-    let gc_health = runtime_health.clone();
-    let gc = tokio::spawn(async move {
-        supervise_controller("owner_gc", gc_supervision, gc_health, move || {
-            let collector = flotilla_store::OwnerGarbageCollector::new(gc_backend.clone(), gc_namespace.clone());
-            async move { collector.run(controller_resync_interval).await }
-        })
-        .await;
-    });
-
     let mut controllers = vec![
-        gc,
-        spawn_vessel_placement_projector(
-            backend.clone(),
-            namespace_string.clone(),
-            state.local_host_ref.clone(),
-            state.ssh_host_refs(),
+        spawn_vessel_requests(
+            flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
+                std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(
+                    backend.clone(),
+                    namespace_string.clone(),
+                )),
+                state.daemon.lifecycle_reads(),
+                Arc::new(ports::DaemonVesselReleaseGate { daemon: Arc::clone(&state.daemon), namespace: namespace_string.clone() }),
+                CanonicalHostId::resolved(state.local_host_ref.clone()),
+                state.ssh_host_refs(),
+            ),
             supervision.clone(),
             runtime_health.clone(),
         ),
         controller!(Repository, {
-            let observed_backend = observed_backend.clone();
+            let lifecycle_reads = state.daemon.lifecycle_reads();
+            let discovered = state.daemon.discovered_checkouts();
             let forge_default_branch_resolver = forge_default_branch_resolver.clone();
-            move |backend: ResourceBackend, namespace_string: String| {
-                let observed_backend = observed_backend.clone();
+            // A repository's clones wake it as their launches change.
+            let decided = state.daemon.decided_store().ok();
+            move |_: ResourceBackend, _: String| {
                 let forge_default_branch_resolver = forge_default_branch_resolver.clone();
-                let mut reconciler = RepositoryReconciler::new(backend, observed_backend.clone(), &namespace_string);
+                let mut reconciler = RepositoryReconciler::new(discovered.clone(), lifecycle_reads.clone());
                 if let Some(resolver) = forge_default_branch_resolver {
                     reconciler = reconciler.with_forge_default_branch_resolver(resolver);
                 }
-                (RepositoryReconciler::secondary_watches(observed_backend, &namespace_string), reconciler)
-            }
-        }),
-        controller!(Environment, {
-            let state = Arc::clone(&state);
-            move |backend: ResourceBackend, namespace_string: String| {
-                let local_host_ref = state.local_host_ref.clone();
-                let additional_host_refs = state.ssh_host_refs();
-                let lifecycle_reads = state.daemon.lifecycle_reads();
-                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.environments));
-                let state = Arc::clone(&state);
-                (
-                    vec![],
-                    Engine::<_, EnvironmentBinding>::new(
-                        EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
-                            .with_lifecycle_reads(lifecycle_reads)
-                            .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
-                            .with_additional_host_refs(additional_host_refs),
-                        lifecycles,
-                    ),
-                )
-            }
-        }),
-        controller!(Clone, {
-            let state = Arc::clone(&state);
-            move |backend: ResourceBackend, namespace_string: String| {
-                (
-                    vec![],
-                    Engine::<_, CloneBinding>::new(
-                        CloneReconciler::new(
-                            Arc::new(RoutingCloneRuntime { state: Arc::clone(&state) }),
-                            backend.using::<Repository>(&namespace_string),
-                        )
-                        .with_lifecycle_reads(state.daemon.lifecycle_reads()),
-                        state.provisioning.as_ref().map(|engine| Arc::clone(&engine.clones)),
-                    ),
-                )
-            }
-        }),
-        controller!(Checkout, {
-            let state = Arc::clone(&state);
-            move |backend: ResourceBackend, namespace_string: String| {
-                let state = Arc::clone(&state);
-                // Match background task admission to the shared daemon semaphore
-                // initialized from this value by with_checkout_removal_concurrency.
-                // A namespace-local task cap alone cannot pace all removals.
-                let removal_concurrency = state.checkout_removal_concurrency;
-                let lifecycle_reads = state.daemon.lifecycle_reads();
-                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.checkouts));
-                (
-                    CheckoutReconciler::<RoutingCheckoutRuntime>::federated_secondary_watches(&backend, &namespace_string),
-                    Engine::<_, CheckoutBinding>::new(
-                        CheckoutReconciler::new(
-                            Arc::new(RoutingCheckoutRuntime {
-                                state,
-                                change_requests: Some(backend.including_replicas::<ChangeRequest>(&namespace_string)),
-                            }),
-                            backend.clone(),
-                            &namespace_string,
-                        )
-                        .with_lifecycle_reads(lifecycle_reads)
-                        .with_background_removal_limit(removal_concurrency)
-                        .with_federated_convoys(&backend, &namespace_string),
-                        lifecycles,
-                    ),
-                )
-            }
-        }),
-        controller!(TerminalSession, {
-            let state = Arc::clone(&state);
-            move |backend: ResourceBackend, namespace_string: String| {
-                let local_host_ref = state.local_host_ref.clone();
-                let additional_host_refs = state.ssh_host_refs();
-                let state = Arc::clone(&state);
-                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.terminal_sessions));
-                let reads = state.daemon.lifecycle_reads();
-                (
-                    vec![],
-                    Engine::<_, TerminalSessionBinding>::new(
-                        TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
-                            .with_lifecycle_reads(reads)
-                            .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
-                            .with_additional_host_refs(additional_host_refs)
-                            .with_federated_convoys(&backend, &namespace_string),
-                        lifecycles,
-                    ),
-                )
+                (RepositoryReconciler::secondary_watches(discovered.clone(), decided.clone()), reconciler)
             }
         }),
         controller!(Vessel, {
             let state = Arc::clone(&state);
-            let config_dir = state.config.base_path().as_path().to_path_buf();
-            let local_host_ref = state.local_host_ref.clone();
-            let additional_host_refs = state.ssh_host_refs();
             move |backend: ResourceBackend, namespace_string: String| {
-                let config_dir = config_dir.clone();
-                let local_host_ref = local_host_ref.clone();
-                let additional_host_refs = additional_host_refs.clone();
-                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.vessels));
-                (
-                    VesselReconciler::secondary_watches(),
-                    Engine::<_, VesselBinding>::new(
-                        VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
-                            .with_lifecycle_reads(state.daemon.lifecycle_reads())
-                            .with_accounts(state.daemon.account_records())
-                            .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None }))
-                            .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref))
-                            .with_additional_host_refs(additional_host_refs),
-                        lifecycles,
-                    ),
-                )
+                // A ready vessel's crews are seated as it, its sessions, its convoy, its crews'
+                // bindings and their briefs change; the Vessel controller writes its edges.
+                let mut secondaries = CrewSeats::secondary_watches();
+                secondaries.push(Box::new(ConvoyVesselWake::new(
+                    &backend,
+                    &namespace_string,
+                    state.daemon.lifecycle_reads(),
+                    state.daemon.convoy_engine_path(),
+                    state.daemon.account_records(),
+                )));
+                let planning = Arc::new(vessel_planning(&state, &backend, &namespace_string));
+                (secondaries, CrewSeats::new(planning).with_rechecks(state.vessel_rechecks.clone()))
             }
         }),
         controller!(Convoy, {
             let daemon = Arc::clone(&state.daemon);
             move |backend: ResourceBackend, namespace_string: String| {
                 let daemon = Arc::clone(&daemon);
-                let mut secondaries = ConvoyReconciler::federated_secondary_watches(&backend, &namespace_string);
+                let mut secondaries = ConvoyReconciler::secondary_watches(
+                    &backend,
+                    &namespace_string,
+                    daemon.convoy_engine_path(),
+                    daemon.crew_message_path(),
+                );
                 secondaries.push(daemon.reconciler_wake_watch());
+                secondaries.push(daemon.convoy_wake_watch());
                 secondaries.push(Box::new(flotilla_crew::convoy::EngineConvoyWake { engine: daemon.convoy_engine_path() }));
+                // A convoy's checkouts are the engine's: their changes wake the convoy holding them.
+                if let Ok(service) = daemon.decided_store() {
+                    secondaries.push(Box::new(flotilla_provisioning::engine::checkouts::CheckoutConvoyWake::new(Arc::clone(&service))));
+                    // A convoy reads its vessels' phases from the engine, so their records wake it.
+                    secondaries.push(Box::new(flotilla_provisioning::engine::vessel::VesselConvoyWake::new(service)));
+                }
                 (
                     secondaries,
-                    ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(&namespace_string))
+                    ConvoyReconciler::new(daemon.lifecycle_reads())
                         .with_engine(daemon.convoy_engine_path())
                         .with_messages(daemon.crew_message_path())
-                        .with_lifecycle_reads(daemon.lifecycle_reads())
                         .with_hosts(backend.including_replicas::<Host>(&namespace_string))
-                        .with_convoys(backend.including_replicas::<Convoy>(&namespace_string))
-                        .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
-                        .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
-                        .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
-                        .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
-                        .with_federated_checkouts(backend.including_replicas::<Checkout>(&namespace_string))
+                        .with_occupancy(backend.clone(), &namespace_string)
+                        .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))
                         .with_forges(backend.definitions::<Forge>(&namespace_string))
                         .with_change_requests(
                             backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
@@ -1038,7 +918,6 @@ fn spawn_controller_loops(
                         )
                         .with_artifacts(backend.including_replicas::<flotilla_resources::Artifact>(&namespace_string))
                         .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
-                        .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
                         .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(
                             backend.clone(),
                             &namespace_string,
@@ -1047,9 +926,17 @@ fn spawn_controller_loops(
             }
         }),
     ];
+    controllers.extend(spawn_environment_controller(&state, provisioning));
+    controllers.extend(spawn_clone_controller(&state, provisioning));
+    let checkout = spawn_checkout_controller(&state, provisioning, &mut controllers);
+    controllers.extend(checkout);
+    let terminal = spawn_terminal_controller(&state, provisioning, &mut controllers);
+    controllers.extend(terminal);
+    let vessel = spawn_vessel_controller(&state, provisioning, &mut controllers);
+    controllers.extend(vessel);
     if let Some(distributor) = &state.image_inventory {
         let distributor = Arc::clone(distributor);
-        controllers.push(tokio::spawn(async move {
+        controllers.push(tokio::spawn(attributed(caller("image inventory"), async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
@@ -1057,104 +944,19 @@ fn spawn_controller_loops(
                     tracing::warn!(%reason, "image availability refresh failed");
                 }
             }
-        }));
+        })));
     }
-    // Every host collects retired ImageBuild records; hosts with a build
-    // service also execute the builds placed on them.
-    if let Some(credentials) = state.credential_store.clone() {
-        let blobs: Arc<dyn crate::blob_store::BlobStore> = match state.blob_store.clone() {
-            Some(blobs) => blobs,
-            None => Arc::new(crate::blob_store::LocalBlobStore::new(state.config.state_dir().as_path())),
-        };
-        let materials: Arc<dyn flotilla_provisioning::reconcilers::ImageBuildMaterials> =
-            Arc::new(crate::image_build::DaemonImageBuildMaterials {
-                credentials,
-                blobs,
-                backend: backend.clone(),
-                namespace: namespace_string.clone(),
-                host: state.local_host_ref.clone(),
-                secrets: image_builder_directory(state.config.state_dir().as_path()).join("secrets"),
-            });
-        let service = state.image_build_service.clone();
-        let host = state.local_host_ref.clone();
-        let probe_wrapper: Arc<str> = flotilla_agent::process::with_preludes("exec \"$@\"").into();
-        let image_build_reads = state.daemon.lifecycle_reads();
-        let image_build_lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.image_builds));
-        controllers.push(controller!(flotilla_resources::ImageBuild, {
-            move |backend: ResourceBackend, namespace_string: String| {
-                (
-                    vec![],
-                    Engine::<_, ImageBuildBinding>::new(
-                        flotilla_provisioning::reconcilers::ImageBuildReconciler::new(
-                            service.clone(),
-                            Arc::clone(&materials),
-                            &backend,
-                            &namespace_string,
-                            &host,
-                            &probe_wrapper,
-                        )
-                        .with_lifecycle_reads(Arc::clone(&image_build_reads)),
-                        image_build_lifecycles.clone(),
-                    ),
-                )
-            }
-        }));
-    } else {
-        warn!("no credential store; image builds placed on this host will not run");
-    }
-    // Builders mirror replicated per-identity ImageBuild demand into their own
-    // store, and withdraw copies whose demand was deleted.
-    {
-        let projection_backend = backend.clone();
-        let projection_namespace = namespace_string.clone();
-        let projection_host = state.local_host_ref.clone();
-        let projection_supervision = supervision.clone();
-        let projection_health = runtime_health.clone();
-        controllers.push(tokio::spawn(async move {
-            supervise_controller("image_build_placement", projection_supervision, projection_health, move || {
-                let backend = projection_backend.clone();
-                let namespace = projection_namespace.clone();
-                let host = projection_host.clone();
-                async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(1));
-                    loop {
-                        interval.tick().await;
-                        crate::image_build::project_builds(&backend, &namespace, &host).await?;
-                    }
-                    #[allow(unreachable_code)]
-                    Ok(())
-                }
-            })
-            .await;
-        }));
-    }
-    // The old Message controller runs only while Message is in the old store
-    // (#3317); behind `[primitives]` the engine path's delivery adapter takes over.
-    if state.daemon.message_primitives().is_none() {
-        controllers.push({
-            let state = Arc::clone(&state);
-            let health = runtime_health.clone();
-            spawn_resource_controller::<flotilla_resources::Message, _, _>(
-                backend.clone(),
-                namespace_string.clone(),
-                supervision.clone(),
-                runtime_health.clone(),
-                move |_backend, namespace| {
-                    let controller = MessageController { state: Arc::clone(&state), namespace };
-                    let heartbeat = Arc::new(AtomicU64::new(0));
-                    let health = health.clone();
-                    let metrics = state.controller_metrics.for_kind("Message");
-                    async move {
-                        let watchdog =
-                            spawn_controller_loop_watchdog("Message", Arc::clone(&heartbeat), controller_resync_interval, health.clone());
-                        let result = controller.run(controller_resync_interval, heartbeat, metrics).await;
-                        watchdog.abort();
-                        health.clear_controller_loop_stall("Message");
-                        result
-                    }
-                },
-            )
-        });
+    controllers.extend(spawn_image_build_controller(&state, provisioning));
+    // Message delivery is the engine path's adapter (#3317, #3108); the runtime opens that path at
+    // startup, before any controller runs.
+    match state.daemon.message_primitives() {
+        Some(primitives) => {
+            let delivery =
+                self::primitives::MessageDelivery::new(Arc::clone(&state), primitives, namespace_string.clone(), runtime_health.clone());
+            let metrics = state.controller_metrics.for_kind("Message");
+            controllers.push(tokio::spawn(attributed(Arc::clone(&metrics.reads), delivery.run(metrics))));
+        }
+        None => tracing::warn!(namespace = %namespace_string, "the Message path is not open; nothing delivers messages"),
     }
     // #3907, #3929: bindings per convoy on its home, provisions per place.
     controllers.push(controller!(Convoy, "AccountBinding", {
@@ -1169,7 +971,7 @@ fn spawn_controller_loops(
             namespace_string.clone(),
             supervision.clone(),
             runtime_health.clone(),
-            move |_backend, namespace| account_access::run_provision_controller(Arc::clone(&state), namespace, controller_resync_interval),
+            move |_backend, namespace| account_access::run_provision_controller(Arc::clone(&state), namespace),
         )
     });
     // #3964: each access's delivery status, removed with its place or convoy.
@@ -1180,15 +982,9 @@ fn spawn_controller_loops(
     controllers
 }
 
-/// The decided store's kinds behind `[primitives]`: Message and AgentSession
-/// (#3317), the provisioning lifecycle kinds and TerminalSession, the account
-/// kinds (#3824 layer 1), and the engine's Vessel and Ensure (#3629), each
-/// under its production code.
+/// The decided store's kinds ([`flotilla_core::in_process::decided::registry`]).
 pub(crate) fn decided_registry() -> Result<flotilla_schema::KindRegistry, flotilla_schema::RegistryError> {
-    let mut registry = flotilla_engine_store::registry()?;
-    flotilla_provisioning::stored::register(&mut registry)?;
-    flotilla_engine_store::register_crew(&mut registry)?;
-    Ok(registry)
+    flotilla_core::in_process::decided::registry()
 }
 
 /// The native verbs, each registered by the crate performing its effect (#4267 ruling 1), and
@@ -1207,10 +1003,7 @@ pub(crate) fn verb_registry(
 
 /// The machine diagram of each kind in [`decided_registry`], by kind name.
 pub(crate) fn decided_diagrams() -> Result<std::collections::BTreeMap<String, String>, flotilla_schema::RegistryError> {
-    let mut diagrams = flotilla_engine_store::machine_registry()?.diagrams;
-    diagrams.extend(flotilla_provisioning::stored::diagrams());
-    diagrams.extend(flotilla_engine_store::crew_diagrams());
-    Ok(diagrams)
+    flotilla_core::in_process::decided::diagrams()
 }
 
 #[cfg(test)]
@@ -1222,7 +1015,7 @@ mod decided_kinds_tests {
     fn the_decided_store_holds_the_provisioning_kinds_with_their_diagrams() {
         let registry = super::decided_registry().expect("no code is held twice");
         let kinds: Vec<&str> = registry.iter().map(|set| set.kind.as_str()).collect();
-        for kind in ["Message", "AgentSession", "Environment", "ImageBuild", "Clone", "Checkout", "TerminalSession", "Vessel", "Ensure"] {
+        for kind in ["Message", "AgentSession", "Environment", "ImageBuild", "Clone", "Checkout", "TerminalSession", "Vessel"] {
             assert!(kinds.contains(&kind), "{kind} in {kinds:?}");
         }
         assert!(kinds.contains(&"AccountBinding") && kinds.contains(&"AccountProvision"), "{kinds:?}");
@@ -1235,38 +1028,29 @@ mod decided_kinds_tests {
     }
 }
 
-/// Opens the engine path behind `[primitives]` (#3317): the decided store, filled from the old
-/// store at its first start ([`crate::engine_import::first_start`]),
-/// with the [`decided_registry`] kinds, homed at this daemon's node id, and the
-/// Message path over it. Installed before peer tasks start, so every peer's
-/// log is followed from the first connection.
-async fn open_message_primitives(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<(), String> {
-    let state_dir = config.state_dir().as_path().to_path_buf();
-    let path = state_dir.join(crate::engine_import::ENGINE_STORE);
-    let home = daemon.node_id().as_str().to_owned();
-    // Before this daemon serves or connects to a peer, so an importing host neither sends nor receives records.
-    let importing = home.clone();
-    let own_host = daemon.local_host_id().map(|host| host.to_string());
-    tokio::task::spawn_blocking(move || crate::engine_import::first_start(&state_dir, &importing, own_host.as_deref()))
-        .await
-        .map_err(|error| error.to_string())??;
-    let registry = decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
-    let service = Arc::new(
-        flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)
-            .map_err(|error| format!("open decided store {}: {error}", path.display()))?,
-    );
-    daemon.install_decided_store(Arc::clone(&service))?;
-    let primitives = retry_phase("restore_message_primitives", || async {
-        let backend = daemon.resource_backend();
-        let clock = daemon.clock_for_scenarios();
-        let home = home.clone();
-        let service = Arc::clone(&service);
-        tokio::task::spawn_blocking(move || flotilla_core::primitives::MessagePrimitives::open(&home, service, backend, clock))
+/// The decided store's opener (#3108), for the composition root to pass to
+/// [`InProcessDaemon::new_composed`]. Once the daemon's identity is resolved it fills the store
+/// from the old one at its first start ([`crate::engine_import::first_start`]), before this
+/// daemon serves or connects to a peer, so an importing host neither sends nor receives records;
+/// then it opens the store ([`flotilla_core::in_process::decided::open`]).
+pub fn engine_opener(config: &ConfigStore) -> flotilla_core::in_process::EngineOpener {
+    flotilla_core::in_process::decided::opener_with(
+        config.state_dir().as_path(),
+        Box::new(|state_dir, home, own_host| crate::engine_import::first_start(state_dir, home, Some(own_host)).map(|_| ())),
+    )
+}
+
+/// Opens the Message path over the decided store composed with the daemon (#3317). Installed
+/// before peer tasks start, so every peer's log is followed from the first connection.
+pub(crate) async fn open_message_primitives(daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
+    result_phase("restore_message_primitives", async {
+        let daemon = Arc::clone(daemon);
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || daemon.open_message_primitives()))
             .await
             .map_err(|error| error.to_string())?
     })
-    .await?;
-    daemon.install_message_primitives(Arc::new(primitives))
+    .await
+    .map(|_| ())
 }
 
 /// The archive shipper over the decided store (#3939), uploading to every configured fleet blob
@@ -1275,7 +1059,7 @@ fn archive_shipper(
     daemon: &Arc<InProcessDaemon>,
     stores: &[flotilla_config::BlobStoreConfig],
     health: &RuntimeHealth,
-) -> Result<Option<archive::ArchiveShipper>, String> {
+) -> Result<Option<(archive::ArchiveShipper, Arc<flotilla_schema_sqlite::stream::Service>)>, String> {
     let Ok(decided) = daemon.decided_store() else { return Ok(None) };
     if stores.is_empty() {
         info!("no [[blob_stores]] configured: ended engine resources stay local");
@@ -1283,178 +1067,438 @@ fn archive_shipper(
     }
     let targets = archive::targets(stores)?;
     let health = health.clone();
-    Ok(Some(archive::ArchiveShipper::new(
+    let shipper = archive::ArchiveShipper::new(
         decided.store(),
         archive::archive_kinds(),
         targets,
         daemon.clock_for_scenarios(),
         Arc::new(move |condition| health.report_archive(condition)),
-    )))
+    );
+    Ok(Some((shipper, decided)))
 }
 
-/// The provisioning kinds' engine homes over the decided store (#3629 layer 3), each restored
-/// with the resources this home holds.
-async fn open_provisioning_lifecycles(
-    daemon: &Arc<InProcessDaemon>,
-) -> Result<flotilla_provisioning::engine::ProvisioningLifecycles, String> {
-    use flotilla_engine_store::{open_home, StoreLog};
-    use flotilla_provisioning::engine::{reads::StoreReads, vessel::PlacementLifecycles, LifecycleHome, ProvisioningLifecycles};
-    let store = daemon.decided_store()?.store();
-    let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
-    daemon.install_lifecycle_reads(Arc::new(flotilla_provisioning::engine::reads::LifecycleReadPort::new(
-        StoreReads::new(Arc::clone(&store)),
+/// `work` with its engine reads counted for `caller` in this daemon's controller metrics.
+fn counted<F: std::future::Future>(state: &ControllerRuntimeState, caller: &str, work: F) -> Attributed<F> {
+    attributed(Arc::clone(&state.controller_metrics.for_kind(caller).reads), work)
+}
+
+/// The Environment controller (#3108): the single writer of this home's environment launches,
+/// realising them through the host's providers and told by its probes what became of them.
+fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
+    use flotilla_provisioning::engine::{controller::Controller, environment_actuator::EnvironmentActuator, reads::StoreReads};
+    let mut observed = state.environment_backing_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
+    // The probes report without waiting on the controller, which starts after startup adoption
+    // has judged every backing; the controller takes their reports in order from here.
+    let (backing, backings) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        while let Some(event) = observed.recv().await {
+            if backing.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    let service = match state.daemon.decided_store() {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "the Environment controller has no decided store; environments will not launch");
+            return None;
+        }
+    };
+    let home = service.home().to_owned();
+    let actuator = EnvironmentActuator::new(
+        Arc::new(DockerControllerRuntime { state: Arc::clone(state) }),
+        StoreReads::new(service.store()),
         home,
-    )))?;
-    daemon.install_vessel_seats(Arc::new(EngineVesselSeats {
-        reads: StoreReads::new(Arc::clone(&store)),
-        backend: daemon.resource_backend(),
-    }))?;
-    // #3824 layer 1: the account kinds on the engine, installed before their controllers start.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let accounts = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::account::EngineAccounts::open(service, clock))
-        .await
-        .map_err(|error| error.to_string())??;
-    daemon.install_account_records(Arc::new(accounts))?;
-    // #3824 layer 2c: ManifestRoot on the engine, installed before the manifest reconciler starts.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let roots =
-        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::manifest_root::EngineManifestRoots::open(service, clock))
-            .await
-            .map_err(|error| error.to_string())??;
-    daemon.install_manifest_roots(Arc::new(roots))?;
-    // #3824 layer 2b-ii: the definition kinds on the engine, installed on the daemon's backend so
-    // every definition read and write reaches them.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let definitions =
-        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::definitions::EngineDefinitions::open(service, clock))
-            .await
-            .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(definitions));
-    // #3824 layer 3a: Repository likewise.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let repositories =
-        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::repositories::EngineRepositories::open(service, clock))
-            .await
-            .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(repositories));
-    // #3824 layer 3b: Project, with project operations' record and the dispatch queue's judgement.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let projects = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::projects::EngineProjects::open(service, clock))
-        .await
-        .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(projects));
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let artifacts = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::artifacts::EngineArtifacts::open(service, clock))
-        .await
-        .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(artifacts));
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let access_deliveries =
-        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::access_deliveries::EngineAccessDeliveries::open(service, clock))
-            .await
-            .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(access_deliveries));
-    // ChangeRequest and Issue: written by their source's observer, read at every home.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let observations =
-        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::observations::EngineObservations::open(service, clock))
-            .await
-            .map_err(|error| error.to_string())??;
-    let observations = Arc::new(observations);
-    daemon.install_observation_records(observations.clone(), observations)?;
-    // FulfilmentKind, which admission and the vessel reconciler read and admission's snapshots write.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let kinds = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::kinds::EngineKinds::open(service, clock))
-        .await
-        .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(kinds));
-    // Host, which every placement reads and this daemon's observers write only on change.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let own_host = daemon.local_host_id().ok_or("the engine's Hosts need this daemon's host id")?.to_string();
-    let hosts = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::hosts::EngineHosts::open(service, own_host, clock))
-        .await
-        .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(hosts));
-    let backend = daemon.resource_backend();
-    tokio::task::spawn_blocking(move || {
-        let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
-        let log = || StoreLog::new(Arc::clone(&store));
-        let terminal_sessions = Arc::new(LifecycleHome::new(&home, open_home(log())?));
-        backend.install_terminal_launches(Arc::new(flotilla_provisioning::engine::terminal_session::EngineTerminalLaunches {
-            lifecycles: terminal_sessions.clone(),
-        }));
-        Ok(ProvisioningLifecycles {
-            environments: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
-            image_builds: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
-            clones: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
-            checkouts: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
-            terminal_sessions,
-            vessels: Arc::new(PlacementLifecycles::new(&home, open_home(log())?)?),
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())?
+        engine.environment_facts.clone(),
+        Arc::new(VesselLaunchEnvironment { backend: state.daemon.resource_backend(), namespace: state.namespace.clone() }),
+    );
+    match Controller::start(Arc::clone(&engine.environments), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
+        Ok(controller) => Some(tokio::spawn(counted(state, "engine Environment", controller.run(backings)))),
+        Err(error) => {
+            error!(%error, "the Environment controller could not start; environments will not launch");
+            None
+        }
+    }
 }
 
-/// Which seats a vessel serves (#3629 layer 8): its sessions by their vessel label, with each role
-/// the engine holds a launch for (`terminal_session.by_holder`, the vessel as holder) served by
-/// that launch's old session record instead. During the switch a vessel can hold launches the
-/// engine decided beside sessions only the old store knows (from before the switch, or homed
-/// elsewhere), so the labels are the base and the engine overlays them; an engine launch whose
-/// record is gone leaves the labels' answer.
-struct EngineVesselSeats {
-    reads: flotilla_provisioning::engine::reads::StoreReads,
+/// The Clone controller (#3108): the single writer of this home's clone launches, cloning each
+/// repository once into its environment. A clone that cannot reach its remote waits for this
+/// host's probe (`remotes`) to reach it again.
+fn spawn_clone_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
+    use flotilla_provisioning::engine::{clone_actuator::CloneActuator, controller::Controller, reads::StoreReads};
+    let service = match state.daemon.decided_store() {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "the Clone controller has no decided store; clones will not launch");
+            return None;
+        }
+    };
+    let home = service.home().to_owned();
+    let actuator = CloneActuator::new(
+        Arc::new(RoutingCloneRuntime { state: Arc::clone(state) }),
+        StoreReads::new(service.store()),
+        home,
+        engine.clone_facts.clone(),
+        Arc::clone(&state.remote_reachability) as _,
+    );
+    match Controller::start(Arc::clone(&engine.clones), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
+        Ok(controller) => Some(tokio::spawn(counted(state, "engine Clone", async move {
+            // No probe observes a clone's backing: what it waits on is in the log.
+            let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
+            controller.run(backings).await
+        }))),
+        Err(error) => {
+            error!(%error, "the Clone controller could not start; clones will not launch");
+            None
+        }
+    }
+}
+
+/// The ImageBuild controller and launcher (#3108, ADR 0062): on a host with a build service and a
+/// credential store, the launcher launches each build any home demands of this host, and the
+/// controller is the single writer of those launches, building each through the build service.
+/// Elsewhere nothing builds here.
+fn spawn_image_build_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Vec<JoinHandle<()>> {
+    use flotilla_provisioning::engine::{
+        controller::Controller, image_build_actuator::ImageBuildActuator, image_builds::ImageBuildLauncher,
+    };
+    let (Some(build_service), Some(credentials)) = (state.image_build_service.clone(), state.credential_store.clone()) else {
+        if state.image_build_service.is_some() {
+            warn!("no credential store; image builds demanded of this host will not run");
+        }
+        return Vec::new();
+    };
+    let service = match state.daemon.decided_store() {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "the ImageBuild controller has no decided store; image builds will not run");
+            return Vec::new();
+        }
+    };
+    let blobs: Arc<dyn crate::blob_store::BlobStore> = match state.blob_store.clone() {
+        Some(blobs) => blobs,
+        None => Arc::new(crate::blob_store::LocalBlobStore::new(state.config.state_dir().as_path())),
+    };
+    let materials = Arc::new(crate::image_build::DaemonImageBuildMaterials {
+        credentials,
+        blobs,
+        backend: state.daemon.resource_backend(),
+        namespace: state.namespace.clone(),
+        host: state.local_host_ref.clone(),
+        secrets: image_builder_directory(state.config.state_dir().as_path()).join("secrets"),
+    });
+    let probe_wrapper: Arc<str> = flotilla_agent::process::with_preludes("exec \"$@\"").into();
+    let host = state.local_host_ref.clone();
+    let actuator = ImageBuildActuator::new(build_service, materials, Arc::clone(&service), host.clone(), probe_wrapper);
+    let launcher = match ImageBuildLauncher::start(Arc::clone(&engine.image_builds), Arc::clone(&service), &host) {
+        Ok(launcher) => launcher,
+        Err(error) => {
+            error!(%error, "the image build launcher could not start; image builds will not run");
+            return Vec::new();
+        }
+    };
+    match Controller::start(Arc::clone(&engine.image_builds), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
+        Ok(controller) => vec![
+            tokio::spawn(counted(state, "engine ImageBuild launcher", launcher.run())),
+            tokio::spawn(counted(state, "engine ImageBuild", async move {
+                // No probe observes a build's backing: the image stays in its cache.
+                let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
+                controller.run(backings).await
+            })),
+        ],
+        Err(error) => {
+            error!(%error, "the ImageBuild controller could not start; image builds will not run");
+            Vec::new()
+        }
+    }
+}
+
+/// The TerminalSession controller (#3108): the single writer of this home's terminal launches,
+/// starting each in its environment's terminal pool and killing it once its holder has ended. This
+/// host's probe looks at the running launches at an interval, pushing each one it finds ended.
+fn spawn_terminal_controller(
+    state: &Arc<ControllerRuntimeState>,
+    engine: &ProvisioningLifecycles,
+    tasks: &mut Vec<JoinHandle<()>>,
+) -> Option<JoinHandle<()>> {
+    use flotilla_provisioning::engine::{
+        controller::Controller,
+        reads::StoreReads,
+        terminal_actuator::{TerminalActuator, TerminalProbe, TERMINAL_PROBE_EVERY},
+    };
+    let service = match state.daemon.decided_store() {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "the TerminalSession controller has no decided store; terminal sessions will not launch");
+            return None;
+        }
+    };
+    let home = service.home().to_owned();
+    let provider = Arc::new(TerminalControllerRuntime { state: Arc::clone(state) });
+    let records = Arc::clone(&engine.terminal_records) as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>;
+    let actuator = TerminalActuator::new(
+        Arc::clone(&provider),
+        Arc::clone(&records),
+        StoreReads::new(service.store()),
+        home,
+        engine.terminal_facts.clone(),
+    );
+    let briefs = actuator.awaited_briefs();
+    match Controller::start(Arc::clone(&engine.terminal_sessions), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
+        Ok(controller) => {
+            let (backings, backing_events) = tokio::sync::mpsc::channel(64);
+            let (rechecks, recheck_events) = tokio::sync::mpsc::channel(64);
+            let probe =
+                TerminalProbe::new(provider, records, backings).with_progress(state.daemon.crew_progress()).with_briefs(briefs, rechecks);
+            tasks.push(tokio::spawn(attributed(caller("TerminalProbe"), probe.run(TERMINAL_PROBE_EVERY))));
+            Some(tokio::spawn(counted(state, "engine TerminalSession", controller.run_with(backing_events, recheck_events))))
+        }
+        Err(error) => {
+            error!(%error, "the TerminalSession controller could not start; terminal sessions will not launch");
+            None
+        }
+    }
+}
+
+/// The Checkout controller's work in this host's environments. A released checkout is judged
+/// landed against the replicated observation of its change request.
+fn checkout_routing(state: &Arc<ControllerRuntimeState>) -> RoutingCheckoutRuntime {
+    let change_requests = ChangeRequestObservations::new(state.daemon.resource_backend(), &state.namespace);
+    RoutingCheckoutRuntime { state: Arc::clone(state), change_requests: Some(change_requests) }
+}
+
+/// The Checkout controller (#3108): the single writer of this home's checkout launches, making
+/// each in its environment for its holder Convoy and removing it once that convoy has ended. The
+/// observed-checkout refresh names the launches whose paths it saw change, and each is observed
+/// again: one still there has its registration protected again, one gone is recorded lost.
+fn spawn_checkout_controller(
+    state: &Arc<ControllerRuntimeState>,
+    engine: &ProvisioningLifecycles,
+    tasks: &mut Vec<JoinHandle<()>>,
+) -> Option<JoinHandle<()>> {
+    use flotilla_provisioning::engine::{checkout_actuator::CheckoutActuator, controller::Controller, reads::StoreReads};
+    let rechecks = state.checkout_recheck_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
+    let service = match state.daemon.decided_store() {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "the Checkout controller has no decided store; checkouts will not launch");
+            return None;
+        }
+    };
+    let home = service.home().to_owned();
+    let routing = checkout_routing(state);
+    let actuator = CheckoutActuator::new(
+        Arc::new(checkouts::EngineCheckoutProvider { routing }),
+        Arc::new(checkouts::ConvoyHolderInputs {
+            daemon: Arc::clone(&state.daemon),
+            backend: state.daemon.resource_backend(),
+            namespace: state.namespace.clone(),
+            lifecycle_reads: state.daemon.lifecycle_reads(),
+        }),
+        Arc::clone(&engine.checkout_records) as _,
+        StoreReads::new(service.store()),
+        home,
+        engine.checkout_facts.clone(),
+    )
+    .with_branch_validation(Arc::new(checkouts::ForgeBranchValidation { daemon: Arc::clone(&state.daemon) }));
+    // A held checkout is told to a person; one they rule archived reaches the controller as a
+    // recheck carrying the ruling.
+    state.daemon.checkout_rechecks().wake_with(state.checkout_rechecks.clone());
+    let holds = checkouts::AttentionHolds { daemon: Arc::clone(&state.daemon), namespace: state.namespace.clone() };
+    let actuator = Arc::new(actuator.with_holds(Arc::new(holds)));
+    // This host's checkout inspector answers gates' inspection requests through the same
+    // actuator, so an inspection is recorded as the controller records it.
+    match state.daemon.message_primitives() {
+        Some(primitives) => {
+            let inspector = Arc::new(checkouts::CheckoutInspector { inspection: Arc::clone(&actuator) as _ });
+            let inspection = role_consumer::serve_role(Arc::clone(&primitives), inspector);
+            tasks.push(tokio::spawn(attributed(caller("checkout inspector"), inspection)));
+            // Branch validation asks this host's forge observer to look its branch up.
+            let observer = Arc::new(checkouts::ForgeObserver { daemon: Arc::clone(&state.daemon) });
+            tasks.push(tokio::spawn(attributed(caller("forge observer"), role_consumer::serve_role(primitives, observer))));
+        }
+        None => error!("the checkout inspector and forge observer have no Message path; requests to them here go unanswered"),
+    }
+    tasks.push(tokio::spawn(attributed(caller("checkout rechecks"), checkouts::recheck_on_discovered_refresh(Arc::clone(state)))));
+    match Controller::start(Arc::clone(&engine.checkouts), actuator, state.daemon.clock_for_scenarios(), service) {
+        Ok(controller) => Some(tokio::spawn(counted(state, "engine Checkout", async move {
+            // A checkout's backing is observed at a recheck, not pushed.
+            let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
+            controller.run_with(backings, rechecks).await
+        }))),
+        Err(error) => {
+            error!(%error, "the Checkout controller could not start; checkouts will not launch");
+            None
+        }
+    }
+}
+
+/// This home's vessel planner over `backend` in `namespace`.
+fn vessel_planning(state: &Arc<ControllerRuntimeState>, backend: &ResourceBackend, namespace: &str) -> VesselPlanning {
+    VesselPlanning::new_with_config_dir(
+        backend.clone(),
+        namespace,
+        state.daemon.account_records(),
+        state.config.base_path().as_path().to_path_buf(),
+    )
+    .with_lifecycle_reads(state.daemon.lifecycle_reads())
+    .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(state), change_requests: None }))
+    .with_federated_dependencies(backend, CanonicalHostId::resolved(state.local_host_ref.clone()))
+    .with_additional_host_refs(state.ssh_host_refs())
+}
+
+/// The Vessel controller (#3108): the single writer of this home's vessel launches, realising each
+/// in its environment once what its planner requests for it is realised. Its holdings' commits
+/// wake it; its convoy's, its crews' bindings' and its seats' changes are told as rechecks.
+fn spawn_vessel_controller(
+    state: &Arc<ControllerRuntimeState>,
+    engine: &ProvisioningLifecycles,
+    tasks: &mut Vec<JoinHandle<()>>,
+) -> Option<JoinHandle<()>> {
+    use flotilla_provisioning::engine::{controller::Controller, vessel_actuator::VesselActuator};
+    let rechecks = state.vessel_recheck_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
+    let service = match state.daemon.decided_store() {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "the Vessel controller has no decided store; vessels will not launch");
+            return None;
+        }
+    };
+    let backend = state.daemon.resource_backend();
+    let planning = Arc::new(vessel_planning(state, &backend, &state.namespace));
+    tasks.push(tokio::spawn(attributed(
+        caller("ConvoyVesselWake"),
+        ConvoyVesselWake::new(
+            &backend,
+            &state.namespace,
+            state.daemon.lifecycle_reads(),
+            state.daemon.convoy_engine_path(),
+            state.daemon.account_records(),
+        )
+        .recheck(state.namespace.clone(), state.vessel_rechecks.clone()),
+    )));
+    let actuator = Arc::new(VesselActuator::new(planning));
+    match Controller::start(Arc::clone(&engine.vessels), actuator, state.daemon.clock_for_scenarios(), service) {
+        Ok(controller) => Some(tokio::spawn(counted(state, "engine Vessel", async move {
+            // No probe observes a vessel: its holdings' commits and its rechecks look at it.
+            let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
+            controller.run_with(backings, rechecks).await
+        }))),
+        Err(error) => {
+            error!(%error, "the Vessel controller could not start; vessels will not launch");
+            None
+        }
+    }
+}
+
+/// The env each vessel's environment is launched with beyond its stored recipe: its crews' skills
+/// and credential grants, from its convoy's frozen requirement.
+struct VesselLaunchEnvironment {
     backend: ResourceBackend,
+    namespace: String,
 }
 
 #[async_trait::async_trait]
-impl flotilla_resources::vessel_seats::VesselSeats for EngineVesselSeats {
-    async fn seats(
-        &self,
-        namespace: &str,
-        vessel_ref: &str,
-    ) -> Result<std::collections::BTreeMap<String, flotilla_resources::ReadResourceObject<flotilla_resources::TerminalSession>>, String>
-    {
-        use flotilla_provisioning::{
-            engine::{launched, reads::ProvisioningReads},
-            stored::Holder,
-        };
-        let sessions = self.backend.including_replicas::<flotilla_resources::TerminalSession>(namespace);
-        let labelled = sessions
-            .list_matching_labels(&std::collections::BTreeMap::from([(
-                flotilla_resources::VESSEL_REF_LABEL.to_string(),
-                vessel_ref.to_owned(),
-            )]))
-            .await
-            .map_err(|error| error.to_string())?
-            .items;
-        let views = self.reads.held_sessions(&Holder::vessel(vessel_ref)).map_err(|error| error.to_string())?;
-        let mut names: Vec<String> = views.iter().map(|view| launched(&view.name).to_owned()).collect();
-        names.sort();
-        names.dedup();
-        let mut seats: std::collections::BTreeMap<_, _> =
-            labelled.into_iter().map(|session| (session.object.spec.role.clone(), session)).collect();
-        for name in names {
-            match sessions.get(&name).await {
-                Ok(session) => {
-                    seats.insert(session.object.spec.role.clone(), session);
-                }
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        Ok(seats)
+impl flotilla_provisioning::engine::environment_actuator::LaunchEnvironment for VesselLaunchEnvironment {
+    async fn launch_env(&self, vessel: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
+        flotilla_crew::reconcilers::vessel::vessel_launch_env(&self.backend, &self.namespace, vessel).await
     }
+}
+
+/// The provisioning kinds' engine homes over the decided store (#3629 layer 3), each restored
+/// with the resources this home holds, and the task that tells environment readers (the
+/// aggregator) what changed among the environments, written here or replicated.
+async fn open_provisioning_lifecycles(
+    daemon: &Arc<InProcessDaemon>,
+) -> Result<(flotilla_provisioning::engine::ProvisioningLifecycles, Vec<JoinHandle<()>>), String> {
+    use flotilla_engine_store::{open_home, open_home_with, StoreLog};
+    use flotilla_provisioning::engine::{
+        checkouts::EngineCheckouts,
+        clones::EngineClones,
+        environments::EngineEnvironments,
+        image_builds::EngineImageBuilds,
+        launch_log::{LaunchLog, StagedFacts},
+        reads::{LifecycleReadPort, StoreReads},
+        terminals::EngineTerminals,
+        vessel::{EngineVessels, PlacementLifecycles},
+        LifecycleHome, ProvisioningLifecycles,
+    };
+    let store = daemon.decided_store()?.store();
+    let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
+    let opened = Arc::clone(&store);
+    let service = daemon.decided_store()?;
+    let lifecycles = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+        let store = opened;
+        let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
+        let log = || StoreLog::new(Arc::clone(&store));
+        // An environment's launch facts are written in the transaction that realises it.
+        let environment_facts = StagedFacts::default();
+        // A clone's facts (the remote's default branch) are written in the transaction that realises it.
+        let clone_facts = StagedFacts::default();
+        // A checkout's facts are written in the transaction that realises it, and each launch is
+        // created under the holder Convoy the port read for it.
+        let checkout_facts = StagedFacts::default();
+        let checkout_inputs = StagedFacts::default();
+        let checkouts: Arc<dyn flotilla_provisioning::engine::Lifecycles<_>> = Arc::new(LifecycleHome::new(
+            &home,
+            open_home_with(&log(), LaunchLog::new(log(), checkout_facts.clone()).with_inputs(checkout_inputs.clone()))?,
+        ));
+        let followed = Arc::clone(&service);
+        let checkout_records =
+            Arc::new(EngineCheckouts::new(Arc::clone(&checkouts), Arc::clone(&store), checkout_inputs, move || followed.homes()));
+        // A terminal launch's facts are written in the transaction that realises it.
+        let terminal_facts = StagedFacts::default();
+        let terminal_sessions: Arc<dyn flotilla_provisioning::engine::Lifecycles<_>> =
+            Arc::new(LifecycleHome::new(&home, open_home_with(&log(), LaunchLog::new(log(), terminal_facts.clone()))?));
+        let terminal_records = Arc::new(EngineTerminals::over(Arc::clone(&terminal_sessions), Arc::clone(&service)));
+        let image_builds: Arc<dyn flotilla_provisioning::engine::Lifecycles<_>> = Arc::new(LifecycleHome::new(&home, open_home(log())?));
+        let image_build_records = Arc::new(EngineImageBuilds::over(Arc::clone(&image_builds), service));
+        Ok::<_, String>(ProvisioningLifecycles {
+            environments: Arc::new(LifecycleHome::new(&home, open_home_with(&log(), LaunchLog::new(log(), environment_facts.clone()))?)),
+            environment_facts,
+            image_builds,
+            image_build_records,
+            clones: Arc::new(LifecycleHome::new(&home, open_home_with(&log(), LaunchLog::new(log(), clone_facts.clone()))?)),
+            clone_facts,
+            checkouts,
+            checkout_facts,
+            checkout_records,
+            terminal_sessions,
+            terminal_facts,
+            terminal_records,
+            vessels: Arc::new(PlacementLifecycles::new(&home, open_home(log())?)?),
+        })
+    }))
+    .await
+    .map_err(|error| error.to_string())??;
+    // Every environment reader and requester goes through the engine's environments.
+    let environments = Arc::new(EngineEnvironments::over(Arc::clone(&lifecycles.environments), daemon.decided_store()?));
+    let environment_changes = environments.follow(daemon.decided_store()?)?;
+    // Every clone reader and requester goes through the engine's clones.
+    let clones = Arc::new(EngineClones::over(Arc::clone(&lifecycles.clones) as _, daemon.decided_store()?));
+    let clone_changes = clones.follow(daemon.decided_store()?)?;
+    // Every checkout reader and requester goes through the engine's checkouts.
+    let checkout_changes = lifecycles.checkout_records.follow(daemon.decided_store()?)?;
+    // Every terminal-session reader and requester goes through the engine's launches.
+    let terminals = Arc::clone(&lifecycles.terminal_records);
+    let terminal_changes = terminals.follow(daemon.decided_store()?)?;
+    // Every vessel reader goes through the engine's launches; this home's are written only here.
+    let vessels = Arc::new(EngineVessels::over(Arc::clone(&lifecycles.vessels), daemon.decided_store()?));
+    let vessel_changes = vessels.follow(daemon.decided_store()?)?;
+    // Capability cards follow a build's launches: a built image's verified tools are on them.
+    let image_build_changes = lifecycles.image_build_records.follow(daemon.decided_store()?)?;
+    daemon.install_lifecycle_reads(Arc::new(
+        LifecycleReadPort::new(StoreReads::new(store), home)
+            .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>)
+            .with_clones(clones as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
+            .with_image_builds(
+                Arc::clone(&lifecycles.image_build_records) as Arc<dyn flotilla_resources::image_build_records::ImageBuildRecords>
+            )
+            .with_checkouts(Arc::clone(&lifecycles.checkout_records) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>)
+            .with_terminals(terminals as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>)
+            .with_vessels(vessels as Arc<dyn flotilla_resources::vessel_records::VesselRecords>),
+    ))?;
+    Ok((lifecycles, vec![environment_changes, clone_changes, checkout_changes, terminal_changes, vessel_changes, image_build_changes]))
 }
 
 /// Daemon-owned image build state: the owned builder's Buildx state, build

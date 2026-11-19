@@ -1,25 +1,26 @@
 //! Composition-root switch for the dummy fleet (#3206). A daemon whose
 //! `daemon.toml` has a `[dummy_fleet]` section installs the dummy providers
-//! into its discovery factories before the daemon is built, then attaches the
-//! fleet's crews to that daemon. Without the section neither step does anything.
+//! into its discovery factories before the daemon is built. Without the section
+//! nothing is installed. The fleet's crews reach the daemon as real crews do,
+//! through their vessels' forwards to its environment sockets.
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_config::{dummy_fleet::DummyFleetConfig, DaemonConfig};
-use flotilla_core::in_process::InProcessDaemon;
-use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::DiscoveryRuntime;
-use flotilla_dummy_fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet};
-use flotilla_protocol::{commands::CommandValue, CommandAction};
+use flotilla_dummy_fleet::DummyFleet;
 use flotilla_provisioning::reconcilers::ForgeDefaultBranchResolver;
-use flotilla_resources::TerminalAttentionState;
-use flotilla_store::ResourceBackend;
 use tracing::warn;
 
-/// Install the configured dummy fleet's factories, if any.
-pub fn install_dummy_fleet(config: &DaemonConfig, discovery: &mut DiscoveryRuntime) -> Option<Arc<DummyFleet>> {
-    let config = config.dummy_fleet.clone()?;
+/// Install the configured dummy fleet's factories, if any: the fleet whose state file is in
+/// `state_dir`, holding what it held when the previous daemon process ended.
+pub fn install_dummy_fleet(
+    config: &DaemonConfig,
+    state_dir: &Path,
+    discovery: &mut DiscoveryRuntime,
+) -> Result<Option<Arc<DummyFleet>>, String> {
+    let Some(config) = config.dummy_fleet.clone() else { return Ok(None) };
     warn!("dummy fleet enabled: dummy environments, crews, checkouts and change requests are installed for load testing");
     // The terminal runtime confirms a delivery after continuous work for this long.
     let confirmation = crate::runtime::DELIVERY_CONFIRMATION_STABLE_FOR + crate::runtime::DELIVERY_CONFIRMATION_POLL;
@@ -29,40 +30,23 @@ pub fn install_dummy_fleet(config: &DaemonConfig, discovery: &mut DiscoveryRunti
             "dummy crews idle before the terminal runtime confirms a delivery; their turns will be held as unconfirmed"
         );
     }
-    let fleet = DummyFleet::new(config);
+    let fleet = DummyFleet::open(config, state_dir)?;
     fleet.install(discovery);
-    Some(fleet)
+    Ok(Some(fleet))
 }
 
-/// Connect the fleet's crews to the daemon whose discovery installed it:
-/// their crew commands through its command path, and their attention reports
-/// through the same recording as harness hook events.
-pub fn attach_dummy_fleet(fleet: &DummyFleet, daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
-    fleet.attach(daemon_crew_port(daemon))
+/// The fleet as part of the daemon's process: a graceful stop stops its crews and writes out its
+/// state file before the runtime's tasks end.
+pub fn dummy_fleet_component(fleet: &Arc<DummyFleet>) -> Arc<dyn crate::runtime::ProcessComponent> {
+    Arc::new(FleetComponent(Arc::clone(fleet)))
 }
 
-/// The port [`attach_dummy_fleet`] attaches: `daemon`'s command path and its
-/// hook-attention recording. A harness that outlives one daemon, as a crew's
-/// process outlives a daemon restart, forwards to the current daemon's port.
-pub fn daemon_crew_port(daemon: &Arc<InProcessDaemon>) -> Arc<dyn CrewCommandPort> {
-    let handle = Arc::clone(daemon) as Arc<dyn DaemonHandle>;
-    Arc::new(DaemonCrewPort { commands: DaemonCommandPort::new(&handle), backend: daemon.resource_backend() })
-}
-
-struct DaemonCrewPort {
-    commands: Arc<DaemonCommandPort>,
-    backend: ResourceBackend,
-}
+struct FleetComponent(Arc<DummyFleet>);
 
 #[async_trait]
-impl CrewCommandPort for DaemonCrewPort {
-    async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
-        self.commands.execute(action).await
-    }
-
-    async fn report_attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
-        let state = if working { TerminalAttentionState::Working } else { TerminalAttentionState::Idle };
-        crate::agent_attention::observe_hook_attention(&self.backend, namespace, session, state, false).await
+impl crate::runtime::ProcessComponent for FleetComponent {
+    async fn stop(&self) {
+        self.0.shutdown().await;
     }
 }
 
@@ -109,12 +93,13 @@ mod tests {
         let mut discovery = DiscoveryRuntime::for_process();
         assert!(dummy_implementations(&discovery.factories).is_empty(), "default factories hold no dummies");
         let adapters = discovery.factories.agent_adapters.len();
-        assert!(install_dummy_fleet(&DaemonConfig::default(), &mut discovery).is_none());
+        let state = tempfile::tempdir().expect("state directory");
+        assert!(install_dummy_fleet(&DaemonConfig::default(), state.path(), &mut discovery).expect("install").is_none());
         assert!(dummy_implementations(&discovery.factories).is_empty(), "no section installs nothing");
         assert_eq!(discovery.factories.agent_adapters.len(), adapters);
 
         let config = DaemonConfig { dummy_fleet: Some(DummyFleetConfig::default()), ..DaemonConfig::default() };
-        assert!(install_dummy_fleet(&config, &mut discovery).is_some());
+        assert!(install_dummy_fleet(&config, state.path(), &mut discovery).expect("install").is_some());
         assert_eq!(dummy_implementations(&discovery.factories).len(), 4, "VCS, change requests, terminal pool, environment");
         assert_eq!(discovery.factories.agent_adapters.len(), adapters + 1);
     }

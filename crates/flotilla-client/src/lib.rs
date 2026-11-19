@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -74,11 +74,17 @@ impl SpawnLockGuard {
 /// Sends a `Hello` with `ConnectionRole::Client` and a fresh `session_id`,
 /// then waits for the server's Hello reply.
 async fn do_client_hello(session: &MessageSession) -> Result<Option<String>, String> {
-    do_client_hello_with_surface(session, None, WireGenerationPolicy::RequireMatch).await
+    do_client_hello_with_surface(session, None, WireGenerationPolicy::RequireMatch, process_crew_claims()).await
 }
 
 async fn do_client_hello_with_declared_surface(session: &MessageSession, surface: SurfaceDeclaration) -> Result<Option<String>, String> {
-    do_client_hello_with_surface(session, Some(surface), WireGenerationPolicy::RequireMatch).await
+    do_client_hello_with_surface(session, Some(surface), WireGenerationPolicy::RequireMatch, process_crew_claims()).await
+}
+
+/// This process's crew identity variables. Over a forwarded environment socket the daemon
+/// cannot read this process's environment, so a crew client states its identity in Hello.
+fn process_crew_claims() -> BTreeMap<String, String> {
+    flotilla_protocol::crew_claims_from(|key| std::env::var(key).ok())
 }
 
 #[derive(Clone, Copy)]
@@ -91,6 +97,7 @@ async fn do_client_hello_with_surface(
     session: &MessageSession,
     surface: Option<SurfaceDeclaration>,
     wire_generation_policy: WireGenerationPolicy,
+    crew_claims: BTreeMap<String, String>,
 ) -> Result<Option<String>, String> {
     let client_build = build_id();
     let session_id = uuid::Uuid::new_v4();
@@ -102,10 +109,7 @@ async fn do_client_hello_with_surface(
             session_id,
             connection_role: Some(ConnectionRole::Client),
             surface,
-            // Over a forwarded environment socket the daemon cannot read this
-            // process's environment, so a crew client states its identity.
-            crew_claims: flotilla_protocol::crew_claims_from(|key| std::env::var(key).ok()),
-            primitives: false,
+            crew_claims,
         })
         .await
         .map_err(|e| format!("failed to send Hello: {e}"))?;
@@ -147,7 +151,7 @@ pub async fn shutdown_existing(socket_path: &Path) -> Result<(), String> {
     let session = connect_unix_message_session(socket_path).await?;
     tokio::time::timeout(
         HELLO_HANDSHAKE_TIMEOUT,
-        do_client_hello_with_surface(&session, None, WireGenerationPolicy::AllowMismatchForShutdown),
+        do_client_hello_with_surface(&session, None, WireGenerationPolicy::AllowMismatchForShutdown, process_crew_claims()),
     )
     .await
     .map_err(|_| {
@@ -261,6 +265,31 @@ impl SocketDaemon {
     pub async fn connect(socket_path: &Path) -> Result<Arc<Self>, String> {
         let session = connect_unix_message_session(socket_path).await?;
         from_session_stateful_bounded(socket_path, session, None).await
+    }
+
+    /// Execute `command`, keyed by `request_key` when given: a retry with the same key, as the
+    /// same caller, follows the first execution's outcome instead of running the command again.
+    pub async fn execute_keyed(&self, command: Command, request_key: Option<String>) -> Result<u64, String> {
+        match into_success_response(self.request(Request::Execute { command, request_key }).await?)? {
+            Response::Execute { command_id } => Ok(command_id),
+            other => Err(format!("unexpected response for execute: {other:?}")),
+        }
+    }
+
+    /// Connect as a crew process whose identity variables are `crew_claims` rather than this
+    /// process's own environment: the claims [`crew_claims_from`](flotilla_protocol::crew_claims_from)
+    /// takes from a crew's launch environment.
+    pub async fn connect_with_crew_claims(socket_path: &Path, crew_claims: BTreeMap<String, String>) -> Result<Arc<Self>, String> {
+        let session = connect_unix_message_session(socket_path).await?;
+        let hello = do_client_hello_with_surface(&session, None, WireGenerationPolicy::RequireMatch, crew_claims);
+        let daemon_build_id = tokio::time::timeout(HELLO_HANDSHAKE_TIMEOUT, hello).await.map_err(|_| {
+            format!(
+                "daemon at {} accepted the connection but did not complete the Hello handshake within {}s",
+                socket_path.display(),
+                HELLO_HANDSHAKE_TIMEOUT.as_secs()
+            )
+        })??;
+        Self::from_session_with_build_id(session, daemon_build_id)
     }
 
     pub async fn connect_with_surface(socket_path: &Path, surface: SurfaceDeclaration) -> Result<Arc<Self>, String> {
@@ -534,6 +563,60 @@ fn spawn_daemon(socket_path: &Path, config_dir: &Path, state_dir: &Path) -> Resu
     cmd.stderr(stderr);
     cmd.spawn().map_err(|e| format!("failed to spawn daemon: {e}"))?;
     Ok(())
+}
+
+/// What [`wait_for_command`] reports while it waits.
+pub enum CommandProgress<'a> {
+    /// One of the command's own events: started, a step update, or finished.
+    Event(&'a DaemonEvent),
+    /// This many events were dropped before the waiter read them.
+    Skipped(u64),
+}
+
+/// Execute a (non-query) command and wait for its `CommandFinished`, as a `flotilla` command
+/// does: each of its own events goes to `progress`, a cancelled command is an error, and an
+/// error outcome is the command's value.
+pub async fn wait_for_command(
+    daemon: &dyn DaemonHandle,
+    command: Command,
+    progress: impl FnMut(CommandProgress<'_>),
+) -> Result<flotilla_protocol::commands::CommandValue, String> {
+    wait_for_execution(daemon, daemon.execute(command), progress).await
+}
+
+/// Wait for the command `execute` starts, as [`wait_for_command`] does; `execute` runs only after
+/// this has subscribed, so its completion cannot pass unseen.
+pub async fn wait_for_execution(
+    daemon: &dyn DaemonHandle,
+    execute: impl std::future::Future<Output = Result<u64, String>>,
+    mut progress: impl FnMut(CommandProgress<'_>),
+) -> Result<flotilla_protocol::commands::CommandValue, String> {
+    use flotilla_protocol::commands::CommandValue;
+    let mut events = daemon.subscribe();
+    let command_id = execute.await?;
+    loop {
+        match events.recv().await {
+            Ok(event) => {
+                let (own, finished) = match &event {
+                    DaemonEvent::CommandStarted { command_id: id, .. } | DaemonEvent::CommandStepUpdate { command_id: id, .. } => {
+                        (*id == command_id, None)
+                    }
+                    DaemonEvent::CommandFinished { command_id: id, result, .. } if *id == command_id => (true, Some(result.clone())),
+                    _ => (false, None),
+                };
+                if own {
+                    progress(CommandProgress::Event(&event));
+                }
+                match finished {
+                    Some(CommandValue::Cancelled) => return Err("command cancelled".into()),
+                    Some(result) => return Ok(result),
+                    None => {}
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => progress(CommandProgress::Skipped(skipped)),
+            Err(broadcast::error::RecvError::Closed) => return Err("daemon disconnected".into()),
+        }
+    }
 }
 
 pub async fn connect_or_spawn(socket_path: &Path, config_dir: &Path, state_dir: &Path) -> Result<Arc<SocketDaemon>, String> {
@@ -1178,10 +1261,7 @@ impl DaemonHandle for SocketDaemon {
     }
 
     async fn execute(&self, command: Command) -> Result<u64, String> {
-        match into_success_response(self.request(Request::Execute { command }).await?)? {
-            Response::Execute { command_id } => Ok(command_id),
-            other => Err(format!("unexpected response for execute: {other:?}")),
-        }
+        self.execute_keyed(command, None).await
     }
 
     async fn observe_focus(&self, _surface_id: uuid::Uuid, targets: Vec<flotilla_protocol::ResourceRef>) -> Result<(), String> {
@@ -1198,7 +1278,7 @@ impl DaemonHandle for SocketDaemon {
     /// side. The parameter exists on the `DaemonHandle` trait for
     /// `InProcessDaemon`'s use, where there is no Hello handshake.
     async fn execute_query(&self, command: Command, _session_id: uuid::Uuid) -> Result<flotilla_protocol::commands::CommandValue, String> {
-        match into_success_response(self.request(Request::Execute { command }).await?)? {
+        match into_success_response(self.request(Request::Execute { command, request_key: None }).await?)? {
             Response::QueryResult { value, .. } => Ok(value),
             Response::Execute { command_id } => Err(format!("expected QueryResult, got Execute response for command {command_id}")),
             other => Err(format!("unexpected response for query: {other:?}")),
@@ -1343,7 +1423,6 @@ mod spawn_lock_tests {
                         connection_role: Some(ConnectionRole::Client),
                         surface: None,
                         crew_claims: Default::default(),
-                        primitives: false,
                     })
                     .await
                     .expect("daemon hello");

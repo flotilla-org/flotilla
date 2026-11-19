@@ -1,6 +1,11 @@
 [profile.dev]
 debug = "line-tables-only"
 
+# SQLite's C at full optimisation in debug builds: every test that opens a store runs its DDL and
+# queries through it, about two to three times faster than unoptimised. Dev profile only.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
 [workspace]
 members = [
     "crates/flotilla-tracing",
@@ -53,7 +58,6 @@ members = [
     "crates/flotilla-terminal",
     "crates/flotilla-protocol",
     "crates/flotilla-protocol-testkit",
-    "crates/flotilla-replication",
     "crates/flotilla-replay-testkit",
     "crates/flotilla-resources",
     "crates/flotilla-schema",
@@ -62,8 +66,14 @@ members = [
     "crates/flotilla-messaging",
     "crates/flotilla-inbox",
     "crates/flotilla-engine-store",
+    "crates/flotilla-engine-convoys",
+    "crates/flotilla-engine-convoys-testkit",
+    "crates/flotilla-engine-messages",
+    "crates/flotilla-engine-messages-testkit",
     "crates/flotilla-inbox-testkit",
+    "crates/flotilla-kind-records-testkit",
     "crates/flotilla-quint-testkit",
+    "crates/flotilla-log-testkit",
     "crates/flotilla-state-machines",
     "crates/flotilla-verbs",
     "crates/flotilla-store",
@@ -194,7 +204,9 @@ chrono = { workspace = true }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
 
 [dev-dependencies]
+flotilla-daemon-testkit = { path = "crates/flotilla-daemon-testkit" }
 flotilla-discovery-testkit = { path = "crates/flotilla-discovery-testkit" }
+flotilla-store-sqlite = { path = "crates/flotilla-store-sqlite" }
 tokio = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }
 flotilla-core = { path = "crates/flotilla-core" }
@@ -213,6 +225,7 @@ workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 flotilla-daemon-testkit = { path = "crates/flotilla-daemon-testkit" }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
+flotilla-engine-convoys-testkit = { path = "crates/flotilla-engine-convoys-testkit" }
 
 # rigging-http-wire speaks the stack CBOR profile through rigging's copy of
 # flotilla-cbor; resolve it to this workspace's copy so the daemon links one profile.

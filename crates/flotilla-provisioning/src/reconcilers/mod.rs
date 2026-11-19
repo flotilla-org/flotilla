@@ -1,16 +1,10 @@
-pub mod checkout;
 pub mod clone;
 pub mod environment;
-pub mod image_build;
 pub mod repository;
 
-pub use checkout::{
-    BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
-};
-pub use clone::{CloneReconciler, CloneRuntime};
-pub use environment::{CloudProvisioning, EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, LocalProvisioning};
-pub use image_build::{ImageBuildMaterials, ImageBuildReconciler};
+pub use clone::CloneRuntime;
+pub use environment::{CloudProvisioning, EnvironmentProvisioning, EnvironmentRuntime, LocalProvisioning};
 
 pub use repository::{ForgeDefaultBranchResolver, RepositoryReconciler};
 #[cfg(test)]
-mod runtime_tests;
+pub(crate) mod runtime_tests;

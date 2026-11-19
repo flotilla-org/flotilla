@@ -277,8 +277,6 @@ pub struct MessageSubmission {
     #[builder(default)]
     pub members: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_since: Option<DateTime<Utc>>,
     /// The agent transport the router chose for this batch; polls and
     /// observations go back to it. Absent on submissions recorded before the
@@ -359,94 +357,6 @@ impl MessageSpec {
     /// A person or supervising role speaking, never flotilla's own turn rules.
     pub fn is_operator_or_supervisor(&self) -> bool {
         !self.is_system_turn() && (self.relation == MessageRelation::Supervisor || self.sender.starts_with("principal:"))
-    }
-}
-
-/// A Message batch whose delivery is held for an operator (#3455): its retry
-/// disposition is terminal, either because acceptance evidence is ambiguous
-/// or because a definitely-unsent batch exhausted its attempts. Later
-/// Messages to the same receiver queue behind it until it is cleared.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeldMessageBatch {
-    /// The recorded submission's batch id, or the first member's name when
-    /// the batch was definitely unsent and kept no submission.
-    pub batch: String,
-    pub receiver: String,
-    pub members: Vec<String>,
-    pub reason: String,
-    /// Every member is a flotilla system turn, so an operator or supervisor
-    /// message to the same receiver supersedes the whole batch.
-    pub system_only: bool,
-    /// A previous attempt may already appear in the conversation.
-    pub prior_submission: bool,
-}
-
-impl HeldMessageBatch {
-    /// Whether this Message is a member of a held batch.
-    pub fn is_held(message: &crate::ResourceObject<Message>) -> bool {
-        message.status.as_ref().is_some_and(|status| {
-            !status.phase.is_terminal()
-                && status.resolved_receiver.is_none()
-                && status
-                    .retry
-                    .as_ref()
-                    .is_some_and(|retry| matches!(retry.disposition, crate::ControllerRetryDisposition::Terminal { .. }))
-        })
-    }
-
-    /// The held batches among `messages`, one per batch, in input order.
-    pub fn collect<'a>(messages: impl IntoIterator<Item = &'a crate::ResourceObject<Message>>) -> Vec<Self> {
-        let messages: Vec<_> = messages.into_iter().collect();
-        let mut batches: Vec<Self> = Vec::new();
-        for message in messages.iter().copied().filter(|message| Self::is_held(message)) {
-            if batches.iter().any(|batch| batch.members.contains(&message.metadata.name)) {
-                continue;
-            }
-            let status = message.status.as_ref().expect("held message has status");
-            let mut members = status
-                .submission
-                .as_ref()
-                .map(|submission| submission.members.clone())
-                .filter(|members| !members.is_empty())
-                .unwrap_or_else(|| status.failed_batch_members.clone());
-            if !members.contains(&message.metadata.name) {
-                members = vec![message.metadata.name.clone()];
-            }
-            let system_only = members.iter().all(|member| {
-                messages.iter().find(|message| message.metadata.name == *member).is_some_and(|message| message.spec.is_system_turn())
-            });
-            batches.push(Self {
-                batch: status.submission.as_ref().map_or_else(|| members[0].clone(), |submission| submission.batch_id.clone()),
-                receiver: message.spec.receiver.clone(),
-                reason: status.reason.clone().unwrap_or_else(|| "delivery held".into()),
-                members,
-                system_only,
-                prior_submission: status.submission.is_some() || !status.delivery_history.is_empty(),
-            });
-        }
-        batches
-    }
-
-    /// The operator command that closes this batch, keeping its audit.
-    pub fn clear_command(&self, namespace: &str) -> String {
-        format!("flotilla resource fail-message-batch {} --namespace {namespace} --reason '<why>'", self.members[0])
-    }
-
-    /// One plain sentence naming the batch, why it is held and how to clear it.
-    pub fn describe(&self, namespace: &str) -> String {
-        format!(
-            "message batch `{}` is held for {} ({} message{}: {}): {}; {}, then authorize same-session delivery with `flotilla resource deliver-message-batch {} --namespace {} --reason '<why>'`; dispose of it with `{}`",
-            self.batch,
-            self.receiver,
-            self.members.len(),
-            if self.members.len() == 1 { "" } else { "s" },
-            self.members.join(", "),
-            self.reason,
-            if self.prior_submission { "confirm the message is not already in the conversation and verify the pane shows the agent composer" } else { "verify the pane shows the agent composer first" },
-            self.members[0],
-            namespace,
-            self.clear_command(namespace)
-        )
     }
 }
 

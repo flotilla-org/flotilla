@@ -11,9 +11,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_charter::{
     ops_entry::{
-        parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION,
-        SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
-        VERIFICATION_PROVENANCE_ANNOTATION,
+        parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
+        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
     },
     project_declaration::{
         parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
@@ -24,12 +23,16 @@ use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     ProviderData,
 };
-use flotilla_resources::{checkout_path::checkout_path, definition_provenance::WHOLE_REPOSITORY_PROJECT_MANAGER};
 use flotilla_resources::{
-    normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyRepositorySpec,
-    DeclarationRefusedCondition, Forge, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
-    Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
-    WriterIdentity, MANAGED_BY_LABEL,
+    checkout_path::checkout_path,
+    definition_provenance::{MANIFEST_RECONCILER_ROOT_ANNOTATION, WHOLE_REPOSITORY_PROJECT_MANAGER},
+    definitions::declares,
+    discovered_checkouts::DiscoveredCheckouts,
+};
+use flotilla_resources::{
+    normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyRepositorySpec, DeclarationRefusedCondition, Forge, InputMeta,
+    Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, Repository, RepositoryIdentity, RepositoryKey,
+    RepositorySpec, ResourceError, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ensure_repository, ResourceBackend};
 use tracing::debug;
@@ -57,6 +60,36 @@ pub fn validate_project_name(name: &str) -> Result<(), String> {
         return Err(format!("project name `{name}` is invalid; use `{normalized}`"));
     }
     Ok(())
+}
+
+/// Whether a materialised definition already carries the stamps an operational entry gives it. The
+/// entry's path is read with the entry and named in its refusals; the stored record's change does
+/// not hold it, so it is left out of the comparison and a refresh that changes nothing writes
+/// nothing.
+fn stamped_alike(stored: &BTreeMap<String, String>, desired: &BTreeMap<String, String>) -> bool {
+    let kept = |(key, _): &(&String, &String)| key.as_str() != SOURCE_ENTRY_PATH_ANNOTATION;
+    stored.iter().filter(kept).eq(desired.iter().filter(kept))
+}
+
+/// Whether a member Repository already carries the annotations a refresh gives it. The stored
+/// record keeps the verification commands' provenance as typed fields, not the JSON text written,
+/// so it reads back with its fields in another order: that annotation is compared as JSON.
+fn repository_stamped_alike(stored: &BTreeMap<String, String>, desired: &BTreeMap<String, String>) -> bool {
+    let kept = |annotations: &BTreeMap<String, String>| {
+        annotations
+            .iter()
+            .map(|(key, value)| {
+                let value = match key.as_str() {
+                    VERIFICATION_PROVENANCE_ANNOTATION => {
+                        serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.clone()))
+                    }
+                    _ => serde_json::Value::String(value.clone()),
+                };
+                (key.clone(), value)
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    kept(stored) == kept(desired)
 }
 
 fn normalize_project_name(name: &str) -> Result<String, String> {
@@ -137,8 +170,11 @@ async fn reconcile_whole_repository_project_definition(
     Ok(reconciled)
 }
 
+/// Whether a declaration owns `project`: its repository's `project.yaml`, or a manifest, which on
+/// the engine is its one origin once a manifest takes it over.
 pub fn is_declaration_backed_project(project: &ResourceObject<Project>) -> bool {
     project.metadata.annotations.contains_key(BOOTSTRAP_REPOSITORY_ANNOTATION)
+        || declares(&project.metadata.labels, &project.metadata.annotations)
 }
 
 fn is_whole_repository_project(spec: &ProjectSpec, repository_key: &RepositoryKey) -> bool {
@@ -170,7 +206,7 @@ fn project_target_syntax(target: &str) -> ProjectTargetSyntax {
 pub struct RepositoryIndex<'a> {
     pub lifecycle_reads: &'a dyn flotilla_resources::lifecycle_reads::LifecycleReads,
     pub backend: &'a ResourceBackend,
-    pub observed: &'a ResourceBackend,
+    pub discovered: &'a DiscoveredCheckouts,
     pub namespace: &'a std::sync::RwLock<String>,
     pub host: &'a str,
 }
@@ -187,8 +223,7 @@ impl RepositoryIndex<'_> {
     async fn select_checkout(&self, key: &RepositoryKey) -> Result<CheckoutSelection, String> {
         let namespace = self.namespace.read().expect("namespace lock poisoned").clone();
         let checkouts = crate::repository_addressing::local_checkouts_with_lifecycle_reads(
-            self.backend,
-            self.observed,
+            self.discovered,
             &namespace,
             self.host,
             self.lifecycle_reads,
@@ -216,18 +251,12 @@ impl RepositoryIndex<'_> {
 
     async fn paths_for(&self, key: &RepositoryKey) -> Result<Vec<PathBuf>, String> {
         let namespace = self.namespace.read().expect("namespace lock poisoned").clone();
-        Ok(crate::repository_addressing::local_checkouts_with_lifecycle_reads(
-            self.backend,
-            self.observed,
-            &namespace,
-            self.host,
-            self.lifecycle_reads,
-        )
-        .await?
-        .into_iter()
-        .filter(|checkout| checkout.spec.repo_ref() == key)
-        .filter_map(|checkout| checkout_path(&checkout).map(PathBuf::from))
-        .collect())
+        Ok(crate::repository_addressing::local_checkouts_with_lifecycle_reads(self.discovered, &namespace, self.host, self.lifecycle_reads)
+            .await?
+            .into_iter()
+            .filter(|checkout| checkout.spec.repo_ref() == key)
+            .filter_map(|checkout| checkout_path(&checkout).map(PathBuf::from))
+            .collect())
     }
 }
 
@@ -240,13 +269,6 @@ pub trait ProjectOperations: Send + Sync {
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String>;
     async fn resolve_forge_identity_in(&self, namespace: &str, spec: RepositorySpec) -> Result<RepositorySpec, String>;
     async fn reap_ensured_convoy(&self, namespace: &str, ensure_name: &str, convoy_name: &str, force: bool) -> Result<(), String>;
-
-    async fn inspect_adopted_checkout(
-        &self,
-        path: &Path,
-        repository_url: Option<&str>,
-        git_ref: Option<&str>,
-    ) -> Result<RepositoryInspection, String>;
     async fn project_add(
         &self,
         target: &str,
@@ -259,6 +281,8 @@ pub trait ProjectOperations: Send + Sync {
         &self,
         request: &flotilla_protocol::image_check::ImageCheckRequest,
     ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String>;
+    /// Launches given-up image build `name` again here, its builder, returning the launch.
+    async fn image_build_retry(&self, name: &str) -> Result<String, String>;
     async fn project_register(&self, target: &str) -> Result<(String, usize), String>;
     async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String>;
     fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool;
@@ -269,7 +293,7 @@ pub struct ProjectService<'a> {
     pub resource_backend: &'a ResourceBackend,
     /// The ops roots of this host's project charter bindings (#3824 layer 2c).
     pub manifest_roots: &'a dyn flotilla_resources::manifest_roots::ManifestRoots,
-    pub observed_resource_backend: &'a ResourceBackend,
+    pub discovered_checkouts: &'a DiscoveredCheckouts,
     pub clock: &'a Arc<dyn Clock>,
     pub namespace: &'a std::sync::RwLock<String>,
     pub repository_index: RepositoryIndex<'a>,
@@ -354,6 +378,16 @@ impl ProjectService<'_> {
         let namespace = self.provisioning_namespace();
         let project =
             self.resource_backend.clone().definitions::<Project>(&namespace).get(name).await.map_err(|error| error.to_string())?;
+        // A manifest that took the project over is its declaration: its root's reconciler applies
+        // it, so there is nothing for its bootstrap repository to refresh.
+        if declares(&project.metadata.labels, &project.metadata.annotations) {
+            let managed = match (&project.spec.charter, project.metadata.annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION)) {
+                (Some(_), _) => "project managed by registered charter".to_owned(),
+                (None, Some(root)) => format!("project managed by manifest root {root}"),
+                (None, None) => "project managed by a manifest".to_owned(),
+            };
+            return Ok((project.spec.repositories.len(), false, Vec::new(), vec![managed]));
+        }
         let bootstrap_key = project
             .metadata
             .annotations
@@ -478,12 +512,13 @@ impl ProjectService<'_> {
             let live_remote = declared_spec.live_remote().expect("remote RepositorySpec has a live remote");
             let mut backoff = std::time::Duration::from_millis(10);
             let mut attempts = 0;
+            // A member Repository carries no bootstrap stamp: the declaration's provenance is the
+            // Project's, read there.
             loop {
                 attempts += 1;
                 let updated_spec = repository.spec.clone().update_remotes(live_remote)?;
-                let mut repository_meta = InputMeta::from(&repository.metadata);
-                repository_meta.annotations.extend(provenance.clone());
-                if repository_meta.annotations == repository.metadata.annotations && updated_spec == repository.spec {
+                let repository_meta = InputMeta::from(&repository.metadata);
+                if updated_spec == repository.spec {
                     break;
                 }
                 // Status and spec share a version. Rebase this narrow declaration
@@ -860,7 +895,10 @@ impl ProjectService<'_> {
                     None => return Err(format!("WorkflowTemplate `{name}` already exists and is not materialized by a project")),
                 }
             }
-            if current.as_ref().is_none_or(|current| current.spec != *spec || current.metadata.annotations != meta.annotations) {
+            if current
+                .as_ref()
+                .is_none_or(|current| current.spec != *spec || !stamped_alike(&current.metadata.annotations, &meta.annotations))
+            {
                 templates.apply(&stored_meta, spec).await.map_err(|error| error.to_string())?;
                 changes.push(format!("WorkflowTemplate/{name}"));
             }
@@ -932,7 +970,10 @@ impl ProjectService<'_> {
                     None => return Err(format!("ConvoyEnsure `{name}` already exists and is not materialized by a project")),
                 }
             }
-            if current.as_ref().is_none_or(|current| current.spec != *spec || current.metadata.annotations != meta.annotations) {
+            if current
+                .as_ref()
+                .is_none_or(|current| current.spec != *spec || !stamped_alike(&current.metadata.annotations, &meta.annotations))
+            {
                 convoy_ensures.apply(meta, spec).await.map_err(|error| error.to_string())?;
                 changes.push(format!("ConvoyEnsure/{name}"));
             }
@@ -951,8 +992,11 @@ impl ProjectService<'_> {
                     && !ensures.contains_key(&ensure.metadata.name)
             })
         {
-            if let Some(convoy_ref) = stale.status.as_ref().and_then(|status| status.convoy_ref.as_deref()) {
-                self.operations.reap_ensured_convoy(&namespace, &stale.metadata.name, convoy_ref, false).await?;
+            let current = flotilla_store::current_generations(self.resource_backend, &namespace, [stale.metadata.name.clone()])
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(convoy) = current.get(&stale.metadata.name) {
+                self.operations.reap_ensured_convoy(&namespace, &stale.metadata.name, &convoy.metadata.name, false).await?;
             }
             convoy_ensures.delete(&stale.metadata.name).await.map_err(|error| error.to_string())?;
             changes.push(format!("deleted ConvoyEnsure/{}", stale.metadata.name));
@@ -1014,7 +1058,7 @@ impl ProjectService<'_> {
                     meta.annotations.remove(VERIFICATION_PROVENANCE_ANNOTATION);
                 }
             }
-            if current.spec != desired_spec || current.metadata.annotations != meta.annotations {
+            if current.spec != desired_spec || !repository_stamped_alike(&current.metadata.annotations, &meta.annotations) {
                 repositories.update(&meta, &current.metadata.resource_version, &desired_spec).await.map_err(|error| error.to_string())?;
                 changes.push(format!("Repository/{} verification commands", member.repo));
             }
@@ -1073,38 +1117,16 @@ impl ProjectService<'_> {
             since: project.status.as_ref().and_then(|status| status.declaration_refused.as_ref()).map_or(now, |old| old.since),
             observed_at: now,
         });
+        // A standing role reads its project's refusal from the Project (#3108): no copy is
+        // written to its ensure.
         let mut errors = Vec::new();
         for patch in [
             ProjectStatusPatch::ReplaceOperationalEntries { ready, message: message.to_string() },
-            ProjectStatusPatch::DeclarationRefused { condition: condition.clone() },
+            ProjectStatusPatch::DeclarationRefused { condition },
         ] {
             if let Err(error) = apply_resource_status_patch(&projects, project_name, &patch).await {
                 errors.push(error.to_string());
             }
-        }
-        match self
-            .resource_backend
-            .definitions::<ConvoyEnsure>(namespace)
-            .list_selected(flotilla_store::StoreQuery {
-                fields: BTreeMap::from([("spec.project_ref".into(), project_name.into())]),
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(ensures) => {
-                for ensure in ensures.into_iter().filter(|ensure| ensure.spec.project_ref == project_name) {
-                    if let Err(error) = apply_resource_status_patch(
-                        &self.resource_backend.using::<ConvoyEnsure>(namespace),
-                        &ensure.metadata.name,
-                        &ConvoyEnsureStatusPatch::DeclarationRefused { condition: condition.clone() },
-                    )
-                    .await
-                    {
-                        errors.push(format!("ConvoyEnsure/{}: {error}", ensure.metadata.name));
-                    }
-                }
-            }
-            Err(error) => errors.push(error.to_string()),
         }
         if errors.is_empty() {
             Ok(())
@@ -1206,7 +1228,7 @@ impl ProjectService<'_> {
                     let role = entry.name;
                     let ensure_name = convoy_ensure_name(project_name, &role);
                     outcomes.push(format!("{}: ConvoyEnsure/{} accepted", file.path, ensure_name));
-                    let mut meta = InputMeta::builder()
+                    let meta = InputMeta::builder()
                         .name(ensure_name.clone())
                         .annotations(
                             BTreeMap::from([
@@ -1220,9 +1242,6 @@ impl ProjectService<'_> {
                             .collect(),
                         )
                         .build();
-                    if let Some(presents_as) = &ensure.presents_as {
-                        meta.annotations.insert(PRESENTS_AS_ANNOTATION.to_string(), presents_as.clone());
-                    }
                     let spec = ConvoyEnsureSpec {
                         project_ref: project_name.to_string(),
                         role: role.clone(),
@@ -1377,8 +1396,7 @@ impl ProjectService<'_> {
         // refreshing one clone cannot erase a sibling clone's identity facts.
         let mut inspections = vec![inspection.clone()];
         for known in crate::repository_addressing::local_checkouts_with_lifecycle_reads(
-            self.resource_backend,
-            self.observed_resource_backend,
+            self.discovered_checkouts,
             namespace,
             &inspection.checkout.host_ref,
             self.repository_index.lifecycle_reads,
@@ -1419,15 +1437,13 @@ impl ProjectService<'_> {
             }
         }
         flotilla_observation::observed_resources::reconcile_checkouts(
-            self.observed_resource_backend,
-            namespace,
+            self.discovered_checkouts,
             repository_key,
             &repository_spec.catalog_slug(),
             &providers,
             &inspection.checkout.host_ref,
-        )
-        .await
-        .map_err(|error| error.to_string())
+        );
+        Ok(())
     }
 }
 
@@ -1612,8 +1628,7 @@ mod registration_race;
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use flotilla_resources::SystemClock;
-    use flotilla_store_memory::InMemoryBackend;
+    use flotilla_resources::{discovered_checkouts::DiscoveredCheckout, SystemClock};
 
     use super::*;
     use flotilla_charter::ops_entry::OperationalEntryFile;
@@ -1689,22 +1704,21 @@ mod tests {
             let runner: Arc<dyn flotilla_provider_runtime::CommandRunner> = Arc::new(ProcessCommandRunner);
             let inspector = Arc::new(CharterSourceInspector { runner, cache: cache.path().to_path_buf() });
             let operations = FakeProjectOperations::with_inspector(inspector.clone());
-            let backend = ResourceBackend::new(InMemoryBackend::default());
-            let observed = ResourceBackend::new(InMemoryBackend::observed());
+            let backend = flotilla_provisioning_testkit::EngineBackend::open("local-host");
+            let discovered = DiscoveredCheckouts::default();
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let namespace = std::sync::RwLock::new("flotilla".to_string());
-            let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
             let service = ProjectService {
                 image_layer_refresh: Default::default(),
                 resource_backend: &backend,
-                manifest_roots: &roots,
-                observed_resource_backend: &observed,
+                manifest_roots: backend.ports.manifest_roots.as_ref(),
+                discovered_checkouts: &discovered,
                 clock: &clock,
                 namespace: &namespace,
                 repository_index: RepositoryIndex {
-                    lifecycle_reads: &flotilla_resources::lifecycle_reads::NoLifecycleReads,
+                    lifecycle_reads: crate::test_support::no_held_checkouts().as_ref(),
                     backend: &backend,
-                    observed: &observed,
+                    discovered: &discovered,
                     namespace: &namespace,
                     host: "local-host",
                 },
@@ -1719,22 +1733,28 @@ mod tests {
             let mut spec = whole_repository_project_spec(repository.key(), "app".into()).expect("project spec");
             spec.repositories[0].roles.extend([ProjectRepositoryRole::Ops, ProjectRepositoryRole::Code]);
             spec.repositories[0].charter_store = Some(CharterStoreBinding { host: "local-host".into(), source });
-            let project_author = if local { ResourceBackend::new(InMemoryBackend::default()) } else { backend.clone() };
-            project_author
-                .using::<Project>("flotilla")
-                .create(&InputMeta::builder().name("app".into()).build(), &spec)
-                .await
-                .expect("project");
-            if local {
-                // The source home can receive its Project from the fleet store;
-                // it owns the source status, not that Project's status.
-                let snapshot = project_author.using::<Project>("flotilla").list().await.expect("fleet project");
-                backend
-                    .replica_writer::<Project>(flotilla_protocol::NodeId::new("fleet-store"), "flotilla")
-                    .replace(&snapshot, chrono::Utc::now())
-                    .await
-                    .expect("federate project");
-            }
+            // The source home can receive its Project from the fleet store, which authors every
+            // edit of it; the source home owns the source status, not that Project's status.
+            let fleet = local.then(|| backend.other_home("fleet-store"));
+            let author = |spec: ProjectSpec| {
+                let (fleet, backend) = (fleet.clone(), &backend);
+                async move {
+                    match fleet {
+                        Some(fleet) => {
+                            fleet.project("app", &BTreeMap::new(), &BTreeMap::new(), &spec).await;
+                            backend.receive(&fleet);
+                        }
+                        None => {
+                            backend
+                                .definitions::<Project>("flotilla")
+                                .apply(&InputMeta::builder().name("app".into()).build(), &spec)
+                                .await
+                                .expect("project");
+                        }
+                    }
+                }
+            };
+            author(spec.clone()).await;
             service.reconcile_bound_charters().await.expect("first pass");
             let root_name = flotilla_charter::charter_store::ops_root_name("app", &spec.repositories[0], "local-host");
             let roots = backend.using::<ManifestRoot>("flotilla");
@@ -1788,7 +1808,7 @@ mod tests {
             unavailable.repo = RepositoryKey("missing-ops".into());
             unavailable.charter_store = None;
             spec.repositories.push(unavailable);
-            projects.apply(&InputMeta::from(&project.metadata), &spec).await.expect("unavailable ops member");
+            author(spec.clone()).await;
             service.reconcile_bound_charters().await.expect("partial-source refusal");
             let refused = roots.get(&root_name).await.expect("root").status.expect("status");
             assert_eq!(refused.applied_revision, status.applied_revision);
@@ -1798,12 +1818,17 @@ mod tests {
             // and stops its reads/pruning while preserving materialized records.
             spec.repositories.pop();
             spec.charter = Some(flotilla_resources::CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() });
-            projects.apply(&InputMeta::from(&project.metadata), &spec).await.expect("declare pointer");
+            author(spec.clone()).await;
             service.reconcile_bound_charters().await.expect("registered charter supersedes legacy ops");
             assert!(matches!(roots.get(&root_name).await, Err(ResourceError::NotFound { .. })));
             let registered = projects.get("app").await.expect("registered Project");
             if local {
-                assert!(registered.status.is_none(), "replicated Project status remains owned by the fleet home");
+                // The engine reads a Project with no status written as an empty one.
+                assert_eq!(
+                    registered.status.unwrap_or_default(),
+                    flotilla_resources::ProjectStatus::default(),
+                    "replicated Project status remains owned by the fleet home"
+                );
             } else {
                 let status = registered.status.expect("Project status");
                 assert!(status.declaration_refused.is_none());
@@ -1859,28 +1884,44 @@ mod tests {
             })),
             ..Default::default()
         };
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
+        let discovered = DiscoveredCheckouts::default();
+        let engine = flotilla_provisioning_testkit::EngineBackend::open_in("local-host", test_namespace);
+        let backend = engine.backend.clone();
+        // The Repository was first seen through a transport alias, so registering its declared
+        // remote is a real spec edit: the declared remote goes first.
+        backend
+            .using::<Repository>(test_namespace)
+            .create(
+                &InputMeta::builder().name(repository_spec.key().to_string()).build(),
+                &repository_spec.clone().update_remotes("https://github-alias.example/example/app").expect("alias remote"),
+            )
+            .await
+            .expect("repository seen through its alias");
+        // From here the startup Repository controller races registration.
         let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let backend = ResourceBackend::new(super::registration_race::RacingStore {
-            inner: Arc::new(InMemoryBackend::default()),
+        let repositories = engine.repository_port();
+        backend.install_engine_records(Arc::new(super::registration_race::RacingRepositories {
+            inner: Arc::new(repositories),
+            backend: backend.downgrade(),
+            namespace: test_namespace.to_owned(),
             armed: Arc::clone(&armed),
-            observed: observed.clone(),
+            discovered: discovered.clone(),
             contention,
-        });
+            racing: Default::default(),
+        }));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new(test_namespace.to_string());
-        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
         let service = ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: &backend,
-            manifest_roots: &roots,
-            observed_resource_backend: &observed,
+            manifest_roots: engine.ports.manifest_roots.as_ref(),
+            discovered_checkouts: &discovered,
             clock: &clock,
             namespace: &namespace,
             repository_index: RepositoryIndex {
-                lifecycle_reads: &flotilla_resources::lifecycle_reads::NoLifecycleReads,
+                lifecycle_reads: crate::test_support::no_held_checkouts().as_ref(),
                 backend: &backend,
-                observed: &observed,
+                discovered: &discovered,
                 namespace: &namespace,
                 host: "local-host",
             },
@@ -1919,7 +1960,10 @@ mod tests {
         assert!(!armed.load(Ordering::SeqCst), "startup reconciler must have raced registration");
         let repository = backend.using::<Repository>("flotilla").get(&repository_spec.key().to_string()).await.expect("repository");
         assert_eq!(repository.status.expect("controller status must survive registration").default_branch.as_deref(), Some("main"));
-        assert_eq!(repository.metadata.annotations[BOOTSTRAP_COMMIT_ANNOTATION], "abc123");
+        assert!(
+            !repository.metadata.annotations.contains_key(BOOTSTRAP_COMMIT_ANNOTATION),
+            "the declaration's provenance is the Project's, not its member Repository's"
+        );
         assert_eq!(operations.identity_resolutions.load(Ordering::SeqCst), 1);
         let project = backend.definitions::<Project>("flotilla").get("app").await.expect("registered project");
         assert_eq!(project.spec.repositories[0].repo, repository_spec.key());
@@ -1943,16 +1987,10 @@ mod tests {
     // Selection is a host-local fact: foreign-host and unrelated-repository
     // checkouts do not participate. A sole checkout is usable; among multiple
     // candidates only a unique main is selectable, otherwise refuse ambiguity.
-    #[hegel::test]
-    fn checkout_selection_uses_local_facts_and_refuses_ambiguity(tc: hegel::TestCase) {
-        use flotilla_resources::{Checkout, CheckoutSpec, ObservedCheckoutSpec};
-        use hegel::generators as gs;
-
-        // Generate 0–8 facts spanning both hosts, repository membership and main/
-        // worktree state; pinned equivalence classes guarantee boundary coverage.
-        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
-        let generated = (0..count).map(|_| (tc.draw(gs::booleans()), tc.draw(gs::booleans()), tc.draw(gs::booleans()))).collect();
-        let cases = [
+    // Pinned equivalence classes guarantee boundary coverage.
+    #[tokio::test]
+    async fn checkout_selection_boundary_classes() {
+        for facts in [
             vec![],
             vec![(true, true, true)],
             vec![(true, false, true)],
@@ -1961,63 +1999,76 @@ mod tests {
             vec![(true, false, true), (true, false, true)],
             vec![(false, true, true), (true, false, true)],
             vec![(true, true, false), (true, false, true)],
-            generated,
-        ];
+        ] {
+            checkout_selection_case(facts).await;
+        }
+    }
+
+    #[hegel::test]
+    fn checkout_selection_uses_local_facts_and_refuses_ambiguity(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+
+        // Generate 0–8 facts spanning both hosts, repository membership and main/
+        // worktree state.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
+        let generated = (0..count).map(|_| (tc.draw(gs::booleans()), tc.draw(gs::booleans()), tc.draw(gs::booleans()))).collect();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("checkout paths");
-            let root = temp.path().canonicalize().expect("physical checkout paths");
-            for facts in cases {
-                let backend = ResourceBackend::new(InMemoryBackend::default());
-                let observed = ResourceBackend::new(InMemoryBackend::observed());
-                let namespace = std::sync::RwLock::new("flotilla".to_string());
-                let key = RepositorySpec::remote("https://github.com/example/ops").expect("repository").key();
-                for (index, (local, main, member)) in facts.iter().enumerate() {
-                    observed
-                        .using::<Checkout>("flotilla")
-                        .create(
-                            &InputMeta::builder().name(format!("checkout-{index}")).build(),
-                            &CheckoutSpec::Observed(
-                                ObservedCheckoutSpec::builder()
-                                    .path(root.join(index.to_string()).to_string_lossy().into_owned())
-                                    .host_ref(if *local { "local-host" } else { "foreign-host" }.to_string())
-                                    .repo_ref(if *member { key.clone() } else { RepositoryKey("other-repository".into()) })
-                                    .r#ref(if *main { "main" } else { "convoy/work" }.to_string())
-                                    .is_main(*main)
-                                    .build(),
-                            ),
-                        )
-                        .await
-                        .expect("observed checkout");
-                }
-                let local = facts.iter().enumerate().filter(|(_, (local, _, member))| *local && *member).collect::<Vec<_>>();
-                let mains = local.iter().filter(|(_, (_, main, _))| *main).collect::<Vec<_>>();
-                let selected = if local.len() == 1 {
-                    Some(local[0].0)
-                } else if mains.len() == 1 {
-                    Some(mains[0].0)
-                } else {
-                    None
-                };
-                let index = RepositoryIndex {
-                    lifecycle_reads: &flotilla_resources::lifecycle_reads::NoLifecycleReads,
-                    backend: &backend,
-                    observed: &observed,
-                    namespace: &namespace,
-                    host: "local-host",
-                };
-                match index.select_checkout(&key).await.expect("selection") {
-                    CheckoutSelection::Unavailable => assert!(local.is_empty(), "available local facts must not be lost"),
-                    CheckoutSelection::Ambiguous => assert!(!local.is_empty() && selected.is_none(), "a unique checkout must be usable"),
-                    CheckoutSelection::Selected(checkout) => {
-                        let expected = selected.expect("ambiguous facts must never select an arbitrary checkout");
-                        assert_eq!(checkout.path, root.join(expected.to_string()));
-                        assert_eq!(checkout.is_main, facts[expected].1);
-                        assert_eq!(checkout.git_ref, if facts[expected].1 { "main" } else { "convoy/work" });
-                    }
-                }
+        runtime.block_on(checkout_selection_case(generated));
+    }
+
+    /// Checks selection over checkout facts, each (local host, main, repository member).
+    async fn checkout_selection_case(facts: Vec<(bool, bool, bool)>) {
+        use flotilla_resources::ObservedCheckoutSpec;
+        let temp = tempfile::tempdir().expect("checkout paths");
+        let root = temp.path().canonicalize().expect("physical checkout paths");
+        let backend = flotilla_provisioning_testkit::EngineBackend::open("local-host");
+        let discovered = DiscoveredCheckouts::default();
+        let namespace = std::sync::RwLock::new("flotilla".to_string());
+        let key = RepositorySpec::remote("https://github.com/example/ops").expect("repository").key();
+        let mut found = BTreeMap::<RepositoryKey, Vec<_>>::new();
+        for (index, (local, main, member)) in facts.iter().enumerate() {
+            let repo_ref = if *member { key.clone() } else { RepositoryKey("other-repository".into()) };
+            found.entry(repo_ref.clone()).or_default().push(DiscoveredCheckout {
+                name: format!("checkout-{index}"),
+                repo_slug: repo_ref.0.clone(),
+                spec: ObservedCheckoutSpec::builder()
+                    .path(root.join(index.to_string()).to_string_lossy().into_owned())
+                    .host_ref(if *local { "local-host" } else { "foreign-host" }.to_string())
+                    .repo_ref(repo_ref)
+                    .r#ref(if *main { "main" } else { "convoy/work" }.to_string())
+                    .is_main(*main)
+                    .build(),
+            });
+        }
+        for (repository, checkouts) in found {
+            discovered.replace(&repository, checkouts);
+        }
+        let local = facts.iter().enumerate().filter(|(_, (local, _, member))| *local && *member).collect::<Vec<_>>();
+        let mains = local.iter().filter(|(_, (_, main, _))| *main).collect::<Vec<_>>();
+        let selected = if local.len() == 1 {
+            Some(local[0].0)
+        } else if mains.len() == 1 {
+            Some(mains[0].0)
+        } else {
+            None
+        };
+        let index = RepositoryIndex {
+            lifecycle_reads: crate::test_support::no_held_checkouts().as_ref(),
+            backend: &backend,
+            discovered: &discovered,
+            namespace: &namespace,
+            host: "local-host",
+        };
+        match index.select_checkout(&key).await.expect("selection") {
+            CheckoutSelection::Unavailable => assert!(local.is_empty(), "available local facts must not be lost"),
+            CheckoutSelection::Ambiguous => assert!(!local.is_empty() && selected.is_none(), "a unique checkout must be usable"),
+            CheckoutSelection::Selected(checkout) => {
+                let expected = selected.expect("ambiguous facts must never select an arbitrary checkout");
+                assert_eq!(checkout.path, root.join(expected.to_string()));
+                assert_eq!(checkout.is_main, facts[expected].1);
+                assert_eq!(checkout.git_ref, if facts[expected].1 { "main" } else { "convoy/work" });
             }
-        });
+        }
     }
 
     #[test]

@@ -4,18 +4,16 @@ use std::sync::Arc;
 use chrono::Utc;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, InputMeta,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, CONVOY_LABEL,
+    CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
 };
+use flotilla_store_testkit::cr_name;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
-use super::support::test_meta;
+use super::support::{admit, test_meta};
 use crate::testkits::discovery::FakeChangeRequest;
-use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_engine_convoys_testkit::single_agent;
 use flotilla_protocol::ChangeRequest;
-use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
-use flotilla_vcs::vcs::GitCheckoutStrategy;
 
 // #2698: automatic branch discovery must not bind an already terminal PR
 // to a newly created convoy. Explicit adoption remains a separate operation.
@@ -30,7 +28,7 @@ async fn branch_discovery_ignores_preexisting_terminal_request() {
                 ChangeRequest {
                     title: "Old work".into(),
                     branch: "reused".into(),
-                    status: state,
+                    status: state.clone(),
                     body: None,
                     provider_name: "github".into(),
                     provider_display_name: "GitHub".into(),
@@ -40,85 +38,13 @@ async fn branch_discovery_ignores_preexisting_terminal_request() {
         fixture.daemon.admission.repository_change_requests().write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
             provider;
         let convoys = fixture.daemon.resource_backend().using::<ResourceConvoy>("flotilla");
-        convoys
-            .create(
-                &test_meta("new-work"),
-                &ConvoySpec::builder()
-                    .workflow_ref("dev".into())
-                    .r#ref("reused".into())
-                    .repositories(vec![ConvoyRepositorySpec {
-                        url: "https://github.com/team/repo0".into(),
-                        repo_ref: fixture.keys[0].clone(),
-                        source_ref: "main".into(),
-                        target_ref: "main".into(),
-                        workspace_slug: "repo0".into(),
-                        subpaths: vec![],
-                    }])
-                    .build(),
-            )
-            .await
-            .expect("convoy");
-        fixture.daemon.discover_convoy_branch_subjects("flotilla", "new-work", "reused").await.expect("discovery");
-        let convoy = convoys.get("new-work").await.expect("convoy");
-        let status = convoy.status.unwrap_or_default();
-        assert!(status.subjects.is_empty(), "old terminal PR must not become produced work");
-        // #3206: a convoy scanned before admission wrote its status still
-        // records the scan, so landing need not wait for the next interval.
-        assert!(status.branch_subject_scan_at.is_some(), "the scan is recorded");
-    }
-}
-
-// #2698: a crew can switch branches, or use a differently named upstream.
-// Discovery uses real Git facts and an in-memory forge collaborator, then
-// stores the new PR as a produced subject and respects operator unlink.
-#[tokio::test]
-async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
-    use flotilla_vcs::vcs::Vcs;
-    let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
-    let root = tempfile::tempdir().expect("git fixture");
-    let git = |args: &[&str]| {
-        let output = std::process::Command::new("git").args(args).current_dir(root.path()).output().expect("git");
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    };
-    git(&["init", "-b", "requested"]);
-    git(&["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
-    let provider = Arc::new(FakeChangeRequest::new());
-    provider
-        .add_change_requests(vec![
-            (
-                "7".into(),
-                ChangeRequest {
-                    title: "Old work".into(),
-                    branch: "requested".into(),
-                    status: flotilla_protocol::ChangeRequestStatus::Merged,
-                    body: None,
-                    provider_name: "github".into(),
-                    provider_display_name: "GitHub".into(),
-                },
-            ),
-            (
-                "8".into(),
-                ChangeRequest {
-                    title: "Real work".into(),
-                    branch: "actual".into(),
-                    status: flotilla_protocol::ChangeRequestStatus::Open,
-                    body: None,
-                    provider_name: "github".into(),
-                    provider_display_name: "GitHub".into(),
-                },
-            ),
-        ])
-        .await;
-    fixture.daemon.admission.repository_change_requests().write().await.get_mut(&fixture.keys[0]).expect("provider").provider = provider;
-    let backend = fixture.daemon.resource_backend();
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    convoys
-        .create(
-            &test_meta("switch-work"),
-            &ConvoySpec::builder()
+        let new_work = admit(
+            &fixture.daemon,
+            "new-work",
+            ConvoySpec::builder()
+                .project_ref("flotilla".into())
                 .workflow_ref("dev".into())
-                .r#ref("requested".into())
-                .adopted_checkout_refs(BTreeMap::from([(fixture.keys[0].clone(), "switch-checkout".into())]))
+                .r#ref("reused".into())
                 .repositories(vec![ConvoyRepositorySpec {
                     url: "https://github.com/team/repo0".into(),
                     repo_ref: fixture.keys[0].clone(),
@@ -128,179 +54,153 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
                     subpaths: vec![],
                 }])
                 .build(),
+            single_agent("coder"),
         )
-        .await
-        .expect("convoy");
-    let checkouts = backend.using::<ResourceCheckout>("flotilla");
-    let checkout = checkouts
-        .create(
-            &InputMeta::builder()
-                .name("switch-checkout".into())
-                .labels(BTreeMap::from([(CONVOY_LABEL.into(), "switch-work".into())]))
-                .build(),
-            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                r#ref: "requested".into(),
-                path: root.path().to_string_lossy().into_owned(),
-                repo_ref: fixture.keys[0].clone(),
-                host_ref: "test-host".into(),
-                is_main: false,
-            }),
-        )
-        .await
-        .expect("checkout");
-    let conflict =
-        fixture.daemon.validate_new_checkout_branch(&checkout).await.expect("forge lookup").expect("old merged head must refuse creation");
-    assert!(conflict.contains("requested") && conflict.contains("#7"), "{conflict}");
-    let runner = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
-    let vcs = flotilla_vcs::vcs::FlotillaVcs::new(
-        ExecutionEnvironmentPath::new(root.path()),
-        runner.clone(),
-        GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), runner))),
-    );
-    assert!(fixture.daemon.resolve_live_checkout_change_request(&checkout, &vcs, root.path()).await.expect("old branch lookup").is_none());
-    git(&["checkout", "--detach"]);
-    assert!(fixture.daemon.resolve_live_checkout_change_request(&checkout, &vcs, root.path()).await.expect("detached lookup").is_none());
-    git(&["switch", "requested"]);
-    // Merge evidence must belong to this checkout's lifetime, including the equality boundary.
-    for offset in [-1, 0, 1] {
-        let mut prior_checkout = checkout.clone();
-        let mut prior = ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).build();
-        prior.integration.landed_evidence = Some(
-            flotilla_resources::LandedEvidence::builder()
-                .change_request_id("7".into())
-                .merged_at((checkout.metadata.creation_timestamp + chrono::Duration::seconds(offset)).to_rfc3339())
-                .build(),
-        );
-        prior_checkout.status = Some(prior);
-        assert_eq!(
-            fixture.daemon.resolve_live_checkout_change_request(&prior_checkout, &vcs, root.path()).await.expect("dated lookup"),
-            (offset >= 0).then(|| "7".to_string())
-        );
+        .await;
+        fixture.daemon.discover_convoy_branch_subjects("flotilla", &new_work, "reused").await.expect("discovery");
+        let convoy = convoys.get(&new_work).await.expect("convoy");
+        let status = convoy.status.unwrap_or_default();
+        assert!(status.subjects.is_empty(), "old terminal PR must not become produced work");
+        // #3206: a convoy scanned before admission wrote its status still
+        // records the scan, so landing need not wait for the next interval.
+        assert!(status.branch_subject_scan_at.is_some(), "the scan is recorded");
     }
-    git(&["switch", "-c", "actual"]);
-    assert_eq!(
-        fixture.daemon.resolve_live_checkout_change_request(&checkout, &vcs, root.path()).await.expect("switched lookup"),
-        Some("8".into())
-    );
-    git(&["switch", "-c", "local-name"]);
-    git(&["branch", "--set-upstream-to", "actual"]);
-    assert_eq!(
-        fixture.daemon.resolve_live_checkout_change_request(&checkout, &vcs, root.path()).await.expect("upstream lookup"),
-        Some("8".into())
-    );
-    git(&["remote", "add", "origin", root.path().to_str().expect("root")]);
-    git(&["update-ref", "refs/remotes/origin/actual", "HEAD"]);
-    git(&["branch", "--set-upstream-to", "origin/actual"]);
-    assert_eq!(
-        fixture.daemon.resolve_live_checkout_change_request(&checkout, &vcs, root.path()).await.expect("remote upstream lookup"),
-        Some("8".into())
-    );
-    assert_eq!(vcs.current_branch().await.expect("branch").trim(), "local-name");
-    let mut status = ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).build();
-    status.integration.change_request = Some(
-        flotilla_resources::ChangeRequestObservation::builder()
-            .id("8".into())
-            .state(flotilla_resources::ChangeRequestState::Open)
-            .mergeability(flotilla_resources::ChangeRequestMergeability::Mergeable)
-            .observed_at(Utc::now().to_rfc3339())
-            .build(),
-    );
-    checkouts.update_status("switch-checkout", &checkout.metadata.resource_version, &status).await.expect("observation");
-    fixture.daemon.discover_convoy_branch_subjects("flotilla", "switch-work", "requested").await.expect("discovery");
-    let convoy = convoys.get("switch-work").await.expect("convoy");
-    assert_eq!(convoy.status.expect("subjects").subjects[0].subject.id, "8");
-    // Repair an already persisted stale produces link, as in the operator's report.
-    fixture
-        .daemon
-        .link_convoy_subject("flotilla", "switch-work", "repo0!7", Some(flotilla_protocol::Relationship::Produces))
-        .await
-        .expect("stale link");
-    // #3633: the unlink command also releases persisted retention history,
-    // including when the observation was not present in live demand discovery.
-    let records = backend.using::<flotilla_resources::ChangeRequest>("flotilla");
-    let address = flotilla_resources::address::stored_change_request_address("github.com", "team/repo0", 7, &[]).unwrap();
-    let record_name = flotilla_resources::address::record_name(&address).unwrap();
-    let claim = flotilla_resources::ChangeRequestSubjectHistory::builder()
-        .namespace("flotilla".into())
-        .convoy("switch-work".into())
-        .origin("test-host".into())
-        .relationship(flotilla_protocol::Relationship::Produces)
-        .role("coder".into())
-        .last_seen(Utc::now())
-        .build();
-    let mut spec = flotilla_resources::ChangeRequestSpec::builder()
-        .service("github.com".into())
-        .scope("team/repo0".into())
-        .number(7)
-        .observing_authority("test-host".into())
-        .build();
-    spec.subject_of = vec![claim];
-    records.create(&test_meta(&record_name), &spec).await.expect("retained stale subject");
-    fixture.daemon.link_convoy_subject("flotilla", "switch-work", "repo0!7", None).await.expect("unlink stale merged subject");
-    assert!(
-        matches!(records.get(&record_name).await, Err(flotilla_resources::ResourceError::NotFound { .. })),
-        "unlink must collect an otherwise unheld record"
-    );
-    fixture.daemon.discover_convoy_branch_subjects("flotilla", "switch-work", "requested").await.expect("repair discovery");
-    let repaired = convoys.get("switch-work").await.expect("convoy").status.expect("subjects");
-    assert_eq!(repaired.subjects.len(), 1);
-    assert_eq!(repaired.subjects[0].subject.id, "8");
-    fixture.daemon.link_convoy_subject("flotilla", "switch-work", "repo0!8", None).await.expect("unlink");
-    fixture.daemon.discover_convoy_branch_subjects("flotilla", "switch-work", "requested").await.expect("repeat discovery");
-    assert!(convoys.get("switch-work").await.expect("convoy").status.expect("subjects").subjects.is_empty());
 }
 
-// #2698: an earlier absence observation cannot authorize creation after a
-// closed PR appears for that branch. Creation checks the forge afresh.
+// #2698: a checkout's inspection names the change request its branch is associated with; branch
+// discovery stores it as a produced subject while the forge observation finds it open, and an
+// operator's unlink wins over rediscovery.
 #[tokio::test]
-async fn checkout_creation_does_not_reuse_cached_branch_absence() {
+async fn inspected_change_request_is_discovered_and_unlink_wins() {
+    use flotilla_resources::checkout_records::{CheckoutRecords as _, Inspection};
     let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
-    let provider = Arc::new(FakeChangeRequest::new());
-    let observed = Arc::new(flotilla_observation::forge_observation::ObservedChangeRequestTracker {
-        inner: provider.clone(),
-        reads: flotilla_observation::forge_observation::ForgeReads::new(fixture.daemon.resource_backend(), "flotilla".into()),
-        source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "team/repo0".into() },
-    });
-    fixture.daemon.admission.repository_change_requests().write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
-        observed.clone();
-    assert!(fixture
-        .daemon
-        .resolve_convoy_change_request(std::slice::from_ref(&fixture.keys[0]), "reused", None)
-        .await
-        .expect("absence")
-        .is_none());
-    provider
-        .add_change_requests(vec![(
-            "7".into(),
-            ChangeRequest {
-                title: "Old work".into(),
-                branch: "reused".into(),
-                status: flotilla_protocol::ChangeRequestStatus::Closed,
-                body: None,
-                provider_name: "github".into(),
-                provider_display_name: "GitHub".into(),
-            },
-        )])
-        .await;
-    // Ordinary observation may reuse the earlier absence; creation must still
-    // inspect the forge anew through the same production observation adapter.
-    assert!(observed.find_change_request_by_branch("reused").await.expect("cached absence").is_none());
-    let checkout = fixture
-        .daemon
-        .resource_backend()
-        .using::<ResourceCheckout>("flotilla")
-        .create(
-            &test_meta("new-checkout"),
-            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                r#ref: "reused".into(),
-                path: "/new".into(),
+    let engine = &fixture.engine.checkouts;
+    let backend = fixture.daemon.resource_backend();
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let switch_work = admit(
+        &fixture.daemon,
+        "switch-work",
+        ConvoySpec::builder()
+            .project_ref("flotilla".into())
+            .workflow_ref("dev".into())
+            .r#ref("requested".into())
+            .adopted_checkout_refs(BTreeMap::from([(fixture.keys[0].clone(), "switch-checkout".into())]))
+            .repositories(vec![ConvoyRepositorySpec {
+                url: "https://github.com/team/repo0".into(),
                 repo_ref: fixture.keys[0].clone(),
-                host_ref: "test".into(),
-                is_main: false,
-            }),
+                source_ref: "main".into(),
+                target_ref: "main".into(),
+                workspace_slug: "repo0".into(),
+                subpaths: vec![],
+            }])
+            .build(),
+        single_agent("coder"),
+    )
+    .await;
+    let launch = engine.put_ready(
+        "switch-checkout",
+        &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+            r#ref: "requested".into(),
+            path: "/switch".into(),
+            repo_ref: fixture.keys[0].clone(),
+            host_ref: "test-host".into(),
+            is_main: false,
+        }),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(switch_work.clone())),
+    );
+    engine.checkouts.inspected(&launch, Inspection { change_request: Some(8), ..Default::default() }).expect("inspection");
+    // The forge observation of #8 finds it open.
+    let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
+    let record_name = cr_name("github.com", "team/repo0", 8);
+    let record = records
+        .create(
+            &test_meta(&record_name),
+            &flotilla_resources::ChangeRequestSpec::builder()
+                .service("github.com".into())
+                .scope("team/repo0".into())
+                .number(8)
+                .observing_authority("test".into())
+                .build(),
         )
         .await
-        .expect("checkout");
-    let error = fixture.daemon.validate_new_checkout_branch(&checkout).await.expect("forge lookup").expect("fresh conflict");
-    assert!(error.contains("reused") && error.contains("#7"), "{error}");
+        .expect("observation record");
+    let now = Utc::now();
+    records
+        .update_status(
+            &record_name,
+            &record.metadata.resource_version,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, now),
+                head_sha: flotilla_resources::Observation::known("head".into(), now),
+                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pending, now),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::known(false, now),
+                },
+                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, now),
+            },
+        )
+        .await
+        .expect("open observation");
+    fixture.daemon.discover_convoy_branch_subjects("flotilla", &switch_work, "requested").await.expect("discovery");
+    let convoy = convoys.get(&switch_work).await.expect("convoy");
+    assert_eq!(convoy.status.expect("subjects").subjects[0].subject.id, "8");
+    // Repair an already persisted stale produces link, as in the operator's report.
+    fixture.daemon.link_convoy_subject("flotilla", &switch_work, "repo0!7").await.expect("stale link");
+    fixture.daemon.unlink_convoy_subject("flotilla", &switch_work, "repo0!7").await.expect("unlink stale merged subject");
+    fixture.daemon.discover_convoy_branch_subjects("flotilla", &switch_work, "requested").await.expect("repair discovery");
+    let repaired = convoys.get(&switch_work).await.expect("convoy").status.expect("subjects");
+    assert_eq!(repaired.subjects.len(), 1);
+    assert_eq!(repaired.subjects[0].subject.id, "8");
+    fixture.daemon.unlink_convoy_subject("flotilla", &switch_work, "repo0!8").await.expect("unlink");
+    fixture.daemon.discover_convoy_branch_subjects("flotilla", &switch_work, "requested").await.expect("repeat discovery");
+    assert!(convoys.get(&switch_work).await.expect("convoy").status.expect("subjects").subjects.is_empty());
+}
+
+// #2698: an earlier absence observation cannot authorize creation after a terminal PR appears
+// for that branch. The branch lookup that validation waits on asks the forge afresh, and what it
+// finds is recorded on the change request branch records validation reads.
+#[tokio::test]
+async fn branch_lookup_for_validation_does_not_reuse_cached_absence() {
+    for state in [flotilla_protocol::ChangeRequestStatus::Merged, flotilla_protocol::ChangeRequestStatus::Closed] {
+        let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
+        let provider = Arc::new(FakeChangeRequest::new());
+        let observed = Arc::new(flotilla_observation::forge_observation::ObservedChangeRequestTracker {
+            inner: provider.clone(),
+            reads: flotilla_observation::forge_observation::ForgeReads::new(fixture.daemon.resource_backend(), "flotilla".into()),
+            source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "team/repo0".into() },
+        });
+        fixture.daemon.admission.repository_change_requests().write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
+            observed.clone();
+        assert!(observed.find_change_request_by_branch("reused").await.expect("absence").is_none());
+        provider
+            .add_change_requests(vec![(
+                "7".into(),
+                ChangeRequest {
+                    title: "Old work".into(),
+                    branch: "reused".into(),
+                    status: state.clone(),
+                    body: None,
+                    provider_name: "github".into(),
+                    provider_display_name: "GitHub".into(),
+                },
+            )])
+            .await;
+        // Ordinary observation may reuse the earlier absence; the lookup must still inspect the
+        // forge anew through the same production observation adapter.
+        assert!(observed.find_change_request_by_branch("reused").await.expect("cached absence").is_none());
+        let (repository, _) = fixture.daemon.repository_address_of("flotilla", &fixture.keys[0]).await.expect("repository address");
+        fixture.daemon.observe_change_request_branch(&repository, "reused").await.expect("forge lookup");
+        let (service, scope) = flotilla_resources::address::stored_service_scope(&repository).expect("forge repository");
+        let found = fixture.daemon.change_request_branches().expect("installed").on_branch(&service, &scope, "reused").await.expect("read");
+        assert_eq!(found.iter().map(|copy| copy.number).collect::<Vec<_>>(), vec![7], "{found:?}");
+        let expected = match state {
+            flotilla_protocol::ChangeRequestStatus::Merged => flotilla_resources::ObservedChangeRequestState::Merged,
+            _ => flotilla_resources::ObservedChangeRequestState::Closed,
+        };
+        assert_eq!(found[0].state, Some(expected));
+    }
 }

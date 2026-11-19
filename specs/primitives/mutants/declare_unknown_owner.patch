@@ -1,10 +1,10 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -160,7 +160,6 @@
-   pure def step(s: State, e: Event): Next = match s {
-     | Open(w) => match e {
-       | Declare(d) => if (w.promises.keys().contains(d.promise) or d.promise < w.promiseFloor) Refused(PromiseExists)
--          else if (not(w.seats.keys().contains(d.owner))) Refused(UnknownSeat)
-           else if (w.retiredSeats.contains(d.owner)) Refused(SeatRetired)
-           else withPromise(w, d.promise, { promise: d.definition, source: Crew, owner: d.owner, state: Pending, submissions: [] })
-       | Submit(a) => onOpen(w, a.promise, p =>
+@@ -178,7 +178,6 @@
+   // One outcome per edge, over an open convoy.
+   def declared(id: int, d: { promise: PromiseId, definition: Promise, owner: Seat }): Outcome =
+     if (promises.get(id).keys().contains(d.promise)) Refused(PromiseExists)
+-    else if (not(known(id, d.owner))) Refused(UnknownSeat)
+     else if (seatRetired(id, d.owner)) Refused(SeatRetired)
+     else Accepted
+   def submitted(id: int, a: { promise: PromiseId, by: Seat, reference: str, durable: bool }): Outcome = onOpen(id, a.promise, p =>

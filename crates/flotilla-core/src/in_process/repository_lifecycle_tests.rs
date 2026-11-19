@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use hegel::generators as gs;
 
 use super::*;
+use crate::in_process::tests::admit;
 use crate::testkits::discovery::fake_discovery;
 use crate::testkits::discovery::fake_discovery_with_runner;
 use crate::testkits::discovery::FakeIssueProvider;
@@ -49,34 +50,28 @@ impl Factory for CountingVcsFactory {
     }
 }
 
-async fn observe(daemon: &InProcessDaemon, backend: &ResourceBackend, name: &str, path: &Path, key: &RepositoryKey) {
-    backend
-        .clone()
-        .using::<ResourceCheckout>(&daemon.provisioning_namespace().await)
-        .create(
-            &InputMeta::builder().name(name.to_string()).build(),
-            &ResourceCheckoutSpec::Observed(
-                flotilla_resources::ObservedCheckoutSpec::builder()
-                    .r#ref("main".into())
-                    .path(path.to_string_lossy().into_owned())
-                    .repo_ref(key.clone())
-                    .host_ref(daemon.environment_manager.local_host_id().to_string())
-                    .is_main(true)
-                    .build(),
-            ),
-        )
-        .await
-        .expect("observe checkout");
+fn observe(daemon: &InProcessDaemon, name: &str, path: &Path, key: &RepositoryKey) {
+    super::tests::discover_checkout(
+        daemon,
+        name,
+        flotilla_resources::ObservedCheckoutSpec::builder()
+            .r#ref("main".into())
+            .path(path.to_string_lossy().into_owned())
+            .repo_ref(key.clone())
+            .host_ref(daemon.environment_manager.local_host_id().to_string())
+            .is_main(true)
+            .build(),
+    );
 }
 
 // #1770: observation alone never constructs a provider. Concurrent demands
 // share one discovered provider, deletion releases it, and recreation gets a
 // new provider even when the resource name and path are reused.
-// Generator spans both backends, one to three lifetimes, duplicate requests,
-// both deletion orders, and an empty inventory between lifetimes.
+// Generator spans one to three lifetimes, duplicate requests, both deletion
+// orders, and an empty inventory between lifetimes. The engine's checkouts'
+// lifetimes are `checkout_providers::lifecycle_contract`'s (#3108).
 #[hegel::test]
 fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
-    let durable = tc.draw(gs::booleans());
     let cycles = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
     let duplicates = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
     let reverse = tc.draw(gs::booleans());
@@ -97,7 +92,8 @@ fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
-        let backend = if durable { &daemon.resource_backend } else { &daemon.observed_resource_backend };
+        // The engine's readings, which a running daemon always has.
+        super::tests::test_engine(&daemon);
         let repository = RepositorySpec::remote("https://github.com/example/lifetime").expect("repository");
         let key = repository.key();
         daemon
@@ -108,7 +104,7 @@ fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
             .expect("create repository");
         assert_eq!(probes.load(Ordering::SeqCst), 0);
         for cycle in 0..cycles {
-            observe(&daemon, backend, "lifetime", path, &key).await;
+            observe(&daemon, "lifetime", path, &key);
             assert_eq!(probes.load(Ordering::SeqCst), cycle * 2, "observation is not provider demand");
             let (first, concurrent) = tokio::time::timeout(Duration::from_secs(2), async {
                 tokio::join!(daemon.local_vcs_for_checkout(path), daemon.local_vcs_for_checkout(path))
@@ -122,10 +118,10 @@ fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
             }
             assert_eq!(probes.load(Ordering::SeqCst), cycle * 2 + 1, "one construction for this Checkout lifetime");
             let old = Arc::downgrade(&first);
-            backend.clone().using::<ResourceCheckout>("flotilla").delete("lifetime").await.expect("delete checkout");
+            daemon.discovered_checkouts.forget_path(&key, path);
             // Recreate before waiting for a watcher: instance identity must also
             // prevent stale reuse across a fast delete/create pair.
-            observe(&daemon, backend, "lifetime", path, &key).await;
+            observe(&daemon, "lifetime", path, &key);
             let replacement = daemon.local_vcs_for_checkout(path).await.expect("replacement demand");
             assert!(!Arc::ptr_eq(&first, &replacement));
             assert_eq!(probes.load(Ordering::SeqCst), cycle * 2 + 2);
@@ -140,7 +136,7 @@ fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
             let live = daemon.local_vcs_for_checkout(path).await.expect("live replacement");
             let retired = Arc::downgrade(&live);
             drop(live);
-            backend.clone().using::<ResourceCheckout>("flotilla").delete("lifetime").await.expect("retire replacement");
+            daemon.discovered_checkouts.forget_path(&key, path);
             tokio::time::timeout(Duration::from_secs(2), async {
                 while retired.upgrade().is_some() {
                     tokio::task::yield_now().await;
@@ -170,6 +166,8 @@ async fn generic_checkout_executes_without_presentation_roots() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::tests::test_engine(&daemon);
     let spec = RepositorySpec::remote("https://github.com/acme/commands").expect("repository");
     let key = spec.key();
     daemon
@@ -179,7 +177,7 @@ async fn generic_checkout_executes_without_presentation_roots() {
         .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
         .await
         .expect("declare Repository");
-    observe(&daemon, &daemon.observed_resource_backend, "commands", path, &key).await;
+    observe(&daemon, "commands", path, &key);
     assert!(daemon.list_repos().await.expect("presentation rows").is_empty());
     let mut events = daemon.subscribe();
     let id = daemon
@@ -273,6 +271,8 @@ async fn project_issue_binding_keeps_conditional_lease_after_checkout_removal() 
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::tests::test_engine(&daemon);
     let spec = RepositorySpec::remote("https://github.com/acme/issues").expect("repository");
     let key = spec.key();
     daemon
@@ -299,7 +299,7 @@ async fn project_issue_binding_keeps_conditional_lease_after_checkout_removal() 
         .await
         .expect("Project binding");
     let path = Path::new("/checkouts/issues");
-    observe(&daemon, &daemon.observed_resource_backend, "issues", path, &key).await;
+    observe(&daemon, "issues", path, &key);
     let identity = flotilla_executor::action_support::repository_event_identity(&spec, None);
     let mut stale = ProviderRegistry::new();
     stale.issue_trackers.insert(
@@ -328,8 +328,8 @@ async fn project_issue_binding_keeps_conditional_lease_after_checkout_removal() 
     assert!(calls[1].1.contains(&"If-None-Match: \"issue-window\"".to_string()));
 }
 
-// Namespace changes retire idle providers immediately and move both resource
-// watchers to the new namespace; deletion there still needs no subsequent demand.
+// Namespace changes retire idle providers immediately; forgetting the checkout in the new
+// namespace still needs no subsequent demand.
 #[tokio::test]
 async fn checkout_provider_watch_follows_namespace_changes() {
     let temp = tempfile::tempdir().expect("config");
@@ -345,17 +345,18 @@ async fn checkout_provider_watch_follows_namespace_changes() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::tests::test_engine(&daemon);
     let spec = RepositorySpec::remote("https://github.com/example/namespace").expect("repository");
     let key = spec.key();
-    for namespace in ["flotilla", "other"] {
-        daemon
-            .resource_backend
-            .using::<Repository>(namespace)
-            .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
-            .await
-            .expect("repository");
-    }
-    observe(&daemon, &daemon.observed_resource_backend, "namespace", path, &key).await;
+    // The decided store has no namespaces: one Repository record reads in both.
+    daemon
+        .resource_backend
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
+        .await
+        .expect("repository");
+    observe(&daemon, "namespace", path, &key);
     let first = daemon.local_vcs_for_checkout(path).await.expect("first provider");
     let first_lifetime = Arc::downgrade(&first);
     // Let both in-memory watch subscriptions reach their pending receive before
@@ -370,20 +371,17 @@ async fn checkout_provider_watch_follows_namespace_changes() {
     })
     .await
     .expect("namespace change retires the previous cached lifetime without demand");
-    for backend in [&daemon.resource_backend, &daemon.observed_resource_backend] {
-        observe(&daemon, backend, "namespace", path, &key).await;
-        let provider = daemon.local_vcs_for_checkout(path).await.expect("new namespace provider");
-        let retired = Arc::downgrade(&provider);
-        drop(provider);
-        backend.using::<ResourceCheckout>("other").delete("namespace").await.expect("delete checkout");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while retired.upgrade().is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("watch in the new namespace retires the provider without demand");
-    }
+    let provider = daemon.local_vcs_for_checkout(path).await.expect("new namespace provider");
+    let retired = Arc::downgrade(&provider);
+    drop(provider);
+    daemon.discovered_checkouts.forget_path(&key, path);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while retired.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("forgetting the checkout in the new namespace retires the provider without demand");
 }
 
 // #1722 bindings select an issue source independently of the live checkout
@@ -416,6 +414,8 @@ async fn project_issue_binding_uses_source_forge_instead_of_mirror_transport() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::tests::test_engine(&daemon);
     let forge = ForgeSpec::builder()
         .forge_id("source-forge".into())
         .kind(ForgeKind::Forgejo)
@@ -505,7 +505,10 @@ async fn github_observation_credential_failure_is_visible_and_recovers() {
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::tests::test_engine(&daemon);
     let backend = daemon.resource_backend();
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
     let forge = flotilla_resources::ForgeSpec::builder()
         .forge_id("github".into())
         .kind(flotilla_resources::ForgeKind::Github)
@@ -535,8 +538,8 @@ async fn github_observation_credential_failure_is_visible_and_recovers() {
     assert_eq!(conditions.len(), 1);
     assert_eq!(conditions[0].message, error);
     assert!(!conditions[0].blocks_readiness() && !conditions[0].blocks_forge_observation());
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
     let spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("work".into())
         .repositories(vec![ConvoyRepositorySpec::builder()
             .repo_ref(key)
@@ -547,17 +550,21 @@ async fn github_observation_credential_failure_is_visible_and_recovers() {
             .subpaths(Vec::new())
             .build()])
         .build();
-    convoys.create(&InputMeta::builder().name("affected".into()).build(), &spec).await.expect("convoy");
-    convoys
-        .create(&InputMeta::builder().name("unrelated".into()).build(), &ConvoySpec::builder().workflow_ref("work".into()).build())
-        .await
-        .expect("unrelated convoy");
-    assert!(daemon.explain_convoy_internal(Some("flotilla"), "affected").await.expect("explain").warnings.contains(&error));
-    assert!(daemon.explain_convoy_internal(Some("flotilla"), "unrelated").await.expect("explain").warnings.is_empty());
+    let single_agent = flotilla_engine_convoys_testkit::single_agent;
+    let affected = admit(&daemon, "affected", spec, single_agent("coder")).await;
+    let unrelated = admit(
+        &daemon,
+        "unrelated",
+        ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("work".into()).build(),
+        single_agent("coder"),
+    )
+    .await;
+    assert!(daemon.explain_convoy_internal(Some("flotilla"), &affected).await.expect("explain").warnings.contains(&error));
+    assert!(daemon.explain_convoy_internal(Some("flotilla"), &unrelated).await.expect("explain").warnings.is_empty());
     tokio::time::advance(Duration::from_secs(29)).await;
     assert_eq!(daemon.observation_credential_conditions().await[0].message, error);
     tokio::time::advance(Duration::from_secs(2)).await;
     assert!(daemon.observation_credential_conditions().await.is_empty());
     assert!(daemon.issue_provider_for_source(&source).await.is_ok());
-    assert!(daemon.explain_convoy_internal(Some("flotilla"), "affected").await.expect("repaired").warnings.is_empty());
+    assert!(daemon.explain_convoy_internal(Some("flotilla"), &affected).await.expect("repaired").warnings.is_empty());
 }

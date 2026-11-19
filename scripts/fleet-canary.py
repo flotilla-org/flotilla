@@ -5,6 +5,7 @@ All external operations pass through Commands, the process boundary used by
 contract tests. No test-only success path exists in the production gate.
 """
 import argparse
+import http.client
 import json
 import os
 import re
@@ -12,15 +13,33 @@ from pathlib import Path
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
+from urllib.parse import quote
 
 
 class CanaryFailure(RuntimeError):
     pass
+
+
+class Refused(CanaryFailure):
+    """The probe reached an end it cannot recover from; waiting longer changes nothing."""
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTP to the daemon's Unix socket, which serves the same router as its loopback listener."""
+    def __init__(self, path, timeout):
+        super().__init__('flotilla.local', timeout=timeout)
+        self.path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.path)
 
 
 def canary_image(image):
@@ -48,6 +67,38 @@ class Commands:
             raise CanaryFailure(f"command failed: {' '.join(map(str, args))}\n"
                                 f"stdout: {result.stdout.strip()}\nstderr: {result.stderr.strip()}")
         return result.stdout
+
+    def rows(self, daemon_socket, table):
+        """Every row of the daemon's described table `table` (GET /tables/<table>/rows).
+
+        `flotilla table` reads the same route but follows it live, which a log table refuses;
+        this reads once."""
+        self.log.write(json.dumps(['GET', str(daemon_socket), table]) + '\n')
+        self.log.flush()
+        connection = UnixHTTPConnection(str(daemon_socket), timeout=30)
+        try:
+            connection.request('GET', f'/tables/{quote(table)}/rows?limit=10000',
+                               headers={'Accept': 'application/x-ndjson', 'Connection': 'close'})
+            response = connection.getresponse()
+            body = response.read()
+        except (OSError, http.client.HTTPException) as error:
+            raise CanaryFailure(f'table {table}: {error}') from error
+        finally:
+            connection.close()
+        if response.status != 200:
+            raise CanaryFailure(f'table {table}: {response.status} {body.decode(errors="replace").strip()}')
+        rows = []
+        for line in body.splitlines():
+            if not line.strip():
+                continue
+            message = json.loads(line)
+            if message.get('type') == 'rows':
+                if message.get('partial'):
+                    raise CanaryFailure(f'table {table}: more rows than one page')
+                rows.extend(message['rows'])
+            elif message.get('type') == 'resync':
+                raise CanaryFailure(f'table {table}: resync: {message.get("reason")}')
+        return rows
 
     def start(self, args, log):
         return subprocess.Popen(args, cwd='/', env=self.environment, stdout=log, stderr=log,
@@ -89,6 +140,14 @@ class Commands:
                 raise CanaryFailure(f'host Cleat daemon could not be reaped: {error}') from error
             finally:
                 os.close(descriptor)
+
+
+def names(column, name):
+    """Selects a row whose `column` names `name`: a reference to it, or an address ending in it."""
+    def select(row):
+        value = row.get(column) or ''
+        return value == name or value.endswith(f':{name}') or value.endswith(f'/{name}')
+    return select
 
 
 def objects(response):
@@ -193,7 +252,8 @@ def live_canary_image(log):
                  and (item.get('status') or {}).get('phase') == 'Ready']
         if not ready:
             raise CanaryFailure('canary image: no ready local Docker environment; set FLEET_CANARY_IMAGE to a built digest')
-        selected = max(ready, key=lambda item: (item['metadata'].get('creation_timestamp', ''), item['metadata']['name']))
+        # Records carry their creation time as creationTimestamp, on the old store and the engine alike.
+        selected = max(ready, key=lambda item: (item['metadata'].get('creationTimestamp', ''), item['metadata']['name']))
         image = selected['status'].get('local_image_id')
         canary_image(image)
         return image
@@ -239,6 +299,9 @@ class Canary:
     def list(self, kind):
         return objects(json.loads(self.cli('resource', 'list', kind, '--local-only')))
 
+    def rows(self, table):
+        return self.commands.rows(self.socket, table)
+
     def wait(self, assertion, probe):
         deadline = time.monotonic() + self.timeout
         last = 'no evidence'
@@ -249,10 +312,55 @@ class Canary:
                 result = probe()
                 if result:
                     return result
+            except Refused as error:
+                raise CanaryFailure(f'{assertion}: {error}') from error
             except (CanaryFailure, json.JSONDecodeError) as error:
                 last = str(error)
             time.sleep(1)
         raise CanaryFailure(f'{assertion}: timed out; {last}')
+
+    # The engine never deletes what a convoy held: each record ends in a state and stays
+    # readable, and an ended convoy retires once nothing holds it. The probe reads each
+    # record's state from its table and the states it passed through from the table's log,
+    # since a record can move past a state between two reads.
+
+    def reached(self, table, names, state):
+        """Those of `names` whose log in `table` shows they reached `state`."""
+        return {entry.get('name') for entry in self.rows(f'{table}.log')
+                if entry.get('to') == state and entry.get('name') in names}
+
+    def realised(self, table, held):
+        """The one live row of `table` that `held` selects, once its log shows it Realised.
+
+        A launch that ends is not restarted in place: its replacement is a new record, so
+        ended rows beside the live one are earlier attempts. One that gave up is final."""
+        rows = [row for row in self.rows(table) if held(row)]
+        for row in rows:
+            if row.get('state') == 'GaveUp':
+                raise Refused(f'{table} {row["resource.name"]} gave up: {row.get("cause_detail")}')
+        live = [row for row in rows if row.get('state') in ('Requested', 'Realised')]
+        if len(live) > 1:
+            raise Refused(f'expected one {table}, found {sorted(row["resource.name"] for row in live)}')
+        if not live:
+            ended = [f'{row["resource.name"]} {row.get("ending")}' for row in rows]
+            raise CanaryFailure(f'no live {table}' + (f'; ended: {", ".join(ended)}' if ended else ''))
+        row = live[0]
+        return row if self.reached(table, {row['resource.name']}, 'Realised') else None
+
+    def released(self, table, names):
+        """Whether every one of `names` is Gone, each Released rather than lost or failed."""
+        rows = {row['resource.name']: row for row in self.rows(table) if row['resource.name'] in names}
+        for name in names:
+            row = rows.get(name)
+            if row is None:
+                raise Refused(f'{table} {name} is no longer listed')
+            if row.get('state') == 'GaveUp' or (row.get('state') == 'Gone' and row.get('ending') != 'Released'):
+                raise Refused(f'{table} {name} ended {row.get("state")} {row.get("ending") or ""}: '
+                              f'{row.get("ending_reason") or row.get("cause_detail") or "no reason given"}')
+        waiting = sorted(f'{name} {rows[name].get("state")}' for name in names if rows[name].get('state') != 'Gone')
+        if waiting:
+            raise CanaryFailure(f'{table} not yet released: {", ".join(waiting)}')
+        return True
 
     def apply(self, kind, name, spec):
         document = self.root / f'{name}.json'
@@ -325,36 +433,57 @@ class Canary:
                  '--skill', 'rjwittams/rjw-skills@testing', '--no-attach')
 
     def run_convoy(self):
-        self.wait('vessel launches', lambda: any(item.get('status', {}).get('phase') == 'Ready' for item in self.list('vessels')))
-        sessions = self.wait('terminal session reaches Running (Cleat accepted launch environment)',
-                             lambda: [item for item in self.list('terminalsessions')
-                                      if item.get('status', {}).get('phase') == 'Running'])
-        if len(sessions) != 1:
-            raise CanaryFailure('expected exactly one canary terminal session')
+        launch = self.wait('convoy admitted', self.convoy)['resource.name']
+        vessel = self.wait('vessel Realised', lambda: self.realised('vessel', names('convoy', launch)))['resource.name']
+        environment = self.wait("vessel's environment Realised",
+                                lambda: self.realised('environment', names('holder', vessel)))
         # Real Cleat refuses managed coordinates supplied via --env; reaching
-        # Running is the acceptance oracle for this assertion, not an env dump.
-        environments = self.list('environments')
-        containers = [item['status']['docker_container_id'] for item in environments
-                      if item.get('spec', {}).get('docker') and item.get('status', {}).get('docker_container_id')]
-        if len(containers) != 1:
-            raise CanaryFailure('expected exactly one canary Docker container')
-        self.containers.update(containers)
-        container = containers[0]
+        # Realised is the acceptance oracle for this assertion, not an env dump.
+        session = self.wait('terminal session Realised (Cleat accepted launch environment)',
+                            lambda: self.realised('terminal_session', names('holder', vessel)))
+        # Docker realises the vessel's environment under its container.
+        container = environment.get('identity')
+        if not container:
+            raise CanaryFailure(f"environment {environment['resource.name']} is realised under no container")
+        self.containers.add(container)
         report = self.wait('stub agent dumps environment', lambda: json.loads(
             self.commands.run(['docker', 'exec', container, 'cat', '/tmp/fleet-canary-report.json'])))
         (self.root / 'crew-report.json').write_text(json.dumps(report, indent=2))
         verify_baseline(report)
         self.commands.run(['docker', 'exec', container, 'touch', '/tmp/fleet-canary-continue'])
-        self.wait('convoy settles', lambda: any(item.get('status', {}).get('phase') == 'Landed' for item in self.list('convoys')))
-        self.wait('canary resources are reaped', lambda: not self.list('vessels') and not self.list('terminalsessions')
-                  and not any(item.get('spec', {}).get('docker') for item in self.list('environments')))
+        self.wait('convoy settles (Delivered)', lambda: self.delivered(launch))
+        held = {'vessel': {vessel}, 'environment': {environment['resource.name']},
+                'terminal_session': {session['resource.name']}}
+        checkouts = {row['resource.name'] for row in self.rows('checkout') if names('holder', launch)(row)}
+        if checkouts:
+            held['checkout'] = checkouts
+        self.wait('canary resources are released', lambda: all(self.released(table, held[table]) for table in held))
+        # Retirement needs every hold on the convoy released: the end of its teardown.
+        self.wait('convoy retires', lambda: self.reached('convoy', {launch}, 'Retired'))
         # Inspect only IDs owned by this daemon; never use fleet-wide rm/prune.
         remaining = set(self.commands.run(['docker', 'ps', '-aq', '--no-trunc']).split())
         if remaining & self.containers:
             raise CanaryFailure('canary Docker containers were not reaped')
-        # The only crew endpoint is inside the reaped container. Its deletion,
-        # together with the terminal finalizer, proves the session is gone;
+        # The only crew endpoint is inside the reaped container. Its removal,
+        # together with the terminal session Released, proves the session is gone;
         # querying host Cleat here would start an unnecessary host daemon.
+
+    def convoy(self):
+        """The probe's convoy launch, once admission has opened it."""
+        rows = [row for row in self.rows('convoy') if names('project', 'fleet-canary')(row)]
+        if len(rows) > 1:
+            raise Refused(f'expected one canary convoy, found {sorted(row["resource.name"] for row in rows)}')
+        return rows[0] if rows else None
+
+    def delivered(self, launch):
+        """Whether the convoy's log shows it Delivered; an abandoned convoy never will be."""
+        log = self.rows('convoy.log')
+        if any(entry.get('name') == launch and entry.get('to') == 'Delivered' for entry in log):
+            return True
+        if any(entry.get('name') == launch and entry.get('to') == 'Abandoned' for entry in log):
+            row = next((row for row in self.rows('convoy') if row['resource.name'] == launch), {})
+            raise Refused(f'convoy {launch} was abandoned ({row.get("cause")}): {row.get("reason")}')
+        return False
 
     def stop(self):
         if self.daemon is not None and self.daemon.poll() is None:
@@ -371,6 +500,11 @@ def isolated_environment(release, root):
                    'CLEAT_RUNTIME_DIR': str(root / 'cleat'), 'FLOTILLA_FLEET_CANARY': '1',
                    'FLOTILLA_SKILLS_DIR': str(release / 'share/flotilla/skills'),
                    'FLOTILLA_CODEX_HOME_TEMPLATE': str(release / 'share/flotilla/codex-home')}
+    # The private HOME hides the operator's Docker contexts, so an endpoint other than the
+    # system socket (rootless Docker) arrives only as DOCKER_HOST. It names an endpoint and
+    # carries no credential; ambient DOCKER_CONFIG stays out.
+    if os.environ.get('DOCKER_HOST'):
+        environment['DOCKER_HOST'] = os.environ['DOCKER_HOST']
     return environment
 
 

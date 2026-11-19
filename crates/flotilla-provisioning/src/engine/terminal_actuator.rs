@@ -1,0 +1,583 @@
+//! The TerminalSession controller's provider work (#3108): the shared [`Controller`] realises a
+//! terminal launch by starting it in its environment's terminal pool, and releases it by killing
+//! it once its holder has ended. This home's [`TerminalProbe`] looks at its running launches at an
+//! interval, the host edge that makes their facts.
+//!
+//! - **Realise** starts the launch's process, adopting nothing: a launch is one run, and its
+//!   pool session is replaced if a stale one holds the name. It stages what the launch was given
+//!   (its cleat endpoint, its harness, its build parallelism) as the launch's
+//!   [`TerminalLaunchFacts`] for the Realise edge, and records the command it ran as a local
+//!   observation. A launch refused for good gives up at once; its holder renews it. A launch that
+//!   waits on something that may yet arrive here (its brief's artifact in this host's blob store,
+//!   its environment's adoption after a restart) is a retryable try that fails; the probe asks for
+//!   the next try once nothing is missing.
+//! - **Holder**: a crew's session is held for its vessel's lease, homed here; a tool's for its
+//!   environment. Either ending releases the launch. A launch is usable only while its environment
+//!   is realised.
+//! - **Release** kills the process, unless the environment has ended and taken it with it. A turn
+//!   already typed into it settles first, so its receipt is recorded. The launch's exit receipt and
+//!   its harness's files go with it.
+//! - **Backing**: an agent whose exit receipt is written has exited; a session the pool no longer
+//!   runs is gone, as the pool says why; a screen that shows the harness refused its credential
+//!   failed it. Each ends the launch, which is never revived: its holder asks for the next.
+//!
+//! [`Controller`]: super::controller::Controller
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use chrono::Utc;
+use flotilla_resources::{
+    agent_activity::ProgressFacts,
+    terminal_records::{TerminalLaunchFacts as FactsView, TerminalRecord, TerminalRecords, PROCESS_EXITED},
+    RetryBackoff, ScreenObstruction, TerminalAttention, TerminalAttentionState, TerminalOccupancy, LOCAL_RETRY_LIMIT,
+    PROVISIONING_RETRY_BACKOFF,
+};
+use flotilla_schema::{reads::carry, Identity, Kind, KindCode, Timestamp};
+use flotilla_schema_sqlite::{Read, StoreError};
+use flotilla_state_machines::{
+    machines::{
+        lifecycle::{Lifecycle, LifecycleState},
+        vessel::VesselKind,
+    },
+    Cause, CauseCategory, Resource,
+};
+use tokio::sync::mpsc;
+use tracing::{debug, warn};
+
+use super::{
+    controller::{Actuator, Backing, BackingEvent, Holding, ProviderFailure, Usability},
+    environment_actuator::state_of,
+    environments::RecipeOf,
+    launch_log::StagedFacts,
+    reads::StoreReads,
+    terminals::{holder_vessel, stored_facts},
+};
+use crate::stored::{
+    environment::EnvironmentKind,
+    terminal_facts::TerminalLaunchFacts,
+    terminal_session::{TerminalSessionKind, TerminalSessionRequest},
+};
+
+/// Whether a launch's pool session runs, as its pool reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalLiveness {
+    Running,
+    /// Its process exited.
+    Stopped,
+    /// The pool could not be asked: no evidence the session is gone.
+    Unavailable(String),
+    /// Positive evidence the session is gone for good, and why.
+    Lost(String),
+}
+
+/// What starting a launch gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalLaunched {
+    /// The pool session it runs as: the launch's identity.
+    pub session_id: String,
+    pub facts: FactsView,
+    /// The command it ran, which a passthrough attach runs again.
+    pub launch_command: String,
+}
+
+/// Why a launch did not start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchFailure {
+    pub message: String,
+    /// Whether it waits on something that may yet arrive on this host, such as its environment's
+    /// adoption: the probe asks for the next try once nothing is missing. Otherwise the launch
+    /// gives up, and its holder renews it.
+    pub retryable: bool,
+}
+
+impl LaunchFailure {
+    /// A launch refused for good.
+    pub fn refused(message: impl Into<String>) -> Self {
+        Self { message: message.into(), retryable: false }
+    }
+
+    /// A launch that waits on what `message` names.
+    pub fn waits(message: impl Into<String>) -> Self {
+        Self { message: message.into(), retryable: true }
+    }
+}
+
+impl From<String> for LaunchFailure {
+    fn from(message: String) -> Self {
+        Self::refused(message)
+    }
+}
+
+/// One read of a running launch's screen and controller seat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenReading {
+    /// A digest of its output: a new one is crew progress.
+    pub output_digest: Option<String>,
+    pub attention: Option<TerminalAttention>,
+    /// What the same read says blocks an idle-looking agent (#3460).
+    pub obstruction: Option<ScreenObstruction>,
+    pub occupancy: TerminalOccupancy,
+}
+
+/// This host's terminal pools and agent harnesses, as the TerminalSession controller uses them.
+#[async_trait]
+pub trait TerminalProvider: Send + Sync {
+    /// What `launch` still waits for on this host before it can start, such as its brief's
+    /// artifact or its environment's adoption; none once it can start.
+    async fn launch_waits_for(&self, launch: &TerminalRecord) -> Result<Option<String>, String>;
+    /// Starts `launch`'s process: its harness prepared, its credentials delivered, its brief
+    /// written.
+    async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, LaunchFailure>;
+    async fn liveness(&self, launch: &TerminalRecord, session_id: &str) -> Result<TerminalLiveness, String>;
+    /// The exit code an agent launch's process left in its receipt, once it exited.
+    async fn exit_code(&self, launch: &TerminalRecord) -> Result<Option<i32>, String>;
+    /// Why an agent that exited with `code` failed, if its harness says it did.
+    async fn exit_failure(&self, launch: &TerminalRecord, session_id: &str, code: i32) -> Result<Option<String>, String>;
+    /// Why an agent's settled screen says it cannot work (a refused credential), if it does.
+    async fn screen_failure(&self, launch: &TerminalRecord, session_id: &str) -> Result<Option<String>, String>;
+    /// Why `launch`'s crew cannot reach this daemon, if it cannot.
+    async fn daemon_reach(&self, launch: &TerminalRecord) -> Result<Option<String>, String>;
+    /// Reads `launch`'s screen; none when it cannot be read now.
+    async fn read_screen(&self, launch: &TerminalRecord, session_id: &str) -> Result<Option<ScreenReading>, String>;
+    /// Waits, within the provider's bound, for a turn already typed into `session_id` to settle.
+    async fn settle_turn(&self, session_id: &str);
+    async fn kill(&self, launch: &TerminalRecord, session_id: &str) -> Result<(), String>;
+    /// Removes `launch`'s exit receipt, named by its launch.
+    async fn remove_exit_receipt(&self, launch: &TerminalRecord) -> Result<(), String>;
+    /// Removes the files `launch`'s harness was prepared with.
+    async fn cleanup_artifacts(&self, launch: &TerminalRecord) -> Result<(), String>;
+    /// Tells a person that `launch` is released without its process known to be stopped, and why:
+    /// its release kept failing and nothing else ends it.
+    async fn left_running(&self, launch: &TerminalRecord, reason: &str);
+}
+
+const ENVIRONMENT: KindCode = <Resource<Lifecycle<EnvironmentKind>> as Kind>::CODE;
+const VESSEL: KindCode = <Resource<Lifecycle<VesselKind>> as Kind>::CODE;
+
+fn transient(message: impl Into<String>) -> Cause {
+    Cause::new(CauseCategory::Transient, message)
+}
+
+/// What became of a realised launch, or `None` while it runs.
+async fn ended<P: TerminalProvider + ?Sized>(provider: &P, record: &TerminalRecord, session_id: &str) -> Result<Option<Backing>, Cause> {
+    // An agent's exit is read before its session's liveness: its session can outlive it.
+    if record.is_agent() {
+        if let Some(code) = provider.exit_code(record).await.map_err(transient)? {
+            return Ok(Some(match provider.exit_failure(record, session_id, code).await.map_err(transient)? {
+                Some(reason) => Backing::Failed { reason },
+                None => Backing::Absent {
+                    reason: Some(format!("{PROCESS_EXITED}: agent exited with code {code}; resume relaunches it in the existing checkout")),
+                },
+            }));
+        }
+    }
+    match provider.liveness(record, session_id).await.map_err(transient)? {
+        TerminalLiveness::Running => {}
+        TerminalLiveness::Stopped => return Ok(Some(Backing::Absent { reason: Some(PROCESS_EXITED.into()) })),
+        TerminalLiveness::Lost(reason) => return Ok(Some(Backing::Absent { reason: Some(reason) })),
+        TerminalLiveness::Unavailable(message) => return Err(transient(message)),
+    }
+    if record.is_agent() {
+        if let Some(reason) = provider.screen_failure(record, session_id).await.map_err(transient)? {
+            return Ok(Some(Backing::Failed { reason }));
+        }
+    }
+    Ok(None)
+}
+
+/// The launches whose last try found something they wait for missing (their brief's artifact,
+/// their environment's adoption), in memory: the probe looks again and asks for the next try once
+/// nothing is missing.
+#[derive(Clone, Default)]
+pub struct AwaitedBriefs(Arc<Mutex<BTreeSet<String>>>);
+
+impl AwaitedBriefs {
+    fn await_brief(&self, launch: &str) {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(launch.to_owned());
+    }
+
+    fn arrived(&self, launch: &str) {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(launch);
+    }
+
+    fn awaited(&self) -> BTreeSet<String> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+}
+
+/// The TerminalSession kind's [`Actuator`] over this host's terminal provider.
+pub struct TerminalActuator<P: ?Sized> {
+    provider: Arc<P>,
+    records: Arc<dyn TerminalRecords>,
+    reads: StoreReads,
+    home: String,
+    staged: StagedFacts<TerminalLaunchFacts>,
+    briefs: AwaitedBriefs,
+    /// When a failed release is tried again, and how many tries it gets.
+    release_backoff: RetryBackoff,
+    release_limit: u32,
+    /// Each launch's failed releases in a row, in memory: a restart tries again from none.
+    release_failures: Mutex<BTreeMap<String, u32>>,
+}
+
+/// What a launch's environment does to it at teardown.
+struct EnvironmentTeardown {
+    /// The environment has ended, or no record of it is left.
+    ended: bool,
+    /// Its teardown ends the processes run in it, as a container's does; assumed when no record
+    /// is left to say.
+    ends_processes: bool,
+}
+
+impl<P: ?Sized> TerminalActuator<P> {
+    pub fn new(
+        provider: Arc<P>,
+        records: Arc<dyn TerminalRecords>,
+        reads: StoreReads,
+        home: impl Into<String>,
+        staged: StagedFacts<TerminalLaunchFacts>,
+    ) -> Self {
+        Self {
+            provider,
+            records,
+            reads,
+            home: home.into(),
+            staged,
+            briefs: AwaitedBriefs::default(),
+            release_backoff: PROVISIONING_RETRY_BACKOFF,
+            release_limit: LOCAL_RETRY_LIMIT,
+            release_failures: Mutex::default(),
+        }
+    }
+
+    /// Tries a failed release again after `backoff`, at most `limit` times in all.
+    pub fn with_release_retry(mut self, backoff: RetryBackoff, limit: u32) -> Self {
+        self.release_backoff = backoff;
+        self.release_limit = limit;
+        self
+    }
+
+    /// The launches waiting on their brief's artifact, which the probe looks for.
+    pub fn awaited_briefs(&self) -> AwaitedBriefs {
+        self.briefs.clone()
+    }
+
+    /// Counts a failed release of `name`: how many in a row, this one included.
+    fn release_failed(&self, name: &str) -> u32 {
+        let mut failures = self.release_failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failed = failures.entry(name.to_owned()).or_default();
+        *failed += 1;
+        *failed
+    }
+
+    fn release_done(&self, name: &str) {
+        self.release_failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(name);
+    }
+
+    fn record(&self, name: &str) -> Result<TerminalRecord, Cause> {
+        self.records
+            .get(name, Some(&self.home))
+            .map_err(|error| transient(format!("read terminal launch {name}: {error}")))?
+            .ok_or_else(|| transient(format!("terminal launch {name} is not held here")))
+    }
+
+    fn environment_teardown(&self, request: &TerminalSessionRequest) -> Result<EnvironmentTeardown, Cause> {
+        let environment = &request.environment;
+        let loaded = self
+            .reads
+            .read(|read| {
+                let Some(id) = read.resolve(Resource::<Lifecycle<EnvironmentKind>>::CODE, &environment.name, &environment.home)? else {
+                    return Ok(None);
+                };
+                Ok(read.load::<Resource<Lifecycle<EnvironmentKind>>>(id)?.map(|loaded| loaded.value))
+            })
+            .map_err(|error| transient(format!("read environment {}: {error}", environment.name)))?;
+        let Some(loaded) = loaded else { return Ok(EnvironmentTeardown { ended: true, ends_processes: true }) };
+        let recipe =
+            RecipeOf::of(loaded.spec().recipe.value()).map_err(|error| transient(format!("environment {}: {error}", environment.name)))?;
+        Ok(EnvironmentTeardown { ended: !loaded.state().live(), ends_processes: recipe.teardown_ends_processes() })
+    }
+
+    /// Whether the vessel `request` is held for, if any, has ended.
+    fn vessel_ended(&self, request: &TerminalSessionRequest) -> Result<bool, Cause> {
+        let Some(vessel) = request.holder.as_ref().and_then(holder_vessel) else { return Ok(false) };
+        let state = self
+            .reads
+            .read(|read| Ok(state_of::<VesselKind>(read, vessel, &self.home)?))
+            .map_err(|error| transient(format!("read vessel {vessel}: {error}")))?;
+        Ok(state.is_none_or(|state| !state.live()))
+    }
+}
+
+#[async_trait]
+impl<P> Actuator<TerminalSessionKind> for TerminalActuator<P>
+where
+    P: TerminalProvider + ?Sized + 'static,
+{
+    async fn observe(&self, name: &str, _: &TerminalSessionRequest) -> Result<Backing, Cause> {
+        let record = self.record(name)?;
+        // A launch never started is started now; a realised one is looked at.
+        let Some(session_id) = record.session_id().map(str::to_owned) else { return Ok(Backing::Absent { reason: None }) };
+        Ok(ended(&*self.provider, &record, &session_id).await?.unwrap_or(Backing::Present { identity: session_id }))
+    }
+
+    async fn realise(&self, name: &str, _: &TerminalSessionRequest) -> Result<String, ProviderFailure> {
+        let record = self.record(name).map_err(|cause| ProviderFailure::new(cause, true))?;
+        match self.provider.launch_waits_for(&record).await {
+            Ok(None) => self.briefs.arrived(name),
+            Ok(Some(missing)) => {
+                self.briefs.await_brief(name);
+                return Err(ProviderFailure::new(transient(missing), true));
+            }
+            Err(message) => return Err(ProviderFailure::new(transient(message), true)),
+        }
+        match self.provider.launch(&record).await {
+            Ok(launched) => {
+                self.staged.stage(name, stored_facts(&launched.facts));
+                self.records.observations().update(name, |observation| observation.launch_command = Some(launched.launch_command));
+                Ok(launched.session_id)
+            }
+            Err(LaunchFailure { message, retryable: true }) => {
+                self.briefs.await_brief(name);
+                Err(ProviderFailure::new(transient(message), true))
+            }
+            // The launch gives up: its holder renews it once what failed is fixed.
+            Err(LaunchFailure { message, retryable: false }) => {
+                Err(ProviderFailure::new(Cause::new(CauseCategory::External, message), false))
+            }
+        }
+    }
+
+    async fn release(&self, name: &str, request: &TerminalSessionRequest, identity: Option<&str>) -> Result<(), ProviderFailure> {
+        let failed = |message: String| ProviderFailure::new(transient(message), true);
+        self.records.observations().forget(name);
+        self.briefs.arrived(name);
+        let environment = self.environment_teardown(request).map_err(|cause| ProviderFailure::new(cause, true))?;
+        // An ended container's teardown removed its sessions, pool and harness with it; a
+        // host-direct environment's end stops nothing, so its sessions are still killed here.
+        if environment.ended && environment.ends_processes {
+            self.release_done(name);
+            return Ok(());
+        }
+        let record = self.record(name).map_err(|cause| ProviderFailure::new(cause, true))?;
+        let mut errors = Vec::new();
+        if let Some(session_id) = identity {
+            self.provider.settle_turn(session_id).await;
+            if let Err(error) = self.provider.kill(&record, session_id).await {
+                errors.push(error);
+            }
+        }
+        // A live process could still write its receipt: it is removed once the kill succeeded.
+        if errors.is_empty() && record.is_agent() {
+            if let Err(error) = self.provider.remove_exit_receipt(&record).await {
+                errors.push(error);
+            }
+        }
+        if let Err(error) = self.provider.cleanup_artifacts(&record).await {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            self.release_done(name);
+            return Ok(());
+        }
+        let errors = errors.join("; ");
+        // A crew's session whose vessel ended goes with its environment, whose release waits
+        // for it: one that cannot be reached here, as when its environment was not adopted after
+        // a restart, is removed by that teardown, when the teardown ends its processes.
+        if environment.ends_processes && self.vessel_ended(request).map_err(|cause| ProviderFailure::new(cause, true))? {
+            warn!(session = name, %errors, "a session of an ended vessel is left to its environment's teardown");
+            self.release_done(name);
+            return Ok(());
+        }
+        // Nothing else ends it: tried again on time, a bounded number of times, after which a
+        // person is told its process may still run, and it is released so its holders' teardown
+        // goes on.
+        let failures = self.release_failed(name);
+        if failures >= self.release_limit {
+            let reason = format!(
+                "the session's release failed {failures} times ({errors}); its process may still be running on {}. Check it and stop it by hand.",
+                record.environment
+            );
+            warn!(session = name, %errors, failures, "a session's release gave up; it may still be running");
+            self.provider.left_running(&record, &reason).await;
+            self.release_done(name);
+            return Ok(());
+        }
+        let delay = chrono::Duration::from_std(self.release_backoff.delay(failures)).unwrap_or_else(|_| chrono::Duration::days(1));
+        let retry_at = Timestamp::from_datetime(&(Utc::now() + delay));
+        Err(ProviderFailure { retry_at: Some(retry_at), ..failed(errors) })
+    }
+
+    fn followed(&self) -> Vec<KindCode> {
+        vec![ENVIRONMENT, VESSEL]
+    }
+
+    fn dependencies(&self, request: &TerminalSessionRequest) -> Vec<Identity> {
+        let mut depends = vec![request.environment.identity()];
+        if let Some(vessel) = request.holder.as_ref().and_then(holder_vessel) {
+            depends.push(Identity { kind: VESSEL, name: vessel.to_owned(), home: self.home.clone() });
+        }
+        depends
+    }
+
+    fn holder(&self, read: &mut Read<'_>, _: &str, request: &TerminalSessionRequest) -> Result<Holding, StoreError> {
+        let environment = &request.environment;
+        if state_of::<EnvironmentKind>(read, &environment.name, &environment.home)?.is_none_or(|state| !state.live()) {
+            return Ok(Holding { ended: true, record: Some(environment.identity()) });
+        }
+        // A crew's vessel lease is homed here, and its sessions are requested only once the lease
+        // exists (every vessel reconciled here is leased, placed or not): an absent lease has ended.
+        let Some(vessel) = request.holder.as_ref().and_then(holder_vessel) else {
+            return Ok(Holding { ended: false, record: Some(environment.identity()) });
+        };
+        let ended = state_of::<VesselKind>(read, vessel, &self.home)?.is_none_or(|state| !state.live());
+        Ok(Holding { ended, record: Some(Identity { kind: VESSEL, name: vessel.to_owned(), home: self.home.clone() }) })
+    }
+
+    fn usability(&self, read: &mut Read<'_>, request: &TerminalSessionRequest) -> Result<Vec<Usability>, StoreError> {
+        let environment = &request.environment;
+        let realised =
+            matches!(state_of::<EnvironmentKind>(read, &environment.name, &environment.home)?, Some(LifecycleState::Realised { .. }));
+        Ok(vec![Usability { fact: environment.identity(), usable: realised }])
+    }
+}
+
+/// How often this home's running launches are looked at. This is an edge probe: it reads the
+/// pools, screens and blob store and pushes what it finds as facts; the controller itself only
+/// wakes on those facts and on its log. Its brief check polls too, because nothing signals a
+/// brief's arrival here: the writer's daemon puts the blob in its local tier, then writes the
+/// Artifact record, and uploads to the fleet tier in the background, so the replicated record can
+/// arrive before the blob is readable from this host, and no tier notifies a reader. Its look at
+/// an environment's adoption polls for the same reason: the daemon registers an adopted
+/// environment in memory, on its own reconciliation interval, and commits nothing a launch could
+/// wake on; the environment's ending is a commit, and releases the launch.
+pub const TERMINAL_PROBE_EVERY: Duration = Duration::from_secs(5);
+
+/// This home's probe of its running launches: it pushes each launch it finds ended to the
+/// controller, and records what it observes of the rest (attention, the screen, the seat, the
+/// crew's path back to the daemon) in memory, and their new output as crew progress. It also looks
+/// again at what waiting launches lack, and asks the controller to try each again once nothing is.
+pub struct TerminalProbe<P: ?Sized> {
+    provider: Arc<P>,
+    records: Arc<dyn TerminalRecords>,
+    progress: Option<Arc<ProgressFacts>>,
+    backings: mpsc::Sender<BackingEvent>,
+    briefs: Option<(AwaitedBriefs, mpsc::Sender<String>)>,
+}
+
+impl<P> TerminalProbe<P>
+where
+    P: TerminalProvider + ?Sized + 'static,
+{
+    pub fn new(provider: Arc<P>, records: Arc<dyn TerminalRecords>, backings: mpsc::Sender<BackingEvent>) -> Self {
+        Self { provider, records, progress: None, backings, briefs: None }
+    }
+
+    /// Looks for the briefs in `briefs`, asking for each launch's next try on `rechecks`.
+    pub fn with_briefs(mut self, briefs: AwaitedBriefs, rechecks: mpsc::Sender<String>) -> Self {
+        self.briefs = Some((briefs, rechecks));
+        self
+    }
+
+    /// Records each launch's new output in `progress` (#3108).
+    pub fn with_progress(mut self, progress: Arc<ProgressFacts>) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// Looks at the running launches every `every` until the controller stops.
+    pub async fn run(self, every: Duration) {
+        let mut ticks = tokio::time::interval(every);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            if !self.pass().await {
+                return;
+            }
+        }
+    }
+
+    /// Looks at each running launch once; false once the controller has stopped.
+    pub async fn pass(&self) -> bool {
+        // A store read, off the async workers, of the launches that can still change: an awaited
+        // brief's launch has not ended (its release forgets it), and only a running one is looked at.
+        let reads = Arc::clone(&self.records);
+        let records = match tokio::task::spawn_blocking(carry(move || reads.live())).await.unwrap_or_else(|error| Err(error.to_string())) {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(%error, "terminal probe could not read this home's launches");
+                return true;
+            }
+        };
+        if let Some((briefs, rechecks)) = &self.briefs {
+            for record in records.iter().filter(|record| briefs.awaited().contains(&record.name)) {
+                match self.provider.launch_waits_for(record).await {
+                    Ok(None) => {
+                        briefs.arrived(&record.name);
+                        if rechecks.send(record.name.clone()).await.is_err() {
+                            return false;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Err(error) => debug!(launch = %record.name, %error, "terminal probe could not look for what the launch waits on"),
+                }
+            }
+        }
+        for record in records.into_iter().filter(TerminalRecord::is_running) {
+            let Some(session_id) = record.session_id().map(str::to_owned) else { continue };
+            match ended(&*self.provider, &record, &session_id).await {
+                Ok(Some(observed)) => {
+                    self.records.observations().forget(&record.name);
+                    if self.backings.send(BackingEvent { name: record.name.clone(), observed }).await.is_err() {
+                        return false;
+                    }
+                }
+                Ok(None) => self.observe(&record, &session_id).await,
+                Err(cause) => debug!(launch = %record.name, ?cause, "terminal probe could not tell whether the launch runs"),
+            }
+        }
+        true
+    }
+
+    async fn observe(&self, record: &TerminalRecord, session_id: &str) {
+        let adapter = record.agent().map(|agent| agent.adapter.clone());
+        match self.provider.daemon_reach(record).await {
+            Ok(unreachable) => {
+                self.records.observations().update(&record.name, |observation| observation.daemon_unreachable = unreachable);
+            }
+            Err(error) => warn!(launch = %record.name, %error, "daemon reach observation failed"),
+        }
+        let now = Utc::now();
+        match self.provider.read_screen(record, session_id).await {
+            Ok(Some(reading)) => {
+                if let (Some(progress), Some(digest)) = (&self.progress, reading.output_digest.as_deref()) {
+                    progress.output(record.session_name(), digest, now);
+                }
+                // A screen read restates the obstruction; other evidence leaves it.
+                let obstruction = reading
+                    .attention
+                    .as_ref()
+                    .filter(|attention| attention.source == flotilla_resources::TerminalAttentionSource::Screen)
+                    .map(|_| reading.obstruction.clone());
+                self.records.observations().update(&record.name, |observation| {
+                    observation.observe(reading.attention, obstruction, reading.occupancy, adapter.as_deref())
+                });
+            }
+            Ok(None) => {
+                // Evidence that aged out says nothing any more.
+                self.records.observations().update(&record.name, |observation| {
+                    if let Some(attention) = observation.attention.as_mut().filter(|attention| attention.is_stale_at(now)) {
+                        attention.state = TerminalAttentionState::Unobservable;
+                        attention.as_of = now;
+                    }
+                });
+            }
+            Err(error) => warn!(launch = %record.name, %error, "terminal screen observation failed"),
+        }
+    }
+}

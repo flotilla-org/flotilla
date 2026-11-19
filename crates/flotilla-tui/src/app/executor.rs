@@ -161,18 +161,6 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::ConvoyBriefInformational { .. }
         | CommandValue::ConvoyBriefQueued { .. }
         | CommandValue::ConvoyBriefWithdrawn { .. } => {}
-        CommandValue::ConvoyBriefHeld { held, .. } => app.set_status_message(Some(format!("brief queued: {held}"))),
-        CommandValue::CrewCompletionAdvisory { pending } => {
-            let message = if pending.is_empty() {
-                "Your part ends when your promises are kept or retracted.".into()
-            } else {
-                format!("Pending promises: {}", pending.join("; "))
-            };
-            app.set_status_message(Some(message));
-        }
-        CommandValue::CrewCompletionWaiting { reason, retry_at } => {
-            app.set_status_message(Some(format!("crew completion waiting until {retry_at}: {reason}")));
-        }
         CommandValue::CrewEscalated { receiver } => {
             app.set_status_message(Some(format!("escalated to {receiver}")));
         }
@@ -221,6 +209,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::FulfilmentList(_)
         | CommandValue::ImageCheck(_)
         | CommandValue::ImageBuild(_)
+        | CommandValue::ImageBuildRetried { .. }
         | CommandValue::FleetList(_)
         | CommandValue::CrewStalls(_)
         | CommandValue::CrewCapabilities { .. }
@@ -230,7 +219,6 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::DaemonLogs { .. }
         | CommandValue::ProjectExplanation(_)
         | CommandValue::ConvoyExplanation(_)
-        | CommandValue::ResourceDigest(_)
         | CommandValue::ResourceRead(_)
         | CommandValue::ResourceObject(_)
         | CommandValue::ResourceDeleted(_)
@@ -311,21 +299,6 @@ mod tests {
         },
         table_view::{PendingRowContext, RowId, RowState},
     };
-
-    // #3586: advisory completion shows pending promises as status information.
-    // Glue: cover the empty and pending forms through the real result handler.
-    #[tokio::test]
-    async fn advisory_completion_shows_promise_status() {
-        for (pending, expected) in [
-            (vec![], "Your part ends when your promises are kept or retracted."),
-            (vec!["template/pr: waiting on PR merge".to_string()], "Pending promises: template/pr: waiting on PR merge"),
-        ] {
-            let daemon = Arc::new(StubDaemon::builder().build());
-            let mut app = stub_app_with_daemon(daemon, vec![]);
-            handle_result(CommandValue::CrewCompletionAdvisory { pending }, &mut app);
-            assert_eq!(app.model.status_message.as_deref(), Some(expected));
-        }
-    }
 
     fn dispatch_channels() -> (mpsc::UnboundedSender<Event>, mpsc::UnboundedReceiver<Event>) {
         mpsc::unbounded_channel()

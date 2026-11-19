@@ -167,17 +167,27 @@ class BuildGraphContract(unittest.TestCase):
             )), ["flotilla-controllers: production dependency on flotilla-inbox outside the Message switch's composition"])
 
     def test_the_message_switch_composes_the_engine_inbox(self):
-        # #3317: the composition root and daemon compose the engine inbox and
-        # state machines behind `[primitives]`; crates above reach it only
+        # #3317: the daemon and the engine Message path compose the engine inbox
+        # and state machines behind `[primitives]`; crates above reach it only
         # through them, and old admission still never reaches the engine.
         self.assertEqual(violations(graph(
             package("flotilla", normal=("flotilla-daemon",)),
             package("flotilla-daemon", normal=("flotilla-core", "flotilla-inbox", STATE_MACHINES)),
-            package("flotilla-core", normal=("flotilla-inbox", "flotilla-engine-store", STATE_MACHINES)),
+            package("flotilla-core", normal=("flotilla-engine-messages", "flotilla-engine-store", STATE_MACHINES)),
+            package("flotilla-engine-messages", normal=("flotilla-inbox", "flotilla-engine-store", STATE_MACHINES)),
             package("flotilla-engine-store", normal=(STATE_MACHINES,)),
             package("flotilla-inbox", normal=(STATE_MACHINES,)),
             package(STATE_MACHINES),
         )), [])
+        self.assertEqual(violations(graph(
+            package("flotilla-core", normal=("flotilla-inbox",)),
+            package("flotilla-inbox"),
+        )), ["flotilla-core: production dependency on flotilla-inbox outside the Message switch's composition"])
+        # #3108: the engine Message path sits below the composition root and beside the capabilities.
+        self.assertEqual(violations(graph(
+            package("flotilla-engine-messages", normal=("flotilla-crew",)),
+            package("flotilla-crew"),
+        )), ["flotilla-engine-messages: must not depend on flotilla-crew, directly or transitively"])
         self.assertEqual(violations(graph(
             package("flotilla-admission", normal=("flotilla-messaging",)),
             package("flotilla-messaging", normal=(STATE_MACHINES,)),
@@ -249,7 +259,7 @@ class BuildGraphContract(unittest.TestCase):
         # normal and build edges, direct and through an otherwise-allowed crate.
         for schema in SCHEMA_CRATES:
             for target in ("flotilla-resources", "flotilla-store", "flotilla-store-sqlite", "flotilla-store-memory",
-                           "flotilla-replication", "flotilla-core", "flotilla-daemon", "flotilla-controllers",
+                           "flotilla-core", "flotilla-daemon", "flotilla-controllers",
                            "flotilla-executor", "flotilla-protocol"):
                 for kind in ("normal", "build"):
                     for middle in (target, "flotilla-cbor"):
@@ -786,30 +796,6 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-credentials", normal=("flotilla-capability-contract",)), package("flotilla-capability-contract"),
             package("flotilla-core", normal=("flotilla-capability-contract",)),
             package("flotilla-daemon", normal=("flotilla-core", "flotilla-credentials")),
-        )), [])
-
-    def test_replication_is_native_and_independent(self):
-        # ADR 0060: replication reaches stores only through dyn Store, not daemon or HTTP crates.
-        self.assertEqual(layer("flotilla-replication"), "native")
-        for target in ("flotilla-core", "flotilla-daemon", "flotilla-daemon-api", "flotilla-projections",
-                       "flotilla-credentials", "flotilla-controllers", "flotilla-store-http"):
-            for kind in ("normal", "build"):
-                for middle in (target, "adapter"):
-                    with self.subTest(target=target, kind=kind, middle=middle):
-                        self.assertEqual(violations(graph(
-                            package("flotilla-replication", **{kind: (middle,)}),
-                            package("adapter", normal=(target,)), package(target),
-                        )), [f"flotilla-replication: must not depend on {target}, directly or transitively"])
-        self.assertEqual(violations(graph(
-            package("flotilla-replication", normal=("flotilla-store", "flotilla-resources", "flotilla-protocol")),
-            package("flotilla-daemon", normal=("flotilla-replication", "flotilla-store-http")),
-            package("flotilla-store", normal=("flotilla-resources", "flotilla-protocol")),
-            package("flotilla-store-http", normal=("flotilla-store",)),
-            package("flotilla-resources", normal=("flotilla-protocol",)), package("flotilla-protocol"),
-        )), [])
-        # A dev-only in-memory store keeps engine tests off the HTTP stack too.
-        self.assertEqual(violations(graph(
-            package("flotilla-replication", dev=("flotilla-store-memory",)), package("flotilla-store-memory"),
         )), [])
 
     def test_testkit_names(self):

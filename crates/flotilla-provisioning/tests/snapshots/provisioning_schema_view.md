@@ -4,10 +4,15 @@ Kind tables only; the shared tables are in `provisioning.sql`.
 
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
-| `checkout` | root | 23 | 4: `source` 2, `ending` 2 | – | `by_environment` (environment), `by_clone` (clone), `by_holder` (holder) |
-| `clone` | root | 18 | 2: `ending` 2 | – | `by_environment` (environment, repository) |
+| `clone_facts` | root | 3 | – | – | – |
+| `checkout` | root | 25 | 4: `source` 2, `ending` 2 | – | `by_environment` (environment), `by_clone` (clone), `by_holder` (holder), `by_repository` (repository), `by_launch` (launch_of, launch) |
+| `clone` | root | 21 | 2: `ending` 2 | – | `by_environment` (environment, repository), `by_repository` (repository), `by_launch` (launch_of, launch) |
+| `environment_launch_facts` | root | 10 | – | – | – |
 | `environment` | root | 18 | 2: `ending` 2 | – | `live_by_provider` (provider), `by_image_build` (image_build), `by_holder` (holder) |
-| `image_build` | root | 21 | 4: `delivery` 2, `ending` 2 | – | `by_composition` (composition) |
+| `image_build` | root | 23 | 4: `delivery` 2, `ending` 2 | – | `by_composition` (composition), `by_launch` (launch_of, launch) |
+| `image_build_demand` | root | 10 | 2: `delivery` 2 | – | `by_builder` (builder), `by_composition` (composition) |
+| `checkout_facts` | root | 3 | – | – | – |
+| `checkout_integration` | root | 16 | – | – | – |
 
 Tables wider than 30 columns:
 - none
@@ -22,8 +27,11 @@ Interned column domains:
 
 | Table | Column | Domain |
 |---|---|---|
+| `checkout` | `launch_of` | `ln` |
 | `checkout` | `repository` | `rk` |
 | `checkout` | `holder` | `hl` |
+| `clone` | `launch_of` | `ln` |
 | `clone` | `repository` | `rk` |
 | `environment` | `provider` | `ad` |
 | `environment` | `holder` | `hl` |
+| `image_build` | `launch_of` | `ln` |

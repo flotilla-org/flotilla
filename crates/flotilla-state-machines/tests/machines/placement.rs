@@ -1,20 +1,16 @@
 //! Placement (spec `machines/vessel.qnt`, scenario `admission_placement.qnt`;
-//! ADR 0064 "Admission grants a cap, never a reservation").
+//! ADR 0064): placement reads only fit and priority.
 
 use std::collections::BTreeMap;
 
 use flotilla_state_machines::{
-    machines::convoy::{ConvoyId, Priority, Quota, VesselClass},
+    machines::convoy::{ConvoyId, Priority, VesselClass},
     placement::{fits, place, Dimension, Evidence, Host, Lease, Ledger, LedgerError, PlacementRefusal, Request, Units, Vessel, VesselId},
 };
 use hegel::generators as gs;
 
 fn units(pairs: &[(u32, u32)]) -> Units {
     pairs.iter().map(|(dimension, n)| (Dimension(*dimension), *n)).collect()
-}
-
-fn quota(pairs: &[(u32, u32)]) -> Quota {
-    pairs.iter().map(|(class, n)| (VesselClass::new(class.to_string()), *n)).collect()
 }
 
 fn convoy(n: u32) -> ConvoyId {
@@ -29,8 +25,8 @@ fn request(convoy_n: u32, class: u32, shape: &[(u32, u32)], priority: u32) -> Re
     Request { convoy: convoy(convoy_n), class: VesselClass::new(class.to_string()), shape: units(shape), priority: Priority(priority) }
 }
 
-fn evidence(available: &[(u32, u32)], waiting: Vec<Request>, live: u32, cap: u32, admitted: bool) -> Evidence {
-    Evidence { host: Host::new("1"), available: units(available), waiting, live, cap, admitted }
+fn evidence(available: &[(u32, u32)], waiting: Vec<Request>) -> Evidence {
+    Evidence { host: Host::new("1"), available: units(available), waiting }
 }
 
 // Generator: shapes and capacities over dimensions 0..=2 with 0..=3 units, so
@@ -69,7 +65,7 @@ fn fit_is_monotone_and_reflexive(tc: hegel::TestCase) {
 fn an_empty_shape_fits_vacuously() {
     let empty = request(1, 0, &[], 1);
     assert!(fits(&empty, &units(&[])));
-    assert!(place(&empty, &evidence(&[], vec![], 0, 1, true)).is_ok());
+    assert!(place(&empty, &evidence(&[], vec![])).is_ok());
 }
 
 // A shape fits only when every one of its dimensions is present and no larger
@@ -82,44 +78,33 @@ fn fit_is_per_dimension() {
     assert!(!fits(&r, &units(&[(0, 5)])));
 }
 
-// The spec's Place order: not admitted, then the cap, then fit, then a
-// fitting waiting request of strictly higher priority. Each refusal wins over
-// every later one, and the granted lease is the request on the snapshot's host.
+// The spec's Place order: fit, then a fitting waiting request of strictly
+// higher priority. A refusal to fit wins over priority, and the granted lease
+// is the request on the snapshot's host.
 #[test]
 fn place_checks_the_rules_in_the_spec_order() {
     let r = request(1, 0, &[(0, 2)], 1);
     let higher = request(2, 0, &[(0, 1)], 2);
-    let all_wrong = || evidence(&[(0, 1)], vec![higher.clone()], 1, 1, false);
-    assert_eq!(place(&r, &all_wrong()), Err(PlacementRefusal::NotAdmitted));
-    assert_eq!(place(&r, &Evidence { admitted: true, ..all_wrong() }), Err(PlacementRefusal::QuotaExceeded));
-    assert_eq!(place(&r, &Evidence { admitted: true, cap: 2, ..all_wrong() }), Err(PlacementRefusal::DoesNotFit));
-    let fitting = Evidence { admitted: true, cap: 2, available: units(&[(0, 2)]), ..all_wrong() };
+    let unfitting = evidence(&[(0, 1)], vec![higher.clone()]);
+    assert_eq!(place(&r, &unfitting), Err(PlacementRefusal::DoesNotFit));
+    let fitting = Evidence { available: units(&[(0, 2)]), ..unfitting };
     assert_eq!(place(&r, &fitting), Err(PlacementRefusal::HigherPriorityWaiting));
     let granted = place(&r, &Evidence { waiting: vec![], host: Host::new("7"), ..fitting });
     assert_eq!(granted, Ok(Lease { request: r, host: Host::new("7") }));
 }
 
-// The cap is a hard bound at its boundary: one below it places, at it is QuotaExceeded.
-#[test]
-fn the_cap_refuses_at_its_boundary() {
-    let r = request(1, 0, &[(0, 1)], 1);
-    assert!(place(&r, &evidence(&[(0, 1)], vec![], 1, 2, true)).is_ok());
-    assert_eq!(place(&r, &evidence(&[(0, 1)], vec![], 2, 2, true)), Err(PlacementRefusal::QuotaExceeded));
-    assert_eq!(place(&r, &evidence(&[(0, 1)], vec![], 0, 0, false)), Err(PlacementRefusal::NotAdmitted));
-}
-
 // A lower-priority request cannot pass a waiting higher-priority request that
-// fits this host, even one whose own convoy is capped; a higher-priority
-// request that does not fit here, or one of equal priority, does not block.
+// fits this host; a higher-priority request that does not fit here, or one of
+// equal priority, does not block.
 #[test]
 fn priority_blocks_only_a_fitting_higher_request() {
     let r = request(1, 0, &[(0, 1)], 1);
     let higher = request(2, 0, &[(0, 2)], 2);
     let wider = request(2, 0, &[(0, 1), (1, 1)], 2);
     let equal = request(2, 0, &[(0, 1)], 1);
-    assert_eq!(place(&r, &evidence(&[(0, 2)], vec![higher.clone()], 0, 1, true)), Err(PlacementRefusal::HigherPriorityWaiting));
-    assert!(place(&r, &evidence(&[(0, 1)], vec![higher], 0, 1, true)).is_ok());
-    assert!(place(&r, &evidence(&[(0, 2)], vec![wider, equal], 0, 1, true)).is_ok());
+    assert_eq!(place(&r, &evidence(&[(0, 2)], vec![higher.clone()])), Err(PlacementRefusal::HigherPriorityWaiting));
+    assert!(place(&r, &evidence(&[(0, 1)], vec![higher])).is_ok());
+    assert!(place(&r, &evidence(&[(0, 2)], vec![wider, equal])).is_ok());
 }
 
 // The ledger's explicit errors: unknown vessel and host, a duplicate host or
@@ -137,11 +122,11 @@ fn the_ledger_reports_errors() {
     assert_eq!(ledger.request(v1.clone(), request(1, 0, &[(0, 1)], 1)), Err(LedgerError::DuplicateRequest(v1.clone())));
     assert_eq!(ledger.place(&v7, Host::new("1")).err(), Some(LedgerError::UnknownVessel(v7.clone())));
     assert_eq!(ledger.place(&v1, Host::new("9")).err(), Some(LedgerError::UnknownHost(Host::new("9"))));
-    assert_eq!(ledger.place(&v1, Host::new("1")).err(), Some(LedgerError::Refused(PlacementRefusal::NotAdmitted)));
+    ledger.request(vessel(2), request(1, 0, &[(0, 3)], 1)).expect("requested");
+    assert_eq!(ledger.place(&vessel(2), Host::new("1")).err(), Some(LedgerError::Refused(PlacementRefusal::DoesNotFit)));
     assert_eq!(ledger.release(&v1).err(), Some(LedgerError::NotLeased(v1.clone())));
     assert!(matches!(ledger.vessel(&v1), Some(Vessel::Waiting(_))), "a refused release keeps the waiting vessel");
     assert_eq!(ledger.release(&v7).err(), Some(LedgerError::UnknownVessel(v7)));
-    ledger.set_caps(convoy(1), quota(&[(0, 1)]));
     ledger.place(&v1, Host::new("1")).expect("placed");
     assert_eq!(ledger.place(&v1, Host::new("1")).err(), Some(LedgerError::NotWaiting(v1.clone())));
     assert_eq!(ledger.evidence(&v1, Host::new("1")).err(), Some(LedgerError::NotWaiting(v1.clone())));
@@ -155,7 +140,6 @@ fn release_returns_the_lease_and_keeps_nothing() {
     let v1 = vessel(1);
     let mut ledger = Ledger::new();
     ledger.add_host(Host::new("1"), units(&[(0, 2)])).expect("host");
-    ledger.set_caps(convoy(1), quota(&[(0, 1)]));
     ledger.request(v1.clone(), request(1, 0, &[(0, 1)], 1)).expect("requested");
     ledger.place(&v1, Host::new("1")).expect("placed");
     assert_eq!(ledger.release(&v1), Ok(Lease { request: request(1, 0, &[(0, 1)], 1), host: Host::new("1") }));
@@ -172,7 +156,6 @@ fn a_lease_holds_capacity_until_released() {
     let (v1, v2) = (vessel(1), vessel(2));
     let mut ledger = Ledger::new();
     ledger.add_host(Host::new("1"), units(&[(0, 2), (1, 1)])).expect("host");
-    ledger.set_caps(convoy(1), quota(&[(0, 2)]));
     ledger.request(v1.clone(), request(1, 0, &[(0, 2), (1, 1)], 1)).expect("requested");
     ledger.request(v2.clone(), request(1, 0, &[(0, 1)], 1)).expect("requested");
     ledger.place(&v1, Host::new("1")).expect("placed");
@@ -188,52 +171,39 @@ enum Op {
     Request(u32, Request),
     Place(u32, u32),
     Release(u32),
-    /// Readmission: a convoy's cap for a class rises by one.
-    Raise(u32, u32),
 }
 
 // Generator: the admission_placement bounds (two convoys, two hosts with its
-// capacities, optionally doubled, two classes, two dimensions) widened to five vessels, caps that
-// start at 0..=1 and only rise, and the scenario's three request shapes.
+// capacities, optionally doubled, two classes, two dimensions) widened to five vessels, and the
+// scenario's three request shapes.
 fn draw_op(tc: &hegel::TestCase) -> Op {
     let id = tc.draw(gs::integers::<u32>().min_value(1).max_value(5));
-    match tc.draw(gs::integers::<u8>().min_value(0).max_value(9)) {
+    match tc.draw(gs::integers::<u8>().min_value(0).max_value(8)) {
         0..=2 => {
             let shapes = [units(&[(0, 2), (1, 1)]), units(&[(0, 1), (1, 2)]), units(&[(0, 1), (1, 1)])];
             let s = shapes[tc.draw(gs::integers::<usize>().min_value(0).max_value(2))].clone();
             Op::Request(id, Request { shape: s, ..draw_request(tc) })
         }
         3..=6 => Op::Place(id, tc.draw(gs::integers::<u32>().min_value(1).max_value(2))),
-        7..=8 => Op::Release(id),
-        _ => Op::Raise(tc.draw(gs::integers::<u32>().min_value(1).max_value(2)), tc.draw(gs::integers::<u32>().min_value(0).max_value(1))),
+        _ => Op::Release(id),
     }
 }
 
-// The ledger's invariants over any sequence of requests, placements, releases
-// and cap raises, checked after every step: live leases of each convoy and
-// class never exceed its cap; each host's leased shapes never exceed its
-// capacity, and availability is exactly capacity less live leases, so a
+// The ledger's invariants over any sequence of requests, placements and
+// releases, checked after every step: each host's leased shapes never exceed
+// its capacity, and availability is exactly capacity less live leases, so a
 // release restores what its lease held; a release returns exactly the lease
 // it held; and the ledger's placement agrees with `place` over the evidence
 // it reports.
 #[hegel::test(test_cases = 200)]
-fn the_ledger_keeps_caps_and_capacity(tc: hegel::TestCase) {
-    // The scenario's capacities, sometimes doubled so several vessels of one
-    // convoy and class fit at once and the cap is what binds.
+fn the_ledger_keeps_capacity(tc: hegel::TestCase) {
+    // The scenario's capacities, sometimes doubled so several vessels fit at once.
     let scale = tc.draw(gs::integers::<u32>().min_value(1).max_value(2));
     let capacities =
         BTreeMap::from([(Host::new("1"), units(&[(0, 2 * scale), (1, scale)])), (Host::new("2"), units(&[(0, scale), (1, 2 * scale)]))]);
-    let mut caps: BTreeMap<ConvoyId, Quota> = BTreeMap::new();
     let mut ledger = Ledger::new();
     for (host, capacity) in &capacities {
         ledger.add_host(host.clone(), capacity.clone()).expect("host");
-    }
-    for n in 1..=2 {
-        let initial: Quota = (0..2)
-            .map(|class: u32| (VesselClass::new(class.to_string()), tc.draw(gs::integers::<u32>().min_value(0).max_value(1))))
-            .collect();
-        ledger.set_caps(convoy(n), initial.clone());
-        caps.insert(convoy(n), initial);
     }
     let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(30));
     for _ in 0..steps {
@@ -255,17 +225,6 @@ fn the_ledger_keeps_caps_and_capacity(tc: hegel::TestCase) {
                     _ => None,
                 };
                 assert_eq!(ledger.release(&vessel(id)).ok(), held);
-            }
-            Op::Raise(n, class) => {
-                let raised = caps.entry(convoy(n)).or_default();
-                *raised.entry(VesselClass::new(class.to_string())).or_default() += 1;
-                ledger.set_caps(convoy(n), raised.clone());
-            }
-        }
-        for n in 1..=2 {
-            for class in (0..2u32).map(|class| VesselClass::new(class.to_string())) {
-                let cap = caps.get(&convoy(n)).and_then(|c| c.get(&class)).copied().unwrap_or(0);
-                assert!(ledger.live(&convoy(n), &class) <= cap, "convoy {n} class {class:?} over its cap {cap}");
             }
         }
         for (host, capacity) in &capacities {

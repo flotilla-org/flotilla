@@ -21,9 +21,15 @@
 //! [`DummyEnvironmentProvider::stop`] and
 //! [`DummyEnvironmentProvider::refuse_provisioning`]: the provider then reports
 //! only what the vendor did, and no stored record is touched.
+//!
+//! A vendor's backings outlive the daemon process, as Docker's containers do:
+//! the provider tells its journal each [`DummyVendorChange`], and a provider
+//! built in the next process is [restored](DummyEnvironmentProvider::restore)
+//! from them.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
@@ -97,10 +103,73 @@ pub struct DummyEnvironmentBehaviour {
 /// In-process providers model resources that a real container destroys with it.
 pub type DummyEnvironmentCleanup = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Told each change to a vendor's backings, in order.
+pub type DummyVendorJournal = Arc<dyn Fn(DummyVendorChange) + Send + Sync>;
+
+/// A change to a dummy vendor's backings, by backing (environment ID).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "vendor", rename_all = "snake_case")]
+pub enum DummyVendorChange {
+    /// The vendor realised a backing.
+    ///
+    /// A journal keeps the names in `environment` but not their values, which are the
+    /// provisioning's tokens; only the dummy's own markers keep theirs.
+    Provisioned {
+        id: String,
+        image: String,
+        mounts: Vec<ProvisionedMount>,
+        #[serde(serialize_with = "serialize_withholding_tokens")]
+        environment: BTreeMap<String, String>,
+    },
+    /// The daemon destroyed it.
+    Destroyed { id: String },
+    /// The vendor deleted it of its own accord.
+    Vanished { id: String },
+    /// The vendor stopped it.
+    Stopped { id: String },
+    /// A command inside it changed its files.
+    Files { id: String, change: DummyFileChange },
+    /// Counts carried over from backings no longer held, added to those the other changes make.
+    Counts { provisioned: u64, destroyed: u64, vanished: u64 },
+}
+
+/// The environment's names, with only the dummy's own markers' values: the rest are tokens.
+fn serialize_withholding_tokens<S: serde::Serializer>(environment: &BTreeMap<String, String>, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(environment.iter().map(|(name, value)| {
+        let kept = name == DUMMY_FLEET_ENV || name == "FLOTILLA_ENVIRONMENT_ID";
+        (name, if kept { value.as_str() } else { "" })
+    }))
+}
+
+/// A change to the file tree inside a dummy environment.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum DummyFileChange {
+    /// A journal keeps the path but never the content: delivered credentials, gitconfig and the
+    /// composed agent environment reach a vessel as ordinary files, and the dummy cannot tell
+    /// them apart. A restored file is present and empty.
+    Wrote {
+        path: PathBuf,
+        #[serde(skip_serializing, default)]
+        content: String,
+    },
+    Made {
+        paths: Vec<PathBuf>,
+    },
+    Removed {
+        path: PathBuf,
+    },
+    Moved {
+        from: PathBuf,
+        to: PathBuf,
+    },
+}
+
 pub struct DummyEnvironmentProvider {
     behaviour: DummyEnvironmentBehaviour,
     class: DummyEnvironmentClass,
     cleanup: Option<DummyEnvironmentCleanup>,
+    journal: Option<DummyVendorJournal>,
     owner: Arc<()>,
     handles: Mutex<HashMap<EnvironmentId, Arc<DummyEnvironment>>>,
     refusing: AtomicBool,
@@ -115,6 +184,7 @@ impl DummyEnvironmentProvider {
             behaviour,
             class: DummyEnvironmentClass::Container,
             cleanup: None,
+            journal: None,
             owner: Arc::new(()),
             handles: Mutex::new(HashMap::new()),
             refusing: AtomicBool::new(false),
@@ -134,6 +204,113 @@ impl DummyEnvironmentProvider {
         self
     }
 
+    /// Tell `journal` each change to the vendor's backings.
+    pub fn with_journal(mut self, journal: DummyVendorJournal) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    fn record(&self, change: DummyVendorChange) {
+        if let Some(journal) = &self.journal {
+            journal(change);
+        }
+    }
+
+    /// A backing as the vendor holds it, running, with an empty file tree.
+    fn backing_of(
+        &self,
+        id: EnvironmentId,
+        image: String,
+        mounts: Vec<ProvisionedMount>,
+        environment: HashMap<String, String>,
+    ) -> DummyEnvironment {
+        let journal = self.journal.clone().map(|journal| {
+            let id = id.to_string();
+            Box::new(move |change| journal(DummyVendorChange::Files { id: id.clone(), change })) as FileJournal
+        });
+        DummyEnvironment {
+            container_name: format!("flotilla-dummy-{id}"),
+            local_image_id: dummy_image_id(&image),
+            descriptor: self.descriptor(&image),
+            image: ImageId::new(image),
+            mounts,
+            environment,
+            runner: Arc::new(DummyCommandRunner { journal, ..DummyCommandRunner::default() }),
+            agent: Arc::default(),
+            id,
+            destroyed: AtomicBool::new(false),
+            vendor: AtomicU8::new(RUNNING),
+            cleanup: self.cleanup.clone(),
+            journal: self.journal.clone(),
+            destroyed_count: Arc::clone(&self.destroyed_counter),
+        }
+    }
+
+    /// Apply a change a previous process's provider recorded, without recording it again or
+    /// cleaning up after it: what it destroyed was cleaned up then.
+    pub fn restore(&self, change: DummyVendorChange) {
+        let held = |id: &str| self.handles().get(&EnvironmentId::new(id)).cloned();
+        match change {
+            DummyVendorChange::Provisioned { id, image, mounts, environment } => {
+                let backing = self.backing_of(EnvironmentId::new(&id), image, mounts, environment.into_iter().collect());
+                self.handles().insert(EnvironmentId::new(id), Arc::new(backing));
+                self.provisioned.fetch_add(1, Ordering::Relaxed);
+            }
+            DummyVendorChange::Destroyed { id } => {
+                if let Some(handle) = self.handles().remove(&EnvironmentId::new(id)) {
+                    handle.destroyed.store(true, Ordering::Release);
+                    self.destroyed_counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            DummyVendorChange::Vanished { id } => {
+                if let Some(handle) = self.handles().remove(&EnvironmentId::new(id)) {
+                    handle.vendor.store(VANISHED, Ordering::Release);
+                    self.vanished.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            DummyVendorChange::Stopped { id } => {
+                if let Some(handle) = held(&id) {
+                    handle.vendor.store(STOPPED, Ordering::Release);
+                }
+            }
+            DummyVendorChange::Files { id, change } => {
+                if let Some(handle) = held(&id) {
+                    handle.runner.apply(&change);
+                }
+            }
+            DummyVendorChange::Counts { provisioned, destroyed, vanished } => {
+                self.provisioned.fetch_add(provisioned, Ordering::Relaxed);
+                self.destroyed_counter.fetch_add(destroyed, Ordering::Relaxed);
+                self.vanished.fetch_add(vanished, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The fewest changes that [restore](Self::restore) what the vendor holds now and its counts.
+    pub fn snapshot(&self) -> Vec<DummyVendorChange> {
+        let held = self.handles().values().filter(|handle| handle.held()).cloned().collect::<Vec<_>>();
+        let counts = self.counts();
+        let mut changes = vec![DummyVendorChange::Counts {
+            provisioned: counts.provisioned - held.len() as u64,
+            destroyed: counts.destroyed,
+            vanished: counts.vanished,
+        }];
+        for handle in held {
+            let id = handle.id.to_string();
+            changes.push(DummyVendorChange::Provisioned {
+                id: id.clone(),
+                image: handle.image.as_str().to_owned(),
+                mounts: handle.mounts.clone(),
+                environment: handle.environment.clone().into_iter().collect(),
+            });
+            if handle.vendor.load(Ordering::Acquire) == STOPPED {
+                changes.push(DummyVendorChange::Stopped { id: id.clone() });
+            }
+            changes.extend(handle.runner.snapshot().into_iter().map(|change| DummyVendorChange::Files { id: id.clone(), change }));
+        }
+        changes
+    }
+
     fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<EnvironmentId, Arc<DummyEnvironment>>> {
         self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -146,6 +323,18 @@ impl DummyEnvironmentProvider {
             .map(|(_, handle)| Arc::clone(handle))
     }
 
+    /// The controller socket the agent of `environment` (environment ID or backing name)
+    /// forwards the vessel's daemon endpoint to, once the daemon has asked for the forward.
+    pub fn forward_target(&self, environment: &str) -> Option<PathBuf> {
+        self.backing(environment)?.agent.controller_forward.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// The command world inside `environment`'s backing, by environment ID or backing name, as a
+    /// process running in it sees it. `None` when the vendor holds no such backing.
+    pub fn runner(&self, environment: &str) -> Option<Arc<dyn CommandRunner>> {
+        self.backing(environment).map(|handle| Arc::clone(&handle.runner) as Arc<dyn CommandRunner>)
+    }
+
     /// The vendor deletes `environment`'s backing, as a sandbox vendor evicts
     /// one: it leaves the inventory, its handles report it gone, and the
     /// processes inside it end. False when the vendor holds no such backing.
@@ -156,6 +345,7 @@ impl DummyEnvironmentProvider {
         }
         self.vanished.fetch_add(1, Ordering::Relaxed);
         self.handles().retain(|_, current| !Arc::ptr_eq(current, &handle));
+        self.record(DummyVendorChange::Vanished { id: handle.id.to_string() });
         if let Some(cleanup) = &self.cleanup {
             cleanup(handle.id.as_str());
         }
@@ -164,8 +354,12 @@ impl DummyEnvironmentProvider {
 
     /// The vendor stops `environment`'s backing; it stays in the inventory.
     pub fn stop(&self, environment: &str) -> bool {
-        self.backing(environment)
-            .is_some_and(|handle| handle.vendor.compare_exchange(RUNNING, STOPPED, Ordering::AcqRel, Ordering::Acquire).is_ok())
+        let Some(handle) = self.backing(environment) else { return false };
+        let stopped = handle.vendor.compare_exchange(RUNNING, STOPPED, Ordering::AcqRel, Ordering::Acquire).is_ok();
+        if stopped {
+            self.record(DummyVendorChange::Stopped { id: handle.id.to_string() });
+        }
+        stopped
     }
 
     /// While set, the vendor refuses to realise any new backing.
@@ -279,23 +473,16 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         let mut environment: HashMap<String, String> = opts.tokens.into_iter().collect();
         environment.insert(DUMMY_FLEET_ENV.into(), "1".into());
         environment.insert("FLOTILLA_ENVIRONMENT_ID".into(), id.to_string());
-        let handle = Arc::new(DummyEnvironment {
-            container_name: format!("flotilla-dummy-{id}"),
-            local_image_id: dummy_image_id(&image),
-            descriptor: self.descriptor(&image),
-            image: ImageId::new(image),
-            mounts: opts.provisioned_mounts,
-            environment,
-            runner: Arc::new(DummyCommandRunner::default()),
-            id: id.clone(),
-            destroyed: AtomicBool::new(false),
-            vendor: AtomicU8::new(RUNNING),
-            cleanup: self.cleanup.clone(),
-            destroyed_count: Arc::clone(&self.destroyed_counter),
-        });
+        let handle = Arc::new(self.backing_of(id.clone(), image, opts.provisioned_mounts, environment));
         let mut handles = self.handles();
         let held = handles.entry(id).or_insert_with(|| {
             self.provisioned.fetch_add(1, Ordering::Relaxed);
+            self.record(DummyVendorChange::Provisioned {
+                id: handle.id.to_string(),
+                image: handle.image.as_str().to_owned(),
+                mounts: handle.mounts.clone(),
+                environment: handle.environment.clone().into_iter().collect(),
+            });
             handle
         });
         Ok(Arc::clone(held) as EnvironmentHandle)
@@ -358,6 +545,7 @@ struct DummyEnvironment {
     /// The vendor's view of the backing: running, stopped or vanished.
     vendor: AtomicU8,
     cleanup: Option<DummyEnvironmentCleanup>,
+    journal: Option<DummyVendorJournal>,
     destroyed_count: Arc<AtomicU64>,
     id: EnvironmentId,
     image: ImageId,
@@ -367,6 +555,110 @@ struct DummyEnvironment {
     mounts: Vec<ProvisionedMount>,
     environment: HashMap<String, String>,
     runner: Arc<DummyCommandRunner>,
+    agent: Arc<DummyAgentState>,
+}
+
+/// What a dummy vessel's resident agent holds beyond its file tree. A real agent's forward
+/// lives as long as the controller process that asked for it, so none is journalled: the next
+/// daemon asks again when it adopts the vessel.
+#[derive(Default)]
+struct DummyAgentState {
+    /// The controller socket the vessel's daemon forward carries connections to.
+    controller_forward: Mutex<Option<PathBuf>>,
+    /// What [`VesselAgent::extend_environment`] added for the vessel's commands.
+    environment: Mutex<BTreeMap<String, String>>,
+}
+
+/// The resident agent of a dummy vessel: its file operations are the in-memory file tree's,
+/// its command runner the dummy's, and it serves the controller's forward by recording its host
+/// target, where a dummy crew in the vessel connects. Tools pushed to it are present in the tree
+/// at their vessel paths, holding the host path they came from rather than their bytes.
+struct DummyVesselAgent {
+    runner: Arc<DummyCommandRunner>,
+    state: Arc<DummyAgentState>,
+}
+
+#[async_trait]
+impl super::VesselAgent for DummyVesselAgent {
+    async fn ready(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String> {
+        Err(format!("nothing serves {} inside a dummy vessel", guest.display()))
+    }
+    async fn push_tools(&self, tools: &[super::EnvironmentTool]) -> Result<(), String> {
+        for tool in tools {
+            for asset in &tool.assets {
+                let source = format!("dummy vessel copy of {}\n", asset.host_path.as_path().display());
+                self.runner.write_file(asset.environment_path.as_path(), &source).await?;
+            }
+            if !self.runner.has_path(tool.executable.as_path()) {
+                self.runner.write_file(tool.executable.as_path(), &format!("dummy vessel tool {}\n", tool.name)).await?;
+            }
+        }
+        Ok(())
+    }
+    async fn forward_controller_socket(&self, _guest: &Path, _tcp: Option<SocketAddr>, controller: &Path) -> Result<(), String> {
+        *self.state.controller_forward.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(controller.to_path_buf());
+        Ok(())
+    }
+    async fn extend_environment(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
+        self.state.environment.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(environment);
+        Ok(())
+    }
+    fn commands(&self) -> Arc<dyn CommandRunner> {
+        Arc::clone(&self.runner) as Arc<dyn CommandRunner>
+    }
+    async fn writable_base(&self) -> Result<PathBuf, String> {
+        self.runner.writable_config_base(None, Path::new(super::runner::CONTAINED_WRITABLE_CONFIG_BASE)).await
+    }
+    async fn stat(&self, path: &Path) -> Result<Option<super::EntryKind>, String> {
+        Ok(if self.runner.files().contains_key(path) {
+            Some(super::EntryKind::File)
+        } else if self.runner.directories().contains(path) {
+            Some(super::EntryKind::Directory)
+        } else {
+            None
+        })
+    }
+    async fn create_dir(&self, path: &Path, _mode: u32) -> Result<(), String> {
+        if self.runner.files().contains_key(path) {
+            return Err(format!("{} is not a directory", path.display()));
+        }
+        self.runner.change(DummyFileChange::Made {
+            paths: path.ancestors().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).collect(),
+        });
+        Ok(())
+    }
+    async fn read(&self, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
+        match self.runner.files().get(path) {
+            Some(content) if content.len() as u64 > limit => Err(format!("{} is larger than {limit} bytes", path.display())),
+            Some(content) => Ok(Some(content.clone().into_bytes())),
+            None => Ok(None),
+        }
+    }
+    async fn write(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String> {
+        let text = String::from_utf8(bytes).map_err(|_| format!("{} must be UTF-8 in a dummy vessel", path.display()))?;
+        self.runner.write_file_with_mode(path, &text, mode).await
+    }
+    async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String> {
+        // The tree holds no links: the path reads as what it points at, as following one does.
+        let content = self.runner.files().get(target).cloned().unwrap_or_default();
+        self.runner.write_file(path, &content).await
+    }
+    async fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
+        if self.runner.has_path(to) {
+            return Err(format!("{} already exists", to.display()));
+        }
+        if !self.runner.files().contains_key(from) {
+            return Err(format!("{} is absent in the dummy vessel", from.display()));
+        }
+        self.runner.change(DummyFileChange::Moved { from: from.into(), to: to.into() });
+        Ok(())
+    }
+    async fn architecture(&self) -> Result<String, String> {
+        Ok("amd64".into())
+    }
 }
 
 impl DummyEnvironment {
@@ -425,13 +717,15 @@ impl ProvisionedEnvironment for DummyEnvironment {
     fn runner(&self) -> Arc<dyn CommandRunner> {
         Arc::clone(&self.runner) as Arc<dyn CommandRunner>
     }
-    /// The dummy's scripted runner stands for its vessel, agent included.
     fn agent(&self) -> Arc<dyn super::VesselAgent> {
-        Arc::new(super::vessel_ops::RunnerVesselAgent(self.runner()))
+        Arc::new(DummyVesselAgent { runner: Arc::clone(&self.runner), state: Arc::clone(&self.agent) })
     }
     async fn destroy(&self) -> Result<(), String> {
         if !self.destroyed.swap(true, Ordering::AcqRel) && self.vendor.load(Ordering::Acquire) != VANISHED {
             self.destroyed_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(journal) = &self.journal {
+                journal(DummyVendorChange::Destroyed { id: self.id.to_string() });
+            }
             if let Some(cleanup) = &self.cleanup {
                 cleanup(self.id.as_str());
             }
@@ -449,7 +743,11 @@ fn succeeded(stdout: impl Into<String>) -> CommandOutput {
 }
 
 fn failed(stderr: impl Into<String>) -> CommandOutput {
-    CommandOutput { stdout: String::new(), stderr: stderr.into(), exit_code: Some(1) }
+    failed_with(1, stderr)
+}
+
+fn failed_with(code: i32, stderr: impl Into<String>) -> CommandOutput {
+    CommandOutput { stdout: String::new(), stderr: stderr.into(), exit_code: Some(code) }
 }
 
 /// The command world inside a dummy environment: an in-memory file tree and
@@ -459,9 +757,43 @@ fn failed(stderr: impl Into<String>) -> CommandOutput {
 pub struct DummyCommandRunner {
     files: Mutex<HashMap<PathBuf, String>>,
     directories: Mutex<BTreeSet<PathBuf>>,
+    journal: Option<FileJournal>,
 }
 
+type FileJournal = Box<dyn Fn(DummyFileChange) + Send + Sync>;
+
 impl DummyCommandRunner {
+    /// Make `change` and tell the journal.
+    fn change(&self, change: DummyFileChange) {
+        self.apply(&change);
+        if let Some(journal) = &self.journal {
+            journal(change);
+        }
+    }
+
+    fn apply(&self, change: &DummyFileChange) {
+        match change {
+            DummyFileChange::Wrote { path, content } => self.store(path, content),
+            DummyFileChange::Made { paths } => self.directories().extend(paths.iter().cloned()),
+            DummyFileChange::Removed { path } => self.remove(path),
+            DummyFileChange::Moved { from, to } => {
+                let moved = self.files().remove(from);
+                if let Some(content) = moved {
+                    self.store(to, &content);
+                }
+            }
+        }
+    }
+
+    /// The changes that make this file tree from an empty one.
+    fn snapshot(&self) -> Vec<DummyFileChange> {
+        let mut changes = vec![DummyFileChange::Made { paths: self.directories().iter().cloned().collect() }];
+        let mut files = self.files().iter().map(|(path, content)| (path.clone(), content.clone())).collect::<Vec<_>>();
+        files.sort();
+        changes.extend(files.into_iter().map(|(path, content)| DummyFileChange::Wrote { path, content }));
+        changes
+    }
+
     fn files(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, String>> {
         self.files.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -494,22 +826,19 @@ impl DummyCommandRunner {
         match cmd {
             "true" | "chmod" | "chown" | "touch" | "sync" => succeeded(""),
             "mkdir" => {
-                self.directories().extend(Self::operands(args).map(PathBuf::from));
+                self.change(DummyFileChange::Made { paths: Self::operands(args).map(PathBuf::from).collect() });
                 succeeded("")
             }
             "rm" | "rmdir" => {
                 for path in Self::operands(args) {
-                    self.remove(Path::new(path));
+                    self.change(DummyFileChange::Removed { path: path.into() });
                 }
                 succeeded("")
             }
             "mv" => {
                 let operands = Self::operands(args).collect::<Vec<_>>();
                 if let [source, destination] = operands.as_slice() {
-                    let moved = self.files().remove(Path::new(source));
-                    if let Some(content) = moved {
-                        self.store(Path::new(destination), &content);
-                    }
+                    self.change(DummyFileChange::Moved { from: source.into(), to: destination.into() });
                 }
                 succeeded("")
             }
@@ -545,11 +874,43 @@ impl DummyCommandRunner {
                     });
                     succeeded(lines.collect::<String>())
                 }
-                // Other scripts (staging probes) observe an empty world: they
-                // succeed and report nothing.
-                _ => succeeded(""),
+                ["-c", script, positional @ ..] => Self::script(script, positional),
+                _ => failed_with(2, format!("{cmd}: only `-c` scripts run in a dummy environment")),
             },
             program => absent(program),
+        }
+    }
+
+    /// A `sh -c` script, `positional` being `$0` and its arguments. A shell answers the
+    /// executable lookups it can make, as a real one does: found on stdout, a miss as exit 1
+    /// with nothing printed. Any other script runs programs this world does not have, so it
+    /// fails as a shell does when a program is absent (exit 127).
+    fn script(script: &str, positional: &[&str]) -> CommandOutput {
+        let lookup = match script.trim().strip_prefix("command -v ").map(str::trim) {
+            Some("\"$1\"") => positional.get(1).copied(),
+            Some(name) if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)) => Some(name),
+            _ => None,
+        };
+        match lookup {
+            Some(name) => match Self::installed(name) {
+                Some(path) => succeeded(format!("{path}\n")),
+                None => failed(""),
+            },
+            None => {
+                let name = positional.first().copied().unwrap_or("sh");
+                failed_with(127, format!("{name}: the script's programs are not present in a dummy environment"))
+            }
+        }
+    }
+
+    /// Where a program present in a dummy environment's image is installed.
+    fn installed(name: &str) -> Option<&'static str> {
+        match name {
+            DUMMY_CREW_BINARY => Some("/usr/local/bin/flotilla-dummy-crew"),
+            "sh" => Some("/bin/sh"),
+            // Crew images carry bash; a session's shell is looked up by name.
+            "bash" => Some("/bin/bash"),
+            _ => None,
         }
     }
 }
@@ -593,17 +954,17 @@ impl CommandRunner for DummyCommandRunner {
         if let Some(existing) = self.files().get(path) {
             return Ok(existing.clone());
         }
-        self.store(path, content);
+        self.change(DummyFileChange::Wrote { path: path.into(), content: content.into() });
         Ok(content.to_string())
     }
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
-        self.store(path, content);
+        self.change(DummyFileChange::Wrote { path: path.into(), content: content.into() });
         Ok(())
     }
 
     async fn write_file_with_mode(&self, path: &Path, content: &str, _mode: u32) -> Result<(), String> {
-        self.store(path, content);
+        self.change(DummyFileChange::Wrote { path: path.into(), content: content.into() });
         Ok(())
     }
 
@@ -617,7 +978,7 @@ impl CommandRunner for DummyCommandRunner {
         let content = tokio::fs::read_to_string(source)
             .await
             .map_err(|error| format!("read {} for the dummy environment: {error}", source.display()))?;
-        self.store(destination, &content);
+        self.change(DummyFileChange::Wrote { path: destination.into(), content });
         Ok(())
     }
 }
@@ -663,7 +1024,10 @@ impl DummyEnvironmentProvider {
 mod tests {
     use flotilla_resources::{DockerEnvironmentSpec, EnvironmentSpec};
 
-    use super::*;
+    use super::{
+        super::{EntryKind, EnvironmentTool},
+        *,
+    };
 
     fn docker_spec(image: &str) -> EnvironmentSpec {
         EnvironmentSpec {
@@ -851,5 +1215,113 @@ mod tests {
         let git = runner.run_output("git", &["--version"], root, &ChannelLabel::Default).await.expect("spawned");
         assert_eq!(git.exit_code, Some(127));
         assert!(!CommandRunner::exists(&runner, "claude", &["--version"]).await);
+    }
+
+    // A shell's answers, as discovery reads them: a lookup finds what the image has and misses
+    // the rest with exit 1 and nothing printed; a script running absent programs exits 127.
+    #[tokio::test]
+    async fn the_shell_misses_absent_programs_as_a_real_one_does() {
+        let runner = DummyCommandRunner::default();
+        let root = Path::new("/");
+        let lookup = |name: &'static str| {
+            let runner = &runner;
+            async move { runner.run_output("sh", &["-c", "command -v \"$1\"", "probe", name], root, &ChannelLabel::Default).await }
+        };
+        let missing = lookup("claude").await.expect("spawned");
+        assert_eq!((missing.exit_code, missing.stdout.as_str(), missing.stderr.as_str()), (Some(1), "", ""));
+        assert_eq!(lookup(DUMMY_CREW_BINARY).await.expect("spawned").stdout, "/usr/local/bin/flotilla-dummy-crew\n");
+        let literal = runner.run_output("sh", &["-c", "command -v gh"], root, &ChannelLabel::Default).await.expect("spawned");
+        assert_eq!(literal.exit_code, Some(1));
+        let script = runner
+            .run_output("sh", &["-c", "umask 077 && mkdir -p \"$1\"", "flotilla-requester-home", "/x"], root, &ChannelLabel::Default)
+            .await
+            .expect("spawned");
+        assert_eq!(script.exit_code, Some(127));
+        assert!(script.stderr.starts_with("flotilla-requester-home:"), "{}", script.stderr);
+
+        // Discovery's binary lookup now resolves the crew harness and finds no other harness,
+        // rather than taking an empty success for a relative path.
+        use flotilla_discovery_api::detectors::resolve_binary_path;
+        assert_eq!(resolve_binary_path(&runner, "claude").await, None);
+        assert_eq!(resolve_binary_path(&runner, DUMMY_CREW_BINARY).await, Some(PathBuf::from("/usr/local/bin/flotilla-dummy-crew")));
+    }
+
+    // A dummy vessel's agent answers as a resident agent does: it is ready, serves the
+    // controller's daemon forward (whose host target a crew in the vessel reads back), keeps
+    // what is written, made, moved and pushed to it in memory, and refuses what a filesystem
+    // refuses.
+    #[tokio::test]
+    async fn the_vessel_agent_serves_the_forward_and_keeps_delivered_files() {
+        let provider = DummyEnvironmentProvider::new(DummyEnvironmentBehaviour::default());
+        let handle = provision(&provider, "one").await.expect("one");
+        let agent = handle.agent();
+        agent.ready().await.expect("ready");
+        assert_eq!(provider.forward_target("one"), None, "no forward before the daemon asks");
+        let controller = Path::new("/run/flotilla/environments/one.sock");
+        agent.forward_controller_socket(Path::new("/run/flotilla/daemon.sock"), None, controller).await.expect("forward");
+        assert_eq!(provider.forward_target("flotilla-dummy-one"), Some(controller.to_path_buf()), "by backing name too");
+
+        let home = Path::new("/home/crew/.claude");
+        agent.create_dir(home, 0o700).await.expect("directory");
+        assert_eq!(agent.stat(home).await.expect("stat"), Some(EntryKind::Directory));
+        agent.write(&home.join("settings.json.new"), b"{}".to_vec(), 0o600).await.expect("write");
+        agent.rename(&home.join("settings.json.new"), &home.join("settings.json")).await.expect("rename");
+        assert_eq!(agent.read(&home.join("settings.json"), 1024).await.expect("read"), Some(b"{}".to_vec()));
+        assert_eq!(agent.stat(&home.join("settings.json.new")).await.expect("stat"), None);
+        assert!(agent.read(&home.join("settings.json"), 1).await.is_err(), "over the limit");
+        assert!(agent.create_dir(&home.join("settings.json"), 0o700).await.is_err(), "a file is not a directory");
+        agent.write(&home.join("other"), b"x".to_vec(), 0o600).await.expect("write");
+        assert!(agent.rename(&home.join("other"), &home.join("settings.json")).await.is_err(), "the target exists");
+
+        let tool = EnvironmentTool::new("flotilla", "/opt/flotilla/bin/flotilla");
+        agent.push_tools(&[tool]).await.expect("push");
+        assert_eq!(agent.stat(Path::new("/opt/flotilla/bin/flotilla")).await.expect("stat"), Some(EntryKind::File));
+        agent
+            .extend_environment(BTreeMap::from([("FLOTILLA_DAEMON_SOCKET".into(), "/run/flotilla/daemon.sock".into())]))
+            .await
+            .expect("env");
+        assert_eq!(agent.architecture().await.as_deref(), Ok("amd64"));
+    }
+
+    // The vendor's journal, as the fleet writes it to disk, holds no secret: provisioning tokens
+    // keep their names but not their values, and written files their paths but not their
+    // contents. A vendor restored from it holds the same backing, its files present and empty.
+    #[tokio::test]
+    async fn the_journal_keeps_no_token_or_file_content() {
+        let journalled = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&journalled);
+        let provider = DummyEnvironmentProvider::new(DummyEnvironmentBehaviour::default())
+            .with_journal(Arc::new(move |change| captured.lock().expect("journal").push(serde_json::to_string(&change).expect("json"))));
+        let prepared = provider.prepare(&docker_spec("dummy/crew:latest"), &PrepareOpts::default()).await.expect("prepare");
+        let tokens = vec![("GH_TOKEN".into(), "ghs-secret-token".into())];
+        let handle =
+            provider.provision(EnvironmentId::new("one"), &prepared, ProvisionOpts { tokens, ..Default::default() }).await.expect("one");
+        let runner = handle.runner();
+        runner.write_file_with_mode(Path::new("/home/crew/.claude/.credentials.json"), "oauth-secret", 0o600).await.expect("credential");
+        runner.write_file(Path::new("/home/crew/.config/agent-environment"), "ANTHROPIC_API_KEY=sk-secret\n").await.expect("environment");
+
+        let lines = journalled.lock().expect("journal").clone();
+        let written = lines.join("\n");
+        for secret in ["ghs-secret-token", "oauth-secret", "sk-secret"] {
+            assert!(!written.contains(secret), "{secret} reached the journal: {written}");
+        }
+        assert!(written.contains("GH_TOKEN") && written.contains(".credentials.json"), "{written}");
+
+        let restored = DummyEnvironmentProvider::new(DummyEnvironmentBehaviour::default());
+        for line in &lines {
+            restored.restore(serde_json::from_str(line).expect("a journal line decodes"));
+        }
+        let handle = restored.backing("one").expect("restored backing");
+        let environment = handle.env_vars().await.expect("environment");
+        assert_eq!(
+            (environment.get("GH_TOKEN").map(String::as_str), environment.get(DUMMY_FLEET_ENV).map(String::as_str)),
+            (Some(""), Some("1"))
+        );
+        let runner = handle.runner();
+        assert!(runner.path_exists(Path::new("/home/crew/.claude/.credentials.json")).await.expect("exists"));
+        assert_eq!(
+            runner.run("cat", &["/home/crew/.claude/.credentials.json"], Path::new("/"), &ChannelLabel::Default).await,
+            Ok(String::new())
+        );
     }
 }

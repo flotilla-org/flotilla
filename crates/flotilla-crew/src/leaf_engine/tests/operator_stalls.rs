@@ -1,0 +1,237 @@
+use super::*;
+use flotilla_resources::attentions::{OpenAttention, Sender, Subject};
+
+/// A launch whose coder works in session `coder-session`, with no supervisor declared, at a home
+/// whose fleet is designated so a person can be told. Its coder's actor row is armed.
+async fn unsupervised_launch() -> Case {
+    let (backend, home) = engine_backend().await;
+    let wake = supervision_wake(&backend, &home);
+    let delivery = Arc::new(RecordingTurnDelivery::default());
+    wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
+    let work = home.admit("unsupervised-work", convoy_spec(), single_agent("coder")).await;
+    let vessel = home.vessel(&work, "work", "env");
+    home.seat(&backend, &work, (&vessel, "work"), ("coder", "coder-session"), CrewWorkPhase::Working).await;
+    let case = Case { backend, home, wake, delivery, work, vessel, governors: BTreeMap::new() };
+    arm_coder(&case.wake, &case.work).await;
+    case
+}
+
+/// Arms `wake`'s actor row for the coder of launch `work`.
+async fn arm_coder(wake: &ReconcilerWake, work: &str) {
+    let id = uuid::Uuid::new_v4();
+    let leaf = leaf(LeafAddress::Work { convoy: work.to_owned(), work: "work".into() }, ".crew.coder.phase", "Done");
+    wake.subscriptions.inner.rows.lock().await.insert(
+        id,
+        LeafSubscriptionRow {
+            id,
+            namespace: "flotilla".into(),
+            leaves: vec![leaf],
+            watcher: LeafWatcher::ReconcilerWake { convoy: work.to_owned() },
+            maker: LeafMaker::Actor { vessel: "work".into(), role: "coder".into() },
+            freshness_demand: None,
+            created_at: Utc::now(),
+            episode_key: EpisodeKeyFields::default(),
+        },
+    );
+}
+
+/// The home restarts: its notes on the launch and its wake's memory are gone, and a new wake
+/// with the coder's row armed judges it.
+async fn restart(case: Case) -> Case {
+    case.home.engine().memory().forget(&case.work);
+    let wake = supervision_wake(&case.backend, &case.home);
+    wake.subscriptions.set_turn_delivery_actuator(case.delivery.clone()).await;
+    arm_coder(&wake, &case.work).await;
+    Case { wake, ..case }
+}
+
+/// The coder's session reads `state` at `now`, and the case is judged then.
+async fn coder_reads(case: &Case, state: TerminalAttentionState, now: DateTime<Utc>) {
+    observe_session(&case.home, "coder-session", Some(TerminalAttention { state, as_of: now, source: TerminalAttentionSource::Screen }));
+    observe_agent(&case.home, "coder-session", state, TerminalAttentionSource::Screen, now);
+    case.judge(&case.wake, now).await;
+}
+
+/// The stall judge's open attentions.
+async fn stall_attentions(case: &Case) -> Vec<OpenAttention> {
+    case.backend.attentions().open("flotilla", Some(Sender::StallJudge), None).await.expect("open attentions")
+}
+
+// #3108: a crew's own stall reaches the operator with no supervisor declared and no row to carry
+// it (nothing actionable): its record holds at the Operator rung and the operator is told.
+#[tokio::test]
+async fn a_declared_stall_with_no_row_reaches_the_operator() {
+    let (backend, home) = engine_backend().await;
+    let wake = supervision_wake(&backend, &home);
+    let delivery = Arc::new(RecordingTurnDelivery::default());
+    wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
+    let work = home.admit("unsupervised-work", convoy_spec(), single_agent("coder")).await;
+    let vessel = home.vessel(&work, "work", "env");
+    home.seat(&backend, &work, (&vessel, "work"), ("coder", "coder-session"), CrewWorkPhase::Working).await;
+    let case = Case { backend, home, wake, delivery, work, vessel, governors: BTreeMap::new() };
+    let work = case.work.clone();
+    case.note(|status| {
+        external_patches::mark_crew_stalled(
+            work,
+            "work".into(),
+            "coder".into(),
+            Utc::now(),
+            flotilla_resources::StallReason::Infra,
+            None,
+            "blocked".into(),
+        )
+        .apply(status)
+    })
+    .await;
+    for _ in 0..2 {
+        case.judge(&case.wake, Utc::now()).await;
+        let status = case.status().await;
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+        let stall = status.stalled.expect("the declared stall is recorded");
+        assert_eq!(
+            (stall.rung, stall.supervisor.as_ref(), &stall.source),
+            (StallRung::Operator, None, &StallEvidenceSource::Crew),
+            "{stall:?}"
+        );
+        assert_eq!(stall.reason, Some(flotilla_resources::StallReason::Infra));
+        // The default ladder's missing governor says why the stall reached the operator.
+        assert_eq!(stall.evidence, "blocked; no live governor for project flotilla (no matching convoy in replica view)");
+        let told = stall_attentions(&case).await;
+        let [attention] = told.as_slice() else { panic!("the operator is told once: {told:?}") };
+        assert_eq!(attention.subject, Subject::ConvoyRole { convoy: case.work.clone(), role: "coder".into() });
+    }
+}
+
+// Run 4 R4-6: a coder whose PR was closed without merging stalls with its promise rejected, and
+// only a person's verdict keeps or retracts that promise. The attention that reaches the operator
+// names both verdicts as runnable commands with the convoy's and the promise's real names.
+#[tokio::test]
+async fn an_operator_stall_over_a_rejected_promise_names_its_verdict_commands() {
+    use flotilla_resources::convoy::engine::Actor;
+    use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict};
+
+    let case = unsupervised_launch().await;
+    let engine = case.home.engine();
+    let (id, reference, submitted_at) = ("pr-18", "cr/github.com/team/one/18".to_string(), Utc::now());
+    let declare = PromiseOperation::Declare { id: id.into(), kind: PromiseKind::Pr, source: PromiseSource::Crew };
+    engine.promise(&case.convoy().await, "work", "coder", &declare, Actor::Crew).await.expect("the coder declares its PR");
+    let submission =
+        Submission { reference: reference.clone(), metadata: BTreeMap::new(), submitted_at: Some(submitted_at), verdict: None };
+    let submit = PromiseOperation::Submit { id: id.into(), kind: PromiseKind::Pr, source: PromiseSource::Crew, submission };
+    engine.promise(&case.convoy().await, "work", "coder", &submit, Actor::Crew).await.expect("the coder submits its PR");
+    let verdict = SubmissionVerdict { accepted: false, who: "forge".into(), at: submitted_at, why: "closed-unmerged".into() };
+    let reject = PromiseOperation::Verdict { id: id.into(), reference, submitted_at: Some(submitted_at), verdict };
+    engine.promise(&case.convoy().await, "work", "coder", &reject, Actor::Observer).await.expect("the forge rejects it");
+    let work = case.work.clone();
+    case.note(|status| {
+        external_patches::mark_crew_stalled(
+            work,
+            "work".into(),
+            "coder".into(),
+            Utc::now(),
+            flotilla_resources::StallReason::Decision,
+            None,
+            "my PR was closed without merging".into(),
+        )
+        .apply(status)
+    })
+    .await;
+    case.judge(&case.wake, Utc::now()).await;
+
+    let told = stall_attentions(&case).await;
+    let [attention] = told.as_slice() else { panic!("the operator is told once: {told:?}") };
+    assert!(attention.reason.contains("Its promise pr-18 was rejected"), "{}", attention.reason);
+    for verb in ["retract", "keep"] {
+        let command = format!("`flotilla convoy '{}' promise 'pr-18' {verb} --reason 'reason'`", case.work);
+        assert!(attention.reason.contains(&command), "{}", attention.reason);
+    }
+    // The supervise commands stay: resuming the crew is still a way out.
+    assert!(attention.reason.contains("flotilla crew supervise"), "{}", attention.reason);
+}
+
+// #3108: a stall that reaches the operator with no person named tells one: one open attention for
+// the stalled seat, however often it is judged, withdrawn when the crew works again.
+#[tokio::test]
+async fn unnamed_operator_stall_is_told_once_and_withdrawn_when_it_closes() {
+    let case = unsupervised_launch().await;
+    let start = Utc::now();
+    let at = |tick: i64| start + chrono::Duration::seconds(tick * 600);
+    // The idle coder is nudged until its nudges run out, then its stall reaches the operator.
+    let mut tick = 0;
+    loop {
+        coder_reads(&case, TerminalAttentionState::Idle, at(tick)).await;
+        tick += 1;
+        if case.status().await.stalled.is_some_and(|stall| stall.rung == StallRung::Operator) || tick == 20 {
+            break;
+        }
+    }
+    let stall = case.status().await.stalled.expect("the idle coder stalls");
+    assert_eq!((stall.rung, stall.supervisor.as_ref()), (StallRung::Operator, None), "{stall:?}");
+    let told = stall_attentions(&case).await;
+    let [attention] = told.as_slice() else { panic!("one attention for the stalled seat: {told:?}") };
+    assert_eq!(attention.subject, Subject::ConvoyRole { convoy: case.work.clone(), role: "coder".into() });
+    assert!(attention.reason.contains("Supervise stalled crew coder@work"), "{}", attention.reason);
+    for later in tick..tick + 3 {
+        coder_reads(&case, TerminalAttentionState::Idle, at(later)).await;
+    }
+    assert_eq!(stall_attentions(&case).await, told, "judging the same stall again tells no one again");
+    coder_reads(&case, TerminalAttentionState::Working, at(tick + 3)).await;
+    assert!(case.status().await.stalled.is_none(), "the working coder's stall closes");
+    assert!(stall_attentions(&case).await.is_empty(), "the closed stall's attention is withdrawn");
+}
+
+// #3108: the attention is a told stall's durable record. A crew's declared stall at the unnamed
+// operator rung outlives its home's restart: the seat still reads Stalled from the open attention,
+// no second one is raised, and a new turn closes both.
+#[tokio::test]
+async fn told_stall_is_noted_again_after_a_restart() {
+    let case = unsupervised_launch().await;
+    let start = Utc::now();
+    let at = |tick: i64| start + chrono::Duration::seconds(tick);
+    case.home
+        .note(&case.backend, &case.work, |status| {
+            flotilla_resources::ConvoyStatusPatch::MarkCrewStalled {
+                convoy: case.work.clone(),
+                vessel: "work".into(),
+                role: "coder".into(),
+                at: start,
+                reason: flotilla_resources::StallReason::Decision,
+                proposed_disposition: None,
+                message: "Need a decision on the schema".into(),
+            }
+            .apply(status);
+        })
+        .await;
+    coder_reads(&case, TerminalAttentionState::Idle, at(1)).await;
+    let told = stall_attentions(&case).await;
+    let [attention] = told.as_slice() else { panic!("one attention for the declared stall: {told:?}") };
+    assert!(attention.reason.contains("Need a decision on the schema"), "{}", attention.reason);
+
+    let case = restart(case).await;
+    assert!(case.status().await.stalled.is_none(), "a restarted home's notes are empty");
+    for tick in 2..5 {
+        coder_reads(&case, TerminalAttentionState::Idle, at(tick)).await;
+    }
+    let status = case.status().await;
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled, "{:?}", status.crew_work);
+    let stall = status.stalled.expect("the told stall is noted again");
+    assert_eq!((stall.rung, stall.supervisor.as_ref(), stall.seat()), (StallRung::Operator, None, Some(("work", "coder"))));
+    assert_eq!(stall_attentions(&case).await, told, "the restarted home tells no one again");
+
+    case.home
+        .note(&case.backend, &case.work, |status| {
+            flotilla_resources::ConvoyStatusPatch::ResumeCrewWork {
+                intent: flotilla_resources::ResumeIntent::Reopen,
+                vessel: "work".into(),
+                role: "coder".into(),
+                resumed_at: at(5),
+                prompt: "Use the second schema".into(),
+                brief_id: None,
+            }
+            .apply(status);
+        })
+        .await;
+    coder_reads(&case, TerminalAttentionState::Working, at(6)).await;
+    assert!(case.status().await.stalled.is_none(), "the new turn closes the stall");
+    assert!(stall_attentions(&case).await.is_empty(), "and withdraws its attention");
+}

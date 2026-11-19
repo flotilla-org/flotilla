@@ -1,5 +1,5 @@
 //! Consumers of an inbox (ADR 0064 "Roles, inboxes and delivery", #3424
-//! rulings 1 to 3): an agent session, a deterministic controller or a person
+//! rulings 1 to 3): an agent session, a service or a person
 //! (#3938). A person's receipt is an acknowledgement or a response, never a
 //! surface loading the message (owner's schema look-over, 2026-10-18).
 //!
@@ -24,9 +24,9 @@ pub enum ConsumerKind {
     /// An agent conversation (`AgentSession`).
     #[store(code = "as")]
     AgentSession,
-    /// A deterministic controller, through its own resource.
-    #[store(code = "co")]
-    Controller,
+    /// Daemon code that takes messages, through its own resource (`Service`).
+    #[store(code = "sv")]
+    Service,
     /// A person, through their own resource (`Person`).
     #[store(code = "pe")]
     Person,

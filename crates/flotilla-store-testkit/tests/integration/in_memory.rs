@@ -18,7 +18,7 @@ use flotilla_store_testkit::fixtures::{
         assert_replica_read_view_contract, assert_stale_resource_version_conflicts,
         assert_store_diagnostics_report_retained_events_with_backend, assert_watch_from_version_replays, assert_watch_now_semantics,
         assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
-        assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture, DemandFixture, RegardFixture,
+        assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture,
     },
     convoy_meta, convoy_spec,
 };
@@ -123,8 +123,6 @@ macro_rules! resource_contract_tests {
 }
 
 resource_contract_tests!(convoy_contract, ConvoyFixture);
-resource_contract_tests!(regard_contract, RegardFixture);
-resource_contract_tests!(demand_contract, DemandFixture);
 
 #[tokio::test]
 async fn replica_read_view_contract() {
@@ -309,6 +307,7 @@ async fn observed_backend_expires_compacted_version_within_current_generation() 
         err,
         flotilla_resources::ResourceError::WatchExpired {
             requested_version: created.metadata.resource_version,
+            reason: format!("events through {} were compacted", second.metadata.resource_version),
             compacted_through: Some(second.metadata.resource_version),
         }
     );
@@ -323,71 +322,6 @@ async fn slow_convoy_watch_is_bounded() {
 async fn slow_replica_watch_is_bounded() {
     flotilla_store_testkit::fixtures::contract::assert_slow_replica_watch_is_bounded(ResourceBackend::new(InMemoryBackend::default()))
         .await;
-}
-
-// ADR 0016: the observation store offers the same overlay contract as other
-// backends; only the local observations have a process-scoped generation.
-#[tokio::test]
-async fn observed_store_with_durable_replicas_satisfies_overlay_contract() {
-    let temp = tempfile::tempdir().expect("replica directory");
-    let replicas = flotilla_store_sqlite::SqliteBackend::open(temp.path().join("replicas.sqlite")).expect("replica store");
-    flotilla_store_testkit::fixtures::contract::assert_replica_read_view_contract(ResourceBackend::new(
-        InMemoryBackend::observed_with_durable_replicas(replicas),
-    ))
-    .await;
-}
-
-// ADR 0016: a holder restart preserves remote facts and cursors while resetting
-// its own observations. An origin generation change then replaces those facts.
-#[tokio::test]
-async fn observed_store_restart_retains_replicas_and_resets_local_generation() {
-    use flotilla_protocol::NodeId;
-    use flotilla_resources::{ConvoySpec, InputMeta};
-    use flotilla_store_sqlite::SqliteBackend;
-
-    let temp = tempfile::tempdir().expect("replica directory");
-    let path = temp.path().join("replicas.sqlite");
-    let origin = NodeId::new("remote");
-    let remote = ResourceBackend::new(InMemoryBackend::observed());
-    let source = remote.using::<Convoy>("flotilla");
-    source
-        .create(
-            &InputMeta::builder().name("remote-fact".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("remote fact");
-    let listed = source.list().await.expect("origin generation");
-    let first_generation = {
-        let backend =
-            ResourceBackend::new(InMemoryBackend::observed_with_durable_replicas(SqliteBackend::open(&path).expect("replica store")));
-        let local = backend.using::<Convoy>("flotilla");
-        local
-            .create(
-                &InputMeta::builder().name("local-fact".to_string()).build(),
-                &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-            )
-            .await
-            .expect("local fact");
-        backend.replica_writer::<Convoy>(origin.clone(), "flotilla").replace(&listed, chrono::Utc::now()).await.expect("replicate facts");
-        local.list().await.expect("local generation").generation
-    };
-    let reopened =
-        ResourceBackend::new(InMemoryBackend::observed_with_durable_replicas(SqliteBackend::open(&path).expect("reopen replicas")));
-    let local = reopened.using::<Convoy>("flotilla").list().await.expect("new local generation");
-    assert!(local.items.is_empty());
-    assert_ne!(local.generation, first_generation);
-    let read = reopened.including_replicas::<Convoy>("flotilla");
-    let items = read.list().await.expect("retained remote observations").items;
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].object.metadata.name, "remote-fact");
-    let writer = reopened.replica_writer::<Convoy>(origin, "flotilla");
-    assert_eq!(writer.cursor().await.expect("persisted cursor").expect("cursor").generation, listed.generation);
-    let restarted_origin =
-        ResourceBackend::new(InMemoryBackend::observed()).using::<Convoy>("flotilla").list().await.expect("new origin generation");
-    assert_ne!(restarted_origin.generation, listed.generation);
-    writer.replace(&restarted_origin, chrono::Utc::now()).await.expect("replace old origin generation");
-    assert!(read.list().await.expect("old facts discarded").items.is_empty());
 }
 
 // Generated create/update/delete sequences keep position equal to list's

@@ -8,6 +8,7 @@ CREATE TABLE resource_identity (
   id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),
   seq INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER,
   UNIQUE (kind, name, home)) STRICT;
 CREATE INDEX resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
@@ -47,6 +48,11 @@ CREATE TABLE stream_watermark (
 CREATE TABLE stream_history (
   home INTEGER PRIMARY KEY REFERENCES strings(id), home_seq INTEGER NOT NULL CHECK (home_seq >= 0)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE snapshot_cause (
+  resource INTEGER PRIMARY KEY REFERENCES resource_identity(id) ON DELETE CASCADE,
+  home INTEGER NOT NULL REFERENCES strings(id),
+  change_seq INTEGER NOT NULL,
+  FOREIGN KEY (home, change_seq) REFERENCES change(home, seq)) STRICT, WITHOUT ROWID;
 CREATE TABLE codes (
   kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
   PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
@@ -112,8 +118,9 @@ CREATE TABLE "host_observation" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
   "daemon_generation" TEXT,
+  "protocol_fingerprint" TEXT,
   "architecture" TEXT,
-  "below_free_space_floor" INTEGER NOT NULL CHECK ("below_free_space_floor" IN (0, 1)),
+  "below_free_space_floor" INTEGER CHECK ("below_free_space_floor" IN (0, 1)),
   "codex_central_login" INTEGER NOT NULL CHECK ("codex_central_login" IN (0, 1))
 ) STRICT;
 CREATE TABLE "host_observation_conditions" (
@@ -231,6 +238,7 @@ CREATE VIEW "host_observation_view" AS SELECT
   "host_observation"."id",
   "host_observation"."version",
   "host_observation"."daemon_generation",
+  "host_observation"."protocol_fingerprint",
   "host_observation"."architecture",
   "host_observation"."below_free_space_floor",
   "host_observation"."codex_central_login"

@@ -30,8 +30,10 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
+flotilla-kind-records-testkit = { path = "../flotilla-kind-records-testkit" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
+flotilla-log-testkit = { path = "../flotilla-log-testkit" }
 futures = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 rstest = { workspace = true }
@@ -47,7 +49,6 @@ flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 serde = { workspace = true }
-flotilla-core = { path = "../flotilla-core" }
 hegeltest = "=0.48.1"
 tempfile = { workspace = true }
 

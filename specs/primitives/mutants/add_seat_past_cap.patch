@@ -1,10 +1,10 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -193,7 +193,6 @@
-           else if (w.seats.keys().contains(a.seat)) Refused(SeatExists)
-           else if (not(w.seats.keys().contains(a.parent))) Refused(UnknownSeat)
-           else if (w.retiredSeats.contains(a.parent)) Refused(SeatRetired)
--          else if (overSeatLimit(w.seats.keys().size() + 1)) Refused(SeatsFull)
-           else withSeat(w, a.seat, { parent: Under(a.parent), supervisedBy: a.supervisedBy, replacements: 0 })
-       // A retired seat may still be resupervised: that changes no ownership.
-       | Resupervise(a) => if (not(a.authorised)) Refused(Unauthorised)
+@@ -205,7 +205,6 @@
+     else if (known(id, a.seat)) Refused(SeatExists)
+     else if (not(known(id, a.parent))) Refused(UnknownSeat)
+     else if (seatRetired(id, a.parent)) Refused(SeatRetired)
+-    else if (overSeatLimit(seats.get(id).keys().size() + 1)) Refused(SeatsFull)
+     else Accepted
+   // A retired seat may still be resupervised: that changes no ownership.
+   def resupervised(id: int, a: { seat: Seat, supervisedBy: str, authorised: bool }): Outcome =

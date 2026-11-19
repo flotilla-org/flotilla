@@ -9,75 +9,42 @@ pub async fn two_origins_admit_identical_placements_without_authorship_collision
 }
 
 pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_second_convoy(factory: &dyn EnsureScenarioController) {
-    use flotilla_resources::Actuation;
-    use flotilla_store::controller::Reconciler;
+    use flotilla_admission::reconcilers::vessel_requests::{VesselReleaseGate, VesselRequests};
+    use flotilla_resources::vessel_records::{VesselRecords, VesselStep};
+
+    /// The governor's convoy never ends here: no release is asked of the gate.
+    struct NeverReleased;
+    #[async_trait::async_trait]
+    impl VesselReleaseGate for NeverReleased {
+        async fn may_release(&self, convoy: &str, _convoy_home: &str) -> Result<(), String> {
+            Err(format!("convoy {} is live", convoy))
+        }
+    }
 
     let (daemon, backend, clock, temp) = standing_ensure_fixture(factory).await;
-    configure_standing_ensure_agent(&backend, Vec::new()).await;
+    configure_standing_ensure_agent(&daemon, Vec::new()).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("admit standing governor");
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let convoy_name = backend
-        .definitions::<ConvoyEnsure>("flotilla")
-        .get("quartermaster")
-        .await
-        .expect("ensure")
-        .status
-        .expect("ensure status")
-        .convoy_ref
-        .expect("governor convoy");
-    let admitted = convoys.get(&convoy_name).await.expect("admitted convoy");
-    let workflow = backend
-        .using::<WorkflowTemplate>("flotilla")
-        .get(&flotilla_charter::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
-        .await
-        .expect("standing workflow");
-    let mut status = admitted.status.clone().unwrap_or_default();
-    status.phase = ConvoyPhase::Active;
-    status.observed_workflow_ref = Some(admitted.spec.workflow_ref.clone());
-    status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
-        cascade: None,
-        exit: workflow.spec.exit,
-        turn_delivery: workflow.spec.turn_delivery,
-        stall_nudges: workflow.spec.stall_nudges,
-        supervision: workflow.spec.supervision,
-        vessels: workflow.spec.vessels,
-    });
-    status.work.insert("work".to_string(), flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build());
-    status.crew_work.insert(
-        "work".to_string(),
-        BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-    );
-    convoys.update_status(&convoy_name, &admitted.metadata.resource_version, &status).await.expect("running governor");
-    let vessels = backend.clone().using::<Vessel>("flotilla");
-    let vessel_name = format!("{convoy_name}-work");
-    let vessel = vessels
-        .create(
-            &InputMeta::builder()
-                .name(vessel_name.clone())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.clone())]))
-                .build(),
-            &VesselSpec {
-                convoy_ref: convoy_name.clone(),
-                vessel_name: "work".to_string(),
-                fulfilment_kind_ref: "docker".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
+    let convoy_name = quartermaster(&daemon).await.convoy_ref.expect("governor convoy");
+    // Admission froze the governor's workflow; its work's phases are derived from its launches.
+    // The governor's work runs in its first launch, which a host reboot loses with its container.
+    let requests = |daemon: &InProcessDaemon| {
+        VesselRequests::new(
+            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), "flotilla")),
+            daemon.lifecycle_reads(),
+            Arc::new(NeverReleased),
+            // The host the governor's work is placed on: the standing agent's.
+            flotilla_protocol::CanonicalHostId::resolved("standing-agent-host"),
+            [],
         )
-        .await
-        .expect("governor vessel");
-    vessels
-        .update_status(
-            &vessel_name,
-            &vessel.metadata.resource_version,
-            &flotilla_resources::VesselStatus {
-                phase: flotilla_resources::VesselPhase::Failed,
-                message: Some("Docker container stopped after host reboot".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("lost container");
-    assert!(backend.using::<ResourceCheckout>("flotilla").list().await.expect("ephemeral checkout observations").items.is_empty());
+    };
+    let requested = requests(&daemon).sync_once(chrono::Utc::now()).await.expect("launch the governor").requested;
+    assert_eq!(requested.len(), 1, "one launch of the governor's work");
+    let first = requested[0].clone();
+    let vessels = &engine(&daemon).vessels;
+    vessels.ready(&first, "env-governor");
+    vessels.step(&first, VesselStep::Lost { reason: "Docker container stopped after host reboot".to_string() });
+    assert!(daemon.lifecycle_reads().checkouts().and_then(|checkouts| checkouts.here()).expect("checkouts here").is_empty());
     drop(daemon);
     let restarted = InProcessDaemon::new_with_resource_backend_and_clock(
         Vec::new(),
@@ -89,6 +56,7 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    install_engine(&restarted);
     restarted
         .install_convoy_ensure_reconciler(factory.create(
             restarted.convoy_teardown(),
@@ -97,55 +65,17 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         ))
         .await;
 
-    let reconciler =
-        flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
-    let convoy = convoys.get(&convoy_name).await.expect("governor after reboot");
-    let outcome = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("reboot observations"), clock.now());
-    assert!(matches!(outcome.patch, Some(flotilla_resources::ConvoyStatusPatch::WorkProvisioningRetry { .. })));
-    // #2875: reboot recovery keeps the death cause and waits for a durable
-    // deadline, rather than replacing the governor at every watch tick.
-    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { .. })));
-    flotilla_store::apply_status_patch(&convoys, &convoy_name, &outcome.patch.expect("interrupt work")).await.expect("interrupt work");
-    clock.advance(ChronoDuration::seconds(29));
-    let convoy = convoys.get(&convoy_name).await.expect("backing off governor");
-    assert_eq!(convoy.status.as_ref().expect("status").work["work"].message.as_deref(), Some("Docker container stopped after host reboot"));
-    let waiting = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("failed vessel still observed"), clock.now());
-    assert!(!waiting
-        .actuations
-        .iter()
-        .any(|actuation| matches!(actuation, Actuation::DeleteVessel { .. } | Actuation::CreateVessel { .. })));
-    clock.advance(ChronoDuration::seconds(1));
-    let retiring = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("failed vessel"), clock.now());
-    assert!(retiring.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == &vessel_name)));
-    vessels.delete(&vessel_name).await.expect("retire lost vessel");
+    // #2875: the replacement waits out the backoff from the loss, rather than relaunching at
+    // every pass; then exactly one launch replaces it.
+    let lost_at = engine(&restarted).vessels.vessels.get(&first, None).expect("read").expect("lost launch").since;
+    let waiting = requests(&restarted).sync_once(lost_at + chrono::Duration::seconds(29)).await.expect("backing off");
+    assert!(waiting.requested.is_empty(), "no replacement inside the backoff");
+    let replaced = requests(&restarted).sync_once(lost_at + chrono::Duration::seconds(30)).await.expect("replace");
+    assert_eq!(replaced.requested.len(), 1, "one replacement launch");
+    assert_ne!(replaced.requested[0], first);
+    let repeated = requests(&restarted).sync_once(lost_at + chrono::Duration::seconds(31)).await.expect("replacement held");
+    assert!(repeated.requested.is_empty(), "the live replacement is kept");
 
-    let convoy = convoys.get(&convoy_name).await.expect("interrupted governor");
-    let replacement = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("lost vessel absent"), clock.now());
-    assert_eq!(
-        replacement.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateVessel { .. })).count(),
-        1,
-        "convoy annotations: {:?}",
-        convoy.metadata.annotations
-    );
-    flotilla_store::apply_status_patch(&convoys, &convoy_name, &replacement.patch.expect("reserve next attempt"))
-        .await
-        .expect("retry reservation");
-    let convoy = convoys.get(&convoy_name).await.expect("reserved retry");
-    let stale_observation =
-        reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("replacement not yet observed"), clock.now());
-    assert!(!stale_observation.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
-    let (meta, spec) = replacement
-        .actuations
-        .into_iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateVessel { meta, spec } => Some((meta, spec)),
-            _ => None,
-        })
-        .expect("replacement vessel");
-    vessels.create(&meta, &spec).await.expect("admit replacement");
-    let convoy = convoys.get(&convoy_name).await.expect("standing convoy");
-    let repeated = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("replacement observed"), clock.now());
-    assert!(!repeated.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
     restarted.reconcile_convoy_ensures_once("flotilla").await.expect("ensure remains steady after restart");
     assert_eq!(convoys.list().await.expect("convoys").items.len(), 1);
     assert_ne!(convoys.get(&convoy_name).await.expect("convoy").status.expect("status").phase, ConvoyPhase::Failed);
@@ -198,17 +128,22 @@ pub async fn standing_ensure_records_admitted_config_and_surfaces_drift_without_
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("admit initial configuration");
     let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
     let first = ensures.get("quartermaster").await.expect("ensure");
-    let first_status = first.status.clone().expect("admitted status");
-    assert_eq!(first_status.admitted_config_hash, first_status.observed_config_hash);
+    let admitted = quartermaster(&daemon).await;
+    let running = admitted.convoy_ref.clone().expect("running convoy");
+    assert_eq!(admitted.last_failure, None, "the admitted configuration is the declared one");
+    let generation = backend.using::<ResourceConvoy>("flotilla").get(&running).await.expect("running generation");
+    assert!(
+        generation.status.as_ref().and_then(|status| status.ensure_admission.as_ref()).is_some(),
+        "its generation records the configuration that admitted it"
+    );
     let mut changed = first.spec.clone();
     changed.presents_as = Some("project".into());
     ensures.apply(&InputMeta::from(&first.metadata), &changed).await.expect("change declaration");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("observe drift");
-    let drifted = ensures.get("quartermaster").await.expect("drifted ensure").status.expect("status");
-    assert_eq!(drifted.convoy_ref, first_status.convoy_ref, "running work must remain intact");
-    assert_eq!(drifted.admitted_config_hash, first_status.admitted_config_hash);
-    assert_ne!(drifted.admitted_config_hash, drifted.observed_config_hash);
-    assert!(drifted.config_drift.expect("typed drift").changes.iter().any(|change| change.contains("presentation")));
+    let drifted = quartermaster(&daemon).await;
+    assert_eq!(drifted.convoy_ref, admitted.convoy_ref, "running work must remain intact");
+    let drift = drifted.last_failure.expect("drift is shown");
+    assert!(drift.starts_with("ConfigDrift: ") && drift.contains("presentation"), "{drift}");
     let fleet = daemon.fleet_list_internal().await.expect("public fleet listing");
     assert!(fleet.declaration_attention.iter().any(|row| row.message.contains("presentation")));
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("drift attention persists across refreshes");
@@ -216,11 +151,8 @@ pub async fn standing_ensure_records_admitted_config_and_surfaces_drift_without_
     assert_eq!(fleet.declaration_attention.len(), 1, "one drift attention, not raised again");
 
     // Its running convoy gone, nothing admitted has drifted: the next pass clears the drift.
-    backend
-        .using::<ResourceConvoy>("flotilla")
-        .delete(first_status.convoy_ref.as_deref().expect("running convoy"))
-        .await
-        .expect("convoy gone");
+    // On the engine a convoy ends rather than going: an operator abandons it.
+    abandon_generation(&daemon, &running).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart the absent generation");
     let fleet = daemon.fleet_list_internal().await.expect("public fleet listing");
     assert!(fleet.declaration_attention.is_empty(), "{:?}", fleet.declaration_attention);
@@ -231,7 +163,7 @@ pub async fn ensure_reconciliation_recovers_a_roll_interrupted_after_retirement(
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
     let first = ensures.get("quartermaster").await.expect("ensure");
-    let old_ref = first.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("active generation");
+    let old_ref = quartermaster(&daemon).await.convoy_ref.expect("active generation");
     let mut next = first.spec.clone();
     next.presents_as = Some("project".into());
     ensures.apply(&InputMeta::from(&first.metadata), &next).await.expect("change config");
@@ -242,11 +174,10 @@ pub async fn ensure_reconciliation_recovers_a_roll_interrupted_after_retirement(
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("schedule recovery");
     clock.advance(chrono::Duration::minutes(3));
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("recover admission");
-    let status = ensures.get("quartermaster").await.expect("ensure").status.expect("status");
-    assert_ne!(status.convoy_ref.as_deref(), Some(old_ref.as_str()));
-    assert!(status.convoy_ref.is_some());
-    assert!(status.config_drift.is_none());
-    assert_eq!(status.admitted_config_hash, status.observed_config_hash);
+    let recovered = quartermaster(&daemon).await;
+    let current = recovered.convoy_ref.expect("a recovered generation");
+    assert_ne!(current, old_ref);
+    assert_eq!(recovered.last_failure, None, "no drift: the recovered generation was admitted as declared");
 }
 
 pub async fn explicit_ensure_roll_readmits_current_config_and_retains_the_previous_generation(factory: &dyn EnsureScenarioController) {
@@ -254,39 +185,40 @@ pub async fn explicit_ensure_roll_readmits_current_config_and_retains_the_previo
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
     let old = ensures.get("quartermaster").await.expect("ensure");
-    let old_ref = old.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("running convoy");
+    let old_ref = quartermaster(&daemon).await.convoy_ref.expect("running convoy");
     let mut next = old.spec.clone();
     next.presents_as = Some("project".into());
     ensures.apply(&InputMeta::from(&old.metadata), &next).await.expect("desired configuration");
     daemon.roll_convoy_ensure("flotilla", "quartermaster").await.expect("operator rolls drifted ensure");
-    let status = ensures.get("quartermaster").await.expect("ensure").status.expect("readmitted status");
-    let next_ref = status.convoy_ref.expect("replacement convoy");
+    let readmitted = quartermaster(&daemon).await;
+    let next_ref = readmitted.convoy_ref.expect("replacement convoy");
     assert_ne!(next_ref, old_ref);
-    assert_eq!(status.admitted_config_hash, status.observed_config_hash);
-    assert!(status.config_drift.is_none());
+    assert_eq!(readmitted.last_failure, None, "the replacement runs the declared configuration");
     let previous = backend.using::<ResourceConvoy>("flotilla").get(&old_ref).await.expect("retained history");
     assert_eq!(previous.status.expect("terminal history").phase, ConvoyPhase::Abandoned);
     let replacement = backend.using::<ResourceConvoy>("flotilla").get(&next_ref).await.expect("replacement");
-    assert_eq!(replacement.spec.generation, previous.spec.generation + 1);
+    // A generation is its launch's number: ordered per role, not gapless (#3108).
+    assert!(replacement.spec.generation > previous.spec.generation, "the replacement is the newer generation");
     assert_eq!(replacement.metadata.annotations.get(PRESENTS_AS_ANNOTATION).map(String::as_str), Some("project"));
     assert_eq!(
         replacement.status.as_ref().and_then(|status| status.ensure_admission.as_ref()).map(|config| config.presents_as.as_deref()),
         Some(Some("project"))
     );
     daemon.roll_convoy_ensure("flotilla", "quartermaster").await.expect("repeated roll is a no-op without drift");
-    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.expect("status").convoy_ref.as_deref(), Some(next_ref.as_str()));
-    assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("attention cleared").items.is_empty());
+    assert_eq!(quartermaster(&daemon).await.convoy_ref.as_deref(), Some(next_ref.as_str()));
+    assert!(open_attentions(&backend).await.is_empty(), "attention cleared");
 }
 
 pub async fn changed_ensure_driver_waits_for_operator_roll_of_the_running_remote_generation(factory: &dyn EnsureScenarioController) {
-    let (old_driver, old_backend, _clock, _temp) = standing_ensure_fixture(factory).await;
+    let (old_driver, _old_backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     old_driver.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     let (new_driver, new_backend, _new_clock, _new_temp) = standing_ensure_fixture_for(factory, "new-driver", true).await;
-    new_backend
-        .replica_writer::<ResourceConvoy>(NodeId::new("old-driver"), "flotilla")
-        .replace(&old_backend.using::<ResourceConvoy>("flotilla").list().await.expect("old generations"), Utc::now())
-        .await
-        .expect("replicate active generation");
+    // The old driver's running generation reaches the new driver through the old driver's log.
+    flotilla_provisioning_testkit::replicate_home(
+        &old_driver.decided_store().expect("old driver's decided store"),
+        old_driver.node_id().as_str(),
+        &new_driver.decided_store().expect("new driver's decided store"),
+    );
     let ensures = new_backend.definitions::<ConvoyEnsure>("flotilla");
     let ensure = ensures.get("quartermaster").await.expect("ensure");
     let mut next = ensure.spec.clone();
@@ -301,7 +233,8 @@ pub async fn changed_ensure_driver_waits_for_operator_roll_of_the_running_remote
         new_backend.using::<ResourceConvoy>("flotilla").list().await.expect("local generations").items.is_empty(),
         "driver drift must not start overlapping work"
     );
-    assert!(ensures.get("quartermaster").await.expect("ensure").status.expect("drift status").config_drift.is_some());
+    let drift = quartermaster(&new_driver).await.last_failure.expect("drift against the running remote generation");
+    assert!(drift.starts_with("ConfigDrift: ") && drift.contains("driver"), "{drift}");
 }
 
 pub async fn ensure_drift_names_config_changes_and_invalid_roll_keeps_the_current_generation(factory: &dyn EnsureScenarioController) {
@@ -309,7 +242,7 @@ pub async fn ensure_drift_names_config_changes_and_invalid_roll_keeps_the_curren
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
     let first = ensures.get("quartermaster").await.expect("ensure");
-    let first_ref = first.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("convoy");
+    let first_ref = quartermaster(&daemon).await.convoy_ref.expect("convoy");
     let mut changed = first.spec.clone();
     changed.workflow_ref = "missing-workflow".into();
     changed.placement_policy = Some("missing-policy".into());
@@ -318,9 +251,10 @@ pub async fn ensure_drift_names_config_changes_and_invalid_roll_keeps_the_curren
         vec![flotilla_protocol::AgentOverride { capability: "governor".into(), adapter: "codex".into(), model: Some("new-model".into()) }];
     ensures.apply(&InputMeta::from(&first.metadata), &changed).await.expect("change declaration");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("report drift while keeping running work");
-    let changes = ensures.get("quartermaster").await.expect("ensure").status.expect("status").config_drift.expect("drift").changes;
+    let changes = quartermaster(&daemon).await.last_failure.expect("drift");
+    assert!(changes.starts_with("ConfigDrift: "), "{changes}");
     for expected in ["repository added", "workflow", "placement", "agents"] {
-        assert!(changes.iter().any(|change| change.contains(expected)), "missing {expected} in {changes:?}");
+        assert!(changes.contains(expected), "missing {expected} in {changes:?}");
     }
     assert!(daemon.roll_convoy_ensure("flotilla", "quartermaster").await.is_err());
     let current = backend.using::<ResourceConvoy>("flotilla").get(&first_ref).await.expect("original generation remains");
@@ -331,7 +265,7 @@ pub async fn ensure_drift_names_config_changes_and_invalid_roll_keeps_the_curren
 pub async fn standing_ensure_applies_agent_overrides_to_the_admitted_workflow_snapshot(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     configure_standing_ensure_agent(
-        &backend,
+        &daemon,
         vec![flotilla_protocol::AgentOverride {
             capability: "governor".to_string(),
             adapter: "codex".to_string(),
@@ -348,7 +282,7 @@ pub async fn standing_ensure_applies_agent_overrides_to_the_admitted_workflow_sn
 
 pub async fn standing_ensure_without_agent_overrides_preserves_the_workflow_selector(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    configure_standing_ensure_agent(&backend, Vec::new()).await;
+    configure_standing_ensure_agent(&daemon, Vec::new()).await;
 
     let workflow = admitted_standing_workflow(&daemon, &backend).await;
     let CrewSource::Agent { selector, .. } = &workflow.vessels[0].crew[0].source else { panic!("governor must remain an agent") };
@@ -358,11 +292,11 @@ pub async fn standing_ensure_without_agent_overrides_preserves_the_workflow_sele
 
 pub async fn standing_readmission_writes_a_new_brief_artifact(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
-    configure_standing_ensure_agent(&backend, Vec::new()).await;
+    configure_standing_ensure_agent(&daemon, Vec::new()).await;
     let writer = Arc::new(RecordingBriefArtifacts::default());
     daemon.set_brief_artifact_writer(writer.clone()).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
-    let first = fail_ensured_generation(&backend, &clock).await;
+    let first = fail_ensured_generation(&daemon).await;
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("record dead generation");
     clock.advance(ChronoDuration::seconds(30));
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("readmit governor");
@@ -394,34 +328,32 @@ pub async fn admission_rejects_agent_roles_reused_across_vessels_before_writing_
             VesselRequirement::builder().name("verify".to_string()).crew(vec![agent()]).build(),
         ])
         .build();
-    let spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+    let spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).build();
     let error = daemon.write_admission_briefs("flotilla", "convoy-ambiguous", &spec, &workflow).await.expect_err("duplicate role");
     assert!(error.contains("agent role `coder` occurs in vessels `implement` and `verify`"), "{error}");
     assert!(writer.writes.lock().await.is_empty(), "admission must not publish a partial set of briefs");
 }
 
 pub async fn generation_allocation_sees_live_and_terminal_replicated_convoys(factory: &dyn EnsureScenarioController) {
-    let (daemon, source, clock, _temp) = standing_ensure_fixture(factory).await;
+    let (daemon, source, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let writer = backend.replica_writer::<ResourceConvoy>(NodeId::new("other-root"), "flotilla");
     writer.replace(&source.using::<ResourceConvoy>("flotilla").list().await.expect("source convoys"), Utc::now()).await.expect("replicate");
-    let error = allocate_convoy_generation(&backend, "flotilla", Some("standing-project"), "quartermaster")
+    let error = refuse_live_convoy_in(&backend, "flotilla", "standing-project", "quartermaster")
         .await
         .expect_err("remote live generation blocks admission");
-    assert!(error.contains("generation 1 already exists"), "{error}");
+    assert!(error.contains("already exists"), "{error}");
     assert!(error.contains("as of root other-root, last synced"), "{error}");
     assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("local reconciliation view").items.is_empty());
 
-    fail_ensured_generation(&source, &clock).await;
+    fail_ensured_generation(&daemon).await;
     writer
         .replace(&source.using::<ResourceConvoy>("flotilla").list().await.expect("source history"), Utc::now())
         .await
         .expect("replicate terminal history");
-    assert_eq!(
-        allocate_convoy_generation(&backend, "flotilla", Some("standing-project"), "quartermaster").await.expect("next generation"),
-        2
-    );
+    // The next generation's number is its launch's, reserved at admission.
+    refuse_live_convoy_in(&backend, "flotilla", "standing-project", "quartermaster").await.expect("next generation");
 }
 
 pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(factory: &dyn EnsureScenarioController) {
@@ -439,10 +371,14 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
         )
         .await
         .expect("absent fingerprint");
-    let source = ResourceBackend::new(InMemoryBackend::default());
-    let mut kind = placement_kind(&source, "remote-policy", "other-host").await;
-    let writer = backend.replica_writer::<FulfilmentKind>(NodeId::new("other-root"), "flotilla");
-    writer.replace(&source.using::<FulfilmentKind>("flotilla").list().await.expect("kinds"), Utc::now()).await.expect("replicate kind");
+    // The kind is declared at another root and arrives through its log.
+    let mut spec = FulfilmentKindSpec::builder()
+        .host_ref("other-host".to_string())
+        .pool("passthrough".to_string())
+        .realisation(FulfilmentRealisation::HostDirect)
+        .build();
+    other_home(&daemon, "other-root").kind("remote-policy", &spec).await;
+    replicate_other_home(&daemon, "other-root");
     let present = factory
         .dependency_hash(
             daemon.as_ref(),
@@ -455,16 +391,9 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
         .await
         .expect("replica fingerprint");
     assert_ne!(absent, present, "arrival must invalidate an admission refusal");
-    kind.spec.cost_class = flotilla_resources::FulfilmentCostClass::Metered;
-    source
-        .using::<FulfilmentKind>("flotilla")
-        .update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &kind.spec)
-        .await
-        .expect("change kind");
-    writer
-        .replace(&source.using::<FulfilmentKind>("flotilla").list().await.expect("updated kinds"), Utc::now())
-        .await
-        .expect("replicate change");
+    spec.cost_class = flotilla_resources::FulfilmentCostClass::Metered;
+    other_home(&daemon, "other-root").kind("remote-policy", &spec).await;
+    replicate_other_home(&daemon, "other-root");
     assert_ne!(
         present,
         factory
@@ -489,20 +418,11 @@ pub async fn replicated_ensure_is_not_reconciled_away_from_its_project_home(fact
     backend.using::<ConvoyEnsure>("flotilla").delete("quartermaster").await.expect("remove local ensure");
     backend.using::<Project>("flotilla").delete("standing-project").await.expect("remove local project");
 
-    let remote_root = NodeId::new("remote-root");
-    let origin = ResourceBackend::new(InMemoryBackend::default()).with_local_root(remote_root.clone());
-    origin.using::<Project>("flotilla").create(&InputMeta::from(&project.metadata), &project.spec).await.expect("remote project");
-    origin.using::<ConvoyEnsure>("flotilla").create(&InputMeta::from(&ensure.metadata), &ensure.spec).await.expect("remote ensure");
-    backend
-        .replica_writer::<Project>(remote_root.clone(), "flotilla")
-        .replace(&origin.using::<Project>("flotilla").list().await.expect("remote projects"), Utc::now())
-        .await
-        .expect("replicate project");
-    backend
-        .replica_writer::<ConvoyEnsure>(remote_root, "flotilla")
-        .replace(&origin.using::<ConvoyEnsure>("flotilla").list().await.expect("remote ensures"), Utc::now())
-        .await
-        .expect("replicate ensure");
+    // The Project and the ensure are homed at the remote root and reach this daemon through that home's log.
+    other_home(&daemon, "remote-root")
+        .stamped_definition::<ConvoyEnsure>("quartermaster", &ensure.metadata.annotations, &ensure.spec)
+        .await;
+    project_at_other_home(&daemon, "remote-root", &project).await;
 
     assert!(backend.definitions::<Project>("flotilla").get("standing-project").await.is_ok(), "replicated project should be visible");
     assert!(backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.is_ok(), "replicated ensure should be visible");
@@ -513,37 +433,23 @@ pub async fn replicated_ensure_is_not_reconciled_away_from_its_project_home(fact
 pub async fn unavailable_declared_driver_surfaces_named_admission_conditions_without_fallback(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     set_ensure_driver(&backend, "missing-driver").await;
+    // Whether the driver is known and reachable is read from its Host records by whoever asks; the
+    // ensure keeps no condition of it (#3108). No other host admits in its place.
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("unknown driver skip").is_empty());
-    let ensure = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("conditioned ensure");
-    let condition = ensure
-        .status
-        .as_ref()
-        .expect("ensure status")
-        .conditions
-        .iter()
-        .find(|condition| condition.condition_type == DRIVER_ADMISSION_CONDITION_TYPE)
-        .expect("driver admission condition");
-    assert_eq!(condition.reason, "UnknownDriver");
     assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.is_empty());
 
-    let hosts = backend.using::<ResourceHost>("flotilla");
-    hosts
-        .create(
-            &test_meta("missing-driver"),
-            &HostSpec { display_name: "missing-driver".to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("known but unreachable driver");
+    // Known but unreachable: its daemon published its Host and nothing since.
+    flotilla_provisioning_testkit::put_host_at_its_home(
+        &daemon.decided_store().expect("decided store"),
+        "missing-driver",
+        &HostSpec { display_name: "missing-driver".to_string(), connection: Default::default(), ..HostSpec::default() },
+        None,
+    )
+    .await;
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("unreachable driver skip").is_empty());
-    let ensure = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("conditioned ensure");
-    let condition = ensure
-        .status
-        .expect("ensure status")
-        .conditions
-        .into_iter()
-        .find(|condition| condition.condition_type == DRIVER_ADMISSION_CONDITION_TYPE)
-        .expect("driver admission condition");
-    assert_eq!(condition.reason, "DriverUnreachable");
+    assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.is_empty());
+    let waiting = quartermaster(&daemon).await;
+    assert_eq!((waiting.convoy_ref, waiting.hold, waiting.next_attempt), (None, None, None), "nothing is admitted or held here");
 }
 
 pub async fn orphaned_ensure_reports_its_absent_parent_project(factory: &dyn EnsureScenarioController) {
@@ -559,54 +465,37 @@ pub async fn statusless_ensured_generation_is_live_even_when_address_labels_are_
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
 
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
-    let ensure = ensures.get("quartermaster").await.expect("ensure");
-    let convoy_ref = ensure.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("admitted generation");
+    let convoy_ref = quartermaster(&daemon).await.convoy_ref.expect("admitted generation");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let convoy = convoys.get(&convoy_ref).await.expect("statusless generation");
-    convoys
-        .update(
-            &InputMeta::builder().name(convoy.metadata.name.clone()).annotations(convoy.metadata.annotations.clone()).build(),
-            &convoy.metadata.resource_version,
-            &convoy.spec,
-        )
-        .await
-        .expect("simulate generation whose address labels have not materialized");
-    ensures
-        .update_status(
-            &ensure.metadata.name,
-            &ensure.metadata.resource_version,
-            &ConvoyEnsureStatus {
-                observed_config_hash: ensure.status.and_then(|status| status.observed_config_hash),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("simulate lost ensure status update");
-
-    assert_eq!(
-        daemon.reconcile_convoy_ensures_once("flotilla").await.expect("rediscover admitted generation"),
-        vec!["ConvoyEnsure/quartermaster observed running"]
+    // On the engine a generation's address labels are derived from its launch, so they cannot
+    // be missing; nothing is stored on the ensure (#3108), so its generation is found from its
+    // ensured-from annotation alone.
+    assert!(
+        daemon.reconcile_convoy_ensures_once("flotilla").await.expect("its generation runs").is_empty(),
+        "a running generation admits no other"
     );
     assert_eq!(convoys.list().await.expect("convoys").items.len(), 1);
-    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.and_then(|status| status.convoy_ref), Some(convoy_ref));
+    assert_eq!(quartermaster(&daemon).await.convoy_ref, Some(convoy_ref));
 }
 
 pub async fn foreign_statusless_generation_at_ensure_address_blocks_admission_without_labels(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    backend
-        .using::<ResourceConvoy>("flotilla")
-        .create(
-            &test_meta("foreign-generation"),
-            &ConvoySpec::builder()
+    // A generation at the ensure's address that no ensure admitted.
+    flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "foreign-generation",
+            ConvoySpec::builder()
                 .workflow_ref("quartermaster".to_string())
                 .role("quartermaster".to_string())
                 .generation(1)
                 .project_ref("standing-project".to_string())
                 .build(),
-        )
-        .await
-        .expect("foreign statusless generation");
+            flotilla_engine_convoys_testkit::single_agent("governor"),
+        ),
+    )
+    .await;
 
     let error = daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("foreign live address must block ensure admission");
     assert!(error.contains("live convoy quartermaster@standing-project already exists outside this ensure"), "{error}");
@@ -626,6 +515,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    install_engine(&daemon);
     daemon
         .install_convoy_ensure_reconciler(factory.create(daemon.convoy_teardown(), daemon.resource_backend(), daemon.clock_for_scenarios()))
         .await;
@@ -638,33 +528,29 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         )
         .await
         .expect("root B host resource");
-    create_host_direct_placement(&target, "host-direct-root-b-vessels", "root-b-vessels").await;
-    let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    create_host_direct_placement((&*daemon).into(), "host-direct-root-b-vessels", "root-b-vessels").await;
+    create_standing_agent_placement(&daemon).await;
     let repository_spec = RepositorySpec::remote("https://github.com/acme/cross-root").expect("repository spec");
     let repository_key = repository_spec.key();
-    let source_repository = source
-        .using::<Repository>("flotilla")
-        .create(&test_meta(&repository_key.to_string()), &repository_spec)
-        .await
-        .expect("source repository");
-    source
-        .using::<Repository>("flotilla")
-        .update_status(
-            &source_repository.metadata.name,
-            &source_repository.metadata.resource_version,
+    // Root A's Repository and Project are homed there, and reach root B through its log.
+    let root_a = other_home(&daemon, "root-a");
+    root_a.repository(&repository_key.to_string(), &repository_spec).await;
+    root_a
+        .repository_status(
+            &repository_key.to_string(),
             &RepositoryStatus { default_branch: Some("main".to_string()), ..Default::default() },
         )
-        .await
-        .expect("source default branch observation");
+        .await;
     target
         .using::<Repository>("flotilla")
         .create(&test_meta(&repository_key.to_string()), &repository_spec)
         .await
         .expect("driver repository without a local status observation");
-    source
-        .definitions::<Project>("flotilla")
-        .create(
-            &test_meta("cross-root-project"),
+    root_a
+        .project(
+            "cross-root-project",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &ProjectSpec::builder()
                 .display_name("Cross Root Project".to_string())
                 .default_workflow_ref("cross-root-workflow".to_string())
@@ -678,8 +564,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
                 }])
                 .build(),
         )
-        .await
-        .expect("source project");
+        .await;
     target
         .using::<WorkflowTemplate>("flotilla")
         .create(
@@ -688,55 +573,33 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
                     .repository_refs(vec![repository_key.clone()])
-                    .crew(Vec::new())
+                    .crew(vec![flotilla_engine_convoys_testkit::agent("quartermaster")])
                     .build()])
                 .build(),
         )
         .await
         .expect("driver-local workflow");
-    source
-        .definitions::<ConvoyEnsure>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("cross-root".to_string())
-                .annotations(BTreeMap::from([
-                    (MATERIALIZED_PROJECT_ANNOTATION.to_string(), "cross-root-project".to_string()),
-                    (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository_key.to_string()),
-                    (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
-                    (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), "ops/cross-root.md".to_string()),
-                ]))
-                .build(),
-            &ConvoyEnsureSpec {
-                project_ref: "cross-root-project".to_string(),
-                role: "quartermaster".to_string(),
-                driver_ref: Some(driver_ref),
-                workflow_ref: "cross-root-workflow".to_string(),
-                placement_policy: None,
-                escalation_reason: None,
-                repositories: vec![repository_key.clone()],
-                presents_as: None,
-                agent_overrides: Vec::new(),
-            },
-        )
-        .await
-        .expect("source ensure");
-
-    let origin = NodeId::new("root-a");
-    target
-        .replica_writer::<Repository>(origin.clone(), "flotilla")
-        .replace(&source.using::<Repository>("flotilla").list().await.expect("source repositories"), Utc::now())
-        .await
-        .expect("replicate repositories");
-    target
-        .replica_writer::<Project>(origin.clone(), "flotilla")
-        .replace(&source.using::<Project>("flotilla").list().await.expect("source projects"), Utc::now())
-        .await
-        .expect("replicate projects");
-    target
-        .replica_writer::<ConvoyEnsure>(origin, "flotilla")
-        .replace(&source.using::<ConvoyEnsure>("flotilla").list().await.expect("source ensures"), Utc::now())
-        .await
-        .expect("replicate ensures");
+    // Root A declares the ensure too; it reaches root B through root A's log.
+    let ensure = ConvoyEnsureSpec {
+        project_ref: "cross-root-project".to_string(),
+        role: "quartermaster".to_string(),
+        driver_ref: Some(driver_ref),
+        workflow_ref: "cross-root-workflow".to_string(),
+        // Its agent seat is placed where a harness is.
+        placement_policy: Some("standing-agent".to_string()),
+        escalation_reason: None,
+        repositories: vec![repository_key.clone()],
+        presents_as: None,
+        agent_overrides: Vec::new(),
+    };
+    let stamps = BTreeMap::from([
+        (MATERIALIZED_PROJECT_ANNOTATION.to_string(), "cross-root-project".to_string()),
+        (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository_key.to_string()),
+        (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
+        (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), "ops/cross-root.md".to_string()),
+    ]);
+    root_a.stamped_definition::<ConvoyEnsure>("cross-root", &stamps, &ensure).await;
+    replicate_other_home(&daemon, "root-a");
 
     assert_eq!(
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("cross-root ensure admission"),
@@ -751,28 +614,17 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         .into_iter()
         .next()
         .expect("admitted convoy on root B");
-    assert_eq!(convoy.spec.project_ref.as_deref(), Some("cross-root-project"));
+    assert_eq!(convoy.spec.project_ref, "cross-root-project");
 
-    let conflicting_source = ResourceBackend::new(InMemoryBackend::default());
-    let conflicting_repository = conflicting_source
-        .using::<Repository>("flotilla")
-        .create(&test_meta(&repository_key.to_string()), &repository_spec)
-        .await
-        .expect("conflicting source repository");
-    conflicting_source
-        .using::<Repository>("flotilla")
-        .update_status(
-            &conflicting_repository.metadata.name,
-            &conflicting_repository.metadata.resource_version,
+    let root_c = other_home(&daemon, "root-c");
+    root_c.repository(&repository_key.to_string(), &repository_spec).await;
+    root_c
+        .repository_status(
+            &repository_key.to_string(),
             &RepositoryStatus { default_branch: Some("trunk".to_string()), ..Default::default() },
         )
-        .await
-        .expect("conflicting default branch observation");
-    target
-        .replica_writer::<Repository>(NodeId::new("root-c"), "flotilla")
-        .replace(&conflicting_source.using::<Repository>("flotilla").list().await.expect("conflicting repositories"), Utc::now())
-        .await
-        .expect("replicate conflicting repository status");
+        .await;
+    replicate_other_home(&daemon, "root-c");
 
     let error = daemon
         .snapshot_project_repositories("flotilla", "cross-root-project", None)
@@ -784,9 +636,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
 pub async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is_superseded(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
-    let first_ref =
-        ensures.get("quartermaster").await.expect("ensure").status.and_then(|status| status.convoy_ref).expect("first convoy ref");
+    let first_ref = quartermaster(&daemon).await.convoy_ref.expect("first convoy ref");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let first = convoys.get(&first_ref).await.expect("first generation");
     let workflow_snapshot_ref =
@@ -801,12 +651,18 @@ pub async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is
     // This patch represents a reconcile that read the generation while it was
     // still active and lost the optimistic write race to the abandon command.
     // Retrying it against the newer status must not resurrect the generation.
-    apply_resource_status_patch(&convoys, &first_ref, &controller_patches::roll_up_phase(ConvoyPhase::Active, Some(clock.now()), None))
-        .await
-        .expect("stale reconcile write");
+    // On the engine that write is a note at the convoy's home, which cannot change its phase.
+    flotilla_store::note_convoy(
+        &daemon.convoy_engine_path(),
+        &convoys,
+        &first_ref,
+        &controller_patches::roll_up_phase(ConvoyPhase::Active, Some(clock.now()), None),
+    )
+    .await
+    .expect("stale reconcile write");
 
-    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("observe abandoned generation");
-    clock.advance(ChronoDuration::seconds(30));
+    // ConvoyEnsure B (decision 78(3)): an operator's abandon is not a strike, so nothing backs off
+    // and the pass that observes it supersedes it.
     assert_eq!(
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("supersede abandoned generation"),
         vec!["started quartermaster@standing-project"]
@@ -816,11 +672,12 @@ pub async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is
     assert_eq!(generations.len(), 2);
     let abandoned = generations.iter().find(|convoy| convoy.metadata.name == first_ref).expect("abandoned history");
     let abandoned_status = abandoned.status.as_ref().expect("abandoned status");
-    assert_eq!(abandoned.spec.generation, 1);
+    assert_eq!(abandoned.spec.generation, first.spec.generation);
     assert_eq!(abandoned_status.phase, ConvoyPhase::Abandoned);
-    assert_eq!(abandoned_status.message.as_deref(), Some("abandoned by human override: operator requested replacement"));
+    // The engine's view gives the operator's reason as the abandonment's message.
+    assert_eq!(abandoned_status.message.as_deref(), Some("operator requested replacement"));
     assert_eq!(abandoned.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION), Some(&workflow_snapshot_ref));
-    assert!(generations.iter().any(|convoy| convoy.spec.generation == 2 && convoy.metadata.name != first_ref));
+    assert!(generations.iter().any(|convoy| convoy.spec.generation > first.spec.generation && convoy.metadata.name != first_ref));
 }
 
 pub async fn standing_ensure_does_not_capture_another_projects_bare_workflow_but_accepts_a_global_builtin(
@@ -830,12 +687,13 @@ pub async fn standing_ensure_does_not_capture_another_projects_bare_workflow_but
     let own_name = flotilla_charter::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
     let own = backend.definitions::<WorkflowTemplate>("flotilla").get(&own_name).await.expect("own workflow");
     backend.definitions::<WorkflowTemplate>("flotilla").delete(&own_name).await.expect("remove own workflow");
+    let repository_key = backend.using::<Repository>("flotilla").list().await.expect("repositories").items[0].spec.key();
     backend
         .definitions::<WorkflowTemplate>("flotilla")
         .apply(
             &InputMeta::builder()
                 .name("quartermaster".to_string())
-                .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.to_string(), "other-project".to_string())]))
+                .annotations(project_ops_stamps("other-project", &repository_key))
                 .build(),
             &own.spec,
         )
@@ -862,25 +720,6 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
     let driver_temp = tempfile::tempdir().expect("driver tempdir");
     std::fs::write(driver_temp.path().join("daemon.toml"), "machine_id = \"driver-test\"\n").expect("driver config");
     let driver_backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("driver-root"));
-    let home_root = NodeId::new("home-root");
-    create_host_direct_placement(&driver_backend, "host-direct-driver-vessels", "driver-vessels").await;
-    driver_backend
-        .replica_writer::<Project>(home_root.clone(), "flotilla")
-        .replace(&home_backend.using::<Project>("flotilla").list().await.expect("home projects"), Utc::now())
-        .await
-        .expect("replicate projects");
-    driver_backend
-        .replica_writer::<WorkflowTemplate>(home_root.clone(), "flotilla")
-        .replace(&home_backend.using::<WorkflowTemplate>("flotilla").list().await.expect("home workflows"), Utc::now())
-        .await
-        .expect("replicate workflows");
-    for repository in home_backend.using::<Repository>("flotilla").list().await.expect("home repositories").items {
-        driver_backend
-            .using::<Repository>("flotilla")
-            .create(&InputMeta::from(&repository.metadata), &repository.spec)
-            .await
-            .expect("driver repository observation");
-    }
     let driver = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(driver_temp.path())),
@@ -890,6 +729,26 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    install_engine(&driver);
+    create_host_direct_placement((&*driver).into(), "host-direct-driver-vessels", "driver-vessels").await;
+    create_standing_agent_placement(&driver).await;
+    // The project's definitions are homed at the project's home and reach the driver through its
+    // log; the driver observes the repositories itself.
+    let home = other_home(&driver, "home-root");
+    for project in home_backend.using::<Project>("flotilla").list().await.expect("home projects").items {
+        home.project(&project.metadata.name, &project.metadata.labels, &project.metadata.annotations, &project.spec).await;
+    }
+    for workflow in home_backend.using::<WorkflowTemplate>("flotilla").list().await.expect("home workflows").items {
+        home.stamped_definition::<WorkflowTemplate>(&workflow.metadata.name, &workflow.metadata.annotations, &workflow.spec).await;
+    }
+    replicate_other_home(&driver, "home-root");
+    for repository in home_backend.using::<Repository>("flotilla").list().await.expect("home repositories").items {
+        driver_backend
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::from(&repository.metadata), &repository.spec)
+            .await
+            .expect("driver repository observation");
+    }
     driver
         .install_convoy_ensure_reconciler(factory.create(driver.convoy_teardown(), driver.resource_backend(), driver.clock_for_scenarios()))
         .await;
@@ -911,7 +770,7 @@ pub async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact
     use flotilla_resources::{FleetDesignation, FleetDesignationSpec, RoleDefinition};
 
     let (daemon, backend, _, _temp) = standing_ensure_fixture(factory).await;
-    configure_standing_ensure_agent(&backend, Vec::new()).await;
+    configure_standing_ensure_agent(&daemon, Vec::new()).await;
     let projects = backend.definitions::<Project>("flotilla");
     let fleet = ProjectSpec::builder()
         .display_name("Fleet".into())
@@ -936,7 +795,11 @@ pub async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact
     let mut project = projects.get("standing-project").await.expect("project");
     project.spec.default_workflow_ref.clear();
     project.spec.charter_prose.insert("governor".into(), "Govern the child project from this delivered charter.".into());
+    // Declared by its repository's charter at commit charter-2719: a declaration's origin is its
+    // repository and that commit together.
     let mut meta = InputMeta::from(&project.metadata);
+    let repository = project.spec.repositories[0].repo.to_string();
+    meta.annotations.insert(flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(), repository);
     meta.annotations.insert(flotilla_charter::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION.into(), "charter-2719".into());
     projects.apply(&meta, &project.spec).await.expect("local charter");
     let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
@@ -978,7 +841,7 @@ pub async fn admission_refuses_same_role_briefs_before_writing_any_artifact(fact
     let mut second = workflow.vessels[0].clone();
     second.name = "second".into();
     workflow.vessels.push(second);
-    let spec = ConvoySpec::builder().workflow_ref("same-role".into()).build();
+    let spec = ConvoySpec::builder().workflow_ref("same-role".into()).project_ref("flotilla".into()).build();
     let error = daemon.write_admission_briefs("flotilla", "same-role", &spec, &workflow).await.expect_err("collision refused");
     assert!(error.contains("convoy-wide unique roles"));
     assert!(writer.writes.lock().await.is_empty(), "refusal is before all artifact writes");
@@ -1010,7 +873,14 @@ pub async fn driverless_ensure_home_case(
     refused: bool,
     passes: &[usize],
 ) {
-    use flotilla_resources::{ManifestRoot, ManifestRootSpec};
+    use flotilla_resources::manifest_roots::RootDeclaration;
+    type EnsureFixture = (Arc<InProcessDaemon>, ResourceBackend, Arc<VirtualClock>, tempfile::TempDir);
+    const MANIFEST_STAMPS: [&str; 4] = [
+        "flotilla.work/manifest-reconciler-root",
+        "flotilla.work/manifest-source",
+        "flotilla.work/manifest-path",
+        "flotilla.work/manifest-revision",
+    ];
 
     let home = standing_ensure_fixture_for(factory, "kiwi", true).await;
     let peer_a = standing_ensure_fixture_for(factory, "feta", false).await;
@@ -1020,56 +890,73 @@ pub async fn driverless_ensure_home_case(
     let acting_home = usize::from(declared);
     let home_backend = &home.1;
     let acting_backend = &hosts[acting_home].1;
-    let ensures = home_backend.definitions::<ConvoyEnsure>("flotilla");
+    // One host's log replayed into another's decided store, as replication carries it.
+    let replicate = |from: &EnsureFixture, to: &EnsureFixture| {
+        flotilla_provisioning_testkit::replicate_home(
+            &from.0.decided_store().expect("source decided store"),
+            from.0.node_id().as_str(),
+            &to.0.decided_store().expect("target decided store"),
+        );
+    };
+    // Each peer registers its own Project copy before any of the home's records reach it.
+    let project = home_backend.definitions::<Project>("flotilla").get("standing-project").await.expect("home project");
+    for peer in [&peer_a, &peer_b] {
+        peer.1
+            .definitions::<Project>("flotilla")
+            .create(&InputMeta::from(&project.metadata), &project.spec)
+            .await
+            .expect("each host registers its own Project copy");
+    }
+    // Manifest stamps are written only at the root's home: the declared ensure is the root's
+    // home's copy of the home's ensure, which then replicates to the other hosts.
+    if declared {
+        replicate(&home, hosts[acting_home]);
+    }
+    let ensures = acting_backend.definitions::<ConvoyEnsure>("flotilla");
     let mut ensure = ensures.get("quartermaster").await.expect("home ensure");
     if declared {
-        acting_backend
-            .using::<ManifestRoot>("flotilla")
-            .create(
-                &test_meta("declaring-root"),
-                &ManifestRootSpec::builder().host("feta".into()).path("/ops".into()).source("project-map".into()).build(),
-            )
-            .await
-            .expect("declaring root");
+        let declaration =
+            RootDeclaration { host: "feta".into(), path: "/ops".into(), source: "project-map".into(), binding: None, ops: false };
+        hosts[acting_home].0.manifest_roots().declare("flotilla", "declaring-root", declaration).await.expect("declaring root");
         let mut meta = InputMeta::from(&ensure.metadata);
         meta.annotations.insert("flotilla.work/manifest-reconciler-root".into(), if legacy { "feta" } else { "declaring-root" }.into());
         meta.annotations.insert("flotilla.work/manifest-source".into(), "project-map".into());
+        meta.annotations.insert("flotilla.work/manifest-path".into(), "ensures/quartermaster.yaml".into());
+        meta.annotations.insert("flotilla.work/manifest-revision".into(), "rev-1".into());
+        // The root's home writes its copy after the home created the ensure.
+        hosts[acting_home].2.advance(chrono::Duration::seconds(1));
         ensure = ensures.apply(&meta, &ensure.spec).await.expect("declared ensure");
+        record_declaring_pass(&hosts[acting_home].0).await;
     }
     if refused {
         let mut spec = ensure.spec.clone();
         spec.workflow_ref = "missing-workflow".into();
         ensures.apply(&InputMeta::from(&ensure.metadata), &spec).await.expect("refused ensure config");
     }
-    let project = home_backend.definitions::<Project>("flotilla").get("standing-project").await.expect("home project");
+    if declared {
+        replicate(hosts[acting_home], &home);
+        replicate(hosts[acting_home], &peer_b);
+    }
     for peer in [&peer_a, &peer_b] {
         let backend = &peer.1;
-        backend
-            .definitions::<Project>("flotilla")
-            .create(&InputMeta::from(&project.metadata), &project.spec)
-            .await
-            .expect("each host registers its own Project copy");
-        backend
-            .replica_writer::<ConvoyEnsure>(home.0.node_id().clone(), "flotilla")
-            .replace(&home_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("ensure snapshot"), Utc::now())
-            .await
-            .expect("replicate ensure");
+        // The home's ensure reaches each peer through the home's log.
+        replicate(&home, peer);
         let copy = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("replicated ensure");
         let mut meta = InputMeta::from(&copy.metadata);
         meta.labels.insert("local-copy".into(), peer.0.node_id().to_string());
-        backend.definitions::<ConvoyEnsure>("flotilla").apply(&meta, &copy.spec).await.expect("local definition copy does not confer home");
-    }
-    if declared {
-        let roots = acting_backend.using::<ManifestRoot>("flotilla").list().await.expect("root snapshot");
-        for (index, host) in hosts.iter().enumerate() {
-            if index != acting_home {
-                host.1
-                    .replica_writer::<ManifestRoot>(hosts[acting_home].0.node_id().clone(), "flotilla")
-                    .replace(&roots, Utc::now())
-                    .await
-                    .expect("replicate declaring root");
+        // Udder holds no root, and only the root's home may write manifest stamps: in the declared
+        // rows udder's later copy is an operator's apply there, the same spec without the stamps.
+        // A stamped apply at a home without the root is refused, which the provisioning test
+        // `an_apply_stamped_with_a_root_another_home_holds_is_refused` covers.
+        if declared && std::ptr::eq(peer, &peer_b) {
+            for stamp in MANIFEST_STAMPS {
+                meta.annotations.remove(stamp);
             }
+            meta.labels.remove(flotilla_resources::MANAGED_BY_LABEL);
         }
+        // Each fixture's clock starts at the same instant: the later copy is written later.
+        peer.2.advance(chrono::Duration::seconds(1));
+        backend.definitions::<ConvoyEnsure>("flotilla").apply(&meta, &copy.spec).await.expect("local definition copy does not confer home");
     }
     let mut before = Vec::new();
     for host in hosts {
@@ -1083,7 +970,9 @@ pub async fn driverless_ensure_home_case(
         let (daemon, backend, _, _) = hosts[index];
         let result = daemon.reconcile_convoy_ensures_once("flotilla").await;
         if index == acting_home {
-            if refused {
+            // A manifest-declared ensure holds no source commit, so it never admits, on the fleet
+            // or here: in the declared rows the root's home acts by attempting admission.
+            if refused || declared {
                 // The first pass refuses; subsequent passes may wait for backoff.
                 assert!(result.as_ref().map_or(true, |changes| changes.is_empty()), "home refusal/backoff: {result:?}");
             } else {
@@ -1097,31 +986,109 @@ pub async fn driverless_ensure_home_case(
             before[index],
             "non-home writes no status or retry state"
         );
-        assert!(backend.using::<Event>("flotilla").list().await.expect("events").items.is_empty(), "non-home writes no Event");
-        assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("demands").items.is_empty(), "non-home raises no stall");
+        assert!(open_attentions(backend).await.is_empty(), "non-home raises no stall");
         assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.is_empty(), "non-home never admits");
     }
-    if refused {
-        assert!(
-            acting_backend
-                .using::<Event>("flotilla")
-                .list()
-                .await
-                .expect("home events")
-                .items
-                .iter()
-                .any(|event| event.spec.reason == "EnsureAdmissionRefused"),
-            "only home attempts refused admission"
-        );
-        let status = acting_backend
-            .using::<ConvoyEnsure>("flotilla")
-            .get("quartermaster")
-            .await
-            .expect("acting ensure")
-            .status
-            .expect("retry status");
-        assert!(status.retry.is_some(), "home persists refusal retry state");
+    if refused || declared {
+        // The refusal note is held in memory by the home that attempted admission (#3108).
+        for (index, host) in hosts.iter().enumerate() {
+            let reading = quartermaster(&host.0).await;
+            assert_eq!(reading.next_attempt.is_some(), index == acting_home, "only home attempts refused admission: host {index}");
+        }
     } else {
         assert_eq!(acting_backend.using::<ResourceConvoy>("flotilla").list().await.expect("home convoys").items.len(), 1);
+    }
+}
+
+/// The declaring root's reconciler records its pass over `ensures/quartermaster.yaml`, whose
+/// baseline gives a stamped copy's document path back.
+async fn record_declaring_pass(daemon: &InProcessDaemon) {
+    let key = flotilla_resources::DocumentKey {
+        path: "ensures/quartermaster.yaml".into(),
+        kind: "ConvoyEnsure".into(),
+        namespace: "flotilla".into(),
+        name: "quartermaster".into(),
+    };
+    let state = flotilla_resources::DocumentState {
+        phase: flotilla_resources::DocumentPhase::Applied,
+        reason: None,
+        live_hash: Some("h".into()),
+        desired_hash: Some("h".into()),
+        baseline_hash: Some("h".into()),
+        observed_at: chrono::Utc::now(),
+        resolved_token: None,
+        resolution_outcome: None,
+        removed_in: None,
+    };
+    let pass = flotilla_resources::manifest_roots::PassReport {
+        revision: "rev-1".into(),
+        complete: true,
+        documents: [(key, state)].into(),
+        at: chrono::Utc::now(),
+    };
+    daemon.manifest_roots().record_pass("flotilla", "declaring-root", pass).await.expect("record the pass");
+}
+
+// #3108: a declaration owns the name. Kiwi holds its undeclared original beside feta's declared
+// copy, and reads prefer its own; while the declared copy lives, only feta, the root's home, acts.
+// Once the declared copy is deleted, the undeclared copies decide again: the earliest, kiwi's.
+// A manifest-declared ensure holds no source commit, so it never admits, on the fleet or here:
+// feta acts by attempting admission, which leaves its refusal note.
+pub async fn a_declared_copy_owns_a_driverless_ensure_until_deleted(factory: &dyn EnsureScenarioController) {
+    use flotilla_resources::manifest_roots::RootDeclaration;
+    let kiwi = standing_ensure_fixture_for(factory, "kiwi", true).await;
+    let feta = standing_ensure_fixture_for(factory, "feta", false).await;
+    let udder = standing_ensure_fixture_for(factory, "udder", false).await;
+    let replicate = |from: &InProcessDaemon, to: &InProcessDaemon| {
+        flotilla_provisioning_testkit::replicate_home(
+            &from.decided_store().expect("source decided store"),
+            from.node_id().as_str(),
+            &to.decided_store().expect("target decided store"),
+        );
+    };
+    let convoys = |backend: &ResourceBackend| backend.clone().using::<ResourceConvoy>("flotilla");
+    let project = kiwi.1.definitions::<Project>("flotilla").get("standing-project").await.expect("kiwi project");
+    for peer in [&feta, &udder] {
+        peer.1
+            .definitions::<Project>("flotilla")
+            .create(&InputMeta::from(&project.metadata), &project.spec)
+            .await
+            .expect("each peer's Project copy");
+        replicate(&kiwi.0, &peer.0);
+    }
+
+    let declaration = RootDeclaration { host: "feta".into(), path: "/ops".into(), source: "project-map".into(), binding: None, ops: false };
+    feta.0.manifest_roots().declare("flotilla", "declaring-root", declaration).await.expect("declaring root");
+    let ensures = feta.1.definitions::<ConvoyEnsure>("flotilla");
+    let original = ensures.get("quartermaster").await.expect("kiwi's ensure at feta");
+    let mut meta = InputMeta::from(&original.metadata);
+    meta.annotations.insert("flotilla.work/manifest-reconciler-root".into(), "declaring-root".into());
+    meta.annotations.insert("flotilla.work/manifest-source".into(), "project-map".into());
+    meta.annotations.insert("flotilla.work/manifest-path".into(), "ensures/quartermaster.yaml".into());
+    meta.annotations.insert("flotilla.work/manifest-revision".into(), "rev-1".into());
+    feta.2.advance(chrono::Duration::seconds(1));
+    ensures.apply(&meta, &original.spec).await.expect("declared ensure");
+    record_declaring_pass(&feta.0).await;
+    replicate(&feta.0, &kiwi.0);
+    replicate(&feta.0, &udder.0);
+
+    // Kiwi's own copy is undeclared and the earliest, yet confers nothing beside a declaration.
+    for (name, host) in [("kiwi", &kiwi), ("udder", &udder)] {
+        assert_eq!(host.0.reconcile_convoy_ensures_once("flotilla").await, Ok(Vec::new()), "{name} does not act");
+        assert!(quartermaster(&host.0).await.next_attempt.is_none(), "{name} attempts nothing beside a declaration");
+        assert!(convoys(&host.1).list().await.expect("convoys").items.is_empty(), "{name} never admits beside a declaration");
+    }
+    let refusal = feta.0.reconcile_convoy_ensures_once("flotilla").await;
+    assert!(refusal.as_ref().is_err_and(|error| error.contains("no source commit provenance")), "the root's home attempts: {refusal:?}");
+    assert!(quartermaster(&feta.0).await.next_attempt.is_some(), "the root's home holds its refusal note");
+
+    ensures.delete("quartermaster").await.expect("the declaration goes away");
+    replicate(&feta.0, &kiwi.0);
+    replicate(&feta.0, &udder.0);
+    kiwi.0.reconcile_convoy_ensures_once("flotilla").await.expect("kiwi admits");
+    assert_eq!(convoys(&kiwi.1).list().await.expect("kiwi convoys").items.len(), 1, "the earliest undeclared copy acts again");
+    for (name, host) in [("feta", &feta), ("udder", &udder)] {
+        assert_eq!(host.0.reconcile_convoy_ensures_once("flotilla").await, Ok(Vec::new()), "{name} does not act");
+        assert!(convoys(&host.1).list().await.expect("convoys").items.is_empty(), "{name} never admits");
     }
 }

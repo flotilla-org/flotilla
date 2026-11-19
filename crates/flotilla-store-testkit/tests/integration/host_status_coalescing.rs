@@ -19,7 +19,7 @@ fn start() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 13, 12, 0, 0).single().expect("valid timestamp")
 }
 
-fn heartbeat(at: DateTime<Utc>, rss: u64) -> HostStatusPatch {
+fn heartbeat(at: DateTime<Utc>, below_floor: bool) -> HostStatusPatch {
     HostStatusPatch::Heartbeat {
         description: None,
         capabilities: BTreeMap::from([("docker".to_string(), serde_json::Value::Bool(true))]),
@@ -27,13 +27,8 @@ fn heartbeat(at: DateTime<Utc>, rss: u64) -> HostStatusPatch {
         ready: true,
         daemon_generation: Some("generation".to_string()),
         protocol_fingerprint: None,
-        daemon_version: None,
-        daemon_started_at: Some(start()),
-        disk_free_bytes: None,
-        daemon_rss_bytes: Some(rss),
-        admission_free_space_floor_bytes: None,
+        below_free_space_floor: Some(below_floor),
         agent_adapter_baseline: None,
-        resource_store: None,
         // Restamped on every heartbeat, as the daemon's gathered conditions are.
         conditions: vec![HostCondition::builder()
             .condition_type("ImageBuild/b1")
@@ -45,7 +40,6 @@ fn heartbeat(at: DateTime<Utc>, rss: u64) -> HostStatusPatch {
             // This test admission condition does not disable forge reads.
             .blocks_forge_observation(false)
             .build()],
-        folded: Default::default(),
     }
 }
 
@@ -80,8 +74,8 @@ async fn version(hosts: &TypedResolver<Host>) -> String {
 
 #[derive(Debug, Clone, Copy)]
 enum Step {
-    /// A heartbeat whose only observation is daemon RSS.
-    Heartbeat { advance: i64, rss: u64 },
+    /// A heartbeat whose only observation is whether free disk is below the floor.
+    Heartbeat { advance: i64, below_floor: bool },
     /// A fulfilment pass; an unchanged toolchain only refreshes `observed_at`.
     Fulfilment { advance: i64, toolchain: u8 },
     /// A sleep-inhibition health observation.
@@ -90,11 +84,11 @@ enum Step {
 
 fn draw_step(tc: &hegel::TestCase) -> Step {
     // Advances straddle HEARTBEAT_REFRESH_SECS (20 s) and the 60 s readiness
-    // TTL; the two-value RSS, toolchain and health domains make "unchanged"
+    // TTL; the two-value floor, toolchain and health domains make "unchanged"
     // observations common, so both commit and elision branches are drawn.
     let advance = tc.draw(gs::integers::<i64>().min_value(0).max_value(45));
     match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
-        0 => Step::Heartbeat { advance, rss: tc.draw(gs::integers::<u64>().min_value(1).max_value(2)) },
+        0 => Step::Heartbeat { advance, below_floor: tc.draw(gs::booleans()) },
         1 => Step::Fulfilment { advance, toolchain: tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) },
         _ => Step::Sleep { advance, failed: tc.draw(gs::booleans()) },
     }
@@ -103,7 +97,7 @@ fn draw_step(tc: &hegel::TestCase) -> Step {
 /// Expected latest observations, independent of how the patch is implemented.
 #[derive(Default)]
 struct Model {
-    rss: Option<u64>,
+    below_floor: Option<bool>,
     toolchain: Option<u8>,
     sleep_failed: Option<bool>,
     /// Readiness as last computed by a heartbeat: a failed sleep inhibition blocks it.
@@ -124,19 +118,19 @@ async fn run_steps(backend: ResourceBackend, steps: &[Step]) {
     for (index, step) in steps.iter().enumerate() {
         let before = version(&hosts).await;
         let (patch, expect_commit) = match *step {
-            Step::Heartbeat { advance, rss } => {
+            Step::Heartbeat { advance, below_floor } => {
                 now += Duration::seconds(advance);
-                // Commit when RSS changed, or when the stored heartbeat is at least the refresh window old.
+                // Commit when the floor judgement changed, or when the stored heartbeat is at least the refresh window old.
                 let stale = model.stored_heartbeat_at.is_none_or(|stored| now - stored >= Duration::seconds(HEARTBEAT_REFRESH_SECS));
                 let ready = model.sleep_failed != Some(true);
-                let commit = model.rss != Some(rss) || model.ready != Some(ready) || stale;
-                model.rss = Some(rss);
+                let commit = model.below_floor != Some(below_floor) || model.ready != Some(ready) || stale;
+                model.below_floor = Some(below_floor);
                 model.ready = Some(ready);
                 model.latest_heartbeat_at = Some(now);
                 if commit {
                     model.stored_heartbeat_at = Some(now);
                 }
-                (heartbeat(now, rss), commit)
+                (heartbeat(now, below_floor), commit)
             }
             Step::Fulfilment { advance, toolchain } => {
                 now += Duration::seconds(advance);
@@ -157,7 +151,7 @@ async fn run_steps(backend: ResourceBackend, steps: &[Step]) {
         assert_eq!(after.metadata.resource_version != before, expect_commit, "step {index} {step:?}: commit iff the observation changed");
         let status = after.status.expect("status");
         // Elision never loses an observation change.
-        assert_eq!(status.daemon_rss_bytes, model.rss, "step {index}");
+        assert_eq!(status.below_free_space_floor, model.below_floor, "step {index}");
         assert_eq!(
             status.fulfilment_facts.get("kind-a").and_then(|facts| facts.toolchains.get("rust").cloned()),
             model.toolchain.map(|toolchain| format!("1.{toolchain}.0")),
@@ -190,35 +184,6 @@ fn host_status_commits_only_observation_changes(tc: hegel::TestCase) {
     });
 }
 
-// Behaviour (#3154): the heartbeat folds a fresh fulfilment `observed_at` into
-// its write without regressing facts another writer changed meanwhile.
-#[tokio::test]
-async fn heartbeat_folds_fulfilment_refresh_without_regressing_changed_facts() {
-    let backend = flotilla_store_testkit::sqlite_backend().expect("sqlite backend");
-    let hosts = host(&backend).await;
-    let observed = start();
-    apply_status_patch(&hosts, HOST, &HostStatusPatch::FulfilmentFacts { facts: facts(observed, 0), model_probes: Default::default() })
-        .await
-        .expect("publish facts");
-
-    let refreshed = observed + Duration::minutes(5);
-    let mut patch = heartbeat(refreshed, 1);
-    let HostStatusPatch::Heartbeat { folded, .. } = &mut patch else { unreachable!() };
-    folded.fulfilment_refresh = facts(refreshed, 0);
-    let status = apply_status_patch(&hosts, HOST, &patch).await.expect("heartbeat").status.expect("status");
-    assert_eq!(status.fulfilment_facts["kind-a"].observed_at, refreshed, "same facts take the newer observation time");
-
-    // A refresh carrying superseded facts must not overwrite the changed ones.
-    apply_status_patch(&hosts, HOST, &HostStatusPatch::FulfilmentFacts { facts: facts(refreshed, 1), model_probes: Default::default() })
-        .await
-        .expect("publish changed facts");
-    let mut stale = heartbeat(refreshed + Duration::seconds(30), 1);
-    let HostStatusPatch::Heartbeat { folded, .. } = &mut stale else { unreachable!() };
-    folded.fulfilment_refresh = facts(refreshed + Duration::seconds(30), 0);
-    let status = apply_status_patch(&hosts, HOST, &stale).await.expect("heartbeat").status.expect("status");
-    assert_eq!(status.fulfilment_facts, facts(refreshed, 1));
-}
-
 // Behaviour (#3154): an otherwise unchanged heartbeat is declined until the
 // stored heartbeat is exactly HEARTBEAT_REFRESH_SECS old (the boundary the
 // generated property rarely draws), then commits.
@@ -226,13 +191,13 @@ async fn heartbeat_folds_fulfilment_refresh_without_regressing_changed_facts() {
 async fn unchanged_heartbeat_commits_at_the_refresh_boundary() {
     let backend = flotilla_store_testkit::sqlite_backend().expect("sqlite backend");
     let hosts = host(&backend).await;
-    apply_status_patch(&hosts, HOST, &heartbeat(start(), 1)).await.expect("first heartbeat");
+    apply_status_patch(&hosts, HOST, &heartbeat(start(), false)).await.expect("first heartbeat");
     let first = version(&hosts).await;
     let just_inside = start() + Duration::seconds(HEARTBEAT_REFRESH_SECS - 1);
-    apply_status_patch(&hosts, HOST, &heartbeat(just_inside, 1)).await.expect("declined heartbeat");
+    apply_status_patch(&hosts, HOST, &heartbeat(just_inside, false)).await.expect("declined heartbeat");
     assert_eq!(version(&hosts).await, first, "a heartbeat inside the refresh window commits nothing");
     let boundary = start() + Duration::seconds(HEARTBEAT_REFRESH_SECS);
-    let status = apply_status_patch(&hosts, HOST, &heartbeat(boundary, 1)).await.expect("refresh heartbeat").status.expect("status");
+    let status = apply_status_patch(&hosts, HOST, &heartbeat(boundary, false)).await.expect("refresh heartbeat").status.expect("status");
     assert_eq!(status.heartbeat_at, Some(boundary));
 }
 
@@ -242,9 +207,9 @@ async fn unchanged_heartbeat_commits_at_the_refresh_boundary() {
 async fn heartbeat_commits_after_a_clock_regression() {
     let backend = flotilla_store_testkit::sqlite_backend().expect("sqlite backend");
     let hosts = host(&backend).await;
-    apply_status_patch(&hosts, HOST, &heartbeat(start(), 1)).await.expect("first heartbeat");
+    apply_status_patch(&hosts, HOST, &heartbeat(start(), false)).await.expect("first heartbeat");
     let regressed = start() - Duration::seconds(1);
-    let status = apply_status_patch(&hosts, HOST, &heartbeat(regressed, 1)).await.expect("heartbeat").status.expect("status");
+    let status = apply_status_patch(&hosts, HOST, &heartbeat(regressed, false)).await.expect("heartbeat").status.expect("status");
     assert_eq!(status.heartbeat_at, Some(regressed));
 }
 
@@ -252,7 +217,7 @@ async fn assert_host_stream_keeps_one_event(backend: ResourceBackend) {
     let hosts = host(&backend).await;
     let created = version(&hosts).await;
     for beat in 0..4 {
-        apply_status_patch(&hosts, HOST, &heartbeat(start() + Duration::seconds(30 * beat), 1)).await.expect("heartbeat");
+        apply_status_patch(&hosts, HOST, &heartbeat(start() + Duration::seconds(30 * beat), false)).await.expect("heartbeat");
     }
     let latest = version(&hosts).await;
 

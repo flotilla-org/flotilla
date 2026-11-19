@@ -1,10 +1,10 @@
 //! Project on the engine, behind `[primitives]` (#3824 layer 3b).
 //!
-//! [`EngineProjects`] is the [`EngineRecords`] port of Project over the decided store. Each home
+//! [`EngineProjects`] is the [`KindRecords`] port of Project over the decided store. Each home
 //! writes the Projects it declares through the plain-kind port, and project operations' record of
 //! each beside it; every home's are read from a resident map kept current by following the log.
 //!
-//! A Project reads as the old object:
+//! A Project reads as the resource:
 //! - its origin as the stamps its writers wrote, rebuilt from its last change as on every
 //!   definition kind ([`provenance`](super::provenance)): its row holds only its own fields (#4024);
 //! - its status from two sources. Project operations' conditions come from the [`ProjectOpsRecord`]
@@ -15,7 +15,6 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
 };
 
 use flotilla_engine_store::{
@@ -24,15 +23,19 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin},
-    engine_records::{EngineObject, EngineRecords},
-    DeclarationRefusedCondition, DispatchQueueAttention, DispatchQueueEntry, OperationalEntriesCondition, ProjectSpec, ProjectStatus,
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, UnloggedJournal, WriteError},
+    DeclarationRefusedCondition, DispatchQueueAttention, DispatchQueueEntry, OperationalEntriesCondition, Project, ProjectSpec,
+    ProjectStatus,
 };
 use flotilla_schema::{Identity, Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
-use serde_json::Value;
 
 use super::provenance;
+use super::reads::created_at;
+use super::resume::followed_since;
+use super::watch::CommitsSeen;
+use super::watch::SharedChanges;
 use crate::stored::manifest_root::ManifestRoot;
 use crate::stored::project::{ProjectDefinition, ProjectOpsRecord};
 
@@ -42,9 +45,6 @@ const OPS: KindCode = <ProjectOpsRecord as Kind>::CODE;
 /// The ManifestRoot's code: a root's baselines hold the paths its Projects read with, so a root's
 /// change re-reads its home's Projects.
 const ROOT: KindCode = <flotilla_state_machines::Resource<ManifestRoot> as Kind>::CODE;
-
-/// How often a change stream looks for new entries in the log, as the account port's does.
-const POLL: Duration = Duration::from_millis(500);
 
 /// How often a write that loses a race to another writer of its name reads and tries again.
 const WRITE_ATTEMPTS: usize = 3;
@@ -58,10 +58,15 @@ const WRITER: &str = "project-records";
 struct Held {
     project: Option<(u64, ProjectDefinition, DefinitionOrigin)>,
     ops: Option<(u64, ProjectOpsRecord)>,
+    /// When the Project's definition was created; none while none is held.
+    created: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Every home's records, by name and home.
 type Records = BTreeMap<(String, String), Held>;
+
+/// One home's Project as the resource it reads as, or why it does not.
+type Object = Result<Record<Project>, String>;
 
 /// The dispatch reconciler's judgement of one Project at this home, with a revision that moves on
 /// each change, so a Project's version moves with it.
@@ -94,10 +99,9 @@ fn datetime(at: Timestamp) -> chrono::DateTime<chrono::Utc> {
     })
 }
 
-/// `held` as the old object, with `judged` (this home's judgement) when the record is this home's.
-fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Option<Result<EngineObject, String>> {
+/// `held` as the resource, with `judged` (this home's judgement) when the record is this home's.
+fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Option<Object> {
     let (version, project, origin) = held.project.as_ref()?;
-    let encode = |error: serde_json::Error| format!("{KIND} {name} at {home}: {error}");
     let ops = held.ops.as_ref().map(|(_, ops)| ops);
     let queue = judged.map(|judged| judged.queue.clone()).unwrap_or_default();
     let status = ProjectStatus {
@@ -116,17 +120,17 @@ fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Optio
     };
     let (labels, annotations) = stamp(origin);
     let version = composed_version(*version, held.ops.as_ref().map(|(version, _)| *version), judged.map_or(0, |judged| judged.revision));
-    Some((|| {
-        Ok(EngineObject {
-            name: name.to_owned(),
-            home: home.to_owned(),
-            version,
-            labels,
-            annotations,
-            spec: serde_json::to_value(project.spec()).map_err(encode)?,
-            status: Some(serde_json::to_value(status).map_err(encode)?),
-        })
-    })())
+    let Some(created_at) = held.created else { return Some(Err(format!("{KIND} {name} at {home} has no creation time"))) };
+    Some(Ok(Record {
+        name: name.to_owned(),
+        home: home.to_owned(),
+        version,
+        created_at,
+        labels,
+        annotations,
+        spec: project.spec().clone(),
+        status: Some(status),
+    }))
 }
 
 /// The version a Project reads at: its records' latest log version, above the judgement's
@@ -165,6 +169,10 @@ fn reload(read: &mut Read<'_>, records: &mut Records, identity: &Identity) -> Re
             .transpose()?
             .flatten()
             .map(|(_, version, value, origin)| (version, value, origin));
+        held.created = match (id, &held.project) {
+            (Some(id), Some(_)) => Some(created_at(read, id)?),
+            _ => None,
+        };
     } else if identity.kind == OPS {
         held.ops = id.map(|id| read.load::<ProjectOpsRecord>(id)).transpose()?.flatten().map(|loaded| (loaded.version, loaded.value));
     }
@@ -183,7 +191,9 @@ fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), 
         let page = read.scan::<ProjectDefinition>(home, after, 64)?;
         for id in page.ids {
             if let Some((name, version, value, origin)) = load_project(read, &mut roots, id)? {
-                records.entry((name, home.to_owned())).or_default().project = Some((version, value, origin));
+                let created = created_at(read, id)?;
+                let held = records.entry((name, home.to_owned())).or_default();
+                (held.project, held.created) = (Some((version, value, origin)), Some(created));
             }
         }
         after = page.next;
@@ -211,13 +221,19 @@ pub struct EngineProjects {
     home: String,
     log: PlainLog,
     resident: Mutex<Resident>,
+    /// Whether the store has committed since the resident map was last brought up to it.
+    commits: CommitsSeen,
+    // One follower for every watcher of these records on this daemon.
+    changes: SharedChanges,
     /// This home's dispatch judgements, by Project name.
     judged: Mutex<BTreeMap<String, Judged>>,
     /// Held across each write, so this home's writes of one Project (its definition and its
     /// operations record together) never interleave. Taken before `resident` and `judged`.
     writing: Mutex<()>,
-    /// Ticks on each change of a judgement, which the log does not carry.
+    /// Ticks on each change of a judgement, which the log does not carry, with their count.
     judged_changes: tokio::sync::watch::Sender<u64>,
+    /// The names each change of a judgement touched. Taken under `judged`.
+    unlogged: Mutex<UnloggedJournal>,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -233,6 +249,8 @@ impl EngineProjects {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
         let opened = Self {
+            changes: SharedChanges::new(Arc::clone(&service), [PROJECT, OPS, ROOT], "projects"),
+            commits: CommitsSeen::follow(&service, [PROJECT, OPS, ROOT]),
             service,
             home,
             log,
@@ -240,6 +258,7 @@ impl EngineProjects {
             judged: Mutex::default(),
             writing: Mutex::default(),
             judged_changes: tokio::sync::watch::Sender::new(0),
+            unlogged: Mutex::default(),
             clock,
         };
         let homes = opened.service.homes();
@@ -264,6 +283,9 @@ impl EngineProjects {
     /// Brings the resident map up to the store: every entry written since the last refresh.
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
+        if !self.commits.take() {
+            return Ok(resident);
+        }
         let homes = self.service.homes();
         {
             let Resident { follower, records } = &mut *resident;
@@ -282,7 +304,8 @@ impl EngineProjects {
                     }
                     Ok(())
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .inspect_err(|_| self.commits.give_back())?;
         }
         // A judgement outlives no Project of this home: whatever removed it, a later one of the
         // name starts afresh (its log version is above anything the old one read at).
@@ -295,8 +318,8 @@ impl EngineProjects {
         Timestamp::from_datetime(&self.clock.now())
     }
 
-    /// Every record of `name` as the old object, by home; this home's with its judgement.
-    fn objects(&self, records: &Records, judged: &BTreeMap<String, Judged>, name: &str) -> Vec<Result<EngineObject, String>> {
+    /// Every record of `name` as the resource, by home; this home's with its judgement.
+    fn objects(&self, records: &Records, judged: &BTreeMap<String, Judged>, name: &str) -> Vec<Object> {
         records
             .range((name.to_owned(), String::new())..)
             .take_while(|((held, _), _)| held == name)
@@ -304,8 +327,8 @@ impl EngineProjects {
             .collect()
     }
 
-    /// This home's current object `name`, read again from the store.
-    fn current(&self, name: &str) -> Result<EngineObject, String> {
+    /// This home's current Project `name`, read again from the store.
+    fn current(&self, name: &str) -> Object {
         let resident = self.refresh()?;
         let records = &resident.records;
         let held = records.get(&(name.to_owned(), self.home.clone())).ok_or_else(|| format!("{KIND} {name} is not held here"))?;
@@ -370,51 +393,74 @@ impl EngineProjects {
         if held.queue != queue {
             held.queue = queue;
             held.revision += 1;
-            self.judged_changes.send_modify(|tick| *tick += 1);
+            self.judged_change(name);
         }
+    }
+
+    /// Counts a change of `name`'s judgement, under the judgements' lock, and ticks watchers.
+    fn judged_change(&self, name: &str) {
+        let count = locked(&self.unlogged).record([name.to_owned()]);
+        self.judged_changes.send_replace(count);
+    }
+
+    /// A reading through `homes`' sequences and the judgements counted so far; taken under the
+    /// judgements' lock, with the records it positions.
+    fn positioned_at(&self, homes: BTreeMap<String, u64>) -> LogPosition {
+        LogPosition { homes, unlogged: Some(locked(&self.unlogged).read()) }
     }
 }
 
 /// One name's records as several homes' resolve at `home`: its own, else the lexically first
 /// home's (the order `objects` gives).
-fn prefer(mut objects: Vec<Result<EngineObject, String>>, home: &str) -> Option<Result<EngineObject, String>> {
+fn prefer(mut objects: Vec<Object>, home: &str) -> Option<Object> {
     match objects.iter().position(|object| object.as_ref().is_ok_and(|object| object.home == home)) {
         Some(index) => Some(objects.swap_remove(index)),
         None => objects.into_iter().next(),
     }
 }
 
-fn refuse_kind(kind: &str) -> Result<(), String> {
-    if kind == KIND {
-        Ok(())
-    } else {
-        Err(format!("{kind} is not served by the project records"))
-    }
-}
-
-fn skip_unencoded(held: Result<EngineObject, String>) -> Option<EngineObject> {
+fn skip_unencoded(held: Object) -> Option<Record<Project>> {
     held.map_err(|error| tracing::warn!(%error, "skipping a project record that does not encode")).ok()
 }
 
+impl flotilla_store::EnginePort for EngineProjects {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<Project>(self);
+    }
+}
+
 #[async_trait::async_trait]
-impl EngineRecords for EngineProjects {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[KIND]
+impl KindRecords<Project> for EngineProjects {
+    fn codes(&self) -> Vec<KindCode> {
+        vec![PROJECT, OPS, ROOT]
+    }
+
+    /// From the shared follower of the log, and from the judge of dispatch.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
+    }
+
+    /// A judgement ticks as it changes.
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, self.codes()))
+    }
+
+    /// This home's dispatch judgements.
+    fn unlogged_changes(&self) -> Option<u64> {
+        Some(locked(&self.unlogged).count())
     }
 
     fn home(&self) -> String {
         self.home.clone()
     }
 
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn get(&self, name: &str) -> Result<Option<Record<Project>>, String> {
         let resident = self.refresh()?;
         let judged = locked(&self.judged);
         prefer(self.objects(&resident.records, &judged, name), &self.home).transpose()
     }
 
-    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn list(&self) -> Result<Vec<Record<Project>>, String> {
         let resident = self.refresh()?;
         let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
         // The map orders by name, then home, so one name's homes are adjacent.
@@ -427,8 +473,7 @@ impl EngineRecords for EngineProjects {
             .collect())
     }
 
-    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn sources(&self) -> Result<Vec<Record<Project>>, String> {
         let resident = self.refresh()?;
         let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
         names.dedup();
@@ -436,19 +481,65 @@ impl EngineRecords for EngineProjects {
         Ok(names.into_iter().flat_map(|name| self.objects(&resident.records, &judged, name)).filter_map(skip_unencoded).collect())
     }
 
+    async fn positioned(&self) -> Result<(Vec<Record<Project>>, LogPosition), String> {
+        let resident = self.refresh()?;
+        let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
+        names.dedup();
+        let judged = locked(&self.judged);
+        let records =
+            names.into_iter().flat_map(|name| self.objects(&resident.records, &judged, name)).filter_map(skip_unencoded).collect();
+        Ok((records, self.positioned_at(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        let resident = self.refresh()?;
+        let _judged = locked(&self.judged);
+        Ok(self.positioned_at(resident.follower.cursors().clone()))
+    }
+
+    /// A root's change names every Project of its home: its baselines hold the paths they read with.
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let (changed, through) = match followed_since(&self.service, [PROJECT, OPS, ROOT], position)? {
+            Ok(followed) => followed,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        let resident = self.refresh()?;
+        let _judged = locked(&self.judged);
+        let mut names = match locked(&self.unlogged).since(position.unlogged.as_ref()) {
+            Ok(names) => names,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        for identity in changed {
+            if identity.kind == ROOT {
+                names.extend(resident.records.keys().filter(|(_, home)| *home == identity.home).map(|(name, _)| name.clone()));
+            } else {
+                names.insert(identity.name);
+            }
+        }
+        Ok(Since::Changed { names, through: self.positioned_at(through) })
+    }
+
+    /// Every home's record `name`, read from the resident map by name.
+    async fn copies(&self, name: &str) -> Result<Vec<Record<Project>>, String> {
+        let resident = self.refresh()?;
+        let judged = locked(&self.judged);
+        Ok(self.objects(&resident.records, &judged, name).into_iter().filter_map(skip_unencoded).collect())
+    }
+
     async fn apply(
         &self,
-        kind: &str,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
-        spec: Value,
-    ) -> Result<EngineObject, String> {
-        refuse_kind(kind)?;
-        let spec: ProjectSpec = serde_json::from_value(spec).map_err(|error| format!("{KIND} spec: {error}"))?;
-        let origin = origin(labels, annotations)?;
-        let value = ProjectDefinition::new(&spec).map_err(|error| format!("{KIND} {name}: {error}"))?;
+        spec: &ProjectSpec,
+    ) -> Result<Record<Project>, WriteError> {
+        let origin = provenance::resolve_stamped_root(&self.service, &self.home, origin(labels, annotations)?)?;
+        let value = ProjectDefinition::new(spec).map_err(|error| format!("{KIND} {name}: {error}"))?;
         let _writing = locked(&self.writing);
+        if version.is_some() {
+            WriteError::unless_at(version, self.current(name).ok().map(|current| current.version))?;
+        }
         if self.log.get::<ProjectDefinition>(name, &self.home).map_err(|error| error.to_string())?.is_none() {
             // A new Project starts with no conditions: an operations record left by a delete that
             // stopped part-way belongs to the one before. `writing` keeps any other write of the
@@ -456,17 +547,17 @@ impl EngineRecords for EngineProjects {
             self.remove::<ProjectOpsRecord>(name)?;
         }
         self.write::<ProjectDefinition>(name, Some(&origin), |_| Ok(Some(value.clone())))?;
-        self.current(name)
+        Ok(self.current(name)?)
     }
 
-    async fn set_status(&self, kind: &str, name: &str, status: Value) -> Result<EngineObject, String> {
-        refuse_kind(kind)?;
-        let status: ProjectStatus = serde_json::from_value(status).map_err(|error| format!("{KIND} status: {error}"))?;
+    async fn set_status(&self, name: &str, version: u64, status: &ProjectStatus) -> Result<Record<Project>, WriteError> {
         let _writing = locked(&self.writing);
-        self.current(name)?;
+        if self.current(name)?.version != version {
+            return Err(WriteError::Stale);
+        }
         // Project operations' conditions are their record; once written it stays, emptied, until
         // the Project goes, so its version only moves forward.
-        let ops = ProjectOpsRecord::from_status(&status);
+        let ops = ProjectOpsRecord::from_status(status);
         self.write::<ProjectOpsRecord>(name, None, |current| {
             Ok(match (&ops, current) {
                 (Some(ops), _) => Some(ops.clone()),
@@ -476,52 +567,38 @@ impl EngineRecords for EngineProjects {
         })?;
         self.judge(
             name,
-            Queue { entries: status.dispatch_queue, error: status.dispatch_queue_error, attention: status.dispatch_queue_attention },
+            Queue {
+                entries: status.dispatch_queue.clone(),
+                error: status.dispatch_queue_error.clone(),
+                attention: status.dispatch_queue_attention.clone(),
+            },
         );
-        self.current(name)
+        Ok(self.current(name)?)
     }
 
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
-        refuse_kind(kind)?;
+    async fn delete(&self, name: &str) -> Result<(), String> {
         let _writing = locked(&self.writing);
         // The operations record first: a delete stopped between the two leaves a Project with no
         // conditions, never conditions with no Project.
         self.remove::<ProjectOpsRecord>(name)?;
         self.remove::<ProjectDefinition>(name)?;
-        if locked(&self.judged).remove(name).is_some() {
-            self.judged_changes.send_modify(|tick| *tick += 1);
+        let mut judged = locked(&self.judged);
+        if judged.remove(name).is_some() {
+            self.judged_change(name);
         }
         Ok(())
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let service = Arc::clone(&self.service);
-        let mut follower = Follower::new([PROJECT, OPS, ROOT]);
-        let homes = service.homes();
-        service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(|error| error.to_string())?;
+        let logged = self.changes.subscribe().map_err(|error| error.to_string())?;
         let mut judged = self.judged_changes.subscribe();
         judged.mark_unchanged();
-        let stream = futures::stream::unfold((service, follower, judged), |(service, mut follower, mut judged)| async move {
-            loop {
-                tokio::select! {
-                    changed = judged.changed() => {
-                        // The port is gone once its sender is; the log alone ticks from then on.
-                        if changed.is_ok() {
-                            return Some(((), (service, follower, judged)));
-                        }
-                        tokio::time::sleep(POLL).await;
-                    }
-                    () = tokio::time::sleep(POLL) => {}
-                }
-                let homes = service.homes();
-                match service.with_store(|store| Ok(!follower.pass(&mut store.read()?, &homes)?.is_empty())) {
-                    Ok(true) => return Some(((), (service, follower, judged))),
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(%error, "project change stream could not read the log; retrying"),
-                }
-            }
+        // The port is gone once its sender is; the log alone ticks from then on.
+        let judged = futures::stream::unfold(judged, |mut judged| async move {
+            judged.changed().await.ok()?;
+            Some(((), judged))
         });
-        Ok(Box::pin(stream))
+        Ok(Box::pin(futures::stream::select(logged, judged)))
     }
 }
 
@@ -529,14 +606,15 @@ impl EngineRecords for EngineProjects {
 mod tests {
     use super::*;
 
-    fn held(home: &str) -> Result<EngineObject, String> {
-        Ok(EngineObject {
+    fn held(home: &str) -> Result<Record<Project>, String> {
+        Ok(Record {
             name: "widgets".into(),
             home: home.into(),
             version: 1,
+            created_at: chrono::DateTime::UNIX_EPOCH,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
-            spec: Value::Null,
+            spec: flotilla_resources::ProjectSpec::builder().display_name("Widgets".into()).build(),
             status: None,
         })
     }

@@ -44,6 +44,10 @@ pub enum ResourceError {
     WatchExpired {
         requested_version: String,
         compacted_through: Option<String>,
+        /// Why the watch cannot resume, for the client that relists: a restart, a journal that
+        /// no longer holds the cursor's changes, a snapshot catch-up at a home, a cursor not
+        /// readable.
+        reason: String,
     },
     Unauthorized {
         message: String,
@@ -128,11 +132,8 @@ impl fmt::Display for ResourceError {
             Self::NotFound { name } => write!(f, "resource not found: {name}"),
             Self::Conflict { name, message } => write!(f, "resource conflict for {name}: {message}"),
             Self::Invalid { message } => write!(f, "{}{message}", Self::INVALID_MESSAGE_PREFIX),
-            Self::WatchExpired { requested_version, compacted_through: Some(compacted_through) } => {
-                write!(f, "watch resourceVersion {requested_version} expired; events through {compacted_through} were compacted")
-            }
-            Self::WatchExpired { requested_version, compacted_through: None } => {
-                write!(f, "watch resourceVersion {requested_version} expired")
+            Self::WatchExpired { requested_version, reason, .. } => {
+                write!(f, "watch resourceVersion {requested_version} expired: {reason}")
             }
             Self::Unauthorized { message } => write!(f, "unauthorized: {message}"),
             Self::FieldOwnership { violations } => {

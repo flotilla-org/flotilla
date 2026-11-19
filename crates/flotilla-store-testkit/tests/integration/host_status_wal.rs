@@ -82,7 +82,7 @@ async fn measure(schedule: Schedule) -> (usize, u64, usize) {
         }
         if heartbeat {
             status.heartbeat_at = Some(now);
-            status.daemon_rss_bytes = Some(200 * 1024 * 1024 + tick as u64);
+            status.disk_free_bytes = Some(200 * 1024 * 1024 + tick as u64);
         }
         let commit = heartbeat || matches!(schedule, Schedule::EveryObservationCommits);
         if commit {

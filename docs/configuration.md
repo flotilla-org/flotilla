@@ -401,7 +401,8 @@ Forced checkout removal saves a Git bundle and patch under `.flotilla-archives/`
 beside the base clone. A `worktree.tar.gz` is written only when the checkout has
 modified or untracked files that Git does not ignore. The
 `excluded-ignored.txt` manifest lists excluded ignored paths, one per line.
-`flotilla events` shows the archive path in a `CheckoutArchived` event.
+The daemon log records the archive path in a `CheckoutArchived` warning under the
+`flotilla::checkout` target.
 
 The hourly retention sweep removes archives older than 14 days by default.
 Set the age in each host's `~/.config/flotilla/daemon.toml`:
@@ -897,32 +898,7 @@ and prints the **viewer-side SSH plan**, rather than the daemon-relative
 terminal-pool command. It does not start the attachment. With a local daemon,
 JSON output retains the daemon-relative plan.
 
-## Message audit retention
-
-The receiver authority compacts terminal Message bodies after 30 days by default,
-on startup and then hourly. Set `message_audit_retention_days` in each host's
-`daemon.toml`; `0` disables compaction. Restart the daemon to apply the setting.
-
-```toml
-message_audit_retention_days = 30
-```
-
-Compaction replaces body text with a SHA-256 digest. It keeps the Message identity,
-addresses, references, canonical suppression pointer, receiver receipt, submission
-evidence, and status. Exact producer retries still resolve to the original record.
-Records are never deleted by this policy. Unresolved submissions, terminal members
-of active recovery batches, and follow-ups awaiting workflow continuation keep their
-body text. Follow-up references are protected across all locally stored and replicated
-Convoy namespaces, using the reference's target Message namespace. Each sweep
-releases inbox locks after at most 100 updates, refreshes recovery protection
-between batches, and logs individual update failures for retry on the next sweep.
-Compacted bodies cannot be recovered by changing the retention setting.
-
-Active inbox reads use maintained in-memory indexes and SQLite indexes, with
-receiver, reply correlation, and batch queries available over the resource API.
-Historical terminal records are fetched by identity when needed for recovery;
-they are excluded from delivery passes before decoding. Resource inventory and
-watch bootstrap still include audit records; retention does not prune receipts.
+## Message adoption gate
 
 Before rolling a generation that retires Message adoption shims, run the candidate
 on **every participating host**, against that host's old daemon:

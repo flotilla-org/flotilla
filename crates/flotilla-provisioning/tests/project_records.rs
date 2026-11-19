@@ -10,9 +10,9 @@ use flotilla_provisioning::engine::projects::EngineProjects;
 use flotilla_resources::{
     definition_provenance::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION},
     Clock, DeclarationRefusedCondition, DispatchQueueEntry, InputMeta, Project, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
-    RepositoryKey, SystemClock,
+    RepositoryKey, ResourceError, SystemClock,
 };
-use flotilla_schema_sqlite::stream::Service;
+use flotilla_schema_sqlite::stream::{Follower, Service};
 use flotilla_store::{apply_status_patch, watch_resource_kind_including_replicas, ResourceBackend, StoreQuery};
 use flotilla_store_memory::InMemoryBackend;
 use futures::StreamExt;
@@ -137,11 +137,15 @@ async fn the_old_store_keeps_the_project_contract() {
 }
 
 fn engine(directory: &std::path::Path) -> (Arc<Service>, ResourceBackend) {
+    engine_at(directory, "alpha")
+}
+
+fn engine_at(directory: &std::path::Path, home: &str) -> (Arc<Service>, ResourceBackend) {
     let mut kinds = flotilla_schema::KindRegistry::new();
     flotilla_provisioning::stored::project::register(&mut kinds).expect("register");
     // The kind a declaration's change item names.
     flotilla_provisioning::stored::repository::register(&mut kinds).expect("register repositories");
-    let service = Arc::new(Service::open(&directory.join("decided.sqlite"), "alpha", kinds).expect("store"));
+    let service = Arc::new(Service::open(&directory.join(format!("{home}.sqlite")), home, kinds).expect("store"));
     let records = EngineProjects::open(Arc::clone(&service), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend.install_engine_records(Arc::new(records));
@@ -154,6 +158,30 @@ async fn the_engine_keeps_the_project_contract() {
     let (_, backend) = engine(directory.path());
     contract(&backend).await;
     assert!(backend.store().list_raw(flotilla_store::ResourceKind::of::<Project>(), NS).await.expect("old rows").items.is_empty());
+}
+
+// Behaviour (two Project writers): an edit made from a read the Project has moved past, here by
+// project operations' conditions, is refused, and the Project keeps what it holds; the port checks
+// the version read in its own order of writes.
+#[tokio::test]
+async fn a_project_edited_from_a_read_it_has_moved_past_is_refused() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (_, backend) = engine(directory.path());
+    let projects = backend.using::<Project>(NS);
+    let meta = InputMeta::builder().name("widgets".into()).build();
+    let read = backend.definitions::<Project>(NS).apply(&meta, &spec("widgets", None)).await.expect("declare");
+    apply_status_patch(&projects, "widgets", &ProjectStatusPatch::ReplaceOperationalEntries { ready: true, message: "ready".into() })
+        .await
+        .expect("status");
+    let moved = projects.get("widgets").await.expect("read");
+    assert_ne!(moved.metadata.resource_version, read.metadata.resource_version, "the conditions move the version");
+
+    let stale = projects.update(&meta, &read.metadata.resource_version, &spec("renamed", None)).await;
+    assert!(matches!(stale, Err(ResourceError::Conflict { .. })), "a stale edit is refused: {stale:?}");
+    assert_eq!(projects.get("widgets").await.expect("read").spec.display_name, "widgets", "the Project keeps its spec");
+    let current =
+        projects.update(&meta, &moved.metadata.resource_version, &spec("renamed", None)).await.expect("an edit from the version held");
+    assert_eq!(current.spec.display_name, "renamed");
 }
 
 // Behaviour (#3824 layer 3b, the 2026-10-26 ruling): the dispatch queue is a judgement, not stored.
@@ -197,4 +225,47 @@ async fn the_engine_stores_project_operations_but_not_the_queue() {
     let status = reopened.using::<Project>(NS).get("widgets").await.expect("read").status.expect("status");
     assert_eq!(status.operational_entries.map(|entries| entries.ready), Some(true));
     assert!(status.dispatch_queue.is_empty());
+}
+
+/// One round of `home`'s log as `from` holds it, received by `to`; `relayed` when `from` is not
+/// the home and passes it on.
+fn round(from: &Service, home: &str, to: &Service, relayed: bool) {
+    let mut frames = Vec::new();
+    from.serve_home(home, None, flotilla_schema::Timestamp::from_datetime(&Utc::now()), |frame| {
+        frames.push(frame.to_vec());
+        Ok(())
+    })
+    .expect("serve");
+    to.with_store(|store| {
+        let mut follower = if relayed { Follower::relayed(store) } else { Follower::new(store) };
+        follower.receive(home, |sink| frames.iter().try_for_each(|frame| sink(frame)))
+    })
+    .expect("receive");
+}
+
+// Behaviour (look-over A): a Project declared at alpha reaches gamma only through beta. Each hop
+// installs it from a snapshot, which carries the change that wrote it, so gamma still reads it as
+// declared, with its declaration's provenance.
+#[tokio::test]
+async fn a_project_relayed_through_another_host_keeps_its_declaration_origin() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (alpha, alpha_backend) = engine_at(directory.path(), "alpha");
+    let (beta, _) = engine_at(directory.path(), "beta");
+    let (gamma, gamma_backend) = engine_at(directory.path(), "gamma");
+    let stamps = BTreeMap::from([
+        (BOOTSTRAP_REPOSITORY_ANNOTATION.to_owned(), REPOSITORY.to_owned()),
+        (BOOTSTRAP_COMMIT_ANNOTATION.to_owned(), "abc".to_owned()),
+        (DECLARATION_FILE_ANNOTATION.to_owned(), DECLARATION_FILE.to_owned()),
+    ]);
+    alpha_backend
+        .definitions::<Project>(NS)
+        .apply(&InputMeta::builder().name("widgets".into()).annotations(stamps.clone()).build(), &spec("widgets", None))
+        .await
+        .expect("declare at alpha");
+
+    round(&alpha, "alpha", &beta, false);
+    round(&beta, "alpha", &gamma, true);
+
+    let read = gamma_backend.definitions::<Project>(NS).get("widgets").await.expect("read at gamma");
+    assert_eq!(read.metadata.annotations, stamps);
 }

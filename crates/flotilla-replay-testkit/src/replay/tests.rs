@@ -873,16 +873,35 @@ impl GhApi for ClassifiedTestApi {
 }
 
 // #2541: recordings round-trip classification and diagnostics without parsing Display.
+// Every error variant, both kinds, every retry source and absent/present deadlines.
+#[tokio::test]
+async fn classified_rest_recording_round_trips_every_outcome() {
+    for expected in classified_rest_outcomes(1_700_000_000, true, 100) {
+        classified_rest_round_trip(expected).await;
+    }
+}
+
 #[hegel::test]
 fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
-    use flotilla_forge_github::github::GithubRetrySource;
     use hegel::generators as gs;
-    // Exhaust error variants, both kinds, every retry source and absent/present
-    // deadlines in each case; generate timestamps across zero and modern dates,
-    // pagination boundaries and counts across the empty/100-item page boundary.
+    // Generate timestamps across zero and modern dates, pagination boundaries
+    // and counts across the empty/100-item page boundary, for any outcome.
     let timestamp = tc.draw(gs::integers::<i64>().min_value(0).max_value(1893456000));
     let has_next_page = tc.draw(gs::booleans());
     let total_count = tc.draw(gs::integers::<u32>().min_value(0).max_value(101));
+    let mut outcomes = classified_rest_outcomes(timestamp, has_next_page, total_count);
+    let index = tc.draw(gs::integers::<usize>().min_value(0).max_value(outcomes.len() - 1));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(classified_rest_round_trip(outcomes.swap_remove(index)));
+}
+
+/// Every classified REST outcome: ordinary failures, a page, and each rate limit with and without
+/// a deadline at `timestamp`.
+fn classified_rest_outcomes(timestamp: i64, has_next_page: bool, total_count: u32) -> Vec<Result<GhApiResponse, ObservationError>> {
+    use flotilla_forge_github::github::GithubRetrySource;
     let mut outcomes = vec![
         Err(ObservationError::Failed("rate limited diagnostics unavailable".into())),
         Err(ObservationError::NotFound("pull request missing".into())),
@@ -903,40 +922,38 @@ fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
             }
         }
     }
-    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("recording.yaml");
-        for expected in outcomes {
-            let recording = Session::recording(&path, Masks::new());
-            let api = RecordingGhApi::new(recording.clone(), Arc::new(ClassifiedTestApi(expected)));
-            let endpoint = "repos/team/one/pulls";
-            let label = flotilla_provider_runtime::gh_api_channel_label("GET", endpoint);
-            let recorded = api.get_classified_with_headers(endpoint, Path::new("/"), &label).await;
-            recording.finish();
-            if let Err(ObservationError::RateLimited { budget, .. }) = &recorded {
-                // The neutral budget is consumed by the recorder's existing metadata schema.
-                let log: RoundLog = serde_yml::from_str(&std::fs::read_to_string(&path).expect("recording")).expect("log");
-                let Interaction::Extra(GithubChannel::GhApi { headers, .. }) = &log.rounds[0].interactions[0] else {
-                    panic!("gh recording")
-                };
-                assert_eq!(headers.get("observation-budget"), Some(budget));
-            }
-            let replay = Session::replaying(&path, Masks::new());
-            let replayed = ReplayGhApi::new(replay.clone()).get_classified_with_headers(endpoint, Path::new("/"), &label).await;
-            match (recorded, replayed) {
-                (Err(expected), Err(actual)) => assert_eq!(actual, expected),
-                (Ok(expected), Ok(actual)) => {
-                    assert_eq!(actual.status, expected.status);
-                    assert_eq!(actual.body, expected.body);
-                    assert_eq!(actual.etag, expected.etag);
-                    assert_eq!(actual.has_next_page, expected.has_next_page);
-                    assert_eq!(actual.total_count, expected.total_count);
-                }
-                outcomes => panic!("record/replay outcomes differ: {outcomes:?}"),
-            }
-            replay.finish();
+    outcomes
+}
+
+async fn classified_rest_round_trip(expected: Result<GhApiResponse, ObservationError>) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("recording.yaml");
+    let recording = Session::recording(&path, Masks::new());
+    let api = RecordingGhApi::new(recording.clone(), Arc::new(ClassifiedTestApi(expected)));
+    let endpoint = "repos/team/one/pulls";
+    let label = flotilla_provider_runtime::gh_api_channel_label("GET", endpoint);
+    let recorded = api.get_classified_with_headers(endpoint, Path::new("/"), &label).await;
+    recording.finish();
+    if let Err(ObservationError::RateLimited { budget, .. }) = &recorded {
+        // The neutral budget is consumed by the recorder's existing metadata schema.
+        let log: RoundLog = serde_yml::from_str(&std::fs::read_to_string(&path).expect("recording")).expect("log");
+        let Interaction::Extra(GithubChannel::GhApi { headers, .. }) = &log.rounds[0].interactions[0] else { panic!("gh recording") };
+        assert_eq!(headers.get("observation-budget"), Some(budget));
+    }
+    let replay = Session::replaying(&path, Masks::new());
+    let replayed = ReplayGhApi::new(replay.clone()).get_classified_with_headers(endpoint, Path::new("/"), &label).await;
+    match (recorded, replayed) {
+        (Err(expected), Err(actual)) => assert_eq!(actual, expected),
+        (Ok(expected), Ok(actual)) => {
+            assert_eq!(actual.status, expected.status);
+            assert_eq!(actual.body, expected.body);
+            assert_eq!(actual.etag, expected.etag);
+            assert_eq!(actual.has_next_page, expected.has_next_page);
+            assert_eq!(actual.total_count, expected.total_count);
         }
-    });
+        outcomes => panic!("record/replay outcomes differ: {outcomes:?}"),
+    }
+    replay.finish();
 }
 
 // Substitute only the gh subprocess boundary; run the real REST client and recorder.
@@ -964,116 +981,126 @@ impl CommandRunner for RestFailureRunner {
 
 // #2557: actual HTTP status, headers and body survive classification/recording;
 // both replay interfaces retain the corresponding live diagnostics/classification.
+/// A failed REST response: status (0 for a transport failure), remaining budget, message, and
+/// whether it carries a reset deadline and a Retry-After.
+type RestFailure = (u16, &'static str, &'static str, bool, bool);
+
+/// Ordinary 403/404, primary and secondary 403/429, missing reset, and transport failure.
+const REST_FAILURES: [RestFailure; 8] = [
+    (403, "4999", "Resource not accessible by integration", true, false),
+    (404, "4999", "Not Found", false, false),
+    (403, "0", "API rate limit exceeded", true, false),
+    (429, "0", "API rate limit exceeded", true, false),
+    (403, "0", "API rate limit exceeded", false, false),
+    (403, "4999", "secondary rate limit exceeded", true, true),
+    (429, "4999", "secondary rate limit exceeded", true, true),
+    (0, "", "transport failure", false, false),
+];
+
+#[tokio::test]
+async fn classified_rest_failures_preserve_response_metadata_for_each_failure() {
+    for failure in REST_FAILURES {
+        classified_rest_failure_case(failure, 1_700_000_000, 30).await;
+    }
+}
+
 #[hegel::test]
 fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
-    use flotilla_forge_github::github::GhApiClient;
-    use flotilla_forge_github::github::GithubRetrySource;
     use hegel::generators as gs;
-    // Exhaust ordinary 403/404, primary and secondary 403/429, missing reset,
-    // and transport failure each run. Generate reset boundaries and retry delay.
+    // Generate reset boundaries and retry delay for any failure.
+    let failure = tc.draw(gs::sampled_from(REST_FAILURES.to_vec()));
     let reset = tc.draw(gs::integers::<i64>().min_value(0).max_value(1893456000));
     let delay = tc.draw(gs::integers::<u32>().min_value(0).max_value(120));
-    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let temp = tempfile::tempdir().expect("tempdir");
-        for (status, remaining, message, deadline, retry_after) in [
-            (403, "4999", "Resource not accessible by integration", true, false),
-            (404, "4999", "Not Found", false, false),
-            (403, "0", "API rate limit exceeded", true, false),
-            (429, "0", "API rate limit exceeded", true, false),
-            (403, "0", "API rate limit exceeded", false, false),
-            (403, "4999", "secondary rate limit exceeded", true, true),
-            (429, "4999", "secondary rate limit exceeded", true, true),
-            (0, "", "transport failure", false, false),
-        ] {
-            let body = format!("{{\"message\":\"{message}\"}}");
-            let mut raw = format!("HTTP/2 {status}\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: {remaining}\r\n");
-            if deadline {
-                raw.push_str(&format!("X-RateLimit-Reset: {reset}\r\n"));
-            }
-            if retry_after {
-                raw.push_str(&format!(
-                    "Retry-After: {}\r\n",
-                    chrono::DateTime::from_timestamp(reset + i64::from(delay), 0).expect("retry time").to_rfc2822()
-                ));
-            }
-            // Reserved recording keys cannot be injected by a REST response:
-            // an untimed primary limit must not inherit this fabricated reset.
-            raw.push_str("Observation-Retry-At: 2040-01-01T00:00:00+00:00\r\n");
-            raw.push_str(&format!("\r\n{body}"));
-            let runner = Arc::new(RestFailureRunner {
-                stdout: raw,
-                stderr: format!("gh: {message} (HTTP {status})"),
-                transport_failure: status == 0,
-            });
-            let endpoint = "repos/team/one/pulls";
-            let label = flotilla_provider_runtime::gh_api_channel_label("GET", endpoint);
-            let path = temp.path().join("recording.yaml");
-            let live = GhApiClient::new(runner.clone());
-            let expected_legacy = live.get_with_headers(endpoint, Path::new("/"), &label).await.expect_err("live failure");
-            let recording = Session::recording(&path, Masks::new());
-            let api = RecordingGhApi::new(recording.clone(), Arc::new(live));
-            let classified = api.get_classified_with_headers(endpoint, Path::new("/"), &label).await.expect_err("classified failure");
-            recording.finish();
-            let detailed = Session::replaying(&path, Masks::new());
-            let failure = ReplayGhApi::new(detailed.clone())
-                .get_classified_response(endpoint, Path::new("/"), &label)
-                .await
-                .expect_err("detailed replay");
-            assert_eq!(failure.error, classified);
-            assert_eq!(failure.response.is_some(), status != 0);
-            if let Some(response) = failure.response {
-                assert_eq!(response.status, status);
-                assert_eq!(response.body, body);
-                assert_eq!(response.legacy_error, expected_legacy);
-                assert!(!response.headers.keys().any(|key| key.starts_with("observation-")));
-            }
-            detailed.finish();
-            let log: RoundLog = serde_yml::from_str(&std::fs::read_to_string(&path).expect("recording")).expect("log");
-            let Interaction::Extra(GithubChannel::GhApi { status: actual_status, body: actual_body, headers, .. }) =
-                &log.rounds[0].interactions[0]
-            else {
-                panic!("REST recording")
-            };
-            assert_eq!(*actual_status, status);
-            if status != 0 {
-                assert_eq!(*actual_body, body);
-                assert_eq!(headers.get("x-ratelimit-remaining").expect("remaining"), remaining);
-                assert_eq!(headers.get("x-ratelimit-resource").expect("resource"), "core");
-                assert_eq!(headers.get("x-ratelimit-reset"), deadline.then(|| reset.to_string()).as_ref());
-                assert_eq!(
-                    headers.get("retry-after"),
-                    retry_after
-                        .then(|| chrono::DateTime::from_timestamp(reset + i64::from(delay), 0).expect("retry time").to_rfc2822())
-                        .as_ref()
-                );
-            }
-            if status == 403 && remaining == "0" && !deadline {
-                let limit = GithubRateLimit::from_observation_error(&classified).expect("primary limit");
-                assert_eq!(limit.retry_at, None);
-                assert_eq!(limit.retry_source, GithubRetrySource::Unavailable);
-            }
-            let replay = Session::replaying(&path, Masks::new());
-            assert_eq!(
-                ReplayGhApi::new(replay.clone())
-                    .get_classified_with_headers(endpoint, Path::new("/"), &label)
-                    .await
-                    .expect_err("classified replay"),
-                classified
-            );
-            replay.finish();
-            for with_headers in [false, true] {
-                let replay = Session::replaying(&path, Masks::new());
-                let api = ReplayGhApi::new(replay.clone());
-                let actual = if with_headers {
-                    api.get_with_headers(endpoint, Path::new("/"), &label).await.expect_err("legacy headers")
-                } else {
-                    api.get(endpoint, Path::new("/"), &label).await.expect_err("legacy body")
-                };
-                assert_eq!(actual, expected_legacy);
-                replay.finish();
-            }
-        }
-    });
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(classified_rest_failure_case(failure, reset, delay));
+}
+
+async fn classified_rest_failure_case((status, remaining, message, deadline, retry_after): RestFailure, reset: i64, delay: u32) {
+    use flotilla_forge_github::github::GhApiClient;
+    use flotilla_forge_github::github::GithubRetrySource;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let body = format!("{{\"message\":\"{message}\"}}");
+    let mut raw = format!("HTTP/2 {status}\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: {remaining}\r\n");
+    if deadline {
+        raw.push_str(&format!("X-RateLimit-Reset: {reset}\r\n"));
+    }
+    if retry_after {
+        raw.push_str(&format!(
+            "Retry-After: {}\r\n",
+            chrono::DateTime::from_timestamp(reset + i64::from(delay), 0).expect("retry time").to_rfc2822()
+        ));
+    }
+    // Reserved recording keys cannot be injected by a REST response:
+    // an untimed primary limit must not inherit this fabricated reset.
+    raw.push_str("Observation-Retry-At: 2040-01-01T00:00:00+00:00\r\n");
+    raw.push_str(&format!("\r\n{body}"));
+    let runner =
+        Arc::new(RestFailureRunner { stdout: raw, stderr: format!("gh: {message} (HTTP {status})"), transport_failure: status == 0 });
+    let endpoint = "repos/team/one/pulls";
+    let label = flotilla_provider_runtime::gh_api_channel_label("GET", endpoint);
+    let path = temp.path().join("recording.yaml");
+    let live = GhApiClient::new(runner.clone());
+    let expected_legacy = live.get_with_headers(endpoint, Path::new("/"), &label).await.expect_err("live failure");
+    let recording = Session::recording(&path, Masks::new());
+    let api = RecordingGhApi::new(recording.clone(), Arc::new(live));
+    let classified = api.get_classified_with_headers(endpoint, Path::new("/"), &label).await.expect_err("classified failure");
+    recording.finish();
+    let detailed = Session::replaying(&path, Masks::new());
+    let failure =
+        ReplayGhApi::new(detailed.clone()).get_classified_response(endpoint, Path::new("/"), &label).await.expect_err("detailed replay");
+    assert_eq!(failure.error, classified);
+    assert_eq!(failure.response.is_some(), status != 0);
+    if let Some(response) = failure.response {
+        assert_eq!(response.status, status);
+        assert_eq!(response.body, body);
+        assert_eq!(response.legacy_error, expected_legacy);
+        assert!(!response.headers.keys().any(|key| key.starts_with("observation-")));
+    }
+    detailed.finish();
+    let log: RoundLog = serde_yml::from_str(&std::fs::read_to_string(&path).expect("recording")).expect("log");
+    let Interaction::Extra(GithubChannel::GhApi { status: actual_status, body: actual_body, headers, .. }) = &log.rounds[0].interactions[0]
+    else {
+        panic!("REST recording")
+    };
+    assert_eq!(*actual_status, status);
+    if status != 0 {
+        assert_eq!(*actual_body, body);
+        assert_eq!(headers.get("x-ratelimit-remaining").expect("remaining"), remaining);
+        assert_eq!(headers.get("x-ratelimit-resource").expect("resource"), "core");
+        assert_eq!(headers.get("x-ratelimit-reset"), deadline.then(|| reset.to_string()).as_ref());
+        assert_eq!(
+            headers.get("retry-after"),
+            retry_after.then(|| chrono::DateTime::from_timestamp(reset + i64::from(delay), 0).expect("retry time").to_rfc2822()).as_ref()
+        );
+    }
+    if status == 403 && remaining == "0" && !deadline {
+        let limit = GithubRateLimit::from_observation_error(&classified).expect("primary limit");
+        assert_eq!(limit.retry_at, None);
+        assert_eq!(limit.retry_source, GithubRetrySource::Unavailable);
+    }
+    let replay = Session::replaying(&path, Masks::new());
+    assert_eq!(
+        ReplayGhApi::new(replay.clone())
+            .get_classified_with_headers(endpoint, Path::new("/"), &label)
+            .await
+            .expect_err("classified replay"),
+        classified
+    );
+    replay.finish();
+    for with_headers in [false, true] {
+        let replay = Session::replaying(&path, Masks::new());
+        let api = ReplayGhApi::new(replay.clone());
+        let actual = if with_headers {
+            api.get_with_headers(endpoint, Path::new("/"), &label).await.expect_err("legacy headers")
+        } else {
+            api.get(endpoint, Path::new("/"), &label).await.expect_err("legacy body")
+        };
+        assert_eq!(actual, expected_legacy);
+        replay.finish();
+    }
 }
 
 // #2557: preemptive issue-budget refusals have no HTTP failure response, and a
@@ -1112,44 +1139,51 @@ async fn classified_issue_budget_recording_has_no_failure_response() {
 }
 
 // Full-output recording/replay preserves every numeric code and termination
-// without a code. Generate arbitrary codes, retaining 0/1/2/17 as fixed edges.
+// without a code. 0/1/2/17 and no code are fixed edges; arbitrary codes are generated.
+#[tokio::test]
+async fn command_exit_status_edges_survive_record_replay() {
+    for exit_code in [Some(0), Some(1), Some(2), Some(17), None] {
+        command_exit_status_case(exit_code).await;
+    }
+}
+
 #[hegel::test]
 fn command_exit_status_survives_record_replay(tc: hegel::TestCase) {
     use hegel::generators as gs;
+    let generated = tc.draw(gs::integers::<i32>());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(command_exit_status_case(Some(generated)));
+}
 
+async fn command_exit_status_case(exit_code: Option<i32>) {
     use super::testing::MockRunner;
 
     let label = flotilla_provider_runtime::command_channel_label("pgrep", &["-x", "flotillad"]);
-    let generated = tc.draw(gs::integers::<i32>());
-    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let temp = tempfile::tempdir().expect("recording directory");
-        for exit_code in [Some(0), Some(1), Some(2), Some(17), Some(generated), None] {
-            let path = temp.path().join("command.yaml");
-            let session = Session::recording(&path, Masks::new());
-            let inner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
-                stdout: "output\n".into(),
-                stderr: "diagnostic\n".into(),
-                exit_code,
-            })]));
-            let recording = RecordingRunner::new(session.clone(), inner);
-            let live = recording.run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.expect("live");
-            session.finish();
-            let session = Session::replaying(&path, Masks::new());
-            let replay = ReplayRunner::new(session.clone());
-            let output = replay.run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.expect("replay");
-            assert_eq!(output.exit_code, exit_code);
-            assert_eq!(output.success(), exit_code == Some(0));
-            assert_eq!((output.stdout, output.stderr), (live.stdout, live.stderr));
-            session.finish();
-            // The string convenience API selects stderr for every failure,
-            // including explicit null/no-code termination, and stdout for zero.
-            let session = Session::replaying(&path, Masks::new());
-            let output = ReplayRunner::new(session.clone()).run("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await;
-            let expected = if exit_code == Some(0) { Ok("output\n".to_string()) } else { Err("diagnostic\n".to_string()) };
-            assert_eq!(output, expected);
-            session.finish();
-        }
-    });
+    let temp = tempfile::tempdir().expect("recording directory");
+    let path = temp.path().join("command.yaml");
+    let session = Session::recording(&path, Masks::new());
+    let inner =
+        Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput { stdout: "output\n".into(), stderr: "diagnostic\n".into(), exit_code })]));
+    let recording = RecordingRunner::new(session.clone(), inner);
+    let live = recording.run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.expect("live");
+    session.finish();
+    let session = Session::replaying(&path, Masks::new());
+    let replay = ReplayRunner::new(session.clone());
+    let output = replay.run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.expect("replay");
+    assert_eq!(output.exit_code, exit_code);
+    assert_eq!(output.success(), exit_code == Some(0));
+    assert_eq!((output.stdout, output.stderr), (live.stdout, live.stderr));
+    session.finish();
+    // The string convenience API selects stderr for every failure,
+    // including explicit null/no-code termination, and stdout for zero.
+    let session = Session::replaying(&path, Masks::new());
+    let output = ReplayRunner::new(session.clone()).run("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await;
+    let expected = if exit_code == Some(0) { Ok("output\n".to_string()) } else { Err("diagnostic\n".to_string()) };
+    assert_eq!(output, expected);
+    session.finish();
 }
 
 // Existing integer and omitted status fields remain decodable; an explicit

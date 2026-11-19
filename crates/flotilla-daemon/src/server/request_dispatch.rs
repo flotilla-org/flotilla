@@ -7,6 +7,7 @@ use flotilla_protocol::{
     AgentHookEvent, Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, DispatcherError, DispatcherErrorClass, Message,
     RepoSelector, Request, Response,
 };
+use flotilla_store::load_metrics::{attributed, caller as reads_caller, inherit_or};
 use tracing::warn;
 
 use super::{caller::missing_crew_message, client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
@@ -15,11 +16,14 @@ use crate::runtime::archive;
 
 const INTERACTIVE_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
+/// The caller a client request's reads count for, unless the request names its own.
+const CLIENT_REQUESTS: &str = "client requests";
+
 fn is_interactive_request(request: &Request) -> bool {
     // SubscribeQueries registers interest before awaiting result sets, so a
     // cancelled setup could leave a live subscription after an error response.
     // FetchMore performs its side effect only after its last await.
-    matches!(request, Request::Execute { command } if command.action.is_query())
+    matches!(request, Request::Execute { command, .. } if command.action.is_query())
         || matches!(
             request,
             Request::ListRepos | Request::GetStatus | Request::GetTopology | Request::FetchMore { .. } | Request::RecoverQueries { .. }
@@ -107,7 +111,7 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     pub(super) fn dispatch(&self, id: u64, request: Request) -> std::pin::Pin<Box<impl Future<Output = Message> + '_>> {
-        Box::pin(async move {
+        Box::pin(inherit_or(CLIENT_REQUESTS, async move {
             if is_interactive_request(&request) {
                 // Attach queries resolve a plan; terminal creation happens after
                 // the client receives that plan, so cancellation cannot leave
@@ -119,7 +123,7 @@ impl<'a> RequestDispatcher<'a> {
             } else {
                 Box::pin(self.dispatch_inner(id, request)).await
             }
-        })
+        }))
     }
 
     async fn dispatch_request_shutdown(&self, id: u64, request: Request) -> Message {
@@ -196,34 +200,31 @@ impl<'a> RequestDispatcher<'a> {
                 .body(ArtifactBody::File(temporary.path().to_path_buf()))
                 .build();
             // Validation and storage are the complete submission; settlement needs no forge write.
-            let (name, spec, owner) = service.prepare_put(caller, input, &settings.artifact_retention_days).await?;
-            let target = self
-                .daemon
-                .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
-                    namespace: Some(namespace.clone()),
-                    name: caller.convoy.clone(),
-                })
-                .await?;
-            let node_id = match target {
-                Some(target) => target.node_id,
-                None if self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? => self.daemon.node_id().clone(),
-                None => return Err(DispatcherError::from("convoy home is unavailable for artifact put")),
-            };
-            let document = |spec: &flotilla_resources::ArtifactSpec| {
-                serde_json::json!({
+            let (name, spec) = service.prepare_put(caller, input, &settings.artifact_retention_days).await?;
+            let store = async {
+                let target = self
+                    .daemon
+                    .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
+                        namespace: Some(namespace.clone()),
+                        name: caller.convoy.clone(),
+                    })
+                    .await?;
+                let node_id = match target {
+                    Some(target) => target.node_id,
+                    None if self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? => self.daemon.node_id().clone(),
+                    None => return Err("convoy home is unavailable for artifact put".to_string()),
+                };
+                let document = serde_json::json!({
                     "apiVersion": "flotilla.work/v1", "kind": "Artifact",
-                    "metadata": { "name": name, "ownerReferences": [owner] }, "spec": spec,
-                })
+                    "metadata": { "name": name }, "spec": spec,
+                });
+                match self.artifact_home_action(&node_id, CommandAction::ResourceApply { namespace: namespace.clone(), document }).await? {
+                    CommandValue::ResourceObject(_) => Ok(()),
+                    CommandValue::Error { message } => Err(format!("artifact storage failed: {message}")),
+                    other => Err(format!("unexpected artifact home result: {other:?}")),
+                }
             };
-            let store = async |spec: &flotilla_resources::ArtifactSpec| match self
-                .artifact_home_action(&node_id, CommandAction::ResourceApply { namespace: namespace.clone(), document: document(spec) })
-                .await?
-            {
-                CommandValue::ResourceObject(_) => Ok(()),
-                CommandValue::Error { message } => Err(format!("artifact storage failed: {message}")),
-                other => Err(format!("unexpected artifact home result: {other:?}")),
-            };
-            store(&spec).await?;
+            service.written(&spec, store.await)?;
             Ok::<_, DispatcherError>(Response::ArtifactPut {
                 address: format!("artifact/{name}"),
                 view_url: flotilla_config::artifact_view_url(&spec, &settings.blob_stores),
@@ -353,7 +354,7 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_execute(&self, id: u64, request: Request) -> Message {
-        let Request::Execute { command } = request else {
+        let Request::Execute { command, request_key } = request else {
             return Message::error_response(id, "Execute request selected the wrong handler");
         };
         if command.action.is_query() {
@@ -369,7 +370,8 @@ impl<'a> RequestDispatcher<'a> {
                 Ok(principal_ref) => {
                     let mut caller = self.caller.clone();
                     caller.principal_ref = principal_ref.unwrap_or_else(|| self.caller.principal_ref.clone());
-                    match self.remote_command_router.dispatch_execute_for_caller_typed(command, Some(caller)).await {
+                    let execute = self.remote_command_router.dispatch_execute_for_caller_typed(command, Some(caller.clone()));
+                    match self.daemon.execute_keyed(request_key.as_deref(), Some(&caller), execute).await {
                         Ok(command_id) => Message::ok_response(id, Response::Execute { command_id }),
                         Err(e) => Message::error_response(id, e),
                     }
@@ -530,15 +532,7 @@ impl<'a> RequestDispatcher<'a> {
         let Request::AgentHook { event } = request else {
             return Message::error_response(id, "AgentHook request selected the wrong handler");
         };
-        match handle_agent_hook(
-            &self.daemon.resource_backend(),
-            self.agent_state_store,
-            self.hook_identity_policy,
-            self.daemon.message_primitives(),
-            event,
-        )
-        .await
-        {
+        match handle_agent_hook(self.agent_state_store, self.hook_identity_policy, Some(Arc::clone(self.daemon)), event).await {
             Ok(()) => Message::ok_response(id, Response::AgentHook),
             Err(e) => {
                 warn!(err = %e, "failed to process agent hook event");
@@ -576,12 +570,22 @@ impl<'a> RequestDispatcher<'a> {
 /// Record one agent hook event: the agent state store entry and, for a managed terminal,
 /// its attention. The framed `AgentHook` request and the router's hook routes share it.
 pub(super) async fn handle_agent_hook(
-    backend: &flotilla_store::ResourceBackend,
     agent_state_store: &SharedAgentStateStore,
     hook_identity_policy: HookIdentityPolicy,
-    primitives: Option<std::sync::Arc<flotilla_core::primitives::MessagePrimitives>>,
+    daemon: Option<std::sync::Arc<InProcessDaemon>>,
+    event: AgentHookEvent,
+) -> Result<(), String> {
+    let hook = agent_hook(agent_state_store, hook_identity_policy, daemon, event);
+    attributed(reads_caller(crate::agent_attention::AGENT_HOOKS), hook).await
+}
+
+async fn agent_hook(
+    agent_state_store: &SharedAgentStateStore,
+    hook_identity_policy: HookIdentityPolicy,
+    daemon: Option<std::sync::Arc<InProcessDaemon>>,
     mut event: AgentHookEvent,
 ) -> Result<(), String> {
+    let primitives = daemon.as_ref().and_then(|daemon| daemon.message_primitives());
     use flotilla_protocol::AgentEventType;
 
     // Older notify clients allocate a candidate UUID on every invocation.
@@ -666,8 +670,27 @@ pub(super) async fn handle_agent_hook(
     }
 
     let Some(terminal) = event.terminal.as_ref() else { return Ok(()) };
+    // What the agent's AgentSession does not record of its progress, this daemon keeps in memory
+    // for its stall check and delivery confirmation (#3108).
+    // A notification that reports no change is not evidence the hooks are wired.
+    if let Some(daemon) = daemon.as_ref().filter(|_| event.event_type != AgentEventType::NoChange) {
+        let (progress, now) = (daemon.crew_progress(), daemon.clock().now());
+        progress.hook(&terminal.session_name, now);
+        if event.event_type == AgentEventType::ToolActive {
+            progress.tool(&terminal.session_name, now);
+        }
+        if event.hook_event.as_deref() == Some("UserPromptSubmit") {
+            progress.prompt_submit(&terminal.session_name, now);
+        }
+    }
+    // A turn's end (the Stop hook) inspects the checkouts it worked in (#3108).
+    if event.event_type == AgentEventType::Idle && matches!(event.hook_event.as_deref(), Some("Stop" | "agent-turn-complete")) {
+        if let Some(daemon) = daemon.as_ref() {
+            daemon.inspect_after_turn(&terminal.namespace, &terminal.session_name);
+        }
+    }
     if let Some(primitives) = primitives {
-        if let Err(error) = record_hook_activity(backend, &primitives, &event).await {
+        if let Err(error) = record_hook_activity(daemon.as_ref().map(|daemon| daemon.lifecycle_reads()), &primitives, &event).await {
             // Activity is an additional observer. Its store/join errors must not
             // suppress the established agent registry and terminal attention path.
             tracing::warn!(session = %terminal.session_name, %error, "failed to record agent session activity");
@@ -680,72 +703,31 @@ pub(super) async fn handle_agent_hook(
         // Interrupted changes only the gated AgentSession observation; preserve legacy terminal attention.
         AgentEventType::Ended | AgentEventType::NoChange | AgentEventType::Interrupted => return Ok(()),
     };
-    if !event.native_codex_hook {
-        return crate::agent_attention::observe_hook_attention(
-            backend,
-            &terminal.namespace,
-            &terminal.session_name,
-            state,
-            event.event_type == AgentEventType::ToolActive,
-        )
-        .await;
-    }
-    let sessions = backend.using::<flotilla_resources::TerminalSession>(&terminal.namespace);
-    sessions.get(&terminal.session_name).await.map_err(|error| error.to_string())?;
-    let attention = flotilla_resources::TerminalAttention {
-        state,
-        as_of: chrono::Utc::now(),
-        source: flotilla_resources::TerminalAttentionSource::Hook,
-    };
-    flotilla_store::apply_status_patch(
-        &sessions,
-        &terminal.session_name,
-        &if event.harness == flotilla_protocol::AgentHarness::Codex {
-            flotilla_resources::TerminalSessionStatusPatch::ObserveNativeCodexHook {
-                attention,
-                tool_activity: event.event_type == AgentEventType::ToolActive,
-            }
-        } else if event.event_type == AgentEventType::ToolActive {
-            flotilla_resources::TerminalSessionStatusPatch::ObserveToolActivity { attention }
-        } else {
-            flotilla_resources::TerminalSessionStatusPatch::ObserveAttention { attention }
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    Ok(())
+    // What this home observes of its launches is its own: a daemon with no engine has none.
+    let Some(daemon) = daemon.as_ref() else { return Ok(()) };
+    let reads = daemon.lifecycle_reads();
+    let native_codex = event.native_codex_hook && event.harness == flotilla_protocol::AgentHarness::Codex;
+    crate::agent_attention::observe_hook_attention(reads.terminals()?, &terminal.session_name, state, native_codex)
 }
 
 /// Records change-only activity, keeping duplicate hooks off the store and
 /// blocking pool. The machine's gate remains authoritative across races.
 pub(super) async fn record_hook_activity(
-    backend: &flotilla_store::ResourceBackend,
-    primitives: &flotilla_core::primitives::MessagePrimitives,
+    reads: Option<std::sync::Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>>,
+    primitives: &flotilla_engine_messages::MessagePrimitives,
     event: &AgentHookEvent,
 ) -> Result<(), String> {
     use flotilla_protocol::AgentEventType;
     use flotilla_state_machines::machines::agent_session::Activity;
     let activity = match event.event_type {
         AgentEventType::Active | AgentEventType::ToolActive => Activity::Working,
+        AgentEventType::WaitingForPermission => Activity::NeedsInput,
         AgentEventType::Idle => Activity::Idle,
         AgentEventType::Interrupted => Activity::Interrupted,
-        _ => return Ok(()),
+        AgentEventType::Started | AgentEventType::Ended | AgentEventType::NoChange => return Ok(()),
     };
     let (Some(terminal), Some(cause)) = (event.terminal.as_ref(), event.hook_event.as_ref()) else { return Ok(()) };
-    if !primitives.sessions().needs_observation(&terminal.session_name, activity)? {
-        return Ok(());
-    }
-    // A hook token can outlive its terminal, so first observations still validate
-    // that identity instead of creating orphan records for stale tokens.
-    backend
-        .using::<flotilla_resources::TerminalSession>(&terminal.namespace)
-        .get(&terminal.session_name)
-        .await
-        .map_err(|error| error.to_string())?;
-    let sessions = std::sync::Arc::clone(primitives.sessions());
-    let name = terminal.session_name.clone();
-    let cause = cause.clone();
-    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
-    tokio::task::spawn_blocking(move || sessions.observe(&name, activity, cause, now)).await.map_err(|error| error.to_string())??;
-    Ok(())
+    // What this home observes of its launches is its own: a daemon with no engine has none.
+    let Some(reads) = reads else { return Ok(()) };
+    crate::agent_attention::record_agent_activity(reads, primitives, &terminal.session_name, activity, cause).await
 }

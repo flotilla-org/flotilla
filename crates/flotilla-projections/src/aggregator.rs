@@ -13,6 +13,7 @@ use std::{
 
 use crate::{
     aggregator_projection::AggregatorProjectionState,
+    ports::{AgentSessionKey, AgentSessionUpdate},
     salience::{AttentionFact, RaisedFact, SalienceFacts},
     terminal_health,
 };
@@ -24,26 +25,29 @@ use flotilla_protocol::{
     result_set::{
         CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, ProjectRepositoriesRow,
         ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ReadinessBlocker, ReadinessState, ResultDelta, SessionPhase,
-        StandingRoleHold, StandingRoleRow, SurfaceState, VesselRow, WorkPhase,
+        StandingRoleRow, SurfaceState, VesselRow, WorkPhase,
     },
     Change, ConfiguredResourceLimits, DaemonEvent, EnvironmentKind, HostName, LifecycleAuthority, RepoDelta, RepoIdentity, RepositoryKey,
     ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
+use flotilla_resources::agent_activity::{self, AgentActivityView};
 use flotilla_resources::attentions::{Attentions, OpenAttention, Sender, Subject as AttentionSubject, HOLD_ESCALATES_AFTER};
+use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
+use flotilla_resources::environment_records::EnvironmentChange;
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
-    Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
-    Demand, Environment, FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource,
-    ResourceError, ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState,
-    TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase,
-    WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, FulfilmentKind,
+    FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError, ResourceObject,
+    ResourceProvenance, StallRung, StalledCondition, TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement,
+    WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, CONVOY_UNREADABLE_ANNOTATION, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 #[cfg(test)]
-use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
-use flotilla_store::{
-    recover_local_view, recover_view, LocalViewSource as AggregatorWatchSource, ViewSource as AggregatorReplicaWatchSource,
-};
-use flotilla_store::{ReplicaReadResolver, TypedResolver};
+use flotilla_resources::{ReadResourceList, ResourceList, WatchEvent, WatchStart, WatchStream};
+#[cfg(test)]
+use flotilla_store::LocalViewSource as AggregatorWatchSource;
+use flotilla_store::ReplicaReadResolver;
+use flotilla_store::{recover_view, ViewSource as AggregatorReplicaWatchSource};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::{
     sync::{broadcast, mpsc},
@@ -55,8 +59,11 @@ use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer,
 
 mod convoy_inputs;
 use convoy_inputs::ConvoyInputs;
+mod held_launches;
+use held_launches::HeldLaunches;
 mod readiness;
-use readiness::{apply_readiness_event, readiness_resources};
+use flotilla_resources::checkout_records::{latest_launches, CheckoutChange, CheckoutHolder};
+use readiness::{apply_readiness_event, engine_origin, next_checkout_change, readiness_resources, HeldCheckouts};
 
 type RepositorySourceKey = (String, String, Option<flotilla_protocol::NodeId>);
 
@@ -71,15 +78,12 @@ const CHANGE_REQUEST_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60
 /// A lookup that runs longer fails, so a hung resolver cannot hold a convoy's
 /// refresh slot; matches the forge observation load timeout.
 const CHANGE_REQUEST_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const CHANGE_REQUEST_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const CHANGE_REQUEST_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(bon::Builder)]
 pub struct AggregatorResolvers {
     durable_convoys: ReplicaReadResolver<Convoy>,
     durable_convoy_ensures: ReplicaReadResolver<ConvoyEnsure>,
-    durable_demands: TypedResolver<Demand>,
-    durable_environments: TypedResolver<Environment>,
     durable_fulfilment_kinds: Option<ReplicaReadResolver<FulfilmentKind>>,
     durable_sessions: ReplicaReadResolver<TerminalSession>,
     durable_projects: ReplicaReadResolver<Project>,
@@ -87,20 +91,12 @@ pub struct AggregatorResolvers {
     durable_repositories: ReplicaReadResolver<Repository>,
     durable_vessels: ReplicaReadResolver<Vessel>,
     durable_hosts: ReplicaReadResolver<flotilla_resources::Host>,
-    durable_checkouts: ReplicaReadResolver<Checkout>,
-    durable_clones: TypedResolver<CloneResource>,
-    observed_convoys: TypedResolver<Convoy>,
-    observed_sessions: ReplicaReadResolver<TerminalSession>,
-    observed_checkouts: TypedResolver<Checkout>,
-    observed_checkout_replicas: ReplicaReadResolver<Checkout>,
 }
 
 #[derive(bon::Builder)]
 struct AggregatorSourceRefs<'a> {
     durable_convoys: &'a dyn AggregatorReplicaWatchSource<Convoy>,
     durable_convoy_ensures: &'a dyn AggregatorReplicaWatchSource<ConvoyEnsure>,
-    durable_demands: &'a dyn AggregatorWatchSource<Demand>,
-    durable_environments: &'a dyn AggregatorWatchSource<Environment>,
     durable_fulfilment_kinds: Option<&'a dyn AggregatorReplicaWatchSource<FulfilmentKind>>,
     durable_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
     durable_projects: &'a dyn AggregatorReplicaWatchSource<Project>,
@@ -108,12 +104,6 @@ struct AggregatorSourceRefs<'a> {
     durable_repositories: &'a dyn AggregatorReplicaWatchSource<Repository>,
     durable_vessels: &'a dyn AggregatorReplicaWatchSource<Vessel>,
     durable_hosts: &'a dyn AggregatorReplicaWatchSource<flotilla_resources::Host>,
-    durable_checkouts: &'a dyn AggregatorReplicaWatchSource<Checkout>,
-    durable_clones: &'a dyn AggregatorWatchSource<CloneResource>,
-    observed_convoys: &'a dyn AggregatorWatchSource<Convoy>,
-    observed_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
-    observed_checkouts: &'a dyn AggregatorWatchSource<Checkout>,
-    observed_checkout_replicas: &'a dyn AggregatorReplicaWatchSource<Checkout>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,6 +162,12 @@ pub trait ConvoyChangeRequestResolver: Send + Sync {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    /// A tick whenever any home's change request records change: the forge observers' writes,
+    /// including what their branch probes find (#3108). None when there are none to follow.
+    async fn change_request_changes(&self) -> Option<futures::stream::BoxStream<'static, ()>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -195,7 +191,7 @@ pub struct Aggregator {
     state: AggregatorProjectionState,
     local_host: HostName,
     #[builder(skip)]
-    convoys_by_source: HashMap<LocalSource, HashMap<ConvoyKey, Arc<ReadResourceObject<Convoy>>>>,
+    convoys: HashMap<ConvoyKey, Arc<ReadResourceObject<Convoy>>>,
     #[builder(skip)]
     attentions: Vec<OpenAttention>,
     #[builder(skip)]
@@ -214,11 +210,20 @@ pub struct Aggregator {
     fleet_projects: BTreeMap<String, String>,
     #[builder(skip)]
     convoy_ensures: BTreeMap<EnsureKey, ResourceObject<ConvoyEnsure>>,
+    /// Reads each declared role's state from its generations (#3108).
+    #[builder(skip = Arc::new(crate::ports::NoStandingRoles))]
+    standing_role_port: Arc<dyn crate::ports::StandingRoles>,
+    /// The last reading of each declared role, by its ensure's namespace and name; `None` when
+    /// it did not read.
+    #[builder(skip)]
+    standing_readings: HashMap<(String, String), Option<crate::ports::StandingRoleReading>>,
     repositories: HashMap<RepositoryKey, ResourceObject<Repository>>,
     repository_sources: BTreeMap<RepositorySourceKey, ReadResourceObject<Repository>>,
+    /// The checkouts this host's refresh discovered, as Checkouts in `discovered_namespace`.
     #[builder(skip)]
-    attention_expired_through: Option<chrono::DateTime<chrono::Utc>>,
-    observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
+    discovered_checkouts: DiscoveredCheckouts,
+    #[builder(skip)]
+    discovered_namespace: String,
     #[builder(skip)]
     readiness_vessels: BTreeMap<RepositorySourceKey, ReadResourceObject<Vessel>>,
     /// Declared Host authority by resource name, which maps a vessel's
@@ -227,12 +232,16 @@ pub struct Aggregator {
     hosts: BTreeMap<String, ResourceObject<flotilla_resources::Host>>,
     #[builder(skip)]
     fulfilment_kinds: BTreeMap<RepositorySourceKey, ReadResourceObject<FulfilmentKind>>,
+    /// The engine's adopted checkouts at every home it follows: each name's latest launch that
+    /// has not ended (#3108).
     #[builder(skip)]
-    readiness_checkouts: BTreeMap<RepositorySourceKey, ReadResourceObject<Checkout>>,
+    engine_checkouts: Vec<flotilla_resources::checkout_records::CheckoutLaunch>,
+    /// Every launch the engine holds at every home it follows, indexed by holder.
     #[builder(skip)]
-    readiness_clones: BTreeMap<RepositorySourceKey, ReadResourceObject<CloneResource>>,
+    held_launches: HeldLaunches,
+    /// This home, as the engine's checkouts name it.
     #[builder(skip)]
-    checkout_replicas: HashMap<(String, String, flotilla_protocol::NodeId), ReadResourceObject<Checkout>>,
+    engine_checkout_home: Option<String>,
     bootstrapping: bool,
     /// The `[primitives]` Convoy path (#3587 layer 8), and the namespace its
     /// changed convoys are named in.
@@ -279,6 +288,22 @@ pub struct Aggregator {
     change_request_refresh_queue: ChangeRequestRefreshQueue,
     #[builder(skip)]
     issue_materializer: Option<IssueMaterializer>,
+    /// The decided store's AgentSessions (#3108), joined to crew members by record name.
+    #[builder(skip = Arc::new(crate::ports::NoAgentSessions))]
+    agent_session_port: Arc<dyn crate::ports::AgentSessions>,
+    #[builder(skip)]
+    agent_sessions: HashMap<AgentSessionKey, flotilla_protocol::AgentSessionReading>,
+    /// The home this daemon's own sessions carry, once following has begun.
+    #[builder(skip)]
+    agent_session_home: Option<flotilla_protocol::NodeId>,
+    /// When this home last heard from each other home: their readings are current until
+    /// `HOME_HEARD_WITHIN` after (#3108).
+    #[builder(skip)]
+    agent_session_heard: HashMap<flotilla_protocol::NodeId, chrono::DateTime<chrono::Utc>>,
+    /// The daemon's wall clock: readings' ages, a quiet home's staleness and escalation deadlines
+    /// are judged against it, so a test drives them by setting it.
+    #[builder(skip = Arc::new(flotilla_resources::SystemClock))]
+    clock: Arc<dyn flotilla_resources::Clock>,
     event_sink: Arc<dyn EventSink>,
     event_rx: broadcast::Receiver<DaemonEvent>,
 }
@@ -342,7 +367,7 @@ impl Aggregator {
             summarized_convoys: Default::default(),
             state,
             local_host,
-            convoys_by_source: HashMap::new(),
+            convoys: HashMap::new(),
             attentions: Vec::new(),
             attention_namespace: String::new(),
             attention_port: None,
@@ -354,16 +379,18 @@ impl Aggregator {
             projects: HashMap::new(),
             fleet_projects: BTreeMap::new(),
             convoy_ensures: BTreeMap::new(),
+            standing_role_port: Arc::new(crate::ports::NoStandingRoles),
+            standing_readings: HashMap::new(),
             repositories: HashMap::new(),
             repository_sources: BTreeMap::new(),
-            attention_expired_through: None,
-            observed_checkouts: HashMap::new(),
+            discovered_checkouts: DiscoveredCheckouts::default(),
+            discovered_namespace: String::new(),
             readiness_vessels: BTreeMap::new(),
             fulfilment_kinds: BTreeMap::new(),
             hosts: BTreeMap::new(),
-            readiness_checkouts: BTreeMap::new(),
-            readiness_clones: BTreeMap::new(),
-            checkout_replicas: HashMap::new(),
+            engine_checkouts: Vec::new(),
+            held_launches: HeldLaunches::default(),
+            engine_checkout_home: None,
             bootstrapping: false,
             convoy_engine: Default::default(),
             engine_namespace: String::new(),
@@ -387,9 +414,39 @@ impl Aggregator {
             change_request_retriggers: HashSet::new(),
             change_request_refresh_queue: ChangeRequestRefreshQueue::default(),
             issue_materializer: None,
+            agent_session_port: Arc::new(crate::ports::NoAgentSessions),
+            agent_sessions: HashMap::new(),
+            agent_session_home: None,
+            agent_session_heard: HashMap::new(),
+            clock: Arc::new(flotilla_resources::SystemClock),
             event_sink,
             event_rx,
         }
+    }
+
+    /// Judges times against `clock`, the daemon's, rather than the system's.
+    pub fn with_clock(mut self, clock: Arc<dyn flotilla_resources::Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Crew members show their AgentSessions, read from the decided store through `port`.
+    pub fn with_agent_sessions(mut self, port: Arc<dyn crate::ports::AgentSessions>) -> Self {
+        self.agent_session_port = port;
+        self
+    }
+
+    /// Standing role rows show each role's state as `port` derives it.
+    pub fn with_standing_roles(mut self, port: Arc<dyn crate::ports::StandingRoles>) -> Self {
+        self.standing_role_port = port;
+        self
+    }
+
+    /// Checkout rows show the checkouts this host's refresh discovered, as Checkouts in `namespace`.
+    pub fn with_discovered_checkouts(mut self, discovered: DiscoveredCheckouts, namespace: &str) -> Self {
+        self.discovered_checkouts = discovered;
+        self.discovered_namespace = namespace.to_owned();
+        self
     }
 
     /// Read engine-held provisioning resources through `reads` (#3629 layer 4).
@@ -452,8 +509,6 @@ impl Aggregator {
         let AggregatorResolvers {
             durable_convoys,
             durable_convoy_ensures,
-            durable_demands,
-            durable_environments,
             durable_fulfilment_kinds,
             durable_sessions,
             durable_projects,
@@ -461,18 +516,10 @@ impl Aggregator {
             durable_repositories,
             durable_vessels,
             durable_hosts,
-            durable_checkouts,
-            durable_clones,
-            observed_convoys,
-            observed_sessions,
-            observed_checkouts,
-            observed_checkout_replicas,
         } = resolvers;
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(&durable_convoys)
             .durable_convoy_ensures(&durable_convoy_ensures)
-            .durable_demands(&durable_demands)
-            .durable_environments(&durable_environments)
             .maybe_durable_fulfilment_kinds(
                 durable_fulfilment_kinds.as_ref().map(|source| source as &dyn AggregatorReplicaWatchSource<FulfilmentKind>),
             )
@@ -486,12 +533,6 @@ impl Aggregator {
             .durable_repositories(&durable_repositories)
             .durable_vessels(&durable_vessels)
             .durable_hosts(&durable_hosts)
-            .durable_checkouts(&durable_checkouts)
-            .durable_clones(&durable_clones)
-            .observed_convoys(&observed_convoys)
-            .observed_sessions(&observed_sessions)
-            .observed_checkouts(&observed_checkouts)
-            .observed_checkout_replicas(&observed_checkout_replicas)
             .build();
         self.run_with_sources(sources).await
     }
@@ -500,8 +541,6 @@ impl Aggregator {
         let AggregatorSourceRefs {
             durable_convoys,
             durable_convoy_ensures,
-            durable_demands,
-            durable_environments,
             durable_fulfilment_kinds,
             durable_sessions,
             durable_projects,
@@ -509,12 +548,6 @@ impl Aggregator {
             durable_repositories,
             durable_vessels,
             durable_hosts,
-            durable_checkouts,
-            durable_clones,
-            observed_convoys,
-            observed_sessions,
-            observed_checkouts,
-            observed_checkout_replicas,
         } = sources;
         // Subscribe before any source bootstrap awaits so demand arriving
         // during recovery remains observable. Also consume the initial value
@@ -545,8 +578,8 @@ impl Aggregator {
             None => Box::pin(futures::stream::pending()) as BoxStream<'static, Result<ReadWatchEvent<FulfilmentKind>, ResourceError>>,
         };
         let mut durable_convoy_stream = self.recover_replica_convoy_watch(durable_convoys).await?;
-        let mut durable_demand_stream = self.recover_demand_watch(durable_demands).await?;
-        let mut durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
+        // The open attentions, read once here and again at each change the port signals.
+        self.read_open_attentions().await;
         let mut durable_session_stream = self.recover_replica_session_watch(durable_sessions).await?;
         let mut durable_fleet_stream = match durable_fleet_designation {
             Some(source) => self.recover_fleet_designation_watch(source).await?,
@@ -556,24 +589,43 @@ impl Aggregator {
         let mut durable_project_stream = self.recover_project_watch(durable_projects).await?;
         let mut durable_ensure_stream = self.recover_convoy_ensure_watch(durable_convoy_ensures).await?;
         let mut durable_repository_stream = self.recover_repository_watch(durable_repositories).await?;
-        let mut observed_convoy_stream = self.recover_convoy_watch(LocalSource::Observed, observed_convoys).await?;
-        let mut observed_session_stream = self.recover_observed_session_watch(observed_sessions).await?;
-        let mut observed_checkout_stream = self.recover_checkout_watch(observed_checkouts).await?;
-        let mut checkout_replica_stream = self.recover_checkout_replica_watch(observed_checkout_replicas).await?;
+        // The engine's checkout commits, at every home, wake the checkout rows and readiness
+        // (#3108); subscribed before the first read, so a commit between the two is not missed.
+        let mut checkout_changes = self.lifecycle_reads.checkouts().ok().map(|checkouts| checkouts.changes());
+        self.read_engine_checkouts();
+        self.refresh_origin_hosts().await;
+        // Subscribed before the first read, so a refresh between the two is not missed.
+        let mut discovered_changes = self.discovered_checkouts.changes();
+        self.rebuild_checkout_rows().await?;
         let (items, mut vessel_stream) = Self::recover_replica_watch(durable_vessels).await?;
         self.readiness_vessels = readiness_resources(items);
         let (items, mut host_stream) = Self::recover_replica_watch(durable_hosts).await?;
         self.replace_hosts(items);
-        let (items, mut readiness_checkout_stream) = Self::recover_replica_watch(durable_checkouts).await?;
-        self.readiness_checkouts = readiness_resources(items);
-        let mut readiness_clone_stream = self.recover_clone_readiness_watch(durable_clones).await?;
+        // AgentSessions are the engine's, at every home: followed from the decided store (#3108).
+        let mut agent_session_updates = match self.agent_session_port.follow().await {
+            Ok(follow) => {
+                self.agent_session_home = Some(follow.home);
+                self.agent_sessions = follow.held.into_iter().collect();
+                self.agent_session_heard = follow.heard.into_iter().collect();
+                Some(follow.updates)
+            }
+            Err(error) => {
+                debug!(%error, "crew members show no AgentSessions");
+                None
+            }
+        };
         self.refresh_origin_hosts().await;
         self.rebuild_local_projection().await;
         self.bootstrapping = false;
         self.projection_delivery = ConvoyProjectionDelivery::Coalesced { deadline: None };
         self.emitted_queries.extend(QueryId::ALWAYS_MATERIALIZED.iter().cloned());
-        self.event_sink.emit(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
-        self.event_sink.emit(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set(&None).await)));
+        // Deltas were withheld while bootstrapping: a subscriber that joined
+        // meanwhile catches up from a full set of every family.
+        for query in QueryId::ALWAYS_MATERIALIZED {
+            if let Some(set) = self.state.result_set_for(query).await {
+                self.event_sink.emit(DaemonEvent::ResultSet(Box::new(set)));
+            }
+        }
         // Publish/bootstrap scoped demand now, rather than charging the first
         // unrelated resource change for every existing project scope.
         self.emit_scoped_convoy_result_sets().await;
@@ -582,14 +634,21 @@ impl Aggregator {
         // An engine edge writes no old record: follow the engine's changes to
         // re-project the convoy's row (#3587 layer 8).
         let mut engine_changes = self.convoy_engine.get().map(|engine| engine.changes());
+        // Environments are the engine's: their changes come from its log (#3108).
+        let mut environment_changes = self.lifecycle_reads.environments().ok().map(|environments| environments.changes());
+        // So are clones: a checkout's readiness reads its clone launch.
+        let mut clone_changes = self.lifecycle_reads.clones().ok().map(|clones| clones.changes());
         let mut attention_changes = self.attention_port.as_ref().and_then(|port| port.changes());
-        let mut change_request_sweep =
-            tokio::time::interval_at(Instant::now() + CHANGE_REQUEST_SWEEP_INTERVAL, CHANGE_REQUEST_SWEEP_INTERVAL);
-        change_request_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // What the forge observers find, their branch probes' finds among it, is on the change
+        // request records: a convoy with no change request looks again when they change (#3108).
+        let mut change_request_changes = match &self.change_request_resolver {
+            Some(resolver) => resolver.change_request_changes().await,
+            None => None,
+        };
 
         loop {
-            let escalation_delay = self.next_escalation_delay(chrono::Utc::now());
-            let attention_expiry_delay = self.next_attention_expiry_delay();
+            let escalation_delay = self.next_escalation_delay(self.clock.now());
+            let home_stale_delay = self.next_home_stale_delay(self.clock.now());
             let escalation = async move {
                 match escalation_delay {
                     Some(delay) => tokio::time::sleep(delay).await,
@@ -597,13 +656,14 @@ impl Aggregator {
                 }
             };
             tokio::pin!(escalation);
-            let attention_expiry = async move {
-                match attention_expiry_delay {
+            // One wake, at the next moment a quiet home's readings stop being current.
+            let home_stale = async move {
+                match home_stale_delay {
                     Some(delay) => tokio::time::sleep(delay).await,
                     None => futures::future::pending().await,
                 }
             };
-            tokio::pin!(attention_expiry);
+            tokio::pin!(home_stale);
             let projection_deadline = match self.projection_delivery {
                 ConvoyProjectionDelivery::Immediate => None,
                 ConvoyProjectionDelivery::Coalesced { deadline } => deadline,
@@ -627,7 +687,38 @@ impl Aggregator {
                     None => futures::future::pending().await,
                 }
             };
+            let environment_change = async {
+                match environment_changes.as_mut() {
+                    Some(changes) => changes.recv().await,
+                    None => futures::future::pending().await,
+                }
+            };
+            let clone_change = async {
+                match clone_changes.as_mut() {
+                    Some(changes) => changes.recv().await,
+                    None => futures::future::pending().await,
+                }
+            };
+            let change_request_change = async {
+                match change_request_changes.as_mut() {
+                    Some(changes) => changes.next().await,
+                    None => futures::future::pending().await,
+                }
+            };
+            let agent_session_update = async {
+                match agent_session_updates.as_mut() {
+                    Some(updates) => updates.next().await,
+                    None => futures::future::pending().await,
+                }
+            };
             tokio::select! {
+                update = agent_session_update => match update {
+                    Some(update) => self.agent_sessions_changed(update).await,
+                    None => {
+                        tracing::warn!("the AgentSession follow ended; crew members keep the last readings");
+                        agent_session_updates = None;
+                    }
+                },
                 change = attention_change => match change {
                     Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => self.refresh_attentions().await,
                     Err(broadcast::error::RecvError::Closed) => attention_changes = None,
@@ -645,16 +736,20 @@ impl Aggregator {
                     self.flush_local_projection().await;
                     tokio::task::yield_now().await;
                 }
-                _ = change_request_sweep.tick() => {
-                    self.sweep_active_change_request_subjects();
-                }
+                change = change_request_change => match change {
+                    Some(()) => self.recheck_unproduced_change_requests(),
+                    None => {
+                        tracing::warn!("the change request records' follow ended; convoys without a change request are not looked up again");
+                        change_request_changes = None;
+                    }
+                },
                 () = &mut escalation => {
                     if self.rebuild_salience_projection().await {
                         self.emit_awareness_result_sets().await;
                     }
                 }
-                () = &mut attention_expiry => {
-                    self.expire_due_attention().await;
+                () = &mut home_stale => {
+                    self.rebuild_local_projection().await;
                 }
                 demand = demand_rx.changed() => {
                     if demand.is_err() {
@@ -718,46 +813,38 @@ impl Aggregator {
                         self.apply_change_request_resolution(resolution).await;
                     }
                 },
-                event = readiness_clone_stream.next() => {
-                    match event {
-                        Some(Ok(event)) => apply_readiness_event(&mut self.readiness_clones, local_read_event(event)),
-                        Some(Err(ResourceError::WatchExpired { .. })) => {
-                            readiness_clone_stream = self.recover_clone_readiness_watch(durable_clones).await?;
-                        }
-                        Some(Err(error)) => return Err(error),
-                        None => return Err(ResourceError::other("aggregator clone readiness watch ended")),
-                    }
-                    self.refresh_origin_hosts().await;
-                    self.rebuild_local_projection().await;
-                }
+                change = clone_change => match change {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => self.rebuild_local_projection().await,
+                    Err(broadcast::error::RecvError::Closed) => clone_changes = None,
+                },
                 event = fulfilment_kind_stream.next() => {
                     match event {
-                        Some(Ok(event)) => apply_readiness_event(&mut self.fulfilment_kinds, event),
+                        Some(Ok(event)) => self.fulfilment_kind_changed(event).await,
                         Some(Err(ResourceError::WatchExpired { .. })) => {
                             if let Some(source) = durable_fulfilment_kinds {
                                 let (items, watch) = Self::recover_replica_watch(source).await?;
                                 self.fulfilment_kinds = readiness_resources(items);
                                 fulfilment_kind_stream = watch;
                             }
+                            self.rebuild_local_projection().await;
                         }
                         Some(Err(error)) => return Err(error),
                         None => return Err(ResourceError::other("aggregator fulfilment kind watch ended")),
                     }
-                    self.rebuild_local_projection().await;
                 }
                 event = vessel_stream.next() => {
                     match event {
-                        Some(Ok(event)) => apply_readiness_event(&mut self.readiness_vessels, event),
+                        Some(Ok(event)) => self.vessel_changed(event).await,
                         Some(Err(ResourceError::WatchExpired { .. })) => {
                             let (items, watch) = Self::recover_replica_watch(durable_vessels).await?;
                             self.readiness_vessels = readiness_resources(items);
                             vessel_stream = watch;
+                            self.refresh_origin_hosts().await;
+                            self.rebuild_local_projection().await;
                         }
                         Some(Err(error)) => return Err(error),
                         None => return Err(ResourceError::other("aggregator vessel readiness watch ended")),
                     }
-                    self.refresh_origin_hosts().await;
-                    self.rebuild_local_projection().await;
                 }
                 event = host_stream.next() => {
                     let changed = match event {
@@ -777,19 +864,10 @@ impl Aggregator {
                         }
                     }
                 }
-                event = readiness_checkout_stream.next() => {
-                    match event {
-                        Some(Ok(event)) => apply_readiness_event(&mut self.readiness_checkouts, event),
-                        Some(Err(ResourceError::WatchExpired { .. })) => {
-                            let (items, watch) = Self::recover_replica_watch(durable_checkouts).await?;
-                            self.readiness_checkouts = readiness_resources(items);
-                            readiness_checkout_stream = watch;
-                        }
-                        Some(Err(error)) => return Err(error),
-                        None => return Err(ResourceError::other("aggregator checkout readiness watch ended")),
+                change = next_checkout_change(&mut checkout_changes) => {
+                    if let Some(change) = change {
+                        self.engine_checkout_changed(change).await?;
                     }
-                    self.refresh_origin_hosts().await;
-                    self.rebuild_local_projection().await;
                 }
                 event = durable_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_replica_convoy_event(event).await,
@@ -799,21 +877,13 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable convoy watch ended")),
                 },
-                event = durable_demand_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_demand_event(event).await,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        durable_demand_stream = self.recover_demand_watch(durable_demands).await?;
+                change = environment_change => match change {
+                    Ok(change) => self.environment_changed(Some(change)).await,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, "aggregator lagged behind the environments' changes");
+                        self.environment_changed(None).await;
                     }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator durable demand watch ended")),
-                },
-                event = durable_environment_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_environment_event(event).await,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
-                    }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator durable environment watch ended")),
+                    Err(broadcast::error::RecvError::Closed) => environment_changes = None,
                 },
 
                 event = durable_session_stream.next() => match event {
@@ -876,50 +946,14 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable repository watch ended")),
                 },
-                event = observed_convoy_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_convoy_event_from(LocalSource::Observed, event).await,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        observed_convoy_stream = self.recover_convoy_watch(LocalSource::Observed, observed_convoys).await?;
-                    }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator observed convoy watch ended")),
-                },
-
-                event = observed_session_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_session_read_event_from(LocalSource::Observed, event).await,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        observed_session_stream = self.recover_observed_session_watch(observed_sessions).await?;
-                    }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator observed terminal session watch ended")),
-                },
-                event = observed_checkout_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_checkout_event(event).await?,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        observed_checkout_stream = self.recover_checkout_watch(observed_checkouts).await?;
-                    }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator observed checkout watch ended")),
-                },
-                event = checkout_replica_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_checkout_replica_event(event).await?,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        checkout_replica_stream = self.recover_checkout_replica_watch(observed_checkout_replicas).await?;
-                    }
-                    Some(Err(error)) => return Err(error),
-                    None => return Err(ResourceError::other("aggregator checkout replica watch ended")),
+                change = discovered_changes.recv() => match change {
+                    // A lagged receiver missed some changes; the rows read them all anyway.
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => self.discovered_checkouts_changed().await?,
+                    Err(broadcast::error::RecvError::Closed) => return Err(ResourceError::other("aggregator discovered checkouts ended")),
                 },
 
             }
         }
-    }
-
-    async fn recover_convoy_watch(
-        &mut self,
-        source: LocalSource,
-        resolver: &dyn AggregatorWatchSource<Convoy>,
-    ) -> Result<WatchStream<Convoy>, ResourceError> {
-        self.list_and_watch_convoys(source, resolver).await
     }
 
     async fn recover_replica_convoy_watch(
@@ -928,26 +962,6 @@ impl Aggregator {
     ) -> Result<BoxStream<'static, Result<ReadWatchEvent<Convoy>, ResourceError>>, ResourceError> {
         let (items, watch) = Self::recover_replica_watch(resolver).await?;
         self.replace_replica_convoys(items).await;
-        Ok(watch)
-    }
-
-    async fn recover_demand_watch(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
-        self.list_and_watch_demands(resolver).await
-    }
-
-    async fn recover_environment_watch(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<Environment>,
-    ) -> Result<WatchStream<Environment>, ResourceError> {
-        self.list_and_watch_environments(resolver).await
-    }
-
-    async fn recover_observed_session_watch(
-        &mut self,
-        resolver: &dyn AggregatorReplicaWatchSource<TerminalSession>,
-    ) -> Result<BoxStream<'static, Result<ReadWatchEvent<TerminalSession>, ResourceError>>, ResourceError> {
-        let (items, watch) = Self::recover_replica_watch(resolver).await?;
-        self.replace_session_read_source(LocalSource::Observed, items).await;
         Ok(watch)
     }
 
@@ -1023,72 +1037,97 @@ impl Aggregator {
         Ok(watch)
     }
 
-    async fn recover_checkout_replica_watch(
-        &mut self,
-        resolver: &dyn AggregatorReplicaWatchSource<Checkout>,
-    ) -> Result<BoxStream<'static, Result<ReadWatchEvent<Checkout>, ResourceError>>, ResourceError> {
-        let (items, watch) = Self::recover_replica_watch(resolver).await?;
-        self.checkout_replicas = items
-            .into_iter()
-            .filter_map(|source| {
-                let ResourceProvenance::Replica { origin_root, .. } = &source.provenance else { return None };
-                Some(((source.object.metadata.namespace.clone(), source.object.metadata.name.clone(), origin_root.clone()), source))
-            })
-            .collect();
-        self.refresh_origin_hosts().await;
-        self.rebuild_checkout_rows().await?;
-        Ok(watch)
-    }
-
-    async fn apply_checkout_replica_event(&mut self, event: ReadWatchEvent<Checkout>) -> Result<(), ResourceError> {
-        match event {
-            ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) => {
-                if let ResourceProvenance::Replica { origin_root, .. } = &source.provenance {
-                    self.checkout_replicas.insert(
-                        (source.object.metadata.namespace.clone(), source.object.metadata.name.clone(), origin_root.clone()),
-                        source,
-                    );
-                }
-            }
-            ReadWatchEvent::Deleted(source) => {
-                if let ResourceProvenance::Replica { origin_root, .. } = source.provenance {
-                    self.checkout_replicas.remove(&(source.object.metadata.namespace, source.object.metadata.name, origin_root));
-                }
-            }
-            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
-                if let ResourceProvenance::Replica { origin_root, .. } = provenance {
-                    self.checkout_replicas.remove(&(tombstone.namespace, tombstone.name, origin_root));
-                }
-            }
+    /// Rereads every launch the engine holds at every home it follows. A failed read keeps the
+    /// checkouts held, and the next change reads again.
+    fn read_engine_checkouts(&mut self) {
+        let reads = Arc::clone(&self.lifecycle_reads);
+        if self.held_launches.read_all(reads.checkouts()) {
+            self.engine_checkout_home = reads.checkouts().ok().map(|checkouts| checkouts.home().to_owned());
+            self.derive_engine_checkouts();
         }
-        self.refresh_origin_hosts().await;
-        self.rebuild_checkout_rows().await
     }
 
-    async fn recover_checkout_watch(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<Checkout>,
-    ) -> Result<WatchStream<Checkout>, ResourceError> {
-        self.list_and_watch_checkouts(resolver).await
+    /// The adopted checkouts among the launches held: each name's latest launch at its home that
+    /// has not ended.
+    fn derive_engine_checkouts(&mut self) {
+        let mut by_home = BTreeMap::<String, Vec<_>>::new();
+        for launch in self.held_launches.launches() {
+            by_home.entry(launch.home.clone()).or_default().push(launch.clone());
+        }
+        self.engine_checkouts = by_home
+            .into_values()
+            .flat_map(|records| latest_launches(records).into_values())
+            .filter(|record| matches!(record.spec, CheckoutSpec::Observed(_)) && !record.ended())
+            .collect();
     }
 
-    async fn list_and_watch_convoys(
-        &mut self,
-        source: LocalSource,
-        resolver: &dyn AggregatorWatchSource<Convoy>,
-    ) -> Result<WatchStream<Convoy>, ResourceError> {
-        let (listed, watch) = recover_local_view(resolver).await?;
-        self.replace_convoy_source(source, listed.items).await;
-        Ok(watch)
+    /// After a commit of the engine's checkouts: a changed launch is read alone, and only the
+    /// convoys it was or is held for are projected again; a rescan, or a launch that did not read,
+    /// reads them all and projects every convoy.
+    async fn engine_checkout_changed(&mut self, change: CheckoutChange) -> Result<(), ResourceError> {
+        let reads = Arc::clone(&self.lifecycle_reads);
+        let holders = match change {
+            CheckoutChange::Changed { name, home } if self.held_launches.current() => {
+                match reads.checkouts().and_then(|checkouts| self.held_launches.read_one(checkouts, &name, &home)) {
+                    Ok(holders) => Some((holders, home)),
+                    Err(error) => {
+                        tracing::warn!(launch = %name, %home, %error, "aggregator could not read a changed checkout; reading them all");
+                        None
+                    }
+                }
+            }
+            CheckoutChange::Changed { .. } | CheckoutChange::Rescanned => None,
+        };
+        let Some((holders, home)) = holders else {
+            self.read_engine_checkouts();
+            self.refresh_origin_hosts().await;
+            self.rebuild_checkout_rows().await?;
+            self.rebuild_local_projection().await;
+            return Ok(());
+        };
+        self.derive_engine_checkouts();
+        let origin = flotilla_protocol::NodeId::new(home.as_str());
+        if self.engine_checkout_home.as_deref() != Some(home.as_str()) && !self.known_origins.contains(&origin) {
+            self.refresh_origin_hosts().await;
+        }
+        self.rebuild_checkout_rows().await?;
+        let keys = self.convoys_holding(&holders);
+        if !keys.is_empty() {
+            self.projection_keys.extend(keys);
+            self.schedule_local_projection().await;
+        }
+        Ok(())
     }
 
-    /// Demands are the old store's attentions: their watch says when to read them again.
-    async fn list_and_watch_demands(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
-        let (_, watch) = recover_local_view(resolver).await?;
+    /// The convoys whose engine launch is one of `holders`.
+    fn convoys_holding(&self, holders: &BTreeSet<CheckoutHolder>) -> Vec<ConvoyKey> {
+        if holders.is_empty() {
+            return Vec::new();
+        }
+        self.convoys
+            .iter()
+            .filter(|(_, convoy)| {
+                flotilla_resources::convoy::engine::checkout_holder(&convoy.object).is_some_and(|holder| holders.contains(&holder))
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// The host `home` names: this host for this home, else the host its origin resolves to.
+    fn engine_home_host(&self, home: &str) -> Option<HostName> {
+        if self.engine_checkout_home.as_deref() == Some(home) {
+            Some(self.local_host.clone())
+        } else {
+            self.origin_hosts.get(&flotilla_protocol::NodeId::new(home)).cloned()
+        }
+    }
+
+    /// Reads the open attentions from the attention port, the engine's, and recomputes salience
+    /// when they changed.
+    async fn read_open_attentions(&mut self) {
         if self.read_attentions().await && self.rebuild_salience_projection().await && !self.bootstrapping {
             self.emit_awareness_result_sets().await;
         }
-        Ok(watch)
     }
 
     /// Reads the open attentions; whether they changed.
@@ -1112,27 +1151,16 @@ impl Aggregator {
     async fn refresh_attentions(&mut self) {
         if self.read_attentions().await {
             self.rebuild_local_projection().await;
+            // A role's hold is read from its attention.
+            self.rebuild_standing_roles().await;
         }
     }
 
-    async fn replace_convoy_source(&mut self, source: LocalSource, convoys: Vec<ResourceObject<Convoy>>) {
-        self.replace_convoy_read_source(
-            source,
-            convoys.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect(),
-        )
-        .await;
-    }
-
     async fn replace_replica_convoys(&mut self, convoys: Vec<ReadResourceObject<Convoy>>) {
-        self.replace_convoy_read_source(LocalSource::Durable, convoys).await;
-    }
-
-    async fn replace_convoy_read_source(&mut self, source: LocalSource, convoys: Vec<ReadResourceObject<Convoy>>) {
         let previous = self.effective_convoys();
-        let replacement = convoys.into_iter().map(|convoy| (convoy_key(&convoy), Arc::new(convoy))).collect();
-        self.convoys_by_source.insert(source, replacement);
+        self.convoys = convoys.into_iter().map(|convoy| (convoy_key(&convoy), Arc::new(convoy))).collect();
         self.convoy_keys_by_name.clear();
-        for key in self.convoys_by_source.values().flat_map(|sources| sources.keys()) {
+        for key in self.convoys.keys() {
             self.convoy_keys_by_name.entry((key.0.clone(), key.1.clone())).or_default().insert(key.clone());
         }
         self.refresh_origin_hosts().await;
@@ -1149,44 +1177,15 @@ impl Aggregator {
         if let Err(error) = self.rebuild_checkout_rows().await {
             debug!(%error, "could not refresh checkout orphan attention after convoy relist");
         }
+        self.rebuild_standing_roles().await;
     }
 
-    async fn list_and_watch_environments(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<Environment>,
-    ) -> Result<WatchStream<Environment>, ResourceError> {
-        let (_listed, watch) = recover_local_view(resolver).await?;
-        self.rebuild_independents_projection().await;
-        Ok(watch)
-    }
-
-    async fn list_and_watch_checkouts(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<Checkout>,
-    ) -> Result<WatchStream<Checkout>, ResourceError> {
-        let (listed, watch) = recover_local_view(resolver).await?;
-        self.observed_checkouts = listed
-            .items
-            .into_iter()
-            .map(|checkout| (self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name), checkout))
-            .collect();
-        self.rebuild_checkout_rows().await?;
-        Ok(watch)
-    }
-
-    async fn apply_demand_event(&mut self, _: WatchEvent<Demand>) {
-        self.refresh_attentions().await;
-    }
-
-    async fn apply_convoy_event_from(&mut self, source: LocalSource, event: WatchEvent<Convoy>) {
-        self.apply_convoy_read_event_from(source, local_read_event(event)).await;
+    /// The role convoy `convoy` is a generation of, as its ensure's namespace and name.
+    fn generation_of(convoy: &ResourceObject<Convoy>) -> Option<(String, String)> {
+        convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(|ensure| (convoy.metadata.namespace.clone(), ensure.clone()))
     }
 
     async fn apply_replica_convoy_event(&mut self, event: ReadWatchEvent<Convoy>) {
-        self.apply_convoy_read_event_from(LocalSource::Durable, event).await;
-    }
-
-    async fn apply_convoy_read_event_from(&mut self, source: LocalSource, event: ReadWatchEvent<Convoy>) {
         let key = match &event {
             ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) | ReadWatchEvent::Deleted(convoy) => convoy_key(convoy),
             ReadWatchEvent::DeletedByName { tombstone, provenance } => tombstone_key(tombstone, provenance),
@@ -1197,12 +1196,19 @@ impl Aggregator {
         let previous_all = new_origin.then(|| self.effective_convoys());
         let previous = self.effective_convoy_key(&key).filter(|item| item.object.metadata.deletion_timestamp.is_none()).cloned();
         let previous_ref = self.convoy_key_ref(&key);
+        let role = match &event {
+            ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) | ReadWatchEvent::Deleted(convoy) => {
+                Self::generation_of(&convoy.object)
+            }
+            ReadWatchEvent::DeletedByName { .. } => None,
+        }
+        .or_else(|| previous.as_ref().and_then(|item| Self::generation_of(&item.object)));
         match event {
             ReadWatchEvent::Added(convoy) | ReadWatchEvent::Modified(convoy) => {
-                self.convoys_by_source.entry(source).or_default().insert(key.clone(), Arc::new(convoy));
+                self.convoys.insert(key.clone(), Arc::new(convoy));
             }
             ReadWatchEvent::Deleted(_) | ReadWatchEvent::DeletedByName { .. } => {
-                self.convoys_by_source.entry(source).or_default().remove(&key);
+                self.convoys.remove(&key);
             }
         }
         let identity = (key.0.clone(), key.1.clone());
@@ -1226,6 +1232,9 @@ impl Aggregator {
                 self.rebuild_local_projection().await;
                 if let Err(error) = self.rebuild_checkout_rows().await {
                     debug!(%error, "could not refresh checkout orphan attention after origin change");
+                }
+                if let Some((namespace, ensure)) = role {
+                    self.refresh_standing_role(&namespace, &ensure).await;
                 }
                 return;
             }
@@ -1252,6 +1261,10 @@ impl Aggregator {
                 debug!(%error, "could not refresh checkout orphan attention after convoy event");
             }
         }
+        // A role's state is read from its generations.
+        if let Some((namespace, ensure)) = role {
+            self.refresh_standing_role(&namespace, &ensure).await;
+        }
     }
 
     /// This home's convoy `name` changed on the engine: re-project its row.
@@ -1265,8 +1278,61 @@ impl Aggregator {
         if keys.is_empty() {
             return;
         }
+        let role = keys.iter().filter_map(|key| self.convoys.get(key)).find_map(|convoy| Self::generation_of(&convoy.object));
         self.projection_keys.extend(keys);
         self.schedule_local_projection().await;
+        if let Some((namespace, ensure)) = role {
+            self.refresh_standing_role(&namespace, &ensure).await;
+        }
+    }
+
+    /// A vessel's change projects again only the convoy it serves, and the one it served before.
+    /// A vessel from a home not seen before resolves the homes again, and projects every convoy.
+    async fn vessel_changed(&mut self, event: ReadWatchEvent<Vessel>) {
+        let (key, origin) = match &event {
+            ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => (
+                repository_source_key(&source.object.metadata.namespace, &source.object.metadata.name, &source.provenance),
+                engine_origin(&source.provenance),
+            ),
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
+                (repository_source_key(&tombstone.namespace, &tombstone.name, provenance), None)
+            }
+        };
+        let parent = |vessels: &BTreeMap<RepositorySourceKey, ReadResourceObject<Vessel>>| {
+            vessels.get(&key).map(|vessel| (vessel.object.metadata.namespace.clone(), vessel.object.spec.convoy_ref.clone()))
+        };
+        let before = parent(&self.readiness_vessels);
+        apply_readiness_event(&mut self.readiness_vessels, event);
+        let after = parent(&self.readiness_vessels);
+        self.reindex_vessel(&key, before.clone(), after.clone());
+        if origin.is_some_and(|origin| !self.known_origins.contains(&flotilla_protocol::NodeId::new(origin))) {
+            self.refresh_origin_hosts().await;
+            self.rebuild_local_projection().await;
+            return;
+        }
+        self.project_convoys_named(before.into_iter().chain(after)).await;
+    }
+
+    /// A fulfilment kind's change projects again only the convoys whose vessels are placed by it.
+    async fn fulfilment_kind_changed(&mut self, event: ReadWatchEvent<FulfilmentKind>) {
+        let (namespace, name) = match &event {
+            ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => {
+                (source.object.metadata.namespace.clone(), source.object.metadata.name.clone())
+            }
+            ReadWatchEvent::DeletedByName { tombstone, .. } => (tombstone.namespace.clone(), tombstone.name.clone()),
+        };
+        apply_readiness_event(&mut self.fulfilment_kinds, event);
+        let placed: Vec<_> = self
+            .readiness_vessels
+            .values()
+            .filter(|vessel| vessel.object.metadata.namespace == namespace)
+            .filter(|vessel| {
+                let observed = vessel.object.status.as_ref().and_then(|status| status.observed_kind_ref.as_ref());
+                observed.unwrap_or(&vessel.object.spec.fulfilment_kind_ref) == &name
+            })
+            .map(|vessel| (namespace.clone(), vessel.object.spec.convoy_ref.clone()))
+            .collect();
+        self.project_convoys_named(placed).await;
     }
 
     fn has_convoy(&self, namespace: &str, name: &str) -> bool {
@@ -1276,7 +1342,7 @@ impl Aggregator {
     }
 
     fn effective_convoy_key(&self, key: &ConvoyKey) -> Option<&Arc<ReadResourceObject<Convoy>>> {
-        LOCAL_SOURCE_PRECEDENCE.iter().rev().find_map(|source| self.convoys_by_source.get(source)?.get(key))
+        self.convoys.get(key)
     }
 
     fn convoy_key_ref(&self, key: &ConvoyKey) -> Option<ResourceRef> {
@@ -1346,13 +1412,17 @@ impl Aggregator {
 
     fn is_home_convoy(&self, reference: &ResourceRef) -> bool {
         reference.host.as_ref() == Some(&self.local_host)
-            && self
-                .convoys_by_source
-                .get(&LocalSource::Durable)
-                .is_some_and(|source| source.contains_key(&(reference.namespace.clone(), reference.name.clone(), None)))
+            && self.convoys.contains_key(&(reference.namespace.clone(), reference.name.clone(), None))
     }
 
-    fn next_change_request_refresh(&self, reference: &ResourceRef, now: Instant) -> Instant {
+    /// When convoy `reference`'s next lookup may run. A lookup by branch reads only the forge
+    /// observers' records, so it runs at once. Only a lookup of a bound change request can still
+    /// reach the forge, when its record is missing (#3108), so only that one keeps the minimum
+    /// interval and the failure backoff.
+    fn next_change_request_refresh(&self, reference: &ResourceRef, bound: bool, now: Instant) -> Instant {
+        if !bound {
+            return now;
+        }
         let failures = self.change_request_refresh_failures.get(reference).copied().unwrap_or(0).min(3);
         let interval = std::cmp::min(CHANGE_REQUEST_MIN_REFRESH_INTERVAL * (1 << failures), CHANGE_REQUEST_MAX_RETRY_INTERVAL);
         match self.change_request_refresh_started.get(reference).copied() {
@@ -1392,15 +1462,15 @@ impl Aggregator {
         let Some(resolver) = self.change_request_resolver.clone() else {
             return;
         };
-        let refresh_at = self.next_change_request_refresh(&reference, Instant::now());
+        let refresh_at = self.next_change_request_refresh(&reference, binding.is_some(), Instant::now());
         self.change_request_refresh_started.insert(reference.clone(), refresh_at);
         let refresh_tx = self.change_request_refresh_queue.tx.clone();
         let task_reference = reference.clone();
-        let task = tokio::spawn(async move {
+        let task = tokio::spawn(flotilla_store::load_metrics::inherit(async move {
             tokio::time::sleep_until(refresh_at).await;
             let result = bounded_refresh(&*resolver, &repositories, &branch, binding.as_ref()).await;
             let _ = refresh_tx.send(ChangeRequestResolution { reference: task_reference, generation, branch, result });
-        });
+        }));
         self.change_request_refresh_tasks.insert(reference, task);
     }
 
@@ -1440,15 +1510,31 @@ impl Aggregator {
         if failed {
             *self.change_request_refresh_failures.entry(reference.clone()).or_default() += 1;
         }
-        if failed || retrigger {
-            if let Some(convoy) = self.effective_convoys().get(&reference) {
+        if let Some(convoy) = self.effective_convoys().get(&reference) {
+            // A failed lookup by branch read only records: the next change to them looks again,
+            // rather than a retry. A bound lookup retries under its backoff.
+            if retrigger || (failed && convoy.spec.change_request.is_some()) {
                 self.schedule_change_request_refresh(convoy);
             }
         }
-        self.rebuild_local_projection().await;
+        // Only this convoy's row shows its change request.
+        let keys: Vec<ConvoyKey> = self
+            .convoy_keys_by_name
+            .get(&(reference.namespace.clone(), reference.name.clone()))
+            .into_iter()
+            .flatten()
+            .filter(|key| self.convoy_key_ref(key).as_ref() == Some(&reference))
+            .cloned()
+            .collect();
+        if !keys.is_empty() {
+            self.projection_keys.extend(keys);
+            self.schedule_local_projection().await;
+        }
     }
 
-    fn sweep_active_change_request_subjects(&mut self) {
+    /// Looks up again the change request of each active home convoy that produces none yet, as
+    /// the change request records change: what a forge observer's branch probe found is read then.
+    fn recheck_unproduced_change_requests(&mut self) {
         let convoys = self.effective_convoys().into_iter().filter(|(reference, convoy)| {
             self.is_home_convoy(reference)
                 && convoy.status.as_ref().is_some_and(|status| status.phase == ResourceConvoyPhase::Active)
@@ -1494,7 +1580,7 @@ impl Aggregator {
             // scan indefinitely (#3206). One not yet started will read the
             // triggering change; one already running may not, so it looks again
             // once its result is applied. The kept lookup captured the convoy's
-            // branch, repositories and binding: this pass serves sweeps and
+            // branch, repositories and binding: this pass serves rechecks and
             // repository triggers only; spec changes go through
             // `schedule_change_request_refresh`, which replaces the task.
             if self.change_request_refresh_tasks.contains_key(&reference) {
@@ -1528,7 +1614,11 @@ impl Aggregator {
         };
         for ((repositories, branch, _), ChangeRequestRefreshGroup { binding, targets }) in lookups {
             let now = Instant::now();
-            let refresh_at = targets.iter().map(|(reference, _)| self.next_change_request_refresh(reference, now)).max().unwrap_or(now);
+            let refresh_at = targets
+                .iter()
+                .map(|(reference, _)| self.next_change_request_refresh(reference, binding.is_some(), now))
+                .max()
+                .unwrap_or(now);
             for (reference, _) in &targets {
                 self.change_request_refresh_started.insert(reference.clone(), refresh_at);
             }
@@ -1545,10 +1635,10 @@ impl Aggregator {
                 let refresh_tx = self.change_request_refresh_queue.tx.clone();
                 let task_reference = reference.clone();
                 let task_branch = branch.clone();
-                let task = tokio::spawn(async move {
+                let task = tokio::spawn(flotilla_store::load_metrics::inherit(async move {
                     let result = lookup.await;
                     let _ = refresh_tx.send(ChangeRequestResolution { reference: task_reference, generation, branch: task_branch, result });
-                });
+                }));
                 self.change_request_refresh_tasks.insert(reference, task);
             }
         }
@@ -1570,14 +1660,11 @@ impl Aggregator {
 
     fn effective_convoy_reads_including_deleted(&self) -> HashMap<ResourceRef, ReadResourceObject<Convoy>> {
         #[cfg(test)]
-        self.copied_convoys
-            .fetch_add(self.convoys_by_source.values().map(HashMap::len).sum::<usize>(), std::sync::atomic::Ordering::Relaxed);
-        let mut effective_by_origin = HashMap::new();
-        for source in LOCAL_SOURCE_PRECEDENCE {
-            let Some(convoys) = self.convoys_by_source.get(&source) else { continue };
-            effective_by_origin.extend(convoys.iter().map(|(key, convoy)| (key.clone(), convoy.as_ref().clone())));
-        }
-        effective_by_origin.into_values().filter_map(|convoy| self.read_convoy_ref(&convoy).map(|reference| (reference, convoy))).collect()
+        self.copied_convoys.fetch_add(self.convoys.len(), std::sync::atomic::Ordering::Relaxed);
+        self.convoys
+            .values()
+            .filter_map(|convoy| self.read_convoy_ref(convoy).map(|reference| (reference, convoy.as_ref().clone())))
+            .collect()
     }
 
     async fn rebuild_local_projection(&mut self) {
@@ -1613,7 +1700,7 @@ impl Aggregator {
         // A convoy whose engine read failed keeps its row until a retried projection reads it.
         let mut unread: Vec<(ResourceRef, ResourceProvenance)> = Vec::new();
         for (reference, convoy) in effective_convoys {
-            let viewed = match flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, &convoy) {
+            let viewed = match self.viewed(&convoy) {
                 Ok(viewed) => viewed,
                 Err(error) => {
                     tracing::warn!(convoy = %reference.name, %error, "the engine convoy did not read; its row stays until a retry");
@@ -1641,7 +1728,7 @@ impl Aggregator {
                 .filter_map(|key| {
                     let reference = self.convoy_key_ref(key)?;
                     let row = match self.effective_convoy_key(key) {
-                        Some(item) => match flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, item) {
+                        Some(item) => match self.viewed(item) {
                             Ok(viewed) => Some(self.summarize(&reference, &viewed)),
                             Err(error) => {
                                 // Keep the row as it is, and project it again.
@@ -1792,6 +1879,11 @@ impl Aggregator {
     }
 
     #[cfg(test)]
+    async fn apply_convoy_event(&mut self, event: WatchEvent<Convoy>) {
+        self.apply_replica_convoy_event(local_read_event(event)).await;
+    }
+
+    #[cfg(test)]
     async fn apply_session_event_from(&mut self, source: LocalSource, event: WatchEvent<TerminalSession>) {
         self.apply_session_read_event_from(source, local_read_event(event)).await;
     }
@@ -1800,30 +1892,158 @@ impl Aggregator {
         self.apply_session_read_event_from(LocalSource::Durable, event).await;
     }
 
+    /// A session's change projects again only the convoy it crews, and the one it crewed before;
+    /// one that maps a home to its host afresh projects every convoy.
     async fn apply_session_read_event_from(&mut self, source: LocalSource, event: ReadWatchEvent<TerminalSession>) {
+        let key = match &event {
+            ReadWatchEvent::Added(session) | ReadWatchEvent::Modified(session) | ReadWatchEvent::Deleted(session) => session_key(session),
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => tombstone_key(tombstone, provenance),
+        };
+        let before = self.session_convoy(&key);
         match event {
             ReadWatchEvent::Added(session) | ReadWatchEvent::Modified(session) => {
-                self.sessions_by_source.entry(source).or_default().insert(session_key(&session), session);
+                self.sessions_by_source.entry(source).or_default().insert(key.clone(), session);
             }
-            ReadWatchEvent::Deleted(session) => {
-                self.sessions_by_source.entry(source).or_default().remove(&session_key(&session));
-            }
-            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
-                self.sessions_by_source.entry(source).or_default().remove(&tombstone_key(&tombstone, &provenance));
+            ReadWatchEvent::Deleted(_) | ReadWatchEvent::DeletedByName { .. } => {
+                self.sessions_by_source.entry(source).or_default().remove(&key);
             }
         }
+        let hosts = self.origin_hosts.clone();
         self.rebuild_independents_projection().await;
-        self.rebuild_local_projection().await;
+        let after = self.session_convoy(&key);
+        self.reindex_session(&key, before.clone(), after.clone());
+        if self.origin_hosts != hosts {
+            self.rebuild_local_projection().await;
+        } else {
+            self.project_convoys_named(before.into_iter().chain(after)).await;
+        }
     }
 
-    async fn apply_environment_event(&mut self, event: WatchEvent<Environment>) {
-        let name = match &event {
-            WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => &object.metadata.name,
-            _ => return,
+    /// The convoy session `key` crews, as `(namespace, name)`.
+    fn session_convoy(&self, key: &SessionKey) -> Option<(String, String)> {
+        let session = self.terminal_sessions.get(key)?;
+        Some((session.object.metadata.namespace.clone(), session.object.metadata.labels.get(CONVOY_LABEL)?.clone()))
+    }
+
+    /// Projects again every convoy named by `parents`, each `(namespace, name)`, at any home.
+    async fn project_convoys_named(&mut self, parents: impl IntoIterator<Item = (String, String)>) {
+        let keys: Vec<ConvoyKey> =
+            parents.into_iter().flat_map(|parent| self.convoy_keys_by_name.get(&parent).into_iter().flatten().cloned()).collect();
+        if !keys.is_empty() {
+            self.projection_keys.extend(keys);
+            self.schedule_local_projection().await;
+        }
+    }
+
+    /// AgentSessions changed in the decided store: the convoys whose crew run in them are
+    /// projected again; a home reread projects every convoy.
+    async fn agent_sessions_changed(&mut self, update: AgentSessionUpdate) {
+        match update {
+            AgentSessionUpdate::Changed(sessions) => {
+                let mut changed = Vec::new();
+                for (key, reading) in sessions {
+                    let differs = match reading {
+                        Some(reading) => self.agent_sessions.insert(key.clone(), reading.clone()).as_ref() != Some(&reading),
+                        None => self.agent_sessions.remove(&key).is_some(),
+                    };
+                    if differs {
+                        changed.push(key);
+                    }
+                }
+                let keys: Vec<ConvoyKey> = changed.iter().flat_map(|key| self.convoys_running_in(key)).collect();
+                if !keys.is_empty() {
+                    self.projection_keys.extend(keys);
+                    self.schedule_local_projection().await;
+                }
+            }
+            AgentSessionUpdate::Heard { home, at } => {
+                let now = self.clock.now();
+                let was = agent_activity::home_current(self.agent_session_heard.get(&home).copied(), now);
+                self.agent_session_heard.insert(home, at);
+                // A keepalive from a home already current changes no row.
+                if was != agent_activity::home_current(Some(at), now) {
+                    self.rebuild_local_projection().await;
+                }
+            }
+            AgentSessionUpdate::Home { home, sessions } => {
+                let held: HashMap<_, _> =
+                    sessions.into_iter().map(|(name, reading)| (AgentSessionKey { home: home.clone(), name }, reading)).collect();
+                let previous: HashMap<_, _> = self.agent_sessions.extract_if(|key, _| key.home == home).collect();
+                let changed = previous != held;
+                self.agent_sessions.extend(held);
+                if changed {
+                    self.rebuild_local_projection().await;
+                }
+            }
+        }
+    }
+
+    /// The convoys with a crew member running in the launch that `key` names.
+    fn convoys_running_in(&self, key: &AgentSessionKey) -> Vec<ConvoyKey> {
+        self.terminal_sessions
+            .values()
+            .filter(|session| {
+                flotilla_resources::terminal_records::launch_of(&session.object) == Some(key.name.as_str())
+                    && self.agent_session_home_of(session).as_ref() == Some(&key.home)
+            })
+            .filter_map(|session| {
+                Some((session.object.metadata.namespace.clone(), session.object.metadata.labels.get(CONVOY_LABEL)?.clone()))
+            })
+            .flat_map(|convoy| self.convoy_keys_by_name.get(&convoy).into_iter().flatten().cloned())
+            .collect()
+    }
+
+    /// The home whose AgentSession a crew in `session` records on: the session's own home.
+    fn agent_session_home_of(&self, session: &ReadResourceObject<TerminalSession>) -> Option<flotilla_protocol::NodeId> {
+        match &session.provenance {
+            ResourceProvenance::Local => self.agent_session_home.clone(),
+            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
+        }
+    }
+
+    /// The AgentSession of the crew member running in `session`, the one its home holds under the
+    /// launch the session's view shows, as this home reads it at `now`: this home's own are always
+    /// current, another home's while that home is heard from.
+    fn agent_view(&self, session: &ReadResourceObject<TerminalSession>, now: chrono::DateTime<chrono::Utc>) -> Option<AgentActivityView> {
+        let home = self.agent_session_home_of(session)?;
+        let own = Some(&home) == self.agent_session_home.as_ref();
+        let heard = self.agent_session_heard.get(&home).copied();
+        let current = own || agent_activity::home_current(heard, now);
+        let stale_at = heard.filter(|_| current && !own).map(agent_activity::home_stale_at);
+        let name = flotilla_resources::terminal_records::launch_of(&session.object)?.to_owned();
+        let reading = self.agent_sessions.get(&AgentSessionKey { home, name })?.clone();
+        Some(AgentActivityView { reading, current, stale_at, progress: None })
+    }
+
+    /// An environment's engine record changed, or any of them may have (`None` or a rescan):
+    /// sessions in it are attachable afresh.
+    /// Only the convoys crewed in a changed environment are projected again; a rescan projects
+    /// every convoy.
+    async fn environment_changed(&mut self, change: Option<EnvironmentChange>) {
+        let changed = match change {
+            Some(EnvironmentChange::Changed(name)) => {
+                self.attach_refresh_inputs.retain(|_, input| input.environment != name);
+                Some(name)
+            }
+            Some(EnvironmentChange::Rescanned) | None => {
+                self.attach_refresh_inputs.clear();
+                None
+            }
         };
-        self.attach_refresh_inputs.retain(|_, input| &input.environment != name);
+        let hosts = self.origin_hosts.clone();
         self.rebuild_independents_projection().await;
-        self.rebuild_local_projection().await;
+        match changed {
+            Some(name) if self.origin_hosts == hosts => {
+                let crewed: Vec<_> = self
+                    .terminal_sessions
+                    .iter()
+                    .filter(|(_, session)| session.object.spec.env_ref == name)
+                    .filter_map(|(key, _)| self.session_convoy(key))
+                    .collect();
+                self.project_convoys_named(crewed).await;
+            }
+            _ => self.rebuild_local_projection().await,
+        }
     }
 
     async fn apply_project_event(&mut self, event: ReadWatchEvent<Project>) {
@@ -1844,34 +2064,62 @@ impl Aggregator {
     }
 
     async fn apply_convoy_ensure_event(&mut self, event: ReadWatchEvent<ConvoyEnsure>) {
-        match event {
+        let key = match event {
             ReadWatchEvent::Added(ensure) | ReadWatchEvent::Modified(ensure) => {
                 let key = repository_source_key(&ensure.object.metadata.namespace, &ensure.object.metadata.name, &ensure.provenance);
-                self.convoy_ensures.insert(key, ensure.object);
+                self.convoy_ensures.insert(key.clone(), ensure.object);
+                key
             }
             ReadWatchEvent::Deleted(ensure) => {
                 let key = repository_source_key(&ensure.object.metadata.namespace, &ensure.object.metadata.name, &ensure.provenance);
                 self.convoy_ensures.remove(&key);
+                key
             }
             ReadWatchEvent::DeletedByName { tombstone, provenance } => {
-                self.convoy_ensures.remove(&tombstone_key(&tombstone, &provenance));
+                let key = tombstone_key(&tombstone, &provenance);
+                self.convoy_ensures.remove(&key);
+                key
             }
-        }
-        self.rebuild_standing_roles().await;
+        };
+        self.refresh_standing_role(&key.0, &key.1).await;
     }
 
-    /// One row per declared role. Several roots may hold a copy of the same
-    /// definition, but only the admitting root records controller status, so
-    /// the representative is the copy carrying that status (local first).
-    async fn rebuild_standing_roles(&self) {
-        let mut representatives: BTreeMap<(&str, &str), &ResourceObject<ConvoyEnsure>> = BTreeMap::new();
+    /// One declaration per role. Several roots may hold a copy of the same definition; any copy
+    /// serves, since nothing of the role's state is stored on it (#3108). This host's comes first.
+    fn standing_role_declarations(&self) -> BTreeMap<(String, String), ResourceObject<ConvoyEnsure>> {
+        let mut declared = BTreeMap::new();
         for ((namespace, name, _), ensure) in &self.convoy_ensures {
-            let slot = representatives.entry((namespace.as_str(), name.as_str())).or_insert(ensure);
-            if !ensure_has_controller_status(slot) && ensure_has_controller_status(ensure) {
-                *slot = ensure;
-            }
+            declared.entry((namespace.clone(), name.clone())).or_insert_with(|| ensure.clone());
         }
-        let rows = representatives.into_values().map(standing_role_row).collect();
+        declared
+    }
+
+    /// Re-reads every declared role and republishes their rows.
+    async fn rebuild_standing_roles(&mut self) {
+        let declared = self.standing_role_declarations();
+        for (key, ensure) in &declared {
+            let reading = self.standing_role_port.reading(&key.0, &ensure.spec.project_ref, &ensure.spec.role).await;
+            self.standing_readings.insert(key.clone(), reading);
+        }
+        self.publish_standing_roles(&declared).await;
+    }
+
+    /// Re-reads the role that ensure `name` in `namespace` declares, after a change to it or to
+    /// one of its generations.
+    async fn refresh_standing_role(&mut self, namespace: &str, name: &str) {
+        let declared = self.standing_role_declarations();
+        let key = (namespace.to_owned(), name.to_owned());
+        if let Some(ensure) = declared.get(&key) {
+            let reading = self.standing_role_port.reading(namespace, &ensure.spec.project_ref, &ensure.spec.role).await;
+            self.standing_readings.insert(key, reading);
+        }
+        self.publish_standing_roles(&declared).await;
+    }
+
+    async fn publish_standing_roles(&mut self, declared: &BTreeMap<(String, String), ResourceObject<ConvoyEnsure>>) {
+        self.standing_readings.retain(|key, _| declared.contains_key(key));
+        let rows =
+            declared.iter().map(|(key, ensure)| standing_role_row(ensure, self.standing_readings.get(key).cloned().flatten())).collect();
         let deltas = self.state.replace_standing_role_rows(rows).await;
         self.emit_store_deltas(deltas).await;
     }
@@ -1915,21 +2163,7 @@ impl Aggregator {
         }
     }
 
-    async fn apply_checkout_event(&mut self, event: WatchEvent<Checkout>) -> Result<(), ResourceError> {
-        match event {
-            WatchEvent::Added(checkout) | WatchEvent::Modified(checkout) => {
-                let reference = self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name);
-                self.observed_checkouts.insert(reference, checkout);
-            }
-            WatchEvent::Deleted(checkout) => {
-                let reference = self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name);
-                self.observed_checkouts.remove(&reference);
-            }
-            WatchEvent::DeletedByName(tombstone) => {
-                let reference = self.checkout_ref(&tombstone.namespace, &tombstone.name);
-                self.observed_checkouts.remove(&reference);
-            }
-        }
+    async fn discovered_checkouts_changed(&mut self) -> Result<(), ResourceError> {
         self.rebuild_checkout_rows().await?;
         if self.rebuild_salience_projection().await {
             self.emit_awareness_result_sets().await;
@@ -2013,7 +2247,7 @@ impl Aggregator {
                         .issue(entry.issue.clone())
                         .title(entry.title.clone())
                         .ready_observed_at(entry.ready_observed_at)
-                        .age_seconds(chrono::Utc::now().signed_duration_since(entry.ready_observed_at).num_seconds().max(0) as u64)
+                        .age_seconds(self.clock.now().signed_duration_since(entry.ready_observed_at).num_seconds().max(0) as u64)
                         .attention(attention)
                         .maybe_score(entry.score.clone())
                         .provenance(entry.provenance.clone())
@@ -2037,9 +2271,22 @@ impl Aggregator {
     async fn rebuild_checkout_rows(&self) -> Result<(), ResourceError> {
         let mut replicas = HashMap::<HostName, Vec<CheckoutRow>>::new();
         let mut local = Vec::new();
-        let sources = self.observed_checkouts.values().map(|checkout| (checkout, self.local_host.clone())).chain(
-            self.checkout_replicas.values().filter_map(|source| self.read_host(&source.provenance).map(|host| (&source.object, host))),
-        );
+        // This host's observations, and the checkouts the engine adopted at every home it follows.
+        let adopted = self
+            .engine_checkouts
+            .iter()
+            .filter_map(|record| {
+                let host = self.engine_home_host(&record.home)?;
+                let mut view = record.read_view();
+                view.metadata.namespace = self.engine_namespace.clone();
+                Some((view, host))
+            })
+            .collect::<Vec<_>>();
+        let discovered = self.discovered_checkouts.views(&self.discovered_namespace);
+        let sources = discovered
+            .iter()
+            .map(|checkout| (checkout, self.local_host.clone()))
+            .chain(adopted.iter().map(|(checkout, host)| (checkout, host.clone())));
         for (checkout, host) in sources {
             let CheckoutSpec::Observed(spec) = &checkout.spec else { continue };
             let authority = checkout.metadata.lifecycle_authority()?.unwrap_or(LifecycleAuthority::Observed);
@@ -2118,7 +2365,6 @@ impl Aggregator {
             .terminal_sessions
             .iter()
             .filter_map(|(key, session)| {
-                let session = self.terminal_view(session)?;
                 let status = session.object.status.as_ref()?;
                 if status.phase != TerminalSessionPhase::Running {
                     return None;
@@ -2158,7 +2404,7 @@ impl Aggregator {
             let host = input.host.clone();
             let resolver = resolver.clone();
             let result_key = key.clone();
-            let task = self.attach_refresh_tasks.spawn(async move {
+            let task = self.attach_refresh_tasks.spawn(flotilla_store::load_metrics::inherit(async move {
                 let targets = [(name, host)];
                 let mut delay = Duration::from_millis(250);
                 let mut warned = false;
@@ -2179,7 +2425,7 @@ impl Aggregator {
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_secs(30));
                 }
-            });
+            }));
             self.attach_refresh_generations.insert(key, (generation, task));
         }
         self.attach_refresh_inputs = inputs;
@@ -2189,13 +2435,17 @@ impl Aggregator {
         if !self.attach_refresh_generations.get(&resolution.key).is_some_and(|(generation, _)| *generation == resolution.generation) {
             return Ok(());
         }
-        if resolution.attachable {
-            self.attachable_sessions.insert(resolution.key);
+        let changed = if resolution.attachable {
+            self.attachable_sessions.insert(resolution.key.clone())
         } else {
-            self.attachable_sessions.remove(&resolution.key);
+            self.attachable_sessions.remove(&resolution.key)
+        };
+        if !changed {
+            return Ok(());
         }
         self.publish_independents_projection(false).await;
-        self.rebuild_local_projection().await;
+        // Only the convoy the session crews shows whether it is attachable.
+        self.project_convoys_named(self.session_convoy(&resolution.key)).await;
         self.rebuild_checkout_rows().await
     }
 
@@ -2248,7 +2498,7 @@ impl Aggregator {
     }
 
     fn salience_facts(&self) -> SalienceFacts {
-        self.salience_facts_at(chrono::Utc::now())
+        self.salience_facts_at(self.clock.now())
     }
 
     fn salience_facts_at(&self, now: chrono::DateTime<chrono::Utc>) -> SalienceFacts {
@@ -2268,17 +2518,18 @@ impl Aggregator {
         });
         let attention = sessions
             .into_iter()
-            .flat_map(|session| {
-                let Some(session) = self.terminal_view(session) else { return Vec::new() };
+            .flat_map(|source| {
+                let session = source;
                 let Some(session_host) = self.read_host(&session.provenance) else { return Vec::new() };
                 let session = &session.object;
                 let Some(convoy) = session.metadata.labels.get(CONVOY_LABEL) else { return Vec::new() };
                 let Some(vessel) = session.metadata.labels.get(VESSEL_LABEL) else { return Vec::new() };
                 let Some(status) = session.status.as_ref() else { return Vec::new() };
-                let Some(observation) = status.attention.as_ref() else { return Vec::new() };
-                if status.phase != TerminalSessionPhase::Running || observation.is_stale_at(now) {
+                if status.phase != TerminalSessionPhase::Running {
                     return Vec::new();
                 }
+                let Some(agent) = self.agent_view(source, now) else { return Vec::new() };
+                let (Some(activity), Some(since)) = (agent.live_activity(), agent.reading.activity_since) else { return Vec::new() };
                 self.convoy_keys_by_name
                     .get(&(session.metadata.namespace.clone(), convoy.clone()))
                     .into_iter()
@@ -2289,8 +2540,8 @@ impl Aggregator {
                         let work = item.object.status.as_ref().and_then(|status| status.work.get(vessel));
                         (self.vessel_host(&reference, work) == session_host).then(|| AttentionFact {
                             target: reference.subresource(format!("vessels/{vessel}")),
-                            state: observation.state,
-                            as_of: observation.as_of,
+                            activity,
+                            as_of: since,
                         })
                     })
                     .collect()
@@ -2299,33 +2550,18 @@ impl Aggregator {
         SalienceFacts { raised, attention }
     }
 
-    fn next_attention_expiry_delay(&self) -> Option<std::time::Duration> {
-        self.next_attention_expiry_delay_at(chrono::Utc::now())
-    }
-
-    fn next_attention_expiry_delay_at(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
-        self.terminal_sessions
-            .values()
-            .filter_map(|session| {
-                let session = self.terminal_view(session)?;
-                let status = session.object.status.as_ref()?;
-                if status.phase != TerminalSessionPhase::Running {
-                    return None;
-                }
-                let attention = status.attention.as_ref()?;
-                if attention.state == TerminalAttentionState::Unobservable {
-                    return None;
-                }
-                attention.as_of.checked_add_signed(TerminalAttention::FRESH_FOR)
-            })
-            .filter(|expiry| self.attention_expired_through.is_none_or(|through| *expiry > through))
+    /// How long until the next home with sessions here stops being current: when its readings
+    /// show as unobservable. A home heard from again before then moves the wake along.
+    fn next_home_stale_delay(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
+        let homes: HashSet<&flotilla_protocol::NodeId> =
+            self.agent_sessions.keys().map(|key| &key.home).filter(|home| Some(*home) != self.agent_session_home.as_ref()).collect();
+        homes
+            .into_iter()
+            .filter_map(|home| self.agent_session_heard.get(home))
+            .map(|heard| agent_activity::home_stale_at(*heard))
+            .filter(|stale| *stale > now)
             .min()
-            .map(|expiry| (expiry - now).to_std().unwrap_or_default())
-    }
-
-    async fn expire_due_attention(&mut self) {
-        self.attention_expired_through = Some(chrono::Utc::now());
-        self.rebuild_local_projection().await;
+            .map(|stale| (stale - now).to_std().unwrap_or_default())
     }
 
     /// How long until the next open hold escalates.
@@ -2351,6 +2587,12 @@ impl Aggregator {
             AttentionSubject::StandingRole { project, .. } => {
                 ResourceRef::new(api_version(Project::API_PATHS), Project::API_PATHS.kind, &self.attention_namespace, project)
             }
+            AttentionSubject::Checkout { checkout, .. } => ResourceRef::new(
+                api_version(flotilla_resources::Checkout::API_PATHS),
+                flotilla_resources::Checkout::API_PATHS.kind,
+                &self.attention_namespace,
+                checkout,
+            ),
         }
     }
 
@@ -2390,19 +2632,21 @@ impl Aggregator {
 
     async fn refresh_origin_hosts(&mut self) {
         let origins = self
-            .convoys_by_source
+            .convoys
             .values()
-            .flat_map(|convoys| convoys.values())
             .map(|convoy| &convoy.provenance)
             .chain(self.sessions_by_source.values().flat_map(|sessions| sessions.values()).map(|session| &session.provenance))
             .chain(self.readiness_vessels.values().map(|source| &source.provenance))
-            .chain(self.readiness_clones.values().map(|source| &source.provenance))
-            .chain(self.readiness_checkouts.values().map(|source| &source.provenance))
-            .chain(self.checkout_replicas.values().map(|checkout| &checkout.provenance))
             .filter_map(|provenance| match provenance {
                 ResourceProvenance::Local => None,
                 ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
             })
+            .chain(
+                self.engine_checkouts
+                    .iter()
+                    .filter(|checkout| self.engine_checkout_home.as_deref() != Some(checkout.home.as_str()))
+                    .map(|checkout| flotilla_protocol::NodeId::new(checkout.home.as_str())),
+            )
             .collect::<HashSet<_>>();
         self.known_origins = origins.clone();
         self.origin_hosts = match &self.attach_resolver {
@@ -2432,10 +2676,9 @@ impl Aggregator {
         session: &ReadResourceObject<TerminalSession>,
         attachable_sessions: &HashSet<SessionKey>,
     ) -> Option<IndependentRow> {
-        let session = self.terminal_view(session)?;
-        let resource = self.terminal_session_ref(&session)?;
+        let resource = self.terminal_session_ref(session)?;
         let host = resource.host.clone().expect("terminal session read reference is host-qualified");
-        let key = session_key(&session);
+        let key = session_key(session);
         let session = &session.object;
         if !is_independent_session(session) {
             return None;
@@ -2539,44 +2782,8 @@ impl Aggregator {
         }
     }
 
-    /// Whether a terminal session is running: behind `[primitives]` the engine's reading of its
-    /// current launch (#3629 layer 8), else its old phase.
-    fn terminal_view(&self, source: &ReadResourceObject<TerminalSession>) -> Option<ReadResourceObject<TerminalSession>> {
-        match flotilla_resources::terminal_launches::read_source(self.lifecycle_reads.as_ref(), source) {
-            Ok((selected, _)) => Some(selected),
-            Err(error) => {
-                tracing::warn!(resource = %source.object.metadata.name, %error, "terminal lifecycle view unavailable");
-                None
-            }
-        }
-    }
-
     fn session_running(&self, session: &ReadResourceObject<TerminalSession>) -> bool {
-        self.terminal_view(session)
-            .is_some_and(|session| session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running))
-    }
-
-    pub(super) fn vessel_phase_from_reading(
-        vessel: &ReadResourceObject<Vessel>,
-        reading: Option<&flotilla_protocol::LifecycleReading>,
-    ) -> VesselPhase {
-        use flotilla_protocol::LifecycleReading;
-        match reading {
-            Some(LifecycleReading::Ready { .. }) => {
-                if vessel.object.status.as_ref().is_some_and(|status| !status.interrupted_roles.is_empty()) {
-                    VesselPhase::Interrupted
-                } else {
-                    VesselPhase::Ready
-                }
-            }
-            Some(LifecycleReading::InProgress | LifecycleReading::Retrying { .. }) => VesselPhase::Provisioning,
-            // Exhaustion is a failed judgement while the engine finishes the terminal GiveUp write.
-            Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. } | LifecycleReading::Exhausted { .. }) => {
-                VesselPhase::Failed
-            }
-            Some(LifecycleReading::Lost | LifecycleReading::Released) => VesselPhase::Lost,
-            None => vessel.object.status.as_ref().map(|status| status.phase).unwrap_or_default(),
-        }
+        session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running)
     }
 
     fn vessel_materialize(&self, namespace: &str, convoy: &str, vessel: &str, vessel_host: &HostName) -> Option<String> {
@@ -2615,17 +2822,35 @@ impl Aggregator {
             .clone()
     }
 
+    /// `read` as its row summarizes it: with the engine's promises, except for a launch the
+    /// convoy views could not read, which has nothing more to read.
+    fn viewed(&self, read: &ReadResourceObject<Convoy>) -> Result<ResourceObject<Convoy>, String> {
+        if unreadable_reason(&read.object).is_some() {
+            return Ok(read.object.clone());
+        }
+        flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, read)
+    }
+
     fn summarize(&self, resource: &ResourceRef, convoy: &ResourceObject<Convoy>) -> ConvoyRow {
         #[cfg(test)]
         self.summarized_convoys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(reason) = unreadable_reason(convoy) {
+            return ConvoyRow::builder()
+                .resource(resource.clone())
+                .name(&convoy.metadata.name)
+                .unreadable(reason.clone())
+                .generation(convoy.spec.generation)
+                .workflow_ref(&convoy.spec.workflow_ref)
+                .project_ref(&convoy.spec.project_ref)
+                .build();
+        }
         let name = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
         let status = convoy.status.as_ref();
         let subject_conflicts = subject_relationship_conflicts(convoy);
-        let project =
-            convoy.spec.project_ref.as_ref().and_then(|name| self.projects.get(&(convoy.metadata.namespace.clone(), name.clone())));
+        let project = self.projects.get(&(convoy.metadata.namespace.clone(), convoy.spec.project_ref.clone()));
         let reference_context = flotilla_resources::convoy_reference_context(
             &convoy.spec.repositories,
-            convoy.spec.project_ref.as_deref(),
+            Some(&convoy.spec.project_ref),
             project.map(|project| &project.spec),
             &[],
             |key| self.repositories.get(key).map(|record| &record.spec),
@@ -2635,6 +2860,8 @@ impl Aggregator {
             entry.repository_key = self.convoy_subject_repository_key(convoy, &entry.subject);
         }
         let phase = status.map(|status| status.phase).unwrap_or_default();
+        let checkouts = self.held_checkouts(convoy);
+        let no_stalls = flotilla_resources::Stalls::default();
         let mut vessels: Vec<VesselRow> = status
             .and_then(|status| status.workflow_snapshot.as_ref())
             .map(|snapshot| {
@@ -2646,8 +2873,9 @@ impl Aggregator {
                             resource,
                             definition,
                             status.and_then(|status| status.work.get(&definition.name)),
-                            status.and_then(|status| status.stalled.as_ref()),
+                            status.map_or(&no_stalls, |status| &status.stalls),
                             status.and_then(|status| status.crew_work.get(&definition.name)),
+                            &checkouts,
                         )
                     })
                     .collect()
@@ -2673,19 +2901,21 @@ impl Aggregator {
             .min()
             .filter(|_| !phase.is_terminal());
         // A standing role's drift is about the role, told on its running convoy.
-        let drift = convoy
-            .spec
-            .project_ref
-            .as_ref()
-            .filter(|_| convoy.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION) && !phase.is_terminal())
-            .and_then(|project| {
-                let role = AttentionSubject::StandingRole { project: project.clone(), role: convoy.spec.role.clone() };
-                self.attentions.iter().find(|open| open.sender == Sender::Standing && open.subject == role)
-            });
+        let drift = (convoy.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION) && !phase.is_terminal())
+            .then(|| AttentionSubject::StandingRole { project: convoy.spec.project_ref.clone(), role: convoy.spec.role.clone() })
+            .and_then(|role| self.attentions.iter().find(|open| open.sender == Sender::Standing && open.subject == role));
+        // A checkout held for this convoy whose removal teardown holds for a person (dirty work
+        // that landed) is about the checkout, not the convoy, so it is found by the convoy's
+        // held checkouts.
+        let held_for_a_person = checkouts.iter().flat_map(BTreeMap::values).filter_map(|launch| {
+            let subject = AttentionSubject::Checkout { host: launch.home.clone(), checkout: launch.checkout_name().to_owned() };
+            self.attentions.iter().find(|open| open.sender == Sender::Teardown && open.subject == subject)
+        });
         let attention_demand = attentions
             .iter()
             .copied()
             .filter(|open| open.sender != Sender::TurnRules)
+            .chain(held_for_a_person)
             .chain(drift)
             .min_by_key(|open| (open.sender != Sender::Teardown, open.sender, &open.subject));
         // Terminal records retain delivery history for explain, but delivery can no
@@ -2697,8 +2927,6 @@ impl Aggregator {
                 status.attention.as_ref().filter(|attention| !phase.is_terminal() || !status.is_turn_delivery_attention(attention))
             })
             .or_else(|| holds.first());
-        let pending_supervisor_turn_count = delivery_status
-            .map_or(0, |status| status.turn_deliveries.values().filter(|delivery| delivery.pending_supervisor_turn.is_some()).count());
         // Preserve unrelated convoy attention and demands even after settlement;
         // only the crew's working surface is suppressed for terminal convoys.
         let surface_state = if !subject_conflicts.is_empty()
@@ -2706,14 +2934,13 @@ impl Aggregator {
             || attention_demand.is_some()
             || convoy_attention.is_some()
             || !holds.is_empty()
-            || pending_supervisor_turn_count > 0
             || vessels.iter().any(|vessel| vessel.surface_state.needs_attention())
         {
             SurfaceState::NeedsYou
         } else if phase.is_terminal() {
             SurfaceState::Available
-        } else if let Some(stalled) = status.and_then(|status| status.stalled.as_ref()) {
-            stalled_surface_state(stalled)
+        } else if let Some(state) = stalls_surface_state(status.into_iter().flat_map(|status| &status.stalls)) {
+            state
         } else if vessels.iter().all(|vessel| vessel.surface_state == SurfaceState::Available) && !vessels.is_empty() {
             SurfaceState::Available
         } else {
@@ -2728,12 +2955,15 @@ impl Aggregator {
             .promise_counts(promise_counts)
             .admission_blockers(
                 status
-                    .and_then(|status| status.stalled.as_ref())
+                    .into_iter()
+                    .flat_map(|status| &status.stalls)
                     .filter(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Controller { .. })))
-                    .map(|stalled| {
-                        vec![ReadinessBlocker { resource: resource.clone(), phase: "Admission".into(), reason: stalled.evidence.clone() }]
+                    .map(|stalled| ReadinessBlocker {
+                        resource: resource.clone(),
+                        phase: "Admission".into(),
+                        reason: stalled.evidence.clone(),
                     })
-                    .unwrap_or_default(),
+                    .collect(),
             )
             .resource(resource.clone())
             .maybe_address_role(convoy.metadata.labels.get(ROLE_LABEL).cloned())
@@ -2761,18 +2991,7 @@ impl Aggregator {
                             format!("conflicting relationships for {details}")
                         })
                     })
-                    .or_else(|| {
-                        let pending = match pending_supervisor_turn_count {
-                            0 => None,
-                            1 => Some("Supervisor turn awaits terminal delivery".to_string()),
-                            count => Some(format!("{count} supervisor turns await terminal delivery")),
-                        };
-                        match (convoy_attention, pending) {
-                            (Some(attention), Some(pending)) => Some(format!("{}; {pending}", attention.reason)),
-                            (Some(attention), None) => Some(attention.reason.clone()),
-                            (None, pending) => pending,
-                        }
-                    })
+                    .or_else(|| convoy_attention.map(|attention| attention.reason.clone()))
                     .or_else(|| status.and_then(|status| status.message.clone())),
             )
             .maybe_disposition(status.and_then(|status| status.disposition.clone()))
@@ -2780,7 +2999,7 @@ impl Aggregator {
             .maybe_started_at(status.and_then(|status| status.started_at))
             .maybe_finished_at(status.and_then(|status| status.finished_at))
             .maybe_observed_workflow_ref(status.and_then(|status| status.observed_workflow_ref.clone()))
-            .maybe_project_ref(convoy.spec.project_ref.clone())
+            .project_ref(&convoy.spec.project_ref)
             .issues(
                 convoy
                     .spec
@@ -2815,7 +3034,7 @@ impl Aggregator {
         convoy.spec.repositories.iter().find_map(|repository| {
             let context = flotilla_resources::convoy_reference_context(
                 std::slice::from_ref(repository),
-                convoy.spec.project_ref.as_deref(),
+                Some(&convoy.spec.project_ref),
                 None,
                 &[],
                 |key| self.repositories.get(key).map(|record| &record.spec),
@@ -2864,8 +3083,9 @@ impl Aggregator {
         convoy_ref: &ResourceRef,
         definition: &VesselRequirement,
         state: Option<&WorkState>,
-        stalled: Option<&StalledCondition>,
+        stalls: &flotilla_resources::Stalls,
         crew_work: Option<&BTreeMap<String, flotilla_resources::CrewWorkState>>,
+        checkouts: &HeldCheckouts,
     ) -> VesselRow {
         let placement = state.and_then(|state| state.placement.as_ref());
         let requested_stance = placement
@@ -2876,6 +3096,7 @@ impl Aggregator {
             .and_then(|placement| placement.fields.get("placement_decision"))
             .and_then(|value| serde_json::from_value(value.clone()).ok());
         let (vessel_host, carried_by) = self.vessel_hosts(convoy_ref, state);
+        let now = self.clock.now();
         let vessel_resource =
             placement.and_then(|placement| placement.fields.get("vessel_ref")).and_then(serde_json::Value::as_str).map(|name| {
                 ResourceRef::new(api_version(Vessel::API_PATHS), Vessel::API_PATHS.kind, &convoy_ref.namespace, name)
@@ -2913,14 +3134,11 @@ impl Aggregator {
                     command_preview,
                     requested_stance: requested_stance.clone(),
                     effective_stance: effective_stance.clone(),
+                    agent_session: session.and_then(|session| self.agent_view(session, now)).map(|agent| agent.row_reading()),
                 }
             })
             .collect();
-        let now = chrono::Utc::now();
-        let selected_sessions = self
-            .convoy_sessions(&convoy_ref.namespace, &convoy_ref.name)
-            .filter_map(|source| self.terminal_view(source))
-            .collect::<Vec<_>>();
+        let selected_sessions = self.convoy_sessions(&convoy_ref.namespace, &convoy_ref.name).cloned().collect::<Vec<_>>();
         let matching_sessions = || {
             selected_sessions.iter().filter(|session| {
                 session.object.metadata.namespace == convoy_ref.namespace
@@ -2942,10 +3160,6 @@ impl Aggregator {
             Some(limits) => Some(placement_limits.unwrap_or_default().with_overrides(limits)),
             None => placement_limits,
         };
-        let completion_pending = matching_sessions()
-            .filter_map(|session| session.object.status.as_ref()?.completion_pending.as_ref())
-            .min_by_key(|pending| pending.attempted_at)
-            .cloned();
         let vessel_subject = AttentionSubject::Vessel { convoy: convoy_ref.name.clone(), vessel: definition.name.clone() };
         let credential_attention = self
             .convoy_attentions(&convoy_ref.namespace, &convoy_ref.name)
@@ -2972,23 +3186,21 @@ impl Aggregator {
             // Several blocked sessions on one vessel show one, chosen
             // lexicographically (role first) so the row is stable.
             .min();
-        let surface_state = if credential_attention.is_some() || completion_pending.is_some() || obstruction.is_some() {
+        let surface_state = if credential_attention.is_some() || obstruction.is_some() {
             SurfaceState::NeedsYou
-        } else if let Some(stalled) = stalled.filter(|stalled| {
+        } else if let Some(state) = stalls_surface_state(stalls.iter().filter(|stalled| {
             matches!(&stalled.maker, Some(flotilla_resources::LeafMaker::Actor { vessel, .. }) if vessel == &definition.name)
                 || stalled
                     .leaves
                     .iter()
                     .any(|leaf| matches!(&leaf.address, flotilla_protocol::LeafAddress::Work { work, .. } if work == &definition.name))
-        }) {
-            stalled_surface_state(stalled)
+        })) {
+            state
         } else {
             matching_sessions()
-                .filter_map(|session| session.object.status.as_ref())
-                .filter(|status| status.phase == TerminalSessionPhase::Running)
-                .filter_map(|status| status.attention.as_ref())
-                .filter(|attention| !attention.is_stale_at(now))
-                .map(|attention| terminal_surface_state(attention.state))
+                .filter(|session| session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running))
+                .filter_map(|session| self.agent_view(session, now)?.live_activity())
+                .map(agent_surface_state)
                 .max_by_key(|state| match state {
                     SurfaceState::NeedsYou => 2,
                     SurfaceState::Working => 1,
@@ -2996,9 +3208,10 @@ impl Aggregator {
                 })
                 .unwrap_or_default()
         };
-        let (mut readiness, loss_reason) = self.vessel_readiness(convoy_ref, definition, state, crew_work, &vessel_host);
+        let (mut readiness, loss_reason) = self.vessel_readiness(convoy_ref, definition, state, crew_work, &vessel_host, checkouts);
         if readiness.state == ReadinessState::Provisioning {
-            if let Some(stalled) = stalled.filter(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Controller { .. })))
+            if let Some(stalled) =
+                stalls.iter().find(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Controller { .. })))
             {
                 readiness.state = ReadinessState::Blocked;
                 readiness.blockers.push(ReadinessBlocker {
@@ -3035,7 +3248,6 @@ impl Aggregator {
                     state
                         .filter(|state| state.phase == ResourceWorkPhase::Interrupted)
                         .and_then(|state| state.message.clone())
-                        .or_else(|| completion_pending.map(|pending| format!("completion pending: {}", pending.last_error)))
                         .or_else(|| obstruction.clone())
                         .or_else(|| terminal_condition.clone())
                         .or_else(|| state.and_then(|state| state.message.clone()))
@@ -3102,15 +3314,9 @@ fn same_host_authority(left: &ResourceObject<flotilla_resources::Host>, right: &
     left.spec.display_name == right.spec.display_name && left.spec.connection == right.spec.connection
 }
 
-fn ensure_has_controller_status(ensure: &ResourceObject<ConvoyEnsure>) -> bool {
-    ensure.status.as_ref().is_some_and(|status| {
-        status.convoy_ref.is_some() || status.hold_reason.is_some() || status.restart_count > 0 || status.last_failure.is_some()
-    })
-}
-
-fn standing_role_row(ensure: &ResourceObject<ConvoyEnsure>) -> StandingRoleRow {
-    let status = ensure.status.clone().unwrap_or_default();
-    StandingRoleRow::builder()
+/// `ensure`'s row, its state from `reading`; with none the state is unknown.
+fn standing_role_row(ensure: &ResourceObject<ConvoyEnsure>, reading: Option<crate::ports::StandingRoleReading>) -> StandingRoleRow {
+    let row = StandingRoleRow::builder()
         .resource(ResourceRef::new(
             api_version(ConvoyEnsure::API_PATHS),
             ConvoyEnsure::API_PATHS.kind,
@@ -3119,24 +3325,20 @@ fn standing_role_row(ensure: &ResourceObject<ConvoyEnsure>) -> StandingRoleRow {
         ))
         .project_ref(&ensure.spec.project_ref)
         .role(&ensure.spec.role)
-        .maybe_presents_as(ensure.spec.presents_as.clone())
-        .maybe_convoy_ref(status.convoy_ref)
-        .maybe_hold(status.hold_reason.map(|hold| match hold {
-            ConvoyEnsureHoldReason::BackingUnverified => StandingRoleHold::BackingUnverified,
-            ConvoyEnsureHoldReason::RestartLimit => StandingRoleHold::RestartLimit,
-        }))
-        .strikes(status.restart_count)
-        .maybe_next_attempt(status.retry_at)
-        .maybe_last_failure(
-            status
-                .declaration_refused
-                .map(|refusal| format!("DeclarationRefused: {}", refusal.message))
-                .or_else(|| status.config_drift.map(|drift| format!("ConfigDrift: {}", drift.changes.join("; "))))
-                .or(status.last_failure),
-        )
-        .build()
+        .maybe_presents_as(ensure.spec.presents_as.clone());
+    match reading {
+        Some(reading) => row
+            .maybe_convoy_ref(reading.convoy_ref)
+            .maybe_hold(reading.hold)
+            .strikes(reading.strikes)
+            .maybe_next_attempt(reading.next_attempt)
+            .maybe_last_failure(reading.last_failure)
+            .build(),
+        None => row.state_unknown(true).build(),
+    }
 }
 
+#[cfg(test)]
 fn local_read_event<T: Resource>(event: WatchEvent<T>) -> ReadWatchEvent<T> {
     let local = |object| ReadResourceObject { object, provenance: ResourceProvenance::Local };
     match event {
@@ -3174,12 +3376,18 @@ fn session_key(session: &ReadResourceObject<TerminalSession>) -> SessionKey {
     (session.object.metadata.namespace.clone(), session.object.metadata.name.clone(), origin)
 }
 
-fn terminal_surface_state(state: TerminalAttentionState) -> SurfaceState {
-    match state {
-        TerminalAttentionState::NeedsInput => SurfaceState::NeedsYou,
-        TerminalAttentionState::Idle => SurfaceState::Available,
-        TerminalAttentionState::Working | TerminalAttentionState::Unobservable => SurfaceState::Working,
+fn agent_surface_state(activity: flotilla_protocol::AgentActivity) -> SurfaceState {
+    use flotilla_protocol::AgentActivity;
+    match activity {
+        AgentActivity::NeedsInput => SurfaceState::NeedsYou,
+        AgentActivity::Idle | AgentActivity::Interrupted => SurfaceState::Available,
+        AgentActivity::Working => SurfaceState::Working,
     }
+}
+
+/// The surface of several stalls: one needing a person outranks those a rung handles.
+fn stalls_surface_state<'a>(stalls: impl Iterator<Item = &'a StalledCondition>) -> Option<SurfaceState> {
+    stalls.map(stalled_surface_state).max_by_key(|state| *state == SurfaceState::NeedsYou)
 }
 
 fn stalled_surface_state(stalled: &StalledCondition) -> SurfaceState {
@@ -3207,6 +3415,12 @@ fn convoy_references_repo(convoy: &ResourceObject<Convoy>, repo_identity: &RepoI
 fn is_independent_session(session: &ResourceObject<TerminalSession>) -> bool {
     !session.metadata.labels.contains_key(CONVOY_LABEL)
         && session.status.as_ref().map(|status| status.phase) == Some(TerminalSessionPhase::Running)
+}
+
+/// Why the convoy views could not read `convoy`'s launch. They list such a launch with no status
+/// and the reason; a launch they read always has a status, and never carries the reason.
+fn unreadable_reason(convoy: &ResourceObject<Convoy>) -> Option<&String> {
+    convoy.metadata.annotations.get(CONVOY_UNREADABLE_ANNOTATION).filter(|_| convoy.status.is_none())
 }
 
 fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
@@ -3246,6 +3460,7 @@ fn work_phase(phase: ResourceWorkPhase) -> WorkPhase {
 
 #[cfg(test)]
 mod tests {
+    use flotilla_resources::VesselPhase;
     use std::{
         collections::{BTreeMap, VecDeque},
         sync::{
@@ -3256,11 +3471,12 @@ mod tests {
     };
 
     use chrono::Utc;
-    use flotilla_protocol::{result_set::Rows, PrincipalRef, Subject};
+    use flotilla_protocol::{result_set::Rows, PrincipalRef, StandingRoleHold, Subject};
     use flotilla_resources::{
-        BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject, EnvironmentSpec, HostDirectEnvironmentSpec,
+        discovered_checkouts::DiscoveredCheckout, BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject,
         InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus, ProjectSpec, RepositorySpec, TerminalAttention,
-        TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
+        TerminalAttentionSource, TerminalAttentionState, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+        VesselRequirement, WorkflowSnapshot,
     };
     use flotilla_store::ResourceBackend;
     use futures::stream;
@@ -3269,77 +3485,80 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn terminal_evidence_distinguishes_available_from_needs_you() {
-        assert!(terminal_surface_state(TerminalAttentionState::NeedsInput).needs_attention());
-        assert!(terminal_surface_state(TerminalAttentionState::Idle) == SurfaceState::Available);
-        assert!(!terminal_surface_state(TerminalAttentionState::Idle).needs_attention());
-        assert!(!terminal_surface_state(TerminalAttentionState::Working).needs_attention());
-        assert!(!terminal_surface_state(TerminalAttentionState::Unobservable).needs_attention());
+    /// This aggregator's own home, once a test has an agent report on it.
+    const OWN_HOME: &str = "local-node-id";
+
+    /// The launch a test session's view shows: its first. Its AgentSession is named by it.
+    fn test_launch(session: &str) -> String {
+        format!("{session}#1")
     }
 
-    #[tokio::test]
-    async fn pending_supervisor_turn_is_visible_on_the_governor_convoy() {
-        let state = AggregatorProjectionState::new();
-        let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
-        let mut governor = convoy_with_vessel("governor").await;
-        let status = governor.status.as_mut().expect("status");
-        status.attention = Some(flotilla_resources::ConvoyAttention {
-            source: "existing-attention".to_string(),
-            reason: "Existing concern".to_string(),
-            raised_at: Utc::now(),
-        });
-        status.turn_deliveries.insert(
-            "supervision-1".to_string(),
-            flotilla_resources::TurnDeliveryStatus {
-                pending_supervisor_turn: Some(flotilla_resources::PendingSupervisorTurn {
-                    queued_order: 0,
-                    vessel: "govern".to_string(),
-                    role: "governor".to_string(),
-                    message: flotilla_resources::TerminalCrewMessage {
-                        id: "supervision-1".to_string(),
-                        text: "Supervise the stalled crew".to_string(),
-                        sender: flotilla_resources::CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
-                        delivery: flotilla_resources::CrewMessageDelivery::Queued,
-                        acknowledged: Default::default(),
-                        following: Vec::new(),
-                    },
-                }),
-                ..Default::default()
-            },
+    /// The crew in TerminalSession `session` reports `activity` on its AgentSession, named by the
+    /// session's [`test_launch`], at `home` (`None`: this home), as the decided store's follow
+    /// delivers it.
+    async fn agent_reports(
+        aggregator: &mut Aggregator,
+        home: Option<&str>,
+        session: &str,
+        activity: flotilla_protocol::AgentActivity,
+        since: chrono::DateTime<Utc>,
+    ) {
+        let own = aggregator.agent_session_home.get_or_insert_with(|| flotilla_protocol::NodeId::new(OWN_HOME)).clone();
+        let home = home.map(flotilla_protocol::NodeId::new).unwrap_or(own);
+        let reading = flotilla_protocol::AgentSessionReading {
+            ended: None,
+            activity: Some(activity),
+            activity_since: Some(since),
+            activity_cause: Some("Stop".into()),
+            stale: false,
+        };
+        aggregator
+            .agent_sessions_changed(AgentSessionUpdate::Changed(vec![(
+                AgentSessionKey { home, name: test_launch(session) },
+                Some(reading),
+            )]))
+            .await;
+    }
+
+    /// `aggregator` reading its convoy rows through an installed engine Convoy path, as the
+    /// daemon's does; the engine holds none of the test's convoys, so their rows show them as
+    /// stored. The path lives as long as the returned home.
+    pub(super) fn with_convoy_engine(aggregator: Aggregator) -> (Aggregator, flotilla_engine_convoys_testkit::EngineConvoysHome) {
+        let engine_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let home = flotilla_engine_convoys_testkit::EngineConvoysHome::open(
+            OWN_HOME,
+            "flotilla",
+            &engine_backend,
+            Arc::new(flotilla_resources::SystemClock),
+            Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
         );
-        let mut no_prior_attention = governor.clone();
-        no_prior_attention.metadata.name = "governor-no-prior-attention".to_string();
-        no_prior_attention.status.as_mut().expect("status").attention = None;
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(governor)).await;
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(no_prior_attention)).await;
-        let result = state.result_set().await;
-        let row = result.rows.as_convoys().expect("convoys").iter().find(|row| row.name == "governor").expect("governor row");
-        assert_eq!(row.surface_state, SurfaceState::NeedsYou);
-        assert!(row.message.as_deref().is_some_and(|message| message.contains("Existing concern")));
-        assert!(row.message.as_deref().is_some_and(|message| message.contains("Supervisor turn awaits terminal delivery")));
-        assert!(!row.message.as_deref().is_some_and(|message| message.contains("Supervise the stalled crew")));
-        let row = result
-            .rows
-            .as_convoys()
-            .expect("convoys")
-            .iter()
-            .find(|row| row.name == "governor-no-prior-attention")
-            .expect("governor row without attention");
-        assert_eq!(row.surface_state, SurfaceState::NeedsYou);
-        assert_eq!(row.message.as_deref(), Some("Supervisor turn awaits terminal delivery"));
+        (aggregator.with_convoy_engine(home.path(), "flotilla"), home)
+    }
+
+    /// This home hears from `home` at `at`, as a keepalive or entry on its change stream.
+    async fn home_heard(aggregator: &mut Aggregator, home: &str, at: chrono::DateTime<Utc>) {
+        aggregator.agent_sessions_changed(AgentSessionUpdate::Heard { home: flotilla_protocol::NodeId::new(home), at }).await;
+    }
+
+    #[test]
+    fn agent_activity_distinguishes_available_from_needs_you() {
+        use flotilla_protocol::AgentActivity;
+        assert!(agent_surface_state(AgentActivity::NeedsInput).needs_attention());
+        assert!(agent_surface_state(AgentActivity::Idle) == SurfaceState::Available);
+        assert!(agent_surface_state(AgentActivity::Interrupted) == SurfaceState::Available);
+        assert!(!agent_surface_state(AgentActivity::Idle).needs_attention());
+        assert!(!agent_surface_state(AgentActivity::Working).needs_attention());
     }
 
     #[tokio::test]
     async fn fleet_surface_states_keep_available_and_handled_stalls_out_of_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         for name in ["governor-a", "governor-b", "governor-c", "crew", "orphan"] {
             let mut convoy = convoy_with_vessel(name).await;
             if name == "crew" || name == "orphan" {
-                convoy.status.as_mut().expect("status").stalled = Some(StalledCondition {
+                convoy.status.as_mut().expect("status").stalls.set(StalledCondition {
                     leaves: Vec::new(),
                     maker: (name == "crew")
                         .then(|| flotilla_resources::LeafMaker::Actor { vessel: "implement".into(), role: "coder".into() }),
@@ -3357,16 +3576,12 @@ mod tests {
                     nudge_history: Vec::new(),
                 });
             }
-            aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+            aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
             if name.starts_with("governor") {
                 let mut session = session_object(&format!("terminal-{name}")).await;
                 session.metadata.labels =
                     BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-                session.status.as_mut().expect("status").attention = Some(TerminalAttention {
-                    state: TerminalAttentionState::Idle,
-                    as_of: Utc::now(),
-                    source: TerminalAttentionSource::Hook,
-                });
+                agent_reports(&mut aggregator, None, &format!("terminal-{name}"), flotilla_protocol::AgentActivity::Idle, Utc::now()).await;
                 aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
             }
         }
@@ -3437,11 +3652,12 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let attentions = Arc::new(SetAttentions::default());
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla"),
+        );
         let query = QueryId::Convoys { scope: None };
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query, since: None }]);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
         let credential = open_attention(
             Sender::Capabilities,
             AttentionSubject::Vessel { convoy: "convoy-a".into(), vessel: "implement".into() },
@@ -3469,6 +3685,55 @@ mod tests {
         assert!(!convoy.vessels[0].surface_state.needs_attention());
     }
 
+    // Behaviour (stale needs_you on landed convoys): a convoy's teardown releases its vessel
+    // before the convoy's Landed event reaches the listing. A released vessel ended on purpose:
+    // neither it nor its convoy needs anyone, before the Landed event or after.
+    #[tokio::test]
+    async fn a_released_vessel_needs_no_one() {
+        use flotilla_provisioning_testkit::{object, VesselsFixture};
+        use flotilla_resources::{vessel_records::VesselStep, VesselSpec, VesselStatus};
+
+        // The listing's convoy is still the one before its teardown: Active, its work running.
+        let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
+        let definition = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).expect("snapshot").vessels[0].clone();
+        let fixture = VesselsFixture::default();
+        let launch = fixture.request(&convoy.metadata.name, &definition.name, "local");
+        fixture.step(&launch, VesselStep::Realised { environment: "env".into() });
+        fixture.step(&launch, VesselStep::Released);
+        let vessel = object::<Vessel>(
+            &launch,
+            VesselSpec {
+                convoy_ref: convoy.metadata.name.clone(),
+                vessel_name: definition.name.clone(),
+                fulfilment_kind_ref: "local".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+            VesselStatus::default(),
+        );
+        let state = AggregatorProjectionState::new();
+        let (events, _) = broadcast::channel(8);
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), events).with_lifecycle_reads(fixture.reads.clone()));
+        aggregator
+            .vessel_changed(ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local }))
+            .await;
+        let surfaces =
+            |rows: &[ConvoyRow]| (rows[0].surface_state, rows[0].vessels.iter().map(|vessel| vessel.surface_state).collect::<Vec<_>>());
+
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
+        let result = state.result_set().await;
+        let (convoy_surface, vessel_surfaces) = surfaces(result.rows.as_convoys().expect("convoy rows"));
+        assert_ne!(convoy_surface, SurfaceState::NeedsYou, "before its Landed event");
+        assert!(!vessel_surfaces.contains(&SurfaceState::NeedsYou), "before its Landed event: {vessel_surfaces:?}");
+
+        convoy.status.as_mut().expect("status").phase = ResourceConvoyPhase::Landed;
+        aggregator.apply_convoy_event(WatchEvent::Modified(convoy)).await;
+        let result = state.result_set().await;
+        let (convoy_surface, vessel_surfaces) = surfaces(result.rows.as_convoys().expect("convoy rows"));
+        assert_ne!(convoy_surface, SurfaceState::NeedsYou, "once Landed");
+        assert!(!vessel_surfaces.contains(&SurfaceState::NeedsYou), "once Landed: {vessel_surfaces:?}");
+    }
+
     // #3460: an idle crew whose composer holds a stray reply is not "working":
     // the vessel and convoy need an operator, and the vessel names the
     // condition and the exact recovery command.
@@ -3476,10 +3741,10 @@ mod tests {
     async fn idle_crew_with_composer_text_names_itself_in_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         state
             .replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: QueryId::Convoys { scope: None }, since: None }]);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
         let mut session = session_object("terminal-convoy-a-implement").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
@@ -3518,18 +3783,19 @@ mod tests {
         assert_eq!(result_set.rows.as_convoys().expect("convoy rows")[0].vessels[0].surface_state, SurfaceState::Working);
     }
 
-    // #3455: a held message batch for a crew names itself at the top of the
-    // convoy's attention instead of a generic "needs you", and clears with it.
+    // #3455: an open attention about a crew's role names itself at the top of
+    // the convoy's attention instead of a generic "needs you", and clears with it.
     #[tokio::test]
-    async fn held_message_batch_names_itself_in_convoy_attention() {
+    async fn an_open_crew_attention_names_itself_in_convoy_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let attentions = Arc::new(SetAttentions::default());
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla"),
+        );
         state
             .replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: QueryId::Convoys { scope: None }, since: None }]);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
         let mut session = session_object("terminal-convoy-a-implement").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
@@ -3537,9 +3803,7 @@ mod tests {
         let mut other = session_object("terminal-convoy-b-implement").await;
         other.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-b".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        let description = "message batch `message-0` is held for flotilla/convoy-a/implement/coder (1 message: message-0): delivery held: \
-            terminal was not ready before submission; attempt 3/3; clear it with \
-            `flotilla resource fail-message-batch message-0 --namespace flotilla --reason '<why>'`";
+        let description = "a turn rule for flotilla/convoy-a/implement/coder needs a person to rule on it";
         let held = |convoy: &str| {
             open_attention(Sender::TurnRules, AttentionSubject::ConvoyRole { convoy: convoy.into(), role: "coder".into() }, description)
         };
@@ -3568,16 +3832,15 @@ mod tests {
     async fn attention_projection_is_namespace_scoped_and_tracks_idle_unsettled_sessions() {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
         let query = QueryId::Convoys { scope: None };
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: query.clone(), since: None }]);
 
         let mut session = session_object("terminal-convoy-a-implement").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: Utc::now(), source: TerminalAttentionSource::Screen });
+        agent_reports(&mut aggregator, None, "terminal-convoy-a-implement", flotilla_protocol::AgentActivity::Idle, Utc::now()).await;
 
         let mut foreign_session = session.clone();
         foreign_session.metadata.namespace = "other".to_string();
@@ -3609,41 +3872,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_crew_completion_is_visible_on_the_convoy() {
-        let state = AggregatorProjectionState::new();
-        let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
-
-        let mut session = session_object("terminal-convoy-a-implement").await;
-        session.metadata.labels =
-            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        session.status.as_mut().expect("running status").completion_pending = Some(flotilla_resources::CrewCompletionPending {
-            message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
-            disposition: None,
-            decision_ledger_ref: None,
-            force: false,
-            principal_ref: None,
-            attempted_at: Utc::now(),
-            authority: "kiwi".into(),
-            last_error: "authority unreachable for convoy-a".into(),
-        });
-
-        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
-
-        let result_set = state.result_set().await;
-        let convoy = result_set.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
-        assert!(convoy.surface_state.needs_attention());
-        let vessel = convoy.vessels.first().expect("vessel row");
-        assert!(vessel.surface_state.needs_attention());
-        assert_eq!(vessel.message.as_deref(), Some("completion pending: authority unreachable for convoy-a"));
-    }
-
-    #[tokio::test]
     async fn adopted_change_request_claim_does_not_raise_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = convoy_with_vessel("adopted-pr").await;
         let subject = Subject {
             kind: flotilla_protocol::SubjectKind::ChangeRequest,
@@ -3661,7 +3893,7 @@ mod tests {
         for source in [flotilla_resources::SubjectDiscoverySource::Branch, flotilla_resources::SubjectDiscoverySource::Claim] {
             status.discover_subject(subject.clone(), flotilla_protocol::Relationship::Produces, source, Utc::now());
         }
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
         let result = state.result_set().await;
         let row = &result.rows.as_convoys().expect("convoys")[0];
         assert_ne!(row.surface_state, SurfaceState::NeedsYou);
@@ -3672,7 +3904,7 @@ mod tests {
     async fn multiple_produced_subjects_do_not_raise_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         let now = Utc::now();
         for number in [281, 282] {
@@ -3690,7 +3922,7 @@ mod tests {
                 now,
             );
         }
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
         let result = state.result_set().await;
         let row = &result.rows.as_convoys().expect("convoys")[0];
         assert_ne!(row.surface_state, SurfaceState::NeedsYou);
@@ -3703,32 +3935,25 @@ mod tests {
             flotilla_resources::SubjectDiscoverySource::Operator,
             now,
         );
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Modified(convoy)).await;
         let result = state.result_set().await;
         let row = &result.rows.as_convoys().expect("convoys")[0];
         assert_ne!(row.surface_state, SurfaceState::NeedsYou);
         assert_eq!(row.subjects.len(), 3);
     }
 
-    // The TUI vessel message exposes provider degradation and confirmed loss;
+    // The TUI vessel message exposes an unreachable daemon and confirmed loss;
     // neither is hidden behind raw-resource inspection, and recovery clears it.
     #[tokio::test]
     async fn vessel_projection_surfaces_terminal_degradation_loss_and_recovery() {
-        use flotilla_resources::{StatusPatch, TerminalSessionStatusPatch};
-
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("health-convoy").await)).await;
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("health-convoy").await)).await;
         let mut session = session_object("health-session").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "health-convoy".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        TerminalSessionStatusPatch::MarkReconcileDegraded {
-            message: "provider offline".into(),
-            consecutive_failures: 100,
-            observed_at: Utc::now(),
-        }
-        .apply(session.status.as_mut().expect("status"));
+        session.status.as_mut().expect("status").daemon_unreachable = Some("daemon forward down: provider offline".into());
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
         let rows = state.result_set().await;
         let vessel = &rows.rows.as_convoys().expect("convoys")[0].vessels[0];
@@ -3736,14 +3961,17 @@ mod tests {
             .message
             .as_deref()
             .is_some_and(|message| message.contains("provider unavailable") && message.contains("provider offline")));
-        TerminalSessionStatusPatch::MarkLost { reason: "generation dead".into(), lost_at: Utc::now() }
-            .apply(session.status.as_mut().expect("status"));
+        let status = session.status.as_mut().expect("status");
+        status.phase = flotilla_resources::TerminalSessionPhase::Lost;
+        status.message = Some("generation dead".into());
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session.clone())).await;
         let rows = state.result_set().await;
         let vessel = &rows.rows.as_convoys().expect("convoys")[0].vessels[0];
         assert!(vessel.message.as_deref().is_some_and(|message| message.contains("session lost") && message.contains("generation dead")));
-        TerminalSessionStatusPatch::MarkRevived.apply(session.status.as_mut().expect("status"));
-        TerminalSessionStatusPatch::ClearReconcileDegraded.apply(session.status.as_mut().expect("status"));
+        let status = session.status.as_mut().expect("status");
+        status.phase = flotilla_resources::TerminalSessionPhase::Running;
+        status.message = None;
+        status.daemon_unreachable = None;
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session)).await;
         let rows = state.result_set().await;
         let vessel = &rows.rows.as_convoys().expect("convoys")[0].vessels[0];
@@ -3757,7 +3985,7 @@ mod tests {
     async fn vessel_needs_you_overrides_a_different_handled_stall() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         let status = convoy.status.as_mut().expect("convoy status");
         status
@@ -3767,7 +3995,7 @@ mod tests {
             .vessels
             .push(VesselRequirement::builder().name("review".to_string()).crew(Vec::new()).build());
         status.work.insert("review".into(), WorkState::builder().phase(ResourceWorkPhase::Ready).build());
-        status.stalled = Some(StalledCondition {
+        status.stalls.set(StalledCondition {
             leaves: Vec::new(),
             maker: Some(flotilla_resources::LeafMaker::Actor { vessel: "implement".into(), role: "coder".into() }),
             evidence: "idle at turn end".into(),
@@ -3783,21 +4011,19 @@ mod tests {
             proposed_disposition: None,
             nudge_history: Vec::new(),
         });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
 
         let mut session = session_object("terminal-convoy-a-review").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "review".to_string())]);
-        session.status.as_mut().expect("session status").completion_pending = Some(flotilla_resources::CrewCompletionPending {
-            message: None,
-            disposition: None,
-            decision_ledger_ref: None,
-            force: false,
-            principal_ref: None,
-            attempted_at: Utc::now(),
-            authority: "local".into(),
-            last_error: "authority unreachable".into(),
+        // An idle crew whose composer holds text needs the operator.
+        let status = session.status.as_mut().expect("session status");
+        status.attention = Some(TerminalAttention {
+            state: TerminalAttentionState::Unobservable,
+            as_of: Utc::now(),
+            source: TerminalAttentionSource::Screen,
         });
+        status.screen_obstruction = Some(flotilla_resources::ScreenObstruction::ComposerText { reply: None, chars: 3 });
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
 
         let result = state.result_set().await;
@@ -3818,7 +4044,8 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
         let resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(Arc::clone(&resolver));
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(Arc::clone(&resolver)));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement = Some(PlacementStatus {
             fields: BTreeMap::from([
@@ -3826,14 +4053,21 @@ mod tests {
                 ("vessel_ref".to_string(), serde_json::json!("convoy-a-implement")),
             ]),
         });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
 
         let now = Utc::now();
         let mut session = session_object("terminal-convoy-a-implement-coder").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::NeedsInput, as_of: now, source: TerminalAttentionSource::Hook });
+        home_heard(&mut aggregator, "feta-node-id", now).await;
+        agent_reports(
+            &mut aggregator,
+            Some("feta-node-id"),
+            "terminal-convoy-a-implement-coder",
+            flotilla_protocol::AgentActivity::NeedsInput,
+            now,
+        )
+        .await;
         let endpoint = flotilla_protocol::result_set::CleatEndpoint {
             runtime_root: "/var/lib/flotilla/cleat".to_owned(),
             daemon: "work@3".to_owned(),
@@ -3862,26 +4096,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicated_idle_attention_stays_stable_across_refreshes_and_unrelated_rebuilds() {
+    async fn replicated_idle_agent_stays_stable_across_refreshes_and_unrelated_rebuilds() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
         let resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(resolver);
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(resolver));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement =
             Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
 
         let now = Utc::now();
         let mut session = session_object("terminal-convoy-a-implement-coder").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        home_heard(&mut aggregator, "feta-node-id", now).await;
         for age in [80, 40, 0] {
-            session.status.as_mut().expect("running status").attention = Some(TerminalAttention {
-                state: TerminalAttentionState::Idle,
-                as_of: now - chrono::Duration::seconds(age),
-                source: TerminalAttentionSource::Screen,
-            });
+            // A reading's age is not its freshness: its home was heard from just now.
+            agent_reports(
+                &mut aggregator,
+                Some("feta-node-id"),
+                "terminal-convoy-a-implement-coder",
+                flotilla_protocol::AgentActivity::Idle,
+                now - chrono::Duration::seconds(age),
+            )
+            .await;
             aggregator
                 .apply_replica_session_event(ReadWatchEvent::Modified(ReadResourceObject {
                     object: session.clone(),
@@ -3895,43 +4135,95 @@ mod tests {
             let convoy = before.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
             assert_eq!(convoy.surface_state, SurfaceState::Available, "availability dropped at observation age {age}s");
             assert_eq!(convoy.vessels[0].surface_state, SurfaceState::Available);
-            aggregator.apply_environment_event(WatchEvent::Added(environment_object("unrelated").await)).await;
+            aggregator.environment_changed(Some(EnvironmentChange::Changed("unrelated".into()))).await;
             let after = state.result_set().await;
             assert_eq!(after.seq, before.seq, "unrelated rebuild changed attention at observation age {age}s");
         }
     }
 
+    // A home gone quiet: its crew's readings stop being current once, at the moment
+    // HOME_HEARD_WITHIN after it was last heard, and hearing from it again restores them.
     #[tokio::test]
-    async fn lost_attention_observation_expires_once_at_its_deadline() {
+    async fn a_quiet_homes_agents_become_unobservable_once_at_its_deadline() {
+        use flotilla_resources::Clock as _;
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
-        let mut session = session_object("terminal-convoy-a-implement").await;
+        let resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
+        // The daemon's clock, which the test moves: the deadline is judged against it.
+        let clock = Arc::new(ManualClock(std::sync::Mutex::new(Utc::now())));
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
+                .with_attach_resolver(resolver)
+                .with_clock(Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>),
+        );
+        let mut convoy = convoy_with_vessel("convoy-a").await;
+        let status = convoy.status.as_mut().expect("convoy status");
+        status.work.get_mut("implement").expect("work status").placement =
+            Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
+        status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0]
+            .crew
+            .push(CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "codex".to_string() }).build());
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
+        let now = clock.now();
+        let heard = now - agent_activity::HOME_HEARD_WITHIN + chrono::Duration::milliseconds(200);
+        home_heard(&mut aggregator, "feta-node-id", heard).await;
+        let name = "terminal-convoy-a-implement-coder";
+        agent_reports(&mut aggregator, Some("feta-node-id"), name, flotilla_protocol::AgentActivity::Idle, now).await;
+        let mut session = session_object(name).await;
+        session.spec.role = "coder".into();
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        let now = Utc::now();
-        session.status.as_mut().expect("running status").attention = Some(TerminalAttention {
-            state: TerminalAttentionState::Idle,
-            as_of: now - TerminalAttention::FRESH_FOR + chrono::Duration::milliseconds(200),
-            source: TerminalAttentionSource::Screen,
-        });
-        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
+        aggregator
+            .replace_replica_sessions(vec![ReadResourceObject {
+                object: session,
+                provenance: ResourceProvenance::Replica {
+                    origin_root: flotilla_protocol::NodeId::new("feta-node-id"),
+                    last_synced_at: now,
+                },
+            }])
+            .await;
         let before = state.result_set().await;
         assert_eq!(before.rows.as_convoys().expect("convoy rows")[0].surface_state, SurfaceState::Available);
-        let delay = aggregator.next_attention_expiry_delay_at(now).expect("attention expiry is scheduled");
-        assert_eq!(delay, Duration::from_millis(200));
-        tokio::time::sleep(aggregator.next_attention_expiry_delay().expect("attention expiry delay") + Duration::from_millis(5)).await;
-        assert_eq!(aggregator.next_attention_expiry_delay(), Some(Duration::ZERO), "overdue expiry remains scheduled");
-        aggregator.expire_due_attention().await;
-        let expired = state.result_set().await;
-        let convoy = &expired.rows.as_convoys().expect("convoy rows")[0];
-        assert!(!convoy.surface_state.needs_attention());
-        assert!(!convoy.vessels[0].surface_state.needs_attention());
-        assert_eq!(expired.seq, before.seq + 1);
-        assert_eq!(aggregator.next_attention_expiry_delay(), None);
+        assert!(!aggregator.salience_facts_at(now).attention.is_empty());
+        assert_eq!(aggregator.next_home_stale_delay(now), Some(Duration::from_millis(200)));
+
+        clock.advance(aggregator.next_home_stale_delay(clock.now()).expect("stale wake") + Duration::from_millis(5));
+        assert_eq!(aggregator.next_home_stale_delay(clock.now()), None, "a home already stale schedules no wake");
         aggregator.rebuild_local_projection().await;
-        assert_eq!(state.result_set().await.seq, expired.seq, "expiry is reported only once");
+        let stale = state.result_set().await;
+        let convoy = &stale.rows.as_convoys().expect("convoy rows")[0];
+        assert_eq!(convoy.vessels[0].surface_state, SurfaceState::Working, "an unobservable agent is not available");
+        let agent = convoy.vessels[0].crew[0].agent_session.as_ref().expect("the row still shows the reading");
+        assert!(agent.stale);
+        assert_eq!(agent.activity, Some(flotilla_protocol::AgentActivity::Idle));
+        assert!(aggregator.salience_facts_at(clock.now()).attention.is_empty());
+        assert_eq!(stale.seq, before.seq + 1);
+        aggregator.rebuild_local_projection().await;
+        assert_eq!(state.result_set().await.seq, stale.seq, "going stale is reported once");
+
+        // Heard from again: current, and a keepalive while current changes nothing.
+        home_heard(&mut aggregator, "feta-node-id", clock.now()).await;
+        let restored = state.result_set().await;
+        assert_eq!(restored.rows.as_convoys().expect("convoy rows")[0].surface_state, SurfaceState::Available);
+        assert!(!restored.rows.as_convoys().expect("convoy rows")[0].vessels[0].crew[0].agent_session.as_ref().expect("reading").stale);
+        home_heard(&mut aggregator, "feta-node-id", clock.now()).await;
+        assert_eq!(state.result_set().await.seq, restored.seq);
+    }
+
+    /// A wall clock a test sets.
+    struct ManualClock(std::sync::Mutex<chrono::DateTime<Utc>>);
+
+    impl ManualClock {
+        fn advance(&self, by: Duration) {
+            let mut now = self.0.lock().expect("clock");
+            *now += chrono::Duration::from_std(by).expect("duration");
+        }
+    }
+
+    impl flotilla_resources::Clock for ManualClock {
+        fn now(&self) -> chrono::DateTime<Utc> {
+            *self.0.lock().expect("clock")
+        }
     }
 
     #[tokio::test]
@@ -3942,11 +4234,12 @@ mod tests {
             attachable_host: HostName::new("kiwi"),
             origin_hosts: HashMap::from([(flotilla_protocol::NodeId::new("feta-node-id"), HostName::new("feta"))]),
         });
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(resolver);
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(resolver));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement =
             Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
 
         let session_name = "terminal-convoy-a-implement-coder";
         let mut local_session = session_object(session_name).await;
@@ -3978,8 +4271,10 @@ mod tests {
     async fn replicated_convoy_appears_origin_tagged_in_fleet_awareness() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
-            .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta")));
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
+                .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"))),
+        );
         let now = Utc::now();
         aggregator
             .replace_replica_convoys(vec![ReadResourceObject {
@@ -4011,13 +4306,15 @@ mod tests {
     async fn remote_homed_idle_governor_remains_in_project_awareness() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
-            .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node-id", "udder")));
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
+                .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node-id", "udder"))),
+        );
         let now = Utc::now();
         let provenance = ResourceProvenance::Replica { origin_root: flotilla_protocol::NodeId::new("udder-node-id"), last_synced_at: now };
         let mut convoy = convoy_with_vessel("governor-andamento-01234567").await;
         convoy.spec.role = "governor".to_string();
-        convoy.spec.project_ref = Some("andamento".to_string());
+        convoy.spec.project_ref = "andamento".to_string();
         aggregator.replace_replica_convoys(vec![ReadResourceObject { object: convoy, provenance: provenance.clone() }]).await;
 
         let mut session = session_object("terminal-governor-implement-coder").await;
@@ -4025,13 +4322,20 @@ mod tests {
             (CONVOY_LABEL.to_string(), "governor-andamento-01234567".to_string()),
             (VESSEL_LABEL.to_string(), "implement".to_string()),
         ]);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Hook });
+        home_heard(&mut aggregator, "udder-node-id", now).await;
+        agent_reports(
+            &mut aggregator,
+            Some("udder-node-id"),
+            "terminal-governor-implement-coder",
+            flotilla_protocol::AgentActivity::Idle,
+            now,
+        )
+        .await;
         aggregator.replace_replica_sessions(vec![ReadResourceObject { object: session, provenance }]).await;
 
         let facts = aggregator.salience_facts_at(now);
         assert_eq!(facts.attention.len(), 1, "replica provenance must resolve both resources to udder");
-        assert_eq!(facts.attention[0].state, TerminalAttentionState::Idle);
+        assert_eq!(facts.attention[0].activity, flotilla_protocol::AgentActivity::Idle);
         let result = state
             .awareness_result_set(
                 &Some(QueryScope::new("flotilla", "andamento")),
@@ -4086,7 +4390,6 @@ mod tests {
     #[tokio::test]
     async fn run_bootstraps_materialization_and_subscribed_fleet_awareness() {
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement =
             Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
@@ -4129,12 +4432,9 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let attach_resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
         let run_state = state.clone();
-        let run = tokio::spawn(async move {
-            Aggregator::new(run_state, HostName::new("kiwi"), event_tx)
-                .with_attach_resolver(attach_resolver)
-                .run(namespace_resolvers(&durable, &observed))
-                .await
-        });
+        let (aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(run_state, HostName::new("kiwi"), event_tx).with_attach_resolver(attach_resolver));
+        let run = tokio::spawn(async move { aggregator.run(namespace_resolvers(&durable)).await });
 
         let (convoy, awareness) = timeout(Duration::from_secs(1), async {
             let mut convoy = None;
@@ -4165,23 +4465,118 @@ mod tests {
         let _ = run.await;
     }
 
-    fn namespace_resolvers(durable: &ResourceBackend, observed: &ResourceBackend) -> AggregatorResolvers {
+    // Deltas computed while bootstrapping are withheld, so a subscriber that
+    // took its snapshot before they landed catches up from the full sets
+    // published when bootstrap ends.
+    #[tokio::test]
+    async fn subscriber_joining_during_bootstrap_receives_every_materialized_family() {
+        let durable = ResourceBackend::new(InMemoryBackend::default());
+        let ensure = convoy_ensure_object("governor").await;
+        durable
+            .clone()
+            .using::<ConvoyEnsure>("flotilla")
+            .create(&InputMeta::builder().name(ensure.metadata.name).build(), &ensure.spec)
+            .await
+            .expect("seed standing role");
+        let project = project_object("widgets").await;
+        durable
+            .clone()
+            .using::<Project>("flotilla")
+            .create(&InputMeta::builder().name(project.metadata.name).build(), &project.spec)
+            .await
+            .expect("seed project");
+
+        let state = AggregatorProjectionState::new();
+        let roles_query = QueryId::StandingRoles { scope: None };
+        let projects_query = QueryId::ProjectRepositories { scope: None };
+        let joined_roles = state.result_set_for(&roles_query).await.expect("standing roles snapshot");
+        let joined_projects = state.result_set_for(&projects_query).await.expect("project repositories snapshot");
+        assert!(joined_roles.rows.as_standing_roles().expect("standing role rows").is_empty());
+        assert!(joined_projects.rows.as_project_repositories().expect("project rows").is_empty());
+
+        let (event_tx, mut event_rx) = broadcast::channel(64);
+        let run_state = state.clone();
+        let run =
+            tokio::spawn(
+                async move { Aggregator::new(run_state, HostName::new("kiwi"), event_tx).run(namespace_resolvers(&durable)).await },
+            );
+
+        timeout(Duration::from_secs(1), async {
+            let (mut role, mut project) = (false, false);
+            while !(role && project) {
+                let DaemonEvent::ResultSet(set) = event_rx.recv().await.expect("aggregator bootstrap event") else { continue };
+                if let Some(rows) = set.rows.as_standing_roles() {
+                    role |= rows.iter().any(|row| row.role == "governor");
+                }
+                if let Some(rows) = set.rows.as_project_repositories() {
+                    project |= rows.iter().any(|row| row.resource.name == "widgets");
+                }
+            }
+        })
+        .await
+        .expect("bootstrap end publishes the standing role and project rows the joined subscriber missed");
+
+        run.abort();
+        let _ = run.await;
+    }
+
+    // A role another home declares is seeded under that home, as its events name it (#3108): when
+    // its home deletes it, the role is withdrawn here too.
+    #[tokio::test]
+    async fn a_role_another_home_declares_is_withdrawn_when_that_home_deletes_it() {
+        let durable = flotilla_provisioning_testkit::EngineBackend::open("kiwi-root");
+        let feta = durable.other_home("feta-root");
+        let ensure = convoy_ensure_object("governor").await;
+        feta.definition::<ConvoyEnsure>(&ensure.metadata.name, &ensure.spec).await;
+        durable.receive(&feta);
+        // Its convoys on the engine too, as the daemon composes them.
+        let _convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
+            &durable.service,
+            "flotilla",
+            &durable.backend,
+            Arc::new(flotilla_resources::SystemClock),
+            durable.reads(),
+        );
+
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(64);
+        let resolvers = namespace_resolvers(&durable);
+        let run = tokio::spawn(Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).run(resolvers));
+        let roles = |state: AggregatorProjectionState| async move {
+            let set = state.result_set_for(&QueryId::StandingRoles { scope: None }).await.expect("standing roles");
+            set.rows.as_standing_roles().expect("standing role rows").iter().map(|row| row.role.clone()).collect::<Vec<_>>()
+        };
+        timeout(Duration::from_secs(5), async {
+            while roles(state.clone()).await != ["governor"] {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("feta's role is declared here");
+
+        feta.delete_definition::<ConvoyEnsure>(&ensure.metadata.name).await;
+        flotilla_provisioning_testkit::replicate_home_tail(feta.service(), feta.home(), &durable.service);
+        timeout(Duration::from_secs(5), async {
+            while !roles(state.clone()).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("feta's deletion withdraws its role here");
+
+        run.abort();
+        let _ = run.await;
+    }
+
+    fn namespace_resolvers(durable: &ResourceBackend) -> AggregatorResolvers {
         AggregatorResolvers::builder()
             .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
             .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
-            .durable_demands(durable.clone().using::<Demand>("flotilla"))
-            .durable_environments(durable.clone().using::<Environment>("flotilla"))
             .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
             .durable_projects(durable.including_replicas::<Project>("flotilla"))
             .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
             .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
             .durable_hosts(durable.including_replicas::<flotilla_resources::Host>("flotilla"))
-            .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
-            .durable_clones(durable.using::<CloneResource>("flotilla"))
-            .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
-            .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
-            .observed_checkouts(observed.using::<Checkout>("flotilla"))
-            .observed_checkout_replicas(observed.including_replicas::<Checkout>("flotilla"))
             .build()
     }
 
@@ -4204,8 +4599,7 @@ mod tests {
     async fn steady_state_delta_read_contract(definitions: bool) {
         use flotilla_store_testkit::ReadCountsBackendExt;
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
-        let (counted_durable, counted_observed) = (durable.clone().with_read_counts(), observed.clone().with_read_counts());
+        let counted_durable = durable.clone().with_read_counts();
         let convoys = durable.clone().using::<Convoy>("flotilla");
         let seed = convoy_with_vessel("convoy-a").await;
         let created = convoys.create(&InputMeta::builder().name("convoy-a".into()).build(), &seed.spec).await.expect("seed convoy");
@@ -4214,8 +4608,9 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(64);
         let run_state = state.clone();
-        let resolvers = namespace_resolvers(&counted_durable, &counted_observed);
-        let run = tokio::spawn(async move { Aggregator::new(run_state, HostName::new("kiwi"), event_tx).run(resolvers).await });
+        let resolvers = namespace_resolvers(&counted_durable);
+        let (aggregator, _engine) = with_convoy_engine(Aggregator::new(run_state, HostName::new("kiwi"), event_tx));
+        let run = tokio::spawn(async move { aggregator.run(resolvers).await });
         async fn wait_for(receiver: &mut broadcast::Receiver<DaemonEvent>, name: &str) -> DaemonEvent {
             let names = |event: &DaemonEvent| match event {
                 DaemonEvent::ResultSet(result) if result.query() == (QueryId::Convoys { scope: None }) => {
@@ -4237,7 +4632,6 @@ mod tests {
         }
         wait_for(&mut event_rx, "convoy-a").await;
         let durable_bootstrap = counted_durable.read_snapshot();
-        let observed_bootstrap = counted_observed.read_snapshot();
         assert!(!durable_bootstrap.lists().is_empty(), "bootstrap lists each watched kind once");
 
         for index in 0..8 {
@@ -4284,7 +4678,6 @@ mod tests {
         // gets keep their separate zero-budget guard expected to fail.
         durable_reads.assert_no_lists("aggregator durable watches");
         durable_reads.assert_zero("aggregator durable delta emission");
-        counted_observed.read_snapshot().since(&observed_bootstrap).assert_zero("aggregator observed delta emission");
         assert!(!run.is_finished(), "the resource watches remain live");
         run.abort();
         let _ = run.await;
@@ -4331,9 +4724,9 @@ mod tests {
         assert!(state.result_set_for(&query).await.expect("query").rows.is_empty());
     }
 
-    async fn convoy_ensure_object(role: &str, status: Option<flotilla_resources::ConvoyEnsureStatus>) -> ResourceObject<ConvoyEnsure> {
+    async fn convoy_ensure_object(role: &str) -> ResourceObject<ConvoyEnsure> {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let mut ensure = backend
+        backend
             .using::<ConvoyEnsure>("flotilla")
             .create(
                 &InputMeta::builder().name(format!("ensure-{role}")).build(),
@@ -4346,60 +4739,70 @@ mod tests {
                     .build(),
             )
             .await
-            .expect("create scripted convoy ensure");
-        ensure.status = status;
-        ensure
+            .expect("create scripted convoy ensure")
+    }
+
+    /// Reads whatever reading a test sets, for any role.
+    #[derive(Default)]
+    struct ScriptedStandingRoles(std::sync::Mutex<Option<crate::ports::StandingRoleReading>>);
+
+    #[async_trait]
+    impl crate::ports::StandingRoles for ScriptedStandingRoles {
+        async fn reading(&self, _: &str, project: &str, role: &str) -> Option<crate::ports::StandingRoleReading> {
+            assert_eq!((project, role), ("widgets", "governor"), "the role is asked for by its project and name");
+            self.0.lock().expect("scripted reading").clone()
+        }
     }
 
     #[tokio::test]
-    async fn standing_roles_follow_ensures_and_prefer_the_copy_with_controller_status() {
+    async fn standing_roles_show_the_reading_their_generations_give_and_unknown_until_it_reads() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let roles = Arc::new(ScriptedStandingRoles::default());
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_standing_roles(roles.clone()));
         let query = QueryId::StandingRoles { scope: None };
 
-        // A non-admitting root's copy carries no controller status; the
-        // admitting root's replica does, and must win in either order.
-        let local = convoy_ensure_object("governor", None).await;
-        let admitting = convoy_ensure_object(
-            "governor",
-            Some(flotilla_resources::ConvoyEnsureStatus {
-                convoy_ref: Some("convoy-a".to_string()),
-                hold_reason: Some(ConvoyEnsureHoldReason::RestartLimit),
-                restart_count: 3,
-                ..Default::default()
-            }),
-        )
-        .await;
-        aggregator
-            .apply_convoy_ensure_event(ReadWatchEvent::Added(ReadResourceObject {
-                object: admitting,
-                provenance: ResourceProvenance::Replica {
-                    origin_root: flotilla_protocol::NodeId::new("feta-node-id"),
-                    last_synced_at: Utc::now(),
-                },
-            }))
-            .await;
-        aggregator
-            .apply_convoy_ensure_event(ReadWatchEvent::Added(ReadResourceObject { object: local, provenance: ResourceProvenance::Local }))
-            .await;
-
+        // Every root may hold a copy of the declaration; none carries the role's state.
+        for provenance in [
+            ResourceProvenance::Replica { origin_root: flotilla_protocol::NodeId::new("feta-node-id"), last_synced_at: Utc::now() },
+            ResourceProvenance::Local,
+        ] {
+            let object = convoy_ensure_object("governor").await;
+            aggregator.apply_convoy_ensure_event(ReadWatchEvent::Added(ReadResourceObject { object, provenance })).await;
+        }
         let set = state.result_set_for(&query).await.expect("standing roles result set");
         let rows = set.rows.as_standing_roles().expect("standing role rows");
         assert_eq!(rows.len(), 1, "copies of one declaration fold onto one role");
         assert_eq!(rows[0].role, "governor");
         assert_eq!(rows[0].project_ref, "widgets");
         assert_eq!(rows[0].presents_as.as_deref(), Some("fleet"));
-        assert_eq!(rows[0].convoy_ref.as_deref(), Some("convoy-a"));
-        assert_eq!(rows[0].hold, Some(StandingRoleHold::RestartLimit));
-        assert_eq!(rows[0].strikes, 3);
+        assert!(rows[0].state_unknown, "a role that did not read is unknown");
+        assert_eq!(rows[0].hold, None);
 
+        // A generation's change re-reads its role.
+        *roles.0.lock().expect("scripted reading") = Some(crate::ports::StandingRoleReading {
+            convoy_ref: Some("convoy-a".to_string()),
+            hold: Some(StandingRoleHold::RestartLimit),
+            strikes: 3,
+            next_attempt: None,
+            last_failure: Some("ensured convoy entered a terminal failure phase".to_string()),
+        });
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.to_string(), "ensure-governor".to_string());
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        // A standing convoy is a launch of its ensure's role, which the engine reads it by.
+        convoy.spec.role = "governor".to_string();
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
         let convoys = state.result_set().await;
         let row = convoys.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         assert_eq!(row.ensured_from.as_deref(), Some("ensure-governor"));
+        let set = state.result_set_for(&query).await.expect("standing roles result set");
+        let rows = set.rows.as_standing_roles().expect("standing role rows");
+        assert!(!rows[0].state_unknown);
+        assert_eq!(rows[0].convoy_ref.as_deref(), Some("convoy-a"));
+        assert_eq!(rows[0].hold, Some(StandingRoleHold::RestartLimit));
+        assert_eq!(rows[0].strikes, 3);
+        assert_eq!(rows[0].last_failure.as_deref(), Some("ensured convoy entered a terminal failure phase"));
 
         for provenance in [
             ResourceProvenance::Local,
@@ -4422,11 +4825,11 @@ mod tests {
         let principal = PrincipalRef::implicit_for_namespace("people");
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.spec.dispatching_principal_ref = principal.clone();
 
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
 
         let result_set = state.result_set().await;
         let row = result_set.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
@@ -4434,27 +4837,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn awareness_salience_recomputes_on_terminal_attention_and_open_attention_changes() {
+    async fn awareness_salience_recomputes_on_agent_activity_and_open_attention_changes() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
         let attentions = Arc::new(SetAttentions::default());
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla"),
+        );
         let query = QueryId::Awareness {
             scope: None,
             grouping: flotilla_protocol::AwarenessGrouping::Convoy,
             limit: flotilla_protocol::AwarenessLimit::default(),
         };
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: query.clone(), since: None }]);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
 
         let now = Utc::now();
         let mut session = session_object("terminal-convoy-a-implement").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::NeedsInput, as_of: now, source: TerminalAttentionSource::Hook });
-        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
+        agent_reports(&mut aggregator, None, "terminal-convoy-a-implement", flotilla_protocol::AgentActivity::NeedsInput, now).await;
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
         assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
 
         let credential = open_attention(
@@ -4486,9 +4889,7 @@ mod tests {
         assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
 
         let working_at = now + chrono::Duration::seconds(2);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::Working, as_of: working_at, source: TerminalAttentionSource::Hook });
-        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session)).await;
+        agent_reports(&mut aggregator, None, "terminal-convoy-a-implement", flotilla_protocol::AgentActivity::Working, working_at).await;
         let (salience, as_of) = awareness_vessel_salience_and_time(&state, &query).await;
         assert_eq!(salience, flotilla_protocol::Salience::Info);
         assert_eq!(as_of, working_at);
@@ -4772,6 +5173,7 @@ mod tests {
                 Err::<WatchEvent<T>, _>(ResourceError::WatchExpired {
                     requested_version: "1".to_string(),
                     compacted_through: Some("2".to_string()),
+                    reason: "events through 2 were compacted".to_string(),
                 })
             })),
         )
@@ -4788,37 +5190,21 @@ mod tests {
     async fn run_with_test_sources(
         aggregator: Aggregator,
         durable_convoys: &dyn AggregatorReplicaWatchSource<Convoy>,
-        observed_convoys: &dyn AggregatorWatchSource<Convoy>,
     ) -> Result<(), ResourceError> {
-        let durable_environments = ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_projects = ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_convoy_ensures = ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_checkout_replicas = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(durable_convoys)
-            .durable_demands(&durable_demands)
-            .durable_environments(&durable_environments)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
             .durable_convoy_ensures(&durable_convoy_ensures)
             .durable_repositories(&durable_repositories)
             .durable_vessels(&durable_vessels)
             .durable_hosts(&durable_hosts)
-            .durable_checkouts(&durable_checkouts)
-            .durable_clones(&durable_clones)
-            .observed_convoys(observed_convoys)
-            .observed_sessions(&observed_sessions)
-            .observed_checkouts(&observed_checkouts)
-            .observed_checkout_replicas(&observed_checkout_replicas)
             .build();
         aggregator.run_with_sources(sources).await
     }
@@ -4842,7 +5228,8 @@ mod tests {
                 origins.iter().map(|origin| (origin.clone(), HostName::new("remote"))).collect()
             }
         }
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver_arc(Arc::new(Hosts));
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver_arc(Arc::new(Hosts)));
         let mut records = Vec::new();
         for index in 0..320 {
             let mut object = convoy_object(&format!("remote-{index}")).await;
@@ -4856,7 +5243,7 @@ mod tests {
                 },
             });
         }
-        aggregator.replace_convoy_read_source(LocalSource::Durable, records.clone()).await;
+        aggregator.replace_replica_convoys(records.clone()).await;
         // Keep a mapped origin without a host registry collaborator.
         aggregator.origin_hosts.insert(flotilla_protocol::NodeId::new("remote"), HostName::new("remote"));
         let before = aggregator.copied_convoys.load(std::sync::atomic::Ordering::Relaxed);
@@ -4913,7 +5300,8 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (tx, _) = broadcast::channel(32);
         let hosts = Arc::new(Hosts::default());
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver_arc(hosts.clone());
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver_arc(hosts.clone()));
         let mut first = ReadResourceObject {
             object: convoy_with_vessel("buffered").await,
             provenance: ResourceProvenance::Replica {
@@ -4921,7 +5309,7 @@ mod tests {
                 last_synced_at: Utc::now(),
             },
         };
-        aggregator.replace_convoy_read_source(LocalSource::Durable, vec![first.clone()]).await;
+        aggregator.replace_replica_convoys(vec![first.clone()]).await;
         assert!(state.result_set().await.rows.as_convoys().unwrap().is_empty());
         let calls = hosts.calls.load(Ordering::Relaxed);
         let copied = aggregator.copied_convoys.load(Ordering::Relaxed);
@@ -4979,7 +5367,7 @@ mod tests {
             .using::<Convoy>("flotilla")
             .create(
                 &InputMeta::builder().name(name.to_string()).build(),
-                &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).build(),
             )
             .await
             .expect("create scripted convoy")
@@ -5009,6 +5397,7 @@ mod tests {
                 &InputMeta::builder().name(name.to_string()).build(),
                 &ConvoySpec::builder()
                     .workflow_ref("scratch".to_string())
+                    .project_ref("flotilla".to_string())
                     .r#ref("feat/convoy".to_string())
                     .repositories(vec![ConvoyRepositorySpec::builder()
                         .url("https://github.com/flotilla-org/flotilla".to_string())
@@ -5024,13 +5413,20 @@ mod tests {
             .expect("create branch-backed convoy")
     }
 
+    /// `convoy` bound to change request 2301 of its repository.
+    fn bound(mut convoy: ResourceObject<Convoy>) -> ResourceObject<Convoy> {
+        convoy.spec.change_request =
+            Some(BoundChangeRequest { id: "2301".into(), repository_ref: RepositoryKey("repo_flotilla".into()), title: "Bound".into() });
+        convoy
+    }
+
     pub(super) async fn convoy_with_vessel(name: &str) -> ResourceObject<Convoy> {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let resolver = backend.using::<Convoy>("flotilla");
         let created = resolver
             .create(
                 &InputMeta::builder().name(name.to_string()).build(),
-                &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).build(),
             )
             .await
             .expect("create convoy with vessel");
@@ -5055,7 +5451,10 @@ mod tests {
         let resolver = backend.using::<TerminalSession>("flotilla");
         let created = resolver
             .create(
-                &InputMeta::builder().name(name.to_string()).build(),
+                &InputMeta::builder()
+                    .name(name.to_string())
+                    .annotations(BTreeMap::from([(flotilla_resources::terminal_records::LAUNCH_ANNOTATION.to_string(), test_launch(name))]))
+                    .build(),
                 &TerminalSessionSpec::builder()
                     .env_ref("local".to_string())
                     .role("observer".to_string())
@@ -5074,23 +5473,6 @@ mod tests {
             )
             .await
             .expect("set scripted terminal session status")
-    }
-
-    async fn environment_object(name: &str) -> ResourceObject<Environment> {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        backend
-            .using::<Environment>("flotilla")
-            .create(
-                &InputMeta::builder().name(name.to_string()).build(),
-                &EnvironmentSpec {
-                    cloud_sandbox: None,
-                    provider_address: None,
-                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".to_string(), repo_default_dir: "/repo".to_string() }),
-                    docker: None,
-                },
-            )
-            .await
-            .expect("create scripted environment")
     }
 
     #[tokio::test]
@@ -5176,6 +5558,51 @@ mod tests {
             .expect("create scripted repository")
     }
 
+    /// Launch `#1` of `checkout`, adopted by the engine at `home` and ready.
+    fn adopted_record(home: &str, checkout: &ResourceObject<Checkout>) -> flotilla_resources::checkout_records::CheckoutLaunch {
+        flotilla_resources::checkout_records::CheckoutLaunch {
+            name: format!("{}#1", checkout.metadata.name),
+            home: home.to_owned(),
+            spec: checkout.spec.clone(),
+            holder: None,
+            requested_at: chrono::DateTime::UNIX_EPOCH,
+            reading: flotilla_protocol::LifecycleReading::Ready { identity: String::new() },
+            degraded: None,
+            integration: (),
+        }
+    }
+
+    /// Holds `records` as the engine's adopted checkouts, `home` being this one, as a checkout
+    /// change rereads them.
+    async fn hold_engine_checkouts(
+        aggregator: &mut Aggregator,
+        home: &str,
+        records: Vec<flotilla_resources::checkout_records::CheckoutLaunch>,
+    ) {
+        aggregator.engine_checkout_home = Some(home.to_owned());
+        aggregator.engine_checkouts = records;
+        aggregator.refresh_origin_hosts().await;
+        aggregator.rebuild_checkout_rows().await.expect("checkout rows");
+    }
+
+    /// Holds `checkouts` as this host's discovered checkouts in `flotilla`, as a refresh replaces them.
+    async fn discover_checkouts(aggregator: &mut Aggregator, checkouts: &[ResourceObject<Checkout>]) {
+        aggregator.discovered_namespace = "flotilla".to_owned();
+        let mut found = BTreeMap::<RepositoryKey, Vec<DiscoveredCheckout>>::new();
+        for checkout in checkouts {
+            let CheckoutSpec::Observed(spec) = &checkout.spec else { panic!("a discovered checkout is observed") };
+            found.entry(spec.repo_ref.clone()).or_default().push(DiscoveredCheckout {
+                name: checkout.metadata.name.clone(),
+                repo_slug: spec.repo_ref.to_string(),
+                spec: spec.clone(),
+            });
+        }
+        for (repository, found) in found {
+            aggregator.discovered_checkouts.replace(&repository, found);
+        }
+        aggregator.discovered_checkouts_changed().await.expect("checkout rows");
+    }
+
     async fn checkout_object(name: &str, path: &str, repo_ref: RepositoryKey) -> ResourceObject<Checkout> {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         backend
@@ -5202,14 +5629,14 @@ mod tests {
         let mut convoy = convoy_with_branch("convoy-0123456789abcdef").await;
         convoy.spec.role = "governor".to_string();
         convoy.spec.generation = 3;
-        convoy.spec.project_ref = Some("andamento".to_string());
+        convoy.spec.project_ref = "andamento".to_string();
         let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-0123456789abcdef");
 
         let row = aggregator.summarize(&reference, &convoy);
 
         assert_eq!(row.name, "governor");
         assert_eq!(row.generation, 3);
-        assert_eq!(row.project_ref.as_deref(), Some("andamento"));
+        assert_eq!(row.project_ref, "andamento");
         assert_eq!(row.resource.name, "convoy-0123456789abcdef");
     }
 
@@ -5236,11 +5663,14 @@ mod tests {
         let (event_tx, _) = broadcast::channel(1);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
         let repository = repository_object("https://github.com/flotilla-org/flotilla").await;
-        let mut checkout = checkout_object("orphan", "/work/orphan", repository.spec.key()).await;
-        checkout.metadata.labels.insert(CONVOY_LABEL.to_string(), "missing-convoy".to_string());
+        let checkout = checkout_object("orphan", "/work/orphan", repository.spec.key()).await;
         aggregator.apply_repository_event(WatchEvent::Added(repository)).await;
 
-        aggregator.apply_checkout_event(WatchEvent::Added(checkout)).await.expect("project orphan checkout");
+        // The engine adopted it for a convoy launch this host does not know.
+        let mut record = adopted_record("local-home", &checkout);
+        record.holder = Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy("missing-convoy#1".to_owned()));
+        aggregator.engine_namespace = "flotilla".to_owned();
+        hold_engine_checkouts(&mut aggregator, "local-home", vec![record]).await;
 
         let result = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout result set");
         let row = &result.rows.as_checkouts().expect("checkout rows")[0];
@@ -5252,7 +5682,7 @@ mod tests {
         );
 
         let convoy = convoy_object("missing-convoy").await;
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
 
         let result = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout result set after convoy appears");
         let row = &result.rows.as_checkouts().expect("checkout rows")[0];
@@ -5261,7 +5691,7 @@ mod tests {
 
         let mut deleting_convoy = convoy;
         deleting_convoy.metadata.deletion_timestamp = Some(Utc::now());
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(deleting_convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Modified(deleting_convoy)).await;
 
         let result = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout result set during convoy teardown");
         let row = &result.rows.as_checkouts().expect("checkout rows")[0];
@@ -5273,26 +5703,26 @@ mod tests {
     async fn failed_convoy_remains_projected_until_reaping_finishes() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(1);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = convoy_object("failed-convoy").await;
         convoy.status = Some(ConvoyStatus {
             phase: ResourceConvoyPhase::Failed,
             message: Some("acceptance criteria not met".to_string()),
             ..Default::default()
         });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
 
         convoy.metadata.deletion_timestamp = Some(Utc::now());
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Modified(convoy.clone())).await;
 
         let result = state.result_set().await;
         let rows = result.rows.as_convoys().expect("convoy rows");
         assert!(
-            matches!(rows, [row] if row.name == "failed-convoy" && row.phase == ConvoyPhase::Failed),
+            matches!(rows, [row] if row.name == "failed-convoy" && row.phase == Some(ConvoyPhase::Failed)),
             "a terminal convoy must remain visible while its finalizers reap child resources: {rows:?}"
         );
 
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Deleted(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Deleted(convoy)).await;
 
         let result = state.result_set().await;
         assert!(result.rows.as_convoys().expect("convoy rows").is_empty(), "a reaped convoy must leave the projection");
@@ -5303,10 +5733,11 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let attentions = Arc::new(SetAttentions::default());
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla"),
+        );
         let convoy = convoy_object("stuck-reclaim").await;
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
         let awareness_query =
             QueryId::Awareness { scope: None, grouping: flotilla_protocol::AwarenessGrouping::Convoy, limit: Default::default() };
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: awareness_query.clone(), since: None }]);
@@ -5349,13 +5780,12 @@ mod tests {
         for (_, _, repository) in &repositories {
             aggregator.apply_repository_event(WatchEvent::Added(repository.clone())).await;
         }
+        let mut checkouts = Vec::new();
         for (name, path, repository) in repositories {
             let Some(path) = path else { continue };
-            aggregator
-                .apply_checkout_event(WatchEvent::Added(checkout_object(name, path, repository.spec.key()).await))
-                .await
-                .expect("project checkout");
+            checkouts.push(checkout_object(name, path, repository.spec.key()).await);
         }
+        discover_checkouts(&mut aggregator, &checkouts).await;
         let mut reticulate_session = session_object("reticulate-scratch").await;
         reticulate_session.metadata.labels = BTreeMap::from([
             (REPO_KEY_LABEL.to_string(), reticulate_key.to_string()),
@@ -5371,8 +5801,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fleet_awareness_excludes_replica_checkout_repository_groups() {
-        // Replica checkout repositories are observation inputs, not real
+    async fn fleet_awareness_excludes_other_hosts_checkout_repository_groups() {
+        // Other hosts' adopted checkouts' repositories are observation inputs, not real
         // Projects, so they must not create awareness tree nodes.
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
@@ -5384,21 +5814,14 @@ mod tests {
             ]),
         };
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("receiver"), event_tx).with_attach_resolver(Arc::new(resolver));
+        let mut adopted = Vec::new();
         for (host, url) in [("github-host", "https://github.com/acme/widgets"), ("gitlab-host", "https://gitlab.com/acme/widgets")] {
             let repository = repository_object(url).await;
             let key = repository.spec.key();
             aggregator.apply_repository_event(WatchEvent::Added(repository)).await;
-            aggregator
-                .apply_checkout_replica_event(ReadWatchEvent::Added(ReadResourceObject {
-                    object: checkout_object(host, &format!("/work/{host}"), key).await,
-                    provenance: ResourceProvenance::Replica {
-                        origin_root: flotilla_protocol::NodeId::new(host),
-                        last_synced_at: Utc::now(),
-                    },
-                }))
-                .await
-                .expect("replica checkout");
+            adopted.push(adopted_record(host, &checkout_object(host, &format!("/work/{host}"), key).await));
         }
+        hold_engine_checkouts(&mut aggregator, "receiver", adopted).await;
         assert_eq!(
             state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkouts").rows.as_checkouts().expect("rows").len(),
             2
@@ -5449,7 +5872,7 @@ mod tests {
         let mut initial = Vec::new();
         for index in 0..512 {
             let mut convoy = convoy_with_branch(&format!("work-{index}")).await;
-            convoy.spec.project_ref = Some(format!("project-{}", index % 32));
+            convoy.spec.project_ref = format!("project-{}", index % 32);
             initial.push(convoy);
         }
         let events = (0..100)
@@ -5463,9 +5886,9 @@ mod tests {
             vec![ResourceList { items: initial, resource_version: "1".into(), generation: None }],
             vec![Ok(watch_events(events))],
         );
-        let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let (tx, mut rx) = broadcast::channel(1024);
-        let run = run_with_test_sources(Aggregator::new(state.clone(), HostName::new("local"), tx), &durable_convoys, &observed_convoys);
+        let (aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), tx));
+        let run = run_with_test_sources(aggregator, &durable_convoys);
         tokio::pin!(run);
         tokio::select! {
             result = &mut run => panic!("aggregator stopped: {result:?}"),
@@ -5493,9 +5916,9 @@ mod tests {
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: scoped_query.clone(), since: None }]);
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let mut convoy = convoy_with_branch("convoy-a").await;
-        convoy.spec.project_ref = Some("roadmap".into());
+        convoy.spec.project_ref = "roadmap".into();
         let mut unrelated_convoy = convoy_with_branch("convoy-b").await;
-        unrelated_convoy.spec.project_ref = Some("other".into());
+        unrelated_convoy.spec.project_ref = "other".into();
         let mut deleting_convoy = convoy.clone();
         deleting_convoy.metadata.deletion_timestamp = Some(Utc::now());
         let durable_convoys = ScriptedSource::new(
@@ -5519,12 +5942,10 @@ mod tests {
                 ),
             ))],
         );
-        let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let run = run_with_test_sources(
+        let (aggregator, _engine) = with_convoy_engine(
             Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::new(BlockingChangeRequestResolver)),
-            &durable_convoys,
-            &observed_convoys,
         );
+        let run = run_with_test_sources(aggregator, &durable_convoys);
         tokio::pin!(run);
 
         tokio::select! {
@@ -5571,22 +5992,21 @@ mod tests {
     async fn soft_deleting_convoy_remains_in_rows_and_salience() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let now = Utc::now();
         let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Landed).work_phase(ResourceWorkPhase::Complete).call();
         convoy.metadata.deletion_timestamp = Some(now);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
 
         let mut session = session_object("terminal-convoy-a-implement").await;
         session.metadata.labels =
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
-        session.status.as_mut().expect("running status").attention =
-            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Hook });
+        agent_reports(&mut aggregator, None, "terminal-convoy-a-implement", flotilla_protocol::AgentActivity::Idle, now).await;
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
 
         let result = state.result_set().await;
         assert_eq!(result.rows.as_convoys().expect("convoy rows")[0].name, "convoy-a");
-        assert_eq!(aggregator.salience_facts_at(now).attention[0].state, TerminalAttentionState::Idle);
+        assert_eq!(aggregator.salience_facts_at(now).attention[0].activity, flotilla_protocol::AgentActivity::Idle);
     }
 
     #[tokio::test]
@@ -5598,15 +6018,15 @@ mod tests {
         let mut convoy = convoy_with_branch("convoy-a").await;
         let reference = aggregator.convoy_ref(&convoy.metadata.namespace, &convoy.metadata.name);
 
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
         let stale_generation = *aggregator.change_request_refresh_generations.get(&reference).expect("active enrichment generation");
 
         convoy.metadata.deletion_timestamp = Some(Utc::now());
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Modified(convoy.clone())).await;
         assert!(!aggregator.change_request_refresh_generations.contains_key(&reference));
 
         convoy.metadata.deletion_timestamp = None;
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
         assert_ne!(aggregator.change_request_refresh_generations.get(&reference), Some(&stale_generation));
 
         aggregator
@@ -5640,12 +6060,12 @@ mod tests {
         let convoy = convoy_with_branch("convoy-a").await;
         let reference = aggregator.convoy_ref(&convoy.metadata.namespace, &convoy.metadata.name);
 
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
         apply_next_change_request_resolution(&mut aggregator).await;
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Deleted(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Deleted(convoy.clone())).await;
         assert!(!aggregator.change_request_refresh_started.contains_key(&reference));
 
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
         apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
     }
@@ -5655,8 +6075,9 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let resolver = Arc::new(FlippingAttachResolver { calls: AtomicUsize::new(0) });
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attach_resolver(resolver);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attach_resolver(resolver));
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
 
         let mut session = session_object("terminal-convoy-a-implement").await;
         session.metadata.labels =
@@ -5667,7 +6088,7 @@ mod tests {
         let before = state.result_set().await;
         assert_eq!(before.rows.as_convoys().expect("convoy rows")[0].vessels[0].materialize, None);
 
-        aggregator.apply_environment_event(WatchEvent::Modified(environment_object("local").await)).await;
+        aggregator.environment_changed(Some(EnvironmentChange::Changed("local".into()))).await;
 
         settle_attach_refresh(&mut aggregator).await;
         let after = state.result_set().await;
@@ -5686,8 +6107,6 @@ mod tests {
             vec![ResourceList { items: vec![convoy_with_vessel("convoy-a").await], resource_version: "1".to_string(), generation: None }],
             vec![Ok(pending_watch())],
         );
-        let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_environments = ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_sessions = ScriptedSource::new(
             vec![ResourceList { items: vec![session], resource_version: "1".to_string(), generation: None }],
             vec![Ok(pending_watch())],
@@ -5695,34 +6114,20 @@ mod tests {
         let durable_projects = ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_convoy_ensures = ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_checkout_replicas = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(&durable_convoys)
-            .durable_demands(&durable_demands)
-            .durable_environments(&durable_environments)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
             .durable_convoy_ensures(&durable_convoy_ensures)
             .durable_repositories(&durable_repositories)
             .durable_vessels(&durable_vessels)
             .durable_hosts(&durable_hosts)
-            .durable_checkouts(&durable_checkouts)
-            .durable_clones(&durable_clones)
-            .observed_convoys(&observed_convoys)
-            .observed_sessions(&observed_sessions)
-            .observed_checkouts(&observed_checkouts)
-            .observed_checkout_replicas(&observed_checkout_replicas)
             .build();
-        let run = Aggregator::new(state, HostName::new("kiwi"), event_tx.clone())
-            .with_attach_resolver(Arc::clone(&resolver))
-            .run_with_sources(sources);
+        let (aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state, HostName::new("kiwi"), event_tx.clone()).with_attach_resolver(Arc::clone(&resolver)));
+        let run = aggregator.run_with_sources(sources);
         tokio::pin!(run);
 
         tokio::select! {
@@ -5786,11 +6191,12 @@ mod tests {
             branches: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
         });
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver)),
+        );
         let mut convoy = convoy_with_branch("convoy-a").await;
 
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
         let DaemonEvent::ResultSet(initial) = event_rx.recv().await.expect("initial result set") else {
             panic!("expected initial result set");
         };
@@ -5801,12 +6207,12 @@ mod tests {
 
         convoy.status =
             Some(ConvoyStatus { phase: ResourceConvoyPhase::Landed, disposition: Some("shipped".to_string()), ..Default::default() });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Modified(convoy)).await;
         let DaemonEvent::ResultDelta(phase_delta) = event_rx.recv().await.expect("phase delta") else {
             panic!("expected result delta");
         };
         let phase_row = &phase_delta.changes.as_convoys().expect("convoy changes")[0];
-        assert_eq!(phase_row.phase, ConvoyPhase::Landed);
+        assert_eq!(phase_row.phase, Some(ConvoyPhase::Landed));
         assert_eq!(phase_row.disposition.as_deref(), Some("shipped"));
         assert!(phase_row.subjects.is_empty());
 
@@ -5819,8 +6225,9 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let resolver = Arc::new(RecordingBoundChangeRequestResolver { calls: Mutex::new(Vec::new()) });
-        let mut aggregator =
-            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver)),
+        );
         let mut convoy = convoy_with_branch("convoy-a").await;
         convoy.spec.change_request = Some(BoundChangeRequest {
             id: "1071".to_string(),
@@ -5828,7 +6235,7 @@ mod tests {
             title: "Existing PR".to_string(),
         });
 
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
         let _ = event_rx.recv().await.expect("initial result set");
         apply_next_change_request_resolution(&mut aggregator).await;
         let result_set = state.result_set().await;
@@ -5857,65 +6264,21 @@ mod tests {
             branches: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
         });
-        let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
+        let (mut aggregator, _engine) = with_convoy_engine(
+            Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver)),
+        );
         let mut convoy = convoy_with_branch("convoy-a").await;
 
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
         assert!(matches!(event_rx.recv().await.expect("initial result set"), DaemonEvent::ResultSet(_)));
         apply_next_change_request_resolution(&mut aggregator).await;
 
         convoy.spec.r#ref = Some("feat/rebased".into());
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Modified(convoy)).await;
         assert!(aggregator.convoy_change_requests.is_empty());
         tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
         apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(resolver.branches.lock().await.as_slice(), ["feat/convoy", "feat/rebased"]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn shadowed_convoy_source_cannot_replace_the_effective_change_request() {
-        let state = AggregatorProjectionState::new();
-        let (event_tx, _event_rx) = broadcast::channel(8);
-        let resolver = Arc::new(ScriptedChangeRequestResolver {
-            results: Mutex::new(VecDeque::from([
-                Ok(Some(ConvoyChangeRequest {
-                    id: "815".into(),
-                    status: flotilla_protocol::ChangeRequestStatus::Open,
-                    repository_key: RepositoryKey("repo_flotilla".into()),
-                })),
-                Ok(Some(ConvoyChangeRequest {
-                    id: "900".into(),
-                    status: flotilla_protocol::ChangeRequestStatus::Open,
-                    repository_key: RepositoryKey("repo_flotilla".into()),
-                })),
-                Ok(Some(ConvoyChangeRequest {
-                    id: "816".into(),
-                    status: flotilla_protocol::ChangeRequestStatus::Merged,
-                    repository_key: RepositoryKey("repo_flotilla".into()),
-                })),
-            ])),
-            branches: Mutex::new(Vec::new()),
-            calls: AtomicUsize::new(0),
-        });
-        let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
-        let mut durable = convoy_with_branch("convoy-a").await;
-        let mut observed = durable.clone();
-        observed.spec.r#ref = Some("feat/observed".into());
-
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(durable.clone())).await;
-        apply_next_change_request_resolution(&mut aggregator).await;
-        aggregator.apply_convoy_event_from(LocalSource::Observed, WatchEvent::Added(observed)).await;
-        tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
-        apply_next_change_request_resolution(&mut aggregator).await;
-
-        durable.spec.r#ref = Some("feat/durable-updated".into());
-        durable.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Landed, ..Default::default() });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(durable)).await;
-
-        let reference = aggregator.convoy_ref("flotilla", "convoy-a");
-        assert_eq!(aggregator.convoy_change_requests.get(&reference).expect("effective change request").id, "900");
-        assert_eq!(resolver.branches.lock().await.as_slice(), ["feat/convoy", "feat/observed"]);
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -5942,11 +6305,9 @@ mod tests {
             vec![ResourceList { items: vec![convoy_with_branch("convoy-a").await], resource_version: "1".into(), generation: None }],
             vec![Ok(pending_watch())],
         );
-        let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let run = run_with_test_sources(
             Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
             &durable_convoys,
-            &observed_convoys,
         );
         tokio::pin!(run);
         tokio::select! {
@@ -5995,11 +6356,9 @@ mod tests {
             vec![ResourceList { items: vec![convoy_with_branch("convoy-a").await], resource_version: "1".into(), generation: None }],
             vec![Ok(pending_watch())],
         );
-        let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let run = run_with_test_sources(
             Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
             &durable_convoys,
-            &observed_convoys,
         );
         tokio::pin!(run);
         tokio::select! {
@@ -6039,7 +6398,7 @@ mod tests {
         let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
             .with_change_request_resolver(Arc::clone(&resolver));
         for name in ["convoy-a", "convoy-b"] {
-            aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch(name).await)).await;
+            aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_branch(name).await)).await;
         }
         apply_next_change_request_resolution(&mut aggregator).await;
         apply_next_change_request_resolution(&mut aggregator).await;
@@ -6067,11 +6426,12 @@ mod tests {
         });
         let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
             .with_change_request_resolver(Arc::clone(&resolver));
-        let convoy_a = convoy_with_branch("convoy-a").await;
-        let mut convoy_b = convoy_with_branch("convoy-b").await;
+        // Only a bound lookup can still reach the forge, so only it keeps the minimum interval.
+        let convoy_a = bound(convoy_with_branch("convoy-a").await);
+        let mut convoy_b = bound(convoy_with_branch("convoy-b").await);
         convoy_b.spec.r#ref = Some("feat/other".into());
         for convoy in [&convoy_a, &convoy_b] {
-            aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+            aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
             apply_next_change_request_resolution(&mut aggregator).await;
         }
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
@@ -6103,20 +6463,20 @@ mod tests {
             .with_change_request_resolver(Arc::clone(&resolver));
         let mut convoy = convoy_with_branch("convoy-a").await;
         convoy.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Pending, ..Default::default() });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
         let reference = aggregator.convoy_ref("flotilla", "convoy-a");
         assert!(aggregator.change_request_refresh_tasks.contains_key(&reference), "admission schedules a lookup at once");
 
         let mut active = convoy.clone();
         active.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(active.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Modified(active.clone())).await;
         apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1, "the admission lookup completes without waiting a refresh interval");
 
         let mut landed = active;
         landed.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Landed, ..Default::default() });
         aggregator.schedule_change_request_refresh(&convoy);
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(landed)).await;
+        aggregator.apply_convoy_event(WatchEvent::Modified(landed)).await;
         assert!(!aggregator.change_request_refresh_tasks.contains_key(&reference), "an ended convoy still cancels its lookup");
     }
 
@@ -6135,14 +6495,14 @@ mod tests {
             .with_change_request_resolver(Arc::clone(&resolver));
         let mut convoy = convoy_with_branch("convoy-a").await;
         convoy.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Pending, ..Default::default() });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
         let reference = aggregator.convoy_ref("flotilla", "convoy-a");
         while !aggregator.change_request_refresh_tasks[&reference].is_finished() {
             tokio::task::yield_now().await;
         }
         let mut active = convoy;
         active.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(active)).await;
+        aggregator.apply_convoy_event(WatchEvent::Modified(active)).await;
         apply_next_change_request_resolution(&mut aggregator).await;
         assert!(
             !aggregator.change_request_refresh_tasks.contains_key(&reference),
@@ -6164,7 +6524,7 @@ mod tests {
         });
         let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
             .with_change_request_resolver(Arc::clone(&resolver));
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
         let reference = aggregator.convoy_ref("flotilla", "convoy-a");
         while !aggregator.change_request_refresh_tasks[&reference].is_finished() {
             tokio::task::yield_now().await;
@@ -6180,13 +6540,14 @@ mod tests {
     }
 
     // Behaviour: a resolver that never answers fails its lookup after the
-    // lookup timeout, so the convoy's refresh slot is released and retried.
+    // lookup timeout, so the convoy's refresh slot is released and retried. A
+    // bound lookup is the one that can still reach the forge and retries.
     #[tokio::test(start_paused = true)]
     async fn a_hung_lookup_fails_at_the_timeout() {
         let (event_tx, _) = broadcast::channel(8);
         let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
             .with_change_request_resolver(Arc::new(BlockingChangeRequestResolver));
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(bound(convoy_with_branch("convoy-a").await))).await;
         let reference = aggregator.convoy_ref("flotilla", "convoy-a");
         // Let the lookup start, so its timeout is running, then pass it.
         for _ in 0..4 {
@@ -6196,6 +6557,38 @@ mod tests {
         apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(aggregator.change_request_refresh_failures.get(&reference), Some(&1));
         assert!(aggregator.change_request_refresh_tasks.contains_key(&reference), "the failed lookup is retried");
+    }
+
+    // Behaviour (#3108): a lookup by branch reads only the forge observers' records. One that fails
+    // is not retried by itself and does not wait an interval; the next change to the records looks
+    // again at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_branch_lookup_waits_for_the_records_to_change() {
+        let (event_tx, _) = broadcast::channel(8);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::from([
+                Err("records unreadable".to_string()),
+                Ok(Some(ConvoyChangeRequest {
+                    id: "2301".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    repository_key: RepositoryKey("repo_flotilla".into()),
+                })),
+            ])),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .with_change_request_resolver(Arc::clone(&resolver));
+        let mut convoy = convoy_with_branch("convoy-a").await;
+        convoy.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() });
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
+        let reference = aggregator.convoy_ref("flotilla", "convoy-a");
+        apply_next_change_request_resolution(&mut aggregator).await;
+        assert!(!aggregator.change_request_refresh_tasks.contains_key(&reference), "no retry of its own");
+        aggregator.recheck_unproduced_change_requests();
+        apply_next_change_request_resolution(&mut aggregator).await;
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(aggregator.convoy_change_requests[&reference].id, "2301");
     }
 
     // Behaviour (#3206): repository change-request churn does not defer a
@@ -6210,7 +6603,7 @@ mod tests {
         });
         let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
             .with_change_request_resolver(Arc::clone(&resolver));
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
         let repo = RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() };
         for _ in 0..3 {
             aggregator.refresh_repository_change_requests(&repo).await;
@@ -6225,7 +6618,7 @@ mod tests {
         let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
             .with_change_request_resolver(Arc::new(BlockingChangeRequestResolver));
         for name in ["convoy-a", "convoy-b"] {
-            aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch(name).await)).await;
+            aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_branch(name).await)).await;
         }
 
         aggregator
@@ -6256,7 +6649,7 @@ mod tests {
         });
         let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
             .with_change_request_resolver(Arc::clone(&resolver));
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
         apply_next_change_request_resolution(&mut aggregator).await;
         resolver.calls.store(0, Ordering::SeqCst);
 
@@ -6286,7 +6679,8 @@ mod tests {
         });
         let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
             .with_change_request_resolver(Arc::clone(&resolver));
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
+        // Only a bound lookup can still reach the forge, so only it retries under the backoff.
+        aggregator.apply_convoy_event(WatchEvent::Added(bound(convoy_with_branch("convoy-a").await))).await;
         apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
@@ -6299,7 +6693,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn active_home_sweep_rechecks_a_convoy_with_no_subject() {
+    async fn a_change_request_record_change_rechecks_an_active_convoy_with_no_subject() {
         let (event_tx, _) = broadcast::channel(8);
         let resolver = Arc::new(ScriptedChangeRequestResolver {
             results: Mutex::new(VecDeque::from([
@@ -6317,14 +6711,76 @@ mod tests {
             .with_change_request_resolver(Arc::clone(&resolver));
         let mut convoy = convoy_with_branch("convoy-a").await;
         convoy.status = Some(ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() });
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
         apply_next_change_request_resolution(&mut aggregator).await;
 
-        aggregator.sweep_active_change_request_subjects();
+        aggregator.recheck_unproduced_change_requests();
         tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
         apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
         assert_eq!(aggregator.convoy_change_requests[&aggregator.convoy_ref("flotilla", "convoy-a")].id, "2301");
+    }
+
+    /// Counts lookups, finds nothing, and ticks its record changes when the test sends.
+    struct TickingChangeRequestResolver {
+        calls: AtomicUsize,
+        changes: Mutex<Option<futures::channel::mpsc::UnboundedReceiver<()>>>,
+    }
+
+    #[async_trait]
+    impl ConvoyChangeRequestResolver for TickingChangeRequestResolver {
+        async fn refresh_branch(
+            &self,
+            repositories: &[RepositoryKey],
+            _branch: &str,
+            _binding: Option<&BoundChangeRequest>,
+        ) -> ConvoyBranchRefresh {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ConvoyBranchRefresh { primary: Ok(None), repositories: repositories.iter().map(|key| (key.clone(), Ok(None))).collect() }
+        }
+
+        async fn change_request_changes(&self) -> Option<BoxStream<'static, ()>> {
+            self.changes.lock().await.take().map(StreamExt::boxed)
+        }
+    }
+
+    // No timer looks a convoy's change request up again (#3108): an active convoy that produces
+    // none is looked up again when the change request records change, as a forge observer's
+    // branch probe writes them.
+    #[tokio::test(start_paused = true)]
+    async fn a_convoy_without_a_change_request_is_looked_up_again_when_the_records_change() {
+        let durable = ResourceBackend::new(InMemoryBackend::default());
+        let template = convoy_with_branch("convoy-a").await;
+        let convoys = durable.using::<Convoy>("flotilla");
+        let created = convoys.create(&InputMeta::builder().name("convoy-a".to_string()).build(), &template.spec).await.expect("convoy");
+        convoys
+            .update_status(
+                "convoy-a",
+                &created.metadata.resource_version,
+                &ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() },
+            )
+            .await
+            .expect("active");
+        let (ticks, changes) = futures::channel::mpsc::unbounded();
+        let resolver = Arc::new(TickingChangeRequestResolver { calls: AtomicUsize::new(0), changes: Mutex::new(Some(changes)) });
+        let (tx, _rx) = broadcast::channel(4096);
+        let aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), tx)
+            .with_change_request_resolver(Arc::clone(&resolver));
+        let task = tokio::spawn(aggregator.run(resource_resolvers(&durable)));
+        let looked_up = |count: usize| {
+            let resolver = Arc::clone(&resolver);
+            async move {
+                while resolver.calls.load(Ordering::SeqCst) < count {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        };
+        timeout(Duration::from_secs(60), looked_up(1)).await.expect("the convoy's first lookup");
+        tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1, "nothing looks again while the records are unchanged");
+        ticks.unbounded_send(()).expect("tick");
+        timeout(CHANGE_REQUEST_MIN_REFRESH_INTERVAL + Duration::from_secs(60), looked_up(2)).await.expect("looked up again");
+        task.abort();
     }
 
     // RepoDelta invalidation re-resolves convoy PR state through the resource-backed resolver.
@@ -6352,11 +6808,9 @@ mod tests {
             vec![ResourceList { items: vec![convoy_with_branch("convoy-a").await], resource_version: "1".into(), generation: None }],
             vec![Ok(pending_watch())],
         );
-        let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let run = run_with_test_sources(
             Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
             &durable_convoys,
-            &observed_convoys,
         );
         tokio::pin!(run);
         tokio::select! {
@@ -6450,7 +6904,7 @@ mod tests {
                 creation_timestamp: Utc::now(),
                 merge: None,
             },
-            spec: ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+            spec: ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).build(),
             status: Some(ConvoyStatus {
                 phase: convoy_phase,
                 workflow_snapshot: Some(WorkflowSnapshot {
@@ -6462,6 +6916,8 @@ mod tests {
                     vessels: vec![definition],
                 }),
                 work,
+                // Admitted on the engine: its checkouts are held for this launch.
+                engine_launch: Some("convoy-a#1".to_string()),
                 ..Default::default()
             }),
         }
@@ -6526,8 +6982,16 @@ mod tests {
             let reference = ResourceRef::new("flotilla/v1", "Convoy", "flotilla", "convoy-a").on_host(HostName::new("local"));
             let status = convoy.status.as_ref().expect("status");
             let definition = &status.workflow_snapshot.as_ref().expect("snapshot").vessels[0];
-            let row =
-                |aggregator: &Aggregator| aggregator.summarize_vessel(&reference, definition, status.work.get("implement"), None, None);
+            let row = |aggregator: &Aggregator| {
+                aggregator.summarize_vessel(
+                    &reference,
+                    definition,
+                    status.work.get("implement"),
+                    &status.stalls,
+                    None,
+                    &Ok(BTreeMap::new()),
+                )
+            };
             assert_eq!(row(&aggregator).environment_kind, None, "{context}");
             let source = ReadResourceObject {
                 object: record.clone(),
@@ -6582,8 +7046,8 @@ mod tests {
             });
             let state = AggregatorProjectionState::new();
             let (tx, _rx) = broadcast::channel(1);
-            let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
-            aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+            let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), tx));
+            aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
             let result = state.result_set().await;
             let reason = &result.rows.as_convoys().expect("convoys")[0].landing_reason;
             assert_eq!(reason.is_some(), matches!(phase, ResourceConvoyPhase::Landing | ResourceConvoyPhase::Landed));
@@ -6596,9 +7060,9 @@ mod tests {
     async fn emitted_vessel(convoy: ResourceObject<Convoy>) -> VesselRow {
         let state = AggregatorProjectionState::new();
         let (tx, mut rx) = broadcast::channel(1);
-        let mut aggregator = Aggregator::new(state, HostName::new("local"), tx);
+        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state, HostName::new("local"), tx));
 
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
 
         let DaemonEvent::ResultSet(result_set) = rx.recv().await.expect("initial result set") else {
             panic!("expected result set");
@@ -6620,7 +7084,10 @@ mod tests {
                 let backend = ResourceBackend::new(InMemoryBackend::default());
                 let convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(phase).call();
                 let (events, _) = broadcast::channel(128);
-                let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events);
+                // The engine holds no launch of this vessel, so its stored status is read.
+                let engine = flotilla_provisioning_testkit::VesselsFixture::at(OWN_HOME);
+                let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events)
+                    .with_lifecycle_reads(engine.reads.clone());
                 let provenance = if remote {
                     let origin = flotilla_protocol::NodeId::new("remote-origin");
                     aggregator.origin_hosts.insert(origin.clone(), HostName::new("kiwi"));
@@ -6655,8 +7122,9 @@ mod tests {
                     &reference,
                     definition,
                     status.work.get("implement"),
-                    None,
+                    &status.stalls,
                     status.crew_work.get("implement"),
+                    &Ok(BTreeMap::new()),
                 );
                 assert_eq!(row.readiness.state, ReadinessState::Blocked);
                 assert_eq!(row.readiness.blockers[0].phase, "Lost");
@@ -6671,28 +7139,25 @@ mod tests {
     // confirmed failure. Recovery and replayed updates must clear old reasons.
     #[hegel::test]
     fn provisioning_readiness_tracks_current_checkout_evidence(tc: hegel::TestCase) {
-        use flotilla_protocol::result_set::ReadinessState;
-        use flotilla_resources::{
-            CheckoutPhase, CheckoutStatus, ControllerRetry, ControllerRetryDisposition, VesselPhase, VesselSpec, VesselStatus,
-        };
+        use flotilla_protocol::{result_set::ReadinessState, LifecycleReading};
+        use flotilla_resources::{VesselPhase, VesselSpec, VesselStatus};
         use hegel::generators as gs;
         // Includes ordinary tasks and standing governors, repeats, failure,
         // retry, success, empty status and deletion, in arbitrary order.
         let governor = tc.draw(gs::booleans());
         let remote = tc.draw(gs::booleans());
-        // Clone is local-only; replicated checkouts retain their own retry evidence.
-        let shared_clone = tc.draw(gs::booleans()) && !remote;
         let operations = (0..tc.draw(gs::integers::<usize>().min_value(1).max_value(10)))
             .map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(6)))
             .collect::<Vec<_>>();
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-            let backend = ResourceBackend::new(InMemoryBackend::default());
             let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Ready).call();
             if governor {
                 convoy.spec.role = "governor".into();
             }
             let (events, _) = broadcast::channel(128);
-            let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events);
+            let reads = Arc::new(ScriptedReadings::default());
+            let mut aggregator =
+                Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads.clone());
             let host = HostName::new(if remote { "feta" } else { "kiwi" });
             let provenance = if remote {
                 let origin = flotilla_protocol::NodeId::new("remote-origin");
@@ -6703,50 +7168,36 @@ mod tests {
             };
             convoy.status.as_mut().expect("status").work.get_mut("implement").expect("work").placement =
                 Some(PlacementStatus { fields: BTreeMap::from([("host".into(), serde_json::json!(host.as_str()))]) });
-            let mut vessel = backend
-                .using::<Vessel>("flotilla")
-                .create(
-                    &InputMeta::builder().name("vessel-a".into()).build(),
-                    &VesselSpec {
-                        convoy_ref: convoy.metadata.name.clone(),
-                        vessel_name: "implement".into(),
-                        fulfilment_kind_ref: "local".into(),
-                        adopted_checkout_refs: BTreeMap::new(),
-                    },
-                )
-                .await
-                .expect("vessel");
-            vessel.status = Some(VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() });
+            // The work's launch at the vessel's home, read as the old Vessel view.
+            let launch = reads.launch(if remote { "remote-origin" } else { "kiwi" }, &convoy.metadata.name, "implement", host.as_str());
+            let mut vessel = flotilla_provisioning_testkit::object::<Vessel>(
+                &launch,
+                VesselSpec {
+                    convoy_ref: convoy.metadata.name.clone(),
+                    vessel_name: "implement".into(),
+                    fulfilment_kind_ref: "local".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+                VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() },
+            );
             apply_readiness_event(
                 &mut aggregator.readiness_vessels,
                 ReadWatchEvent::Added(ReadResourceObject { object: vessel.clone(), provenance: provenance.clone() }),
             );
-            let mut checkout = checkout_object("checkout-a", "/work/repo", RepositoryKey("repo".into())).await;
-            checkout.metadata.labels.insert(CONVOY_LABEL.into(), convoy.metadata.name.clone());
-            let mut clone = backend
-                .using::<CloneResource>("flotilla")
-                .create(
-                    &InputMeta::builder().name("ops-clone".into()).build(),
-                    &flotilla_resources::CloneSpec::builder()
-                        .repo_ref(RepositoryKey("repo".into()))
-                        .url("https://forgejo.test/ops".into())
-                        .env_ref("local".into())
-                        .path("/work/ops".into())
-                        .build(),
-                )
-                .await
-                .expect("clone");
-            if shared_clone {
-                checkout.spec = CheckoutSpec::Worktree(
-                    flotilla_resources::CheckoutWorktreeSpec::builder()
-                        .repo_ref(RepositoryKey("repo".into()))
-                        .env_ref("local".into())
-                        .r#ref("main".into())
-                        .target_path("/work/ops".into())
-                        .clone_ref("ops-clone".into())
-                        .build(),
-                );
-            }
+            // A worktree the engine holds for the convoy at the vessel's home: its clone's retries
+            // are the engine's reading of the clone, read at the checkout's home whether the
+            // checkout is local or replicated (#3108).
+            let spec = CheckoutSpec::Worktree(
+                flotilla_resources::CheckoutWorktreeSpec::builder()
+                    .repo_ref(RepositoryKey("repo".into()))
+                    .env_ref("local".into())
+                    .r#ref("main".into())
+                    .target_path("/work/ops".into())
+                    .clone_ref("ops-clone".into())
+                    .build(),
+            );
+            let home = if remote { "remote-origin" } else { "kiwi" };
+            reads.checkouts.lock().expect("checkouts").insert("checkout-a".into(), (home.into(), spec));
             let reference =
                 ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
             let mut terminal = session_object("terminal-ops-coder").await;
@@ -6760,53 +7211,30 @@ mod tests {
                     3 | 6 => ReadinessState::Ready,
                     _ => ReadinessState::Provisioning,
                 };
-                checkout.status = (op != 4).then(|| CheckoutStatus {
-                    phase: match op {
-                        2 => CheckoutPhase::Failed,
-                        3 | 6 => CheckoutPhase::Ready,
-                        _ => CheckoutPhase::Pending,
-                    },
-                    message: (op != 3).then(|| "Forgejo authentication refused".into()),
-                    clone_retry: (op == 1 || op == 6).then(|| ControllerRetry {
-                        attempts: 1,
-                        first_failure_at: Utc::now(),
-                        disposition: ControllerRetryDisposition::Retryable { next_attempt_at: Utc::now() },
-                    }),
-                    ..Default::default()
-                });
-                if shared_clone {
-                    clone.status = (op != 4).then(|| flotilla_resources::CloneStatus {
-                        phase: match op {
-                            2 => flotilla_resources::ClonePhase::Failed,
-                            3 => flotilla_resources::ClonePhase::Ready,
-                            _ => flotilla_resources::ClonePhase::Cloning,
-                        },
-                        message: (op != 3).then(|| "Forgejo authentication refused".into()),
-                        retry: checkout.status.as_ref().and_then(|status| status.clone_retry.clone()),
-                        failure_policy: (op == 2).then_some(flotilla_resources::CloneFailurePolicy::Terminal),
-                        ..Default::default()
-                    });
-                    if op != 2 {
-                        if let Some(status) = checkout.status.as_mut() {
-                            status.message = None;
-                            status.clone_retry = None;
-                        }
-                    }
-                    apply_readiness_event(
-                        &mut aggregator.readiness_clones,
-                        ReadWatchEvent::Modified(ReadResourceObject { object: clone.clone(), provenance: provenance.clone() }),
-                    );
-                }
+                let cause = "Forgejo authentication refused".to_owned();
+                // The checkout's own reading: given up with the cause, realised, or still being
+                // made; deleted (5) it is held no more.
+                let checkout = match op {
+                    2 => Some(LifecycleReading::GaveUp { cause: cause.clone() }),
+                    3 | 6 => Some(LifecycleReading::Ready { identity: "/work/ops".into() }),
+                    5 => None,
+                    _ => Some(LifecycleReading::InProgress),
+                };
+                reads.set(crate::ports::ProvisioningKind::Checkout, "checkout-a", checkout);
+                let reading = match op {
+                    1 | 6 => Some(LifecycleReading::Retrying { failures: 1, next: Utc::now(), cause }),
+                    2 => Some(LifecycleReading::GaveUp { cause }),
+                    3 => Some(LifecycleReading::Ready { identity: "/work/ops".into() }),
+                    4 => None,
+                    _ => Some(LifecycleReading::InProgress),
+                };
+                reads.set(crate::ports::ProvisioningKind::Clone, "ops-clone", reading);
                 vessel.status.as_mut().expect("status").phase =
                     if op == 3 || op == 6 { VesselPhase::Ready } else { VesselPhase::Provisioning };
+                reads.realise(op == 3 || op == 6);
                 apply_readiness_event(
                     &mut aggregator.readiness_vessels,
                     ReadWatchEvent::Modified(ReadResourceObject { object: vessel.clone(), provenance: provenance.clone() }),
-                );
-                let source = ReadResourceObject { object: checkout.clone(), provenance: provenance.clone() };
-                apply_readiness_event(
-                    &mut aggregator.readiness_checkouts,
-                    if op == 5 { ReadWatchEvent::Deleted(source) } else { ReadWatchEvent::Modified(source) },
                 );
                 aggregator.terminal_sessions.clear();
                 aggregator.attachable_sessions.clear();
@@ -6815,8 +7243,9 @@ mod tests {
                     aggregator.attachable_sessions.insert(session_key(&source));
                     aggregator.terminal_sessions.insert(session_key(&source), source);
                 }
+                aggregator.read_engine_checkouts();
                 let row = aggregator.summarize(&reference, &convoy);
-                assert_eq!(row.phase, ConvoyPhase::Active, "readiness must not rewrite lifecycle");
+                assert_eq!(row.phase, Some(ConvoyPhase::Active), "readiness must not rewrite lifecycle");
                 assert_eq!(row.readiness().state, expected, "operation {op}");
                 if op == 1 || op == 2 {
                     assert!(row.readiness().explanation().contains("Forgejo authentication refused"));
@@ -6836,9 +7265,33 @@ mod tests {
         errors: std::sync::Mutex<HashMap<(crate::ports::ProvisioningKind, String), String>>,
         readings: std::sync::Mutex<HashMap<(crate::ports::ProvisioningKind, String), flotilla_protocol::LifecycleReading>>,
         reads: std::sync::Mutex<Vec<(crate::ports::ProvisioningKind, String, Option<String>)>>,
+        /// The home and spec of each checkout the engine holds: its reading is scripted as a
+        /// [`crate::ports::ProvisioningKind::Checkout`] reading.
+        checkouts: std::sync::Mutex<BTreeMap<String, (String, CheckoutSpec)>>,
+        /// The vessel's launch at its home, once requested: still being realised, and realised.
+        launches: std::sync::OnceLock<(flotilla_provisioning_testkit::VesselsFixture, flotilla_provisioning_testkit::VesselsFixture)>,
+        /// Whether the vessel reads as its realised launch.
+        realised: std::sync::atomic::AtomicBool,
     }
 
     impl ScriptedReadings {
+        /// Requests the launch serving `work` of `convoy` on `host` at `home`, and returns its
+        /// name; it reads as being realised until [`Self::realise`].
+        fn launch(&self, home: &str, convoy: &str, work: &str, host: &str) -> String {
+            let (pending, realised) = self.launches.get_or_init(|| {
+                (flotilla_provisioning_testkit::VesselsFixture::at(home), flotilla_provisioning_testkit::VesselsFixture::at(home))
+            });
+            let launch = pending.request(convoy, work, host);
+            assert_eq!(realised.request(convoy, work, host), launch, "both launches share one name");
+            realised.ready(&launch, "env");
+            launch
+        }
+
+        /// Whether the vessel reads as realised or still being realised.
+        fn realise(&self, realised: bool) {
+            self.realised.store(realised, std::sync::atomic::Ordering::SeqCst);
+        }
+
         fn set(&self, kind: crate::ports::ProvisioningKind, name: &str, reading: Option<flotilla_protocol::LifecycleReading>) {
             let mut readings = self.readings.lock().expect("script");
             match reading {
@@ -6849,14 +7302,11 @@ mod tests {
     }
 
     impl crate::ports::LifecycleReads for ScriptedReadings {
-        fn try_terminal_launch(
-            &self,
-            name: &str,
-            origin: Option<&str>,
-        ) -> Result<Option<flotilla_resources::terminal_launches::TerminalLaunch>, String> {
-            self.try_reading(crate::ports::ProvisioningKind::TerminalSession, name, origin).map(|reading| {
-                reading.map(|reading| flotilla_resources::terminal_launches::TerminalLaunch { name: format!("{name}#1"), reading })
-            })
+        fn home(&self) -> Result<&str, String> {
+            Err("scripted readings read no engine".into())
+        }
+        fn joins(&self) -> Result<&flotilla_resources::held_joins::HeldJoins, String> {
+            Err("scripted readings read no engine".into())
         }
         fn reading(
             &self,
@@ -6879,21 +7329,151 @@ mod tests {
                 None => Ok(self.reading(kind, name, origin)),
             }
         }
+        fn clones(&self) -> Result<&dyn flotilla_resources::clone_records::CloneRecords, String> {
+            Ok(self)
+        }
+        fn checkouts(&self) -> Result<&dyn flotilla_resources::checkout_records::CheckoutRecords, String> {
+            Ok(self)
+        }
+        fn vessels(&self) -> Result<&dyn flotilla_resources::vessel_records::VesselRecords, String> {
+            let (pending, realised) = self.launches.get().ok_or("no vessel launched")?;
+            let fixture = if self.realised.load(std::sync::atomic::Ordering::SeqCst) { realised } else { pending };
+            Ok(fixture.vessels.as_ref())
+        }
     }
 
-    /// A convoy with a provisioning vessel on `host` (a replica's when `remote`), a checkout
-    /// `checkout-a` whose old status is Ready, and, when `clone` is set, its worktree's local clone
-    /// `ops-clone`, also Ready in the old status.
+    /// The checkouts held for the convoys the fixtures make (launch `convoy-a#1`): each scripted
+    /// checkout with a reading, as its first launch at its home. A scripted read error fails the
+    /// whole read.
+    impl flotilla_resources::checkout_records::CheckoutRecords for ScriptedReadings {
+        fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+            Vec::new()
+        }
+
+        fn get(&self, _: &str, _: Option<&str>) -> Result<Option<flotilla_resources::checkout_records::CheckoutRecord>, String> {
+            Err("readiness reads checkouts by holder".into())
+        }
+        fn held(
+            &self,
+            holder: &flotilla_resources::checkout_records::CheckoutHolder,
+        ) -> Result<Vec<flotilla_resources::checkout_records::CheckoutRecord>, String> {
+            let held = self.launches(flotilla_resources::checkout_records::Launches::Held(holder))?;
+            Ok(held.into_iter().map(|launch| launch.with_integration(None)).collect())
+        }
+        fn launches(
+            &self,
+            which: flotilla_resources::checkout_records::Launches<'_>,
+        ) -> Result<Vec<flotilla_resources::checkout_records::CheckoutLaunch>, String> {
+            use crate::ports::{LifecycleReads as _, ProvisioningKind};
+            use flotilla_resources::checkout_records::Launches;
+            match which {
+                Launches::Held(_) | Launches::Every => {}
+                Launches::Here => return Ok(Vec::new()),
+                Launches::Named { .. } => return Err("readiness reads checkouts by holder".into()),
+            }
+            let checkouts = self.checkouts.lock().expect("checkouts").clone();
+            let mut held = Vec::new();
+            for (name, (home, spec)) in checkouts {
+                if let Some(reading) = self.try_reading(ProvisioningKind::Checkout, &name, Some(&home))? {
+                    held.push(flotilla_resources::checkout_records::CheckoutLaunch {
+                        name: format!("{name}#1"),
+                        home,
+                        spec,
+                        holder: Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy("convoy-a#1".into())),
+                        requested_at: chrono::DateTime::UNIX_EPOCH,
+                        reading,
+                        degraded: None,
+                        integration: (),
+                    });
+                }
+            }
+            Ok(held)
+        }
+        fn of_repository(&self, _: &RepositoryKey) -> Result<Vec<flotilla_resources::checkout_records::CheckoutRecord>, String> {
+            Ok(Vec::new())
+        }
+        fn in_environment(&self, _: &str, _: Option<&str>) -> Result<Vec<flotilla_resources::checkout_records::CheckoutRecord>, String> {
+            Ok(Vec::new())
+        }
+        fn here(&self) -> Result<Vec<flotilla_resources::checkout_records::CheckoutRecord>, String> {
+            Ok(Vec::new())
+        }
+        fn home(&self) -> &str {
+            "home"
+        }
+        fn every(&self) -> Result<Vec<flotilla_resources::checkout_records::CheckoutRecord>, String> {
+            self.held(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(String::new()))
+        }
+        fn request(
+            &self,
+            _: &str,
+            _: &CheckoutSpec,
+            _: Option<&flotilla_resources::checkout_records::CheckoutHolder>,
+        ) -> Result<String, String> {
+            Err("readiness requests no checkout".into())
+        }
+        fn inspected(&self, _: &str, _: flotilla_resources::checkout_records::Inspection) -> Result<bool, String> {
+            Err("readiness inspects no checkout".into())
+        }
+        fn inspection_failed(&self, _: &str) -> Result<(), String> {
+            Err("readiness inspects no checkout".into())
+        }
+    }
+
+    /// Clones read by key from the same script as [`crate::ports::ProvisioningKind::Clone`].
+    impl flotilla_resources::clone_records::CloneRecords for ScriptedReadings {
+        fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+            Vec::new()
+        }
+
+        fn get(&self, name: &str, home: Option<&str>) -> Result<Option<flotilla_resources::clone_records::CloneRecord>, String> {
+            use crate::ports::LifecycleReads as _;
+            let reading = self.try_reading(crate::ports::ProvisioningKind::Clone, name, home)?;
+            Ok(reading.map(|reading| flotilla_resources::clone_records::CloneRecord {
+                name: format!("{name}#1"),
+                home: home.unwrap_or("kiwi").to_owned(),
+                spec: flotilla_resources::CloneSpec::builder()
+                    .repo_ref(RepositoryKey("repo".into()))
+                    .url("https://forgejo.test/ops".into())
+                    .env_ref("local".into())
+                    .path("/work/ops".into())
+                    .build(),
+                discovered: false,
+                requested_at: chrono::DateTime::UNIX_EPOCH,
+                reading,
+                default_branch: None,
+            }))
+        }
+        fn of_repository(&self, _: &RepositoryKey) -> Result<Vec<flotilla_resources::clone_records::CloneRecord>, String> {
+            Ok(Vec::new())
+        }
+        fn here(&self) -> Result<Vec<flotilla_resources::clone_records::CloneRecord>, String> {
+            Ok(Vec::new())
+        }
+        fn every(&self) -> Result<Vec<flotilla_resources::clone_records::CloneRecord>, String> {
+            Ok(Vec::new())
+        }
+        fn request(&self, _: &flotilla_resources::RepositorySpec, _: &flotilla_resources::CloneSpec, _: bool) -> Result<String, String> {
+            Err("readiness requests no clone".into())
+        }
+        fn renew(&self, _: &str) -> Result<flotilla_resources::clone_records::CloneRenewal, String> {
+            Err("readiness renews no clone".into())
+        }
+    }
+
+    /// A convoy with a provisioning vessel on `host` (a replica's when `remote`), and a checkout
+    /// `checkout-a` the engine holds for it at the vessel's home, made as a worktree of the clone
+    /// `ops-clone` when `clone` is set; `reads` scripts both readings (#3108).
     async fn engine_readiness_fixture(
         remote: bool,
         clone: bool,
         reads: Arc<ScriptedReadings>,
     ) -> (Aggregator, ResourceRef, ResourceObject<Convoy>) {
-        use flotilla_resources::{CheckoutPhase, CheckoutStatus, VesselPhase, VesselSpec, VesselStatus};
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        use flotilla_resources::{VesselPhase, VesselSpec, VesselStatus};
         let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Ready).call();
         let (events, _) = broadcast::channel(128);
-        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads);
+        let mut aggregator =
+            Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads.clone());
         let host = HostName::new(if remote { "feta" } else { "kiwi" });
         let provenance = if remote {
             let origin = flotilla_protocol::NodeId::new("remote-origin");
@@ -6904,27 +7484,23 @@ mod tests {
         };
         convoy.status.as_mut().expect("status").work.get_mut("implement").expect("work").placement =
             Some(PlacementStatus { fields: BTreeMap::from([("host".into(), serde_json::json!(host.as_str()))]) });
-        let mut vessel = backend
-            .using::<Vessel>("flotilla")
-            .create(
-                &InputMeta::builder().name("vessel-a".into()).build(),
-                &VesselSpec {
-                    convoy_ref: convoy.metadata.name.clone(),
-                    vessel_name: "implement".into(),
-                    fulfilment_kind_ref: "local".into(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                },
-            )
-            .await
-            .expect("vessel");
-        vessel.status = Some(VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() });
+        // The work's launch at the vessel's home, read as the old Vessel view.
+        let launch = reads.launch(if remote { "remote-origin" } else { "kiwi" }, &convoy.metadata.name, "implement", host.as_str());
+        let vessel = flotilla_provisioning_testkit::object::<Vessel>(
+            &launch,
+            VesselSpec {
+                convoy_ref: convoy.metadata.name.clone(),
+                vessel_name: "implement".into(),
+                fulfilment_kind_ref: "local".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+            VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() },
+        );
         apply_readiness_event(
             &mut aggregator.readiness_vessels,
             ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance: provenance.clone() }),
         );
         let mut checkout = checkout_object("checkout-a", "/work/repo", RepositoryKey("repo".into())).await;
-        checkout.metadata.labels.insert(CONVOY_LABEL.into(), convoy.metadata.name.clone());
-        checkout.status = Some(CheckoutStatus { phase: CheckoutPhase::Ready, ..Default::default() });
         if clone {
             checkout.spec = CheckoutSpec::Worktree(
                 flotilla_resources::CheckoutWorktreeSpec::builder()
@@ -6935,39 +7511,21 @@ mod tests {
                     .clone_ref("ops-clone".into())
                     .build(),
             );
-            let mut clone = backend
-                .using::<CloneResource>("flotilla")
-                .create(
-                    &InputMeta::builder().name("ops-clone".into()).build(),
-                    &flotilla_resources::CloneSpec::builder()
-                        .repo_ref(RepositoryKey("repo".into()))
-                        .url("https://forgejo.test/ops".into())
-                        .env_ref("local".into())
-                        .path("/work/ops".into())
-                        .build(),
-                )
-                .await
-                .expect("clone");
-            clone.status = Some(flotilla_resources::CloneStatus { phase: flotilla_resources::ClonePhase::Ready, ..Default::default() });
-            apply_readiness_event(
-                &mut aggregator.readiness_clones,
-                ReadWatchEvent::Added(ReadResourceObject { object: clone, provenance: provenance.clone() }),
-            );
         }
-        apply_readiness_event(
-            &mut aggregator.readiness_checkouts,
-            ReadWatchEvent::Added(ReadResourceObject { object: checkout, provenance }),
-        );
+        let home = if remote { "remote-origin" } else { "kiwi" };
+        reads.checkouts.lock().expect("checkouts").insert("checkout-a".into(), (home.into(), checkout.spec));
         let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
         (aggregator, reference, convoy)
     }
 
     /// The readiness state, and each checkout and clone blocker's resource name and reason.
     fn readiness_blockers(
-        aggregator: &Aggregator,
+        aggregator: &mut Aggregator,
         reference: &ResourceRef,
         convoy: &ResourceObject<Convoy>,
     ) -> (flotilla_protocol::result_set::ReadinessState, Vec<(String, String)>) {
+        // The scripted readings changed without a commit: read them as a rescan does.
+        aggregator.read_engine_checkouts();
         let row = aggregator.summarize(reference, convoy);
         let readiness = row.readiness().clone();
         let provisioning =
@@ -6978,23 +7536,23 @@ mod tests {
         )
     }
 
-    // Behaviour (#3629 layer 4): behind `[primitives]` the engine's reading of a checkout decides its
-    // readiness over the old status, read by key at the checkout's home (a replica's origin root);
-    // without a reading the old status still decides.
+    // Behaviour (#3629 layer 4, #3108): the engine's reading of a checkout it holds for the convoy
+    // at the vessel's home (a replica's origin root) decides its readiness; one held at another
+    // home is not the vessel's, and a read that fails blocks the vessel.
     #[tokio::test]
     async fn engine_readings_decide_checkout_readiness() {
         use flotilla_protocol::{result_set::ReadinessState, LifecycleReading};
 
         use crate::ports::ProvisioningKind::Checkout as Kind;
         let reads = Arc::new(ScriptedReadings::default());
-        let (aggregator, reference, convoy) = engine_readiness_fixture(true, false, reads.clone()).await;
-        let checkout = |reading| {
+        let (mut aggregator, reference, convoy) = engine_readiness_fixture(true, false, reads.clone()).await;
+        let mut checkout = |reading| {
             reads.set(Kind, "checkout-a", reading);
-            readiness_blockers(&aggregator, &reference, &convoy)
+            readiness_blockers(&mut aggregator, &reference, &convoy)
         };
         let blocker = |reason: &str| vec![("checkout-a".to_owned(), reason.to_owned())];
 
-        assert!(checkout(None).1.is_empty(), "no reading: the old status, Ready, decides");
+        assert!(checkout(None).1.is_empty(), "nothing held: no checkout blocks");
         assert_eq!(
             checkout(Some(LifecycleReading::GaveUp { cause: "branch conflicts".into() })),
             (ReadinessState::Failed, blocker("branch conflicts"))
@@ -7007,28 +7565,32 @@ mod tests {
         assert_eq!(state, ReadinessState::Blocked);
         assert!(blockers[0].1.starts_with("worktree add failed (2 failed"));
         assert_eq!(checkout(Some(LifecycleReading::InProgress)), (ReadinessState::Provisioning, blocker("being realised")));
-        assert_eq!(checkout(Some(LifecycleReading::Lost)), (ReadinessState::Failed, blocker("observed absent")));
+        assert_eq!(checkout(Some(LifecycleReading::Lost { reason: None })), (ReadinessState::Failed, blocker("observed absent")));
         assert!(checkout(Some(LifecycleReading::Ready { identity: "/work/repo".into() })).1.is_empty());
+        // Held at another home, it is not the remote vessel's checkout.
+        reads.checkouts.lock().expect("checkouts").get_mut("checkout-a").expect("scripted").0 = "kiwi".into();
+        assert!(checkout(Some(LifecycleReading::InProgress)).1.is_empty(), "another home's checkout is not the vessel's");
+        // The held checkouts' read fails: the vessel is blocked on its checkouts, with the reason.
         reads.errors.lock().expect("errors").insert((Kind, "checkout-a".into()), "checkout store unavailable".into());
-        assert_eq!(checkout(None), (ReadinessState::Blocked, blocker("checkout store unavailable")));
-
-        let reads = reads.reads.lock().expect("reads").clone();
-        assert!(reads.contains(&(Kind, "checkout-a".into(), Some("remote-origin".into()))), "{reads:?}");
+        aggregator.read_engine_checkouts();
+        let row = aggregator.summarize(&reference, &convoy);
+        assert_eq!(row.readiness().state, ReadinessState::Blocked);
+        assert!(row.readiness().explanation().contains("checkout store unavailable"), "{}", row.readiness().explanation());
     }
 
-    // Behaviour (#3629 layer 4, #3731 review): a worktree's clone is read from the engine too, at
-    // this home for a local clone; it blocks the vessel beside its checkout, whichever of the
-    // engine and the old status decides the checkout.
+    // Behaviour (#3629 layer 4, #3731 review, #3108): a worktree's clone is read from the engine
+    // too, at its checkout's home (here, for a local checkout); it blocks the vessel beside its
+    // checkout.
     #[tokio::test]
     async fn engine_readings_decide_clone_readiness() {
         use flotilla_protocol::{result_set::ReadinessState, LifecycleReading};
 
         use crate::ports::ProvisioningKind;
         let reads = Arc::new(ScriptedReadings::default());
-        let (aggregator, reference, convoy) = engine_readiness_fixture(false, true, reads.clone()).await;
+        let (mut aggregator, reference, convoy) = engine_readiness_fixture(false, true, reads.clone()).await;
         reads.set(ProvisioningKind::Checkout, "checkout-a", Some(LifecycleReading::InProgress));
         reads.set(ProvisioningKind::Clone, "ops-clone", Some(LifecycleReading::GaveUp { cause: "repository not found".into() }));
-        let (state, blockers) = readiness_blockers(&aggregator, &reference, &convoy);
+        let (state, blockers) = readiness_blockers(&mut aggregator, &reference, &convoy);
         assert_eq!(state, ReadinessState::Failed);
         assert_eq!(
             blockers,
@@ -7036,86 +7598,205 @@ mod tests {
         );
         reads.set(ProvisioningKind::Clone, "ops-clone", Some(LifecycleReading::Ready { identity: "/work/ops".into() }));
         assert_eq!(
-            readiness_blockers(&aggregator, &reference, &convoy),
+            readiness_blockers(&mut aggregator, &reference, &convoy),
             (ReadinessState::Provisioning, vec![("checkout-a".to_owned(), "being realised".to_owned())])
         );
         reads.errors.lock().expect("errors").insert((ProvisioningKind::Clone, "ops-clone".into()), "decided store unavailable".into());
         assert_eq!(
-            readiness_blockers(&aggregator, &reference, &convoy),
+            readiness_blockers(&mut aggregator, &reference, &convoy),
             (ReadinessState::Blocked, vec![("ops-clone".into(), "decided store unavailable".into())])
         );
         let reads = reads.reads.lock().expect("reads").clone();
-        assert!(reads.contains(&(ProvisioningKind::Clone, "ops-clone".into(), None)), "{reads:?}");
+        assert!(reads.contains(&(ProvisioningKind::Clone, "ops-clone".into(), Some("kiwi".into()))), "{reads:?}");
     }
 
-    // Behaviour (#3629 layer 8): behind `[primitives]` a session materializes its vessel only while
-    // the engine reads its current launch as running; an ended launch is not, whatever its old
-    // phase says. Without a reading the old phase decides.
+    // Behaviour (#3108): a vessel's change, and a change to a checkout held for one convoy, project
+    // only the convoys they touch, and read the engine as much at 16 convoys as at 2.
     #[tokio::test]
-    async fn the_engine_reading_decides_whether_a_session_runs() {
-        use flotilla_protocol::LifecycleReading;
-        use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatus};
+    async fn one_change_reads_the_engine_flat_as_convoys_grow() {
+        use flotilla_resources::{checkout_records::CheckoutChange, VesselPhase, VesselSpec, VesselStatus};
+        use flotilla_store::load_metrics::{measure, ReadCounts};
 
-        use crate::ports::ProvisioningKind;
-        let reads = Arc::new(ScriptedReadings::default());
-        let (events, _) = broadcast::channel(8);
-        let aggregator =
-            Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events).with_lifecycle_reads(reads.clone());
-        let mut session = session_object("terminal-ops-coder").await;
-        session.status = Some(TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() });
-        let session = ReadResourceObject { object: session, provenance: ResourceProvenance::Local };
-        assert!(aggregator.session_running(&session), "no reading: the old phase");
-        reads.set(ProvisioningKind::TerminalSession, "terminal-ops-coder", Some(LifecycleReading::Released));
-        assert!(!aggregator.session_running(&session), "its launch ended");
-        reads.set(ProvisioningKind::TerminalSession, "terminal-ops-coder", Some(LifecycleReading::Ready { identity: "s2".into() }));
-        assert!(aggregator.session_running(&session));
+        /// Every engine read made, whatever its shape, and the records they decoded.
+        fn reads(counts: &ReadCounts) -> (u64, u64) {
+            counts
+                .values()
+                .fold((0, 0), |(reads, decoded), kind| (reads + kind.keyed + kind.index + kind.whole_kind, decoded + kind.decoded))
+        }
+        let spec = |name: &str| {
+            CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "main".into(),
+                path: format!("/work/{name}"),
+                repo_ref: RepositoryKey("repo".into()),
+                host_ref: "local".into(),
+                is_main: false,
+            })
+        };
+        let mut costs = Vec::new();
+        for convoys in [2, 16] {
+            let engine = flotilla_provisioning_testkit::CheckoutFixture::at(OWN_HOME);
+            let (events, _) = broadcast::channel(1024);
+            let (mut aggregator, _convoys) = with_convoy_engine(
+                Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), events)
+                    .with_lifecycle_reads(engine.reads.clone()),
+            );
+            for index in 0..convoys {
+                let name = format!("convoy-{index}");
+                let mut convoy = convoy_with_vessel(&name).await;
+                let launch = engine.open_convoy(&name);
+                engine.put_ready(&format!("checkout-{index}"), &spec(&name), Some(&engine.holder(&name)));
+                convoy.status.as_mut().expect("status").engine_launch = Some(launch);
+                aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
+            }
+            aggregator.read_engine_checkouts();
+            let summarized = aggregator.summarized_convoys.load(Ordering::Relaxed);
+
+            let vessel = flotilla_provisioning_testkit::object::<Vessel>(
+                "vessel-0",
+                VesselSpec {
+                    convoy_ref: "convoy-0".into(),
+                    vessel_name: "implement".into(),
+                    fulfilment_kind_ref: "local".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+                VesselStatus { phase: VesselPhase::Provisioning, ..Default::default() },
+            );
+            let ((), vessel_reads) = measure(
+                aggregator
+                    .vessel_changed(ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local })),
+            )
+            .await;
+            assert_eq!(aggregator.summarized_convoys.load(Ordering::Relaxed) - summarized, 1, "only the vessel's convoy is projected");
+            assert!(!vessel_reads.keys().any(|kind| kind.starts_with("Checkout")), "checkouts are held, not read: {vessel_reads:?}");
+
+            let launch = engine.request("checkout-more", &spec("more"), Some(&engine.holder("convoy-1")));
+            let change = CheckoutChange::Changed { name: launch, home: OWN_HOME.into() };
+            let (changed, checkout_reads) = measure(aggregator.engine_checkout_changed(change)).await;
+            changed.expect("checkout change applied");
+            assert_eq!(aggregator.summarized_convoys.load(Ordering::Relaxed) - summarized, 2, "only the holder's convoy is projected");
+            let holder = aggregator.convoys.values().find(|convoy| convoy.object.metadata.name == "convoy-1").expect("convoy-1");
+            assert_eq!(aggregator.held_checkouts(&holder.object).expect("held").len(), 2, "the new checkout is held in memory");
+            costs.push((reads(&vessel_reads), reads(&checkout_reads)));
+        }
+        assert_eq!(costs[0], costs[1], "engine reads for one change at 2 and at 16 convoys");
     }
 
-    // The same SQLite view contract serves local and foreign-origin rows without status copies.
+    // Behaviour (stale needs_you on landed convoys): a crew session's change, a change in the
+    // environment it runs in, a convoy's change request and the fulfilment kind placing its vessel
+    // each project only the convoy they touch, so a busy fleet's convoy events are not queued
+    // behind whole projections.
     #[tokio::test]
-    async fn terminal_views_use_engine_identity_latest_launch_and_ending() {
-        use flotilla_provisioning_testkit::{terminal_session, Ending, TerminalFixture};
-        for replica in [false, true] {
-            let fixture = TerminalFixture::new(replica);
-            let obj = terminal_session(TerminalSessionPhase::Running);
-            fixture.request(&obj);
-            let (events, _) = broadcast::channel(8);
-            let aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("reader"), events)
-                .with_lifecycle_reads(fixture.reads.clone());
-            let source = ReadResourceObject {
-                object: obj.clone(),
-                provenance: if replica {
-                    ResourceProvenance::Replica {
-                        origin_root: flotilla_protocol::NodeId::new("home"),
-                        last_synced_at: chrono::DateTime::UNIX_EPOCH,
-                    }
-                } else {
-                    ResourceProvenance::Local
+    async fn a_convoys_own_inputs_project_it_alone() {
+        use flotilla_resources::{VesselPhase, VesselSpec, VesselStatus};
+        use flotilla_store::load_metrics::measure;
+
+        fn summarized(aggregator: &Aggregator) -> usize {
+            aggregator.summarized_convoys.load(Ordering::Relaxed)
+        }
+        let mut costs = Vec::new();
+        for convoys in [2, 16] {
+            let (events, _) = broadcast::channel(1024);
+            let (mut aggregator, _engine) =
+                with_convoy_engine(Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), events));
+            let mut sessions = Vec::new();
+            for index in 0..convoys {
+                let name = format!("convoy-{index}");
+                aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel(&name).await)).await;
+                let mut session = session_object(&format!("terminal-{name}")).await;
+                session.spec.env_ref = format!("env-{index}");
+                session.metadata.labels.insert(CONVOY_LABEL.into(), name.clone());
+                session.metadata.labels.insert(VESSEL_LABEL.into(), "implement".into());
+                aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
+                sessions.push(session);
+            }
+            aggregator.rebuild_local_projection().await;
+
+            let before = summarized(&aggregator);
+            let mut session = sessions[0].clone();
+            session.status.as_mut().expect("status").phase = TerminalSessionPhase::Stopped;
+            let ((), session_reads) =
+                measure(aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session))).await;
+            assert_eq!(summarized(&aggregator) - before, 1, "a session's change projects its convoy alone");
+
+            let before = summarized(&aggregator);
+            let ((), environment_reads) = measure(aggregator.environment_changed(Some(EnvironmentChange::Changed("env-0".into())))).await;
+            assert_eq!(summarized(&aggregator) - before, 1, "an environment's change projects the convoy crewed in it alone");
+
+            let reference = aggregator.convoy_ref("flotilla", "convoy-0");
+            let generation = uuid::Uuid::new_v4();
+            aggregator.change_request_refresh_generations.insert(reference.clone(), generation);
+            let before = summarized(&aggregator);
+            let resolution = ChangeRequestResolution {
+                reference: reference.clone(),
+                generation,
+                branch: "feat/convoy".into(),
+                result: ConvoyBranchRefresh {
+                    primary: Ok(Some(ConvoyChangeRequest {
+                        id: "7".into(),
+                        status: flotilla_protocol::ChangeRequestStatus::Open,
+                        repository_key: RepositoryKey("repo_flotilla".into()),
+                    })),
+                    repositories: Vec::new(),
                 },
             };
-            assert!(!aggregator.session_running(&source));
-            fixture.finish(&obj, Ending::Ready("engine identity"));
-            let selected = aggregator.terminal_view(&source).expect("view");
-            assert_eq!(selected.object.status.expect("status").session_id.as_deref(), Some("engine identity"));
-            assert!(aggregator.session_running(&source));
-            fixture.finish(&obj, Ending::Released);
-            assert_eq!(
-                aggregator.terminal_view(&source).expect("view").object.status.expect("status").phase,
-                TerminalSessionPhase::Stopped
-            );
-            assert_eq!(fixture.replace(&obj, "terminal-a#1").expect("replacement"), "terminal-a#2");
-            assert_eq!(
-                aggregator.terminal_view(&source).expect("view").object.status.expect("status").phase,
-                TerminalSessionPhase::Starting
-            );
-            fixture.finish(&obj, Ending::Failed("engine ending reason"));
-            let selected = aggregator.terminal_view(&source).expect("view").object.status.expect("status");
-            assert_eq!(selected.phase, TerminalSessionPhase::Failed);
-            assert!(selected.message.expect("reason").contains("engine ending reason"));
-            assert_eq!(obj.status.as_ref().expect("raw").phase, TerminalSessionPhase::Running);
-            fixture.poison();
-            assert!(aggregator.terminal_view(&source).is_none(), "read errors never select stale Running");
+            let ((), resolution_reads) = measure(aggregator.apply_change_request_resolution(resolution)).await;
+            assert_eq!(summarized(&aggregator) - before, 1, "a change request's resolution projects its convoy alone");
+            assert!(aggregator.convoy_change_requests.contains_key(&reference));
+
+            for index in 0..convoys {
+                let vessel = flotilla_provisioning_testkit::object::<Vessel>(
+                    &format!("vessel-{index}"),
+                    VesselSpec {
+                        convoy_ref: format!("convoy-{index}"),
+                        vessel_name: "implement".into(),
+                        fulfilment_kind_ref: format!("kind-{index}"),
+                        adopted_checkout_refs: BTreeMap::new(),
+                    },
+                    VesselStatus { phase: VesselPhase::Provisioning, ..Default::default() },
+                );
+                aggregator
+                    .vessel_changed(ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local }))
+                    .await;
+            }
+            let spec = flotilla_resources::FulfilmentKindSpec::builder()
+                .host_ref("local".into())
+                .pool("test".into())
+                .realisation(FulfilmentRealisation::HostDirect)
+                .build();
+            let mut kind = create_placement_record::<FulfilmentKind>(spec).await;
+            kind.metadata.name = "kind-0".into();
+            let before = summarized(&aggregator);
+            let ((), kind_reads) = measure(aggregator.fulfilment_kind_changed(ReadWatchEvent::Added(ReadResourceObject {
+                object: kind,
+                provenance: ResourceProvenance::Local,
+            })))
+            .await;
+            assert_eq!(summarized(&aggregator) - before, 1, "a fulfilment kind's change projects the convoy it places alone");
+
+            let key = ("flotilla".to_string(), "terminal-convoy-1".to_string(), None);
+            let generation = uuid::Uuid::new_v4();
+            aggregator.attach_refresh_generations.insert(key.clone(), (generation, tokio::spawn(async {}).abort_handle()));
+            let before = summarized(&aggregator);
+            let resolution =
+                AttachCapabilityResolution { generation, key: key.clone(), attachable: !aggregator.attachable_sessions.contains(&key) };
+            let (applied, attach_reads) = measure(aggregator.apply_attach_capability_resolution(resolution)).await;
+            applied.expect("attach resolution applied");
+            assert_eq!(summarized(&aggregator) - before, 1, "a session's attach resolution projects its convoy alone");
+
+            // A session moved to another convoy crews that one from then on.
+            let before = summarized(&aggregator);
+            let mut moved = sessions[0].clone();
+            moved.metadata.labels.insert(CONVOY_LABEL.into(), "convoy-1".into());
+            aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(moved)).await;
+            assert_eq!(summarized(&aggregator) - before, 2, "a moved session projects the convoy it left and the one it joined");
+            let crewing = |convoy: &str| {
+                aggregator.convoy_sessions("flotilla", convoy).map(|session| session.object.metadata.name.clone()).collect::<BTreeSet<_>>()
+            };
+            assert_eq!(crewing("convoy-0"), BTreeSet::new());
+            assert_eq!(crewing("convoy-1"), BTreeSet::from(["terminal-convoy-0".to_string(), "terminal-convoy-1".to_string()]));
+            costs.push((session_reads, environment_reads, resolution_reads, kind_reads, attach_reads));
         }
+        assert_eq!(costs[0], costs[1], "engine reads for one change at 2 and at 16 convoys");
     }
 
     // Engine readings decide readiness despite stale lifecycle phase/message; interrupted roles remain observations.
@@ -7143,29 +7824,39 @@ mod tests {
     }
 
     fn assert_vessel_readiness_contract(old: VesselPhase, reason: &str, mode: usize) {
-        use crate::ports::ProvisioningKind;
         use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
-        use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
-        use flotilla_resources::{VesselSpec, VesselStatus};
+        use flotilla_provisioning_testkit::{object, VesselsFixture};
+        use flotilla_resources::{vessel_records::VesselStep, VesselSpec, VesselStatus};
         let recorded_reason = reason;
-        let (ending, expected, reason) = match mode {
-            0 => (Some(Ending::Released), VesselPhase::Lost, "released"),
-            1 => (Some(Ending::Lost("env")), VesselPhase::Lost, "observed absent"),
-            2 => {
-                (Some(Ending::Failed(reason)), VesselPhase::Failed, if reason.is_empty() { "failed (no reason recorded)" } else { reason })
+        let ready = |environment: &str| VesselStep::Realised { environment: environment.into() };
+        let (steps, expected, reason) = match mode {
+            0 => (vec![VesselStep::Released], VesselPhase::Released, String::new()),
+            1 => {
+                (vec![ready("env"), VesselStep::Lost { reason: "observed absent".into() }], VesselPhase::Lost, "observed absent".to_owned())
             }
-            3 => (Some(Ending::GaveUp(reason)), VesselPhase::Failed, reason),
-            4 => (None, VesselPhase::Provisioning, "being realised"),
-            5 => (Some(Ending::Ready("env")), VesselPhase::Interrupted, "crew roles are interrupted: coder"),
-            6 => (None, VesselPhase::Provisioning, "provider is busy (1 failed; next try at 1970-01-01T00:00:03+00:00)"),
-            _ => (None, VesselPhase::Failed, "provider refused (attempts spent)"),
+            2 => (
+                vec![ready("env"), VesselStep::Broke { reason: reason.into() }],
+                VesselPhase::Failed,
+                if reason.is_empty() { "failed (no reason recorded)".to_owned() } else { reason.to_owned() },
+            ),
+            3 => (vec![VesselStep::Failed { cause: reason.into(), retryable: false }], VesselPhase::Failed, reason.to_owned()),
+            4 => (Vec::new(), VesselPhase::Provisioning, "being realised".to_owned()),
+            5 => (vec![ready("env")], VesselPhase::Interrupted, "crew roles are interrupted: coder".to_owned()),
+            6 => (
+                vec![VesselStep::Failed { cause: "provider is busy".into(), retryable: true }],
+                VesselPhase::Provisioning,
+                "provider is busy (1 failed; next try at".to_owned(),
+            ),
+            // Its tries spent and no give-up written yet: a restart between the two leaves it so.
+            _ => (Vec::new(), VesselPhase::Failed, "provider refused (attempts spent)".to_owned()),
         };
         let convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
         let status = convoy.status.as_ref().expect("status");
         let definition = &status.workflow_snapshot.as_ref().expect("snapshot").vessels[0];
-        let fixture = VesselFixture::new(false);
+        let fixture = VesselsFixture::default();
+        let launch = fixture.request(&convoy.metadata.name, &definition.name, "host");
         let vessel = object::<Vessel>(
-            "vessel",
+            &launch,
             VesselSpec {
                 convoy_ref: convoy.metadata.name.clone(),
                 vessel_name: definition.name.clone(),
@@ -7186,14 +7877,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        fixture.request(&vessel);
-        if mode == 6 {
-            fixture.retry(&vessel, "provider is busy");
-        } else if mode == 7 {
-            fixture.exhaust_before_give_up(&vessel, "provider refused");
+        for step in steps {
+            fixture.step(&launch, step);
         }
-        if let Some(ending) = ending {
-            fixture.finish(&vessel, ending);
+        if mode == 7 {
+            fixture.exhaust_before_give_up(&launch, "provider refused");
         }
         let (events, _) = broadcast::channel(8);
         let mut aggregator =
@@ -7215,20 +7903,44 @@ mod tests {
 
         apply_readiness_event(&mut aggregator.readiness_vessels, ReadWatchEvent::Added(read.clone()));
         let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("host"));
-        let (readiness, _) =
-            aggregator.vessel_readiness(&reference, definition, status.work.get(&definition.name), None, &HostName::new("host"));
+        let (readiness, _) = aggregator.vessel_readiness(
+            &reference,
+            definition,
+            status.work.get(&definition.name),
+            None,
+            &HostName::new("host"),
+            &Ok(BTreeMap::new()),
+        );
+        // A released vessel ended on purpose: nothing blocks it, whatever its stale status says.
+        if expected == VesselPhase::Released {
+            assert_eq!(readiness.state, flotilla_protocol::result_set::ReadinessState::Ready);
+            assert!(readiness.blockers.is_empty(), "{:?}", readiness.blockers);
+            return;
+        }
         assert_eq!(readiness.blockers.len(), 1, "stale checkout refs are not combined with engine evidence");
-        assert_eq!(readiness.blockers[0].reason, reason);
+        // A retrying launch's next try is at the engine's clock; the rest of its reason is fixed.
+        if mode == 6 {
+            assert!(readiness.blockers[0].reason.starts_with(&reason), "{}", readiness.blockers[0].reason);
+        } else {
+            assert_eq!(readiness.blockers[0].reason, reason);
+        }
         assert_eq!(readiness.blockers[0].phase, format!("{expected:?}"));
         if mode == 2 {
             assert_eq!(
-                fixture.reads.try_reading(ProvisioningKind::Vessel, "vessel", None),
+                flotilla_resources::vessel_records::engine_vessel(fixture.reads.as_ref(), &read.object, None)
+                    .map(|record| record.map(|record| record.reading)),
                 Ok(Some(LifecycleReading::Failed { reason: recorded_reason.into() }))
             );
         }
         fixture.poison();
-        let (readiness, _) =
-            aggregator.vessel_readiness(&reference, definition, status.work.get(&definition.name), None, &HostName::new("host"));
+        let (readiness, _) = aggregator.vessel_readiness(
+            &reference,
+            definition,
+            status.work.get(&definition.name),
+            None,
+            &HostName::new("host"),
+            &Ok(BTreeMap::new()),
+        );
         assert_eq!(readiness.blockers[0].phase, "Unknown");
         assert!(readiness.blockers[0].reason.contains("poisoned"));
     }
@@ -7274,7 +7986,7 @@ mod tests {
                 for phase in [CrewWorkPhase::Pending, CrewWorkPhase::Working, CrewWorkPhase::Stalled, CrewWorkPhase::Interrupted] {
                     let state = AggregatorProjectionState::new();
                     let (event_tx, _) = broadcast::channel(8);
-                    let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+                    let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
                     let mut convoy = convoy_with_work().convoy_phase(convoy_phase).work_phase(ResourceWorkPhase::Abandoned).call();
                     let status = convoy.status.as_mut().unwrap();
                     if !snapshot {
@@ -7288,18 +8000,21 @@ mod tests {
                         session.metadata.labels.insert(CONVOY_LABEL.into(), convoy.metadata.name.clone());
                         session.metadata.labels.insert(VESSEL_LABEL.into(), "implement".into());
                         session.spec.role = "coder".into();
-                        session.status.as_mut().unwrap().attention = Some(TerminalAttention {
-                            state: TerminalAttentionState::Working,
-                            as_of: Utc::now(),
-                            source: TerminalAttentionSource::Screen,
-                        });
+                        agent_reports(
+                            &mut aggregator,
+                            None,
+                            "terminal-abandoned-coder",
+                            flotilla_protocol::AgentActivity::Working,
+                            Utc::now(),
+                        )
+                        .await;
                         let source = ReadResourceObject { object: session, provenance: ResourceProvenance::Local };
                         aggregator.terminal_sessions.insert(session_key(&source), source);
                     }
-                    aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+                    aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
                     let result = state.result_set().await;
                     let row = &result.rows.as_convoys().unwrap()[0];
-                    assert_eq!(row.phase, super::convoy_phase(convoy_phase));
+                    assert_eq!(row.phase, Some(super::convoy_phase(convoy_phase)));
                     assert_eq!(row.surface_state, SurfaceState::Available);
                     assert!(row.vessels.iter().all(|vessel| vessel.surface_state == SurfaceState::Available));
                 }
@@ -7409,7 +8124,7 @@ mod tests {
                     Some(ConfiguredResourceLimits { cpus: None, cpu_shares: None, build_jobs: Some(2), linker_threads: None });
                 aggregator.replace_replica_sessions(vec![ReadResourceObject { object: session, provenance }]).await;
                 let resource = ResourceRef::new("flotilla/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
-                let row = aggregator.summarize_vessel(&resource, &definition, Some(work), None, None);
+                let row = aggregator.summarize_vessel(&resource, &definition, Some(work), &Default::default(), None, &Ok(BTreeMap::new()));
                 assert_eq!(row.crew[0].adapter.as_deref(), Some("codex"));
                 assert_eq!(row.crew[0].model, model);
                 assert_eq!(
@@ -7449,8 +8164,13 @@ mod tests {
         for (target, machine) in [("host-b1", "b1"), ("host-udder", "udder")] {
             let backend = ResourceBackend::new(InMemoryBackend::default());
             let (events, _) = broadcast::channel(128);
-            let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events)
-                .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node", "udder")));
+            // The engine holds no launch of this vessel, so its stored status is read.
+            let engine = flotilla_provisioning_testkit::VesselsFixture::at(OWN_HOME);
+            let (mut aggregator, _convoys) = with_convoy_engine(
+                Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events)
+                    .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node", "udder")))
+                    .with_lifecycle_reads(engine.reads.clone()),
+            );
             let origin = flotilla_protocol::NodeId::new("udder-node");
             aggregator.origin_hosts.insert(origin.clone(), HostName::new("udder"));
             let provenance = ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() };
@@ -7507,15 +8227,13 @@ mod tests {
             session.spec.role = "coder".into();
             session.metadata.labels =
                 BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone()), (VESSEL_LABEL.into(), "implement".into())]);
-            session.status.as_mut().expect("session status").attention = Some(TerminalAttention {
-                state: TerminalAttentionState::Working,
-                as_of: Utc::now(),
-                source: TerminalAttentionSource::Hook,
-            });
+            home_heard(&mut aggregator, "udder-node", Utc::now()).await;
+            agent_reports(&mut aggregator, Some("udder-node"), "terminal-ssh-coder", flotilla_protocol::AgentActivity::Working, Utc::now())
+                .await;
             let session = ReadResourceObject { object: session, provenance };
             let key = session_key(&session);
             aggregator.replace_replica_sessions(vec![session]).await;
-            aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+            aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
             // Attach capability resolves asynchronously; settle it as attachable.
             aggregator.attachable_sessions.insert(key);
             let status = convoy.status.as_ref().expect("convoy status");
@@ -7523,8 +8241,9 @@ mod tests {
                 &aggregator.convoy_ref("flotilla", &convoy.metadata.name),
                 &status.workflow_snapshot.as_ref().expect("workflow snapshot").vessels[0],
                 status.work.get("implement"),
-                None,
+                &status.stalls,
                 status.crew_work.get("implement"),
+                &Ok(BTreeMap::new()),
             );
 
             assert_eq!(row.host, HostName::new("udder"));
@@ -7604,29 +8323,23 @@ mod tests {
             };
             let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attach_resolver(Arc::new(resolver));
             let object = checkout_object("same-name", "/srv/widgets", RepositoryKey("widgets".into())).await;
-            aggregator.apply_checkout_event(WatchEvent::Added(object.clone())).await.expect("local checkout");
+            discover_checkouts(&mut aggregator, std::slice::from_ref(&object)).await;
             let mut expected = [None, None];
             for (origin, op) in operations {
-                let mut updated = object.clone();
                 let branch = format!("branch-{op}");
-                if let CheckoutSpec::Observed(spec) = &mut updated.spec {
-                    spec.r#ref = branch.clone();
-                }
-                let source = ReadResourceObject {
-                    object: updated,
-                    provenance: ResourceProvenance::Replica {
-                        origin_root: flotilla_protocol::NodeId::new(format!("origin-{origin}")),
-                        last_synced_at: Utc::now(),
-                    },
-                };
-                let event = if op == 2 {
-                    expected[origin] = None;
-                    ReadWatchEvent::Deleted(source)
-                } else {
-                    expected[origin] = Some(branch);
-                    ReadWatchEvent::Modified(source)
-                };
-                aggregator.apply_checkout_replica_event(event).await.expect("replica event");
+                expected[origin] = (op != 2).then_some(branch);
+                let adopted = expected
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(origin, branch)| {
+                        let mut updated = object.clone();
+                        if let CheckoutSpec::Observed(spec) = &mut updated.spec {
+                            spec.r#ref = branch.clone()?;
+                        }
+                        Some(adopted_record(&format!("origin-{origin}"), &updated))
+                    })
+                    .collect();
+                hold_engine_checkouts(&mut aggregator, "local-home", adopted).await;
                 let set = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout query");
                 let rows = set.rows.as_checkouts().expect("checkout rows");
                 assert_eq!(rows.len(), 1 + expected.iter().filter(|entry| entry.is_some()).count());
@@ -7643,7 +8356,6 @@ mod tests {
     #[tokio::test]
     async fn restart_relist_removes_local_rows_missing_from_stores() {
         let durable = ResourceBackend::new(InMemoryBackend::default());
-        let observed = ResourceBackend::new(InMemoryBackend::observed());
         let state = AggregatorProjectionState::new();
         let stale_ref = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "deleted-during-outage");
         state.write().await.local_rows.insert(
@@ -7652,6 +8364,7 @@ mod tests {
                 .resource(stale_ref)
                 .name("deleted-during-outage")
                 .workflow_ref("scratch")
+                .project_ref("flotilla")
                 .phase(ConvoyPhase::Active)
                 .build(),
         );
@@ -7662,19 +8375,11 @@ mod tests {
                 AggregatorResolvers::builder()
                     .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
                     .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
-                    .durable_demands(durable.clone().using::<Demand>("flotilla"))
-                    .durable_environments(durable.clone().using::<Environment>("flotilla"))
                     .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
                     .durable_projects(durable.including_replicas::<Project>("flotilla"))
                     .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
                     .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
                     .durable_hosts(durable.including_replicas::<flotilla_resources::Host>("flotilla"))
-                    .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
-                    .durable_clones(durable.using::<CloneResource>("flotilla"))
-                    .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
-                    .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
-                    .observed_checkouts(observed.using::<Checkout>("flotilla"))
-                    .observed_checkout_replicas(observed.including_replicas::<Checkout>("flotilla"))
                     .build(),
             ),
         );
@@ -7698,21 +8403,13 @@ mod tests {
             vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
             vec![Ok(expiring_watch()), Ok(pending_watch())],
         ));
-        let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
 
         let run_durable_convoys = Arc::clone(&durable_convoys);
-        let run_observed_convoys = Arc::clone(&observed_convoys);
         let run_state = state.clone();
-        let task = tokio::spawn(async move {
-            run_with_test_sources(
-                Aggregator::new(run_state, HostName::new("local"), event_tx),
-                run_durable_convoys.as_ref(),
-                run_observed_convoys.as_ref(),
-            )
-            .await
-        });
+        let (aggregator, _engine) = with_convoy_engine(Aggregator::new(run_state, HostName::new("local"), event_tx));
+        let task = tokio::spawn(async move { run_with_test_sources(aggregator, run_durable_convoys.as_ref()).await });
 
         let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial result set timeout").await;
         let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
@@ -7726,7 +8423,6 @@ mod tests {
         assert!(state.result_set().await.rows.is_empty());
         assert_eq!(durable_convoys.list_calls.load(Ordering::SeqCst), 2);
         assert_eq!(durable_convoys.watch_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(observed_convoys.watch_calls.load(Ordering::SeqCst), 1, "healthy watch must not restart");
         assert!(!task.is_finished(), "aggregator should remain alive after in-place relist");
 
         task.abort();
@@ -7737,8 +8433,6 @@ mod tests {
     async fn expired_session_watch_relists_its_source_and_removes_missed_deletion() {
         let stale = session_object("deleted-while-watch-expired").await;
         let durable_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let durable_environments = Arc::new(ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let durable_demands = Arc::new(ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_sessions = Arc::new(ScriptedSource::new(
             vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
             vec![Ok(expiring_watch()), Ok(pending_watch())],
@@ -7746,14 +8440,8 @@ mod tests {
         let durable_projects = Arc::new(ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_convoy_ensures = Arc::new(ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_repositories = Arc::new(ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_sessions = Arc::new(ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let observed_checkouts = Arc::new(ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let observed_checkout_replicas = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
 
@@ -7762,20 +8450,12 @@ mod tests {
         let task = tokio::spawn(async move {
             let sources = AggregatorSourceRefs::builder()
                 .durable_convoys(durable_convoys.as_ref())
-                .durable_demands(durable_demands.as_ref())
-                .durable_environments(durable_environments.as_ref())
                 .durable_sessions(run_durable_sessions.as_ref())
                 .durable_projects(durable_projects.as_ref())
                 .durable_convoy_ensures(durable_convoy_ensures.as_ref())
                 .durable_repositories(durable_repositories.as_ref())
                 .durable_vessels(&durable_vessels)
                 .durable_hosts(&durable_hosts)
-                .durable_checkouts(&durable_checkouts)
-                .durable_clones(&durable_clones)
-                .observed_convoys(observed_convoys.as_ref())
-                .observed_sessions(observed_sessions.as_ref())
-                .observed_checkouts(observed_checkouts.as_ref())
-                .observed_checkout_replicas(&observed_checkout_replicas)
                 .build();
             Aggregator::new(run_state, HostName::new("local"), event_tx).run_with_sources(sources).await
         });
@@ -7805,23 +8485,21 @@ mod tests {
         let durable_convoys = Arc::new(ScriptedSource::new(
             vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
             vec![
-                Err(ResourceError::WatchExpired { requested_version: "1".to_string(), compacted_through: Some("2".to_string()) }),
+                Err(ResourceError::WatchExpired {
+                    requested_version: "1".to_string(),
+                    compacted_through: Some("2".to_string()),
+                    reason: "events through 2 were compacted".to_string(),
+                }),
                 Ok(pending_watch()),
             ],
         ));
-        let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
 
         let run_durable_convoys = Arc::clone(&durable_convoys);
         let run_state = state.clone();
         let task = tokio::spawn(async move {
-            run_with_test_sources(
-                Aggregator::new(run_state, HostName::new("local"), event_tx),
-                run_durable_convoys.as_ref(),
-                observed_convoys.as_ref(),
-            )
-            .await
+            run_with_test_sources(Aggregator::new(run_state, HostName::new("local"), event_tx), run_durable_convoys.as_ref()).await
         });
 
         let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial result set timeout").await;
@@ -7839,13 +8517,12 @@ mod tests {
     #[tokio::test]
     async fn non_expiry_watch_error_still_exits_aggregator() {
         let durable_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(failing_watch("convoy watch failed"))]);
-        let observed_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let state = AggregatorProjectionState::new();
         let (event_tx, _event_rx) = broadcast::channel(8);
 
         let result = timeout(
             Duration::from_secs(1),
-            run_with_test_sources(Aggregator::new(state, HostName::new("local"), event_tx), &durable_convoys, &observed_convoys),
+            run_with_test_sources(Aggregator::new(state, HostName::new("local"), event_tx), &durable_convoys),
         )
         .await
         .expect("aggregator should return the watch error")
@@ -8115,23 +8792,15 @@ mod tests {
         .expect("held provider check is canceled on drop");
     }
 
-    fn resource_resolvers(d: &ResourceBackend, observed: &ResourceBackend) -> AggregatorResolvers {
+    fn resource_resolvers(d: &ResourceBackend) -> AggregatorResolvers {
         AggregatorResolvers::builder()
             .durable_convoys(d.including_replicas::<Convoy>("flotilla"))
             .durable_convoy_ensures(d.including_replicas::<ConvoyEnsure>("flotilla"))
-            .durable_demands(d.using::<Demand>("flotilla"))
-            .durable_environments(d.using::<Environment>("flotilla"))
             .durable_sessions(d.including_replicas::<TerminalSession>("flotilla"))
             .durable_projects(d.including_replicas::<Project>("flotilla"))
             .durable_repositories(d.including_replicas::<Repository>("flotilla"))
             .durable_vessels(d.including_replicas::<Vessel>("flotilla"))
             .durable_hosts(d.including_replicas::<flotilla_resources::Host>("flotilla"))
-            .durable_checkouts(d.including_replicas::<Checkout>("flotilla"))
-            .durable_clones(d.using::<CloneResource>("flotilla"))
-            .observed_convoys(observed.using::<Convoy>("flotilla"))
-            .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
-            .observed_checkouts(observed.using::<Checkout>("flotilla"))
-            .observed_checkout_replicas(observed.including_replicas::<Checkout>("flotilla"))
             .build()
     }
 
@@ -8163,15 +8832,15 @@ mod tests {
             } else {
                 ResourceBackend::new(InMemoryBackend::default())
             };
-            let observed = ResourceBackend::new(InMemoryBackend::observed());
             let sessions = durable.using::<TerminalSession>("flotilla");
             let session = session_object("terminal-probe").await;
             let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
             let gate = Arc::new(HeldAttachResolver { entered: entered_tx, release: tokio::sync::Semaphore::new(0) });
             let state = AggregatorProjectionState::new();
             let (tx, mut rx) = broadcast::channel(4096);
-            let aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver(gate.clone());
-            let resolvers = resource_resolvers(&durable, &observed);
+            let (aggregator, _engine) =
+                with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver(gate.clone()));
+            let resolvers = resource_resolvers(&durable);
             let task = tokio::spawn(aggregator.run(resolvers));
             timeout(Duration::from_secs(1), async {
                 loop {
@@ -8199,7 +8868,10 @@ mod tests {
             convoys
                 .create(
                     &InputMeta::builder().name("prompt-local".to_string()).build(),
-                    &flotilla_resources::ConvoySpec::builder().workflow_ref("latency".to_string()).build(),
+                    &flotilla_resources::ConvoySpec::builder()
+                        .workflow_ref("latency".to_string())
+                        .project_ref("flotilla".to_string())
+                        .build(),
                 )
                 .await
                 .expect("local write");
@@ -8335,19 +9007,6 @@ mod hold_attention_tests {
                         .build()
                 })
                 .collect(),
-            pending_supervisor_turn: Some(flotilla_resources::PendingSupervisorTurn {
-                queued_order: 0,
-                vessel: "work".into(),
-                role: "governor".into(),
-                message: flotilla_resources::TerminalCrewMessage {
-                    id: "supervise".into(),
-                    text: "Supervise".into(),
-                    sender: Default::default(),
-                    delivery: flotilla_resources::CrewMessageDelivery::Queued,
-                    acknowledged: Default::default(),
-                    following: Vec::new(),
-                },
-            }),
             ..Default::default()
         }
     }
@@ -8373,12 +9032,12 @@ mod hold_attention_tests {
                     Some("actionable-review"),
                     Some(ConvoyAttention::QUEUED_TURN_SOURCE),
                     Some(ConvoyAttention::MISSING_TURN_HOOK_SOURCE),
-                    Some(ConvoyAttention::SUPERVISOR_TURN_SOURCE),
                     Some("settlement"),
                 ] {
                     let state = AggregatorProjectionState::new();
                     let (event_tx, _) = broadcast::channel(8);
-                    let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+                    let (mut aggregator, _engine) =
+                        super::tests::with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
                     let mut convoy = super::tests::convoy_with_vessel("held").await;
                     let status = convoy.status.as_mut().expect("status");
                     status.phase = phase;
@@ -8388,7 +9047,7 @@ mod hold_attention_tests {
                     status.attention = source.map(|source| ConvoyAttention { source: source.into(), ..attention.clone() });
                     let delivery = refusal_delivery(&attention, explicit_hold);
                     status.turn_deliveries.insert("actionable-review".into(), delivery.clone());
-                    aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+                    aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
                     let result = state.result_set().await;
                     let row = &result.rows.as_convoys().expect("convoys")[0];
                     assert_eq!(
@@ -8396,11 +9055,11 @@ mod hold_attention_tests {
                         !phase.is_terminal() || source == Some("settlement"),
                         "{phase:?}, explicit={explicit_hold}, source={source:?}"
                     );
-                    assert_eq!(row.phase, convoy_phase(phase));
+                    assert_eq!(row.phase, Some(convoy_phase(phase)));
                     if phase.is_terminal() && source != Some("settlement") {
                         assert!(row.message.is_none(), "stale delivery reason must not label the terminal row");
                     }
-                    let stored = aggregator.convoys_by_source[&LocalSource::Durable].values().next().expect("convoy");
+                    let stored = aggregator.convoys.values().next().expect("convoy");
                     assert_eq!(stored.object.status.as_ref().unwrap().turn_deliveries["actionable-review"], delivery);
                 }
             }
@@ -8413,7 +9072,7 @@ mod hold_attention_tests {
     async fn persisted_hold_survives_attention_slot_clear() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let (mut aggregator, _engine) = super::tests::with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
         let mut convoy = super::tests::convoy_with_vessel("held").await;
         let status = convoy.status.as_mut().expect("status");
         status.attention = None;
@@ -8428,7 +9087,7 @@ mod hold_attention_tests {
                 ..Default::default()
             },
         );
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
         let result = state.result_set().await;
         let row = result.rows.as_convoys().expect("convoys").iter().find(|row| row.name == "held").expect("held row");
         assert_eq!(row.surface_state, SurfaceState::NeedsYou);

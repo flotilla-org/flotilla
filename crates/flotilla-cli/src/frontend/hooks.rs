@@ -9,10 +9,7 @@ use crate::cli::args::{Cli, CompletionShell, HooksSubCommand};
 pub async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argument_payload: Option<&str>) -> Result<()> {
     use std::io::Read;
 
-    // 1. Resolve harness parser
-    let (harness_enum, parser) = agents::parser_for_harness(harness).map_err(|e| color_eyre::eyre::eyre!("unknown harness: {e}"))?;
-
-    // 2. Read native payload from stdin
+    // 1. Read the native payload: Codex notify passes it as an argument, every other hook on stdin.
     let mut payload = Vec::new();
     if harness == "codex" && event_type == "notify" {
         payload = argument_payload.ok_or_else(|| color_eyre::eyre::eyre!("Codex notify requires a JSON argument"))?.as_bytes().to_vec();
@@ -20,36 +17,20 @@ pub async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argument_paylo
         std::io::stdin().read_to_end(&mut payload).map_err(|e| color_eyre::eyre::eyre!("failed to read stdin: {e}"))?;
     }
 
-    // 3. Parse the event
-    let parsed = parser.parse_event(event_type, &payload).map_err(|e| color_eyre::eyre::eyre!("parse error: {e}"))?;
-
-    // 4. Resolve the managed terminal before the temporary hook identity.
+    // 2. The managed terminal names the agent, so a Claude Code session's command hooks
+    // (SessionStart) and HTTP hooks update one attachable.
     let terminal = std::env::var("FLOTILLA_NAMESPACE")
         .ok()
         .filter(|value| !value.is_empty())
         .zip(std::env::var("FLOTILLA_TERMINAL_SESSION").ok().filter(|value| !value.is_empty()))
         .map(|(namespace, session_name)| flotilla_protocol::AgentHookTerminalRef { namespace, session_name });
     let explicit_id = std::env::var("FLOTILLA_ATTACHABLE_ID").ok();
-    // A managed terminal names the agent, so a Claude Code session's command hooks
-    // (SessionStart) and HTTP hooks update one attachable.
-    let attachable_id = flotilla_agent::attachable::terminal_hook_id(explicit_id.as_deref(), terminal.as_ref());
 
-    // 5. Build the event.
-    let cause = agents::hooks::hook_event_name(&harness_enum, event_type).map(str::to_owned);
-    let event = AgentHookEvent::builder()
-        .attachable_id(attachable_id)
-        .harness(harness_enum)
-        .maybe_hook_event(cause)
-        .event_type(parsed.event_type)
-        .maybe_session_id(parsed.session_id)
-        .maybe_model(parsed.model)
-        .maybe_cwd(parsed.cwd)
-        .maybe_transcript_path(parsed.transcript_path)
-        .native_codex_hook(parsed.native_codex_hook)
-        .maybe_terminal(terminal)
-        .build();
+    // 3. Parse and build the event.
+    let event = agents::hook_event(harness, event_type, &payload, terminal, explicit_id.as_deref())
+        .map_err(|e| color_eyre::eyre::eyre!("hook event: {e}"))?;
 
-    // 6. Send to daemon via socket. The daemon owns agent state as a single
+    // 4. Send to daemon via socket. The daemon owns agent state as a single
     // actor — no file-level races between concurrent hook processes.
     send_hook_event(&cli.socket_path(), event).await
 }

@@ -4,18 +4,18 @@ pub mod image_check;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
-    commands::ExplainedSubjectFact, output::OutputFormat, CliListKind, CliListResponse, Command, CommandAction, CommandValue,
-    CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, EvidenceFreshness, FleetHealthResponse, FleetHostStaleness,
-    FleetListResponse, FleetObservationAgreement, FleetStaleness, FulfilmentListResponse, FulfilmentRow, HostProvidersResponse,
-    HostStatusResponse, NodeId, NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey,
-    TopologyResponse,
+    commands::{ExplainedHolds, ExplainedSubjectFact},
+    output::OutputFormat,
+    CliListKind, CliListResponse, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus,
+    EvidenceFreshness, FleetHealthResponse, FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness,
+    FulfilmentListResponse, FulfilmentRow, HostProvidersResponse, HostStatusResponse, NodeId, NodeInfo, PeerConnectionState,
+    ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::{DaemonEndpoint, SocketDaemon};
@@ -190,7 +190,6 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
             "Convoys",
             "Surfaces",
             "Disk Free",
-            "Daemon RSS",
             "Blob Sync",
             "Sleep Inhibition",
             "Staleness",
@@ -242,9 +241,6 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
                     host.surface_states.available, host.surface_states.stalled_handled, host.surface_states.needs_you
                 )),
                 Cell::new(format_disk_free(host.disk_free_bytes)),
-                Cell::new(
-                    host.daemon_rss_bytes.map_or_else(|| "-".to_string(), |bytes| format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))),
-                ),
                 Cell::new(host.blob_sync.as_ref().map_or_else(
                     || "-".to_string(),
                     |sync| match &sync.last_error {
@@ -472,6 +468,15 @@ fn format_issue_page_human(page: &flotilla_protocol::issue_query::IssueResultPag
     output
 }
 
+fn format_last_round(at: Option<DateTime<Utc>>) -> String {
+    match at {
+        Some(at) => {
+            format!("{} ({}s ago)", at.format("%Y-%m-%d %H:%M:%S UTC"), Utc::now().signed_duration_since(at).num_seconds().max(0))
+        }
+        None => "none yet".to_owned(),
+    }
+}
+
 fn format_host_status_human(response: &HostStatusResponse) -> String {
     let mut out = String::new();
     out.push_str(&format!("Host: {}\n", response.host_name));
@@ -481,8 +486,17 @@ fn format_host_status_human(response: &HostStatusResponse) -> String {
     out.push_str(&format!("Repositories: {}\n", response.repo_count));
     if let Some(stream) = &response.change_stream {
         out.push_str(&format!("Change stream: watermark {}, {} consecutive failures\n", stream.watermark, stream.consecutive_failures));
+        out.push_str(&format!("Change stream last round: {}\n", format_last_round(stream.followed_at)));
         if let Some(error) = &stream.last_error {
             out.push_str(&format!("Change stream error: {error}\n"));
+        }
+        for path in &stream.paths {
+            let route = path.via.as_ref().map_or_else(|| "direct".to_owned(), |via| format!("via {via}"));
+            out.push_str(&format!("Change stream path {route}: last round {}", format_last_round(path.followed_at)));
+            if let Some(error) = &path.last_error {
+                out.push_str(&format!(", {} consecutive failures: {error}", path.consecutive_failures));
+            }
+            out.push('\n');
         }
     }
     if let Some(sync) = &response.blob_sync {
@@ -860,10 +874,11 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
 fn format_crew_list_human(response: &CrewListResponse) -> String {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Role", "Kind", "State", "Attention", "Adapter", "Model", "Stance", "Reason"]);
+    table.set_header(vec!["Role", "Vessel", "Kind", "State", "Attention", "Adapter", "Model", "Stance", "Reason"]);
     for member in &response.members {
         table.add_row(vec![
             Cell::new(&member.role),
+            Cell::new(member.vessel.as_deref().unwrap_or(&response.vessel)),
             Cell::new(&member.kind),
             Cell::new(&member.state),
             Cell::new(member.attention.map_or_else(|| "-".to_string(), |attention| attention.to_string())),
@@ -930,10 +945,11 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         .as_ref()
         .map(|cascade| format!("\nResolved defaults:\n{}\n", serde_json::to_string_pretty(cascade).expect("serialize cascade")))
         .unwrap_or_default();
-    let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
-    for held in &explanation.held_deliveries {
-        let _ = writeln!(output, "HELD DELIVERY: {}", held.description);
+    let mut output = format!("Convoy: {}/{}\n", explanation.namespace, explanation.convoy);
+    if !explanation.role.is_empty() {
+        let _ = writeln!(output, "Role: {}", explanation.role);
     }
+    let _ = writeln!(output, "Phase: {}", explanation.phase);
     for warning in &explanation.warnings {
         let _ = writeln!(output, "Warning: {warning}");
     }
@@ -960,9 +976,6 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     }
     for hold in &explanation.holds {
         let _ = writeln!(output, "Turn delivery: {} held since={}: {}", hold.source, hold.raised_at, hold.reason);
-    }
-    for mutation in &explanation.lifecycle_mutations {
-        let _ = writeln!(output, "{} by {} at {}", mutation.action, mutation.caller, mutation.at);
     }
     if let Some(message) = explanation.message.as_deref() {
         let _ = writeln!(output, "Message: {message}");
@@ -1080,7 +1093,7 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             );
         }
     }
-    if let Some(stalled) = &explanation.stalled {
+    for stalled in &explanation.stalls {
         let _ = writeln!(output, "Stalled: {}", serde_json::to_string_pretty(stalled).expect("stall condition serializes"));
     }
     let standing = explanation.settlement.mode == flotilla_protocol::commands::SETTLEMENT_MODE_STANDING;
@@ -1088,7 +1101,14 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     if standing {
         output.push_str("Settlement: STANDING (no exit table)\n");
     } else {
-        let _ = writeln!(output, "Settlement: {verdict} ({})", explanation.settlement.mode);
+        match &explanation.settlement.disposition {
+            Some(disposition) => {
+                let _ = writeln!(output, "Settlement: {verdict} ({}, {disposition})", explanation.settlement.mode);
+            }
+            None => {
+                let _ = writeln!(output, "Settlement: {verdict} ({})", explanation.settlement.mode);
+            }
+        }
     }
     let _ = writeln!(
         output,
@@ -1101,11 +1121,47 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             let _ = writeln!(output, "  - {}: {} — {}", unmet.reason, unmet.subject, unmet.detail);
         }
     }
+    if !explanation.settlement.discharged.is_empty() {
+        output.push_str("\nDischarged unread (no vessel left to read them):\n");
+        for discharge in &explanation.settlement.discharged {
+            let unmet = &discharge.expectation;
+            let _ = writeln!(output, "  - {}: {} — {}", unmet.reason, unmet.subject, unmet.detail);
+            for vessel in &discharge.ended_vessels {
+                let reason = vessel.reason.as_deref().map(|reason| format!(" ({reason})")).unwrap_or_default();
+                let _ = writeln!(output, "      {} {}{} at {}", vessel.launch, vessel.reading, reason, vessel.ended_at);
+            }
+        }
+    }
 
     if !explanation.unclaimed_work.is_empty() {
         output.push_str("\nCrew work needing a settlement claim:\n");
         for work in &explanation.unclaimed_work {
             let _ = writeln!(output, "  - {}/{} ({})", work.vessel, work.role, work.evidence.replace('_', " "));
+        }
+    }
+
+    if let Some(held_by) = &explanation.held_by {
+        output.push_str("\nHeld by:\n");
+        let holds = match held_by {
+            ExplainedHolds::Retired => {
+                output.push_str("  retired\n");
+                &[][..]
+            }
+            ExplainedHolds::Open { holds } => {
+                output.push_str("  open: it retires once it ends and nothing holds it\n");
+                holds.as_slice()
+            }
+            ExplainedHolds::Ended { holds } if holds.is_empty() => {
+                output.push_str("  nothing holds it\n");
+                &[][..]
+            }
+            ExplainedHolds::Ended { holds } => holds.as_slice(),
+        };
+        for hold in holds {
+            let _ = match hold.split_once(':') {
+                Some((kind, name)) => writeln!(output, "  - {kind}: {name}"),
+                None => writeln!(output, "  - {hold}"),
+            };
         }
     }
 
@@ -1160,16 +1216,11 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 continue;
             }
             if ledger.missing {
-                let detail = ledger.override_principal.as_ref().map_or_else(
-                    || {
-                        if ledger.comment_url.is_some() {
-                            "PR comment exists, decision-ledger artifact not found".to_string()
-                        } else {
-                            "decision-ledger artifact not found".to_string()
-                        }
-                    },
-                    |principal| format!("completed by {}/{} with --force", principal.namespace, principal.name),
-                );
+                let detail = if ledger.comment_url.is_some() {
+                    "PR comment exists, decision-ledger artifact not found"
+                } else {
+                    "decision-ledger artifact not found"
+                };
                 let _ = writeln!(
                     output,
                     "  - {}/{} claimed_at={} MISSING ({detail}){} comment={}",
@@ -1221,6 +1272,19 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             ]);
         }
         let _ = writeln!(output, "{table}");
+        // A clone that is not ready is what its checkout waits on, or why it failed.
+        for checkout in &explanation.checkouts {
+            let Some(clone) = &checkout.clone else { continue };
+            if let Some(reason) = clone.reading.reason() {
+                let _ = writeln!(output, "  {} clone {}: {} ({reason})", checkout.name, clone.name, clone.reading.label());
+            }
+        }
+        // A checkout whose release is held on its work says why, and since when.
+        for checkout in &explanation.checkouts {
+            let Some(held) = &checkout.held else { continue };
+            let reason = held.reason.replace('\n', "\n    ");
+            let _ = writeln!(output, "  {}: Held: {reason} since {}", checkout.name, held.since.to_rfc3339());
+        }
     }
 
     output.push_str("\nSubjects:\n");
@@ -1240,10 +1304,11 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                     let observation = explanation.subject_observations.iter().find(|observation| observation.subject == subject.subject);
                     let _ = writeln!(
                         output,
-                        "    {} state={} checks={} review={} actionable_at_head={} readiness={}",
+                        "    {} state={} checks={} mergeable={} review={} actionable_at_head={} readiness={}",
                         subject.short,
                         format_subject_fact(observation.map(|o| &o.state)),
                         format_subject_fact(observation.map(|o| &o.checks)),
+                        format_subject_fact(observation.map(|o| &o.mergeable)),
                         format_subject_fact(observation.map(|o| &o.review)),
                         format_subject_fact(observation.map(|o| &o.review_actionable_at_head)),
                         format_subject_fact(observation.map(|o| &o.readiness))
@@ -1351,21 +1416,16 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         for delivery in &explanation.crew_deliveries {
             let _ = writeln!(
                 output,
-                "  - {} role={} last_rung={} delivered_message={} sender={}",
+                "  - {} role={} last_rung={}",
                 delivery.session,
                 delivery.role,
-                delivery.last_delivery_rung.as_deref().unwrap_or("not recorded"),
-                delivery.delivered_message_id.as_deref().unwrap_or("-"),
-                delivery.sender.as_deref().unwrap_or("-")
+                delivery.last_delivery_rung.as_deref().unwrap_or("not recorded")
             );
             if let Some(condition) = &delivery.terminal_condition {
                 let _ = writeln!(output, "    {condition}");
             }
             if let Some(obstruction) = &delivery.obstruction {
                 let _ = writeln!(output, "    blocked: {obstruction}");
-            }
-            for brief in &delivery.pending_briefs {
-                let _ = writeln!(output, "    pending brief: {brief}");
             }
         }
     }
@@ -1428,14 +1488,6 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::CrewEscalated { receiver } => format!("escalated to {receiver}"),
         CommandValue::CrewEscalationRefused { rung, reason } => format!("escalation refused at {rung} rung: {reason}"),
         CommandValue::CrewFollowUpDelivered => flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION.to_string(),
-        CommandValue::CrewCompletionAdvisory { pending } => {
-            if pending.is_empty() {
-                "Your part ends when your promises are kept or retracted.".into()
-            } else {
-                format!("Pending promises:\n{}", pending.join("\n"))
-            }
-        }
-        CommandValue::CrewCompletionWaiting { reason, retry_at } => format!("crew completion waiting until {retry_at}: {reason}"),
         CommandValue::ResourceReconciled { message, .. } => message.clone(),
         CommandValue::ConvoyBriefDelivered { displaced: Some(displaced) } => {
             format!("brief delivered now; displaced pending brief:\n{displaced}")
@@ -1446,13 +1498,6 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
             format!("brief queued for turn end; displaced brief:\n{displaced}")
         }
         CommandValue::ConvoyBriefQueued { displaced: None } => "brief queued for turn end".to_string(),
-        CommandValue::ConvoyBriefHeld { displaced, held } => {
-            let mut output = format!("brief queued, not for turn end: {held}");
-            if let Some(displaced) = displaced {
-                output.push_str(&format!("\ndisplaced brief:\n{displaced}"));
-            }
-            output
-        }
         CommandValue::ConvoyBriefWithdrawn { withdrawn: Some(withdrawn) } => format!("pending brief withdrawn:\n{withdrawn}"),
         CommandValue::ConvoyBriefWithdrawn { withdrawn: None } => "no pending brief to withdraw".to_string(),
         CommandValue::RepoTracked { path, resolved_from, identity_change } => {
@@ -1519,6 +1564,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
             image_check::format_image_check_human(&image_check::ImageCheckOutcome { report: (**report).clone(), timed_out: false })
         }
         CommandValue::ImageBuild(build) => format!("image build {}: {} (attempt {})\n", build.name, build.phase.as_str(), build.attempt),
+        CommandValue::ImageBuildRetried { launch } => format!("launched {launch}"),
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
         CommandValue::CrewStalls(stalls) => {
             if stalls.rows.is_empty() {
@@ -1536,7 +1582,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                 .map(|(index, cause)| (cause, index + 1))
                 .collect();
             for row in &stalls.rows {
-                let evidence = format_stall_evidence(&row.evidence, stalls.full);
+                let evidence = row.evidence.as_deref().map(|evidence| format_stall_evidence(evidence, stalls.full));
                 let supervisor = row
                     .supervisor
                     .clone()
@@ -1548,7 +1594,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                     "{} / {} | {} / {} | {} | {} | {} | {} | group {} ({}) | {}",
                     row.project_display_name.as_deref().or(row.project.as_deref()).unwrap_or("-"),
                     row.convoy_display_name,
-                    if row.vessel.is_empty() { "-" } else { &row.vessel },
+                    row.vessel.as_deref().unwrap_or("-"),
                     if row.role.is_empty() { "-" } else { &row.role },
                     row.rung.map(|rung| rung.to_string()).unwrap_or_else(|| "unknown".into()),
                     supervisor,
@@ -1556,8 +1602,11 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                     proposed,
                     groups[row.cause_group.as_str()],
                     row.shared_cause_count,
-                    evidence
+                    evidence.as_deref().unwrap_or("-")
                 );
+                if let (true, Some(raised_at)) = (stalls.full, row.raised_at) {
+                    let _ = writeln!(output, "  operator attention raised: {}", raised_at.to_rfc3339());
+                }
                 if stalls.full && !row.artifacts.is_empty() {
                     let _ = writeln!(output, "  artifacts: {}", row.artifacts.join(", "));
                 }
@@ -1571,7 +1620,6 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::DaemonLogs { lines } => lines.join("\n"),
         CommandValue::ProjectExplanation(explanation) => serde_json::to_string_pretty(explanation).expect("serialize project explanation"),
         CommandValue::ConvoyExplanation(explanation) => format_convoy_explanation_human(explanation),
-        CommandValue::ResourceDigest(value) => serde_json::to_string_pretty(value).unwrap_or_default(),
         CommandValue::ResourceRead(response) => {
             let mut output = String::new();
             for record in &response.records {
@@ -1933,65 +1981,15 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
     if command.action.is_query() {
         return run_query_command(daemon, command, format).await;
     }
-
-    let mut rx = daemon.subscribe();
-    let mut command_id = daemon.execute(command.clone()).await?;
-
-    loop {
-        match rx.recv().await {
-            Ok(ref event @ DaemonEvent::CommandStarted { command_id: id, .. }) if id == command_id => {
-                if matches!(format, OutputFormat::Human) {
-                    println!("{}", format_event_human(event));
-                }
-            }
-            Ok(event @ DaemonEvent::CommandStepUpdate { command_id: id, .. }) if id == command_id => {
-                if matches!(format, OutputFormat::Human) {
-                    println!("{}", format_event_human(&event));
-                }
-            }
-            Ok(ref event @ DaemonEvent::CommandFinished { command_id: id, ref result, .. }) if id == command_id => {
-                if let CommandValue::CrewCompletionWaiting { retry_at, .. } = result {
-                    if !matches!(command.action, CommandAction::CrewComplete { .. }) {
-                        return Err("unexpected completion wait for a non-completion command".into());
-                    }
-                    // JSON mode retains one final stdout document; wait progress
-                    // is diagnostic output, just like lag/disconnection notices.
-                    eprintln!("{}", format_command_result(result));
-                    // Remote clock skew may shift this sleep; the daemon checks
-                    // its own cooldown and all gates again on every re-claim.
-                    // This live wait lasts until evidence recovers or the caller
-                    // cancels; dropping it leaves no queued retry in the daemon.
-                    let delay = retry_at.signed_duration_since(Utc::now()).to_std().unwrap_or_default();
-                    tokio::time::sleep(delay.max(Duration::from_millis(10))).await;
-                    command_id = daemon.execute(command.clone()).await?;
-                    continue;
-                }
-                match format {
-                    OutputFormat::Human => {
-                        println!("{}", format_event_human(event));
-                    }
-                    OutputFormat::Json => {
-                        println!("{}", flotilla_protocol::output::json_pretty(&result));
-                    }
-                }
-                let result = result.clone();
-                return match result {
-                    CommandValue::Error { .. } => Ok(result),
-                    CommandValue::Cancelled => Err("command cancelled".into()),
-                    result => Ok(result),
-                };
-            }
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                if matches!(format, OutputFormat::Human) {
-                    eprintln!("warning: skipped {n} events");
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                return Err("daemon disconnected".into());
-            }
+    flotilla_client::wait_for_command(daemon, command, |progress| match (progress, format) {
+        (flotilla_client::CommandProgress::Event(event), OutputFormat::Human) => println!("{}", format_event_human(event)),
+        (flotilla_client::CommandProgress::Event(DaemonEvent::CommandFinished { result, .. }), OutputFormat::Json) => {
+            println!("{}", flotilla_protocol::output::json_pretty(result))
         }
-    }
+        (flotilla_client::CommandProgress::Skipped(skipped), OutputFormat::Human) => eprintln!("warning: skipped {skipped} events"),
+        (flotilla_client::CommandProgress::Event(_) | flotilla_client::CommandProgress::Skipped(_), OutputFormat::Json) => {}
+    })
+    .await
 }
 
 async fn run_query_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<CommandValue, String> {

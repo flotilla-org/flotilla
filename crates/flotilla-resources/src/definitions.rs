@@ -1,6 +1,6 @@
 //! The declared definition kinds' records (#3824 layer 2b-ii): Forge, FleetDesignation,
-//! CredentialSpec, CredentialGrant, CrewDefaults, ImageLayer and WorkflowTemplate, and Project
-//! (layer 3b).
+//! CredentialSpec, CredentialGrant, CrewDefaults, ImageLayer, WorkflowTemplate and ConvoyEnsure,
+//! and Project (layer 3b).
 //!
 //! On the engine each is a plain record at the home that declared it, holding only its own fields:
 //! why it was written is its change's (#4024), never a column of its row. [`DefinitionOrigin`] is
@@ -23,8 +23,8 @@ use crate::{
 };
 
 /// The kinds the engine's definition records serve, by their resource kind names.
-pub const DEFINITION_KINDS: [&str; 7] =
-    ["Forge", "FleetDesignation", "CredentialSpec", "CredentialGrant", "CrewDefaults", "ImageLayer", "WorkflowTemplate"];
+pub const DEFINITION_KINDS: [&str; 8] =
+    ["Forge", "FleetDesignation", "CredentialSpec", "CredentialGrant", "CrewDefaults", "ImageLayer", "WorkflowTemplate", "ConvoyEnsure"];
 
 /// Whether `kind` is one of [`DEFINITION_KINDS`].
 pub fn is_definition_kind(kind: &str) -> bool {
@@ -85,6 +85,10 @@ pub fn declares(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String
 
 /// The origin a writer stamped as `labels` and `annotations`. Stamps naming an origin without all
 /// of its fields are refused with the missing key named.
+///
+/// A ProjectOps origin does not hold the `manifest-reconciler-root` that project operations stamp
+/// for a bound ops root, so an engine read of such a definition carries no root. Its home is still
+/// the binding host: project operations materialise from a bound root only on that host.
 pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, String>) -> Result<DefinitionOrigin, String> {
     let annotation = |key: &str| annotations.get(key).cloned().ok_or_else(|| format!("no `{key}` annotation"));
     let managed_by = labels.get(MANAGED_BY_LABEL).map(String::as_str);
@@ -125,7 +129,9 @@ pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, 
             project: annotation(MATERIALIZED_PROJECT_ANNOTATION)?,
             repository: annotation(SOURCE_REPOSITORY_ANNOTATION)?,
             commit: annotation(SOURCE_COMMIT_ANNOTATION)?,
-            entry_path: Some(annotation(SOURCE_ENTRY_PATH_ANNOTATION)?),
+            // The entry is named when it was read; a record rebuilt from the engine's change holds
+            // no path, so its stamps name none.
+            entry_path: annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).cloned(),
         });
     }
     // A declaration-backed Project stays the declaration's even when a whole-repository label
@@ -219,7 +225,12 @@ mod tests {
                 charter: tc.draw(gs::booleans()).then(|| CharterOrigin { source: Some(text(&tc)), revision: text(&tc), scope: text(&tc) }),
                 materialized_project: tc.draw(gs::booleans()).then(|| text(&tc)),
             },
-            2 => DefinitionOrigin::ProjectOps { project: text(&tc), repository: text(&tc), commit: text(&tc), entry_path: Some(text(&tc)) },
+            2 => DefinitionOrigin::ProjectOps {
+                project: text(&tc),
+                repository: text(&tc),
+                commit: text(&tc),
+                entry_path: tc.draw(gs::booleans()).then(|| text(&tc)),
+            },
             3 => DefinitionOrigin::ProjectImage { project: text(&tc), commit: text(&tc) },
             4 => DefinitionOrigin::ProjectDeclaration { repository: text(&tc), commit: text(&tc) },
             5 => DefinitionOrigin::WholeRepository,

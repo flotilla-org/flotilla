@@ -1,0 +1,27 @@
+[package]
+name = "flotilla-engine-convoys-testkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Dev-only: the engine Convoy path at a home over a decided store, served as the backend's Convoy, and launches admitted on it"
+
+[dependencies]
+flotilla-engine-convoys = { path = "../flotilla-engine-convoys" }
+flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-engine-messages = { path = "../flotilla-engine-messages" }
+flotilla-engine-messages-testkit = { path = "../flotilla-engine-messages-testkit" }
+flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-store = { path = "../flotilla-store" }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

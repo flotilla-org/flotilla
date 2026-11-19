@@ -4,13 +4,12 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_resources::{ResourceError, WatchStart};
+use flotilla_resources::{ManifestRoot, Resource, ResourceError, WatchStart};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::{
     get_resource_kind, get_resource_kind_all_provenances, get_resource_kind_including_replicas, list_resource_kind,
-    list_resource_kind_including_replicas, list_resource_kind_replica_sources, registered_resource_namespaces, watch_resource_kind,
-    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceWatch,
-    ResourceBackend, REGISTERED_RESOURCE_KINDS,
+    list_resource_kind_including_replicas, list_resource_kind_replica_sources, registered_resource_namespaces, watch_resource_kind_with,
+    DynamicResourceWatch, DynamicWatchRequest, ResourceBackend, REGISTERED_RESOURCE_KINDS,
 };
 
 /// What the resource API answers, before it is written to a connection.
@@ -47,6 +46,10 @@ impl Reply {
     }
 
     fn resource_error(error: ResourceError) -> Self {
+        // A Status message, as Kubernetes sends with a 410: why the client relists.
+        if let ResourceError::WatchExpired { reason, .. } = &error {
+            return Self::error(410, reason);
+        }
         let status = match error {
             ResourceError::WatchExpired { .. } => 410,
             ResourceError::Invalid { .. } => 400,
@@ -94,28 +97,42 @@ pub(in crate::server) async fn respond(
         };
     }
 
-    let observed_path = path == "/observed" || path.starts_with("/observed/");
-    let additional_stores = if daemon.is_some() && !observed_path { vec!["/observed"] } else { Vec::new() };
-    let (path, backend) = if observed_path {
-        let path = path.strip_prefix("/observed").expect("observed store prefix");
-        let Some(daemon) = daemon else {
-            return Reply::error(404, "observed resource store unavailable");
-        };
-        (path, daemon.observed_resource_backend())
-    } else {
-        (path, backend)
-    };
     if path == "/apis/flotilla.work/v1" {
-        let namespaces = match registered_resource_namespaces(&backend).await {
+        let mut namespaces = match registered_resource_namespaces(&backend).await {
             Ok(namespaces) => namespaces,
             Err(error) => return Reply::resource_error(error),
         };
+        // The engine holds manifest roots in the provisioning namespace; it is named when any is
+        // held, so a candidate asks it for their bound charter inputs.
+        if let Some(daemon) = daemon {
+            let namespace = daemon.provisioning_namespace().await;
+            match daemon.manifest_roots().roots(&namespace).await {
+                Ok(roots) if !roots.is_empty() => {
+                    let held = namespaces.entry(ManifestRoot::API_PATHS.plural.to_owned()).or_default();
+                    if !held.contains(&namespace) {
+                        held.push(namespace);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => return Reply::error(500, &error),
+            }
+        }
         return Reply::json(
             200,
-            serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>(), "namespaces": namespaces, "stores": additional_stores }),
+            serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>(), "namespaces": namespaces }),
         );
     }
-    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    // Each segment is percent-decoded once split, so a name holding `/` stays one segment.
+    let segments = match path
+        .trim_matches('/')
+        .split('/')
+        .map(|segment| percent_encoding::percent_decode_str(segment).decode_utf8())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(segments) => segments,
+        Err(_) => return Reply::error(400, "resource API path is not UTF-8 once decoded"),
+    };
+    let segments = segments.iter().map(|segment| segment.as_ref()).collect::<Vec<_>>();
     let (namespace, kind, name) = match segments.as_slice() {
         ["apis", "flotilla.work", "v1", "namespaces", namespace, kind] => (*namespace, *kind, None),
         ["apis", "flotilla.work", "v1", "namespaces", namespace, kind, name] => (*namespace, *kind, Some(*name)),
@@ -151,27 +168,6 @@ pub(in crate::server) async fn respond(
         };
     }
     let query = parse_query(raw_query);
-    if let Some(mode) = query.get("digest") {
-        if name.is_some() {
-            return Reply::error(400, "digests require a collection");
-        }
-        let expected_root = query.get("expectedRoot").cloned().unwrap_or_default();
-        let query = match mode.as_str() {
-            "root" => flotilla_resources::DigestQuery::Root,
-            "children" if !expected_root.is_empty() => flotilla_resources::DigestQuery::Children { expected_root },
-            "snapshot" if !expected_root.is_empty() => {
-                let Some(bucket) = query.get("bucket").and_then(|value| value.parse::<u8>().ok()) else {
-                    return Reply::error(400, "invalid digest bucket");
-                };
-                flotilla_resources::DigestQuery::Snapshot { expected_root, bucket }
-            }
-            _ => return Reply::error(400, "invalid digest query"),
-        };
-        return match flotilla_store::digest_resource_kind(&backend, namespace, kind, &query).await {
-            Ok(digest) => Reply::serialized(serde_json::to_value(digest).map_err(|error| error.to_string())),
-            Err(error) => Reply::resource_error(error),
-        };
-    }
     let include_replicas = query_flag(&query, &["includeReplicas", "include-replicas", "include_replicas"]);
     let replica_sources = query_flag(&query, &["replicaSources", "replica-sources", "replica_sources"]);
     let all_provenances = query_flag(&query, &["allProvenances", "all-provenances", "all_provenances"]);
@@ -281,29 +277,19 @@ pub(in crate::server) async fn respond(
         };
     }
 
-    let watched = if replica_sources {
-        if query.contains_key("resourceVersion") {
-            Err(ResourceError::invalid("replica-source watches do not support resourceVersion resume"))
-        } else {
-            watch_resource_kind_replica_sources(&backend, namespace, kind).await
+    if replica_sources {
+        return Reply::error(400, "replica sources are a collection read, not a watch");
+    }
+    let start = query.get("resourceVersion").map(|resource_version| match query.get("generation") {
+        Some(generation) => {
+            WatchStart::FromVersionInGeneration { generation: generation.clone(), resource_version: resource_version.clone() }
         }
-    } else if include_replicas {
-        if query.contains_key("resourceVersion") {
-            Err(ResourceError::invalid("include-replicas watches do not support resourceVersion resume"))
-        } else {
-            watch_resource_kind_including_replicas(&backend, namespace, kind).await
-        }
-    } else if let Some(resource_version) = query.get("resourceVersion") {
-        let start = match query.get("generation") {
-            Some(generation) => {
-                WatchStart::FromVersionInGeneration { generation: generation.clone(), resource_version: resource_version.clone() }
-            }
-            None => WatchStart::FromVersion(resource_version.clone()),
-        };
-        watch_resource_kind_from(&backend, namespace, kind, start).await
-    } else {
-        watch_resource_kind(&backend, namespace, kind).await
-    };
+        None => WatchStart::FromVersion(resource_version.clone()),
+    });
+    // An engine-served kind's include-replicas watch resumes from its list's position; any other
+    // kind's is refused. Bookmarks are sent where asked for, as Kubernetes does.
+    let bookmarks = query.get("allowWatchBookmarks").is_some_and(|allowed| allowed == "true");
+    let watched = watch_resource_kind_with(&backend, namespace, kind, DynamicWatchRequest { start, include_replicas, bookmarks }).await;
 
     match watched {
         Ok(watch) => Reply::Watch(watch),

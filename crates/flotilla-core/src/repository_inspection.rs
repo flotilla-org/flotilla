@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use flotilla_resources::{ForgeSpec, RepositorySpec};
 
 use flotilla_charter::ops_entry::OperationalEntryFile;
+use flotilla_provider_runtime::blocking_probe::BlockingProbe;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_vcs::vcs::CheckoutVcsResolver;
@@ -24,6 +25,7 @@ pub struct GitRepositoryInspector {
     host_ref: String,
     forges: Vec<ForgeSpec>,
     charter_cache: PathBuf,
+    probe: BlockingProbe,
 }
 
 impl GitRepositoryInspector {
@@ -35,7 +37,14 @@ impl GitRepositoryInspector {
             vcs_cache: tokio::sync::Mutex::new(HashMap::new()),
             host_ref: host_ref.into(),
             forges: Vec::new(),
+            probe: BlockingProbe::shared(),
         }
+    }
+
+    /// Resolves paths within `probe`, the budget of the host it inspects.
+    pub fn with_probe(mut self, probe: BlockingProbe) -> Self {
+        self.probe = probe;
+        self
     }
 
     pub fn with_charter_cache(mut self, cache: PathBuf) -> Self {
@@ -201,9 +210,9 @@ impl RepositoryInspector for GitRepositoryInspector {
     }
 
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
-        let path = flotilla_provider_runtime::probe::canonicalize(path).await?;
+        let path = self.probe.canonicalize(path).await?;
         let top_level = PathBuf::from(self.read(&path, RepositoryRead::CheckoutRoot).await?);
-        let top_level = flotilla_provider_runtime::probe::canonicalize(&top_level).await?;
+        let top_level = self.probe.canonicalize(&top_level).await?;
         let provider = self.provider(&path).await?;
         self.vcs_cache.lock().await.insert(top_level.clone(), provider);
         // `rev-parse HEAD` can fail before the first commit, while the symbolic
@@ -224,7 +233,7 @@ impl RepositoryInspector for GitRepositoryInspector {
             None => {
                 let common_dir = PathBuf::from(self.read(&top_level, RepositoryRead::SharedMetadataDir).await?);
                 let common_dir = if common_dir.is_absolute() { common_dir } else { top_level.join(common_dir) };
-                let common_dir = flotilla_provider_runtime::probe::canonicalize(&common_dir).await?;
+                let common_dir = self.probe.canonicalize(&common_dir).await?;
                 (RepositorySpec::local(&self.host_ref, common_dir.to_string_lossy())?, None)
             }
         };

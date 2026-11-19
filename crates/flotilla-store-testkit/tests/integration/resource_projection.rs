@@ -73,19 +73,6 @@ fn convoy_crd_allows_omitted_empty_repository_subpaths() {
 }
 
 #[test]
-fn attention_crds_parse_with_expected_names() {
-    let regard: serde_json::Value =
-        serde_yml::from_str(include_str!("../../../flotilla-resources/src/crds/regard.crd.yaml")).expect("Regard CRD should parse");
-    let demand: serde_json::Value =
-        serde_yml::from_str(include_str!("../../../flotilla-resources/src/crds/demand.crd.yaml")).expect("Demand CRD should parse");
-
-    assert_eq!(regard["metadata"]["name"], "regards.flotilla.work");
-    assert_eq!(regard["spec"]["names"]["kind"], "Regard");
-    assert_eq!(demand["metadata"]["name"], "demands.flotilla.work");
-    assert_eq!(demand["spec"]["names"]["kind"], "Demand");
-}
-
-#[test]
 fn convoy_ensure_crd_parses_with_expected_shape() {
     let ensure: serde_json::Value = serde_yml::from_str(include_str!("../../../flotilla-resources/src/crds/convoy_ensure.crd.yaml"))
         .expect("ConvoyEnsure CRD should parse");
@@ -133,7 +120,7 @@ fn k8s_object_projection_deserializes_kubernetes_casing() {
             "creationTimestamp": "2026-04-13T12:00:00Z"
         },
         "spec": {
-            "workflow_ref": "review",
+            "workflow_ref": "review", "project_ref": "flotilla",
             "inputs": {},
             "placement_policy": "laptop-docker"
         },

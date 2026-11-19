@@ -4,23 +4,13 @@ use flotilla_protocol::{
     result_set::{Readiness, ReadinessBlocker, ReadinessState},
     LifecycleReading,
 };
-use flotilla_resources::{CheckoutPhase, ClonePhase, CrewWorkPhase, CrewWorkState, VesselPhase};
+use flotilla_resources::checkout_records::{CheckoutChange, CheckoutLaunch};
+use flotilla_resources::{CrewWorkPhase, CrewWorkState, VesselPhase};
 
 use super::*;
-use crate::ports::ProvisioningKind;
+use flotilla_resources::vessel_records::engine_vessel;
 
 impl Aggregator {
-    pub(super) async fn recover_clone_readiness_watch(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<CloneResource>,
-    ) -> Result<WatchStream<CloneResource>, ResourceError> {
-        let (listed, watch) = recover_local_view(resolver).await?;
-        self.readiness_clones = readiness_resources(
-            listed.items.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect(),
-        );
-        Ok(watch)
-    }
-
     pub(super) fn vessel_readiness(
         &self,
         convoy: &ResourceRef,
@@ -28,6 +18,7 @@ impl Aggregator {
         work: Option<&WorkState>,
         crew: Option<&BTreeMap<String, CrewWorkState>>,
         host: &HostName,
+        checkouts: &HeldCheckouts,
     ) -> (Readiness, Option<String>) {
         let phase = work.map(|work| work.phase).unwrap_or(ResourceWorkPhase::Pending);
         if phase.is_terminal() {
@@ -55,8 +46,8 @@ impl Aggregator {
         });
         if let Some(vessel) = vessel {
             let origin = engine_origin(&vessel.provenance);
-            let engine = match self.lifecycle_reads.try_reading(ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref()) {
-                Ok(reading) => reading,
+            let engine = match engine_vessel(self.lifecycle_reads.as_ref(), &vessel.object, origin.as_deref()) {
+                Ok(record) => record.map(|record| record.reading),
                 Err(error) => {
                     return (
                         Readiness {
@@ -78,7 +69,13 @@ impl Aggregator {
                 }
             };
             let status = engine.is_none().then_some(vessel.object.status.as_ref()).flatten();
-            let vessel_phase = Self::vessel_phase_from_reading(vessel, engine.as_ref());
+            let vessel_phase = VesselPhase::from_reading(engine.as_ref(), vessel.object.status.as_ref());
+            // A released vessel ended on purpose, its children with it: nothing blocks it and it
+            // needs no one. Readiness has no ended state, so it reads Ready.
+            if vessel_phase == VesselPhase::Released {
+                result.state = ReadinessState::Ready;
+                return (result, None);
+            }
             if vessel_phase == VesselPhase::Ready {
                 result.state = ReadinessState::Ready;
             } else {
@@ -106,129 +103,75 @@ impl Aggregator {
                 let loss_reason = result.blockers.last().expect("lost vessel blocker").reason.clone();
                 return (result, Some(loss_reason));
             }
-            // Engine-backed vessels use adopted refs and convoy membership; stale status-only refs are not dependencies.
+            // The vessel's checkouts: those it records and adopts, and the ones the engine holds for
+            // the convoy at the vessel's home, provisioning before the ready vessel records them.
+            let held = match checkouts {
+                Ok(held) => held,
+                Err(error) => {
+                    result.state = result.state.max(ReadinessState::Blocked);
+                    result.blockers.push(ReadinessBlocker {
+                        resource: convoy.subresource(format!("vessels/{}/checkouts", definition.name)),
+                        phase: "Unknown".into(),
+                        reason: error.clone(),
+                    });
+                    return (result, None);
+                }
+            };
+            let vessel_home = engine_origin(&vessel.provenance);
+            let at_vessel_home = |checkout: &CheckoutLaunch| match &vessel_home {
+                Some(home) => checkout.home == *home,
+                None => !self.known_origins.contains(&flotilla_protocol::NodeId::new(checkout.home.clone())),
+            };
             let mut checkout_refs =
                 status.map(|status| status.checkout_refs.values().cloned().collect::<BTreeSet<_>>()).unwrap_or_default();
             checkout_refs.extend(vessel.object.spec.adopted_checkout_refs.values().cloned());
-            // Provisioning checkouts belong to the convoy before the ready
-            // vessel records their refs. Host-scoped membership avoids joining
-            // a same-named replica or another convoy's checkout.
-            checkout_refs.extend(
-                self.convoy_checkouts(&convoy.namespace, &convoy.name)
-                    .filter(|source| {
-                        source.object.metadata.namespace == convoy.namespace
-                            && source.object.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.name)
-                            && self.read_host(&source.provenance).as_ref() == Some(host)
-                    })
-                    .map(|source| source.object.metadata.name.clone()),
-            );
+            checkout_refs
+                .extend(held.values().filter(|checkout| at_vessel_home(checkout)).map(|checkout| checkout.checkout_name().to_owned()));
             for name in &checkout_refs {
-                let source = self.named_checkouts(&convoy.namespace, name).find(|source| {
-                    source.object.metadata.namespace == convoy.namespace
-                        && source.object.metadata.name == *name
-                        && self.read_host(&source.provenance).as_ref() == Some(host)
-                });
-                let Some(source) = source else {
+                let checkout_ref = || {
+                    ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
+                        .on_host(host.clone())
+                };
+                let Some(checkout) = held.get(name).filter(|checkout| at_vessel_home(checkout)) else {
                     result.state = result.state.max(ReadinessState::Provisioning);
                     result.blockers.push(ReadinessBlocker {
-                        resource: ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
-                            .on_host(host.clone()),
+                        resource: checkout_ref(),
                         phase: "Unknown".into(),
                         reason: "waiting for checkout evidence".into(),
                     });
                     continue;
                 };
-                // Behind `[primitives]` the engine's reading of the checkout decides (#3629 layer 4).
-                let origin = engine_origin(&source.provenance);
-                let engine = match self.lifecycle_reads.try_reading(ProvisioningKind::Checkout, name, origin.as_deref()) {
-                    Ok(reading) => reading,
-                    Err(error) => {
-                        result.state = result.state.max(ReadinessState::Blocked);
-                        result.blockers.push(ReadinessBlocker {
-                            resource: ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
-                                .on_host(host.clone()),
-                            phase: "Unknown".into(),
-                            reason: error,
-                        });
-                        continue;
-                    }
-                };
-                let status = source.object.status.as_ref();
-                let phase = status.map(|status| status.phase).unwrap_or_default();
-                if engine.as_ref().map_or(phase == CheckoutPhase::Ready, |reading| matches!(reading, LifecycleReading::Ready { .. })) {
+                let Some((state, phase, reason)) = reading_blocker(&checkout.reading, "checkout is not ready") else {
                     continue;
-                }
-                if let CheckoutSpec::Worktree(spec) = &source.object.spec {
-                    if let Some(clone) = self.named_clones(&convoy.namespace, &spec.clone_ref).find(|clone| {
-                        clone.object.metadata.namespace == convoy.namespace
-                            && clone.object.metadata.name == spec.clone_ref
-                            && self.read_host(&clone.provenance).as_ref() == Some(host)
-                    }) {
-                        let clone_ref = || {
-                            ResourceRef::new(
-                                api_version(CloneResource::API_PATHS),
-                                CloneResource::API_PATHS.kind,
-                                &convoy.namespace,
-                                &spec.clone_ref,
-                            )
-                            .on_host(host.clone())
-                        };
-                        let reading = self.lifecycle_reads.try_reading(
-                            ProvisioningKind::Clone,
+                };
+                if let CheckoutSpec::Worktree(spec) = &checkout.spec {
+                    // The clone launch the checkout was made from, at the checkout's home (#3108).
+                    let clone_ref = || {
+                        ResourceRef::new(
+                            api_version(CloneResource::API_PATHS),
+                            CloneResource::API_PATHS.kind,
+                            &convoy.namespace,
                             &spec.clone_ref,
-                            engine_origin(&clone.provenance).as_deref(),
-                        );
-                        let reading = match reading {
-                            Ok(reading) => reading,
-                            Err(error) => {
-                                result.state = result.state.max(ReadinessState::Blocked);
-                                result.blockers.push(ReadinessBlocker { resource: clone_ref(), phase: "Unknown".into(), reason: error });
-                                continue;
-                            }
-                        };
-                        if let Some(reading) = reading {
-                            if let Some((state, phase, reason)) = reading_blocker(&reading, "clone is not ready") {
+                        )
+                        .on_host(host.clone())
+                    };
+                    match self.lifecycle_reads.clones().and_then(|clones| clones.get(&spec.clone_ref, Some(&checkout.home))) {
+                        Ok(Some(clone)) => {
+                            if let Some((state, phase, reason)) = reading_blocker(&clone.reading, "clone is not ready") {
                                 result.state = result.state.max(state);
                                 result.blockers.push(ReadinessBlocker { resource: clone_ref(), phase, reason });
                             }
-                        } else if let Some(status) = clone.object.status.as_ref().filter(|status| status.phase != ClonePhase::Ready) {
-                            let state = if status.phase == ClonePhase::Failed && status.failure_policy.is_some() {
-                                ReadinessState::Failed
-                            } else if status.retry.is_some() || status.phase == ClonePhase::Failed {
-                                ReadinessState::Blocked
-                            } else {
-                                ReadinessState::Provisioning
-                            };
-                            result.state = result.state.max(state);
-                            result.blockers.push(ReadinessBlocker {
-                                resource: clone_ref(),
-                                phase: format!("{:?}", status.phase),
-                                reason: status.message.clone().unwrap_or_else(|| "clone is not ready".into()),
-                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            result.state = result.state.max(ReadinessState::Blocked);
+                            result.blockers.push(ReadinessBlocker { resource: clone_ref(), phase: "Unknown".into(), reason: error });
+                            continue;
                         }
                     }
                 }
-                let (state, phase, reason) = match engine.as_ref().and_then(|reading| reading_blocker(reading, "checkout is not ready")) {
-                    Some(blocker) => blocker,
-                    None => (
-                        if phase == CheckoutPhase::Failed {
-                            ReadinessState::Failed
-                        } else if status.is_some_and(|status| status.clone_retry.is_some()) {
-                            ReadinessState::Blocked
-                        } else {
-                            ReadinessState::Provisioning
-                        },
-                        format!("{phase:?}"),
-                        status.and_then(|status| status.message.clone()).unwrap_or_else(|| "checkout is not ready".into()),
-                    ),
-                };
                 result.state = result.state.max(state);
-                result.blockers.push(ReadinessBlocker {
-                    resource: ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
-                        .on_host(host.clone()),
-                    phase,
-                    reason,
-                });
+                result.blockers.push(ReadinessBlocker { resource: checkout_ref(), phase, reason });
             }
         }
         for role in definition
@@ -291,6 +234,25 @@ pub(super) fn apply_readiness_event<T: Resource>(
 
 /// The engine home of a resource read from `provenance`: a replica's origin root, or `None` for
 /// this home.
+/// The checkouts the engine holds for one convoy, by checkout name, or why they could not be read.
+pub(super) type HeldCheckouts = Result<BTreeMap<String, CheckoutLaunch>, String>;
+
+/// Waits for the engine's next checkout commit: what changed (a rescan where changes were
+/// missed), none once the changes end; never returns where none are followed.
+pub(super) async fn next_checkout_change(changes: &mut Option<tokio::sync::broadcast::Receiver<CheckoutChange>>) -> Option<CheckoutChange> {
+    let Some(receiver) = changes.as_mut() else {
+        return std::future::pending().await;
+    };
+    match receiver.recv().await {
+        Ok(change) => Some(change),
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some(CheckoutChange::Rescanned),
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            *changes = None;
+            None
+        }
+    }
+}
+
 pub(super) fn engine_origin(provenance: &ResourceProvenance) -> Option<String> {
     match provenance {
         ResourceProvenance::Local => None,
@@ -308,7 +270,7 @@ fn reading_blocker(reading: &LifecycleReading, not_ready: &str) -> Option<(Readi
         // Exhausted gives up on the next reconcile; until then a retry may still be under way.
         // An ended checkout or clone never comes back: the engine has no incarnations, so a vessel
         // waiting on it waits on a replacement under a new name, and readiness says so.
-        LifecycleReading::Failed { .. } | LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::GaveUp { .. } => {
+        LifecycleReading::Failed { .. } | LifecycleReading::Lost { .. } | LifecycleReading::Released | LifecycleReading::GaveUp { .. } => {
             ReadinessState::Failed
         }
     };

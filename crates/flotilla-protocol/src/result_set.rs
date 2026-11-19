@@ -910,9 +910,12 @@ pub struct StandingRoleRow {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presents_as: Option<String>,
-    /// Current attempt as recorded by the ensure controller. Driver-managed
-    /// ensures leave this empty; consumers resolve attempts through
-    /// [`ConvoyRow::ensured_from`].
+    /// Whether the role's state could not be read: its hold, strikes, next attempt and failure
+    /// are then unknown, never "not held".
+    #[builder(default)]
+    #[serde(default)]
+    pub state_unknown: bool,
+    /// Its current generation: the newest live one, or the ended one it is held on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1118,6 +1121,10 @@ pub struct ConvoyRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_role: Option<String>,
     pub name: String,
+    /// Why this launch's record could not be read. Its state is then unknown: no message,
+    /// phase or other state field of the row describes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
     #[builder(default)]
     #[serde(default)]
     pub generation: u64,
@@ -1126,7 +1133,9 @@ pub struct ConvoyRow {
     #[builder(default)]
     #[serde(default)]
     pub dispatching_principal_ref: PrincipalRef,
-    pub phase: ConvoyPhase,
+    /// `None` exactly when the launch is `unreadable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ConvoyPhase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_decision: Option<crate::PlacementDecision>,
     /// The convoy has no workflow snapshot yet and is not terminal.
@@ -1145,8 +1154,7 @@ pub struct ConvoyRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_workflow_ref: Option<String>,
     /// The Project this convoy belongs to, from `ConvoySpec.project_ref`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_ref: Option<String>,
+    pub project_ref: String,
     /// Name of the `ConvoyEnsure` that admitted this attempt. `None` for task
     /// convoys, even when they carry a role address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1266,8 +1274,18 @@ impl Readiness {
 }
 
 impl ConvoyRow {
+    /// The launch has a known phase that is not terminal.
+    pub fn is_live(&self) -> bool {
+        self.phase.is_some_and(|phase| !phase.is_terminal())
+    }
+
+    /// The launch has a known terminal phase.
+    pub fn is_ended(&self) -> bool {
+        self.phase.is_some_and(ConvoyPhase::is_terminal)
+    }
+
     pub fn readiness(&self) -> Readiness {
-        if !self.phase.is_terminal() && !self.admission_blockers.is_empty() {
+        if self.is_live() && !self.admission_blockers.is_empty() {
             let mut readiness = Readiness::aggregate(self.vessels.iter().map(|vessel| &vessel.readiness));
             readiness.state = readiness.state.max(ReadinessState::Blocked);
             for blocker in &self.admission_blockers {
@@ -1277,7 +1295,7 @@ impl ConvoyRow {
             }
             return readiness;
         }
-        if self.initializing && !self.phase.is_terminal() {
+        if self.initializing && self.is_live() {
             return Readiness {
                 state: ReadinessState::Provisioning,
                 blockers: vec![ReadinessBlocker {
@@ -1383,6 +1401,47 @@ pub struct CrewMemberSummary {
     pub requested_stance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_stance: Option<String>,
+    /// The member's AgentSession as its home's engine log holds it (#3108), joined by the
+    /// TerminalSession's record name; absent while no such record is held here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<AgentSessionReading>,
+}
+
+/// An AgentSession's lifecycle and latest activity, as recorded at its home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
+pub struct AgentSessionReading {
+    /// How the session ended; absent while it is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<AgentSessionEnd>,
+    /// The latest activity recorded; absent until one is observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<AgentActivity>,
+    /// When the recorded activity began: the record changes only when the activity does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_since: Option<Timestamp>,
+    /// What reported it: a harness's native event, or `screen`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_cause: Option<String>,
+    /// Set by the reader: the session's home has not been heard from recently enough to trust
+    /// the reading, so the agent is unobservable from here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionEnd {
+    Completed,
+    Lost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivity {
+    Working,
+    NeedsInput,
+    Idle,
+    Interrupted,
 }
 
 #[cfg(test)]

@@ -48,10 +48,16 @@ fn provisioning_kind_codes_are_pinned() {
     let registry = stored::production_kinds().expect("no code is held twice");
     let held = |kind: &str| registry.iter().find(|set| set.kind == kind).map(|set| set.code);
     assert_eq!(held("Environment"), Some(KindCode::new("ev")));
+    assert_eq!(held("EnvironmentLaunchFacts"), Some(KindCode::new("el")));
     assert_eq!(held("ImageBuild"), Some(KindCode::new("ib")));
+    assert_eq!(held("ImageBuildDemand"), Some(KindCode::new("iq")));
     assert_eq!(held("Clone"), Some(KindCode::new("cl")));
+    assert_eq!(held("CloneFacts"), Some(KindCode::new("cf")));
     assert_eq!(held("Checkout"), Some(KindCode::new("ck")));
+    assert_eq!(held("CheckoutFacts"), Some(KindCode::new("kf")));
+    assert_eq!(held("CheckoutIntegration"), Some(KindCode::new("ki")));
     assert_eq!(held("TerminalSession"), Some(KindCode::new("ts")));
+    assert_eq!(held("TerminalLaunchFacts"), Some(KindCode::new("tf")));
     assert_eq!(held("AccountBinding"), Some(KindCode::new("ab")));
     assert_eq!(held("AccountProvision"), Some(KindCode::new("ap")));
     assert_eq!(held("ManifestRoot"), Some(KindCode::new("mr")));
@@ -66,7 +72,8 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Host"), Some(KindCode::new("ho")));
     assert_eq!(held("HostObservation"), Some(KindCode::new("ob")));
     assert_eq!(held("AccessDelivery"), Some(KindCode::new("ad")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 25);
+    assert_eq!(held("StandingRole"), Some(KindCode::new("sr")));
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 33);
     // The definition kinds (#3824 layer 2b), in the decided store with their writers (2b-ii).
     for (kind, code) in [
         ("Forge", "fo"),
@@ -76,6 +83,7 @@ fn provisioning_kind_codes_are_pinned() {
         ("CrewDefaults", "dc"),
         ("ImageLayer", "il"),
         ("WorkflowTemplate", "wt"),
+        ("ConvoyEnsure", "ce"),
     ] {
         assert_eq!(held(kind), Some(KindCode::new(code)), "{kind}");
     }
@@ -200,6 +208,8 @@ fn each_kind_survives_the_codec() {
     for delivery in [Delivery::Registry { repository: "registry/flotilla".into() }, Delivery::Local] {
         for state in states() {
             let spec = ImageBuildRequest {
+                launch_of: "image-feed-arm64".into(),
+                launch: 0,
                 composition: "sha256:feed".into(),
                 architecture: Architecture::Arm64,
                 layers: layers.clone(),
@@ -211,10 +221,13 @@ fn each_kind_survives_the_codec() {
     }
     for state in states() {
         let spec = CloneRequest {
+            launch_of: "repo".into(),
+            launch: 7,
             repository: "repo".into(),
             url: "https://example/repo".into(),
             environment: environment("feta"),
             path: "/c".into(),
+            discovered: true,
         };
         round_trip::<CloneKind>(spec, state);
     }
@@ -224,6 +237,8 @@ fn each_kind_survives_the_codec() {
     ] {
         for state in states() {
             let spec = CheckoutRequest {
+                launch_of: "feature".into(),
+                launch: 12,
                 repository: "repo".into(),
                 environment: environment("feta"),
                 branch: "feature".into(),
@@ -231,7 +246,7 @@ fn each_kind_survives_the_codec() {
                 path: "/w".into(),
                 source: source.clone(),
                 clone: clone.clone(),
-                holder: holder.clone().or_else(|| Some(Holder::ensure("standing"))),
+                holder: holder.clone().or_else(|| Some(Holder::convoy("standing"))),
             };
             round_trip::<CheckoutKind>(spec, state);
         }
@@ -317,12 +332,13 @@ fn failures_before_give_up<K: LifecycleKind>(spec: K::Request) -> Option<u32> {
     };
     let world = MemoryLifecycleWorld::default();
     let mut home = Home::<Lifecycle<K>>::new("home").expect("declaration");
-    home.create("r", spec, &world, Timestamp::from_micros(0)).expect("created");
+    // A launch kind's resource is named for its launch.
+    let name = home.create("r", spec, &world, Timestamp::from_micros(0)).expect("created").resource.name().to_owned();
     let cause = Cause::new(CauseCategory::Transient, "unreachable");
     for failures in 1..=64 {
         let at = Timestamp::from_micros(i64::from(failures) * 3_600_000_000);
-        home.apply("r", Attempted { outcome: Outcome::Failed { cause: cause.clone(), retryable: true } }, &world, at).expect("attempt");
-        if home.apply("r", GiveUp { cause: cause.clone() }, &world, at).is_ok() {
+        home.apply(&name, Attempted { outcome: Outcome::Failed { cause: cause.clone(), retryable: true } }, &world, at).expect("attempt");
+        if home.apply(&name, GiveUp { cause: cause.clone() }, &world, at).is_ok() {
             return Some(failures);
         }
     }
@@ -343,6 +359,8 @@ fn environment_request() -> EnvironmentRequest {
 
 fn image_build_request() -> ImageBuildRequest {
     ImageBuildRequest {
+        launch_of: "image-feed-arm64".into(),
+        launch: 0,
         composition: "sha256:feed".into(),
         architecture: Architecture::Amd64,
         layers: Frozen::new(vec![layer()]).expect("freeze"),
@@ -353,8 +371,9 @@ fn image_build_request() -> ImageBuildRequest {
 
 // Behaviour (#3629 layer 2): each kind's policy keeps its old retry budget. An ImageBuild gives up
 // after five failed attempts (`IMAGE_BUILD_MAX_ATTEMPTS`) and at once on a recipe failure; a Clone
-// retries transient failures for as long as it is wanted and gives up at once on one that is not
-// retryable; Environment and Checkout take the engine's default three; and the backoff between
+// gives up after three tries and at once on one that is not retryable (#3108 ruling: what it waits
+// on, such as free space or a reachable remote, is a wait, not a try); Environment and Checkout
+// take the engine's default three; and the backoff between
 // ImageBuild attempts doubles from 30 s to 30 min.
 #[test]
 fn policies_give_up_as_the_old_retries_did() {
@@ -363,10 +382,20 @@ fn policies_give_up_as_the_old_retries_did() {
         Home, Outcome,
     };
     assert_eq!(failures_before_give_up::<ImageBuildKind>(image_build_request()), Some(flotilla_resources::IMAGE_BUILD_MAX_ATTEMPTS));
-    let clone = || CloneRequest { repository: "r".into(), url: "u".into(), environment: environment("feta"), path: "/c".into() };
-    assert_eq!(failures_before_give_up::<CloneKind>(clone()), None);
+    let clone = || CloneRequest {
+        launch_of: "r".into(),
+        launch: 0,
+        repository: "r".into(),
+        url: "u".into(),
+        environment: environment("feta"),
+        path: "/c".into(),
+        discovered: false,
+    };
+    assert_eq!(failures_before_give_up::<CloneKind>(clone()), Some(3));
     assert_eq!(failures_before_give_up::<EnvironmentKind>(environment_request()), Some(3));
     let checkout = CheckoutRequest {
+        launch_of: "r".into(),
+        launch: 0,
         repository: "r".into(),
         environment: environment("feta"),
         branch: "b".into(),
@@ -380,21 +409,21 @@ fn policies_give_up_as_the_old_retries_did() {
 
     let world = MemoryLifecycleWorld::default();
     let mut home = Home::<Lifecycle<ImageBuildKind>>::new("home").expect("declaration");
-    home.create("b", image_build_request(), &world, Timestamp::from_micros(0)).expect("created");
+    let b = home.create("b", image_build_request(), &world, Timestamp::from_micros(0)).expect("created").resource.name().to_owned();
     let recipe = Cause::new(CauseCategory::Refused, "probe failed");
-    home.apply("b", Attempted { outcome: Outcome::Failed { cause: recipe.clone(), retryable: false } }, &world, Timestamp::from_micros(1))
+    home.apply(&b, Attempted { outcome: Outcome::Failed { cause: recipe.clone(), retryable: false } }, &world, Timestamp::from_micros(1))
         .expect("attempt");
-    home.apply("b", GiveUp { cause: recipe }, &world, Timestamp::from_micros(1)).expect("a recipe failure gives up at once");
+    home.apply(&b, GiveUp { cause: recipe }, &world, Timestamp::from_micros(1)).expect("a recipe failure gives up at once");
 
     let mut clones = Home::<Lifecycle<CloneKind>>::new("home").expect("declaration");
-    clones.create("c", clone(), &world, Timestamp::from_micros(0)).expect("created");
+    let c = clones.create("r", clone(), &world, Timestamp::from_micros(0)).expect("created").resource.name().to_owned();
     let wrong = Cause::new(CauseCategory::Misconfigured, "repository not found");
     clones
-        .apply("c", Attempted { outcome: Outcome::Failed { cause: wrong.clone(), retryable: false } }, &world, Timestamp::from_micros(1))
+        .apply(&c, Attempted { outcome: Outcome::Failed { cause: wrong.clone(), retryable: false } }, &world, Timestamp::from_micros(1))
         .expect("attempt");
-    clones.apply("c", GiveUp { cause: wrong }, &world, Timestamp::from_micros(1)).expect("a clone that cannot succeed gives up at once");
+    clones.apply(&c, GiveUp { cause: wrong }, &world, Timestamp::from_micros(1)).expect("a clone that cannot succeed gives up at once");
     let policy = CloneKind::policy();
-    assert_eq!((policy.backoff(1), policy.backoff(2), policy.backoff(9)), (30_000_000, 60_000_000, 120_000_000));
+    assert_eq!((policy.backoff(1), policy.backoff(2)), (0, 0), "a clone tries again at once; what it waits on wakes it");
 
     let policy = ImageBuildKind::policy();
     let seconds = |failures| policy.backoff(failures) / 1_000_000;

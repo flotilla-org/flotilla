@@ -6,7 +6,7 @@
 //!
 //! | Demand name | Attention |
 //! |---|---|
-//! | `ensure-attention-<ensure>` | [`Cause::Hold`] of the convoy |
+//! | `ensure-attention-<ensure>` | [`Cause::Hold`] of the generation, by its launch name |
 //! | `ensure-config-drift-<ensure>` | [`Cause::Drift`] of the ensure's standing role |
 //! | `reclaim-refusal-<convoy>` | [`Cause::ReclaimRefused`] of the convoy |
 //! | `credential-refresh-<vessel>-<credential>` | [`Cause::CredentialRefresh`], one per vessel |
@@ -16,12 +16,10 @@
 use std::collections::BTreeMap;
 
 use flotilla_address::{Address, Kind};
-use flotilla_charter::ops_entry::{ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX};
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION, Convoy, ConvoyEnsure, Demand, DemandAddressee, DemandState, MessageReference,
-    ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION,
-    ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION, ROLE_LABEL,
+    convoy::engine::{convoy_reference_address, launch_address, standing_name, ImportedLaunch, NoLaunch},
+    Convoy, ConvoyEnsure, MessageReference, ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, ROLE_LABEL,
 };
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
@@ -29,10 +27,17 @@ use flotilla_state_machines::{
     Resource, StoredState, Version,
 };
 
-use super::{
-    attention::{Attention, Cause, Read},
-    convert::Conversion,
-    import::{check, imported_name, ImportDrop, ImportRefusal, Imported, ImportedMessage},
+use flotilla_engine_messages::attention::{Attention, Cause, Read};
+
+use super::convert::Conversion;
+use super::import::{check, imported_name, ImportDrop, ImportRefusal, Imported, ImportedMessage};
+
+pub mod retired;
+
+use retired::{
+    DemandAddressee, DemandState, RetiredDemand, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION,
+    DELIVERY_HOLD_REASON_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX, ENSURE_HOLD_REASON_ANNOTATION,
+    RECLAIM_REFUSAL_REASON_ANNOTATION,
 };
 
 const HOLD: &str = "ensure-attention-";
@@ -44,7 +49,7 @@ const DECLARATION_REFUSED: &str = "declaration-refused-";
 
 /// One old Demand, as the import reads it: the record and the host it is homed at.
 pub struct OldDemand<'a> {
-    pub record: &'a ResourceObject<Demand>,
+    pub record: &'a RetiredDemand,
     pub home: String,
 }
 
@@ -55,6 +60,8 @@ pub struct DemandRecords<'a> {
     pub ensures: BTreeMap<String, &'a ResourceObject<ConvoyEnsure>>,
     pub vessels: Vec<&'a ResourceObject<Vessel>>,
     pub terminals: BTreeMap<String, &'a ResourceObject<TerminalSession>>,
+    /// The tombstone each convoy the old store no longer holds imports as, by old name.
+    pub tombstones: BTreeMap<String, &'a ImportedLaunch>,
 }
 
 /// An attention a demand maps to: its id, and the person and project it is addressed by.
@@ -62,7 +69,7 @@ struct Pending {
     id: String,
     attention: Attention,
     principal: String,
-    project: Option<String>,
+    project: String,
 }
 
 /// What one demand becomes before it is admitted: an attention to send, or not.
@@ -73,7 +80,7 @@ enum Mapped {
 
 /// The live writer that raised an open demand, with the records its name and target name.
 enum Writer<'r> {
-    Hold { convoy: &'r str },
+    Hold { ensure: &'r str, convoy: &'r str },
     Drift { ensure: &'r str, convoy: &'r str },
     Reclaim { convoy: &'r str },
     Delivery { session: &'r str },
@@ -166,7 +173,7 @@ fn alone(result: Result<Imported, ImportRefusal>) -> DemandImport {
     DemandImport { result, folded_into: None }
 }
 
-fn raised(record: &ResourceObject<Demand>) -> chrono::DateTime<chrono::Utc> {
+fn raised(record: &RetiredDemand) -> chrono::DateTime<chrono::Utc> {
     record.status.as_ref().and_then(|status| status.raised.as_ref()).map_or(record.metadata.creation_timestamp, |raised| raised.as_of)
 }
 
@@ -203,8 +210,8 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
         } else {
             Err(format!("it is about a {kind}, not a TerminalSession"))
         }
-    } else if name.starts_with(HOLD) {
-        convoy().map(|convoy| Writer::Hold { convoy })
+    } else if let Some(ensure) = name.strip_prefix(HOLD) {
+        convoy().map(|convoy| Writer::Hold { ensure, convoy })
     } else if let Some(ensure) = name.strip_prefix(ENSURE_DRIFT_ATTENTION_PREFIX) {
         convoy().map(|convoy| Writer::Drift { ensure, convoy })
     } else if name.starts_with(RECLAIM) {
@@ -215,7 +222,7 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
         };
         return match convoy() {
             Err(reason) => Class::Refused(reason),
-            Ok(convoy) if !records.convoys.contains_key(convoy) => Class::Dropped("its convoy is gone"),
+            Ok(convoy) if !records.convoys.contains_key(convoy) => Class::Refused(gone(convoy)),
             Ok(convoy) => Class::Credential { group: (old.home.as_str(), convoy, vessel.as_str()), principal },
         };
     } else {
@@ -228,12 +235,18 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
 }
 
 /// The person a demand is addressed to.
-fn addressed(record: &ResourceObject<Demand>) -> String {
+fn addressed(record: &RetiredDemand) -> String {
     let DemandAddressee::Principal { principal_ref } = &record.spec.addressee;
     format!("principal:{}", principal_ref.name)
 }
 
-fn convoy_target(record: &ResourceObject<Demand>) -> Result<&str, String> {
+/// Why a demand about convoy `convoy`, which this host's replica does not hold, is refused: every
+/// record naming a convoy with no launch is (#3108).
+fn gone(convoy: &str) -> String {
+    format!("it {} (`{convoy}`)", NoLaunch::NotHeld)
+}
+
+fn convoy_target(record: &RetiredDemand) -> Result<&str, String> {
     let target = &record.spec.originating_work_ref;
     if target.kind != "Convoy" {
         return Err(format!("it is about a {}, not a Convoy", target.kind));
@@ -241,16 +254,35 @@ fn convoy_target(record: &ResourceObject<Demand>) -> Result<&str, String> {
     Ok(target.name.as_str())
 }
 
-fn reason(record: &ResourceObject<Demand>, annotation: &str, otherwise: impl FnOnce() -> String) -> String {
+fn reason(record: &RetiredDemand, annotation: &str, otherwise: impl FnOnce() -> String) -> String {
     record.metadata.annotations.get(annotation).cloned().unwrap_or_else(otherwise)
 }
 
+/// What a demand's attention reads of `convoy`: the launch it imports as. Refused when it imports
+/// as no launch (one never bootstrapped).
 fn convoy_read(convoy: &ResourceObject<Convoy>, conversion: &Conversion<'_>) -> Result<Read, String> {
     let reference = MessageReference::ControlRecord {
         resource: ResourceRef::new("flotilla.work/v1", "Convoy", &convoy.metadata.namespace, &convoy.metadata.name),
         revision: convoy.metadata.resource_version.clone(),
     };
-    Ok(Read { address: conversion.records.address(&reference)?, revision: convoy.metadata.resource_version.clone() })
+    let address = conversion.records.launched(conversion.records.address(&reference)?)?;
+    Ok(Read { address, revision: convoy.metadata.resource_version.clone() })
+}
+
+/// What a demand's attention reads of a convoy the old store no longer holds: its tombstone's
+/// launch, which never changes, so its name is its revision, as a vessel's launch is.
+fn tombstone_read(tombstone: &ImportedLaunch) -> Result<Read, String> {
+    let project = Address::project(&tombstone.project).map_err(|error| format!("project `{}`: {error}", tombstone.project))?;
+    let name = tombstone.name();
+    Ok(Read { address: launch_address(&project, &name)?, revision: name })
+}
+
+/// What a standing role's attention reads of its generation `held`: the role's launch numbered by
+/// the generation (`<standing name>#<generation>`), as the ensure pass raises and clears the
+/// attention, whether or not the generation bootstrapped and so has a launch.
+fn generation_read(held: &ResourceObject<Convoy>, ensure: &ResourceObject<ConvoyEnsure>) -> Result<Read, String> {
+    let launch = format!("{}#{}", standing_name(&ensure.spec.project_ref, &ensure.spec.role)?, held.spec.generation);
+    Ok(Read { address: convoy_reference_address(&launch, &ensure.spec.project_ref)?, revision: held.metadata.resource_version.clone() })
 }
 
 fn child(parent: &Address, kind: Kind, name: &str) -> Result<Address, String> {
@@ -258,54 +290,62 @@ fn child(parent: &Address, kind: Kind, name: &str) -> Result<Address, String> {
 }
 
 fn map(
-    record: &ResourceObject<Demand>,
+    record: &RetiredDemand,
     writer: Writer<'_>,
     principal: String,
     conversion: &Conversion<'_>,
     records: &DemandRecords<'_>,
 ) -> Result<Mapped, String> {
-    let attention = |cause, reason, convoy: &ResourceObject<Convoy>| {
+    let attention = |cause, reason, project: String| {
         Mapped::Attention(Box::new(Pending {
             id: record.metadata.name.clone(),
             attention: Attention { cause, reason },
             principal,
-            project: convoy.spec.project_ref.clone(),
+            project,
         }))
     };
-    let convoy = |name: &str| -> Result<Option<(&ResourceObject<Convoy>, Read)>, String> {
-        let Some(convoy) = records.convoys.get(name) else { return Ok(None) };
-        Ok(Some((*convoy, convoy_read(convoy, conversion)?)))
+    // A convoy the old store no longer holds is read as its tombstone (#3108 import ruling (a)).
+    // Its attention goes to the project the tombstone is under.
+    let convoy = |name: &str| -> Result<Option<(String, Read)>, String> {
+        if let Some(convoy) = records.convoys.get(name) {
+            return Ok(Some((convoy.spec.project_ref.clone(), convoy_read(convoy, conversion)?)));
+        }
+        let Some(tombstone) = records.tombstones.get(name) else { return Ok(None) };
+        Ok(Some((tombstone.project.clone(), tombstone_read(tombstone)?)))
     };
-    let gone = || Ok(Mapped::Dropped("its convoy is gone"));
     match writer {
         Writer::Delivery { session } => {
             let Some(terminal) = records.terminals.get(session) else { return Ok(Mapped::Dropped("its TerminalSession is gone")) };
             let label = |key| terminal.metadata.labels.get(key).ok_or_else(|| format!("TerminalSession `{session}` has no `{key}` label"));
-            let Some((held, read)) = convoy(label(CONVOY_LABEL)?)? else { return gone() };
+            let target = label(CONVOY_LABEL)?;
+            let Some((held, read)) = convoy(target)? else { return Err(gone(target)) };
             let role = Read { address: child(&read.address, Kind::Role, label(ROLE_LABEL)?)?, revision: read.revision };
             let reason = reason(record, DELIVERY_HOLD_REASON_ANNOTATION, || "Turn delivery is held until a person rules.".into());
             Ok(attention(Cause::DeliveryHeld { role }, reason, held))
         }
-        Writer::Hold { convoy: target } => {
-            let Some((held, read)) = convoy(target)? else { return gone() };
+        Writer::Hold { ensure, convoy: target } => {
+            let Some(held) = records.convoys.get(target) else { return Err(gone(target)) };
+            let Some(ensure) = records.ensures.get(ensure) else { return Ok(Mapped::Dropped("its ConvoyEnsure is gone")) };
+            let read = generation_read(held, ensure)?;
             let reason = reason(record, ENSURE_HOLD_REASON_ANNOTATION, || format!("Standing convoy `{target}` is held."));
-            Ok(attention(Cause::Hold { convoy: read }, reason, held))
+            Ok(attention(Cause::Hold { convoy: read }, reason, held.spec.project_ref.clone()))
         }
         Writer::Reclaim { convoy: target } => {
-            let Some((held, read)) = convoy(target)? else { return gone() };
+            let Some((held, read)) = convoy(target)? else { return Err(gone(target)) };
             let reason = reason(record, RECLAIM_REFUSAL_REASON_ANNOTATION, || format!("Reclaim of convoy `{target}` is refused."));
             Ok(attention(Cause::ReclaimRefused { convoy: read }, reason, held))
         }
         Writer::Drift { ensure, convoy: target } => {
-            let Some((held, read)) = convoy(target)? else { return gone() };
+            let Some(held) = records.convoys.get(target) else { return Err(gone(target)) };
             let Some(ensure) = records.ensures.get(ensure) else { return Ok(Mapped::Dropped("its ConvoyEnsure is gone")) };
+            let read = generation_read(held, ensure)?;
             let project =
                 Address::project(&ensure.spec.project_ref).map_err(|error| format!("project `{}`: {error}", ensure.spec.project_ref))?;
             let role =
                 Read { address: child(&project, Kind::Role, &ensure.spec.role)?, revision: ensure.metadata.resource_version.clone() };
             let reason =
                 reason(record, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, || format!("Standing role `{}` has drifted.", ensure.spec.role));
-            Ok(attention(Cause::Drift { role, convoy: read }, reason, held))
+            Ok(attention(Cause::Drift { role, convoy: read }, reason, held.spec.project_ref.clone()))
         }
     }
 }
@@ -320,7 +360,7 @@ fn credential(
     if group.iter().any(|old| addressed(old.record) != principal) {
         return Err("its vessel's credential demands are addressed to different people".into());
     }
-    let Some(convoy) = records.convoys.get(convoy) else { return Ok(Mapped::Dropped("its convoy is gone")) };
+    let Some(convoy) = records.convoys.get(convoy) else { return Err(gone(convoy)) };
     let Some(vessel) =
         records.vessels.iter().find(|vessel| vessel.spec.convoy_ref == convoy.metadata.name && vessel.spec.vessel_name == vessel_name)
     else {
@@ -349,13 +389,14 @@ fn credential(
 }
 
 fn message(old: &OldDemand<'_>, pending: &Pending, version: u64, conversion: &Conversion<'_>) -> Result<ImportedMessage, String> {
-    let inbox = conversion.person(&pending.principal, pending.project.as_deref())?;
+    let inbox = conversion.person(&pending.principal, Some(&pending.project))?;
     let mut spec = pending.attention.spec(conversion.roles, inbox.clone())?;
     spec.admitted_seq = version;
     let name = imported_name(&inbox, &pending.id)?;
-    let created = Timestamp::from_datetime(&raised(old.record));
+    let raised = raised(old.record);
+    let (created, created_at) = (Timestamp::from_datetime(&raised), flotilla_schema::CreatedAt::from_datetime(&raised));
     let resource: Resource<Machine> =
         Resource::stored(name, spec, StoredState::<Machine>::new(MessageState::Pending, created), Version(version));
     check(&resource)?;
-    Ok(ImportedMessage { record: old.record.metadata.name.clone(), home: old.home.clone(), resource, created })
+    Ok(ImportedMessage { record: old.record.metadata.name.clone(), home: old.home.clone(), resource, created, created_at })
 }

@@ -1,7 +1,7 @@
 use crate::MessageQuery;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-type MessageIndexKeys = (Option<String>, Option<String>, Option<String>);
+type MessageIndexKeys = (Option<String>, Option<String>);
 
 #[derive(Debug, Default)]
 pub(super) struct MessageIndex {
@@ -10,7 +10,6 @@ pub(super) struct MessageIndex {
     audit_keys: HashMap<String, chrono::DateTime<chrono::Utc>>,
     receivers: BTreeMap<String, BTreeSet<String>>,
     replies: BTreeMap<String, BTreeSet<String>>,
-    batches: BTreeMap<String, BTreeSet<String>>,
     keys: HashMap<String, MessageIndexKeys>,
 }
 
@@ -25,8 +24,8 @@ impl MessageIndex {
                 }
             }
         }
-        if let Some((receiver, reply, batch)) = self.keys.remove(name) {
-            for (map, key) in [(&mut self.receivers, receiver), (&mut self.replies, reply), (&mut self.batches, batch)] {
+        if let Some((receiver, reply)) = self.keys.remove(name) {
+            for (map, key) in [(&mut self.receivers, receiver), (&mut self.replies, reply)] {
                 if let Some(key) = key {
                     if let Some(names) = map.get_mut(&key) {
                         names.remove(name);
@@ -44,7 +43,6 @@ impl MessageIndex {
             .is_some_and(flotilla_resources::MessagePhase::is_terminal);
         let receiver = active.then(|| value.pointer("/spec/receiver").and_then(Value::as_str).map(str::to_owned)).flatten();
         let reply = value.pointer("/spec/in_reply_to").and_then(Value::as_str).map(str::to_owned);
-        let batch = value.pointer("/status/submission/batch_id").and_then(Value::as_str).map(str::to_owned);
         if active {
             self.active.insert(name.into());
         } else if value.pointer("/spec/body_digest").is_none_or(Value::is_null) {
@@ -58,12 +56,12 @@ impl MessageIndex {
                 self.audit_keys.insert(name.into(), at);
             }
         }
-        for (map, key) in [(&mut self.receivers, &receiver), (&mut self.replies, &reply), (&mut self.batches, &batch)] {
+        for (map, key) in [(&mut self.receivers, &receiver), (&mut self.replies, &reply)] {
             if let Some(key) = key {
                 map.entry(key.clone()).or_default().insert(name.into());
             }
         }
-        self.keys.insert(name.into(), (receiver, reply, batch));
+        self.keys.insert(name.into(), (receiver, reply));
     }
     pub(super) fn names(&self, query: &MessageQuery) -> Vec<String> {
         let names = match query {
@@ -73,7 +71,6 @@ impl MessageIndex {
             MessageQuery::AuditBefore { before } => {
                 return self.audit.range(..*before).flat_map(|(_, names)| names.iter().cloned()).collect()
             }
-            MessageQuery::Batch { id } => self.batches.get(id),
         };
         names.into_iter().flatten().cloned().collect()
     }

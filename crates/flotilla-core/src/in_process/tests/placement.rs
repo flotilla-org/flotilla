@@ -1,24 +1,24 @@
 use flotilla_admission::support::placement_host_ref;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
 use flotilla_config::ConfigStore;
-use flotilla_protocol::{HostName, NodeId};
+use flotilla_protocol::HostName;
+use flotilla_provisioning_testkit::EngineBackend;
+use flotilla_resources::terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource};
 use flotilla_resources::{
     Convoy as ResourceConvoy, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, FulfilmentFacts,
     FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostCondition, HostSpec, HostStatus,
-    InputMeta, Project, ProjectSpec, ResourceProvenance, Selector, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
+    Project, ProjectSpec, ResourceProvenance, Selector, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    AGENT_ADAPTERS_CAPABILITY,
 };
-use flotilla_store::ResourceBackend;
 
 use super::support::{
-    create_host_direct_placement, create_identity_convoy, create_running_session, create_test_environment, host_direct_kind, test_meta,
+    create_host_direct_host, create_host_direct_placement, create_identity_convoy, create_running_session, create_test_environment,
+    ensure_vessel, host_direct_kind, host_direct_kind_spec, install_engine_messages, put_host, read_host, test_engine, test_meta,
     trusted_codex_workflow,
 };
 use crate::in_process::{placement_actuator_host_ref, placement_target_host, ConditionValue, InProcessDaemon};
@@ -28,28 +28,41 @@ use flotilla_admission::convoy_admission::{
     PlacementResolution,
 };
 
-/// Resolves an unpinned convoy's placement over `backend` through admission's
-/// capability path.
-async fn created_convoy_placement(backend: &ResourceBackend, workflow: &WorkflowTemplateSpec) -> Result<PlacementResolution, String> {
+/// A daemon resolving placements over its own store, with the directory holding it.
+async fn placement_daemon(machine: &str) -> (Arc<InProcessDaemon>, tempfile::TempDir) {
     let temp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"placement-resolver\"\n").expect("daemon config");
+    std::fs::write(temp.path().join("daemon.toml"), format!("machine_id = \"{machine}\"\n")).expect("daemon config");
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
-        HostName::new("placement-resolver"),
-        backend.clone(),
+        HostName::new(machine),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    daemon.admission.resolve_created_convoy_placement("flotilla", None, &[], workflow, None).await
+    (daemon, temp)
+}
+
+/// Resolves an unpinned convoy's placement at `daemon` through admission's
+/// capability path.
+async fn created_convoy_placement(daemon: &InProcessDaemon, workflow: &WorkflowTemplateSpec) -> Result<PlacementResolution, String> {
+    daemon.admission.resolve_created_convoy_placement("flotilla", "flotilla", &[], workflow, None).await
+}
+
+/// Writes FulfilmentKind `name` at `home`, another daemon, and replicates it to `daemon`.
+async fn put_kind_at_home(daemon: &InProcessDaemon, home: &str, name: &str, spec: &FulfilmentKindSpec) {
+    let target = daemon.decided_store().expect("decided store");
+    let home = flotilla_provisioning_testkit::other_home_for(&target, home);
+    home.kind(name, spec).await;
+    home.replicate_to(&target);
 }
 
 #[tokio::test]
 async fn remote_placement_resolves_replicated_credentials_before_admission() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -59,6 +72,7 @@ async fn remote_placement_resolves_replicated_credentials_before_admission() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    super::test_engine(&daemon);
     backend
         .definitions::<Project>("flotilla")
         .create(
@@ -112,69 +126,53 @@ async fn remote_placement_resolves_replicated_credentials_before_admission() {
         )
         .await
         .expect("workflow");
-    let hosts = backend.using::<ResourceHost>("flotilla");
-    let host = hosts
-        .create(
-            &test_meta("udder-id"),
-            &HostSpec { display_name: "udder".to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("remote host");
-    hosts
-        .update_status(
-            "udder-id",
-            &host.metadata.resource_version,
-            &HostStatus {
-                capabilities: [
-                    (
-                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                    ),
-                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"])),
-                    (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"])),
-                    ("docker".to_string(), serde_json::json!(true)),
-                    ("os".to_string(), serde_json::json!("linux")),
-                ]
-                .into_iter()
-                .collect(),
-                heartbeat_at: Some(Utc::now()),
-                ready: true,
-                fulfilment_facts: BTreeMap::from([(
-                    "docker-udder-id".to_string(),
-                    FulfilmentFacts {
-                        harnesses: BTreeMap::from([(
-                            "claude-code".to_string(),
-                            HarnessFacts { version: "2.0.0".to_string(), models: BTreeMap::new() },
-                        )]),
-                        observed_at: Utc::now(),
-                        ..Default::default()
-                    },
-                )]),
-                ..HostStatus::default()
-            },
-        )
-        .await
-        .expect("remote host capabilities");
-    let placement_source = ResourceBackend::new(InMemoryBackend::default());
-    placement_source
-        .using::<FulfilmentKind>("flotilla")
-        .create(
-            &test_meta("docker-udder-id"),
-            &FulfilmentKindSpec::builder()
-                .host_ref("udder-id".to_string())
-                .pool("passthrough".to_string())
-                .realisation(FulfilmentRealisation::DockerPerVessel {
-                    image: Some(flotilla_resources::PlacementImageSource::Literal("crew:latest".to_string())),
-                })
-                .build(),
-        )
-        .await
-        .expect("remote placement");
-    backend
-        .replica_writer::<FulfilmentKind>(NodeId::new("udder-root"), "flotilla")
-        .replace(&placement_source.using::<FulfilmentKind>("flotilla").list().await.expect("list remote kinds"), Utc::now())
-        .await
-        .expect("replicate remote kind");
+    put_host(
+        &daemon,
+        "udder-id",
+        &HostSpec { display_name: "udder".to_string(), connection: Default::default(), ..HostSpec::default() },
+        &HostStatus {
+            capabilities: [
+                (
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                ),
+                (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"])),
+                (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"])),
+                ("docker".to_string(), serde_json::json!(true)),
+                ("os".to_string(), serde_json::json!("linux")),
+            ]
+            .into_iter()
+            .collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            fulfilment_facts: BTreeMap::from([(
+                "docker-udder-id".to_string(),
+                FulfilmentFacts {
+                    harnesses: BTreeMap::from([(
+                        "claude-code".to_string(),
+                        HarnessFacts { version: "2.0.0".to_string(), models: BTreeMap::new() },
+                    )]),
+                    observed_at: Utc::now(),
+                    ..Default::default()
+                },
+            )]),
+            ..HostStatus::default()
+        },
+    )
+    .await;
+    put_kind_at_home(
+        &daemon,
+        "udder-root",
+        "docker-udder-id",
+        &FulfilmentKindSpec::builder()
+            .host_ref("udder-id".to_string())
+            .pool("passthrough".to_string())
+            .realisation(FulfilmentRealisation::DockerPerVessel {
+                image: Some(flotilla_resources::PlacementImageSource::Literal("crew:latest".to_string())),
+            })
+            .build(),
+    )
+    .await;
 
     let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("andamento".to_string()).build();
     let (_, mut resolved_workflow) = daemon
@@ -217,50 +215,46 @@ async fn remote_placement_resolves_replicated_credentials_before_admission() {
 
 #[tokio::test]
 async fn placement_candidates_and_refusals_agree_across_roots() {
-    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("kiwi-root"));
-    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("feta-root"));
-    host_direct_kind(&kiwi, "kiwi-kind", "kiwi").await;
-    host_direct_kind(&feta, "feta-kind", "feta").await;
+    let (kiwi, _kiwi_dir) = placement_daemon("kiwi-root").await;
+    let (feta, _feta_dir) = placement_daemon("feta-root").await;
+    host_direct_kind(&kiwi.resource_backend(), "kiwi-kind", "kiwi").await;
+    host_direct_kind(&feta.resource_backend(), "feta-kind", "feta").await;
     let synced_at = Utc::now();
-    for (destination, source, origin) in [(&kiwi, &feta, "feta-root"), (&feta, &kiwi, "kiwi-root")] {
-        destination
-            .replica_writer::<FulfilmentKind>(NodeId::new(origin), "flotilla")
-            .replace(&source.using::<FulfilmentKind>("flotilla").list().await.expect("local kinds"), synced_at)
-            .await
-            .expect("replicate kinds");
+    for (destination, source) in [(&kiwi, &feta), (&feta, &kiwi)] {
+        flotilla_provisioning_testkit::replicate_home_at(
+            &source.decided_store().expect("source store"),
+            source.node_id().as_str(),
+            &destination.decided_store().expect("destination store"),
+            synced_at,
+        );
     }
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
     let left = created_convoy_placement(&kiwi, &workflow).await.expect_err("kiwi candidates");
     let right = created_convoy_placement(&feta, &workflow).await.expect_err("feta candidates");
     assert_eq!(left, right);
     assert!(left.find("feta-kind").expect("feta refused") < left.find("kiwi-kind").expect("kiwi refused"), "{left}");
-    for backend in [&kiwi, &feta] {
-        assert_eq!(backend.using::<FulfilmentKind>("flotilla").list().await.expect("controller view").items.len(), 1);
+    for daemon in [&kiwi, &feta] {
+        assert_eq!(daemon.resource_backend().using::<FulfilmentKind>("flotilla").list().await.expect("controller view").items.len(), 1);
     }
-    let replica = kiwi.including_replicas::<FulfilmentKind>("flotilla").get("feta-kind").await.expect("replica provenance");
-    assert_eq!(replica.provenance, ResourceProvenance::Replica { origin_root: NodeId::new("feta-root"), last_synced_at: synced_at });
+    let replica =
+        kiwi.resource_backend().including_replicas::<FulfilmentKind>("flotilla").get("feta-kind").await.expect("replica provenance");
+    // The engine keeps no per-record sync time: a replica's provenance names its home.
+    assert!(
+        matches!(&replica.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == feta.node_id()),
+        "{:?}",
+        replica.provenance
+    );
 }
 
 #[tokio::test]
 async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_host_direct_placement(&backend, "shared-kind", "local-host", BTreeSet::new()).await;
-    let replica_source = ResourceBackend::new(InMemoryBackend::default());
-    create_host_direct_placement(&replica_source, "shared-kind", "replica-host", BTreeSet::new()).await;
-    let replica_host = replica_source.using::<ResourceHost>("flotilla").list().await.expect("replica host");
-    backend
-        .replica_writer::<ResourceHost>(NodeId::new("remote-root"), "flotilla")
-        .replace(&replica_host, Utc::now())
-        .await
-        .expect("replicate replica host");
-    backend
-        .replica_writer::<FulfilmentKind>(NodeId::new("remote-root"), "flotilla")
-        .replace(&replica_source.using::<FulfilmentKind>("flotilla").list().await.expect("list replica kind"), Utc::now())
-        .await
-        .expect("replicate colliding kind");
+    let (daemon, _dir) = placement_daemon("placement-resolver").await;
+    create_host_direct_placement(&daemon, "shared-kind", "local-host", BTreeSet::new()).await;
+    create_host_direct_host(&daemon, "replica-host", BTreeSet::new()).await;
+    put_kind_at_home(&daemon, "remote-root", "shared-kind", &host_direct_kind_spec("replica-host")).await;
 
     let resolution =
-        created_convoy_placement(&backend, &WorkflowTemplateSpec::builder().vessels(Vec::new()).build()).await.expect("resolve placement");
+        created_convoy_placement(&daemon, &WorkflowTemplateSpec::builder().vessels(Vec::new()).build()).await.expect("resolve placement");
     let selected = resolution.selected.expect("select local home kind");
 
     assert_eq!(placement_host_ref(&selected), Some("local-host"));
@@ -269,7 +263,7 @@ async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
 
 #[tokio::test]
 async fn placement_target_host_rejects_unknown_display_name() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = EngineBackend::open("home");
     let policy = host_direct_kind(&backend, "unknown-host", "missing-host").await;
     let error = placement_target_host(&backend, "flotilla", &policy).await.expect_err("unknown host alias must be rejected");
     assert_eq!(error, "placement `unknown-host` references unknown host `missing-host`");
@@ -277,16 +271,10 @@ async fn placement_target_host_rejects_unknown_display_name() {
 
 #[tokio::test]
 async fn placement_target_host_rejects_ambiguous_display_name() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let hosts = backend.using::<ResourceHost>("flotilla");
+    let backend = EngineBackend::open("home");
     for host_id in ["host-id-a", "host-id-b"] {
-        hosts
-            .create(
-                &test_meta(host_id),
-                &HostSpec { display_name: "shared-name".to_string(), connection: Default::default(), ..HostSpec::default() },
-            )
-            .await
-            .expect("host");
+        let spec = HostSpec { display_name: "shared-name".to_string(), connection: Default::default(), ..HostSpec::default() };
+        backend.put_host_at_its_home(host_id, &spec, None).await;
     }
     let policy = host_direct_kind(&backend, "ambiguous-host", "shared-name").await;
     let error = placement_target_host(&backend, "flotilla", &policy).await.expect_err("ambiguous host alias must be rejected");
@@ -295,45 +283,38 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
 
 #[tokio::test]
 async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let hosts = backend.using::<ResourceHost>("flotilla");
-    let host = hosts
-        .create(
-            &test_meta("ssh-host"),
-            &HostSpec {
-                display_name: "beaufort".to_string(),
-                connection: flotilla_resources::HostConnection::SshHost {
-                    owning_daemon: "owner-host".to_string(),
-                    destination: "crew@beaufort.example".to_string(),
-                },
-                ..HostSpec::default()
-            },
-        )
-        .await
-        .expect("SSH Host");
-    hosts
-        .update_status(
-            &host.metadata.name,
-            &host.metadata.resource_version,
-            &HostStatus {
-                capabilities: BTreeMap::from([
-                    (
-                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                    ),
-                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!([])),
-                    ("ssh_host".to_string(), serde_json::json!(true)),
-                    ("transport".to_string(), serde_json::json!("ssh")),
-                    ("placement".to_string(), serde_json::json!("host_direct_only")),
-                    ("owning_daemon".to_string(), serde_json::json!("owner-host")),
-                ]),
-                heartbeat_at: Some(Utc::now()),
-                ready: true,
-                ..HostStatus::default()
-            },
-        )
-        .await
-        .expect("SSH observation");
+    let (daemon, _dir) = placement_daemon("placement-resolver").await;
+    let backend = daemon.resource_backend();
+    let spec = HostSpec {
+        display_name: "beaufort".to_string(),
+        connection: flotilla_resources::HostConnection::SshHost {
+            owning_daemon: "owner-host".to_string(),
+            destination: "crew@beaufort.example".to_string(),
+        },
+        ..HostSpec::default()
+    };
+    put_host(
+        &daemon,
+        "ssh-host",
+        &spec,
+        &HostStatus {
+            capabilities: BTreeMap::from([
+                (
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                ),
+                (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!([])),
+                ("ssh_host".to_string(), serde_json::json!(true)),
+                ("transport".to_string(), serde_json::json!("ssh")),
+                ("placement".to_string(), serde_json::json!("host_direct_only")),
+                ("owning_daemon".to_string(), serde_json::json!("owner-host")),
+            ]),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            ..HostStatus::default()
+        },
+    )
+    .await;
     let policy = host_direct_kind(&backend, "host-direct-ssh-host", "ssh-host").await;
     let trusted = WorkflowTemplateSpec::builder()
         .vessels(vec![flotilla_resources::VesselRequirement::builder()
@@ -344,7 +325,7 @@ async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
                 .build()])
             .build()])
         .build();
-    let unpinned = created_convoy_placement(&backend, &trusted).await.expect_err("an unpinned convoy must not land on an SSH host");
+    let unpinned = created_convoy_placement(&daemon, &trusted).await.expect_err("an unpinned convoy must not land on an SSH host");
     assert!(unpinned.contains(&policy.metadata.name), "{unpinned}");
     assert!(unpinned.contains("SSH host takes only convoys that pin its placement"), "{unpinned}");
     validate_workflow_agent_adapters(&backend, "flotilla", &trusted, Some(&policy), false)
@@ -359,10 +340,20 @@ async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
         .expect_err("SSH host has no central Codex login to copy");
     assert!(refused.contains("agent adapter `codex`"), "{refused}");
 
-    let observed = hosts.get("ssh-host").await.expect("SSH Host");
+    // Unreachable is the owner's blocking condition: readiness is judged from it.
+    let observed = read_host(&daemon, "ssh-host").await;
     let mut unreachable = observed.status.expect("observed SSH status");
-    unreachable.ready = false;
-    hosts.update_status("ssh-host", &observed.metadata.resource_version, &unreachable).await.expect("failed SSH probe");
+    unreachable.conditions.push(
+        HostCondition::builder()
+            .condition_type("SshProbe")
+            .value(ConditionValue::False)
+            .reason("Unreachable")
+            .message("ssh probe failed")
+            .observed_at(Utc::now())
+            .blocks_forge_observation(false)
+            .build(),
+    );
+    put_host(&daemon, "ssh-host", &observed.spec, &unreachable).await;
     let unavailable = placement_agent_adapters(&backend, "flotilla", &policy, false).await.expect_err("unreachable host is not ready");
     assert!(unavailable.contains("not ready"), "{unavailable}");
 }
@@ -374,7 +365,8 @@ async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
 #[tokio::test]
 async fn codex_crews_place_on_an_ssh_host_only_while_its_owner_has_a_central_login() {
     for central_login in [None, Some(false), Some(true)] {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        // The SSH host is homed at its owning daemon.
+        let backend = EngineBackend::open("owner-host");
         let hosts = backend.using::<ResourceHost>("flotilla");
         let connection = flotilla_resources::HostConnection::SshHost {
             owning_daemon: "owner-host".to_string(),
@@ -429,9 +421,9 @@ async fn codex_crews_place_on_an_ssh_host_only_while_its_owner_has_a_central_log
 
 #[tokio::test]
 async fn placement_refuses_unknown_host_without_blocking_tool_workflow() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    host_direct_kind(&backend, "a-unknown-host", "deleted-host").await;
-    create_host_direct_placement(&backend, "z-clean", "clean-host", BTreeSet::new()).await;
+    let (daemon, _dir) = placement_daemon("placement-resolver").await;
+    host_direct_kind(&daemon.resource_backend(), "a-unknown-host", "deleted-host").await;
+    create_host_direct_placement(&daemon, "z-clean", "clean-host", BTreeSet::new()).await;
     let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
         .vessels(vec![flotilla_resources::VesselRequirement::builder()
             .name("work".to_string())
@@ -442,48 +434,45 @@ async fn placement_refuses_unknown_host_without_blocking_tool_workflow() {
             .build()])
         .build();
 
-    let resolution = created_convoy_placement(&backend, &workflow).await.expect("clean candidate");
+    let resolution = created_convoy_placement(&daemon, &workflow).await.expect("clean candidate");
     assert_eq!(resolution.selected.expect("clean placement").metadata.name, "z-clean");
     assert_eq!(resolution.refused_candidates[0].kind, "a-unknown-host");
 }
 
 #[tokio::test]
 async fn placement_error_lists_each_refusal_and_failed_host_condition_reason() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let (daemon, _dir) = placement_daemon("placement-resolver").await;
     for (policy_name, host_name, condition_reason, condition_message) in [
         ("host-direct-feta", "feta", "StoredObjectDecodeFailed", "ConvoyEnsure/quarantined-record failed typed decode"),
         ("host-direct-udder", "udder", "RestartBudgetExhausted", "resource controller stopped after repeated failures"),
     ] {
-        create_host_direct_placement(&backend, policy_name, host_name, BTreeSet::from(["codex".to_string()])).await;
-        let hosts = backend.using::<ResourceHost>("flotilla");
-        let host = hosts.get(host_name).await.expect("host");
-        hosts
-            .update_status(
-                &host.metadata.name,
-                &host.metadata.resource_version,
-                &HostStatus {
-                    capabilities: host.status.expect("host status").capabilities,
-                    daemon_generation: Some(format!("{host_name}-generation")),
-                    heartbeat_at: Some(Utc::now()),
-                    ready: false,
-                    conditions: vec![HostCondition::builder()
-                        .condition_type("test")
-                        .value(ConditionValue::False)
-                        .reason(condition_reason)
-                        .message(condition_message)
-                        .observed_at(Utc::now())
-                        // This test admission condition does not disable forge reads.
-                        .blocks_forge_observation(false)
-                        .build()],
-                    ..HostStatus::default()
-                },
-            )
-            .await
-            .expect("degraded host status");
+        create_host_direct_placement(&daemon, policy_name, host_name, BTreeSet::from(["codex".to_string()])).await;
+        let host = read_host(&daemon, host_name).await;
+        put_host(
+            &daemon,
+            host_name,
+            &host.spec,
+            &HostStatus {
+                capabilities: host.status.expect("host status").capabilities,
+                daemon_generation: Some(format!("{host_name}-generation")),
+                heartbeat_at: Some(Utc::now()),
+                ready: false,
+                conditions: vec![HostCondition::builder()
+                    .condition_type("test")
+                    .value(ConditionValue::False)
+                    .reason(condition_reason)
+                    .message(condition_message)
+                    .observed_at(Utc::now())
+                    // This test admission condition does not disable forge reads.
+                    .blocks_forge_observation(false)
+                    .build()],
+                ..HostStatus::default()
+            },
+        )
+        .await;
     }
 
-    let error =
-        created_convoy_placement(&backend, &trusted_codex_workflow()).await.expect_err("all placement candidates should be refused");
+    let error = created_convoy_placement(&daemon, &trusted_codex_workflow()).await.expect_err("all placement candidates should be refused");
 
     assert!(error.starts_with("no fulfilment kind covers"), "{error}");
     for refusal in [
@@ -497,43 +486,6 @@ RestartBudgetExhausted: resource controller stopped after repeated failures",
 }
 
 #[tokio::test]
-async fn placement_accepts_a_host_with_an_authorship_collision() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_host_direct_placement(&backend, "host-direct-feta", "feta", BTreeSet::from(["codex".to_string()])).await;
-    let hosts = backend.using::<ResourceHost>("flotilla");
-    let host = hosts.get("feta").await.expect("host");
-    hosts
-        .update_status(
-            &host.metadata.name,
-            &host.metadata.resource_version,
-            &HostStatus {
-                capabilities: host.status.expect("host status").capabilities,
-                heartbeat_at: Some(Utc::now()),
-                ready: true,
-                conditions: vec![HostCondition::builder()
-                    .condition_type("ResourceReplication/AuthorshipCollision")
-                    .value(ConditionValue::False)
-                    .reason("HomeBoundRecordAuthoredAtMultipleRoots")
-                    .message("Convoy/flotilla/standing-collision is authored at multiple roots")
-                    .observed_at(Utc::now())
-                    .blocks_readiness(false)
-                    // This test admission condition does not disable forge reads.
-                    .blocks_forge_observation(false)
-                    .build()],
-                ..HostStatus::default()
-            },
-        )
-        .await
-        .expect("host status with advisory collision");
-
-    let resolution = created_convoy_placement(&backend, &trusted_codex_workflow())
-        .await
-        .expect("standing authorship collisions must not freeze dispatch placement");
-
-    assert_eq!(resolution.selected.expect("viable placement").metadata.name, "host-direct-feta");
-}
-
-#[tokio::test]
 async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
@@ -542,25 +494,21 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("local"),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let local_host = daemon.local_host_id().expect("local host id").to_string();
-    let local_env = create_test_environment(&daemon, "local-env", &local_host).await;
-    let ambiguous_env = create_test_environment(&daemon, "ambiguous-env", "shared-host").await;
-    let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
+    let _messages = install_engine_messages(&daemon);
+    let engine = test_engine(&daemon);
+    let local_env = create_test_environment(&engine.environments, "local-env", &local_host);
+    let ambiguous_env = create_test_environment(&engine.environments, "ambiguous-env", "shared-host");
     for host_id in ["shared-host-id-a", "shared-host-id-b"] {
-        hosts
-            .create(
-                &test_meta(host_id),
-                &HostSpec { display_name: "shared-host".to_string(), connection: Default::default(), ..HostSpec::default() },
-            )
-            .await
-            .expect("ambiguous host");
+        let spec = HostSpec { display_name: "shared-host".to_string(), connection: Default::default(), ..HostSpec::default() };
+        put_host(&daemon, host_id, &spec, &HostStatus::default()).await;
     }
-    create_running_session(&daemon, &ambiguous_env, "terminal-ambiguous", "convoy-ambiguous", "watcher").await;
-    create_running_session(&daemon, &local_env, "terminal-local", "convoy-local", "watcher").await;
+    create_running_session(&engine, &ambiguous_env, "terminal-ambiguous", "convoy-ambiguous", "watcher").await;
+    create_running_session(&engine, &local_env, "terminal-local", "convoy-local", "watcher").await;
 
     let rows = daemon.fleet_list_internal().await.expect("fleet list").rows;
     let hosts_by_convoy = rows.into_iter().map(|row| (row.convoy, row.host)).collect::<BTreeMap<_, _>>();
@@ -577,83 +525,66 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("local"),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
     let host = daemon.local_host_id().expect("local host id").to_string();
-    let env = create_test_environment(&daemon, "local-env", &host).await;
-    for (convoy, project) in [("convoy-one", "island-one"), ("convoy-two", "island-two")] {
-        create_identity_convoy(&daemon.resource_backend(), convoy, convoy, Some(project)).await;
-        if convoy == "convoy-one" {
-            let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
-            let name = "terminal-convoy-one";
-            let created = terminals
-                .create(
-                    &InputMeta::builder()
-                        .name(name.to_string())
-                        .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.to_string())]))
-                        .build(),
-                    &ResourceTerminalSessionSpec {
-                        env_ref: env.clone(),
-                        role: "coder".to_string(),
-                        source: TerminalSessionSource::Agent {
-                            selector: Selector { capability: "code".to_string(), adapter: Some("codex".to_string()), model: None },
-                            brief: flotilla_resources::TerminalBrief {
-                                artifact_digest: None,
-                                path: "brief.md".to_string(),
-                                content: "Work".to_string(),
-                                copies: vec![],
-                            },
-                            context: Box::new(flotilla_resources::TerminalCrewContext {
-                                namespace: "flotilla".to_string(),
-                                convoy: convoy.to_string(),
-                                vessel_ref: "vessel-one".to_string(),
-                            }),
-                            message: None,
-                        },
-                        cwd: "/repo".to_string(),
-                        env: Default::default(),
-                        pool: "passthrough".to_string(),
+    let _messages = install_engine_messages(&daemon);
+    let engine = test_engine(&daemon);
+    let env = create_test_environment(&engine.environments, "local-env", &host);
+    let mut crew_one = String::new();
+    let mut launches = BTreeMap::new();
+    for (record, project) in [("convoy-one", "island-one"), ("convoy-two", "island-two")] {
+        let convoy = create_identity_convoy(&daemon, record, record, project).await;
+        launches.insert(record, convoy.clone());
+        if record == "convoy-one" {
+            let vessel = ensure_vessel(&engine, &convoy, "work");
+            let launch = engine.terminals.request(&TerminalLaunchRequest {
+                session: "terminal-convoy-one".to_string(),
+                environment: env.clone(),
+                vessel: Some(vessel),
+                role: "coder".to_string(),
+                pool: "passthrough".to_string(),
+                cwd: "/repo".to_string(),
+                env: Default::default(),
+                source: TerminalLaunchSource::Agent {
+                    capability: "code".to_string(),
+                    adapter: Some("codex".to_string()),
+                    model: None,
+                    brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
+                        path: "brief.md".to_string(),
+                        content: "Work".to_string(),
+                        copies: vec![],
                     },
-                )
-                .await
-                .expect("agent session");
-            terminals
-                .update_status(
-                    name,
-                    &created.metadata.resource_version,
-                    &ResourceTerminalSessionStatus {
-                        phase: ResourceTerminalSessionPhase::Running,
-                        session_id: Some("session-one".to_string()),
-                        crew: Some(flotilla_resources::CrewSessionStatus {
-                            id: "crew-one".to_string(),
-                            adapter: "codex".to_string(),
-                            model: None,
-                            stance: "coder".to_string(),
-                        }),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("agent status");
+                },
+            });
+            let facts = TerminalLaunchFacts {
+                agent: Some(AgentLaunch { adapter: "codex".to_string(), model: None, stance: "coder".to_string() }),
+                ..Default::default()
+            };
+            engine.terminals.ready(&launch, "session-one", &facts);
+            // Its crew id is its launch's name.
+            crew_one = launch;
         } else {
-            create_running_session(&daemon, &env, &format!("terminal-{convoy}"), convoy, "coder").await;
+            create_running_session(&engine, &env, &format!("terminal-{record}"), &convoy, "coder").await;
         }
     }
 
     let fleet = daemon.scoped_fleet_list(None, None, None).await.expect("fleet");
     assert_eq!(fleet.rows.len(), 2);
-    let scoped = daemon.scoped_fleet_list(None, None, Some("convoy-one")).await.expect("crew convoy scope");
+    let (one, two) = (launches["convoy-one"].as_str(), launches["convoy-two"].as_str());
+    let scoped = daemon.scoped_fleet_list(None, None, Some(one)).await.expect("crew convoy scope");
     assert_eq!(scoped.rows.len(), 1);
-    assert_eq!(scoped.rows[0].convoy_ref.as_deref(), Some("convoy-one"));
-    let by_crew = daemon.scoped_fleet_list(None, Some("crew-one"), None).await.expect("crew identity scope");
+    assert_eq!(scoped.rows[0].convoy_ref.as_deref(), Some(one));
+    let by_crew = daemon.scoped_fleet_list(None, Some(&crew_one), None).await.expect("crew identity scope");
     assert_eq!(by_crew.rows.len(), 1);
-    assert_eq!(by_crew.rows[0].convoy_ref.as_deref(), Some("convoy-one"));
+    assert_eq!(by_crew.rows[0].convoy_ref.as_deref(), Some(one));
     assert!(daemon.scoped_fleet_list(None, Some("missing"), None).await.is_err());
-    let explicit = daemon.scoped_fleet_list(Some("island-two"), None, Some("convoy-one")).await.expect("explicit scope");
+    let explicit = daemon.scoped_fleet_list(Some("island-two"), None, Some(one)).await.expect("explicit scope");
     assert_eq!(explicit.rows.len(), 1);
-    assert_eq!(explicit.rows[0].convoy_ref.as_deref(), Some("convoy-two"));
+    assert_eq!(explicit.rows[0].convoy_ref.as_deref(), Some(two));
     let explicit_with_stale_crew = daemon.scoped_fleet_list(Some("island-two"), Some("missing"), None).await.expect("explicit scope wins");
     assert_eq!(explicit_with_stale_crew.rows.len(), 1);
 }

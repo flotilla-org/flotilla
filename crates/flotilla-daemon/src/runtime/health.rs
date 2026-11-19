@@ -1,98 +1,35 @@
-//! Runtime health, heartbeat conditions, and projection parity.
+//! Runtime health and heartbeat conditions.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
-    },
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
 use chrono::Utc;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_projections::IssuePollingHealth;
 
 use flotilla_credentials::CredentialStore;
-use flotilla_protocol::{BlobSyncStatus, HostSummary, NodeId, Rows};
-use flotilla_resources::Resource;
+use flotilla_protocol::HostSummary;
+use flotilla_resources::ResourceError;
 use flotilla_resources::{
-    ConditionValue, Convoy, CredentialExpiry, FoldedHostObservations, Forge, FulfilmentFacts, Host, HostCondition, HostStatus,
-    HostStatusPatch, ReplicationClass, SystemClock, Vessel, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
-    HELD_CREDENTIALS_CAPABILITY, LOCAL_ROWS_MISSING_REASON, PROJECTION_PARITY_CONDITION,
+    ConditionValue, CredentialExpiry, Forge, FulfilmentFacts, Host, HostCondition, HostStatus, HostStatusPatch, ResourceObject,
+    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
 };
-use flotilla_store::{home_bound_authorship_collisions, ResourceBackend, REGISTERED_RESOURCE_KINDS};
+use flotilla_store::{Listed, TypedResolver};
 use serde_json::json;
-use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::warn;
 
 use super::discovery::LocalProvisioningProfile;
-use super::seed::{canonicalize_kind_hosts, ensure_host_exists};
-use super::tasks::{spawn_periodic_task, PeriodicTaskStart, AGGREGATOR_CONTROLLER, CONVOY_ENSURE_CONDITION_TYPE};
+use super::seed::{canonicalize_kinds_for, ensure_host_matches};
+use super::tasks::{AGGREGATOR_CONTROLLER, CONVOY_ENSURE_CONDITION_TYPE, RETENTION_CONDITION_TYPE};
 use crate::{
-    blob_store::TieredBlobStore, resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name,
-    supervisor::RestartBudgetExhausted,
+    resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name, supervisor::RestartBudgetExhausted,
 };
 
 const FLEET_DESIGNATION_CONDITION_TYPE: &str = "Message/FleetDesignation";
-
-/// An engine-held build's failure and cause come from the same judgement.
-pub(super) fn image_build_failure_condition(
-    build: &flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>,
-    lifecycles: &dyn flotilla_resources::lifecycle_reads::LifecycleReads,
-) -> Option<HostCondition> {
-    use flotilla_protocol::LifecycleReading;
-    use flotilla_resources::lifecycle_reads::ProvisioningKind;
-    let (reason, message) = match lifecycles.try_reading(ProvisioningKind::ImageBuild, &build.metadata.name, None) {
-        // A failed read must remain visible without suppressing the other heartbeat observations.
-        Err(error) => ("LifecycleReadFailed", error),
-        Ok(Some(
-            LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause } | LifecycleReading::Failed { reason: cause },
-        )) => ("ImageBuildFailed", cause),
-        // Absence or release makes the image unusable, but does not establish a failed build execution.
-        Ok(Some(LifecycleReading::Lost | LifecycleReading::Released)) => return None,
-        Ok(Some(_)) => return None,
-        Ok(None) => {
-            let status = build.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Failed)?;
-            ("ImageBuildFailed", status.failure.as_ref().map(|failure| failure.reason.clone()).unwrap_or_default())
-        }
-    };
-    Some(
-        HostCondition::builder()
-            .condition_type(format!("ImageBuild/{}", build.metadata.name))
-            .value(ConditionValue::False)
-            .reason(reason)
-            .message(message)
-            .observed_at(Utc::now())
-            .blocks_readiness(false)
-            // A failed image build or read does not disable forge reads.
-            .blocks_forge_observation(false)
-            .build(),
-    )
-}
-
-/// A shared reader failure is one heartbeat fault, regardless of the number of image records.
-fn image_build_failure_conditions<'a>(
-    builds: impl Iterator<Item = &'a flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>>,
-    lifecycles: &dyn flotilla_resources::lifecycle_reads::LifecycleReads,
-) -> Vec<HostCondition> {
-    let mut read_failed = false;
-    builds
-        .filter_map(|build| {
-            let mut condition = image_build_failure_condition(build, lifecycles)?;
-            if condition.reason == "LifecycleReadFailed" {
-                if read_failed {
-                    return None;
-                }
-                read_failed = true;
-                condition.condition_type = "ImageBuild/LifecycleReads".into();
-            }
-            Some(condition)
-        })
-        .collect()
-}
 
 #[derive(Debug, Clone)]
 pub(super) struct DaemonHealthIdentity {
@@ -107,14 +44,18 @@ pub(super) struct RuntimeHealth {
     pub(super) restart_history_dir: Option<Arc<PathBuf>>,
     pub(super) issue_polling: IssuePollingHealth,
     pub(super) host_observations: HostObservations,
+    /// Wakes the heartbeat to publish a condition straight away, before its next tick.
+    pub(super) heartbeat_now: Arc<tokio::sync::Notify>,
+    /// What the heartbeat last published, and the Hosts it last listed.
+    pub(super) heartbeat: Arc<tokio::sync::Mutex<HeartbeatMemory>>,
+    /// Where the heartbeat publishes; the store's, unless a test counts the calls.
+    pub(super) heartbeat_publish: HeartbeatPublish,
 }
 
-/// Latest periodic observations of the local Host, folded into the heartbeat's
-/// status write so each observer does not commit the Host object on its own
-/// cadence (#3154). Host status is "latest value only" (WORKLOAD.md).
+/// Latest periodic observations of the local Host that the heartbeat and the fulfilment probe
+/// share. Host status is "latest value only" (WORKLOAD.md).
 #[derive(Clone, Default)]
 pub(super) struct HostObservations {
-    blob_store: Option<Arc<TieredBlobStore>>,
     provider_advertisements: Arc<tokio::sync::RwLock<Option<ProviderObservation>>>,
     fulfilment_facts: Arc<tokio::sync::RwLock<Option<BTreeMap<String, FulfilmentFacts>>>>,
 }
@@ -127,23 +68,11 @@ struct ProviderObservation {
 
 impl std::fmt::Debug for HostObservations {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("HostObservations").field("blob_store", &self.blob_store.is_some()).finish_non_exhaustive()
+        formatter.debug_struct("HostObservations").finish_non_exhaustive()
     }
 }
 
 impl HostObservations {
-    pub(super) fn with_blob_store(mut self, blob_store: Arc<TieredBlobStore>) -> Self {
-        self.blob_store = Some(blob_store);
-        self
-    }
-
-    async fn blob_sync(&self) -> Option<BlobSyncStatus> {
-        match &self.blob_store {
-            Some(store) => Some(store.status().await),
-            None => None,
-        }
-    }
-
     pub(super) async fn record_provider_advertisements(&self, providers: Vec<flotilla_protocol::provider::ProviderAdvertisement>) {
         *self.provider_advertisements.write().await = Some(ProviderObservation { at: tokio::time::Instant::now(), providers });
     }
@@ -172,11 +101,6 @@ impl HostObservations {
 }
 
 impl RuntimeHealth {
-    pub(super) fn with_blob_store(mut self, blob_store: Arc<TieredBlobStore>) -> Self {
-        self.host_observations = self.host_observations.with_blob_store(blob_store);
-        self
-    }
-
     pub(super) fn report_capability_regression(&self, condition: HostCondition) {
         self.failures.lock().expect("runtime health lock poisoned").insert(condition.condition_type.clone(), condition);
     }
@@ -230,36 +154,6 @@ impl RuntimeHealth {
         }
     }
 
-    pub(super) fn report_controller_loop_stall(&self, name: &str, elapsed: Duration) {
-        let condition_type = format!("ControllerLoop/{name}");
-        let condition = HostCondition::builder()
-            .condition_type(condition_type.clone())
-            .value(ConditionValue::False)
-            .reason("HeartbeatStale")
-            .message(format!("{name} controller loop made no progress for {elapsed:?}"))
-            .observed_at(Utc::now())
-            // A stalled actuator reconcile does not stop the independent forge reader.
-            .blocks_forge_observation(false)
-            .build();
-        self.failures.lock().expect("runtime health lock poisoned").insert(condition_type, condition);
-    }
-
-    pub(super) fn clear_controller_loop_stall(&self, name: &str) {
-        self.failures.lock().expect("runtime health lock poisoned").remove(&format!("ControllerLoop/{name}"));
-    }
-
-    pub(super) fn report_projection_parity(&self, condition: Option<HostCondition>) {
-        let mut failures = self.failures.lock().expect("runtime health lock poisoned");
-        match condition {
-            Some(condition) => {
-                failures.insert(PROJECTION_PARITY_CONDITION.to_string(), condition);
-            }
-            None => {
-                failures.remove(PROJECTION_PARITY_CONDITION);
-            }
-        }
-    }
-
     /// The archive's `Archive` condition (#3939): present while a bundle is overdue.
     pub(super) fn report_archive(&self, condition: Option<HostCondition>) {
         let mut failures = self.failures.lock().expect("runtime health lock poisoned");
@@ -269,6 +163,28 @@ impl RuntimeHealth {
             }
             None => {
                 failures.remove(super::archive::ARCHIVE_CONDITION);
+            }
+        }
+    }
+
+    /// Artifact retention's condition: present while its failures are past their retry limit.
+    pub(super) fn report_retention(&self, failing: Option<String>) {
+        let mut failures = self.failures.lock().expect("runtime health lock poisoned");
+        match failing {
+            Some(message) => {
+                let condition = HostCondition::builder()
+                    .condition_type(RETENTION_CONDITION_TYPE)
+                    .value(ConditionValue::False)
+                    .reason("RetentionFailing")
+                    .message(message)
+                    .observed_at(Utc::now())
+                    .blocks_readiness(false)
+                    .blocks_forge_observation(false)
+                    .build();
+                failures.insert(RETENTION_CONDITION_TYPE.to_string(), condition);
+            }
+            None => {
+                failures.remove(RETENTION_CONDITION_TYPE);
             }
         }
     }
@@ -293,7 +209,6 @@ impl RuntimeHealth {
     pub(super) async fn conditions(&self) -> Vec<HostCondition> {
         let mut conditions = self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect::<Vec<_>>();
         conditions.extend(self.issue_polling.condition());
-        conditions.extend(store_read_retry_condition(&flotilla_store::load_metrics::read_retry_snapshot()));
         if let Some(state_dir) = self.restart_history_dir.clone() {
             let frequency =
                 flotilla_provider_runtime::probe::blocking("restart history", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
@@ -359,7 +274,12 @@ pub(super) fn assess_agent_adapter_capabilities(
             }
         },
     };
-    let same_daemon = previous.daemon_generation == health.generation && previous.daemon_started_at == Some(health.started_at);
+    // The observed store's generation is minted per daemon process, so it alone tells a restart
+    // from this daemon's own earlier heartbeat; the decided store keeps no start time.
+    let same_daemon = match (&previous.daemon_generation, &health.generation) {
+        (Some(previous), Some(current)) => previous == current,
+        _ => previous.daemon_started_at == Some(health.started_at),
+    };
     if same_daemon {
         return AgentAdapterCapabilityAssessment { baseline, regression: None };
     }
@@ -399,90 +319,6 @@ pub(super) fn test_health_identity() -> DaemonHealthIdentity {
     }
 }
 
-pub(super) fn spawn_projection_parity_task(
-    backend: ResourceBackend,
-    namespace: String,
-    projection: AggregatorProjectionState,
-    runtime_health: RuntimeHealth,
-    interval: Duration,
-) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
-        let backend = backend.clone();
-        let namespace = namespace.clone();
-        let projection = projection.clone();
-        let runtime_health = runtime_health.clone();
-        async move {
-            match projection_parity_condition(&backend, &namespace, &projection, &SystemClock).await {
-                Ok(condition) => runtime_health.report_projection_parity(condition),
-                Err(error) => warn!(%error, "failed to evaluate aggregator projection parity"),
-            }
-        }
-    })
-}
-
-// Local convoy creation and aggregator watch delivery are not atomic. Give
-// newly authored rows a small, non-renewing grace period; rows still missing
-// at the boundary retain the existing host-readiness failure (#2736).
-pub(super) const PROJECTION_PARITY_GRACE: chrono::Duration = chrono::Duration::seconds(10);
-
-pub(super) async fn projection_parity_condition(
-    backend: &ResourceBackend,
-    namespace: &str,
-    projection: &AggregatorProjectionState,
-    clock: &dyn flotilla_resources::Clock,
-) -> Result<Option<HostCondition>, String> {
-    let stored = backend.using::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
-    let projected = match projection.local_result_set().await.rows {
-        Rows::Convoys { rows, .. } => rows.into_iter().map(|row| row.resource.name).collect::<BTreeSet<_>>(),
-        rows => return Err(format!("local convoy projection returned unexpected rows: {rows:?}")),
-    };
-    let now = clock.now();
-    let expected = stored.items.iter().map(|convoy| convoy.metadata.name.clone()).collect::<BTreeSet<_>>();
-    // `using` lists only this root's durable rows, never replicas. Creation time
-    // (rather than last update or first parity observation) bounds the grace
-    // even if controllers keep updating the row or the daemon restarts.
-    // Sort missing names for stable diagnostics, independent of backend list order.
-    let missing = stored
-        .items
-        .into_iter()
-        .filter_map(|convoy| {
-            let age = now.signed_duration_since(convoy.metadata.creation_timestamp);
-            let within_grace = age >= chrono::Duration::zero() && age < PROJECTION_PARITY_GRACE;
-            (!projected.contains(&convoy.metadata.name) && !within_grace).then_some(convoy.metadata.name)
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        return Ok(None);
-    }
-    // Totals include every row in each snapshot; the missing list omits rows
-    // still within grace, preserving the existing diagnostic counts.
-    let message = format!(
-        "durable store has {} convoys but the local aggregator projection has {}; missing: {}",
-        expected.len(),
-        projected.len(),
-        missing.join(", ")
-    );
-    error!(
-        stored = expected.len(),
-        projected = projected.len(),
-        missing = ?missing,
-        "aggregator projection parity check failed"
-    );
-    Ok(Some(
-        HostCondition::builder()
-            .condition_type(PROJECTION_PARITY_CONDITION)
-            .value(ConditionValue::False)
-            .reason(LOCAL_ROWS_MISSING_REASON)
-            .message(message)
-            .observed_at(now)
-            // Local projection lag blocks admission, not durable forge observation.
-            .blocks_forge_observation(false)
-            .build(),
-    ))
-}
-
 pub(super) async fn apply_host_heartbeat_with_credentials(
     daemon: &Arc<InProcessDaemon>,
     namespace: &str,
@@ -492,26 +328,28 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
     runtime_health: &RuntimeHealth,
 ) -> Result<(), String> {
     daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
-    ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id, &profile.display_name, profile.max_vessels).await?;
     let backend = daemon.resource_backend();
-    let hosts = backend.using::<Host>(namespace);
-    let host = hosts.get(&profile.host_id).await.map_err(|err| err.to_string())?;
+    let hosts = backend.clone().using::<Host>(namespace);
+    let mut memory = runtime_health.heartbeat.lock().await;
+    // This daemon's own Host, and those its kinds may name, listed again only once they moved:
+    // after bringing its own in line with the profile, among other writes.
+    let mut listed = memory.hosts.read(&hosts).await.map_err(|err| err.to_string())?;
+    let own = |host: &&ResourceObject<Host>| host.metadata.name == profile.host_id;
+    let existing = listed.iter().find(own);
+    if ensure_host_matches(&hosts, existing, &profile.host_id, &profile.display_name, profile.max_vessels).await? {
+        listed = memory.hosts.read(&hosts).await.map_err(|err| err.to_string())?;
+        // A Host made or remade holds none of what was published.
+        memory.published = None;
+    }
+    let host = listed.iter().find(own).ok_or_else(|| format!("host {} is not held", profile.host_id))?;
+    if host.status.is_none() {
+        memory.published = None;
+    }
     let adapter_assessment = assess_agent_adapter_capabilities(host.status.as_ref(), &profile.available_agent_adapters, health);
     if let Some(condition) = adapter_assessment.regression {
         runtime_health.report_capability_regression(condition);
     }
     let summary = daemon.local_host_description().await;
-    let resource_store = backend.diagnostics().await.map_err(|err| err.to_string())?;
-    if let Some(diagnostics) = resource_store.as_ref().filter(|diagnostics| !diagnostics.warnings.is_empty()) {
-        warn!(
-            event_count = diagnostics.event_count,
-            object_count = diagnostics.object_count,
-            resource_stream_count = diagnostics.resource_stream_count,
-            max_retained_events = diagnostics.max_retained_events,
-            warnings = ?diagnostics.warnings,
-            "resource event log tripwire triggered",
-        );
-    }
     let (held_credentials, credential_expiry) = match credential_store {
         Some(store) => (store.held_credentials().await?, store.credential_expiry().await),
         None => (BTreeSet::new(), BTreeMap::new()),
@@ -520,8 +358,8 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
         Ok(bytes) => (bytes, None),
         Err(error) => (None, Some(error)),
     };
-    let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
-    canonicalize_kind_hosts(&backend, namespace, &profile.host_id).await?;
+    let below_free_space_floor = below_floor(disk_free_bytes, daemon.admission_free_space_floor_bytes()?);
+    canonicalize_kinds_for(&backend, namespace, &listed, &profile.host_id).await?;
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(daemon.project_image_layer_conditions().await);
     conditions.extend(daemon.observation_credential_conditions().await);
@@ -538,74 +376,153 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
                 .build(),
         );
     }
-    let build_records = backend.using::<flotilla_resources::ImageBuild>(namespace).list().await.map_err(|error| error.to_string())?;
-    let lifecycles = daemon.lifecycle_reads();
-    let local_host = profile.host_id.clone();
-    conditions.extend(
-        tokio::task::spawn_blocking(move || {
-            image_build_failure_conditions(
-                build_records.items.iter().filter(|build| build.spec.current().is_some_and(|spec| spec.host_ref == local_host)),
-                lifecycles.as_ref(),
-            )
-        })
-        .await
-        .map_err(|error| error.to_string())?,
-    );
-
     conditions.extend(file_descriptor_pressure_condition());
     conditions.extend(daemon.generation_conditions().await);
-    if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
-        conditions.push(condition);
-    }
-    if let Some(condition) = resource_field_ownership_condition(resource_store.as_ref()) {
-        conditions.push(condition);
-    }
-    if let Some(condition) = resource_authorship_collision_condition(daemon, namespace).await? {
-        conditions.push(condition);
-    }
-    if let Some(condition) = resource_replication_content_condition(daemon, namespace).await? {
-        conditions.push(condition);
-    }
     if let Some(condition) = daemon_forgejo_credential_condition(daemon, namespace).await {
         conditions.push(condition);
     }
-    let mut capabilities = host_capabilities(&summary, profile, &held_credentials, &credential_expiry);
-    if let Some(providers) = runtime_health.host_observations.provider_advertisements().await {
-        capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
+    let report = HeartbeatReport {
+        description: summary,
+        providers: runtime_health
+            .host_observations
+            .provider_advertisements()
+            .await
+            .unwrap_or_else(|| profile.environment_providers.clone()),
+        held_credentials,
+        credential_expiry,
+        agent_adapter_baseline: adapter_assessment.baseline,
+        ready: !conditions.iter().any(HostCondition::blocks_readiness),
+        daemon_generation: health.generation.clone(),
+        below_free_space_floor,
+        conditions,
+    };
+    // Unchanged since the last publish: no patch is made, and nothing is read or written.
+    if memory.published.as_ref().is_some_and(|published| published.same_as(&report)) {
+        return Ok(());
     }
-    if let Some(snapshot) = crate::resource_limits::io_pressure_snapshot().await {
-        capabilities.insert("io_pressure".to_string(), snapshot);
-    }
-    capabilities.insert("store_read_retries".into(), json!(flotilla_store::load_metrics::read_retry_snapshot()));
-    capabilities.insert("forge_budgets".into(), serde_json::to_value(daemon.forge_budget_rows()).expect("forge budgets serialize"));
-    let ready = !conditions.iter().any(HostCondition::blocks_readiness);
-    flotilla_store::apply_status_patch(
-        &hosts,
-        &profile.host_id,
-        &HostStatusPatch::Heartbeat {
-            description: Some(Box::new(summary)),
-            capabilities,
-            agent_adapter_baseline: Some(adapter_assessment.baseline),
-            heartbeat_at: daemon.clock().now(),
-            ready,
-            resource_store: resource_store.map(Box::new),
-            daemon_rss_bytes: flotilla_projections::host_summary::daemon_rss_bytes(),
-            daemon_generation: health.generation.clone(),
-            protocol_fingerprint: Some(flotilla_protocol::PROTOCOL_FINGERPRINT.to_string()),
-            daemon_version: Some(health.version.clone()),
-            daemon_started_at: Some(health.started_at),
-            disk_free_bytes,
-            admission_free_space_floor_bytes: Some(admission_free_space_floor_bytes),
-            conditions,
-            folded: Box::new(FoldedHostObservations {
-                blob_sync: runtime_health.host_observations.blob_sync().await,
-                fulfilment_refresh: runtime_health.host_observations.fulfilment_facts().await.unwrap_or_default(),
-            }),
-        },
-    )
-    .await
-    .map_err(|err| err.to_string())?;
+    runtime_health
+        .heartbeat_publish
+        .0
+        .publish(&hosts, &profile.host_id, &report.patch(profile, daemon.clock().now()))
+        .await
+        .map_err(|err| err.to_string())?;
+    memory.published = Some(report);
     Ok(())
+}
+
+/// Where the heartbeat publishes its own Host's status.
+#[async_trait::async_trait]
+pub(super) trait HostStatusPublish: Send + Sync {
+    async fn publish(&self, hosts: &TypedResolver<Host>, name: &str, patch: &HostStatusPatch) -> Result<(), ResourceError>;
+}
+
+/// Publishes through the store, which writes only an observation that changed.
+struct StoreStatusPublish;
+
+#[async_trait::async_trait]
+impl HostStatusPublish for StoreStatusPublish {
+    async fn publish(&self, hosts: &TypedResolver<Host>, name: &str, patch: &HostStatusPatch) -> Result<(), ResourceError> {
+        flotilla_store::observe_status(hosts, name, patch).await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct HeartbeatPublish(pub(super) Arc<dyn HostStatusPublish>);
+
+impl Default for HeartbeatPublish {
+    fn default() -> Self {
+        Self(Arc::new(StoreStatusPublish))
+    }
+}
+
+impl std::fmt::Debug for HeartbeatPublish {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HeartbeatPublish").finish_non_exhaustive()
+    }
+}
+
+/// What the heartbeat keeps between its ticks.
+#[derive(Default)]
+pub(super) struct HeartbeatMemory {
+    hosts: Listed<Host>,
+    /// The report last published, which an unchanged tick does not publish again.
+    published: Option<HeartbeatReport>,
+}
+
+impl std::fmt::Debug for HeartbeatMemory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HeartbeatMemory").field("published", &self.published.is_some()).finish_non_exhaustive()
+    }
+}
+
+/// Whether `free` bytes are below the admission `floor`: a floor of zero admits whatever is free,
+/// and an unread free figure is unknown.
+pub(super) fn below_floor(free: Option<u64>, floor: u64) -> Option<bool> {
+    if floor == 0 {
+        return Some(false);
+    }
+    free.map(|free| free < floor)
+}
+
+/// What one heartbeat observes of this daemon's own host, compared with the last one published
+/// before any patch is made of it.
+#[derive(Debug, Clone)]
+pub(super) struct HeartbeatReport {
+    description: HostSummary,
+    providers: Vec<flotilla_protocol::provider::ProviderAdvertisement>,
+    held_credentials: BTreeSet<String>,
+    credential_expiry: BTreeMap<String, CredentialExpiry>,
+    agent_adapter_baseline: BTreeSet<String>,
+    ready: bool,
+    daemon_generation: Option<String>,
+    below_free_space_floor: Option<bool>,
+    conditions: Vec<HostCondition>,
+}
+
+impl HeartbeatReport {
+    /// Whether `other` observes what this does: each condition's observation time aside.
+    fn same_as(&self, other: &Self) -> bool {
+        let Self {
+            description,
+            providers,
+            held_credentials,
+            credential_expiry,
+            agent_adapter_baseline,
+            ready,
+            daemon_generation,
+            below_free_space_floor,
+            conditions,
+        } = self;
+        *description == other.description
+            && *providers == other.providers
+            && *held_credentials == other.held_credentials
+            && *credential_expiry == other.credential_expiry
+            && *agent_adapter_baseline == other.agent_adapter_baseline
+            && *ready == other.ready
+            && *daemon_generation == other.daemon_generation
+            && *below_free_space_floor == other.below_free_space_floor
+            && conditions.len() == other.conditions.len()
+            && conditions.iter().zip(&other.conditions).all(|(left, right)| left.same_observation(right))
+    }
+
+    fn patch(&self, profile: &LocalProvisioningProfile, heartbeat_at: chrono::DateTime<Utc>) -> HostStatusPatch {
+        HostStatusPatch::Heartbeat {
+            description: Some(Box::new(self.description.clone())),
+            capabilities: BTreeMap::from([
+                (flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(), json!(self.providers)),
+                (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
+                (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(self.held_credentials)),
+                (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(self.credential_expiry)),
+            ]),
+            agent_adapter_baseline: Some(self.agent_adapter_baseline.clone()),
+            heartbeat_at,
+            ready: self.ready,
+            daemon_generation: self.daemon_generation.clone(),
+            protocol_fingerprint: Some(flotilla_protocol::PROTOCOL_FINGERPRINT.to_string()),
+            below_free_space_floor: self.below_free_space_floor,
+            conditions: self.conditions.clone(),
+        }
+    }
 }
 
 /// Diagnose host-local intent against namespace-scoped declarations, never checkout observations.
@@ -642,18 +559,16 @@ pub(super) async fn resolve_daemon_forgejo_credential_condition(
             _ => return Ok(None),
         }
     }
-    // A cursor for some other kind does not establish that Forge definitions
-    // have arrived. Wait for each connected peer's Forge snapshot bookmark.
+    // Forge definitions arrive with each connected peer's decided log: wait until this store has
+    // committed a first round of every one of them.
+    let decided = daemon.decided_store()?;
     for peer in daemon.connected_peer_node_ids().await {
-        if backend.replica_writer::<Forge>(peer, namespace).cursor().await.map_err(|error| error.to_string())?.is_none() {
+        if !decided.has_watermark(peer.as_str()) {
             return Ok(None);
         }
     }
-    // The host-local map applies to source-addressed requests in any namespace.
-    // A declaration outside the runtime namespace is still a valid use of a key.
-    let mut namespaces =
-        backend.stored_namespaces::<Forge>().await.map_err(|error| error.to_string())?.into_iter().collect::<BTreeSet<_>>();
-    namespaces.insert(namespace.to_string());
+    // The decided store holds definitions without namespaces.
+    let namespaces = BTreeSet::from([namespace.to_string()]);
     let mut declared = BTreeSet::new();
     for declared_namespace in &namespaces {
         let forges = backend.definitions::<Forge>(declared_namespace).list().await.map_err(|error| error.to_string())?;
@@ -679,261 +594,6 @@ pub(super) async fn resolve_daemon_forgejo_credential_condition(
         .build()))
 }
 
-pub(super) async fn resource_authorship_collision_condition(
-    daemon: &Arc<InProcessDaemon>,
-    namespace: &str,
-) -> Result<Option<HostCondition>, String> {
-    let collisions = home_bound_authorship_collisions(&daemon.resource_backend(), namespace).await.map_err(|error| error.to_string())?;
-    if collisions.is_empty() {
-        return Ok(None);
-    }
-    let identities = collisions
-        .iter()
-        .map(|collision| {
-            format!(
-                "{}/{}/{} is authored locally at {} and replicated from {}",
-                collision.kind, collision.namespace, collision.name, collision.local_root, collision.replica_root
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    let vessel_guidance = if collisions.iter().any(|collision| collision.kind == Vessel::API_PATHS.kind) {
-        " For a Vessel with live crew on the non-origin copy, preserve both copies until that crew is drained or finished; deleting the origin Vessel can tear down the placed actuator. Then remove the non-origin authored copy and let the origin's Vessel replicate and project again. Do not delete a running copy to clear this warning."
-    } else {
-        ""
-    };
-    Ok(Some(
-        HostCondition::builder()
-            .condition_type("ResourceReplication/AuthorshipCollision")
-            .value(ConditionValue::False)
-            .reason("HomeBoundRecordAuthoredAtMultipleRoots")
-            .message(format!(
-                "{} home-bound resource authorship collision{} detected: {identities}. Choose the record's natural home and delete the other authored copy at its root; the replicator will not choose a winner.{vessel_guidance}",
-                collisions.len(),
-                if collisions.len() == 1 { "" } else { "s" },
-            ))
-            .observed_at(Utc::now())
-            .blocks_readiness(false)
-            // A home-bound actuator collision does not disable forge reads.
-            .blocks_forge_observation(false)
-            .build(),
-    ))
-}
-
-pub(super) async fn resource_replication_content_condition(
-    daemon: &Arc<InProcessDaemon>,
-    namespace: &str,
-) -> Result<Option<HostCondition>, String> {
-    let connected_peers = daemon.connected_peer_node_ids().await;
-    if connected_peers.is_empty() {
-        return Ok(None);
-    }
-
-    let backend = daemon.resource_backend();
-    let mut peers_without_cursors = Vec::new();
-    for peer in connected_peers {
-        let mut cursor_count = 0;
-        for kind in REGISTERED_RESOURCE_KINDS {
-            if kind.replication_class == ReplicationClass::None {
-                continue;
-            }
-            if flotilla_store::replica_cursor_for_resource_kind(&backend, namespace, kind.kind, &peer)
-                .await
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                cursor_count += 1;
-            }
-        }
-        if cursor_count == 0 {
-            peers_without_cursors.push(peer);
-        }
-    }
-    if peers_without_cursors.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(
-        HostCondition::builder()
-            .condition_type("ResourceReplication")
-            .value(ConditionValue::False)
-            .reason("ReplicaCursorsMissing")
-            .message(format!(
-                "connected peer{} {} {} zero replica cursors; resource replication has not bootstrapped",
-                if peers_without_cursors.len() == 1 { "" } else { "s" },
-                peers_without_cursors.iter().map(NodeId::as_str).collect::<Vec<_>>().join(", "),
-                if peers_without_cursors.len() == 1 { "has" } else { "have" },
-            ))
-            .observed_at(Utc::now())
-            // Replication bootstrap lag does not disable local reads; lag handover belongs to #3414.
-            .blocks_forge_observation(false)
-            .build(),
-    ))
-}
-
-pub(super) fn resource_decode_quarantine_condition(
-    diagnostics: Option<&flotilla_resources::ResourceStoreDiagnostics>,
-) -> Option<HostCondition> {
-    let diagnostics = diagnostics?;
-    let object_quarantines = &diagnostics.decode_quarantines;
-    let event_quarantines = &diagnostics.event_decode_quarantines;
-    if object_quarantines.is_empty() && event_quarantines.is_empty() {
-        return None;
-    }
-    // Extend this list when source_owner gains another stored election input
-    // or forge observation gains another stored kind; keep its scope test aligned.
-    let forge_kinds = [
-        Host::API_PATHS.kind,
-        Forge::API_PATHS.kind,
-        flotilla_resources::Project::API_PATHS.kind,
-        flotilla_resources::Repository::API_PATHS.kind,
-        flotilla_resources::Issue::API_PATHS.kind,
-        flotilla_resources::ChangeRequest::API_PATHS.kind,
-    ];
-    let observation_corruption = object_quarantines
-        .iter()
-        .map(|record| record.kind.as_str())
-        .chain(event_quarantines.iter().map(|record| record.kind.as_str()))
-        .any(|kind| forge_kinds.contains(&kind));
-    let identities = object_quarantines
-        .iter()
-        .map(|quarantine| format!("{}/{}: {}", quarantine.kind, quarantine.name, quarantine.error))
-        .chain(
-            event_quarantines
-                .iter()
-                .map(|quarantine| format!("{}/{}@{}: {}", quarantine.kind, quarantine.name, quarantine.event_version, quarantine.error)),
-        )
-        .collect::<Vec<_>>()
-        .join("; ");
-    let (reason, message) = if event_quarantines.is_empty() {
-        (
-            "StoredObjectDecodeFailed",
-            format!(
-                "{} stored resource object{} quarantined after typed decode failure{}: {identities}",
-                object_quarantines.len(),
-                if object_quarantines.len() == 1 { "" } else { "s" },
-                if object_quarantines.len() == 1 { "" } else { "s" },
-            ),
-        )
-    } else if object_quarantines.is_empty() {
-        (
-            "StoredEventDecodeFailed",
-            format!(
-                "{} stored resource event{} quarantined after typed decode failure{}: {identities}",
-                event_quarantines.len(),
-                if event_quarantines.len() == 1 { "" } else { "s" },
-                if event_quarantines.len() == 1 { "" } else { "s" },
-            ),
-        )
-    } else {
-        (
-            "StoredResourceDecodeFailed",
-            format!(
-                "{} stored resource object{} and {} event{} quarantined after typed decode failures: {identities}",
-                object_quarantines.len(),
-                if object_quarantines.len() == 1 { "" } else { "s" },
-                event_quarantines.len(),
-                if event_quarantines.len() == 1 { "" } else { "s" },
-            ),
-        )
-    };
-    Some(
-        HostCondition::builder()
-            .condition_type("ResourceStore/DecodeQuarantine")
-            .value(ConditionValue::False)
-            .reason(reason)
-            .message(message)
-            .observed_at(Utc::now())
-            // Only corrupt forge inputs/results disable observation; unrelated actuator records do not.
-            .blocks_forge_observation(observation_corruption)
-            .build(),
-    )
-}
-
-pub(super) fn resource_field_ownership_condition(
-    diagnostics: Option<&flotilla_resources::ResourceStoreDiagnostics>,
-) -> Option<HostCondition> {
-    let violations = &diagnostics?.field_ownership_violations;
-    if violations.is_empty() {
-        return None;
-    }
-    let details = violations
-        .iter()
-        .map(|violation| {
-            format!(
-                "{}/{}/{} {:?} attempted {}={} ({})",
-                violation.kind,
-                violation.namespace,
-                violation.name,
-                violation.writer.role,
-                violation.field,
-                violation.attempted_value,
-                violation.rule
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Some(
-        HostCondition::builder()
-            .condition_type("ResourceStore/FieldOwnership")
-            .value(ConditionValue::False)
-            .reason("FieldOwnershipViolation")
-            .message(format!(
-                "{} field ownership violation{} recorded: {details}",
-                violations.len(),
-                if violations.len() == 1 { "" } else { "s" }
-            ))
-            .observed_at(Utc::now())
-            .blocks_readiness(false)
-            // Historical rejected writes do not disable current forge reads.
-            .blocks_forge_observation(false)
-            .build(),
-    )
-}
-
-pub(super) fn host_capabilities(
-    summary: &HostSummary,
-    profile: &LocalProvisioningProfile,
-    held_credentials: &BTreeSet<String>,
-    credential_expiry: &BTreeMap<String, CredentialExpiry>,
-) -> BTreeMap<String, serde_json::Value> {
-    BTreeMap::from([
-        (flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(), json!(profile.environment_providers)),
-        (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
-        (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
-        (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(credential_expiry)),
-        ("docker".to_string(), json!(profile.docker_available)),
-        ("os".to_string(), json!(summary.system.os)),
-        ("terminal_pools".to_string(), json!(profile.available_pools)),
-    ])
-}
-
-/// A long reconcile also stalls other names, so it counts as missing loop progress.
-pub(super) fn spawn_controller_loop_watchdog(
-    name: &'static str,
-    heartbeat: Arc<AtomicU64>,
-    interval: Duration,
-    health: RuntimeHealth,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.tick().await;
-        let mut last_value = heartbeat.load(Ordering::Relaxed);
-        let mut last_progress = tokio::time::Instant::now();
-        loop {
-            ticker.tick().await;
-            let value = heartbeat.load(Ordering::Relaxed);
-            if value != last_value {
-                last_value = value;
-                last_progress = tokio::time::Instant::now();
-                health.clear_controller_loop_stall(name);
-            } else if last_progress.elapsed() >= interval.saturating_mul(2) {
-                health.report_controller_loop_stall(name, last_progress.elapsed());
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 mod provider_readiness_tests {
     use super::*;
@@ -956,106 +616,5 @@ mod provider_readiness_tests {
             observations.record_provider_advertisements(vec![provider.clone()]).await;
             assert_eq!(observations.provider_advertisements().await.unwrap()[0].readiness, provider.readiness);
         });
-    }
-}
-
-/// Informational pressure signal, independent of readiness, forge admission,
-/// and restart policy. Recomputed on every heartbeat.
-fn store_read_retry_condition(snapshot: &BTreeMap<&str, flotilla_store::load_metrics::ReadRetrySnapshot>) -> Option<HostCondition> {
-    let prolonged = snapshot
-        .iter()
-        .filter(|(_, metrics)| metrics.prolonged > 0)
-        .map(|(class, metrics)| {
-            format!(
-                "{class}: {} prolonged, {} consecutive busy refusals, oldest {} ms",
-                metrics.prolonged, metrics.consecutive, metrics.oldest_millis
-            )
-        })
-        .collect::<Vec<_>>();
-    if prolonged.is_empty() {
-        return None;
-    }
-    Some(
-        HostCondition::builder()
-            .condition_type("ResourceStore/ReadRetries")
-            .value(ConditionValue::False)
-            .reason("StoreBusyReadRetriesProlonged")
-            .message(format!(
-                "store-busy reads retrying for at least {} seconds; {}",
-                flotilla_store::load_metrics::READ_RETRY_PROLONGED.as_secs(),
-                prolonged.join("; ")
-            ))
-            .observed_at(Utc::now())
-            .blocks_readiness(false)
-            .blocks_forge_observation(false)
-            .build(),
-    )
-}
-
-#[cfg(test)]
-mod read_retry_health_tests {
-    use super::*;
-    use flotilla_store::load_metrics::ReadRetrySnapshot;
-
-    // The health condition exists only while at least one class has prolonged
-    // retries. Historical counters never keep it latched after recovery.
-    #[hegel::test]
-    fn prolonged_retries_are_informational_and_recovery_clears(tc: hegel::TestCase) {
-        let prolonged = tc.draw(hegel::generators::integers::<u64>().min_value(0).max_value(10));
-        let historical = tc.draw(hegel::generators::integers::<u64>());
-        let mut snapshot = BTreeMap::from([(
-            "controller",
-            ReadRetrySnapshot { prolonged, retries: historical, recoveries: historical, ..Default::default() },
-        )]);
-        let condition = store_read_retry_condition(&snapshot);
-        assert_eq!(condition.is_some(), prolonged > 0);
-        if let Some(condition) = condition {
-            assert_eq!(condition.condition_type, "ResourceStore/ReadRetries");
-            assert!(!condition.blocks_readiness());
-            assert!(!condition.blocks_forge_observation());
-            assert!(condition.message.contains("controller"));
-        }
-        snapshot.get_mut("controller").unwrap().prolonged = 0;
-        assert!(store_read_retry_condition(&snapshot).is_none());
-    }
-}
-
-#[cfg(test)]
-mod image_health_tests {
-    use super::*;
-
-    // Build execution failures raise health conditions; release and absence only invalidate the artifact.
-    #[test]
-    fn image_health_follows_engine_without_a_copy() {
-        use flotilla_provisioning::engine::image_build::ImageBuildBinding;
-        use flotilla_provisioning_testkit::{image_build, Ending, LifecycleFixture};
-        let build = image_build(flotilla_resources::ImageBuildPhase::Failed);
-        for (ending, failed) in [
-            (Ending::GaveUp("engine cause"), true),
-            (Ending::Failed("engine cause"), true),
-            (Ending::Lost("digest"), false),
-            (Ending::Released, false),
-        ] {
-            let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
-            fixture.request(&build);
-            assert!(image_build_failure_condition(&build, fixture.reads.as_ref()).is_none());
-            fixture.finish(&build, ending);
-            let condition = image_build_failure_condition(&build, fixture.reads.as_ref());
-            assert_eq!(condition.is_some(), failed);
-            if let Some(condition) = condition {
-                assert_eq!(condition.reason, "ImageBuildFailed");
-                assert_eq!(condition.message, "engine cause");
-                assert!(!condition.blocks_readiness);
-                assert!(!condition.blocks_forge_observation);
-            }
-            fixture.poison();
-            let mut other = build.clone();
-            other.metadata.name = "other-image".into();
-            let conditions = image_build_failure_conditions([&build, &other].into_iter(), fixture.reads.as_ref());
-            assert_eq!(conditions.len(), 1, "one unavailable reader, not one fault per image");
-            assert_eq!(conditions[0].condition_type, "ImageBuild/LifecycleReads");
-            assert_eq!(conditions[0].reason, "LifecycleReadFailed");
-            assert!(conditions[0].message.contains("poisoned"));
-        }
     }
 }

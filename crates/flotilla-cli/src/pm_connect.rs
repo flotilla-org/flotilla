@@ -390,7 +390,7 @@ impl ConnectorState {
         self.projection.expire_at(
             node.clone(),
             row.as_ref()
-                .filter(|row| row.phase == flotilla_protocol::result_set::ConvoyPhase::Landed)
+                .filter(|row| row.phase == Some(flotilla_protocol::result_set::ConvoyPhase::Landed))
                 .and_then(|row| row.finished_at)
                 .map(|at| at + chrono::Duration::hours(24)),
         );
@@ -631,44 +631,75 @@ async fn ensure_resource_watches(
             continue;
         }
         for kind in resources::KINDS {
-            let mut watch = client
-                .watch(
-                    ResourceWatchRequest::builder().kind((*kind).to_string()).namespace(namespace.clone()).include_replicas(true).build(),
-                )
-                .await?;
-            for envelope in read_subject_snapshot(&mut watch, &namespace, kind).await? {
+            let request = |cursor: Option<flotilla_protocol::ResourceCursor>| {
+                ResourceWatchRequest::builder()
+                    .kind((*kind).to_string())
+                    .namespace(namespace.clone())
+                    .include_replicas(true)
+                    .maybe_cursor(cursor)
+                    .build()
+            };
+            let mut watch = client.watch(request(None)).await?;
+            let (envelopes, mut cursor) = read_subject_snapshot(&mut watch, &namespace, kind).await?;
+            for envelope in envelopes {
                 state.apply_resource_records(&envelope)?;
             }
             let updates = updates.clone();
             let client = ResourceClient::new(Arc::clone(daemon));
             let namespace = namespace.clone();
             tasks.spawn(async move {
+                let request = |cursor: Option<flotilla_protocol::ResourceCursor>| {
+                    ResourceWatchRequest::builder()
+                        .kind((*kind).to_string())
+                        .namespace(namespace.clone())
+                        .include_replicas(true)
+                        .maybe_cursor(cursor)
+                        .build()
+                };
                 loop {
                     let update = match watch.next_event().await {
-                        Ok(Some(envelope)) => Ok(ResourceUpdate::Delta(envelope)),
+                        Ok(Some(envelope)) => {
+                            // Resume from the newest bookmark, never an object's resourceVersion.
+                            if is_bookmark(&envelope) {
+                                cursor = envelope.cursor.clone();
+                            }
+                            Ok(ResourceUpdate::Delta(envelope))
+                        }
                         Ok(None) => Err("subject catalog resource watch ended".to_string()),
                         Err(ResourceWatchError::Lagged(skipped)) => {
-                            warn!(%namespace, kind, skipped, "subject watch lagged; rebuilding its scope");
                             // Retire this watch before opening its replacement. Only
                             // this task owns its scope, so no old updates follow the snapshot.
                             drop(watch);
+                            // Every change after the newest bookmark comes again from it; a kind
+                            // that cannot resume, or a bookmark that expired, rebuilds the scope.
+                            let resumed = async {
+                                let mut next = client.watch(request(Some(cursor.clone()))).await?;
+                                let first = next.next().await?.ok_or_else(|| "the resumed watch ended".to_string())?;
+                                match is_bookmark(&first) {
+                                    true => Ok::<_, String>((next, first)),
+                                    false => Err("a resumed watch began without its bookmark".to_string()),
+                                }
+                            }
+                            .await;
+                            match resumed {
+                                Ok((next, bookmark)) => {
+                                    warn!(%namespace, kind, skipped, "subject watch lagged; resumed from its bookmark");
+                                    watch = next;
+                                    cursor = bookmark.cursor;
+                                    continue;
+                                }
+                                Err(reason) => warn!(%namespace, kind, skipped, %reason, "subject watch lagged; rebuilding its scope"),
+                            }
                             let restarted = async {
-                                let mut next = client
-                                    .watch(
-                                        ResourceWatchRequest::builder()
-                                            .kind((*kind).to_string())
-                                            .namespace(namespace.clone())
-                                            .include_replicas(true)
-                                            .build(),
-                                    )
-                                    .await?;
-                                let envelopes = read_subject_snapshot(&mut next, &namespace, kind).await?;
-                                Ok::<_, String>((next, envelopes))
+                                let mut next = client.watch(request(None)).await?;
+                                let (envelopes, cursor) = read_subject_snapshot(&mut next, &namespace, kind).await?;
+                                Ok::<_, String>((next, envelopes, cursor))
                             }
                             .await;
                             match restarted {
-                                Ok((next, envelopes)) => {
+                                Ok((next, envelopes, bookmark)) => {
                                     watch = next;
+                                    cursor = bookmark;
                                     if updates
                                         .send(Ok(ResourceUpdate::Snapshot {
                                             namespace: namespace.clone(),
@@ -708,11 +739,17 @@ async fn ensure_resource_watches(
 // The daemon emits snapshot envelopes followed by a bookmark, then live
 // events. Consume through that explicit boundary, allowing fragmentation but
 // refusing live updates or a mismatched scope before setup can publish.
+/// Whether `envelope` is a bookmark alone, whose cursor a watch resumes from.
+fn is_bookmark(envelope: &flotilla_protocol::ResourceReadEnvelope) -> bool {
+    matches!(envelope.records.as_slice(), [record] if record.record_type == flotilla_protocol::ResourceRecordType::Bookmark && record.object.is_none())
+}
+
+/// The snapshot's envelopes, and the cursor of the bookmark ending it.
 async fn read_subject_snapshot(
     watch: &mut flotilla_client::resource::ResourceWatch,
     namespace: &str,
     plural: &str,
-) -> Result<Vec<flotilla_protocol::ResourceReadEnvelope>, String> {
+) -> Result<(Vec<flotilla_protocol::ResourceReadEnvelope>, flotilla_protocol::ResourceCursor), String> {
     use flotilla_protocol::ResourceRecordType;
     use flotilla_resources::ResourceError;
 
@@ -723,10 +760,10 @@ async fn read_subject_snapshot(
             return Err(ResourceError::invalid("subject resource snapshot scope does not match its watch").to_string());
         }
         if envelope.records.iter().any(|record| record.record_type == ResourceRecordType::Bookmark) {
-            if envelope.records.len() != 1 || envelope.records[0].object.is_some() {
+            if !is_bookmark(&envelope) {
                 return Err(ResourceError::invalid("subject resource snapshot bookmark must be a separate envelope").to_string());
             }
-            return Ok(envelopes);
+            return Ok((envelopes, envelope.cursor));
         }
         if envelope.records.iter().any(|record| !matches!(record.record_type, ResourceRecordType::Current | ResourceRecordType::Added)) {
             return Err(ResourceError::invalid("subject resource snapshot contains a live event before its bookmark").to_string());

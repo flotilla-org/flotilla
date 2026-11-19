@@ -5,17 +5,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     result_set::{ConvoyRow, ResultSet, Rows},
-    CanonicalHostId, CredentialAttention, CredentialAttentionSeverity, FleetListRow, FleetObservationAgreement, FleetStaleness, HostName,
-    NodeId, PeerConnectionState,
+    CanonicalHostId, ChangeStreamPathStatus, ChangeStreamStatus, CredentialAttention, CredentialAttentionSeverity, FleetListRow,
+    FleetObservationAgreement, FleetStaleness, HostName, NodeId, PeerConnectionState,
 };
 use flotilla_resources::canonical_placement_host_ref_from_sources;
+use flotilla_resources::checkout_records::latest_launches;
+use flotilla_resources::LifecycleAuthority;
 use flotilla_resources::{
-    crew_attention, Checkout as ResourceCheckout, Environment as ResourceEnvironment, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, ReadResourceObject, ResourceProvenance, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    crew_attention, Host as ResourceHost, HostStatus as ResourceHostStatus, ReadResourceObject, ResourceProvenance,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, CONVOY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
-use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::aggregator_projection::AggregatorProjectionState;
@@ -47,18 +48,21 @@ pub async fn is_host_self_report(source: &ReadResourceObject<ResourceHost>, host
 
 pub struct ReplicatedHostReport {
     pub host_id: String,
-    pub last_synced_at: DateTime<Utc>,
+    /// When this host's home last completed a change-stream round here; `None` until it has.
+    pub followed_at: Option<DateTime<Utc>>,
     pub status: Option<ResourceHostStatus>,
 }
 
+/// Each peer host's self-report, from the home most recently followed when several name it.
 pub async fn replicated_host_reports(
     sources: &[ReadResourceObject<ResourceHost>],
     host_registry: &HostRegistry,
     configured_by_node: &HashMap<NodeId, HostName>,
+    streams: &HashMap<NodeId, ChangeStreamStatus>,
 ) -> HashMap<HostName, ReplicatedHostReport> {
     let mut reports = HashMap::<HostName, ReplicatedHostReport>::new();
     for source in sources {
-        let ResourceProvenance::Replica { origin_root, last_synced_at } = &source.provenance else { continue };
+        let ResourceProvenance::Replica { origin_root, .. } = &source.provenance else { continue };
         if !is_host_self_report(source, host_registry).await {
             continue;
         }
@@ -66,22 +70,27 @@ pub async fn replicated_host_reports(
         else {
             continue;
         };
+        let followed_at = streams.get(origin_root).and_then(|stream| stream.followed_at);
         if reports.get(&host).is_some_and(|existing| {
-            existing.last_synced_at > *last_synced_at
-                || (existing.last_synced_at == *last_synced_at && existing.host_id <= source.object.metadata.name)
+            existing.followed_at > followed_at || (existing.followed_at == followed_at && existing.host_id <= source.object.metadata.name)
         }) {
             continue;
         }
         reports.insert(
             host,
-            ReplicatedHostReport {
-                host_id: source.object.metadata.name.clone(),
-                last_synced_at: *last_synced_at,
-                status: source.object.status.clone(),
-            },
+            ReplicatedHostReport { host_id: source.object.metadata.name.clone(), followed_at, status: source.object.status.clone() },
         );
     }
     reports
+}
+
+/// A peer row's staleness from when its home was last followed here.
+pub fn followed_staleness(followed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> FleetStaleness {
+    match followed_at {
+        Some(last_sync) if replica_sync_is_fresh(last_sync, now) => FleetStaleness::Fresh { last_sync },
+        Some(last_sync) => FleetStaleness::Stale { last_sync },
+        None => FleetStaleness::Unreachable { last_sync: None, message: "change stream not followed yet".into() },
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,19 +98,68 @@ pub enum ChangeStreamUpdate {
     /// A source tail advanced, but does not prove its full snapshot is servable.
     Progress(u64),
     /// A complete follower round, or a source snapshot, clears prior failures.
-    Healthy(u64),
+    Healthy {
+        watermark: u64,
+        at: DateTime<Utc>,
+    },
     Failure {
         watermark: Option<u64>,
         message: String,
     },
 }
 
+/// One home's committed watermark here and each path following it, keyed by the peer passing
+/// it on (`None` for the home itself).
+#[derive(Default)]
+struct HomeStreams {
+    watermark: u64,
+    paths: BTreeMap<Option<NodeId>, ChangeStreamPathStatus>,
+}
+
+impl HomeStreams {
+    /// A path fails when its last round failed, or when its rounds stopped: a path whose follower
+    /// ended ages out. A path still on its first round is neither followed nor failing. The home
+    /// is failing only when every path is, and then reports why each one is.
+    fn status(&self, now: DateTime<Utc>) -> ChangeStreamStatus {
+        let paths = self.paths.values().cloned().collect::<Vec<_>>();
+        let why = |path: &ChangeStreamPathStatus| match (&path.last_error, path.followed_at) {
+            (Some(error), _) => Some(error.clone()),
+            (None, Some(at)) if !replica_sync_is_fresh(at, now) => Some(format!("no round since {}", at.format("%Y-%m-%d %H:%M:%S UTC"))),
+            (None, _) => None,
+        };
+        let (last_error, consecutive_failures) = if paths.is_empty() || paths.iter().any(|path| why(path).is_none()) {
+            (None, 0)
+        } else {
+            let error = match paths.as_slice() {
+                [only] => why(only).unwrap_or_default(),
+                _ => paths
+                    .iter()
+                    .map(|path| {
+                        let route = path.via.as_ref().map_or_else(|| "direct".to_owned(), |via| format!("via {via}"));
+                        format!("{route}: {}", why(path).unwrap_or_default())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            };
+            (Some(error), paths.iter().map(|path| path.consecutive_failures).min().unwrap_or_default())
+        };
+        ChangeStreamStatus {
+            watermark: self.watermark,
+            followed_at: paths.iter().filter_map(|path| path.followed_at).max(),
+            last_error,
+            consecutive_failures,
+            paths,
+        }
+    }
+}
+
 pub struct FleetService {
     aggregator_projection_state: AggregatorProjectionState,
     host_name: HostName,
     canonical_local_host_id: Option<CanonicalHostId>,
-    change_streams: std::sync::RwLock<HashMap<NodeId, flotilla_protocol::ChangeStreamStatus>>,
-    resource_replication_failures: RwLock<HashMap<NodeId, BTreeMap<String, String>>>,
+    change_streams: std::sync::RwLock<HashMap<NodeId, HomeStreams>>,
+    /// This host's own log as its followers are served it.
+    serving: std::sync::RwLock<Option<ChangeStreamStatus>>,
 }
 
 impl FleetService {
@@ -112,16 +170,21 @@ impl FleetService {
     ) -> Self {
         Self {
             change_streams: Default::default(),
+            serving: Default::default(),
             aggregator_projection_state,
             host_name,
             canonical_local_host_id,
-            resource_replication_failures: RwLock::new(HashMap::new()),
         }
     }
 
-    pub async fn replication_failures(&self) -> HashMap<NodeId, BTreeMap<String, String>> {
-        let mut failures = self.resource_replication_failures.read().await.clone();
-        for (peer, state) in self.change_streams() {
+    pub fn replication_failures(&self, now: DateTime<Utc>) -> HashMap<NodeId, BTreeMap<String, String>> {
+        let mut failures = HashMap::<NodeId, BTreeMap<String, String>>::new();
+        for (peer, state) in self.change_streams(now) {
+            // A home whose rounds only aged is stale, which its last round already says; a failure
+            // is a round that errored on every path.
+            if state.paths.iter().any(|path| path.last_error.is_none()) {
+                continue;
+            }
             if let Some(error) = state.last_error {
                 failures.entry(peer).or_default().insert(
                     "change-stream".into(),
@@ -132,17 +195,26 @@ impl FleetService {
         failures
     }
 
-    pub fn change_streams(&self) -> HashMap<NodeId, flotilla_protocol::ChangeStreamStatus> {
-        self.change_streams.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    /// Each followed home's status as of `now`.
+    pub fn change_streams(&self, now: DateTime<Utc>) -> HashMap<NodeId, ChangeStreamStatus> {
+        let streams = self.change_streams.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        streams.iter().map(|(home, state)| (home.clone(), state.status(now))).collect()
     }
 
-    pub fn report_change_stream(&self, peer: &NodeId, update: ChangeStreamUpdate) {
-        let mut streams = self.change_streams.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = streams.entry(peer.clone()).or_default();
+    pub fn serving(&self) -> Option<ChangeStreamStatus> {
+        self.serving.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Records serving this host's own log: a snapshot served, its tail advancing, or a
+    /// resource it cannot serve.
+    pub fn report_serving(&self, update: ChangeStreamUpdate) {
+        let mut serving = self.serving.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = serving.get_or_insert_with(ChangeStreamStatus::default);
         match update {
             ChangeStreamUpdate::Progress(watermark) => state.watermark = watermark,
-            ChangeStreamUpdate::Healthy(watermark) => {
+            ChangeStreamUpdate::Healthy { watermark, at } => {
                 state.watermark = watermark;
+                state.followed_at = Some(at);
                 state.last_error = None;
                 state.consecutive_failures = 0;
             }
@@ -156,20 +228,29 @@ impl FleetService {
         }
     }
 
-    pub async fn begin_peer_resource_replication(&self, peer: &NodeId) {
-        self.resource_replication_failures.write().await.remove(peer);
-    }
-
-    pub async fn report_resource_replication_failure(&self, peer: &NodeId, kind: &str, message: &str) {
-        self.resource_replication_failures.write().await.entry(peer.clone()).or_default().insert(kind.to_string(), message.to_string());
-    }
-
-    pub async fn report_resource_replication_healthy(&self, peer: &NodeId, kind: &str) {
-        let mut failures = self.resource_replication_failures.write().await;
-        let Some(peer_failures) = failures.get_mut(peer) else { return };
-        peer_failures.remove(kind);
-        if peer_failures.is_empty() {
-            failures.remove(peer);
+    /// Records a round of `home`'s log followed directly, or through `via` when a peer passes it on.
+    pub fn report_change_stream(&self, home: &NodeId, via: Option<&NodeId>, update: ChangeStreamUpdate) {
+        let mut streams = self.change_streams.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = streams.entry(home.clone()).or_default();
+        let path = state
+            .paths
+            .entry(via.cloned())
+            .or_insert_with(|| ChangeStreamPathStatus { via: via.cloned(), ..ChangeStreamPathStatus::default() });
+        match update {
+            ChangeStreamUpdate::Progress(watermark) => state.watermark = watermark,
+            ChangeStreamUpdate::Healthy { watermark, at } => {
+                state.watermark = watermark;
+                path.followed_at = Some(at);
+                path.last_error = None;
+                path.consecutive_failures = 0;
+            }
+            ChangeStreamUpdate::Failure { watermark, message } => {
+                if let Some(watermark) = watermark {
+                    state.watermark = watermark;
+                }
+                path.last_error = Some(message);
+                path.consecutive_failures = path.consecutive_failures.saturating_add(1);
+            }
         }
     }
 
@@ -188,18 +269,13 @@ impl FleetService {
         backend: &ResourceBackend,
         namespace: &str,
         host_registry: &HostRegistry,
+        lifecycles: &dyn crate::ports::LifecycleReads,
     ) -> Result<Vec<FleetListRow>, String> {
         let now = Utc::now();
-        let environments = backend.clone().using::<ResourceEnvironment>(namespace);
-        let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
+        let streams = self.change_streams(now);
 
         let session_list =
             backend.including_replicas::<ResourceTerminalSession>(namespace).list().await.map_err(|err| err.to_string())?.items;
-        let session_list = if let Some(reads) = backend.terminal_readings() {
-            flotilla_store::read_terminal_sources(reads, session_list).await.map_err(|error| error.to_string())?
-        } else {
-            session_list
-        };
         let host_sources = backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|err| err.to_string())?;
         let result_sets = vec![self.aggregator_projection_state.result_set().await];
         let placement_by_convoy = result_sets
@@ -219,14 +295,8 @@ impl FleetService {
             .flatten()
             .map(|convoy| ((convoy.resource.namespace.clone(), convoy.resource.name.clone()), convoy.surface_state))
             .collect::<HashMap<_, _>>();
-        let environment_map: HashMap<_, _> = environments
-            .list()
-            .await
-            .map_err(|err| err.to_string())?
-            .items
-            .into_iter()
-            .map(|environment| (environment.metadata.name.clone(), environment))
-            .collect();
+        // The hosts the sessions' environments run on, from the engine's records.
+        let environment_map = environment_hosts(lifecycles, session_list.iter().map(|session| session.object.spec.env_ref.as_str()))?;
         // The Aggregator maintains this catalog from watch events. Health polls
         // consume projected rows, never stored Convoy bodies or frozen workflows.
         let convoy_addresses = result_sets
@@ -235,22 +305,33 @@ impl FleetService {
             .flatten()
             .map(|convoy| {
                 let role = convoy.address_role.as_deref().unwrap_or(&convoy.name);
-                let address = convoy.project_ref.as_ref().map_or_else(|| role.to_string(), |project| format!("{role} @ {project}"));
+                let address = format!("{role} @ {}", convoy.project_ref);
                 (convoy.resource.name.clone(), address)
             })
             .collect::<HashMap<_, _>>();
+        // A crewed convoy's checkout authority, from the checkouts the engine holds for it: adopted
+        // when it holds an adopted one, else managed (#3108).
+        let crewed = session_list.iter().filter_map(|session| session.object.metadata.labels.get(CONVOY_LABEL)).collect::<HashSet<_>>();
         let mut authority_by_convoy = HashMap::new();
-        for checkout in checkouts.list().await.map_err(|err| err.to_string())?.items {
-            let Some(convoy) = checkout.metadata.labels.get(CONVOY_LABEL).cloned() else {
-                continue;
-            };
-            let authority = checkout
-                .metadata
-                .lifecycle_authority()
-                .map_err(|err| err.to_string())?
-                .map(|authority| authority.as_label_value().to_string());
-            if authority.is_some() {
-                authority_by_convoy.insert(convoy, authority);
+        if !crewed.is_empty() {
+            let checkouts = lifecycles.checkouts()?;
+            for source in
+                backend.including_replicas::<flotilla_resources::Convoy>(namespace).list().await.map_err(|err| err.to_string())?.items
+            {
+                let convoy = source.object;
+                if !crewed.contains(&convoy.metadata.name) {
+                    continue;
+                }
+                let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(&convoy) else { continue };
+                let held = latest_launches(checkouts.held(&holder)?);
+                let authority = if held.values().any(|checkout| matches!(checkout.spec, flotilla_resources::CheckoutSpec::Observed(_))) {
+                    Some(LifecycleAuthority::Adopted)
+                } else {
+                    (!held.is_empty()).then_some(LifecycleAuthority::Managed)
+                };
+                if let Some(authority) = authority {
+                    authority_by_convoy.insert(convoy.metadata.name.clone(), Some(authority.as_label_value().to_string()));
+                }
             }
         }
 
@@ -259,7 +340,7 @@ impl FleetService {
             let session = session_source.object;
             let remote_origin = match &session_source.provenance {
                 ResourceProvenance::Local => None,
-                ResourceProvenance::Replica { origin_root, last_synced_at } => Some((origin_root, *last_synced_at)),
+                ResourceProvenance::Replica { origin_root, .. } => Some(origin_root),
             };
             let labels = &session.metadata.labels;
             let convoy = labels.get(CONVOY_LABEL).cloned().unwrap_or_else(|| "-".to_string());
@@ -269,18 +350,25 @@ impl FleetService {
                 Some(task) => format!("{task}/{role}"),
                 None => role.clone(),
             };
-            let attention = crew_attention(session.status.as_ref(), now);
+            let origin = remote_origin.map(NodeId::as_str);
+            let launch = flotilla_resources::terminal_records::launch_of(&session);
+            let agent = match launch.map(|launch| lifecycles.agent_sessions().and_then(|reads| reads.read(launch, origin))).transpose() {
+                Ok(agent) => agent.flatten(),
+                Err(error) => {
+                    debug!(session = %session.metadata.name, %error, "fleet row shows no agent activity");
+                    None
+                }
+            };
+            let attention = crew_attention(session.status.as_ref(), agent.as_ref());
             let convoy_key = (session.metadata.namespace.clone(), convoy.clone());
-            let host = if let Some((origin_root, _)) = remote_origin {
+            let host = if let Some(origin_root) = remote_origin {
                 // The origin may arrive before its host summary. Wait for the mapping instead of exposing a phantom host.
                 let Some(host) = host_registry.host_name_for_node(origin_root).await else {
                     debug!(origin = %origin_root, session = %session.metadata.name, "omitting fleet row until host origin is mapped");
                     continue;
                 };
                 host
-            } else if let Some(host_ref) =
-                environment_map.get(&session.spec.env_ref).and_then(|environment| resource_environment_host_ref(environment))
-            {
+            } else if let Some(host_ref) = environment_map.get(&session.spec.env_ref).map(String::as_str) {
                 canonical_placement_host_ref_from_sources(&host_sources.items, host_ref).ok().flatten().map_or_else(
                     || {
                         if self.canonical_local_host_id.clone().is_some_and(|local| local.as_str() == host_ref) {
@@ -309,8 +397,7 @@ impl FleetService {
                     .namespace(session.metadata.namespace.clone())
                     .session(session.metadata.name.clone())
                     .staleness(match remote_origin {
-                        Some((_, last_sync)) if !replica_sync_is_fresh(last_sync, now) => FleetStaleness::Stale { last_sync },
-                        Some((_, last_sync)) => FleetStaleness::Fresh { last_sync },
+                        Some(origin_root) => followed_staleness(streams.get(origin_root).and_then(|stream| stream.followed_at), now),
                         None => FleetStaleness::Local,
                     })
                     .build(),
@@ -337,17 +424,13 @@ impl FleetService {
             }
         }
         {
-            let reports = replicated_host_reports(&host_sources.items, host_registry, &HashMap::new()).await;
+            let reports = replicated_host_reports(&host_sources.items, host_registry, &HashMap::new(), &streams).await;
             for row in &mut rows {
                 if row.host == self.host_name || !matches!(row.staleness, FleetStaleness::Local) {
                     continue;
                 }
-                if let Some(last_sync) = reports.get(&row.host).map(|report| report.last_synced_at) {
-                    row.staleness = if !replica_sync_is_fresh(last_sync, now) {
-                        FleetStaleness::Stale { last_sync }
-                    } else {
-                        FleetStaleness::Fresh { last_sync }
-                    };
+                if let Some(report) = reports.get(&row.host) {
+                    row.staleness = followed_staleness(report.followed_at, now);
                 }
             }
         }
@@ -472,9 +555,12 @@ pub struct ResourceReplicationFailure {
 }
 
 fn convoy_state_label(row: &ConvoyRow) -> String {
+    let Some(phase) = row.phase else {
+        return format!("unreadable: {}", row.unreadable.as_deref().unwrap_or("no reason recorded"));
+    };
     match row.message.as_deref().filter(|message| !message.trim().is_empty()) {
-        Some(message) => format!("{}: {message}", row.phase),
-        None => row.phase.to_string(),
+        Some(message) => format!("{phase}: {message}"),
+        None => phase.to_string(),
     }
 }
 
@@ -495,7 +581,7 @@ fn append_crewless_convoy_rows(
             if !convoys_with_crew.insert(row.resource.name.clone()) {
                 continue;
             }
-            let display = row.project_ref.as_ref().map_or_else(|| row.name.clone(), |project| format!("{} @ {project}", row.name));
+            let display = format!("{} @ {}", row.name, row.project_ref);
             rows.push(
                 FleetListRow::builder()
                     .convoy(display)
@@ -516,50 +602,49 @@ fn append_crewless_convoy_rows(
     }
 }
 
-pub(crate) fn resource_environment_host_ref(environment: &flotilla_resources::ResourceObject<ResourceEnvironment>) -> Option<&str> {
-    environment
-        .spec
-        .host_direct
-        .as_ref()
-        .map(|spec| spec.host_ref.as_str())
-        .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
+pub(crate) fn environment_host_ref(spec: &flotilla_resources::EnvironmentSpec) -> Option<&str> {
+    spec.host_direct.as_ref().map(|spec| spec.host_ref.as_str()).or_else(|| spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
+}
+
+/// The host each of `names` runs on, for those the engine holds and that run on a host.
+pub(crate) fn environment_hosts<'a>(
+    lifecycles: &dyn crate::ports::LifecycleReads,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<HashMap<String, String>, String> {
+    let names = names.into_iter().collect::<std::collections::BTreeSet<_>>();
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let environments = lifecycles.environments()?;
+    let mut hosts = HashMap::new();
+    for name in names {
+        if let Some(host) = environments.find(name)?.as_ref().and_then(|environment| environment_host_ref(&environment.spec)) {
+            hosts.insert(name.to_owned(), host.to_owned());
+        }
+    }
+    Ok(hosts)
 }
 
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::{ConvoyPhase, CrewAttention, ResourceRef};
-    use flotilla_resources::{TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSessionStatus};
+    use flotilla_resources::TerminalSessionStatus;
 
     use super::*;
 
+    // A held turn shows the crew as unconfirmed whether or not its agent has reported; a
+    // stopped session shows none.
     #[test]
     fn crew_attention_keeps_monitoring_distinct_from_lifecycle_state() {
         let now = Utc::now();
-        let mut status = TerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            attention: Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Screen }),
-            ..Default::default()
-        };
+        let mut status = TerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() };
+        assert_eq!(crew_attention(Some(&status), None), None);
 
-        assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::Idle));
-
-        status.degraded = Some(flotilla_resources::TerminalSessionDegradedCondition {
-            reason: "DeliveryUnconfirmed".to_string(),
-            message: "composer retained delivery".to_string(),
-            message_id: Some("handoff-1".to_string()),
-            consecutive_failures: 1,
-            observed_at: now,
-        });
-        assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::DeliveryUnconfirmed));
-        status.degraded.as_mut().expect("condition").reason = "DeliveryNotSubmitted".into();
-        assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::DeliveryUnconfirmed));
-        status.degraded = None;
-
-        status.attention.as_mut().expect("attention").as_of = now - TerminalAttention::FRESH_FOR;
-        assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::Unobservable));
+        status.delivery_unconfirmed_since = Some(now);
+        assert_eq!(crew_attention(Some(&status), None), Some(CrewAttention::DeliveryUnconfirmed));
 
         status.phase = ResourceTerminalSessionPhase::Stopped;
-        assert_eq!(crew_attention(Some(&status), now), None);
+        assert_eq!(crew_attention(Some(&status), None), None);
     }
 
     #[test]
@@ -570,6 +655,7 @@ mod tests {
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy").on_host(remote.clone()))
             .name("convoy".to_string())
             .workflow_ref("workflow".to_string())
+            .project_ref("flotilla".to_string())
             .landing_reason("landed: coder complete (#2973) after merged-unclaimed")
             .phase(ConvoyPhase::Landed)
             .build();
@@ -581,6 +667,22 @@ mod tests {
         assert_eq!(merged_rows[0].host, remote);
         // The retained convoy row carries its trigger after the crew is gone.
         assert_eq!(merged_rows[0].landing_reason.as_deref(), Some("landed: coder complete (#2973) after merged-unclaimed"));
+    }
+
+    #[test]
+    fn an_unreadable_crewless_convoy_reads_as_unreadable_not_pending() {
+        let convoy = ConvoyRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy"))
+            .name("convoy".to_string())
+            .workflow_ref("workflow".to_string())
+            .project_ref("flotilla".to_string())
+            .unreadable("admission document does not decode")
+            .build();
+        let result_sets = vec![ResultSet { seq: 1, rows: Rows::Convoys { scope: None, rows: vec![convoy] }, state: Default::default() }];
+
+        let mut merged_rows = Vec::new();
+        append_crewless_convoy_rows(&mut merged_rows, "flotilla", &result_sets, &HostName::new("local"), FleetStaleness::Local);
+        assert_eq!(merged_rows[0].crew_state, "unreadable: admission document does not decode");
     }
 
     #[test]

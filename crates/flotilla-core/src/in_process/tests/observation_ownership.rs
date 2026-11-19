@@ -1,4 +1,4 @@
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -11,7 +11,6 @@ use flotilla_protocol::HostName;
 use flotilla_resources::{
     ConvoyRepositorySpec, Host as ResourceHost, HostSpec, HostStatus, Project, ProjectSpec, Repository, RepositorySpec,
 };
-use flotilla_store::ResourceBackend;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::{test_meta, SuspendedBoardProvider};
@@ -59,7 +58,6 @@ impl ChangeRequestTracker for CountingForgeRequests {
 
 #[tokio::test]
 async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
-    use flotilla_resources::Resource;
     let mut temps = Vec::new();
     let mut daemons = Vec::new();
     let mut providers = Vec::new();
@@ -80,15 +78,23 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
                 FakeDiscoveryProviders::default().with_issue_tracker(provider.clone()).with_change_request(requests.clone()),
             ),
             HostName::new(name),
-            ResourceBackend::new(InMemoryBackend::default()),
+            engine_home_backend(),
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
+        super::test_engine(&daemon);
         temps.push(temp);
         daemons.push(daemon);
         providers.push(provider);
         request_providers.push(requests);
     }
+    // The decided store keeps no creation time, so two homes declaring one source elect the
+    // lexically first: order the daemons by home, so daemon 0 is the preferred observer.
+    let mut order: Vec<usize> = (0..daemons.len()).collect();
+    order.sort_by_key(|index| daemons[*index].node_id().clone());
+    let daemons: Vec<_> = order.iter().map(|index| Arc::clone(&daemons[*index])).collect();
+    let providers: Vec<_> = order.iter().map(|index| Arc::clone(&providers[*index])).collect();
+    let request_providers: Vec<_> = order.iter().map(|index| Arc::clone(&request_providers[*index])).collect();
     let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "org/shared".into() };
     let project = ProjectSpec::builder()
         .display_name("Shared".into())
@@ -99,24 +105,22 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         .build();
     daemons[0].resource_backend().using::<Project>("flotilla").create(&test_meta("shared"), &project).await.unwrap();
     daemons[1].resource_backend().using::<Project>("flotilla").create(&test_meta("also-shared"), &project).await.unwrap();
-    async fn replicate<T: Resource>(daemons: &[Arc<InProcessDaemon>]) {
+    // Each daemon's decided store reaches the others from its home, as its peers' logs would.
+    fn replicate(daemons: &[Arc<InProcessDaemon>]) {
         for source in daemons {
-            let backend = source.resource_backend();
-            let listed = backend.using::<T>("flotilla").list().await.unwrap();
             for target in daemons {
                 if Arc::ptr_eq(source, target) {
                     continue;
                 }
-                target
-                    .resource_backend()
-                    .replica_writer::<T>(backend.local_root().unwrap(), "flotilla")
-                    .replace(&listed, Utc::now())
-                    .await
-                    .unwrap();
+                flotilla_provisioning_testkit::replicate_home(
+                    &source.decided_store().unwrap(),
+                    source.node_id().as_str(),
+                    &target.decided_store().unwrap(),
+                );
             }
         }
     }
-    replicate::<Project>(&daemons).await;
+    replicate(&daemons);
     let repository = RepositorySpec::remote("https://github.com/org/shared").unwrap();
     daemons[0]
         .resource_backend()
@@ -124,7 +128,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         .create(&test_meta(&repository.key().to_string()), &repository)
         .await
         .unwrap();
-    replicate::<Repository>(&daemons).await;
+    replicate(&daemons);
     let subject = ChangeRequestKey::new(
         "flotilla",
         flotilla_resources::address::stored_change_request_address("github.com", "org/shared", 7, &[]).expect("address"),
@@ -134,7 +138,6 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         .iter()
         .map(|daemon| {
             flotilla_observation::change_request_observer::ChangeRequestRefresher::new(
-                "topology".into(),
                 daemon.resource_backend(),
                 daemon.resource_backend().local_root().unwrap().to_string(),
                 daemon.change_request_observation_source.clone(),
@@ -143,24 +146,17 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         })
         .collect::<Vec<_>>();
 
+    // Each daemon writes its own Host and heartbeats: only Hosts that have sent a
+    // heartbeat are observer candidates.
+    let heartbeat = || HostStatus { heartbeat_at: Some(Utc::now()), ..HostStatus::default() };
+    let own_hosts = daemons.iter().map(|daemon| daemon.local_host_id().unwrap().to_string()).collect::<Vec<_>>();
     for (index, daemon) in daemons.iter().enumerate() {
         let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
-        let host = hosts.create(&test_meta(&format!("host-{index}")), &HostSpec::default()).await.unwrap();
-        if index == 0 {
-            continue;
-        }
-        hosts
-            .update_status(
-                &host.metadata.name,
-                &host.metadata.resource_version,
-                &HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() },
-            )
-            .await
-            .unwrap();
+        let host = hosts.create(&test_meta(&own_hosts[index]), &HostSpec::default()).await.unwrap();
+        hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &heartbeat()).await.unwrap();
     }
-    replicate::<ResourceHost>(&daemons).await;
-    // A declared Host whose first heartbeat has not arrived is unknown, not
-    // positive unready evidence. Ready replicas must not steal its source.
+    replicate(&daemons);
+    // Every daemon names the preferred observer as the one owner.
     for daemon in &daemons {
         assert_eq!(
             flotilla_observation::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),
@@ -168,21 +164,14 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         );
     }
     let hosts = daemons[0].resource_backend().using::<ResourceHost>("flotilla");
-    let host = hosts.get("host-0").await.unwrap();
-    hosts
-        .update_status(
-            "host-0",
-            &host.metadata.resource_version,
-            &HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() },
-        )
-        .await
-        .unwrap();
-    replicate::<ResourceHost>(&daemons).await;
+    let host = hosts.get(&own_hosts[0]).await.unwrap();
+    hosts.update_status(&own_hosts[0], &host.metadata.resource_version, &heartbeat()).await.unwrap();
+    replicate(&daemons);
     for refresher in &refreshers {
         refresher.refresh_once(&subject).await.unwrap();
     }
     assert_eq!(request_providers.iter().map(|p| p.0.load(Ordering::SeqCst)).collect::<Vec<_>>(), vec![1, 0, 0]);
-    replicate::<flotilla_resources::ChangeRequest>(&daemons).await;
+    replicate(&daemons);
     for daemon in &daemons {
         let record = daemon
             .resource_backend()
@@ -228,15 +217,12 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         }
     }
     assert_eq!(providers.iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).collect::<Vec<_>>(), vec![3, 2, 2]);
-    let hosts = daemons[0].resource_backend().using::<ResourceHost>("flotilla");
-    let host = hosts.get("host-0").await.unwrap();
+    let host = hosts.get(&own_hosts[0]).await.unwrap();
     hosts
         .update_status(
-            "host-0",
+            &own_hosts[0],
             &host.metadata.resource_version,
             &HostStatus {
-                ready: true,
-                heartbeat_at: Some(Utc::now()),
                 conditions: vec![flotilla_resources::HostCondition::builder()
                     .condition_type("ForgeObservation")
                     .reason("Withdrawn")
@@ -247,12 +233,12 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
                     // Explicit withdrawal must work independently of placement readiness.
                     .blocks_forge_observation(true)
                     .build()],
-                ..Default::default()
+                ..heartbeat()
             },
         )
         .await
         .unwrap();
-    replicate::<ResourceHost>(&daemons).await;
+    replicate(&daemons);
     let expected = daemons[1..].iter().map(|daemon| daemon.resource_backend().local_root().unwrap()).min().unwrap();
     for daemon in &daemons {
         assert_eq!(
@@ -267,16 +253,9 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     assert_eq!(request_providers[1..].iter().map(|p| p.0.load(Ordering::SeqCst)).sum::<usize>(), 1);
 
     // Recovery restores the preferred observer; the fallback stops polling.
-    let host = hosts.get("host-0").await.unwrap();
-    hosts
-        .update_status(
-            "host-0",
-            &host.metadata.resource_version,
-            &HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() },
-        )
-        .await
-        .unwrap();
-    replicate::<ResourceHost>(&daemons).await;
+    let host = hosts.get(&own_hosts[0]).await.unwrap();
+    hosts.update_status(&own_hosts[0], &host.metadata.resource_version, &heartbeat()).await.unwrap();
+    replicate(&daemons);
     for daemon in &daemons {
         assert_eq!(
             flotilla_observation::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),

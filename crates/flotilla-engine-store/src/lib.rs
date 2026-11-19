@@ -8,19 +8,20 @@
 pub mod archive;
 pub mod follow;
 pub mod plain;
+pub mod watch;
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use flotilla_schema::{
-    Cbor, ChangeItem, Event, Identity, Kind, KindRegistry, KindSpec, Labelled, NewChange, RegistryError, StateData, Timestamp,
+    Cbor, ChangeItem, CreatedAt, Event, Identity, Kind, KindRegistry, KindSpec, Labelled, NewChange, RegistryError, StateData, Timestamp,
 };
-use flotilla_schema_sqlite::{AboutCursor, Read, Stamp, Store, StoreError};
+use flotilla_schema_sqlite::{AboutCursor, ChangeId, Read, Stamp, Store, StoreError, StoreGuard, StoreHandle, Write};
 use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession,
         awaiting_reply::AwaitingReply,
         consumer::Consumer,
-        convoy, ensure,
+        convoy,
         message::{Message, ReceiptLog},
         person::Person,
         vessel,
@@ -49,6 +50,8 @@ pub fn machine_registry() -> Result<MachineRegistry, RegistryError> {
     register!(Message);
     register!(AgentSession);
     register!(Person);
+    // A service's receipts: first, each host's checkout inspector (#3108).
+    register!(flotilla_state_machines::machines::service::Service);
     register!(convoy::Convoy);
     register!(AwaitingReply);
     Ok(MachineRegistry { kinds, diagrams })
@@ -69,21 +72,25 @@ pub fn convoy_registry() -> Result<KindRegistry, RegistryError> {
     Ok(kinds)
 }
 
-/// Registers the engine's crew kinds the `[primitives]` switch moves (#3629 layer 6): Vessel,
-/// the placement lease, and Ensure, each under its production code.
+/// Drops the tables of fields the engine no longer stores, with their readable views, from a
+/// store the previous generation wrote (ADR 0047 N→N+1): the Convoy's quota (#3108), which
+/// admission always granted empty and nothing reads. Opening ignores a table no kind declares,
+/// so this only discards the retired rows. Run it before the store opens. Remove it one fleet
+/// roll after the quota's removal ships, once no store holds the table.
+pub fn drop_retired_tables(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
+    connection.execute_batch("DROP VIEW IF EXISTS \"convoy_quota_view\";\nDROP TABLE IF EXISTS \"convoy_quota\";")
+}
+
+/// Registers the engine's crew kind the `[primitives]` switch moves (#3629 layer 6): Vessel, the
+/// placement lease, under its production code.
 pub fn register_crew(kinds: &mut KindRegistry) -> Result<(), RegistryError> {
     kinds.register::<Resource<vessel::Vessel>>()?;
-    kinds.register::<Resource<ensure::Ensure>>()?;
     Ok(())
 }
 
 /// The machine diagram of each kind [`register_crew`] registers, by kind name.
 pub fn crew_diagrams() -> std::collections::BTreeMap<String, String> {
-    [
-        (Resource::<vessel::Vessel>::KIND.to_owned(), vessel::Vessel::definition().mermaid(flotilla_state_machines::Diagram::Full)),
-        (Resource::<ensure::Ensure>::KIND.to_owned(), ensure::Ensure::definition().mermaid(flotilla_state_machines::Diagram::Full)),
-    ]
-    .into()
+    [(Resource::<vessel::Vessel>::KIND.to_owned(), vessel::Vessel::definition().mermaid(flotilla_state_machines::Diagram::Full))].into()
 }
 
 fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
@@ -95,8 +102,8 @@ fn refused(error: impl std::error::Error + Send + Sync + 'static) -> LogError {
 // IDs; a partially promoted commit leaves valid entries or cache misses. Reads
 // cache only committed IDs, and identity removal only invalidates cache entries.
 // No resource state is cached in Store, so there is nothing to rebuild here.
-// Recover as the provisioning and Ensure home wrappers do above this log.
-fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
+// Recover as the provisioning home wrappers do above this log.
+fn lock_store(store: &StoreHandle) -> StoreGuard<'_> {
     store.lock().unwrap_or_else(|poisoned| {
         let store = poisoned.into_inner();
         tracing::warn!(home = store.home(), "recovering poisoned decided-store lock");
@@ -109,14 +116,14 @@ fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
 /// and the Message it names commit to one store and home.
 #[derive(Clone)]
 pub struct StoreLog {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreHandle>,
     home: String,
     receipts: ReceiptLog,
 }
 
 impl StoreLog {
-    /// A log homed at the store's own home, accepting AgentSession and Person receipts.
-    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+    /// A log homed at the store's own home, accepting AgentSession, Person and Service receipts.
+    pub fn new(store: Arc<StoreHandle>) -> Self {
         let home = lock_store(&store).home().to_owned();
         Self { store, home, receipts: ReceiptLog::new() }
     }
@@ -131,7 +138,7 @@ impl StoreLog {
         self
     }
 
-    pub fn store(&self) -> &Arc<Mutex<Store>> {
+    pub fn store(&self) -> &Arc<StoreHandle> {
         &self.store
     }
 
@@ -165,9 +172,21 @@ where
     Resource<M>: Kind,
     StoreLog: Log<M>,
 {
-    let home = log.home().to_owned();
+    let store = log.clone();
+    open_home_with(&store, log)
+}
+
+/// [`open_home`] writing through `log`, a log built over `store` for a kind whose writes take
+/// more than the store log's (an Environment's Realise and its launch's facts).
+pub fn open_home_with<M, L>(store: &StoreLog, log: L) -> Result<flotilla_state_machines::Home<M, L>, String>
+where
+    M: Machine,
+    Resource<M>: Kind,
+    L: Log<M>,
+{
+    let home = store.home().to_owned();
     let stored = {
-        let mut store = lock_store(log.store());
+        let mut store = lock_store(store.store());
         let mut read = store.read().map_err(|error| error.to_string())?;
         let mut stored = Vec::new();
         let mut after = None;
@@ -227,10 +246,20 @@ pub trait ImportTarget {
     /// Whether records homed at `home` are written here.
     fn imports(&self, home: &str) -> bool;
 
-    /// Writes the value `make` builds as `name` at `home`, as part of `change`, reads it back and
-    /// compares; the value written, or the reason it was refused or read back differently. `make`
-    /// is given the version the value is written at: `version` in a rehearsal, which restores, and
-    /// the home sequence its create takes in an import.
+    /// Writes the value `make` builds, under the name it gives, at `home`, as part of `change`,
+    /// reads it back and compares; the name and value written, or the reason it was refused or
+    /// read back differently. `make` is given the version the value is written at: `version` in
+    /// a rehearsal, which restores, and the home sequence its create takes in an import, which
+    /// also numbers a launch ([`flotilla_state_machines::launch_name`]).
+    fn write_named_with<K: Kind + PartialEq>(
+        &mut self,
+        home: &str,
+        change: &NewChange,
+        version: u64,
+        make: impl FnOnce(u64) -> (String, K),
+    ) -> Result<(String, K), String>;
+
+    /// [`Self::write_named_with`] under `name`, whatever the version.
     fn write_with<K: Kind + PartialEq>(
         &mut self,
         home: &str,
@@ -238,7 +267,9 @@ pub trait ImportTarget {
         change: &NewChange,
         version: u64,
         make: impl FnOnce(u64) -> K,
-    ) -> Result<K, String>;
+    ) -> Result<K, String> {
+        self.write_named_with(home, change, version, |version| (name.to_owned(), make(version))).map(|(_, value)| value)
+    }
 
     /// [`Self::write_with`] for a value written whatever its version (version 1 in a rehearsal).
     fn write<K: Kind + PartialEq + Clone>(&mut self, home: &str, name: &str, change: &NewChange, value: &K) -> Result<(), String> {
@@ -247,6 +278,26 @@ pub trait ImportTarget {
 
     /// Whether a live `K` named `name` at `home` was written: a reference's target, say.
     fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String>;
+
+    /// Raises `home`'s sequence to at least `n` by empty changes made as `change`, as reservations
+    /// never created leave it: a launch reserved there afterwards is numbered above `n`. A target
+    /// that numbers nothing raises nothing.
+    fn raise_launches(&mut self, home: &str, n: u64, change: &NewChange) -> Result<(), String> {
+        let _ = (home, n, change);
+        Ok(())
+    }
+
+    /// [`Self::write_named_with`] for launch number `n`, the number the import gives it: `make`
+    /// names the launch `n` and is given the version its create takes.
+    fn write_launch<K: Kind + PartialEq>(
+        &mut self,
+        home: &str,
+        change: &NewChange,
+        n: u64,
+        make: impl FnOnce(u64) -> (String, K),
+    ) -> Result<(String, K), String> {
+        self.write_named_with(home, change, n, make)
+    }
 }
 
 fn read_back<K: Kind + PartialEq>(store: &mut Store, home: &str, name: &str, value: &K) -> Result<(), String> {
@@ -281,12 +332,33 @@ impl Rehearsal {
     /// Restores `value` as `name` at `home` and `version`, reads it back and compares; the reason
     /// it was refused, or read back differently, otherwise.
     pub fn restore<K: Kind + PartialEq>(&mut self, home: &str, name: &str, version: u64, value: &K) -> Result<(), String> {
+        self.restore_created(home, name, version, value, None)
+    }
+
+    /// [`Self::restore`] at the creation time `created`, as a replica installs the home's snapshot.
+    fn restore_created<K: Kind + PartialEq>(
+        &mut self,
+        home: &str,
+        name: &str,
+        version: u64,
+        value: &K,
+        created: Option<CreatedAt>,
+    ) -> Result<(), String> {
         use flotilla_schema::Encoder;
         if home == REHEARSAL_HOME {
             return Err(format!("homed at `{REHEARSAL_HOME}`, the rehearsal's own home"));
         }
         let rows = Encoder::encode(value).map_err(|error| error.to_string())?;
-        let snapshot = flotilla_schema_sqlite::Snapshot { kind: K::CODE, name: name.to_owned(), home: home.to_owned(), version, rows };
+        let snapshot = flotilla_schema_sqlite::Snapshot {
+            kind: K::CODE,
+            name: name.to_owned(),
+            home: home.to_owned(),
+            version,
+            rows,
+            cause: None,
+            created_at: created,
+            entries: Vec::new(),
+        };
         let mut write = self.store.write().map_err(|error| error.to_string())?;
         write.restore(&snapshot).map_err(|error| error.to_string())?;
         write.commit().map_err(|error| error.to_string())?;
@@ -299,17 +371,18 @@ impl ImportTarget for Rehearsal {
         home != REHEARSAL_HOME
     }
 
-    fn write_with<K: Kind + PartialEq>(
+    fn write_named_with<K: Kind + PartialEq>(
         &mut self,
         home: &str,
-        name: &str,
-        _: &NewChange,
+        change: &NewChange,
         version: u64,
-        make: impl FnOnce(u64) -> K,
-    ) -> Result<K, String> {
-        let value = make(version);
-        self.restore(home, name, version, &value)?;
-        Ok(value)
+        make: impl FnOnce(u64) -> (String, K),
+    ) -> Result<(String, K), String> {
+        let (name, value) = make(version);
+        // The creation time an import's create would give it, on its home and every replica.
+        let created = change.created.unwrap_or_else(|| CreatedAt::from(change.at));
+        self.restore_created(home, &name, version, &value, Some(created))?;
+        Ok((name, value))
     }
 
     fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
@@ -319,9 +392,11 @@ impl ImportTarget for Rehearsal {
 
 /// The cut-over import's writes into an engine store: each record homed at the store's home is
 /// created through its change, as the write path creates one, so its log entry carries the
-/// change's time and replicates to peers like any other create.
+/// change's time and replicates to peers like any other create. A record's later edges (an
+/// imported convoy's end, its retirement) go through [`Import::log`], as a home writes them.
 pub struct Import {
-    store: Store,
+    store: Arc<StoreHandle>,
+    home: String,
 }
 
 impl Import {
@@ -329,48 +404,78 @@ impl Import {
     /// so that, once dropped, it is whole in that one file.
     pub fn create(path: &std::path::Path, home: &str, kinds: KindRegistry) -> Result<Self, String> {
         let connection = rusqlite::Connection::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
-        Ok(Self { store: Store::open(connection, home, kinds).map_err(|error| format!("open {}: {error}", path.display()))? })
+        Ok(Self::over(Store::open(connection, home, kinds).map_err(|error| format!("open {}: {error}", path.display()))?))
     }
 
     /// An engine store in memory over `kinds`, homed at `home`: a rehearsal of what an import there writes.
     pub fn in_memory(home: &str, kinds: KindRegistry) -> Result<Self, String> {
         let connection = rusqlite::Connection::open_in_memory().map_err(|error| error.to_string())?;
-        Ok(Self { store: Store::open(connection, home, kinds).map_err(|error| error.to_string())? })
+        Ok(Self::over(Store::open(connection, home, kinds).map_err(|error| error.to_string())?))
     }
 
-    pub fn store(&mut self) -> &mut Store {
-        &mut self.store
+    fn over(store: Store) -> Self {
+        let home = store.home().to_owned();
+        Self { store: Arc::new(StoreHandle::new(store)), home }
+    }
+
+    pub fn store(&self) -> StoreGuard<'_> {
+        lock_store(&self.store)
+    }
+
+    /// The store's log at its home: a home writing through it logs each edge under the change
+    /// its writer and the edge's time make.
+    pub fn log(&self) -> StoreLog {
+        StoreLog::new(Arc::clone(&self.store))
     }
 }
 
 impl ImportTarget for Import {
     fn imports(&self, home: &str) -> bool {
-        home == self.store.home()
+        home == self.home
     }
 
-    fn write_with<K: Kind + PartialEq>(
+    fn write_named_with<K: Kind + PartialEq>(
         &mut self,
         home: &str,
-        name: &str,
         change: &NewChange,
         _: u64,
-        make: impl FnOnce(u64) -> K,
-    ) -> Result<K, String> {
+        make: impl FnOnce(u64) -> (String, K),
+    ) -> Result<(String, K), String> {
         if !self.imports(home) {
             return Err(format!("homed at `{home}`, another home's to import"));
         }
-        let mut write = self.store.write().map_err(|error| error.to_string())?;
-        let change = write.open_change(change).map_err(|error| error.to_string())?;
+        let mut store = lock_store(&self.store);
+        let mut write = store.write().map_err(|error| error.to_string())?;
+        let opened = write.open_change(change).map_err(|error| error.to_string())?;
         let version = write.last_sequence(home).map_err(|error| error.to_string())? + 1;
-        let value = make(version).with_identity(name, version);
-        write.insert(name, &value, change).map_err(|error| error.to_string())?;
+        let (name, value) = make(version);
+        let value = value.with_identity(&name, version);
+        match change.created {
+            Some(created) => write.insert_created(&name, &value, opened, created),
+            None => write.insert(&name, &value, opened),
+        }
+        .map_err(|error| error.to_string())?;
         write.commit().map_err(|error| error.to_string())?;
-        read_back(&mut self.store, home, name, &value)?;
-        Ok(value)
+        read_back(&mut store, home, &name, &value)?;
+        Ok((name, value))
     }
 
     fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
-        holds::<K>(&mut self.store, name, home)
+        holds::<K>(&mut lock_store(&self.store), name, home)
+    }
+
+    /// Empty changes, each taking the next home sequence as a reservation never created does,
+    /// until the home's sequence reaches `n`; all in one transaction.
+    fn raise_launches(&mut self, home: &str, n: u64, change: &NewChange) -> Result<(), String> {
+        if !self.imports(home) {
+            return Err(format!("homed at `{home}`, another home's to import"));
+        }
+        let mut store = lock_store(&self.store);
+        let mut write = store.write().map_err(|error| error.to_string())?;
+        while write.last_sequence(home).map_err(|error| error.to_string())? < n {
+            write.open_change(change).map_err(|error| error.to_string())?;
+        }
+        write.commit().map_err(|error| error.to_string())
     }
 }
 
@@ -419,6 +524,51 @@ impl StoreLog {
         let items: Vec<ChangeItem> = reads.iter().filter_map(|_| None).collect();
         NewChange::new(writer, at).with_items(items)
     }
+
+    /// Creates `resource` under a change whose items are `items`: the records its requester read
+    /// to make it, each at the version read (#4024 ruling 1), such as a Checkout's holder Convoy.
+    /// A launch is numbered by the home sequence its create takes, in this transaction
+    /// ([`Resource::numbered`]); the resource as committed is returned.
+    pub fn create_with_items<M>(
+        &self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<M>,
+        items: Vec<ChangeItem>,
+    ) -> Result<Resource<M>, LogError>
+    where
+        M: Machine,
+        M::Spec: KindSpec<State = M::State>,
+        M::State: StateData + Labelled<Label = Label<M>>,
+        M::Write: StoredWrite<Resource<M>>,
+        EdgePayload<M::Edge>: Cbor,
+        M::Edge: Cbor,
+    {
+        self.insert_created(&NewChange::new(writer, at).with_items(items), resource)
+    }
+
+    fn insert_created<M>(&self, change: &NewChange, resource: Resource<M>) -> Result<Resource<M>, LogError>
+    where
+        M: Machine,
+        M::Spec: KindSpec<State = M::State>,
+        M::State: StateData + Labelled<Label = Label<M>>,
+        M::Write: StoredWrite<Resource<M>>,
+        EdgePayload<M::Edge>: Cbor,
+        M::Edge: Cbor,
+    {
+        let mut store = lock_store(&self.store);
+        let mut write = store.write().map_err(refused)?;
+        let change = write.open_change(change).map_err(refused)?;
+        // The insert below takes the next home sequence: the launch's number and its version.
+        let next = write.last_sequence(&self.home).map_err(refused)? + 1;
+        let resource = resource.numbered(next);
+        let stamp = write.insert(resource.name(), &resource, change).map_err(refused)?;
+        // The resource as committed: the insert stamps every records row with the create's
+        // version, so the home's copy must carry those stamps or it differs from what storage holds.
+        let stored = write.load::<Resource<M>>(stamp.id).map_err(refused)?.ok_or_else(|| LogError::new("created resource not found"))?;
+        write.commit().map_err(refused)?;
+        Ok(stored.value)
+    }
 }
 
 impl<M> Log<M> for StoreLog
@@ -431,14 +581,61 @@ where
     M::Edge: Cbor,
 {
     fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<M>, reads: &[InputRead]) -> Result<Version, LogError> {
+        if M::launch(resource.spec()).is_some() {
+            return Err(LogError::new("a launch is created through Log::create_resource, which numbers it"));
+        }
+        let change = self.change(writer, at, reads);
+        Ok(self.insert_created(&change, resource.clone())?.version())
+    }
+
+    fn create_resource(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<M>,
+        reads: &[InputRead],
+    ) -> Result<Resource<M>, LogError> {
+        let change = self.change(writer, at, reads);
+        self.insert_created(&change, resource)
+    }
+
+    /// An empty change: it takes the next home sequence, and replicas receive it as a change
+    /// with no entries, so the home's prefix stays whole.
+    fn reserve(&mut self, writer: &str, at: Timestamp) -> Result<u64, LogError> {
+        let mut store = lock_store(&self.store);
+        let mut write = store.write().map_err(refused)?;
+        let change = write.open_change(&NewChange::new(writer, at)).map_err(refused)?;
+        write.commit().map_err(refused)?;
+        Ok(change.0)
+    }
+
+    /// Refuses a number that is not an empty change at this home: one never given, or given to
+    /// another write.
+    fn create_reserved(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<M>,
+        n: u64,
+        reads: &[InputRead],
+    ) -> Result<Resource<M>, LogError> {
         let change = self.change(writer, at, reads);
         let mut store = lock_store(&self.store);
         let mut write = store.write().map_err(refused)?;
+        let reserved = n > 0
+            && write.change(&self.home, n).map_err(refused)?.is_some()
+            && write.changes_since(&self.home, n - 1, 1).map_err(refused)?.first().is_none_or(|entry| entry.home_seq != n);
+        if !reserved {
+            return Err(LogError::new(format!("launch number {n} is not a reservation at {}", self.home)));
+        }
         let change = write.open_change(&change).map_err(refused)?;
-        let stamp = write.insert(resource.name(), resource, change).map_err(refused)?;
+        let resource = resource.numbered(n);
+        let stamp = write.insert(resource.name(), &resource, change).map_err(refused)?;
+        let stored = write.load::<Resource<M>>(stamp.id).map_err(refused)?.ok_or_else(|| LogError::new("created resource not found"))?;
         write.commit().map_err(refused)?;
-        Ok(Version(stamp.version))
+        Ok(stored.value)
     }
+
     fn edge(&mut self, writer: &str, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
         self.edge_with_writes(writer, previous, next, event, &[])
     }
@@ -451,6 +648,32 @@ where
         event: &EdgeEventOf<M>,
         writes: &[M::Write],
     ) -> Result<Version, LogError> {
+        self.edge_and(writer, previous, next, event, writes, |_, _| Ok(()))
+    }
+}
+
+impl StoreLog {
+    /// [`Log::edge_with_writes`], with `also` writing other records in the edge's own
+    /// transaction and change: they commit with the edge or not at all. A log for a kind whose
+    /// edge creates a record beside it (an Environment's Realise and its launch's facts) is built
+    /// on this.
+    pub fn edge_and<M>(
+        &mut self,
+        writer: &str,
+        previous: &StoredState<M>,
+        next: &Resource<M>,
+        event: &EdgeEventOf<M>,
+        writes: &[M::Write],
+        also: impl FnOnce(&mut Write<'_>, ChangeId) -> Result<(), StoreError>,
+    ) -> Result<Version, LogError>
+    where
+        M: Machine,
+        M::Spec: KindSpec<State = M::State>,
+        M::State: StateData + Labelled<Label = Label<M>>,
+        M::Write: StoredWrite<Resource<M>>,
+        EdgePayload<M::Edge>: Cbor,
+        M::Edge: Cbor,
+    {
         // An edge's master is a Message homed beside its consumer (ADR 0064).
         let master = |name: &str| Identity { kind: Resource::<Message>::CODE, name: name.to_owned(), home: self.home.clone() };
         let edge = next.stored_edge_about(previous, event, master).map_err(refused)?;
@@ -461,6 +684,7 @@ where
             write.resolve(Resource::<M>::CODE, next.name(), &self.home).map_err(refused)?.ok_or_else(|| LogError::new("not stored"))?;
         let change = write.open_change(&self.change(writer, event.at, &event.arguments.reads)).map_err(refused)?;
         let stamp = write.apply_edge(Stamp { id, version: next.version().0 }, edge, change).map_err(refused)?;
+        also(&mut write, change).map_err(refused)?;
         write.commit().map_err(refused)?;
         Ok(Version(stamp.version))
     }
@@ -481,7 +705,7 @@ impl std::ops::Deref for MessageLog {
 }
 
 impl MessageLog {
-    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+    pub fn new(store: Arc<StoreHandle>) -> Self {
         Self { inner: StoreLog::new(store) }
     }
 

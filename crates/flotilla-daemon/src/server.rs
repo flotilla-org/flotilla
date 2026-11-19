@@ -1,4 +1,3 @@
-use flotilla_store_sqlite::SqliteBackend;
 mod caller;
 pub mod change_stream;
 mod client_connection;
@@ -9,7 +8,6 @@ mod http;
 mod peer_connection;
 pub mod peer_runtime;
 pub mod remote_commands;
-mod replication;
 mod request_dispatch;
 mod shared;
 mod tables;
@@ -36,7 +34,10 @@ use flotilla_protocol::{
     ConfigLabel, ConnectionRole, EnvironmentId, GoodbyeReason, HostName, Message, NodeId, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,
 };
 
-use flotilla_store::ResourceBackend;
+use flotilla_store::{
+    load_metrics::{attributed, caller as reads_caller},
+    ResourceBackend,
+};
 use flotilla_transport::message::{unix_message_session_with_prefix, MessageSession};
 use tokio::{
     net::UnixListener,
@@ -55,7 +56,7 @@ use self::{
 };
 use crate::{
     peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport, SshTransportPaths},
-    startup::{phase, result_phase, retry_phase},
+    startup::{phase, result_phase},
     DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH,
 };
 
@@ -181,13 +182,13 @@ pub(crate) struct PeerConnectedNotice {
 
 /// Lifecycle event sent from connection sites to the outbound task.
 ///
-/// `Connected` drives outbound state sync and starts resource replicators
-/// for the peer's generation. `Disconnected` is sent only from a
+/// `Connected` drives outbound state sync and starts following the peer's
+/// change stream for its generation. `Disconnected` is sent only from a
 /// connection-owning task that has no retry loop of its own (inbound
 /// `PeerConnection::run`, or the outbound per-target task's terminal
 /// shutdown branch) — never from a transient, still-retrying disconnect —
-/// so the outbound task can cancel and drop that peer's resource
-/// replicators. The generation is checked against the currently tracked
+/// so the outbound task can cancel and drop that peer's change-stream
+/// follower. The generation is checked against the currently tracked
 /// generation before acting, so a stale/displaced connection's belated
 /// teardown can't cancel a newer, already-reconnected generation.
 #[visibility::make(pub)]
@@ -237,9 +238,7 @@ fn build_peer_manager(
             daemon.session_id(),
             Arc::clone(&command_runner),
             SshTransportPaths { state_dir: config.state_dir().as_path(), daemon_socket: local_daemon_socket_path },
-        )
-        .map(|transport| transport.with_local_primitives(daemon.primitives_switch()))
-        {
+        ) {
             Ok(transport) => {
                 peer_manager.add_configured_target(ConfigLabel(name), expected_host_name, expected_node_id, Box::new(transport));
             }
@@ -254,22 +253,11 @@ fn build_peer_manager(
     Ok(Arc::new(Mutex::new(peer_manager)))
 }
 
-async fn build_embedded_resource_backend(
-    config: &ConfigStore,
-) -> Result<(ResourceBackend, Arc<flotilla_store::load_metrics::StoreLoadMetrics>), String> {
-    let path = config.state_dir().as_path().join("resources.sqlite");
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|err| format!("create embedded resource store directory {}: {err}", parent.display()))?;
-    }
-    SqliteBackend::open_async(&path)
-        .await
-        .map(|store| {
-            let metrics = store.load_metrics();
-            (ResourceBackend::new(store), metrics)
-        })
-        .map_err(|err| format!("open embedded resource store {}: {err}", path.display()))
+/// The resource API's backend, the engine's home: the engine holds every registered kind, so
+/// its store holds nothing and is not durable. The old `resources.sqlite` is never opened here;
+/// only the first start's import reads it, read-only.
+fn build_embedded_resource_backend() -> ResourceBackend {
+    flotilla_store_memory::engine_home_backend()
 }
 
 pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &ConfigStore) -> Result<tokio::task::JoinHandle<()>, String> {
@@ -284,10 +272,6 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
     }
     let (inbound_peer_tx, inbound_peer_rx) = mpsc::channel(256);
     let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
-    {
-        let router = remote_command_router.clone();
-        tokio::spawn(async move { router.resume_pending_crew_completions().await });
-    }
     let (handle, _peer_connected_tx) = spawn_peer_networking_runtime(
         daemon,
         peer_manager,
@@ -387,60 +371,72 @@ impl Drop for ClientActivityLease {
     }
 }
 
-impl DaemonServer {
-    pub fn environment_socket_service(&self) -> environment_sockets::EnvironmentSocketService {
-        let daemon = self.daemon.clone();
-        let router = self.remote_command_router.clone();
-        let client_count = self.client_count.clone();
-        let client_notify = self.client_notify.clone();
-        let shutdown = self.shutdown_rx.clone();
-        let http_router = self.http_router.clone();
-        let directory = flotilla_protocol::DaemonHostPath::new(self.socket_path.with_extension("env"));
-        environment_sockets::EnvironmentSocketService::new(
-            self.environment_sockets.clone(),
+/// What every connection to an environment socket is served with: the framed crew transport
+/// and the HTTP router, with the same caller rules, client-activity lease and shutdown. The
+/// daemon server owns one; a harness that composes a daemon without its main socket builds one
+/// for the environment sockets alone.
+#[derive(Clone)]
+pub struct EnvironmentFrontDoor {
+    daemon: Arc<InProcessDaemon>,
+    router: RemoteCommandRouter,
+    http_router: axum::Router,
+    client_count: Arc<AtomicUsize>,
+    client_notify: Arc<Notify>,
+    shutdown: watch::Receiver<bool>,
+    sockets: Arc<tokio::sync::Mutex<EnvironmentSocketRegistry>>,
+    directory: flotilla_protocol::DaemonHostPath,
+}
+
+impl EnvironmentFrontDoor {
+    /// A front door for `daemon` alone, whose sockets live under `directory`: its HTTP router
+    /// serves the hook routes with `hooks`, and its commands have no peers to route to.
+    pub fn for_daemon(
+        daemon: &Arc<InProcessDaemon>,
+        hooks: HookEndpoint,
+        directory: flotilla_protocol::DaemonHostPath,
+        shutdown: watch::Receiver<bool>,
+    ) -> Self {
+        let peer_manager = Arc::new(Mutex::new(PeerManager::new(daemon.node_id().clone())));
+        let router = build_remote_command_router(daemon, &peer_manager);
+        let logins = Arc::new(http::LoginStore::new(daemon.clock_for_scenarios()));
+        let http_router =
+            http::HttpRouter::for_daemon(Arc::clone(daemon), logins, http::ListenerOrigin::default()).with_hooks(hooks).into_router();
+        Self {
+            daemon: Arc::clone(daemon),
+            router,
+            http_router,
+            client_count: Arc::new(AtomicUsize::new(0)),
+            client_notify: Arc::new(Notify::new()),
+            shutdown,
+            sockets: Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
             directory,
+        }
+    }
+
+    pub fn install_blob_store(&self, store: Arc<crate::blob_store::TieredBlobStore>) -> Result<(), String> {
+        self.router.install_blob_store(store)
+    }
+
+    /// What reads made while serving an environment socket's connection count for: the crew
+    /// transport's identity checks and requests, and hook posts' caller resolution.
+    const ENVIRONMENT_CONNECTIONS: &str = "environment connections";
+
+    pub fn socket_service(&self) -> environment_sockets::EnvironmentSocketService {
+        let front_door = self.clone();
+        environment_sockets::EnvironmentSocketService::new(
+            self.sockets.clone(),
+            self.directory.clone(),
             move |listener, environment, reach| {
-                let daemon = daemon.clone();
-                let router = router.clone();
-                let http_router = http_router.clone();
-                let client_count = client_count.clone();
-                let client_notify = client_notify.clone();
-                let mut shutdown = shutdown.clone();
+                let front_door = front_door.clone();
+                let mut shutdown = front_door.shutdown.clone();
                 tokio::spawn(async move {
                     let mut connections = JoinSet::new();
                     loop {
                         tokio::select! {
                             result = listener.accept() => match result {
                                 Ok((stream, _)) => {
-                                    let peer = caller::reach_evidence(reach, caller::socket_peer_credential(&stream));
-                                    let daemon = daemon.clone();
-                                    let router = router.clone();
-                                    let environment = environment.clone();
-                                    let shutdown = shutdown.clone();
-                                    let http_router = http_router.clone();
-                                    let lease = ClientActivityLease::acquire(client_count.clone(), client_notify.clone());
-                                    connections.spawn(async move {
-                                        let _lease = lease;
-                                        let mut stream = stream;
-                                        let Some(first_byte) = read_preface(&mut stream).await else { return };
-                                        if http::is_http_preface(first_byte) {
-                                            // The socket binds the caller to its environment, as the framed protocol does.
-                                            let bound = environment.clone();
-                                            let caller = move |kernel_peer| http::CallerAuth::Environment {
-                                                environment: bound,
-                                                peer: caller::reach_evidence(reach, Some(kernel_peer)),
-                                            };
-                                            let serving = http::serve_sniffed(stream, first_byte, http_router, caller, shutdown_signal(shutdown.clone()));
-                                            serve_until_drained(serving, shutdown, "environment socket").await;
-                                            return;
-                                        }
-                                        let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
-                                            Ok(claims) => Some(claims),
-                                            Err(error) => { warn!(%error, "environment peer evidence unavailable"); return; }
-                                        };
-                                        let session = unix_message_session_with_prefix(stream, vec![first_byte]);
-                                        environment_connection::serve(session, daemon, router, environment, claims, shutdown).await;
-                                    });
+                                    let serving = front_door.clone().serve(stream, environment.clone(), reach);
+                                    connections.spawn(attributed(reads_caller(Self::ENVIRONMENT_CONNECTIONS), serving));
                                 }
                                 Err(error) => { warn!(%error, "environment socket accept failed"); return; }
                             },
@@ -451,6 +447,52 @@ impl DaemonServer {
                 })
             },
         )
+    }
+
+    /// Serve one connection to `environment`'s socket: HTTP when its first byte starts a
+    /// request line, otherwise the framed crew transport.
+    async fn serve(self, mut stream: tokio::net::UnixStream, environment: EnvironmentId, reach: environment_sockets::SocketReach) {
+        let Self { daemon, router, http_router, client_count, client_notify, shutdown, .. } = self;
+        let _lease = ClientActivityLease::acquire(client_count, client_notify);
+        let peer = caller::reach_evidence(reach, caller::socket_peer_credential(&stream));
+        let Some(first_byte) = read_preface(&mut stream).await else { return };
+        if http::is_http_preface(first_byte) {
+            // The socket binds the caller to its environment, as the framed protocol does.
+            let caller =
+                move |kernel_peer| http::CallerAuth::Environment { environment, peer: caller::reach_evidence(reach, Some(kernel_peer)) };
+            let serving = http::serve_sniffed(stream, first_byte, http_router, caller, shutdown_signal(shutdown.clone()));
+            serve_until_drained(serving, shutdown, "environment socket").await;
+            return;
+        }
+        let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
+            Ok(claims) => Some(claims),
+            Err(error) => {
+                warn!(%error, "environment peer evidence unavailable");
+                return;
+            }
+        };
+        let session = unix_message_session_with_prefix(stream, vec![first_byte]);
+        environment_connection::serve(session, daemon, router, environment, claims, shutdown).await;
+    }
+}
+
+impl DaemonServer {
+    /// The environment sockets' front door, sharing this server's routers, client count and shutdown.
+    pub fn environment_front_door(&self) -> EnvironmentFrontDoor {
+        EnvironmentFrontDoor {
+            daemon: self.daemon.clone(),
+            router: self.remote_command_router.clone(),
+            http_router: self.http_router.clone(),
+            client_count: self.client_count.clone(),
+            client_notify: self.client_notify.clone(),
+            shutdown: self.shutdown_rx.clone(),
+            sockets: self.environment_sockets.clone(),
+            directory: flotilla_protocol::DaemonHostPath::new(self.socket_path.with_extension("env")),
+        }
+    }
+
+    pub fn environment_socket_service(&self) -> environment_sockets::EnvironmentSocketService {
+        self.environment_front_door().socket_service()
     }
 
     /// Attach the runtime registry before serving; controller families are absent until installed.
@@ -505,23 +547,24 @@ impl DaemonServer {
         idle_timeout: Duration,
     ) -> Result<Self, String> {
         let daemon_config = config.load_daemon_config()?;
-        let primitives_on = daemon_config.primitives()?.is_some();
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
-        let (resource_backend, store_metrics) = retry_phase("open_resource_backend", || build_embedded_resource_backend(&config)).await?;
-        let load_metrics = Arc::new(http::metrics::LoadMetrics::new(store_metrics));
+        let resource_backend = build_embedded_resource_backend();
+        let load_metrics = Arc::new(http::metrics::LoadMetrics::default());
+        let engine = crate::runtime::engine_opener(&config);
         let daemon = phase(
             "initialize_in_process_daemon",
-            InProcessDaemon::new_with_resource_backend(
+            InProcessDaemon::new_composed(
                 repo_paths,
                 Arc::clone(&config),
                 discovery,
                 host_name.clone(),
                 resource_backend,
+                Arc::new(flotilla_resources::SystemClock),
                 std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+                engine,
             ),
         )
-        .await;
-        daemon.set_primitives_switch(primitives_on);
+        .await?;
         let peer_manager = build_peer_manager(&daemon, &config, &socket_path)?;
         phase("sync_peer_query_state", sync_peer_query_state(&peer_manager, &daemon)).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -684,11 +727,6 @@ impl DaemonServer {
         let remote_command_router = self.remote_command_router;
         let peer_resource_socket_dir = self.peer_resource_socket_dir;
         let http_router = self.http_router;
-
-        // This only reads local pending records and registers asynchronous retry
-        // workers. Keep the snapshot before admission so replay cannot replace a
-        // newer client retry with stale completion data.
-        phase("resume_pending_crew_completions", remote_command_router.resume_pending_crew_completions()).await;
 
         let idle_client_count = Arc::clone(&client_count);
         let idle_shutdown_request_tx = shutdown_request_tx.clone();
@@ -1039,6 +1077,16 @@ async fn handle_client_session(
     .await;
 }
 
+/// Serve one HTTP connection on `stream` as the main socket serves the operator's own process
+/// (`curl --unix-socket`): the same router, the caller trusted as the user. For harnesses that
+/// read the daemon's tables as an operator does.
+pub async fn serve_local_http(mut stream: tokio::net::UnixStream, daemon: Arc<InProcessDaemon>) -> std::io::Result<()> {
+    let Some(first_byte) = read_preface(&mut stream).await else { return Ok(()) };
+    let logins = Arc::new(http::LoginStore::new(daemon.clock_for_scenarios()));
+    let router = http::HttpRouter::for_daemon(daemon, logins, http::ListenerOrigin::default()).into_router();
+    http::serve_sniffed(stream, first_byte, router, |peer| http::CallerAuth::Socket(Some(peer)), std::future::pending()).await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_client_session_with_caller(
     session: MessageSession,
@@ -1132,7 +1180,7 @@ async fn handle_client_session_with_identity(
     match first_msg {
         // The main socket derives identity from kernel peer evidence; in-band
         // claims are honoured only by environment sockets.
-        Message::Hello { protocol_version, node_id, display_name, session_id, connection_role, surface, crew_claims: _, primitives } => {
+        Message::Hello { protocol_version, node_id, display_name, session_id, connection_role, surface, crew_claims: _ } => {
             if environment_context.is_some() {
                 warn!("peer/client hello on per-environment socket is unsupported");
                 return;
@@ -1187,7 +1235,6 @@ async fn handle_client_session_with_identity(
                         connection_role: Some(ConnectionRole::Client),
                         surface: None,
                         crew_claims: Default::default(),
-                        primitives: false,
                     })
                     .await
                     .is_err()
@@ -1243,7 +1290,7 @@ async fn handle_client_session_with_identity(
             } else {
                 // Peer path (ConnectionRole::Peer or None) — existing behavior.
                 PeerConnection::new(daemon, shutdown_rx, inbound_peer_tx, peer_manager, peer_connected_tx, client_count, client_notify)
-                    .run(session, protocol_version, node_id, display_name, session_id, primitives)
+                    .run(session, protocol_version, node_id, display_name, session_id)
                     .await;
             }
         }

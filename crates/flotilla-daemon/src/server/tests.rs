@@ -1,6 +1,4 @@
 use flotilla_store_http::HttpBackend;
-use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::{BTreeMap, HashMap},
     os::unix::fs::MetadataExt,
@@ -15,7 +13,6 @@ use std::{
 use flotilla_agent::AgentEntry;
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_api::provider_config;
 use flotilla_discovery_testkit::fake_discovery;
@@ -32,15 +29,12 @@ use flotilla_protocol::{
     RepoSelector, Request, ResourceCursor, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome,
     StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
-use flotilla_replication::{replicate_kind_direct, ReplicationStore};
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, FulfilmentFacts,
-    FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceError, ResourceList, ResourceProvenance, Selector, StatusPatch,
-    TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTarget, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    Convoy, ConvoySpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceError, ResourceProvenance, Selector, TerminalAttentionState,
+    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, WatchEvent, WatchStart,
 };
-use flotilla_store::{controller::ControllerLoop, list_resource_kind, ResourceBackend};
+use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use tokio::{
@@ -68,7 +62,6 @@ use super::remote_commands::PendingRemoteCancelMap;
 use super::remote_commands::PendingRemoteCommand;
 use super::remote_commands::PendingRemoteCommandMap;
 use super::remote_commands::RemoteCommandRouter;
-use super::replication::replication_host;
 use super::request_dispatch::RequestDispatcher;
 use super::shared::sync_peer_query_state;
 use super::shared::write_message;
@@ -83,19 +76,22 @@ use super::HELLO_HANDSHAKE_TIMEOUT;
 use crate::peer::ConnectionDirection;
 use crate::peer::ConnectionMeta;
 use crate::startup::test_support::GatedCredentialPreflight;
+use crate::testkits::engine::engine;
+use crate::testkits::engine::request_session;
+use crate::testkits::engine::run_session;
+use crate::testkits::engine::runtime_terminals;
+use crate::testkits::engine::session_request;
 use crate::testkits::server::apply_convoy_replica_feed;
 use crate::testkits::server::seed_trusted_remote_convoy_project;
 
 #[tokio::test(start_paused = true)]
 async fn aborting_peer_runtime_releases_connection_and_replication_owners() {
-    use flotilla_resources::Resource;
-
     use super::{build_remote_command_router, peer_runtime::PeerRuntime};
     use crate::peer::channel_transport::channel_transport_pair_with_nodes;
     use crate::peer::PeerTransport;
 
     // Runtime teardown must release both a live connection loop and the outbound
-    // replication supervisor, even while its peer and notification sender live.
+    // change-stream task, even while its peer and notification sender live.
     let (_tmp, daemon) = empty_daemon().await;
     let manager = Arc::new(Mutex::new(crate::peer::PeerManager::new(daemon.node_id().clone())));
     let weak_manager = Arc::downgrade(&manager);
@@ -107,9 +103,8 @@ async fn aborting_peer_runtime_releases_connection_and_replication_owners() {
     manager.lock().await.add_configured_target(ConfigLabel("remote".to_string()), HostName::new("remote"), None, Box::new(local_transport));
     let router = build_remote_command_router(&daemon, &manager);
     let (inbound_tx, inbound_rx) = mpsc::channel(256);
-    let (runtime, _connected_tx) = PeerRuntime::new(Arc::clone(&daemon), Arc::clone(&manager), Some(inbound_rx), inbound_tx, router, None)
-        .with_replication_kinds(Some(&[Host::API_PATHS.kind]))
-        .spawn();
+    let (runtime, _connected_tx) =
+        PeerRuntime::new(Arc::clone(&daemon), Arc::clone(&manager), Some(inbound_rx), inbound_tx, router, None).spawn();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !daemon.get_topology().await.expect("topology").routes.iter().any(|route| route.connected) {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -227,29 +222,15 @@ async fn daemon_discovery_path_is_independent_of_its_config_and_socket_paths() {
 
 #[tokio::test]
 async fn resource_http_lists_and_watches_over_a_unix_socket() {
-    let source = ResourceBackend::new(InMemoryBackend::default());
-    let source_convoys = source.using::<Convoy>("flotilla");
-    source_convoys
-        .create(
-            &InputMeta::builder().name("before-watch".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create initial convoy");
-    source_convoys
-        .create(
-            &InputMeta::builder().name("replica-row".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create replica source row");
-    let replica_snapshot = source_convoys.list().await.expect("list replica source rows");
-    source
-        .replica_writer::<Convoy>(NodeId::new("remote-root"), "flotilla")
-        .replace(&replica_snapshot, chrono::Utc::now())
-        .await
-        .expect("seed replica rows");
-    source_convoys.delete("replica-row").await.expect("remove local copy of replica row");
+    use flotilla_engine_convoys_testkit::{single_agent, EngineHome};
+    let spec = || ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).build();
+    // One convoy admitted here, and one admitted at another home and received here.
+    let home = EngineHome::open_in("source-root", "flotilla");
+    let source = home.backend().clone();
+    home.admit("before-watch", spec(), single_agent("coder")).await;
+    let remote_home = EngineHome::open_in("remote-root", "flotilla");
+    let replica_row = remote_home.admit("replica-row", spec(), single_agent("coder")).await;
+    remote_home.replicate_to(&home);
 
     let socket_path = PathBuf::from(format!("/tmp/flotilla-resource-http-{}.sock", uuid::Uuid::new_v4()));
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind resource HTTP socket");
@@ -266,14 +247,14 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
     let remote = ResourceBackend::new(HttpBackend::from_unix_socket(&socket_path).expect("build Unix-socket resource client"));
     let overlay = remote.including_replicas::<Convoy>("flotilla").list().await.expect("list overlay over Unix-socket HTTP");
     assert!(overlay.items.iter().any(|item| {
-        item.object.metadata.name == "replica-row"
+        item.object.metadata.name == replica_row
             && matches!(
                 item.provenance,
                 ResourceProvenance::Replica { ref origin_root, .. }
                     if origin_root == &NodeId::new("remote-root")
             )
     }));
-    let replica = remote.including_replicas::<Convoy>("flotilla").get("replica-row").await.expect("get replica over Unix-socket HTTP");
+    let replica = remote.including_replicas::<Convoy>("flotilla").get(&replica_row).await.expect("get replica over Unix-socket HTTP");
     assert!(matches!(
         replica.provenance,
         ResourceProvenance::Replica { ref origin_root, .. } if origin_root == &NodeId::new("remote-root")
@@ -283,13 +264,7 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
     let mut watch =
         remote.using::<Convoy>("flotilla").watch(WatchStart::resuming_from(&listed)).await.expect("watch convoys over Unix-socket HTTP");
 
-    source_convoys
-        .create(
-            &InputMeta::builder().name("after-watch".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create watched convoy");
+    let after_watch = home.admit("after-watch", spec(), single_agent("coder")).await;
     let event = tokio::time::timeout(Duration::from_secs(2), futures::StreamExt::next(&mut watch))
         .await
         .expect("HTTP watch event timeout")
@@ -297,401 +272,11 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
         .expect("valid HTTP watch event");
     assert!(matches!(
         event,
-        WatchEvent::Added(object) if object.metadata.name == "after-watch"
+        WatchEvent::Added(object) if object.metadata.name == after_watch
     ));
 
     server.abort();
     std::fs::remove_file(&socket_path).expect("remove resource HTTP socket");
-}
-
-#[tokio::test]
-async fn http_replication_resnapshots_after_quarantined_history() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let origin_path = temp.path().join("origin.sqlite");
-    let origin = ResourceBackend::new(SqliteBackend::open(&origin_path).expect("open origin store"));
-    let origin_convoys = origin.using::<Convoy>("flotilla");
-    let first = origin_convoys
-        .create(
-            &InputMeta::builder().name("superseded".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("old-workflow".to_string()).build(),
-        )
-        .await
-        .expect("create event that predates the schema change");
-    origin_convoys
-        .update(
-            &InputMeta::builder().name("superseded".to_string()).build(),
-            &first.metadata.resource_version,
-            &ConvoySpec::builder().workflow_ref("current-workflow".to_string()).build(),
-        )
-        .await
-        .expect("write a full superseding event");
-    origin_convoys
-        .create(
-            &InputMeta::builder().name("unrelated".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("healthy-workflow".to_string()).build(),
-        )
-        .await
-        .expect("write an unrelated later event");
-    drop(origin_convoys);
-    drop(origin);
-
-    let connection = rusqlite::Connection::open(&origin_path).expect("open raw origin store");
-    let body: String = connection
-        .query_row("SELECT body_json FROM resource_events WHERE event_version = 1", [], |row| row.get(0))
-        .expect("read historical event");
-    let mut body: serde_json::Value = serde_json::from_str(&body).expect("decode historical event");
-    body.pointer_mut("/spec")
-        .expect("historical event should contain a spec")
-        .as_object_mut()
-        .expect("historical spec should be an object")
-        .remove("workflow_ref");
-    connection
-        .execute(
-            "UPDATE resource_events SET body_json = ?1 WHERE event_version = 1",
-            [serde_json::to_string(&body).expect("encode old-schema event")],
-        )
-        .expect("remove a now-required field from the historical event");
-    drop(connection);
-    let origin = ResourceBackend::new(SqliteBackend::open(&origin_path).expect("reopen origin after schema upgrade"));
-
-    let holder_backend = ResourceBackend::new(InMemoryBackend::default());
-    let origin_root = NodeId::new("origin-root");
-    holder_backend
-        .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
-        .replace(&ResourceList { items: Vec::new(), resource_version: "0".to_string(), generation: None }, chrono::Utc::now())
-        .await
-        .expect("seed a pre-upgrade replica cursor");
-    let holder = InProcessDaemon::new_with_resource_backend(
-        vec![],
-        test_config_store(temp.path().join("holder")),
-        fake_discovery(false),
-        HostName::new("holder"),
-        holder_backend.clone(),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-
-    let socket_path = PathBuf::from(format!("/tmp/flotilla-event-quarantine-http-{}.sock", uuid::Uuid::new_v4()));
-    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind origin resource HTTP socket");
-    let server_backend = origin.clone();
-    let server = tokio::spawn(async move {
-        // The router keeps connections alive, so serve each one until the test ends.
-        loop {
-            let (mut stream, _) = listener.accept().await.expect("accept resource HTTP request");
-            let first_byte = tokio::io::AsyncReadExt::read_u8(&mut stream).await.expect("read HTTP preface");
-            tokio::spawn(serve_test_connection(stream, first_byte, server_backend.clone(), None));
-        }
-    });
-
-    let http = HttpBackend::from_unix_socket(&socket_path).expect("build resource HTTP client");
-    let holder_for_replication = Arc::clone(&holder);
-    let origin_for_replication = origin_root.clone();
-    let replicator = tokio::spawn(async move {
-        replicate_kind_direct::<Convoy>(
-            ResourceBackend::new(http),
-            &replication_host(&holder_for_replication),
-            &origin_for_replication,
-            ReplicationStore::Durable,
-        )
-        .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let replicas = holder_backend.including_replicas::<Convoy>("flotilla").list().await.expect("list replicated convoys");
-            let names = replicas.items.iter().map(|item| item.object.metadata.name.as_str()).collect::<Vec<_>>();
-            if names.contains(&"superseded") && names.contains(&"unrelated") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("replication should advance past the quarantined event");
-
-    let diagnostics = origin.diagnostics().await.expect("read origin diagnostics").expect("sqlite diagnostics");
-    assert_eq!(diagnostics.event_decode_quarantines.len(), 1, "resume must expose the quarantined event gap");
-
-    replicator.abort();
-    server.abort();
-    let _ = replicator.await;
-    let _ = server.await;
-    std::fs::remove_file(&socket_path).expect("remove resource HTTP socket");
-}
-
-#[tokio::test]
-async fn http_replicator_relists_after_an_origin_generation_change() {
-    let old_origin = ResourceBackend::new(InMemoryBackend::observed());
-    old_origin
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("old-generation".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create old-generation convoy");
-    let old_list = old_origin.using::<Convoy>("flotilla").list().await.expect("list old generation");
-
-    let holder_backend = ResourceBackend::new(InMemoryBackend::default());
-    let origin_root = NodeId::new("remote-root");
-    holder_backend
-        .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
-        .replace(&old_list, chrono::Utc::now())
-        .await
-        .expect("seed old-generation cursor");
-    let temp = tempfile::tempdir().expect("tempdir");
-    let holder = InProcessDaemon::new_with_resource_backend(
-        vec![],
-        test_config_store(temp.path().join("holder")),
-        fake_discovery(false),
-        HostName::new("holder"),
-        holder_backend.clone(),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-
-    let new_origin = ResourceBackend::new(InMemoryBackend::observed());
-    new_origin
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("new-generation".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create new-generation convoy");
-    let new_generation =
-        new_origin.using::<Convoy>("flotilla").list().await.expect("list new generation").generation.expect("new origin generation");
-
-    let listed = list_resource_kind(&new_origin, "flotilla", "convoys").await.expect("encode new generation list").value;
-    let listed_body = serde_json::to_vec(&listed).expect("encode new generation response");
-    let socket_path = PathBuf::from(format!("/tmp/flotilla-replicator-http-{}.sock", uuid::Uuid::new_v4()));
-    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind replicator HTTP socket");
-    let requested_targets = Arc::new(StdMutex::new(Vec::new()));
-    let server_targets = Arc::clone(&requested_targets);
-    let old_generation = old_list.generation.expect("old generation");
-    let server = tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.expect("accept replicator HTTP request");
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut buffer = [0_u8; 1024];
-                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await.expect("read replicator HTTP request");
-                assert_ne!(read, 0, "replicator HTTP request ended before its headers");
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let request = std::str::from_utf8(&request).expect("replicator HTTP request is UTF-8");
-            let target =
-                request.lines().next().and_then(|line| line.split_whitespace().nth(1)).expect("replicator HTTP request target").to_string();
-            server_targets.lock().expect("requested targets lock").push(target.clone());
-            if target.contains("watch=true") && target.contains(&format!("generation={old_generation}")) {
-                tokio::io::AsyncWriteExt::write_all(&mut stream, b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await
-                    .expect("reject expired generation");
-                continue;
-            }
-            if target.contains("watch=true") {
-                tokio::io::AsyncWriteExt::write_all(
-                    &mut stream,
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .expect("write hanging watch response");
-                std::future::pending::<()>().await;
-            }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                listed_body.len()
-            );
-            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write list response headers");
-            tokio::io::AsyncWriteExt::write_all(&mut stream, &listed_body).await.expect("write list response body");
-        }
-    });
-
-    let http = HttpBackend::from_unix_socket(&socket_path).expect("build replicator HTTP client");
-    let holder_for_replication = Arc::clone(&holder);
-    let origin_for_replication = origin_root.clone();
-    let replicator = tokio::spawn(async move {
-        replicate_kind_direct::<Convoy>(
-            ResourceBackend::new(http),
-            &replication_host(&holder_for_replication),
-            &origin_for_replication,
-            ReplicationStore::Durable,
-        )
-        .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let listed = holder_backend.including_replicas::<Convoy>("flotilla").list().await.expect("list relisted replicas");
-            if listed.items.iter().any(|item| item.object.metadata.name == "new-generation") {
-                assert!(
-                    listed.items.iter().all(|item| item.object.metadata.name != "old-generation"),
-                    "generation relist must atomically discard old rows"
-                );
-                let cursor = holder_backend
-                    .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
-                    .cursor()
-                    .await
-                    .expect("read relisted cursor")
-                    .expect("relisted cursor");
-                assert_eq!(cursor.generation.as_deref(), Some(new_generation.as_str()));
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("generation relist timeout");
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while requested_targets.lock().expect("requested targets lock").len() < 3 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("replacement watch request timeout");
-    let requested_targets = requested_targets.lock().expect("requested targets lock").clone();
-    assert_eq!(requested_targets.len(), 3);
-    assert!(requested_targets[0].contains("watch=true"), "try the proven cursor first");
-    assert!(!requested_targets[1].contains("watch=true"), "expired generation requires a snapshot");
-    assert!(requested_targets[2].contains("watch=true"));
-    assert!(
-        requested_targets[2].contains(&format!("generation={new_generation}")),
-        "the replacement watch must be scoped to the new generation: {}",
-        requested_targets[2]
-    );
-    replicator.abort();
-    server.abort();
-    let _ = replicator.await;
-    let _ = server.await;
-    std::fs::remove_file(&socket_path).expect("remove replicator HTTP socket");
-}
-
-#[tokio::test]
-async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
-    let origin = ResourceBackend::new(InMemoryBackend::observed());
-    origin
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("before-watch".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create initial convoy");
-    let initial = origin.using::<Convoy>("flotilla").list().await.expect("list initial origin");
-
-    let holder_backend = ResourceBackend::new(InMemoryBackend::default());
-    let origin_root = NodeId::new("remote-root");
-    holder_backend
-        .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
-        .replace(&initial, chrono::Utc::now())
-        .await
-        .expect("seed resumable cursor");
-    origin
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("after-watch".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create convoy after initial list");
-    let fresh_body = serde_json::to_vec(&list_resource_kind(&origin, "flotilla", "convoys").await.expect("encode fresh list").value)
-        .expect("encode fresh response");
-
-    let temp = tempfile::tempdir().expect("tempdir");
-    let holder = InProcessDaemon::new_with_resource_backend(
-        vec![],
-        test_config_store(temp.path().join("holder")),
-        fake_discovery(false),
-        HostName::new("holder"),
-        holder_backend.clone(),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-    let socket_path = PathBuf::from(format!("/tmp/flotilla-replicator-relist-{}.sock", uuid::Uuid::new_v4()));
-    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind replicator HTTP socket");
-    let requested_targets = Arc::new(StdMutex::new(Vec::new()));
-    let server_targets = Arc::clone(&requested_targets);
-    let server = tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.expect("accept replicator HTTP request");
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut buffer = [0_u8; 1024];
-                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await.expect("read replicator HTTP request");
-                assert_ne!(read, 0, "replicator HTTP request ended before its headers");
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let request = std::str::from_utf8(&request).expect("replicator HTTP request is UTF-8");
-            let target =
-                request.lines().next().and_then(|line| line.split_whitespace().nth(1)).expect("replicator HTTP request target").to_string();
-            let request_number = {
-                let mut targets = server_targets.lock().expect("requested targets lock");
-                targets.push(target.clone());
-                targets.len()
-            };
-            if target.contains("watch=true") {
-                let body = if request_number == 1 { b"not-json\n".as_slice() } else { b"".as_slice() };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write watch response headers");
-                tokio::io::AsyncWriteExt::write_all(&mut stream, body).await.expect("write watch response body");
-                if request_number > 1 {
-                    std::future::pending::<()>().await;
-                }
-                continue;
-            }
-            let body = &fresh_body;
-            let response =
-                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write list response headers");
-            tokio::io::AsyncWriteExt::write_all(&mut stream, body).await.expect("write list response body");
-        }
-    });
-
-    let http = HttpBackend::from_unix_socket(&socket_path).expect("build replicator HTTP client");
-    let holder_for_replication = Arc::clone(&holder);
-    let origin_for_replication = origin_root.clone();
-    let replicator = tokio::spawn(async move {
-        replicate_kind_direct::<Convoy>(
-            ResourceBackend::new(http),
-            &replication_host(&holder_for_replication),
-            &origin_for_replication,
-            ReplicationStore::Durable,
-        )
-        .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let listed = holder_backend.including_replicas::<Convoy>("flotilla").list().await.expect("list relisted replicas");
-            if listed.items.iter().any(|item| item.object.metadata.name == "after-watch") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("fresh relist timeout");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while requested_targets.lock().expect("requested targets lock").len() < 3 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("replacement watch request timeout");
-    let requested_targets = requested_targets.lock().expect("requested targets lock").clone();
-    assert!(requested_targets[0].contains("watch=true"), "valid prefix resumes without listing");
-    assert!(!requested_targets[1].contains("watch=true"), "a failed resumed watch triggers a fresh list");
-    assert!(requested_targets[2].contains("watch=true"));
-
-    replicator.abort();
-    server.abort();
-    let _ = replicator.await;
-    let _ = server.await;
-    std::fs::remove_file(&socket_path).expect("remove replicator HTTP socket");
 }
 
 use crate::peer::InboundPeerEnvelope;
@@ -733,7 +318,6 @@ fn current_client_hello() -> Message {
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     }
 }
 
@@ -867,7 +451,65 @@ async fn empty_daemon_named(host_name: &str) -> (tempfile::TempDir, Arc<InProces
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     (tmp, daemon)
+}
+
+/// A daemon named `host_name` composed with `store` as its decided store, which the test opened
+/// with its own kinds beside the decided ones ([`decided_kinds`]).
+pub(super) async fn daemon_with_decided_store(
+    host_name: &str,
+    store: Arc<flotilla_schema_sqlite::stream::Service>,
+) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
+    use flotilla_provisioning::engine::decided::{open_ports, DecidedPorts};
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(tmp.path().join("config"));
+    // The ports the daemon's own opener installs, over the test's store.
+    let engine: flotilla_core::in_process::EngineOpener = Box::new(move |identity: flotilla_core::in_process::EngineIdentity| {
+        Box::pin(async move {
+            let DecidedPorts {
+                records,
+                observations,
+                observation_failures,
+                change_request_branches,
+                source_observers,
+                accounts,
+                manifest_roots,
+                standing_roles,
+            } = open_ports(&store, &identity.host_id.to_string(), identity.clock)?;
+            Ok(flotilla_core::in_process::ComposedEngine {
+                standing_roles,
+                service: store,
+                records,
+                observations,
+                observation_failures,
+                change_request_branches,
+                source_observers,
+                accounts,
+                manifest_roots,
+            })
+        }) as futures::future::BoxFuture<'static, _>
+    });
+    let daemon = InProcessDaemon::new_composed(
+        vec![],
+        config,
+        fake_discovery(false),
+        HostName::new(host_name),
+        flotilla_store_memory::engine_home_backend(),
+        Arc::new(flotilla_resources::SystemClock),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+        engine,
+    )
+    .await
+    .expect("compose the daemon with the test's decided store");
+    daemon.open_message_primitives().expect("message path");
+    (tmp, daemon)
+}
+
+/// The decided store's kinds, to which a test adds its own.
+pub(super) fn decided_kinds() -> flotilla_schema::KindRegistry {
+    flotilla_core::in_process::decided::registry().expect("decided registry")
 }
 
 fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
@@ -1066,6 +708,8 @@ async fn dispatch_add_list_remove_repo_round_trip() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has: discovery reads its clones.
+    engine_environments(&daemon);
     let repo_path = tmp.path().join("repo-a");
     init_git_repo_with_remote(&repo_path, "git@github.com:owner/repo-a.git");
 
@@ -1090,53 +734,111 @@ async fn dispatch_add_list_remove_repo_round_trip() {
     assert!(matches!(ok_response(remove, 12), Response::RemoveRepo));
 }
 
+/// A dropped daemon releases its resource backend and its decided store, so a daemon
+/// restarted in the same process over the same state directory does not find them held.
+#[test]
+fn dropped_daemon_releases_its_stores() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(tmp.path().join("config"));
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let (backend, decided) = runtime.block_on(async {
+        let backend = super::build_embedded_resource_backend();
+        let daemon = InProcessDaemon::new_composed(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery(false),
+            HostName::local(),
+            backend,
+            Arc::new(flotilla_resources::SystemClock),
+            Arc::new(crate::peer::HostPeerOverlay::default()),
+            crate::runtime::engine_opener(&config),
+        )
+        .await
+        .expect("daemon should compose");
+        let backend = daemon.resource_backend().downgrade();
+        let decided = Arc::downgrade(&daemon.decided_store().expect("decided store should open"));
+        drop(daemon);
+        (backend, decided)
+    });
+    drop(runtime);
+
+    assert!(backend.upgrade().is_none(), "the dropped daemon's resource backend is still held");
+    assert!(decided.upgrade().is_none(), "the dropped daemon's decided store is still held");
+}
+
+/// The engine a test installs into its daemon goes with the daemon, and with it the decided store.
+#[test]
+fn dropped_daemon_releases_the_engine_a_test_installed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(tmp.path().join("config"));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    let decided = runtime.block_on(async {
+        let daemon = InProcessDaemon::new(
+            vec![],
+            config,
+            fake_discovery(false),
+            HostName::local(),
+            Arc::new(crate::peer::HostPeerOverlay::default()),
+        )
+        .await;
+        let engine = Arc::downgrade(&install_engine(&daemon));
+        assert!(engine.upgrade().is_some(), "the daemon holds the engine installed in it");
+        Arc::downgrade(&daemon.decided_store().expect("decided store"))
+    });
+    // The engine's followers run on the test's runtime and end with it.
+    drop(runtime);
+
+    assert!(decided.upgrade().is_none(), "the dropped daemon's decided store is still held");
+}
+
+/// A fresh host keeps its resources in the engine store across a restart, and never creates the
+/// old resource store.
 #[tokio::test]
-async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
+async fn daemon_server_keeps_resources_across_restart_without_an_old_store() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(tmp.path().join("config"));
     let socket_path = tmp.path().join("flotilla.sock");
+    let old_store = config.state_dir().as_path().join(crate::engine_import::OLD_STORE);
 
     let server = DaemonServer::new(Vec::new(), Arc::clone(&config), fake_discovery(false), socket_path.clone(), StdDuration::from_secs(30))
         .await
         .expect("server should start");
     let backend = server.daemon().resource_backend();
-    assert!(backend.durable_local());
-    assert!(config.state_dir().as_path().join("resources.sqlite").exists());
+    assert!(!old_store.exists(), "a fresh host's daemon created the old resource store");
+
+    use flotilla_resources::{
+        CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
+    };
 
     backend
-        .using::<Convoy>("flotilla")
+        .definitions::<CredentialSpec>("flotilla")
         .create(
             &InputMeta::builder().name("persisted".to_string()).build(),
-            &ConvoySpec {
-                continuation: None,
-                subjects: Vec::new(),
-                role: String::new(),
-                generation: 1,
-                workflow_ref: "scratch".to_string(),
-                dispatching_principal_ref: Default::default(),
-                inputs: Default::default(),
-                placement_policy: None,
-                repositories: Vec::new(),
-                r#ref: None,
-                project_ref: None,
-                adopted_checkout_refs: BTreeMap::new(),
-                issues: Vec::new(),
-                change_request: None,
-                instruction: None,
-                promises: Vec::new(),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::Claude,
+                source: CredentialSource::Env { name: "PERSISTED_TOKEN".into() },
+                lifecycle: CredentialLifecycle::Issued,
+                placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
             },
         )
         .await
-        .expect("convoy create should succeed");
+        .expect("credential declaration should succeed");
     drop(server);
 
     let restarted = DaemonServer::new(Vec::new(), config, fake_discovery(false), socket_path, StdDuration::from_secs(30))
         .await
         .expect("server should restart");
-    let fetched =
-        restarted.daemon().resource_backend().using::<Convoy>("flotilla").get("persisted").await.expect("convoy should survive restart");
+    let fetched = restarted
+        .daemon()
+        .resource_backend()
+        .definitions::<CredentialSpec>("flotilla")
+        .get("persisted")
+        .await
+        .expect("credential declaration should survive restart");
 
-    assert_eq!(fetched.spec.workflow_ref, "scratch");
+    assert_eq!(fetched.spec.source, CredentialSource::Env { name: "PERSISTED_TOKEN".into() });
+    assert!(!old_store.exists(), "the restarted daemon created the old resource store");
 }
 
 #[test]
@@ -1164,7 +866,7 @@ fn daemon_startup_cleanup_removes_only_reverse_peer_socket_files() {
 }
 
 #[tokio::test]
-async fn daemon_server_observed_resource_backend_is_ephemeral_per_restart() {
+async fn daemon_server_discovered_checkouts_are_ephemeral_per_restart() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(tmp.path().join("config"));
     let socket_path = tmp.path().join("flotilla.sock");
@@ -1172,32 +874,29 @@ async fn daemon_server_observed_resource_backend_is_ephemeral_per_restart() {
     let server = DaemonServer::new(Vec::new(), Arc::clone(&config), fake_discovery(false), socket_path.clone(), StdDuration::from_secs(30))
         .await
         .expect("server should start");
-    let observed = server.daemon().observed_resource_backend();
-    let checkouts = observed.using::<ResourceCheckout>("flotilla");
-    checkouts
-        .create(
-            &InputMeta::builder().name("local-main".to_string()).build(),
-            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+    let repository = flotilla_resources::RepositoryKey("project-flotilla".to_string());
+    let discovered = server.daemon().discovered_checkouts();
+    discovered.replace(
+        &repository,
+        vec![flotilla_resources::discovered_checkouts::DiscoveredCheckout {
+            name: "local-main".to_string(),
+            repo_slug: "flotilla".to_string(),
+            spec: ResourceObservedCheckoutSpec {
                 r#ref: "main".to_string(),
                 path: "/Users/alice/dev/flotilla".to_string(),
-                repo_ref: flotilla_resources::RepositoryKey("project-flotilla".to_string()),
+                repo_ref: repository.clone(),
                 host_ref: "host-01".to_string(),
                 is_main: true,
-            }),
-        )
-        .await
-        .expect("observed checkout create should succeed");
-    let first_generation = checkouts.list().await.expect("observed list should succeed").generation.expect("generation");
+            },
+        }],
+    );
+    assert!(discovered.get("local-main").is_some(), "the discovered checkout is held while the daemon runs");
     drop(server);
 
     let restarted = DaemonServer::new(Vec::new(), config, fake_discovery(false), socket_path, StdDuration::from_secs(30))
         .await
         .expect("server should restart");
-    let restarted_checkouts = restarted.daemon().observed_resource_backend().using::<ResourceCheckout>("flotilla");
-    let restarted_list = restarted_checkouts.list().await.expect("observed list after restart should succeed");
-
-    assert_ne!(restarted_list.generation.expect("generation"), first_generation);
-    assert!(matches!(restarted_checkouts.get("local-main").await, Err(ResourceError::NotFound { .. })));
+    assert!(restarted.daemon().discovered_checkouts().get("local-main").is_none(), "a restarted daemon discovers its checkouts again");
 }
 
 #[tokio::test]
@@ -1291,32 +990,15 @@ async fn dispatch_agent_hook_started_updates_existing_session_entry() {
 async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
     let (_tmp, daemon) = empty_daemon().await;
     let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
-    let created = sessions
-        .create(
-            &InputMeta::builder().name("terminal-demo-coder".to_string()).build(),
-            &TerminalSessionSpec {
-                env_ref: "host-direct".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Tool { command: "claude".into() },
-                cwd: "/repo".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
-            },
-        )
-        .await
-        .expect("terminal create");
-    let mut status = TerminalSessionStatus::default();
-    TerminalSessionStatusPatch::MarkRunning {
-        configured_limits: None,
-        session_id: "terminal-demo-coder".into(),
-        pid: None,
-        started_at: chrono::Utc::now(),
-        crew: None,
-        launch_command: "claude".into(),
-        delivered_message_id: None,
-    }
-    .apply(&mut status);
-    sessions.update_status("terminal-demo-coder", &created.metadata.resource_version, &status).await.expect("running status");
+    let spec = TerminalSessionSpec {
+        env_ref: "host-direct".into(),
+        role: "coder".into(),
+        source: TerminalSessionSource::Tool { command: "claude".into() },
+        cwd: "/repo".into(),
+        env: Default::default(),
+        pool: "cleat".into(),
+    };
+    run_session(&daemon, "terminal-demo-coder", &spec, &Default::default());
     let agent_state_store = flotilla_agent::shared_in_memory_agent_state_store();
 
     let response = dispatch_request_with_state(
@@ -1350,6 +1032,26 @@ async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
 #[tokio::test]
 async fn managed_hook_turns_update_attention_through_terminal_session() {
     let (_tmp, daemon) = empty_daemon().await;
+    // Hooks record the crew's AgentSession on the Message path the runtime always opens, whose
+    // delivery, and the stall judging after it, wait for a designated fleet.
+    crate::runtime::open_message_primitives(&daemon).await.expect("open the Message path");
+    {
+        use flotilla_resources::{FleetDesignation, FleetDesignationSpec, Project, ProjectSpec, FLEET_DESIGNATION_NAME};
+        let backend = daemon.resource_backend();
+        backend
+            .definitions::<Project>("flotilla")
+            .create(&InputMeta::builder().name("fleet".into()).build(), &ProjectSpec::builder().display_name("Fleet".into()).build())
+            .await
+            .expect("fleet project");
+        backend
+            .definitions::<FleetDesignation>("flotilla")
+            .create(
+                &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
+                &FleetDesignationSpec { fleet: Some("fleet".into()), project: "fleet".into(), image_cache: None },
+            )
+            .await
+            .expect("fleet designation");
+    }
     let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
     for (harness_name, harness, active_event, active_payload, idle_event, idle_payload) in [
         (
@@ -1371,96 +1073,55 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
     ] {
         // #2634: delivered notify/Stop hooks must reach the actor obligation,
         // not just transient terminal attention.
-        let convoy_name = format!("hook-{harness_name}");
         let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
-        let created_convoy = convoys
-            .create(
-                &InputMeta::builder().name(convoy_name.clone()).build(),
-                &ConvoySpec::builder().workflow_ref("hook-test".into()).build(),
-            )
-            .await
-            .expect("convoy");
         let workflow = flotilla_resources::single_agent_workflow_spec();
-        convoys
-            .update_status(
-                &convoy_name,
-                &created_convoy.metadata.resource_version,
-                &flotilla_resources::ConvoyStatus {
-                    phase: flotilla_resources::ConvoyPhase::Active,
-                    work: BTreeMap::from([(
-                        "work".into(),
-                        flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-                    )]),
-                    crew_work: BTreeMap::from([(
-                        "work".into(),
-                        BTreeMap::from([(
-                            "coder".into(),
-                            flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                        )]),
-                    )]),
-                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                        cascade: None,
-                        vessels: workflow.vessels,
-                        exit: workflow.exit,
-                        turn_delivery: Default::default(),
-                        stall_nudges: Default::default(),
-                        supervision: None,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("convoy status");
+        let status = flotilla_resources::ConvoyStatus {
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
+                vessels: workflow.vessels,
+                exit: workflow.exit,
+                turn_delivery: Default::default(),
+                stall_nudges: Default::default(),
+                supervision: None,
+            }),
+            ..Default::default()
+        };
+        let spec = ConvoySpec::builder().workflow_ref("hook-test".into()).project_ref("flotilla".into()).build();
+        let convoy_name =
+            admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy("flotilla", &format!("hook-{harness_name}"), spec, status)).await;
         let name = format!("terminal-{harness_name}");
-        let created = sessions
-            .create(
-                &InputMeta::builder()
-                    .name(name.clone())
-                    .labels(BTreeMap::from([
-                        (flotilla_resources::CONVOY_LABEL.into(), convoy_name.clone()),
-                        (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
-                        (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
-                    ]))
-                    .build(),
-                &TerminalSessionSpec {
-                    env_ref: "contained-vessel".into(),
-                    role: "coder".into(),
-                    source: TerminalSessionSource::Agent {
-                        selector: Selector::for_capability("coding"),
-                        brief: TerminalBrief {
-                            artifact_digest: None,
-                            path: ".flotilla/briefs/coder.md".into(),
-                            content: "fix".into(),
-                            copies: Vec::new(),
-                        },
-                        context: Box::new(TerminalCrewContext {
-                            namespace: "flotilla".into(),
-                            convoy: convoy_name.clone(),
-                            vessel_ref: "work".into(),
-                        }),
-                        message: None,
-                    },
-                    cwd: "/repo".into(),
-                    env: Default::default(),
-                    pool: "cleat".into(),
+        let vessel = install_engine(&daemon).vessels.request(&convoy_name, "work", daemon.local_host_id().expect("local host").as_str());
+        // The crew's vessel stands ready, so its convoy is active.
+        install_engine(&daemon).vessels.ready(&vessel, "contained-vessel");
+        let spec = TerminalSessionSpec {
+            env_ref: "contained-vessel".into(),
+            role: "coder".into(),
+            source: TerminalSessionSource::Agent {
+                selector: Selector::for_capability("coding"),
+                brief: TerminalBrief {
+                    artifact_digest: None,
+                    path: ".flotilla/briefs/coder.md".into(),
+                    content: "fix".into(),
+                    copies: Vec::new(),
                 },
-            )
-            .await
-            .expect("terminal create");
-        let mut status = TerminalSessionStatus::default();
-        TerminalSessionStatusPatch::MarkRunning {
-            configured_limits: None,
-            session_id: name.clone(),
-            pid: None,
-            started_at: chrono::Utc::now() - chrono::Duration::minutes(20),
-            crew: Some(
-                CrewSessionStatus::builder().id("crew".into()).adapter(harness_name.into()).stance("trusted-implicit".into()).build(),
-            ),
-            launch_command: harness_name.into(),
-            delivered_message_id: None,
-        }
-        .apply(&mut status);
-        sessions.update_status(&name, &created.metadata.resource_version, &status).await.expect("running status");
+                context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: convoy_name.clone(), vessel_ref: vessel }),
+            },
+            cwd: "/repo".into(),
+            env: Default::default(),
+            pool: "cleat".into(),
+        };
+        let facts = flotilla_resources::terminal_records::TerminalLaunchFacts {
+            agent: Some(flotilla_resources::terminal_records::AgentLaunch {
+                adapter: harness_name.into(),
+                model: None,
+                stance: "trusted-implicit".into(),
+            }),
+            ..Default::default()
+        };
+        // Running for twenty minutes without a turn hook.
+        let launch = request_session(&daemon, &name, &spec);
+        let started = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() - chrono::Duration::minutes(20)));
+        install_engine(&daemon).terminals.ready_at(&launch, &name, &facts, started);
         let store = flotilla_agent::shared_in_memory_agent_state_store();
         if harness_name == "codex" {
             // Upgrade from a pre-fix notification stored under a random candidate.
@@ -1504,17 +1165,24 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             (idle_event, idle_payload, TerminalAttentionState::Idle),
         ] {
             if harness_name == "codex" && expected == TerminalAttentionState::Working {
-                let current = sessions.get(&name).await.expect("terminal for screen observation");
-                let mut status = current.status.expect("running status");
-                TerminalSessionStatusPatch::ObserveAttention {
-                    attention: flotilla_resources::TerminalAttention {
-                        state: TerminalAttentionState::Working,
-                        as_of: chrono::Utc::now(),
-                        source: flotilla_resources::TerminalAttentionSource::Screen,
-                    },
-                }
-                .apply(&mut status);
-                sessions.update_status(&name, &current.metadata.resource_version, &status).await.expect("screen working status");
+                let attention = flotilla_resources::TerminalAttention {
+                    state: TerminalAttentionState::Working,
+                    as_of: chrono::Utc::now(),
+                    source: flotilla_resources::TerminalAttentionSource::Screen,
+                };
+                flotilla_resources::terminal_records::TerminalRecords::observations(install_engine(&daemon).terminals.terminals.as_ref())
+                    .update(&launch, |observation| observation.observe_attention(attention, Some(harness_name)));
+                // The terminal runtime records the same screen read on the crew's AgentSession.
+                daemon
+                    .message_primitives()
+                    .expect("Message path")
+                    .sessions()
+                    .observe_screen(
+                        &name,
+                        flotilla_state_machines::machines::agent_session::Activity::Working,
+                        flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()),
+                    )
+                    .expect("screen working activity");
             } else {
                 let parsed = parser.parse_event(event_type, payload.as_bytes()).expect("parse hook");
                 let response = dispatch_request_with_state(
@@ -1527,6 +1195,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                             .harness(harness.clone())
                             .event_type(parsed.event_type)
                             .maybe_session_id(parsed.session_id)
+                            .maybe_hook_event(flotilla_agent::hooks::hook_event_name(&harness, event_type).map(str::to_owned))
                             .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() })
                             .build(),
                     },
@@ -1552,14 +1221,24 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                 flotilla_resources::TerminalAttentionSource::Hook
             };
             assert_eq!(attention.source, source);
-            daemon.reconcile_crew_stalls_once("flotilla").await.expect("observe actor hook");
-            let convoy_status = convoys.get(&convoy_name).await.expect("convoy").status.expect("status");
-            let obligation = convoy_status.nudge_obligations.first().expect("actor obligation");
+            // The stall pass reads convoys from a watch of the engine's views, which hears a new
+            // launch a moment after its admission: pass until it judges this convoy.
+            let screen = source == flotilla_resources::TerminalAttentionSource::Screen;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let convoy_status = loop {
+                daemon.reconcile_crew_stalls_once("flotilla").await.expect("observe actor hook");
+                let status = convoys.get(&convoy_name).await.expect("convoy").status.expect("status");
+                if !screen || status.attention.is_some() || tokio::time::Instant::now() > deadline {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            let hook_at = daemon.crew_progress().get(&name).hook_at;
             if source == flotilla_resources::TerminalAttentionSource::Hook {
-                assert_eq!(obligation.last_hook_at, Some(attention.as_of));
+                assert!(hook_at.is_some(), "an attributed hook is seen");
                 assert!(convoy_status.attention.is_none(), "attributed idle hooks clear the no-hook advisory");
             } else {
-                assert!(obligation.last_hook_at.is_none(), "screen evidence must not masquerade as a hook");
+                assert!(hook_at.is_none(), "screen evidence must not masquerade as a hook");
                 assert_eq!(convoy_status.attention.as_ref().map(|a| a.source.as_str()), Some("missing-turn-hook"));
             }
         }
@@ -1796,7 +1475,6 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
                     kind: "convoys".into(),
                     name: Some("demo".into()),
                     include_replicas: false,
-                    replica_sources: false,
                     cursor: Some(cursor.clone()),
                 })
                 .node_id(node("feta"))
@@ -1822,7 +1500,6 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
                         kind: "convoys".into(),
                         name: Some("demo".into()),
                         include_replicas: false,
-                        replica_sources: false,
                         cursor: Some(cursor),
                     })
                     .node_id(node("feta"))
@@ -1837,24 +1514,30 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
 async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause() {
     let (_tmp, daemon) = empty_daemon().await;
     let home = HostName::new("feta");
-    apply_convoy_replica_feed(&daemon, "flotilla", "stranded", home.clone()).await;
-    let replica_fixture = ResourceBackend::new(InMemoryBackend::default());
-    replica_fixture
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder().name("stranded".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
-        )
-        .await
-        .expect("create replica fixture");
-    let replica_snapshot = replica_fixture.using::<Convoy>("flotilla").list().await.expect("list replica fixture");
-    let last_seen_at = chrono::DateTime::parse_from_rfc3339("2026-08-21T12:34:56Z").expect("fixed timestamp").with_timezone(&chrono::Utc);
-    daemon
-        .resource_backend()
-        .replica_writer::<Convoy>(node("feta"), "flotilla")
-        .replace(&replica_snapshot, last_seen_at)
-        .await
-        .expect("seed last-seen replica");
+    // Feta's launch, last seen when it was admitted there.
+    let decided = daemon.decided_store().expect("decided store");
+    let feta = flotilla_provisioning_testkit::other_home_for(&decided, "feta");
+    let feta_convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
+        feta.service(),
+        "flotilla",
+        &flotilla_store_memory::engine_home_backend(),
+        Arc::new(flotilla_resources::SystemClock),
+        daemon.lifecycle_reads(),
+    );
+    let stranded = feta_convoys
+        .launch(flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "stranded",
+            ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        ))
+        .await;
+    feta.replicate_to(&decided);
+    apply_convoy_replica_feed(&daemon, "flotilla", &stranded, home.clone()).await;
+    let replica = daemon.resource_backend().including_replicas::<Convoy>("flotilla").get(&stranded).await.expect("feta's launch");
+    let flotilla_resources::ResourceProvenance::Replica { last_synced_at: last_seen_at, .. } = replica.provenance else {
+        panic!("feta's launch is a replica here")
+    };
     daemon
         .publish_peer_summary(
             HostSummary::builder()
@@ -1878,22 +1561,30 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
     let message = remote_command_router
         .dispatch_execute(
             Command::builder()
-                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: "stranded".to_string(), force: true })
+                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: stranded.clone(), force: true })
                 .build(),
         )
         .await
         .expect_err("failed peer send should reject dispatch");
 
+    // Last seen is when feta's launch reached here, whichever read of it the router made.
+    let (seen, rest) = message
+        .strip_prefix(&format!("convoy flotilla/{stranded} is homed at feta, last seen "))
+        .and_then(|rest| rest.split_once("; "))
+        .unwrap_or_else(|| panic!("{message}"));
+    let seen = chrono::DateTime::parse_from_rfc3339(seen).unwrap_or_else(|error| panic!("{message}: {error}"));
+    assert!((seen.with_timezone(&chrono::Utc) - last_seen_at).num_seconds().abs() < 5, "{message}");
     assert_eq!(
-        message,
-        "convoy flotilla/stranded is homed at feta, last seen 2026-08-21T12:34:56+00:00; home is unreachable: \
-         connect to feta at ssh://feta.example: outbound channel closed. Break glass: flotilla resource delete convoys stranded \
-         --namespace flotilla --host feta"
+        rest,
+        format!(
+            "home is unreachable: connect to feta at ssh://feta.example: outbound channel closed. Break glass: flotilla resource \
+             delete convoys {stranded} --namespace flotilla --host feta"
+        )
     );
 }
 
 #[tokio::test]
-async fn crew_completion_partition_is_persisted_and_names_the_unreachable_authority() {
+async fn crew_completion_to_an_unreachable_home_fails_and_queues_nothing() {
     let (_tmp, daemon) = empty_daemon().await;
     let home = HostName::new("feta");
     apply_convoy_replica_feed(&daemon, "flotilla", "stranded", home.clone()).await;
@@ -1909,49 +1600,25 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         )
         .await;
 
-    let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
-    let created = sessions
-        .create(
-            &InputMeta::builder().name("terminal-stranded-work-coder".to_string()).build(),
-            &TerminalSessionSpec {
-                env_ref: "local".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("code"),
-                    brief: TerminalBrief {
-                        artifact_digest: None,
-                        path: ".flotilla/briefs/coder.md".into(),
-                        content: String::new(),
-                        copies: vec![],
-                    },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "stranded".into(),
-                        vessel_ref: "stranded-work".into(),
-                    }),
-                    message: None,
-                },
-                cwd: "/repo".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
+    let vessel = install_engine(&daemon).vessels.request("stranded", "work", daemon.local_host_id().expect("local host").as_str());
+    let spec = TerminalSessionSpec {
+        env_ref: "local".into(),
+        role: "coder".into(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector::for_capability("code"),
+            brief: TerminalBrief {
+                artifact_digest: None,
+                path: ".flotilla/briefs/coder.md".into(),
+                content: String::new(),
+                copies: vec![],
             },
-        )
-        .await
-        .expect("terminal create");
-    let mut status = TerminalSessionStatus::default();
-    TerminalSessionStatusPatch::MarkRunning {
-        configured_limits: None,
-        session_id: "terminal-stranded-work-coder".into(),
-        pid: None,
-        started_at: chrono::Utc::now(),
-        crew: Some(
-            CrewSessionStatus::builder().id("crew-coder".to_string()).adapter("codex".to_string()).stance("trusted".to_string()).build(),
-        ),
-        launch_command: "codex".into(),
-        delivered_message_id: None,
-    }
-    .apply(&mut status);
-    sessions.update_status(&created.metadata.name, &created.metadata.resource_version, &status).await.expect("running terminal");
+            context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: "stranded".into(), vessel_ref: vessel }),
+        },
+        cwd: "/repo".into(),
+        env: Default::default(),
+        pool: "cleat".into(),
+    };
+    let crew = run_session(&daemon, "terminal-stranded-work-coder", &spec, &codex_crew_facts());
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     {
@@ -1961,131 +1628,43 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     }
     let router = empty_remote_command_router(&daemon, &peer_manager);
 
-    let error = router
-        .dispatch_execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                    message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
-                    disposition: None,
-                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1300#issuecomment-1".into()),
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect_err("partitioned completion should report that it was queued");
-
-    assert_eq!(
-        error,
-        "completion pending: authority unreachable for stranded at feta: connect to feta at ssh://feta.example: outbound channel closed"
-    );
-    let terminal = sessions.get("terminal-stranded-work-coder").await.expect("terminal");
-    let pending = terminal.status.expect("terminal status").completion_pending.expect("durable completion intent");
-    assert_eq!(pending.authority, "feta");
-    assert!(pending.last_error.contains("authority unreachable for stranded"));
-
-    router
-        .dispatch_execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                    message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
-                    disposition: None,
-                    decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1301#issuecomment-2".into()),
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect_err("corrected completion should remain queued during the partition");
-    let pending = sessions
-        .get("terminal-stranded-work-coder")
-        .await
-        .expect("terminal after corrected completion")
-        .status
-        .expect("terminal status")
-        .completion_pending
-        .expect("corrected durable completion intent");
-    assert_eq!(pending.message.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/1301"));
-    assert_eq!(pending.decision_ledger_ref.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/1301#issuecomment-2"));
+    let forced = || {
+        Command::builder()
+            .action(CommandAction::CrewComplete {
+                context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() },
+                message: Some("operator verdict".into()),
+                disposition: None,
+            })
+            .build()
+    };
+    // A forced completion to an unreachable convoy home fails, naming the home; nothing is
+    // queued, so nothing is sent once the route heals.
+    let error = router.dispatch_execute(forced()).await.expect_err("partitioned completion fails");
+    assert!(error.contains("convoy flotilla/stranded is homed at feta") && error.contains("home is unreachable"), "{error}");
+    assert!(error.contains("connect to feta at ssh://feta.example: outbound channel closed"), "{error}");
 
     let delivered = Arc::new(StdMutex::new(Vec::new()));
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(CapturePeerSender(Arc::clone(&delivered))));
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if !delivered.lock().expect("delivered lock").is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("queued completion should retry when the authority route heals");
+    // Longer than the retired outbox's first retry (1 s).
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(delivered.lock().expect("delivered lock").is_empty(), "a failed completion is not retried");
 
-    let request_id = match delivered.lock().expect("delivered lock").first().expect("retried command") {
-        PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, command, .. }) => {
-            assert!(matches!(
-                &command.action,
-                CommandAction::CrewComplete { message: Some(message), .. }
-                    if message == "https://github.com/flotilla-org/flotilla/pull/1301"
-            ));
+    router.dispatch_execute(forced()).await.expect("a reachable home receives the completion");
+    let request_id = match delivered.lock().expect("delivered lock").as_slice() {
+        [PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, command, .. })] => {
+            assert!(matches!(&command.action, CommandAction::CrewComplete { .. }));
             *request_id
         }
-        other => panic!("expected retried crew completion, got {other:?}"),
+        other => panic!("expected one routed crew completion, got {other:?}"),
     };
-    router.complete_remote_command(request_id, node("feta"), CommandValue::Error { message: "crew work no longer exists".into() }).await;
-    assert!(
-        sessions
-            .get("terminal-stranded-work-coder")
-            .await
-            .expect("terminal after acknowledgement")
-            .status
-            .expect("terminal status")
-            .completion_pending
-            .is_none(),
-        "authority rejection should retire the acknowledged durable intent"
-    );
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert_eq!(delivered.lock().expect("delivered lock").len(), 1, "permanent authority rejection must not retry");
-
-    router
-        .dispatch_execute(
-            Command::builder()
-                .action(CommandAction::CrewComplete {
-                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                    message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
-                    disposition: None,
-                    decision_ledger_ref: None,
-                    force: false,
-                })
-                .build(),
-        )
-        .await
-        .expect("reachable authority should accept a fresh completion");
-    let request_id = match delivered.lock().expect("delivered lock").get(1).expect("fresh completion") {
-        PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { request_id, .. }) => *request_id,
-        other => panic!("expected fresh crew completion, got {other:?}"),
-    };
-    router.complete_remote_command(request_id, node("feta"), CommandValue::CrewCompletionAdvisory { pending: vec![] }).await;
-    assert!(
-        sessions
-            .get("terminal-stranded-work-coder")
-            .await
-            .expect("terminal after successful acknowledgement")
-            .status
-            .expect("terminal status")
-            .completion_pending
-            .is_none(),
-        "successful authority acknowledgement should retire the durable completion intent"
-    );
+    router.complete_remote_command(request_id, node("feta"), CommandValue::Ok).await;
 
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(FailingPeerSender));
     // Both live crew queries route to the authority and report partitions;
     // contacts must not silently answer from a stale follower projection.
     for action in [
-        CommandAction::QueryCrewList { context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() } },
-        CommandAction::QueryMessageContacts { context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() } },
+        CommandAction::QueryCrewList { context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() } },
+        CommandAction::QueryMessageContacts { context: CrewCommandContext { crew_id: Some(crew.clone()), ..Default::default() } },
     ] {
         let query_error = router
             .dispatch_query(Command::builder().action(action).build(), uuid::Uuid::nil())
@@ -2111,59 +1690,42 @@ fn host_direct_kind(host_ref: &str) -> FulfilmentKindSpec {
 async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option<flotilla_protocol::CommandCaller>) {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
+    // feta's Host and placement kind, written at its home and replicated to both daemons as its
+    // log arrives.
+    let target = daemon.decided_store().expect("decided store");
+    let feta = flotilla_provisioning_testkit::other_home_for(&target, "feta");
     let remote_host_id = "feta-host-id".to_string();
-    let remote_hosts = remote_daemon.resource_backend().using::<Host>("flotilla");
-    let remote_host = remote_hosts
-        .create(&InputMeta::builder().name(remote_host_id.clone()).build(), &HostSpec::default())
-        .await
-        .expect("create remote host resource");
-    remote_hosts
-        .update_status(
-            &remote_host_id,
-            &remote_host.metadata.resource_version,
-            &HostStatus {
-                capabilities: BTreeMap::from([
-                    (
-                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                    ),
-                    (flotilla_resources::AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
-                ]),
-                fulfilment_facts: BTreeMap::from([(
-                    format!("host-direct-{remote_host_id}"),
-                    FulfilmentFacts {
-                        harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
-                        ..Default::default()
-                    },
-                )]),
-                heartbeat_at: Some(chrono::Utc::now()),
-                daemon_generation: Some("feta-test".to_string()),
-                ready: true,
-                disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
-                admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
-                ..HostStatus::default()
-            },
-        )
-        .await
-        .expect("publish remote host capacity");
-    daemon
-        .resource_backend()
-        .replica_writer::<Host>(node("feta"), "flotilla")
-        .replace(&remote_hosts.list().await.expect("list remote host resources"), chrono::Utc::now())
-        .await
-        .expect("replicate remote host capacity");
+    feta.host(
+        &remote_host_id,
+        &HostSpec::default(),
+        Some(&HostStatus {
+            capabilities: BTreeMap::from([
+                (
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                ),
+                (flotilla_resources::AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
+            ]),
+            fulfilment_facts: BTreeMap::from([(
+                format!("host-direct-{remote_host_id}"),
+                FulfilmentFacts {
+                    harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
+                    ..Default::default()
+                },
+            )]),
+            heartbeat_at: Some(chrono::Utc::now()),
+            daemon_generation: Some("feta-test".to_string()),
+            ready: true,
+            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+            ..HostStatus::default()
+        }),
+    )
+    .await;
     let remote_policy_name = format!("host-direct-{remote_host_id}");
-    let remote_kinds = remote_daemon.resource_backend().using::<FulfilmentKind>("flotilla");
-    remote_kinds
-        .create(&InputMeta::builder().name(remote_policy_name.clone()).build(), &host_direct_kind(&remote_host_id))
-        .await
-        .expect("remote fulfilment kind at its home");
-    daemon
-        .resource_backend()
-        .replica_writer::<FulfilmentKind>(node("feta"), "flotilla")
-        .replace(&remote_kinds.list().await.expect("list remote fulfilment kinds"), chrono::Utc::now())
-        .await
-        .expect("replicate remote fulfilment kind");
+    feta.kind(&remote_policy_name, &host_direct_kind(&remote_host_id)).await;
+    feta.replicate_to(&target);
+    feta.replicate_to(&remote_daemon.decided_store().expect("remote decided store"));
     let remote_summary = HostSummary::builder()
         .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(&remote_host_id)))
         .host_name(HostName::new("feta"))
@@ -2265,97 +1827,80 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
             .all(|policy| !policy.metadata.name.starts_with("placement-snapshot-")),
         "routing must not leave a dispatcher-owned snapshot with an in-flight remote reference"
     );
+    // The convoy's controller readies the placed work; the actuation host then requests its
+    // launch, and the dispatcher requests none.
+    let remote_engine = install_engine(&remote_daemon);
     let controller = ControllerLoop {
         primary: placed.using::<Convoy>("flotilla"),
         secondaries: Vec::new(),
-        reconciler: ConvoyReconciler::new(placed.definitions::<WorkflowTemplate>("flotilla"))
+        reconciler: flotilla_crew::convoy::ConvoyReconciler::new(remote_daemon.lifecycle_reads())
             .with_hosts(placed.including_replicas::<Host>("flotilla"))
-            .with_vessels(placed.using::<Vessel>("flotilla")),
-        resync_interval: Duration::from_millis(20),
+            .with_vessels(placed.including_replicas::<Vessel>("flotilla")),
         backend: placed.clone(),
     };
     let controller_task = tokio::spawn(controller.run());
-    let vessels = tokio::time::timeout(Duration::from_secs(5), async {
+    let requests = flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(placed.clone(), "flotilla")),
+        remote_daemon.lifecycle_reads(),
+        Arc::new(SanctionedRelease),
+        flotilla_protocol::CanonicalHostId::resolved(remote_host_id.as_str()),
+        [],
+    );
+    let requested = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let vessels = placed.using::<Vessel>("flotilla").list().await.expect("placed vessels");
-            if !vessels.items.is_empty() {
-                break vessels;
+            let requested = requests.sync_once(chrono::Utc::now()).await.expect("placed vessel requests").requested;
+            if !requested.is_empty() {
+                break requested;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("placed vessel authored");
+    .expect("placed vessel requested");
     controller_task.abort();
-    assert_eq!(vessels.items.len(), 1, "one vessel is authored at its actuation host");
-    assert_eq!(vessels.items[0].spec.convoy_ref, convoy.metadata.name);
-    assert!(daemon.resource_backend().using::<Vessel>("flotilla").list().await.expect("dispatcher vessels").items.is_empty());
+    assert_eq!(requested.len(), 1, "one vessel is launched at its actuation host");
+    let launch = flotilla_resources::vessel_records::VesselRecords::get(remote_engine.vessels.vessels.as_ref(), &requested[0], None)
+        .expect("read launch")
+        .expect("launch");
+    assert_eq!(launch.convoy, convoy.metadata.name);
+    assert!(flotilla_resources::vessel_records::VesselRecords::every(install_engine(&daemon).vessels.vessels.as_ref())
+        .expect("dispatcher launches")
+        .is_empty());
 
-    let environments = placed.using::<flotilla_resources::Environment>("flotilla");
     let environment_name = format!("host-direct-{remote_host_id}");
-    let environment = environments
-        .create(
-            &InputMeta::builder().name(environment_name.clone()).build(),
-            &flotilla_resources::EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
-                    host_ref: remote_host_id.clone(),
-                    repo_default_dir: "/workspace".to_string(),
-                }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("placement host environment");
-    environments
-        .update_status(
-            &environment_name,
-            &environment.metadata.resource_version,
-            &flotilla_resources::EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                configured_limits: None,
-                runtime_observation: None,
-                phase: flotilla_resources::EnvironmentPhase::Ready,
-                ready: true,
-                docker_container_id: None,
-                image_ref: None,
-                local_image_id: None,
-                registry_digest: None,
-                message: None,
-                credential_delivery_retry: None,
-                credential_refresh_retry: None,
-            },
-        )
-        .await
-        .expect("placement host environment ready");
-    let vessel_task = tokio::spawn(
-        ControllerLoop {
-            primary: placed.using::<Vessel>("flotilla"),
-            secondaries: flotilla_crew::reconcilers::vessel::VesselReconciler::secondary_watches(),
-            reconciler: flotilla_crew::reconcilers::vessel::VesselReconciler::new(placed.clone(), "flotilla"),
-            resync_interval: Duration::from_millis(20),
-            backend: placed.clone(),
-        }
-        .run(),
+    engine_environments(&remote_daemon).put_ready(
+        &environment_name,
+        &flotilla_resources::EnvironmentSpec {
+            host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
+                host_ref: remote_host_id.clone(),
+                repo_default_dir: "/workspace".to_string(),
+            }),
+            ..Default::default()
+        },
+        None,
+        "/workspace",
+        Default::default(),
     );
-    let terminal_task = tokio::spawn(
-        ControllerLoop {
-            primary: placed.using::<TerminalSession>("flotilla"),
-            secondaries: Vec::new(),
-            reconciler: flotilla_crew::reconcilers::terminal_session::TerminalSessionReconciler::new(
-                Arc::new(RunningTerminalRuntime),
-                placed.clone(),
-                "flotilla",
-            ),
-            resync_interval: Duration::from_millis(20),
-            backend: placed.clone(),
-        }
-        .run(),
+    let vessels = flotilla_orchestration_testkit::run_vessels(
+        &placed,
+        "flotilla",
+        flotilla_crew::reconcilers::vessel::VesselPlanning::new(placed.clone(), "flotilla", remote_daemon.account_records())
+            .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
+        Arc::clone(&install_engine(&remote_daemon).vessels.lifecycles),
+        remote_daemon.lifecycle_reads(),
+        remote_daemon.decided_store().expect("placement decided store"),
     );
+    // Stands in for the placement's TerminalSession controller, whose own tests cover it: each
+    // session its vessel requested is realised.
+    let terminals = &install_engine(&remote_daemon).terminals;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
+            use flotilla_resources::terminal_records::TerminalRecords as _;
+            for record in terminals.terminals.at(&terminals.home).expect("placement launches") {
+                if !record.ended() && !record.is_running() {
+                    terminals.ready(&record.name, &format!("session-{}", record.session_name()), &Default::default());
+                }
+            }
             let sessions = placed.using::<TerminalSession>("flotilla").list().await.expect("placement sessions");
             if sessions.items.iter().any(|session| {
                 session.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::TerminalSessionPhase::Running)
@@ -2368,8 +1913,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     })
     .await
     .expect("placement session reaches Running");
-    vessel_task.abort();
-    terminal_task.abort();
+    drop(vessels);
     assert!(daemon.resource_backend().using::<TerminalSession>("flotilla").list().await.expect("dispatcher sessions").items.is_empty());
 
     let disconnected_peers = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -2442,9 +1986,8 @@ async fn command_target_resolver_keeps_reads_local_and_routes_explicit_delivery(
                 name: "new-work".into(),
                 workflow_ref: "scratch".into(),
                 inputs: vec![],
-                repository_url: None,
                 r#ref: None,
-                project_ref: None,
+                project_ref: "flotilla".into(),
                 placement_policy: None,
                 adopted_checkout: None,
             },
@@ -2466,13 +2009,7 @@ async fn command_target_resolver_keeps_reads_local_and_routes_explicit_delivery(
 
     let unresolved = daemon
         .resolve_command_target(
-            &CommandAction::CrewComplete {
-                context: CrewCommandContext::default(),
-                message: None,
-                disposition: None,
-                decision_ledger_ref: None,
-                force: false,
-            },
+            &CommandAction::CrewComplete { context: CrewCommandContext::default(), message: None, disposition: None },
             None,
         )
         .await
@@ -2485,44 +2022,34 @@ async fn command_target_resolver_keeps_reads_local_and_routes_explicit_delivery(
 // refusal. A placement still needs a connected peer route for delivery.
 async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement() {
     let (_tmp, daemon) = empty_daemon().await;
-    let (_remote_tmp, remote_daemon) = empty_daemon_named("stopped").await;
-    let remote_backend = remote_daemon.resource_backend();
-    let hosts = remote_backend.using::<Host>("flotilla");
-    let host = hosts
-        .create(&InputMeta::builder().name("stopped-host-id".to_string()).build(), &HostSpec::default())
-        .await
-        .expect("create remote host");
-    hosts
-        .update_status(
-            &host.metadata.name,
-            &host.metadata.resource_version,
-            &HostStatus {
+    // The stopped daemon's records, written at its home and replicated here as its log arrives.
+    // Its Host is not ready: a blocking condition, as its daemon reports one.
+    let target = daemon.decided_store().expect("decided store");
+    let stopped = flotilla_provisioning_testkit::other_home_for(&target, "stopped");
+    let host_name = "stopped-host-id";
+    stopped
+        .host(
+            host_name,
+            &HostSpec::default(),
+            Some(&HostStatus {
                 daemon_generation: Some("stopped-generation".to_string()),
                 heartbeat_at: Some(chrono::Utc::now()),
                 ready: false,
+                conditions: vec![flotilla_resources::HostCondition::builder()
+                    .condition_type("Stopping")
+                    .value(flotilla_resources::ConditionValue::False)
+                    .reason("DaemonStopping")
+                    .message("the daemon is stopping")
+                    .observed_at(chrono::Utc::now())
+                    .blocks_forge_observation(false)
+                    .build()],
                 ..HostStatus::default()
-            },
+            }),
         )
-        .await
-        .expect("mark remote host not ready");
-    daemon
-        .resource_backend()
-        .replica_writer::<Host>(node("stopped"), "flotilla")
-        .replace(&hosts.list().await.expect("list remote host"), chrono::Utc::now())
-        .await
-        .expect("replicate not-ready host");
+        .await;
     let policy_name = "host-direct-stopped-host-id";
-    let kinds = remote_backend.using::<FulfilmentKind>("flotilla");
-    kinds
-        .create(&InputMeta::builder().name(policy_name.to_string()).build(), &host_direct_kind(&host.metadata.name))
-        .await
-        .expect("create remote fulfilment kind");
-    daemon
-        .resource_backend()
-        .replica_writer::<FulfilmentKind>(node("stopped"), "flotilla")
-        .replace(&kinds.list().await.expect("list remote fulfilment kinds"), chrono::Utc::now())
-        .await
-        .expect("replicate remote fulfilment kind");
+    stopped.kind(policy_name, &host_direct_kind(host_name)).await;
+    stopped.replicate_to(&target);
     let router = make_remote_command_router(
         &daemon,
         &Arc::new(Mutex::new(PeerManager::new(NodeId::new("local")))),
@@ -2551,27 +2078,11 @@ async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement()
         .expect_err("unreachable placement must be refused by peer routing");
     assert_eq!(error, "peer host stopped-host-id is not connected");
 
-    let statusless = hosts
-        .create(&InputMeta::builder().name("statusless-host-id".to_string()).build(), &HostSpec::default())
-        .await
-        .expect("create remote host without status");
-    daemon
-        .resource_backend()
-        .replica_writer::<Host>(node("stopped"), "flotilla")
-        .replace(&hosts.list().await.expect("list remote hosts"), chrono::Utc::now())
-        .await
-        .expect("replicate host without status");
+    let statusless = "statusless-host-id";
+    stopped.host(statusless, &HostSpec::default(), None).await;
     let statusless_policy = "host-direct-statusless-host-id";
-    kinds
-        .create(&InputMeta::builder().name(statusless_policy.to_string()).build(), &host_direct_kind(&statusless.metadata.name))
-        .await
-        .expect("create fulfilment kind without host status");
-    daemon
-        .resource_backend()
-        .replica_writer::<FulfilmentKind>(node("stopped"), "flotilla")
-        .replace(&kinds.list().await.expect("list remote fulfilment kinds"), chrono::Utc::now())
-        .await
-        .expect("replicate fulfilment kind without host status");
+    stopped.kind(statusless_policy, &host_direct_kind(statusless)).await;
+    stopped.replicate_to(&target);
     let error = router
         .dispatch_execute(
             Command::builder()
@@ -2591,29 +2102,6 @@ async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement()
         .await
         .expect_err("statusless placement still requires a connected route");
     assert_eq!(error, "peer host statusless-host-id is not connected");
-}
-
-struct RunningTerminalRuntime;
-
-#[async_trait::async_trait]
-impl flotilla_crew::reconcilers::terminal_session::TerminalRuntime for RunningTerminalRuntime {
-    async fn ensure_session(
-        &self,
-        name: &str,
-        _spec: TerminalSessionTarget<'_>,
-        _tags: &[flotilla_terminal::TerminalSessionTag],
-    ) -> Result<flotilla_crew::reconcilers::terminal_session::TerminalRuntimeState, String> {
-        Ok(flotilla_crew::reconcilers::terminal_session::TerminalRuntimeState::builder()
-            .session_id(format!("session-{name}"))
-            .pid(42)
-            .started_at(chrono::Utc::now())
-            .launch_command("test terminal".to_string())
-            .build())
-    }
-
-    async fn kill_session(&self, _session_id: &str, _spec: TerminalSessionTarget<'_>) -> Result<(), String> {
-        Ok(())
-    }
 }
 
 #[tokio::test]
@@ -2732,7 +2220,7 @@ async fn query_commands_return_directed_response_instead_of_remote_dispatch() {
 
     // Local query commands (host=None) execute directly and return QueryResult.
     let response = request_dispatcher
-        .dispatch(401, Request::Execute { command: Command::builder().action(CommandAction::QueryHostList {}).build() })
+        .dispatch(401, Request::Execute { command: Command::builder().action(CommandAction::QueryHostList {}).build(), request_key: None })
         .await;
 
     match ok_response(response, 401) {
@@ -2786,6 +2274,7 @@ async fn request_dispatcher_forwards_daemon_log_query_through_peer_manager() {
                 .dispatch(
                     402,
                     Request::Execute {
+                        request_key: None,
                         command: Command::builder()
                             .action(CommandAction::QueryDaemonLogs {
                                 query: DaemonLogQuery {
@@ -2876,6 +2365,8 @@ async fn remote_command_remote_step_events_remap_to_client_command_id_and_global
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -2987,6 +2478,8 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3234,6 +2727,8 @@ async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_com
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3400,6 +2895,8 @@ async fn cancel_disconnect_of_active_remote_segment_finishes_pending_command() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3590,6 +3087,8 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
     // Refresh reports physical checkout paths (#2574); macOS tempdirs sit behind /var -> /private/var.
     let physical_repo = std::fs::canonicalize(&repo).expect("canonical repo path");
@@ -3706,6 +3205,8 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&remote_repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3862,7 +3363,6 @@ async fn handle_client_forwards_peer_link_state_and_registers_peer() {
         connection_role: None,
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -3933,7 +3433,6 @@ async fn silent_peer_session_is_reaped_at_idle_deadline() {
         connection_role: None,
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write peer hello");
     assert!(matches!(
@@ -4408,7 +3907,6 @@ async fn assert_client_hello_rejected(protocol_version: u32, display_name: Strin
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -4452,7 +3950,6 @@ async fn wire_generation_mismatched_client_can_request_shutdown() {
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write client hello");
     let hello = reader.next_line().await.expect("read hello").expect("hello payload");
@@ -4486,7 +3983,6 @@ async fn wire_generation_mismatched_client_cannot_request_rich_rpc() {
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write client hello");
     let _hello = reader.next_line().await.expect("read hello").expect("hello payload");
@@ -4978,7 +4474,6 @@ async fn handle_client_relays_outbound_peer_messages() {
         connection_role: None,
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
     let _ = reader.next_line().await.expect("read hello").expect("line");
@@ -5099,7 +4594,6 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
             connection_role: None,
             surface: None,
             crew_claims: Default::default(),
-            primitives: false,
         };
         flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -5257,9 +4751,8 @@ impl flotilla_discovery_api::Factory for GatedStartupEnvironmentFactory {
 #[tokio::test]
 async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() {
     use flotilla_resources::{
-        ConvoyPhase, ConvoyStatus, CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
-        CredentialSpec, CredentialSpecSpec, TerminalSessionPhase, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
-        WorkflowSnapshot,
+        ConvoyStatus, CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
+        CredentialSpecSpec, VesselRequirement, WorkflowSnapshot,
     };
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -5280,27 +4773,18 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
     let server =
         DaemonServer::new(Vec::new(), config.clone(), discovery, socket_path.clone(), StdDuration::from_secs(60)).await.expect("server");
     let daemon = server.daemon();
-    // Match feta's stored convoy count without making wall time the slow-work oracle.
+    // Match feta's stored convoy count without making wall time the slow-work oracle: landed
+    // launches on the engine, which the runtime's restoration reads.
+    let path = daemon.convoy_engine_path();
     for index in 0..143 {
-        let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
-        let convoy = convoys
-            .create(
-                &InputMeta::builder().name(format!("stored-{index}")).build(),
-                &ConvoySpec::builder().workflow_ref("finished-workflow".to_string()).build(),
-            )
-            .await
-            .expect("stored convoy");
-        convoys
-            .update_status(
-                &convoy.metadata.name,
-                &convoy.metadata.resource_version,
-                &flotilla_resources::ConvoyStatus {
-                    phase: flotilla_resources::ConvoyPhase::Landed,
-                    ..flotilla_resources::ConvoyStatus::default()
-                },
-            )
-            .await
-            .expect("settled stored convoy");
+        let mut convoy = flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            &format!("stored-{index}"),
+            ConvoySpec::builder().workflow_ref("finished-workflow".to_string()).project_ref("flotilla".to_string()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        );
+        convoy.metadata.name = flotilla_engine_convoys_testkit::launch(&path, convoy.clone()).await;
+        flotilla_engine_convoys_testkit::land(&path, &convoy).await;
     }
     let backend = daemon.resource_backend();
     let env_ref = format!("host-direct-{}", daemon.local_host_id().expect("local host"));
@@ -5318,95 +4802,52 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
         )
         .await
         .expect("credential declaration");
-    let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name("live-credential-work".into()).build(),
-            &ConvoySpec::builder().workflow_ref("test".into()).build(),
-        )
-        .await
-        .expect("live convoy");
-    convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".into())
-                        .credential_refs(std::collections::BTreeSet::from(["work-token".into()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                ..ConvoyStatus::default()
+    let status = ConvoyStatus {
+        workflow_snapshot: Some(WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: vec![VesselRequirement::builder()
+                .name("work".into())
+                .credential_refs(std::collections::BTreeSet::from(["work-token".into()]))
+                .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                .build()],
+        }),
+        ..ConvoyStatus::default()
+    };
+    let spec = ConvoySpec::builder().workflow_ref("test".into()).project_ref("flotilla".into()).build();
+    let convoy = flotilla_engine_convoys_testkit::launch(
+        &daemon.convoy_engine_path(),
+        flotilla_engine_convoys_testkit::convoy("flotilla", "live-credential-work", spec, status),
+    )
+    .await;
+    // Written on its decided store before the runtime starts, as the runtime's engine finds it.
+    let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store().expect("decided store"));
+    let vessel = vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
+    vessels.ready(&vessel, &env_ref);
+    // The live crew's launch, running before this start as the last run's controller left it.
+    let spec = TerminalSessionSpec {
+        env_ref,
+        role: "coder".into(),
+        cwd: "/workspace".into(),
+        env: Default::default(),
+        pool: "passthrough".into(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector { capability: "code".into(), adapter: None, model: None },
+            brief: TerminalBrief {
+                artifact_digest: None,
+                path: ".flotilla/briefs/coder.md".into(),
+                content: "test".into(),
+                copies: Vec::new(),
             },
-        )
-        .await
-        .expect("live credential requirement");
-    let vessels = backend.using::<Vessel>("flotilla");
-    let vessel = vessels
-        .create(
-            &InputMeta::builder().name("live-work-vessel".into()).build(),
-            &VesselSpec {
-                convoy_ref: "live-credential-work".into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("live vessel");
-    vessels
-        .update_status(
-            &vessel.metadata.name,
-            &vessel.metadata.resource_version,
-            &VesselStatus { phase: VesselPhase::Ready, environment_ref: Some(env_ref.clone()), ..VesselStatus::default() },
-        )
-        .await
-        .expect("placed vessel");
-    let sessions = backend.using::<TerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder().name("live-crew".into()).build(),
-            &TerminalSessionSpec {
-                env_ref,
-                role: "coder".into(),
-                cwd: "/workspace".into(),
-                env: Default::default(),
-                pool: "passthrough".into(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector { capability: "code".into(), adapter: None, model: None },
-                    brief: TerminalBrief {
-                        artifact_digest: None,
-                        path: ".flotilla/briefs/coder.md".into(),
-                        content: "test".into(),
-                        copies: Vec::new(),
-                    },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "live-credential-work".into(),
-                        vessel_ref: "live-work-vessel".into(),
-                    }),
-                    message: None,
-                },
-            },
-        )
-        .await
-        .expect("live crew");
-    sessions
-        .update_status(
-            &session.metadata.name,
-            &session.metadata.resource_version,
-            &TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..TerminalSessionStatus::default() },
-        )
-        .await
-        .expect("running crew");
+            context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: convoy.clone(), vessel_ref: vessel }),
+        },
+    };
+    let terminals = runtime_terminals(&daemon);
+    let launch = terminals.request(&session_request("live-crew", &spec));
+    terminals.ready(&launch, "live-crew", &Default::default());
     let runtime = tokio::time::timeout(
         StdDuration::from_secs(2),
         crate::runtime::DaemonRuntime::start_with_options(
@@ -5465,7 +4906,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
     })
     .await
     .expect("background startup completes credential delivery");
-    runtime.shutdown();
+    runtime.shutdown().await;
     shutdown.send(true).expect("shutdown");
     task.await.expect("server task").expect("server stops");
 }
@@ -5485,6 +4926,8 @@ async fn remote_command_mutations_route_remote_step_requests() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -5510,6 +4953,7 @@ async fn remote_command_mutations_route_remote_step_requests() {
         .dispatch(
             402,
             Request::Execute {
+                request_key: None,
                 command: Command::builder()
                     .action(CommandAction::Checkout {
                         repo: RepoSelector::Identity(repo_identity.clone()),
@@ -5580,6 +5024,8 @@ async fn remote_checkout_completion_is_headless() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -5729,110 +5175,131 @@ async fn failed_connection_tasks_are_reaped() {
     assert!(tasks.is_empty());
 }
 
+pub(super) use crate::testkits::engine::engine_environments;
+use crate::testkits::engine::{admit_convoy, current_launch, engine as install_engine};
+
 pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     let (_tmp, daemon) = empty_daemon().await;
-    place_crew(&daemon, environment, PlacedCrew { convoy: "own", vessel: "placed-vessel", session: "placed-session", crew: "placed-crew" })
-        .await;
+    place_crew(&daemon, environment, PlacedCrew { convoy: "own", session: "placed-session" }).await;
     (_tmp, daemon)
 }
 
 /// One active single-agent convoy whose coder session is placed in an Environment.
 pub(super) struct PlacedCrew<'a> {
     pub convoy: &'a str,
-    pub vessel: &'a str,
     pub session: &'a str,
-    pub crew: &'a str,
 }
 
-pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, placed: PlacedCrew<'_>) {
-    let backend = daemon.resource_backend();
-    let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name(placed.convoy.into()).build(),
-            &ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
-        )
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            placed.convoy,
-            &convoy.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Active,
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([(
-                        "coder".into(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                    )]),
-                )]),
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    vessels: flotilla_resources::single_agent_workflow_spec().vessels,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("active crew work");
-    backend
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder().name(placed.vessel.into()).build(),
-            &flotilla_resources::VesselSpec {
-                convoy_ref: placed.convoy.into(),
-                vessel_name: "work".into(),
-                fulfilment_kind_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("placed vessel");
-    let sessions = backend.using::<TerminalSession>("flotilla");
-    let created = sessions
-        .create(
-            &InputMeta::builder().name(placed.session.into()).build(),
-            &TerminalSessionSpec {
-                env_ref: environment.into(),
-                role: "coder".into(),
-                cwd: "/workspace".into(),
-                pool: "cleat".into(),
-                env: Default::default(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("coding"),
-                    brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: placed.convoy.into(),
-                        vessel_ref: placed.vessel.into(),
-                    }),
-                    message: None,
-                },
-            },
-        )
-        .await
-        .expect("placed session");
-    sessions
-        .update_status(
-            placed.session,
-            &created.metadata.resource_version,
-            &TerminalSessionStatus {
-                crew: Some(
-                    CrewSessionStatus::builder().id(placed.crew.into()).adapter("codex".into()).stance("trusted-implicit".into()).build(),
-                ),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("crew identity");
+/// The launch that serves convoy `convoy`'s work at `daemon`: its crew's vessel.
+pub(super) fn vessel_of(daemon: &InProcessDaemon, convoy: &str) -> String {
+    let engine = install_engine(daemon);
+    flotilla_resources::vessel_records::VesselRecords::of_convoy(engine.vessels.vessels.as_ref(), &current_launch(daemon, convoy))
+        .expect("read launches")
+        .pop()
+        .expect("a launch")
+        .name
 }
 
-mod primitives_peering;
+/// The newest launch of session `session` at `daemon`'s engine: the crew id of its crew.
+pub(super) fn launch_of(daemon: &InProcessDaemon, session: &str) -> String {
+    let engine = install_engine(daemon);
+    flotilla_resources::terminal_records::TerminalRecords::get(engine.terminals.terminals.as_ref(), session, None)
+        .expect("read launch")
+        .expect("a launch")
+        .name
+}
+
+/// Places `placed`'s crew in `environment`, returning its convoy's launch.
+pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, placed: PlacedCrew<'_>) -> String {
+    let (convoy, spec) = crew_session(daemon, environment, placed.convoy).await;
+    run_session(daemon, placed.session, &spec, &codex_crew_facts());
+    convoy
+}
+
+/// An active single-agent convoy `convoy`'s launch, and its coder session placed in
+/// `environment`, not yet requested.
+pub(super) async fn crew_session(daemon: &InProcessDaemon, environment: &str, convoy: &str) -> (String, TerminalSessionSpec) {
+    let mut vessels = flotilla_resources::single_agent_workflow_spec().vessels;
+    // These identity scenarios have no PR deliverable.
+    let coder = &mut vessels[0].crew[0];
+    coder.deliverer = false;
+    coder.completion_conditions.clear();
+    coder.promises.clear();
+    let status = flotilla_resources::ConvoyStatus {
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            vessels,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+        }),
+        ..Default::default()
+    };
+    let spec = ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref("flotilla".into()).build();
+    let convoy = admit_convoy(daemon, flotilla_engine_convoys_testkit::convoy("flotilla", convoy, spec, status)).await;
+    let vessel = install_engine(daemon).vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
+    let spec = TerminalSessionSpec {
+        env_ref: environment.into(),
+        role: "coder".into(),
+        cwd: "/workspace".into(),
+        pool: "cleat".into(),
+        env: Default::default(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector::for_capability("coding"),
+            brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
+            context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: convoy.clone(), vessel_ref: vessel }),
+        },
+    };
+    (convoy, spec)
+}
+
+// Behaviour (d16 finding 1): a launch starts its crew's process before its realise commits, and
+// the crew may call at once. Its identity is its launch's request, committed before the process
+// starts: a caller whose session is still starting is placed as that launch's crew, at once, and
+// as the same crew once realised. An environment with no crew session places none.
+#[tokio::test]
+async fn a_crew_calling_while_its_session_starts_is_placed_once_realised() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let (_, spec) = crew_session(&daemon, "starting-environment", "own").await;
+    let launch = request_session(&daemon, "starting-session", &spec);
+    let placed = || async {
+        let crews = super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("starting-environment"))
+            .await
+            .expect("placement identity");
+        crews.into_iter().map(|crew| crew.crew_id).collect::<Vec<_>>()
+    };
+
+    assert_eq!(placed().await, vec![launch.clone()], "placed while its session starts");
+    install_engine(&daemon).terminals.ready(&launch, "starting-session", &codex_crew_facts());
+    assert_eq!(placed().await, vec![launch.clone()], "the same crew once realised");
+
+    let none = super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("empty-environment")).await.expect("read");
+    assert!(none.is_empty());
+}
+
+/// A release gate that sanctions every ended convoy's reclaim.
+struct SanctionedRelease;
+
+#[async_trait::async_trait]
+impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for SanctionedRelease {
+    async fn may_release(&self, _convoy: &str, _convoy_home: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The facts of a Codex crew's launch that runs trusted.
+fn codex_crew_facts() -> flotilla_resources::terminal_records::TerminalLaunchFacts {
+    flotilla_resources::terminal_records::TerminalLaunchFacts {
+        agent: Some(flotilla_resources::terminal_records::AgentLaunch {
+            adapter: "codex".into(),
+            model: None,
+            stance: "trusted-implicit".into(),
+        }),
+        ..Default::default()
+    }
+}
+
 mod ssh_host_forward;
 
 // #3270: the transport's environment constrains every request, independently of
@@ -5842,43 +5309,27 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
     let (_tmp, daemon) = placed_crew_daemon("placed-environment").await;
     let backend = daemon.resource_backend();
     let convoys = backend.using::<Convoy>("flotilla");
+    let own = current_launch(&daemon, "own");
     let pm = Arc::new(Mutex::new(PeerManager::new(daemon.node_id().clone())));
     // CallerCrew.vessel is the resource reference used by artifact attribution,
     // not the within-convoy vessel display name.
     let crews = super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("placed-environment"))
         .await
         .expect("placement identity");
-    assert_eq!(crews[0].vessel, "placed-vessel");
+    assert_eq!(crews[0].vessel, vessel_of(&daemon, "own"));
     // #3271: real indexed placement maps a kernel-derived container identity;
     // new-style container claims never select a crew outside that environment.
-    let environments = backend.using::<flotilla_resources::Environment>("flotilla");
-    let environment = environments
-        .create(
-            &InputMeta::builder().name("placed-environment".into()).build(),
-            &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
-                serde_json::json!({"docker": {"host_ref": "host", "image": "image"}}),
-            )
-            .unwrap(),
+    // The environment is realised under its container's immutable ID.
+    engine_environments(&daemon).put_ready(
+        "placed-environment",
+        &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
+            serde_json::json!({"docker": {"host_ref": "host", "image": "image"}}),
         )
-        .await
-        .unwrap();
-    environments
-        .update_status(
-            "placed-environment",
-            &environment.metadata.resource_version,
-            &flotilla_resources::EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                docker_container_id: Some("actuation-container-name".into()),
-                runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
-                    container_id: Some("kernel-container".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        .unwrap(),
+        None,
+        "kernel-container",
+        Default::default(),
+    );
     let mounts = caller_mountinfo(&EnvironmentId::new("placed-environment"), true);
     let evidence = flotilla_protocol::CommandCaller {
         principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
@@ -5887,10 +5338,10 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
     };
     let claims = std::collections::HashMap::from([
         ("FLOTILLA_NAMESPACE".into(), "flotilla".into()),
-        ("FLOTILLA_CONVOY".into(), "own".into()),
-        ("FLOTILLA_VESSEL".into(), "placed-vessel".into()),
+        ("FLOTILLA_CONVOY".into(), current_launch(&daemon, "own")),
+        ("FLOTILLA_VESSEL".into(), vessel_of(&daemon, "own")),
         ("FLOTILLA_CREW_ROLE".into(), "coder".into()),
-        ("FLOTILLA_CREW_ID".into(), "placed-crew".into()),
+        ("FLOTILLA_CREW_ID".into(), launch_of(&daemon, "placed-session")),
         ("FLOTILLA_TERMINAL_SESSION".into(), "placed-session".into()),
     ]);
     let resolved = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&mounts)).await.unwrap();
@@ -5956,6 +5407,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         Request::Shutdown,
         Request::GetStatus,
         Request::Execute {
+            request_key: None,
             command: Command::builder()
                 .action(CommandAction::QueryCrewList { context: CrewCommandContext { convoy: Some("other".into()), ..Default::default() } })
                 .build(),
@@ -5996,6 +5448,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         .write(Message::Request {
             id: 10,
             request: Request::Execute {
+                request_key: None,
                 command: Command::builder()
                     .action(CommandAction::CrewPromise {
                         context: CrewCommandContext::default(),
@@ -6011,7 +5464,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
     };
     assert!(matches!(read_session_message(&client).await, Message::Event { event }
         if matches!(event.as_ref(), DaemonEvent::CommandFinished { command_id: finished, result: CommandValue::Ok, .. } if *finished == command_id)));
-    let convoy = convoys.get("own").await.expect("updated convoy");
+    let convoy = convoys.get(&own).await.expect("updated convoy");
     assert!(flotilla_resources::promises::owned(convoy.status.as_ref().expect("status"), "work", "coder")
         .iter()
         .any(|promise| promise.id == "relay-proof"));
@@ -6038,7 +5491,7 @@ async fn environment_client_lease_releases_idle_accounting() {
 }
 
 pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
-    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Project, ProjectSpec};
+    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, Project, ProjectSpec};
     let (_tmp, daemon) = empty_daemon().await;
     let backend = daemon.resource_backend();
     backend
@@ -6052,116 +5505,70 @@ pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
         )
         .await
         .unwrap();
+    let host = daemon.local_host_id().expect("local host").to_string();
+    // The supervisor is the current generation of the standing role `holder` declares, so the
+    // engine names it by that role.
+    let supervisor = flotilla_resources::convoy::engine::standing_name("project-a", "lead").expect("standing name");
     for (name, project) in [("supervisor", "project-a"), ("target", "project-a"), ("foreign", "project-b")] {
-        backend
-            .using::<Convoy>("flotilla")
-            .create(
-                &InputMeta::builder().name(name.into()).build(),
-                &ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref(project.into()).build(),
-            )
-            .await
-            .unwrap();
+        let mut spec = ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref(project.into()).build();
+        let status = flotilla_engine_convoys_testkit::single_agent("coder");
+        if name == "supervisor" {
+            spec.role = "lead".into();
+        }
+        let mut convoy = flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, status);
+        if name == "supervisor" {
+            convoy.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), "holder".into());
+        }
+        let launch = admit_convoy(&daemon, convoy).await;
+        install_engine(&daemon).vessels.request(&launch, "work", &host);
     }
-    for (vessel, convoy) in [("supervisor-vessel", "supervisor"), ("target-vessel", "target"), ("foreign-vessel", "foreign")] {
-        backend
-            .using::<Vessel>("flotilla")
-            .create(
-                &InputMeta::builder().name(vessel.into()).build(),
-                &flotilla_resources::VesselSpec {
-                    convoy_ref: convoy.into(),
-                    vessel_name: "work".into(),
-                    fulfilment_kind_ref: "policy".into(),
-                    adopted_checkout_refs: Default::default(),
-                },
-            )
-            .await
-            .unwrap();
-    }
-    let sessions = backend.using::<TerminalSession>("flotilla");
-    let created = sessions
-        .create(
-            &InputMeta::builder()
-                .name("supervisor-session".into())
-                .labels(BTreeMap::from([
-                    (flotilla_resources::CONVOY_LABEL.into(), "supervisor".into()),
-                    (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
-                    (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
-                ]))
-                .build(),
-            &TerminalSessionSpec {
-                env_ref: "supervisor-environment".into(),
-                role: "coder".into(),
-                cwd: "/workspace".into(),
-                pool: "cleat".into(),
-                env: Default::default(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector::for_capability("coding"),
-                    brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
-                    context: Box::new(TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "supervisor".into(),
-                        vessel_ref: "supervisor-vessel".into(),
-                    }),
-                    message: None,
-                },
-            },
-        )
-        .await
-        .unwrap();
-    sessions
-        .update_status(
-            "supervisor-session",
-            &created.metadata.resource_version,
-            &TerminalSessionStatus {
-                crew: Some(
-                    CrewSessionStatus::builder()
-                        .id("supervisor-crew".into())
-                        .adapter("codex".into())
-                        .stance("trusted-implicit".into())
-                        .build(),
-                ),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
-    ensures
+    let spec = TerminalSessionSpec {
+        env_ref: "supervisor-environment".into(),
+        role: "coder".into(),
+        cwd: "/workspace".into(),
+        pool: "cleat".into(),
+        env: Default::default(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector::for_capability("coding"),
+            brief: TerminalBrief { path: "brief.md".into(), content: "work".into(), copies: Vec::new(), artifact_digest: None },
+            context: Box::new(TerminalCrewContext {
+                namespace: "flotilla".into(),
+                convoy: current_launch(&daemon, &supervisor),
+                vessel_ref: vessel_of(&daemon, &supervisor),
+            }),
+        },
+    };
+    let launch = request_session(&daemon, "supervisor-session", &spec);
+    install_engine(&daemon).terminals.ready(&launch, "supervisor-session", &codex_crew_facts());
+    backend
+        .using::<ConvoyEnsure>("flotilla")
         .create(
             &InputMeta::builder().name("holder".into()).build(),
             &ConvoyEnsureSpec::builder().project_ref("project-a".into()).role("lead".into()).repositories(Vec::new()).build(),
         )
         .await
         .unwrap();
-    ensures
-        .update_status(
-            "holder",
-            &ensures.get("holder").await.unwrap().metadata.resource_version,
-            &ConvoyEnsureStatus { convoy_ref: Some("supervisor".into()), ..Default::default() },
-        )
-        .await
-        .unwrap();
     (_tmp, daemon)
 }
 
-// Supervision is conferred by a current role holder's subscription, not by a
-// caller's role spelling. Every extra command stays within that bound Project.
+// Supervision authority is where supervision is routed (here a current role holder's
+// subscription), not a caller's role spelling. Every extra command stays within that Project.
 #[tokio::test]
 async fn environment_supervisor_authority_is_project_bound_and_revocable() {
-    use flotilla_resources::ConvoyEnsure;
     let (_tmp, daemon) = supervisor_daemon().await;
     let backend = daemon.resource_backend();
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
     let crew =
         super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("supervisor-environment")).await.unwrap().remove(0);
     let mut ordinary = crew.clone();
     ordinary.role = "governor".into(); // A name alone is never a binding.
     ordinary.terminal_session = None;
-    let request = |action| Request::Execute { command: Command::builder().action(action).build() };
-    for (convoy, vessel, allowed) in [("target", "target-vessel", true), ("foreign", "foreign-vessel", false)] {
+    let request = |action| Request::Execute { command: Command::builder().action(action).build(), request_key: None };
+    for (of, allowed) in [("target", true), ("foreign", false)] {
+        let convoy = current_launch(&daemon, of);
+        let convoy = convoy.as_str();
         let context = CrewCommandContext {
             convoy: Some(convoy.into()),
-            vessel_ref: Some(vessel.into()),
+            vessel_ref: Some(vessel_of(&daemon, of)),
             role: Some("coder".into()),
             ..Default::default()
         };
@@ -6224,7 +5631,7 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     ] {
         let mut scoped = request(action);
         super::environment_supervision::authorize(&daemon, &mut scoped, &crew).await.unwrap();
-        let Request::Execute { command } = scoped else { panic!("execute") };
+        let Request::Execute { command, .. } = scoped else { panic!("execute") };
         let selected = match command.action {
             CommandAction::QueryDispatchBoard { project }
             | CommandAction::QueryDispatchQueue { project }
@@ -6236,8 +5643,8 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     let mut forged = request(CommandAction::CrewFail {
         context: CrewCommandContext {
             crew_id: Some("forged-crew-id".into()),
-            convoy: Some("target".into()),
-            vessel_ref: Some("target-vessel".into()),
+            convoy: Some(current_launch(&daemon, "target")),
+            vessel_ref: Some(vessel_of(&daemon, "target")),
             role: Some("coder".into()),
             ..Default::default()
         },
@@ -6256,7 +5663,7 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     }
     for context in [
         CrewCommandContext { crew_id: Some(crew.crew_id.clone()), role: Some("forged-role".into()), ..Default::default() },
-        CrewCommandContext { crew_id: Some(crew.crew_id.clone()), vessel_ref: Some("foreign-vessel".into()), ..Default::default() },
+        CrewCommandContext { crew_id: Some(crew.crew_id.clone()), vessel_ref: Some(vessel_of(&daemon, "foreign")), ..Default::default() },
     ] {
         assert!(super::environment_supervision::authorize(
             &daemon,
@@ -6268,8 +5675,12 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     }
     // A valid own-project convoy cannot hide a foreign vessel or namespace.
     for context in [
-        CrewCommandContext { convoy: Some("target".into()), vessel_ref: Some("foreign-vessel".into()), ..Default::default() },
-        CrewCommandContext { namespace: Some("other".into()), convoy: Some("target".into()), ..Default::default() },
+        CrewCommandContext {
+            convoy: Some(current_launch(&daemon, "target")),
+            vessel_ref: Some(vessel_of(&daemon, "foreign")),
+            ..Default::default()
+        },
+        CrewCommandContext { namespace: Some("other".into()), convoy: Some(current_launch(&daemon, "target")), ..Default::default() },
     ] {
         assert!(super::environment_supervision::authorize(&daemon, &mut request(CommandAction::QueryCrewList { context }), &crew)
             .await
@@ -6277,8 +5688,8 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     }
     let mut fail = request(CommandAction::CrewFail {
         context: CrewCommandContext {
-            convoy: Some("target".into()),
-            vessel_ref: Some("target-vessel".into()),
+            convoy: Some(current_launch(&daemon, "target")),
+            vessel_ref: Some(vessel_of(&daemon, "target")),
             role: Some("coder".into()),
             ..Default::default()
         },
@@ -6287,13 +5698,26 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     });
     super::environment_supervision::authorize(&daemon, &mut fail, &crew).await.unwrap();
     assert!(
-        matches!(fail, Request::Execute { command } if matches!(&command.action, CommandAction::CrewSupervise { actor_crew_id: Some(id), operation: flotilla_protocol::CrewSupervisionAction::Fail, .. } if id == &crew.crew_id))
+        matches!(fail, Request::Execute { command, .. } if matches!(&command.action, CommandAction::CrewSupervise { actor_crew_id: Some(id), operation: flotilla_protocol::CrewSupervisionAction::Fail, .. } if id == &crew.crew_id))
     );
     let mut read = request(CommandAction::QueryCrewStalls { full: true });
     assert!(super::environment_supervision::authorize(&daemon, &mut read, &crew).await.is_ok());
     assert!(super::environment_supervision::authorize(&daemon, &mut read, &ordinary).await.is_err());
-    ensures.delete("holder").await.unwrap();
-    assert!(super::environment_supervision::authorize(&daemon, &mut read, &crew).await.is_err(), "retired role binding loses authority");
+    // Authority follows supervision routing: once the Project no longer routes supervision to
+    // the role, its holder is no longer the Project's supervisor.
+    let projects = backend.using::<flotilla_resources::Project>("flotilla");
+    projects.delete("project-a").await.unwrap();
+    projects
+        .create(
+            &InputMeta::builder().name("project-a".into()).build(),
+            &serde_json::from_value::<flotilla_resources::ProjectSpec>(serde_json::json!({"display_name": "A"})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        super::environment_supervision::authorize(&daemon, &mut read, &crew).await.is_err(),
+        "a role supervision no longer reaches loses authority"
+    );
 }
 
 pub(super) fn caller_mountinfo(environment: &EnvironmentId, bound: bool) -> super::caller::PeerMounts {
@@ -6310,50 +5734,21 @@ pub(super) fn caller_mountinfo(environment: &EnvironmentId, bound: bool) -> supe
     }
 }
 
-fn placed_caller_claims() -> HashMap<String, String> {
+fn placed_caller_claims(daemon: &InProcessDaemon) -> HashMap<String, String> {
     HashMap::from([
         ("FLOTILLA_NAMESPACE".into(), "flotilla".into()),
-        ("FLOTILLA_CONVOY".into(), "own".into()),
-        ("FLOTILLA_VESSEL".into(), "placed-vessel".into()),
+        ("FLOTILLA_CONVOY".into(), current_launch(daemon, "own")),
+        ("FLOTILLA_VESSEL".into(), vessel_of(daemon, "own")),
         ("FLOTILLA_CREW_ROLE".into(), "coder".into()),
-        ("FLOTILLA_CREW_ID".into(), "placed-crew".into()),
+        ("FLOTILLA_CREW_ID".into(), launch_of(daemon, "placed-session")),
         ("FLOTILLA_TERMINAL_SESSION".into(), "placed-session".into()),
     ])
 }
 
-async fn caller_can_stall_and_complete(daemon: &InProcessDaemon, caller: flotilla_protocol::CommandCaller) {
+async fn caller_can_stall_and_promise(daemon: &InProcessDaemon, caller: flotilla_protocol::CommandCaller) {
     let backend = daemon.resource_backend();
     let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys.get("own").await.unwrap();
-    let mut status = convoy.status.unwrap();
-    let coder = &mut status.workflow_snapshot.as_mut().unwrap().vessels[0].crew[0];
-    // This identity scenario has no PR deliverable. It still supplies real
-    // admitted ledger metadata, so completion exercises the normal lifecycle.
-    coder.deliverer = false;
-    coder.completion_conditions.clear();
-    coder.promises.clear();
-    convoys.update_status("own", &convoy.metadata.resource_version, &status).await.unwrap();
-    let name = flotilla_resources::address::record_name(
-        &flotilla_resources::address::artifact_address("own", "coder", "decision-ledger", "own").expect("artifact address"),
-    )
-    .expect("record name");
-    backend
-        .using::<flotilla_resources::Artifact>("flotilla")
-        .create(
-            &InputMeta::builder().name(name).build(),
-            &flotilla_resources::ArtifactSpec::builder()
-                .convoy("own".into())
-                .producer("coder".into())
-                .kind("decision-ledger".into())
-                .subject("own".into())
-                .digest("admitted-ledger".into())
-                .size(1)
-                .media_type("text/markdown".into())
-                .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
-                .build(),
-        )
-        .await
-        .unwrap();
+    let own = current_launch(daemon, "own");
     let context = CrewCommandContext { crew_id: caller.crew.as_ref().map(|crew| crew.crew_id.clone()), ..Default::default() };
     for action in [
         CommandAction::CrewStall {
@@ -6362,83 +5757,111 @@ async fn caller_can_stall_and_complete(daemon: &InProcessDaemon, caller: flotill
             proposed_disposition: None,
             message: "waiting for dependency".into(),
         },
-        CommandAction::CrewComplete { context, message: Some("done".into()), disposition: None, decision_ledger_ref: None, force: false },
+        CommandAction::CrewPromise {
+            context,
+            operation: flotilla_protocol::commands::CrewPromiseOperation::Promise { id: "follow-up".into(), kind: "pr".into() },
+        },
     ] {
         let stalling = matches!(action, CommandAction::CrewStall { .. });
-        let mut events = daemon.subscribe();
+        let completion = daemon.capture_completion();
         let id = daemon.execute_for_caller(Command::builder().action(action).build(), Some(caller.clone())).await.unwrap();
-        let event = super::environment_connection::command_completion(&mut events, id).await.unwrap();
-        assert!(
-            matches!(&event, DaemonEvent::CommandFinished { result, .. }
-            if if stalling { matches!(result, CommandValue::Ok) } else { matches!(result, CommandValue::CrewCompletionAdvisory { .. }) }),
-            "{event:?}"
-        );
-        let status = convoys.get("own").await.unwrap().status.unwrap();
-        let work = &status.crew_work["work"]["coder"];
-        if stalling {
-            assert_eq!(work.phase, flotilla_resources::CrewWorkPhase::Stalled);
-        } else {
-            assert_eq!(work.phase, flotilla_resources::CrewWorkPhase::Stalled);
-            assert!(work.completion_refusal.is_none());
+        let event = super::environment_connection::command_completion(completion, id).await.unwrap();
+        assert!(matches!(&event, DaemonEvent::CommandFinished { result: CommandValue::Ok, .. }), "{event:?}");
+        let status = convoys.get(&own).await.unwrap().status.unwrap();
+        // The crew's stall is the home's stall judgement, made by the coder; the seat reads
+        // Stalled once its supervision opens a stall record about it.
+        let maker = status.stalled.as_ref().and_then(|stall| stall.maker.clone());
+        assert_eq!(maker, Some(flotilla_resources::LeafMaker::Actor { vessel: "work".into(), role: "coder".into() }));
+        if !stalling {
+            assert!(flotilla_resources::promises::owned(&status, "work", "coder").iter().any(|promise| promise.id == "follow-up"));
         }
     }
 }
 
 // Host-direct is out of scope: keep its existing variable-derived crew identity
-// and prove both stall and completion still persist through the real lifecycle.
+// and prove both a stall and a promise still persist through the real lifecycle.
 #[tokio::test]
-async fn host_direct_caller_keeps_crew_completion_and_stall() {
+async fn host_direct_caller_keeps_crew_stall_and_promise() {
     let (_tmp, daemon) = placed_crew_daemon("host-direct-fixture").await;
-    daemon
-        .resource_backend()
-        .using::<flotilla_resources::Environment>("flotilla")
-        .create(
-            &InputMeta::builder().name("host-direct-fixture".into()).build(),
-            &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
-                serde_json::json!({"host_direct": {"host_ref": "local", "repo_default_dir": "/workspace"}}),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+    let environments = engine_environments(&daemon);
+    let host_direct = serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
+        serde_json::json!({"host_direct": {"host_ref": "local", "repo_default_dir": "/workspace"}}),
+    )
+    .unwrap();
     let evidence = flotilla_protocol::CommandCaller {
         principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
         process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).build()),
         crew: None,
     };
-    // A stale container observation on a host-direct record cannot establish
-    // container authority, even when its ID and dedicated mount name match.
-    let environments = daemon.resource_backend().using::<flotilla_resources::Environment>("flotilla");
-    let current = environments.get("host-direct-fixture").await.unwrap();
-    environments
-        .update_status(
-            "host-direct-fixture",
-            &current.metadata.resource_version,
-            &flotilla_resources::EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
-                    container_id: Some("stale-container".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    // A host-direct environment cannot establish container authority, even when realised under
+    // the caller's container ID and its dedicated mount name matches.
+    environments.put_ready("host-direct-fixture", &host_direct, None, "stale-container", Default::default());
     let mut contained = evidence.clone();
     contained.process.as_mut().unwrap().container = Some("stale-container".into());
     let mounts = caller_mountinfo(&EnvironmentId::new("host-direct-fixture"), true);
-    for claims in [Default::default(), placed_caller_claims()] {
+    for claims in [Default::default(), placed_caller_claims(&daemon)] {
         assert_eq!(
             super::caller::resolve_main_caller(&daemon, contained.clone(), &claims, Some(&mounts)).await.unwrap_err(),
             "CallerIdentityUnavailable: container has no placed environment"
         );
     }
-    let resolution = super::caller::resolve_main_caller(&daemon, evidence, &placed_caller_claims(), None).await.unwrap();
+    let resolution = super::caller::resolve_main_caller(&daemon, evidence, &placed_caller_claims(&daemon), None).await.unwrap();
     assert!(!resolution.transport_bound);
-    assert_eq!(resolution.caller.crew.as_ref().unwrap().crew_id, "placed-crew");
-    caller_can_stall_and_complete(&daemon, resolution.caller).await;
+    assert_eq!(resolution.caller.crew.as_ref().unwrap().crew_id, launch_of(&daemon, "placed-session"));
+    caller_can_stall_and_promise(&daemon, resolution.caller).await;
+}
+
+// A crew command answers with its id once accepted, before it runs, so however long it runs
+// (a handoff delivering across many convoys) the client's request does not wait on it. A retry
+// that carries the request's key follows the first execution instead of running again: a
+// promise, which refuses a second declaration of its label, is declared once and both answer Ok.
+#[tokio::test]
+async fn crew_commands_answer_on_acceptance_and_keyed_retries_run_once() {
+    use futures::FutureExt;
+    let (_tmp, daemon) = placed_crew_daemon("placed-environment").await;
+    let evidence = flotilla_protocol::CommandCaller {
+        principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+        process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).build()),
+        crew: None,
+    };
+    let caller = super::caller::resolve_main_caller(&daemon, evidence, &placed_caller_claims(&daemon), None).await.unwrap().caller;
+    let context = CrewCommandContext { crew_id: caller.crew.as_ref().map(|crew| crew.crew_id.clone()), ..Default::default() };
+    let promise = || {
+        Command::builder()
+            .action(CommandAction::CrewPromise {
+                context: context.clone(),
+                operation: flotilla_protocol::commands::CrewPromiseOperation::Promise { id: "once".into(), kind: "pr".into() },
+            })
+            .build()
+    };
+    let keyed =
+        |command| daemon.execute_keyed(Some("retry-key"), Some(&caller), daemon.execute_for_caller_typed(command, Some(caller.clone())));
+    let completion = daemon.capture_completion();
+    let first = keyed(promise()).await.unwrap();
+    let mut first_finished = Box::pin(completion.finished(first));
+    assert!((&mut first_finished).now_or_never().is_none(), "the answer does not wait for the command to run");
+    let completion = daemon.capture_completion();
+    let retry = keyed(promise()).await.unwrap();
+    assert_ne!(first, retry, "a retry is answered under its own id");
+    for finished in [first_finished.await, completion.finished(retry).await] {
+        let finished = finished.expect("outcome");
+        assert!(matches!(&finished, DaemonEvent::CommandFinished { result: CommandValue::Ok, .. }), "{finished:?}");
+    }
+    let completion = daemon.capture_completion();
+    let late = keyed(promise()).await.unwrap();
+    assert!(matches!(completion.finished(late).await, Some(DaemonEvent::CommandFinished { result: CommandValue::Ok, .. })));
+
+    // Unkeyed, the same command runs again, and the promise refuses its second declaration.
+    let completion = daemon.capture_completion();
+    let again = daemon.execute_for_caller(promise(), Some(caller.clone())).await.unwrap();
+    let refused = completion.finished(again).await.expect("outcome");
+    assert!(
+        matches!(&refused, DaemonEvent::CommandFinished { result: CommandValue::Error { message }, .. } if message.contains("already exists")),
+        "{refused:?}"
+    );
+    let own = current_launch(&daemon, "own");
+    let status = daemon.resource_backend().using::<Convoy>("flotilla").get(&own).await.unwrap().status.unwrap();
+    assert_eq!(flotilla_resources::promises::owned(&status, "work", "coder").iter().filter(|promise| promise.id == "once").count(), 1);
 }
 
 // A pre-#3270 mount set continues to work independently of socket adoption.
@@ -6446,51 +5869,31 @@ async fn host_direct_caller_keeps_crew_completion_and_stall() {
 #[tokio::test]
 async fn legacy_mount_caller_keeps_working_until_vessel_ends() {
     let (_tmp, daemon) = placed_crew_daemon("placed-environment").await;
-    let backend = daemon.resource_backend();
-    let environments = backend.using::<flotilla_resources::Environment>("flotilla");
-    let created = environments
-        .create(
-            &InputMeta::builder().name("placed-environment".into()).build(),
-            &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
-                serde_json::json!({"docker": {"host_ref": "host", "image": "image"}}),
-            )
-            .unwrap(),
+    let environments = engine_environments(&daemon);
+    environments.request(
+        "placed-environment",
+        &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
+            serde_json::json!({"docker": {"host_ref": "host", "image": "image"}}),
         )
-        .await
-        .unwrap();
-    environments
-        .update_status(
-            "placed-environment",
-            &created.metadata.resource_version,
-            &flotilla_resources::EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                docker_container_id: Some("actuation-container-name".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        .unwrap(),
+        None,
+    );
     let evidence = flotilla_protocol::CommandCaller {
         principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
         process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).container("kernel-container".into()).build()),
         crew: None,
     };
-    let claims = placed_caller_claims();
+    let claims = placed_caller_claims(&daemon);
     let environment = EnvironmentId::new("placed-environment");
     let old_mounts = caller_mountinfo(&environment, false);
     let legacy = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&old_mounts)).await.unwrap();
     assert!(!legacy.transport_bound);
-    caller_can_stall_and_complete(&daemon, legacy.caller).await;
-    // Legacy operation did not need an inspected ID (as at first restart).
-    // Once inspection is available, its immutable ID enables the strict path;
-    // the Docker actuation name deliberately remains a different value.
-    let current = environments.get("placed-environment").await.unwrap();
-    let mut status = current.status.unwrap();
-    assert!(status.runtime_observation.is_none());
-    status.runtime_observation =
-        Some(flotilla_protocol::EnvironmentRuntimeObservation { container_id: Some("kernel-container".into()), ..Default::default() });
-    environments.update_status("placed-environment", &current.metadata.resource_version, &status).await.unwrap();
+    caller_can_stall_and_promise(&daemon, legacy.caller).await;
+    // Legacy operation did not need the environment realised under the container's ID.
+    // Once it is, that immutable ID enables the strict path.
+    use flotilla_resources::environment_records::EnvironmentRecords;
+    assert!(!environments.environments.find("placed-environment").unwrap().unwrap().is_ready());
+    environments.ready("placed-environment", "kernel-container", Default::default());
     let new_mounts = caller_mountinfo(&environment, true);
     let bound = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&new_mounts)).await.unwrap();
     assert!(bound.transport_bound);
@@ -6553,18 +5956,13 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
     use flotilla_state_machines::machines::agent_session::Activity;
     use tower::ServiceExt;
     for enabled in [false, true] {
-        let (tmp, daemon) = empty_daemon().await;
-        let service = Arc::new(
-            flotilla_schema_sqlite::stream::Service::open(
-                &tmp.path().join("activity.sqlite"),
-                "home",
-                flotilla_engine_store::registry().unwrap(),
-            )
-            .unwrap(),
-        );
+        let (_tmp, daemon) = empty_daemon().await;
+        // The primitives share the daemon's decided store and home, where its Convoy path is.
+        let service = daemon.decided_store().unwrap();
+        let home = daemon.node_id().as_str().to_owned();
         let primitives = Arc::new(
-            flotilla_core::primitives::MessagePrimitives::open(
-                "home",
+            flotilla_engine_messages::MessagePrimitives::open(
+                &home,
                 Arc::clone(&service),
                 daemon.resource_backend(),
                 Arc::new(flotilla_resources::SystemClock),
@@ -6581,20 +5979,15 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
                 let name = format!("{harness_name}-{http}");
                 let terminal = flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() };
                 let terminals = daemon.resource_backend().using::<TerminalSession>("flotilla");
-                terminals
-                    .create(
-                        &InputMeta::builder().name(name.clone()).build(),
-                        &TerminalSessionSpec {
-                            env_ref: "host-direct".into(),
-                            role: "coder".into(),
-                            source: TerminalSessionSource::Tool { command: harness_name.into() },
-                            cwd: "/repo".into(),
-                            env: Default::default(),
-                            pool: "test".into(),
-                        },
-                    )
-                    .await
-                    .unwrap();
+                let spec = TerminalSessionSpec {
+                    env_ref: "host-direct".into(),
+                    role: "coder".into(),
+                    source: TerminalSessionSource::Tool { command: harness_name.into() },
+                    cwd: "/repo".into(),
+                    env: Default::default(),
+                    pool: "test".into(),
+                };
+                let launch = run_session(&daemon, &name, &spec, &Default::default());
                 let router = HttpRouter::for_daemon(
                     Arc::clone(&daemon),
                     Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))),
@@ -6603,19 +5996,22 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
                 .into_router()
                 .layer(Extension(CallerAuth::Hook {
                     terminal: terminal.clone(),
-                    generation: terminals.get(&name).await.expect("terminal").metadata.creation_timestamp.to_rfc3339(),
+                    generation: super::http::hooks::launch_generation(&terminals.get(&name).await.expect("terminal")),
                 }));
                 let (harness, parser) = flotilla_agent::parser_for_harness(harness_name).unwrap();
                 let interrupt =
                     if harness_name == "codex" { ("interrupt", "Interrupt") } else { ("post-tool-use-failure", "PostToolUseFailure") };
                 let mut previous = None;
-                for (argument, native, activity) in [
-                    ("user-prompt-submit", "UserPromptSubmit", Activity::Working),
-                    ("pre-tool-use", "PreToolUse", Activity::Working),
-                    ("stop", "Stop", Activity::Idle),
-                    (interrupt.0, interrupt.1, Activity::Interrupted),
-                ] {
+                let mut steps =
+                    vec![("user-prompt-submit", "UserPromptSubmit", Activity::Working), ("pre-tool-use", "PreToolUse", Activity::Working)];
+                // Claude Code reports a permission prompt through its Notification hook.
+                if harness_name == "claude-code" {
+                    steps.push(("notification", "Notification", Activity::NeedsInput));
+                }
+                steps.extend([("stop", "Stop", Activity::Idle), (interrupt.0, interrupt.1, Activity::Interrupted)]);
+                for (argument, native, activity) in steps {
                     let payload = serde_json::json!({ "session_id":"native-1", "cwd":"/repo", "hook_event_name":native,
+                        "notification_type":"permission_prompt",
                         "is_interrupt":true, "stop_hook_active":false, "prompt":"work", "tool_name":"Bash",
                         "tool_input":{"command":"secret-call-detail"}, "tool_use_id":"call-detail" });
                     if http {
@@ -6653,9 +6049,9 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
                         .await;
                         assert!(matches!(ok_response(response, 1), Response::AgentHook));
                     }
-                    // A single name lookup returns this session, and another session stays unchanged.
+                    // A single name lookup returns this launch's session, and another session stays unchanged.
                     assert_eq!(primitives.sessions().get("other-session").unwrap(), other);
-                    let current = primitives.sessions().get(&name);
+                    let current = primitives.sessions().get(&launch);
                     if !enabled {
                         assert!(current.is_none());
                         continue;
@@ -6674,8 +6070,8 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
             }
         }
         // Reopening from the actual store preserves current activity and its cause.
-        let reopened = flotilla_core::primitives::MessagePrimitives::open(
-            "home",
+        let reopened = flotilla_engine_messages::MessagePrimitives::open(
+            &home,
             service,
             daemon.resource_backend(),
             Arc::new(flotilla_resources::SystemClock),
@@ -6691,19 +6087,15 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
     }
 }
 
-async fn activity_failure_test_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>, Arc<flotilla_core::primitives::MessagePrimitives>) {
+/// A daemon whose session `agent` runs, and the launch its AgentSession is named by.
+async fn activity_failure_test_daemon(
+) -> (tempfile::TempDir, Arc<InProcessDaemon>, Arc<flotilla_engine_messages::MessagePrimitives>, String) {
     let (tmp, daemon) = empty_daemon().await;
-    let service = Arc::new(
-        flotilla_schema_sqlite::stream::Service::open(
-            &tmp.path().join("activity.sqlite"),
-            "home",
-            flotilla_engine_store::registry().unwrap(),
-        )
-        .unwrap(),
-    );
+    // The primitives share the daemon's decided store and home, where its Convoy path is.
+    let service = daemon.decided_store().unwrap();
     let primitives = Arc::new(
-        flotilla_core::primitives::MessagePrimitives::open(
-            "home",
+        flotilla_engine_messages::MessagePrimitives::open(
+            daemon.node_id().as_str(),
             service,
             daemon.resource_backend(),
             Arc::new(flotilla_resources::SystemClock),
@@ -6711,23 +6103,17 @@ async fn activity_failure_test_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
         .unwrap(),
     );
     daemon.install_message_primitives(Arc::clone(&primitives)).unwrap();
-    daemon
-        .resource_backend()
-        .using::<TerminalSession>("flotilla")
-        .create(
-            &InputMeta::builder().name("agent".to_string()).build(),
-            &TerminalSessionSpec {
-                env_ref: "host-direct".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Tool { command: "agent".into() },
-                cwd: "/repo".into(),
-                env: Default::default(),
-                pool: "test".into(),
-            },
-        )
-        .await
-        .unwrap();
-    (tmp, daemon, primitives)
+    let spec = TerminalSessionSpec {
+        env_ref: "host-direct".into(),
+        role: "coder".into(),
+        source: TerminalSessionSource::Tool { command: "agent".into() },
+        cwd: "/repo".into(),
+        env: Default::default(),
+        pool: "test".into(),
+    };
+    let launch = request_session(&daemon, "agent", &spec);
+    install_engine(&daemon).terminals.ready(&launch, "agent", &Default::default());
+    (tmp, daemon, primitives, launch)
 }
 
 // Activity-store errors must leave the pre-existing hook attention path working.
@@ -6739,20 +6125,20 @@ async fn agent_activity_store_failure_preserves_legacy_attention() {
         machines::agent_session::{Activity, AgentSession},
         Resource,
     };
-    let (_tmp, daemon, primitives) = activity_failure_test_daemon().await;
-    primitives.sessions().ensure("agent", Timestamp(0)).unwrap();
+    let (_tmp, daemon, primitives, launch) = activity_failure_test_daemon().await;
+    primitives.sessions().ensure(&launch, Timestamp(0)).unwrap();
     primitives
         .service()
         .with_store(|store| {
             let mut write = store.write()?;
-            let id = write.resolve(Resource::<AgentSession>::CODE, "agent", "home")?.unwrap();
+            let id = write.resolve(Resource::<AgentSession>::CODE, &launch, daemon.node_id().as_str())?.unwrap();
             let loaded = write.load::<Resource<AgentSession>>(id)?.unwrap();
             write.delete::<Resource<AgentSession>>(loaded.stamp(), &NewChange::new("test", Timestamp(1)))?;
             write.commit()
         })
         .unwrap();
     assert!(
-        primitives.sessions().observe("agent", Activity::Working, "UserPromptSubmit".into(), Timestamp(2)).is_err(),
+        primitives.sessions().observe(&launch, Activity::Working, "UserPromptSubmit".into(), Timestamp(2)).is_err(),
         "the store write really fails"
     );
     for harness in [AgentHarness::ClaudeCode, AgentHarness::Codex] {
@@ -6769,22 +6155,22 @@ async fn agent_activity_store_failure_preserves_legacy_attention() {
         let terminal = daemon.resource_backend().using::<TerminalSession>("flotilla").get("agent").await.unwrap();
         assert_eq!(terminal.status.unwrap().attention.unwrap().state, TerminalAttentionState::Working);
         assert!(
-            primitives.sessions().get("agent").unwrap().state().observation().is_none(),
+            primitives.sessions().get(&launch).unwrap().state().observation().is_none(),
             "failed activity writes leave the cached value unchanged"
         );
     }
 }
 
-// Duplicate observations bypass terminal reads and the blocking writer entirely.
-// A missing terminal would fail the observer if it did any backend lookup.
+// Duplicate observations never reach the AgentSession writer; a changed one still finds the
+// session's launch here, and a session with none records nothing. The launch is read first now:
+// the AgentSession is named by it (#3108).
 #[tokio::test]
-async fn agent_activity_duplicates_skip_terminal_reads() {
+async fn agent_activity_duplicates_skip_the_writer() {
     use flotilla_schema::Timestamp;
     use flotilla_state_machines::machines::agent_session::Activity;
-    let (_tmp, daemon, primitives) = activity_failure_test_daemon().await;
-    primitives.sessions().observe("agent", Activity::Working, "UserPromptSubmit".into(), Timestamp(1)).unwrap();
-    let before = primitives.sessions().get("agent").unwrap();
-    let empty_backend = ResourceBackend::new(InMemoryBackend::default());
+    let (_tmp, daemon, primitives, launch) = activity_failure_test_daemon().await;
+    primitives.sessions().observe(&launch, Activity::Working, "UserPromptSubmit".into(), Timestamp(1)).unwrap();
+    let before = primitives.sessions().get(&launch).unwrap();
     let mut event = AgentHookEvent::builder()
         .attachable_id(AttachableId::new("candidate"))
         .harness(AgentHarness::ClaudeCode)
@@ -6792,14 +6178,15 @@ async fn agent_activity_duplicates_skip_terminal_reads() {
         .hook_event("PreToolUse".to_string())
         .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "agent".into() })
         .build();
-    super::request_dispatch::record_hook_activity(&empty_backend, &primitives, &event).await.unwrap();
-    assert_eq!(primitives.sessions().get("agent").unwrap(), before);
+    super::request_dispatch::record_hook_activity(Some(daemon.lifecycle_reads()), &primitives, &event).await.unwrap();
+    assert_eq!(primitives.sessions().get(&launch).unwrap(), before);
     event.event_type = AgentEventType::Idle;
+    event.terminal = Some(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "gone".into() });
     assert!(
-        super::request_dispatch::record_hook_activity(&empty_backend, &primitives, &event).await.is_err(),
-        "changed activity still validates the terminal"
+        super::request_dispatch::record_hook_activity(Some(daemon.lifecycle_reads()), &primitives, &event).await.is_err(),
+        "changed activity still validates the session's launch"
     );
-    assert_eq!(primitives.sessions().get("agent").unwrap(), before);
+    assert_eq!(primitives.sessions().get(&launch).unwrap(), before);
     drop(daemon);
 }
 
@@ -6879,16 +6266,22 @@ impl PeerSender for StreamCommandWire {
 // a damaged HTTP body and unreachable point-read homes retain explicit failures.
 #[tokio::test]
 async fn routed_only_change_stream_follows_snapshot_and_tail() {
-    use flotilla_schema::{Kind, KindRegistry, NewChange, Timestamp};
+    use flotilla_schema::{Kind, NewChange, Timestamp};
     use flotilla_schema_sqlite::stream::Service;
-    let (_local_dir, local) = empty_daemon().await;
-    let (_home_dir, home) = empty_daemon_named("home").await;
     let dir = tempfile::tempdir().unwrap();
-    let mut kinds = KindRegistry::new();
+    let mut kinds = decided_kinds();
     kinds.register::<RoutedStreamSample>().unwrap();
     let source = Arc::new(Service::open(&dir.path().join("source.db"), "home", kinds.clone()).unwrap());
     let target = Arc::new(Service::open(&dir.path().join("target.db"), "local", kinds.clone()).unwrap());
-    home.install_decided_store(Arc::clone(&source)).unwrap();
+    let fresh = Arc::new(Service::open(&dir.path().join("fresh.db"), "local", kinds).unwrap());
+    let (_local_dir, local) = daemon_with_decided_store("local", Arc::clone(&fresh)).await;
+    // Its fleet list reads the engine's records.
+    engine(&local);
+    // The home's own tasks poll its decided store, which this test later holds locked from a
+    // writer while the follower waits out its frame deadline: they run on a runtime of their
+    // own, so they wait without stalling the test's current-thread runtime.
+    let home_runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let (_home_dir, home) = home_runtime.spawn(daemon_with_decided_store("home", Arc::clone(&source))).await.unwrap();
     let seed = |name: &str| {
         source
             .with_store(|store| {
@@ -6941,7 +6334,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     });
     // A missing forwarded socket must use the working peer route immediately.
     let missing = rigging_tls::client_builder().unix_socket(dir.path().join("missing.sock")).build().unwrap();
-    super::change_stream::follow_round(Arc::clone(&target), "home", Some(&missing), &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&missing), &router, &Default::default()).await.unwrap();
     // Twenty writes, each a change and its entry (#4024).
     assert_eq!(target.watermark("home").unwrap().home_seq, 40);
     // The stand-in replaces only HTTP: one unavailable route, then a damaged
@@ -6969,14 +6362,16 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         }
     });
     seed("tail");
-    super::change_stream::follow_round(Arc::clone(&target), "home", Some(&http), &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&http), &router, &Default::default()).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 42);
     seed("partial");
-    let error = super::change_stream::follow_round(Arc::clone(&target), "home", Some(&http), &router).await.unwrap_err();
+    let error = super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&http), &router, &Default::default())
+        .await
+        .unwrap_err();
     assert_eq!(error, "truncated home stream", "a mid-body failure must not fall back");
     assert_eq!(target.watermark("home").unwrap().home_seq, 42);
     serving.await.unwrap();
-    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", None, &router, &Default::default()).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 44);
     for index in 0..=21 {
         let name = match index {
@@ -6996,7 +6391,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         assert_eq!(snapshot(&source), snapshot(&target));
     }
     // Neither a routed-only home nor a broken socket proves a record absent.
-    use flotilla_core::primitives::ports::HomeReads;
+    use flotilla_engine_messages::ports::HomeReads;
     let peers = Arc::new(StdMutex::new(std::collections::BTreeMap::from([("home".to_owned(), None)])));
     let reads = super::change_stream::DecidedHomeReads {
         service: Arc::clone(&target),
@@ -7027,7 +6422,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     tokio::time::pause();
     let round = tokio::spawn({
         let (target, router) = (Arc::clone(&target), router.clone());
-        async move { super::change_stream::follow_round(target, "home", None, &router).await }
+        async move { super::change_stream::follow_round(target, "home", "home", None, &router, &Default::default()).await }
     });
     let error = loop {
         for _ in 0..64 {
@@ -7073,10 +6468,15 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         current.version = stamp.version;
         current.value = next;
     }
-    let fresh = Arc::new(Service::open(&dir.path().join("fresh.db"), "local", kinds).unwrap());
-    local.install_decided_store(Arc::clone(&fresh)).unwrap();
-    let following =
-        tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(Arc::clone(&local), "home".into(), None, router.clone()));
+    let metrics = Arc::new(flotilla_store::load_metrics::ReplicationLoadMetrics::default());
+    let following = tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(
+        Arc::clone(&local),
+        "home".into(),
+        None,
+        router.clone(),
+        Default::default(),
+        Arc::clone(&metrics),
+    ));
     let failure = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Some(replica) = local
@@ -7102,8 +6502,11 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     assert!(state.last_error.unwrap().contains("home/rs/large"));
     assert!(failure.message.unwrap().contains("home/rs/large"));
     assert!(!fresh.has_watermark("home"));
+    // The failed round counts into the replication load metrics; it installed nothing.
+    assert!(metrics.stream_failures.get() >= 1);
+    assert_eq!(metrics.snapshots.get(), 0);
 
-    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", None, &router, &Default::default()).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 176);
     let hosts = home.list_hosts_internal().await.unwrap();
     let environment = &hosts.hosts.iter().find(|host| host.is_local).unwrap().environment_id.clone().unwrap();
@@ -7114,7 +6517,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
 
     // HTTP must carry the producer's reason as a frame, rather than replacing it
     // with a generic truncated-body error; the receiver rolls back that failure.
-    let first = home.next_change_stream_frame("http-health", None, None).await.unwrap();
+    let first = home.next_change_stream_frame("http-health", None, None, None).await.unwrap();
     let CommandValue::ChangeStreamFrame { session, .. } = first else { panic!("first frame") };
     let frames = super::change_stream::body(Arc::clone(&home), "http-health".into(), session);
     tokio::pin!(frames);
@@ -7138,8 +6541,15 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
             write.commit()
         })
         .unwrap();
-    let following =
-        tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(Arc::clone(&local), "home".into(), None, router.clone()));
+    let metrics = Arc::new(flotilla_store::load_metrics::ReplicationLoadMetrics::default());
+    let following = tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(
+        Arc::clone(&local),
+        "home".into(),
+        None,
+        router.clone(),
+        Default::default(),
+        Arc::clone(&metrics),
+    ));
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if fresh.has_watermark("home")
@@ -7160,24 +6570,22 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     .unwrap();
     following.abort();
     assert_eq!(fresh.watermark("home").unwrap().home_seq, 178);
+    // The recovering follower's snapshot counts into the replication load metrics.
+    assert!(metrics.snapshots.get() >= 1);
     let state = home.get_host_status_internal(environment).await.unwrap().change_stream.unwrap();
     assert_eq!(state.watermark, 178);
     assert_eq!(state.consecutive_failures, 0);
     assert!(state.last_error.is_none());
     remote.abort();
+    home_runtime.shutdown_background();
 }
 
 // Forwarded surface context must not acquire a whole-home replication cursor. Only the
 // peer-owned path (no caller or surface session) is admitted by the destination router.
 #[tokio::test]
 async fn routed_change_stream_origin_admission_rows() {
-    use flotilla_schema::KindRegistry;
-    use flotilla_schema_sqlite::stream::Service;
+    // The home serves the decided store it composed with.
     let (_dir, home) = empty_daemon_named("home").await;
-    let files = tempfile::tempdir().unwrap();
-    let mut kinds = KindRegistry::new();
-    kinds.register::<RoutedStreamSample>().unwrap();
-    home.install_decided_store(Arc::new(Service::open(&files.path().join("home.db"), "home", kinds).unwrap())).unwrap();
     let pm = Arc::new(Mutex::new(PeerManager::new(NodeId::new("home"))));
     let (tx, mut rx) = mpsc::channel(1);
     pm.lock().await.register_sender(NodeId::new("local"), Arc::new(StreamCommandWire(tx)));
@@ -7197,7 +6605,7 @@ async fn routed_change_stream_origin_admission_rows() {
                 1,
                 NodeId::new("local"),
                 NodeId::new("local"),
-                Command::builder().action(CommandAction::QueryChangeStream { after: None, session: None }).build(),
+                Command::builder().action(CommandAction::QueryChangeStream { home: None, after: None, session: None }).build(),
                 caller,
                 session,
             )
@@ -7239,7 +6647,7 @@ async fn dropped_replication_dispatch_releases_pending_entry() {
             .dispatch_replication_query(
                 Command::builder()
                     .node_id(NodeId::new("home"))
-                    .action(CommandAction::QueryChangeStream { after: None, session: None })
+                    .action(CommandAction::QueryChangeStream { home: None, after: None, session: None })
                     .build(),
             )
             .await

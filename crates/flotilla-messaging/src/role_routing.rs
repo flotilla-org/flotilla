@@ -12,12 +12,16 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Convoy, MessageReceiverSnapshot, Project, ProjectHierarchy, ReadResourceObject, ResolvedCascade, ResourceBackend, ResourceError,
-    TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    CascadeDeclarations, Convoy, MessageReceiverSnapshot, Project, ProjectHierarchy, ReadResourceObject, ResolvedCascade, ResourceBackend,
+    ResourceError, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
-pub const BRIEF_CHARTER_REVISION_ANNOTATION: &str = "flotilla.work/brief-charter-revision";
 pub const FLEET_STORE_SENDER: &str = "system:fleet-store";
+
+/// A charter notice's record name: one per receiver, sender and charter revision.
+pub fn charter_notice_name(inbox: &flotilla_address::Address, sender: &flotilla_address::Address, revision: &str) -> String {
+    flotilla_address::message_record_name(inbox.as_str(), sender.as_str(), &format!("charter@{revision}"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleContact {
@@ -58,19 +62,20 @@ impl CrewAddressBook {
 /// `topic:<project>/<name>` is an address, independent of any role spelling.
 /// Resolve nearest-first supervision recipients, skipping absent holders. Within
 /// a Project, priorities express the charter's governor/operator/owner sequence.
-/// A source holder is excluded so a stalled governor advances rather than loops.
-pub async fn supervision_path(
-    backend: &ResourceBackend,
-    namespace: &str,
+/// A source holder is excluded so a stalled governor advances rather than loops; with no
+/// sender, every holder is listed.
+/// A pass over many senders reads `declarations` and `receivers` once and resolves each here.
+pub fn supervision_path(
+    declarations: &CascadeDeclarations,
+    receivers: &MessageReceiverSnapshot,
     project: &str,
-    sender: &str,
+    sender: Option<&str>,
 ) -> Result<Vec<RoleContact>, ResourceError> {
-    topic_contacts(
-        backend,
-        namespace,
-        TopicRouting::builder().project(project).topic("supervision").sender(sender).reach(TopicReach::Ancestors).build(),
+    topic_candidates_from_declarations(
+        TopicRouting::builder().project(project).topic("supervision").maybe_sender(sender).reach(TopicReach::Ancestors).build(),
+        ReceiverPresence::Current(receivers),
+        declarations,
     )
-    .await
 }
 
 /// Ordinary topics reach subtree subscribers; supervision can fall back through
@@ -109,44 +114,8 @@ async fn topic_contacts_in_snapshot(
     topic_candidates(backend, namespace, routing, ReceiverPresence::Current(receivers)).await
 }
 
-// A deliberately broad preload set: presence and sender exclusion need holder
-// evidence. These addresses must never be used as the final routing result.
-pub(crate) async fn topic_receiver_addresses(
-    backend: &ResourceBackend,
-    namespace: &str,
-    addresses: &[&str],
-) -> Result<Vec<String>, ResourceError> {
-    if addresses.is_empty() {
-        return Ok(Vec::new());
-    }
-    let hierarchy = ProjectHierarchy::load_for_inspection(backend, namespace).await?;
-    let projects = backend.definitions::<Project>(namespace).list().await?;
-    let mut candidates = BTreeSet::new();
-    for address in addresses {
-        // Message::validate_spec rejects malformed topics at admission. Keep
-        // the resolver's error if corrupt stored data bypasses that boundary.
-        let (project, topic) = parse_topic_address(address).ok_or_else(|| ResourceError::invalid("invalid topic address"))?;
-        let reach = if topic == "supervision" { TopicReach::Ancestors } else { TopicReach::SubtreeSubscriptions };
-        candidates.extend(
-            topic_candidates_from_declarations(
-                backend,
-                namespace,
-                TopicRouting::builder().project(project).topic(topic).reach(reach).build(),
-                ReceiverPresence::Candidates,
-                &hierarchy,
-                &projects,
-            )
-            .await?
-            .into_iter()
-            .map(|contact| contact.address),
-        );
-    }
-    Ok(candidates.into_iter().collect())
-}
-
 #[derive(Clone, Copy)]
 enum ReceiverPresence<'a> {
-    Candidates,
     Current(&'a MessageReceiverSnapshot),
 }
 
@@ -156,29 +125,26 @@ async fn topic_candidates(
     routing: TopicRouting<'_>,
     receivers: ReceiverPresence<'_>,
 ) -> Result<Vec<RoleContact>, ResourceError> {
-    let hierarchy = ProjectHierarchy::load_for_inspection(backend, namespace).await?;
-    let projects = backend.definitions::<Project>(namespace).list().await?;
-    topic_candidates_from_declarations(backend, namespace, routing, receivers, &hierarchy, &projects).await
+    let declarations = CascadeDeclarations::load(backend, namespace).await?;
+    topic_candidates_from_declarations(routing, receivers, &declarations)
 }
 
-async fn topic_candidates_from_declarations(
-    backend: &ResourceBackend,
-    namespace: &str,
+fn topic_candidates_from_declarations(
     routing: TopicRouting<'_>,
     receivers: ReceiverPresence<'_>,
-    hierarchy: &ProjectHierarchy,
-    projects: &[crate::ResourceObject<Project>],
+    declarations: &CascadeDeclarations,
 ) -> Result<Vec<RoleContact>, ResourceError> {
     let TopicRouting { project, topic, sender, reach } = routing;
+    let projects = declarations.projects();
     if !projects.iter().any(|object| object.metadata.name == project) {
         return Ok(Vec::new());
     }
-    let ancestors = hierarchy.ancestors(project)?;
+    let ancestors = declarations.hierarchy().ancestors(project)?;
     let mut result = Vec::new();
     let mut seen = BTreeSet::new();
     for (depth, name) in std::iter::once(project.to_string()).chain(ancestors).enumerate() {
         let object = projects.iter().find(|object| object.metadata.name == name).ok_or_else(|| ResourceError::not_found(&name))?;
-        let cascade = ResolvedCascade::load(backend, namespace, &name, &object.spec).await?;
+        let cascade = declarations.resolve(&name, &object.spec)?;
         let mut local = Vec::new();
         for (role, definition) in &cascade.roles {
             for subscription in definition.subscriptions.iter().flatten() {
@@ -226,10 +192,9 @@ async fn topic_candidates_from_declarations(
 }
 
 fn terminal_has_address(terminal: &crate::ResourceObject<TerminalSession>, project: &str, address: &str) -> bool {
-    let parts: Vec<_> = address.split('/').collect();
-    matches!(parts.as_slice(), [p, convoy, vessel, role]
-        if *p == project
-        && terminal.metadata.labels.get(CONVOY_LABEL).is_some_and(|value| value == convoy)
+    matches!(flotilla_resources::parse_crew_role_address(address), Some((p, convoy, vessel, role))
+        if p == project
+        && terminal.metadata.labels.get(CONVOY_LABEL).is_some_and(|value| *value == convoy)
         && terminal.metadata.labels.get(VESSEL_LABEL).is_some_and(|value| value == vessel)
         && terminal.metadata.labels.get(ROLE_LABEL).is_some_and(|value| value == role))
 }
@@ -265,7 +230,7 @@ pub async fn crew_address_book(backend: &ResourceBackend, namespace: &str, own_a
     }
     for source in convoys {
         let convoy = &source.object;
-        let candidate_project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+        let candidate_project = convoy.spec.project_ref.as_str();
         if !visible_projects.contains(candidate_project) || convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             continue;
         }
@@ -275,7 +240,7 @@ pub async fn crew_address_book(backend: &ResourceBackend, namespace: &str, own_a
         if let Some(status) = &convoy.status {
             for (vessel, crew) in &status.crew_work {
                 for role in crew.keys() {
-                    let address = format!("{candidate_project}/{}/{vessel}/{role}", convoy.metadata.name);
+                    let address = flotilla_resources::crew_role_address(candidate_project, &convoy.metadata.name, vessel, role);
                     if address != own_address {
                         let holder = receivers.resolve(&address)?;
                         contacts.push(RoleContact {
@@ -367,77 +332,35 @@ impl CharterBriefRenderer for CharterProseRenderer {
     }
 }
 
-/// Applied revisions generate receiver-homed notifications. Deterministic IDs
-/// make a restart idempotent; ordinary subject supersession coalesces revisions
-/// until the holder reaches a turn boundary.
-pub async fn reconcile_charter_notifications(inbox: &crate::MessageInbox, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
-    reconcile_charter_notifications_with_renderer(inbox, &CharterProseRenderer, now).await
-}
-
-pub async fn reconcile_charter_notifications_with_renderer(
-    inbox: &crate::MessageInbox,
-    renderer: &dyn CharterBriefRenderer,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), ResourceError> {
-    reconcile_charter_notifications_with_view(inbox, renderer, now, &inbox.backend).await
-}
-
-/// Use watch-maintained reads for charter routing while retaining the durable
-/// inbox for admission and writes.
-pub async fn reconcile_charter_notifications_with_view(
-    inbox: &crate::MessageInbox,
-    renderer: &dyn CharterBriefRenderer,
-    now: chrono::DateTime<chrono::Utc>,
-    backend: &ResourceBackend,
-) -> Result<(), ResourceError> {
-    let _charter_pass = inbox.charter_notifications.lock().await;
-    let receivers = MessageReceiverSnapshot::load(backend, &inbox.namespace).await?;
-    let projects = backend.definitions::<Project>(&inbox.namespace).list().await?;
-    reconcile_charter_notifications_from_receivers(inbox, renderer, now, backend, &receivers, projects.iter().collect()).await
-}
-
-/// Reuse shared receiver evidence already frozen by the leaf engine.
-/// Where charter notifications are admitted (#3317): the old store's inbox,
-/// or the engine's behind the `[primitives]` switch. One pass at a time;
+/// Where charter notifications are admitted (#3317): the engine's inbox. One pass at a time;
 /// admission and predecessor selection hold [`CharterNotices::admission`].
 #[async_trait::async_trait]
 pub trait CharterNotices: Send + Sync {
     fn namespace(&self) -> &str;
     fn pass(&self) -> std::sync::Arc<tokio::sync::Mutex<()>>;
     fn admission(&self) -> std::sync::Arc<tokio::sync::Mutex<()>>;
-    /// Whether `name` exists, repairing one stored without admission.
-    async fn existing(&self, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError>;
-    /// The open Messages to `receiver`.
-    async fn open_to(&self, receiver: &str) -> Result<Vec<ResourceObject<Message>>, ResourceError>;
-    async fn admit(&self, name: &str, spec: &crate::MessageSpec, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError>;
+    /// The fleet-store role's inbox, which sends the notices; `None` until the fleet is designated,
+    /// when nothing is admitted.
+    async fn sender(&self) -> Result<Option<flotilla_address::Address>, ResourceError>;
+    /// Whether `inbox` holds `name`.
+    async fn existing(&self, inbox: &flotilla_address::Address, name: &str) -> Result<bool, ResourceError>;
+    /// The newest open notification from `sender` in `inbox` about `project`'s charter, which the
+    /// next one supersedes: its name.
+    async fn open_charter_notice(
+        &self,
+        inbox: &flotilla_address::Address,
+        sender: &flotilla_address::Address,
+        project: &str,
+    ) -> Result<Option<String>, ResourceError>;
+    async fn admit(&self, name: &str, intent: &crate::Intent) -> Result<(), ResourceError>;
 }
 
-#[async_trait::async_trait]
-impl CharterNotices for crate::MessageInbox {
-    fn namespace(&self) -> &str {
-        &self.namespace
-    }
-    fn pass(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-        std::sync::Arc::clone(&self.charter_notifications)
-    }
-    fn admission(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-        std::sync::Arc::clone(&self.admission)
-    }
-    async fn existing(&self, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError> {
-        repair_existing_charter_notification(self, name, now).await
-    }
-    async fn open_to(&self, receiver: &str) -> Result<Vec<ResourceObject<Message>>, ResourceError> {
-        self.messages.query(&crate::MessageQuery::Active { receiver: Some(receiver.to_owned()) }).await
-    }
-    async fn admit(&self, name: &str, spec: &crate::MessageSpec, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
-        self.accept_locked(&crate::InputMeta::builder().name(name.to_owned()).build(), spec, now).await.map(|_| ())
-    }
-}
-
+/// Applied revisions generate receiver-homed notifications. Deterministic IDs make a restart
+/// idempotent; ordinary subject supersession coalesces revisions until the holder reaches a turn
+/// boundary. Reuses the receiver evidence the leaf engine already holds.
 pub async fn reconcile_charter_notifications_with_receivers(
     inbox: &dyn CharterNotices,
     renderer: &dyn CharterBriefRenderer,
-    now: chrono::DateTime<chrono::Utc>,
     backend: &ResourceBackend,
     receivers: &MessageReceiverSnapshot,
     projects: &crate::ReadResourceList<Project>,
@@ -447,7 +370,6 @@ pub async fn reconcile_charter_notifications_with_receivers(
     reconcile_charter_notifications_from_receivers(
         inbox,
         renderer,
-        now,
         backend,
         receivers,
         projects.items.iter().map(|item| &item.object).collect(),
@@ -458,14 +380,14 @@ pub async fn reconcile_charter_notifications_with_receivers(
 async fn reconcile_charter_notifications_from_receivers(
     inbox: &dyn CharterNotices,
     renderer: &dyn CharterBriefRenderer,
-    now: chrono::DateTime<chrono::Utc>,
     backend: &ResourceBackend,
     receivers: &MessageReceiverSnapshot,
     projects: Vec<&ResourceObject<Project>>,
 ) -> Result<(), ResourceError> {
-    use crate::{MessageExpectation, MessageReference, MessageRelation, MessageSpec, ResourceProvenance, TerminalSessionSource};
-    use sha2::{Digest, Sha256};
+    use crate::{Intent, IntentExpectation, IntentReference, MessageRelation, ResourceProvenance, TerminalSessionSource};
     let namespace = inbox.namespace();
+    // Nothing is admitted before the fleet is designated.
+    let Some(sender) = inbox.sender().await? else { return Ok(()) };
     let convoys = receivers.convoys();
     let mut cascades = BTreeMap::new();
     for holder in receivers.terminals() {
@@ -500,20 +422,27 @@ async fn reconcile_charter_notifications_from_receivers(
             }
             (project.to_string(), role.to_string(), address.clone())
         } else {
-            let Some(project) = convoy.and_then(|convoy| convoy.spec.project_ref.as_ref()) else { continue };
+            let Some(project) = convoy.map(|convoy| &convoy.spec.project_ref) else { continue };
             let (Some(vessel), Some(role)) = (labels.get(VESSEL_LABEL), labels.get(ROLE_LABEL)) else { continue };
-            (project.clone(), role.clone(), format!("{project}/{}/{vessel}/{role}", context.convoy))
+            (project.clone(), role.clone(), flotilla_resources::crew_role_address(project, &context.convoy, vessel, role))
         };
         let Some(project) = projects.iter().find(|project| project.metadata.name == project_name) else { continue };
         let Some(revision) = flotilla_resources::role_cascade::project_charter_revision(project) else { continue };
-        if holder.object.metadata.annotations.get(BRIEF_CHARTER_REVISION_ANNOTATION) == Some(&revision) {
+        // Its brief was rendered from its convoy's frozen workflow cascade.
+        let briefed = convoy
+            .and_then(|convoy| convoy.status.as_ref())
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .and_then(|workflow| workflow.cascade.as_ref())
+            .and_then(|cascade| cascade.charter_commit.as_ref());
+        if briefed == Some(&revision) {
             continue;
         }
-        let name = format!("charter-{:x}", Sha256::digest(format!("{receiver}\0{revision}").as_bytes()));
+        let receiver_inbox = flotilla_resources::convoy::engine::role_inbox(&receiver).map_err(ResourceError::invalid)?;
+        let name = charter_notice_name(&receiver_inbox, &sender, &revision);
         {
             let admission = inbox.admission();
             let _admission = admission.lock().await;
-            if inbox.existing(&name, now).await? {
+            if inbox.existing(&receiver_inbox, &name).await? {
                 continue;
             }
         }
@@ -522,10 +451,10 @@ async fn reconcile_charter_notifications_from_receivers(
             cascades.insert(project_name.clone(), cascade);
         }
         let cascade = cascades.get(&project_name).expect("loaded Project cascade");
-        let subject = MessageReference::ControlRecord {
-            resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Project", namespace, &project_name),
-            revision: revision.clone(),
-        };
+        let subject = IntentReference::subject(
+            flotilla_address::Address::project(&project_name).map_err(|error| ResourceError::invalid(error.to_string()))?,
+            flotilla_address::Revision::new(revision.clone()).map_err(|error| ResourceError::invalid(error.to_string()))?,
+        );
         let rendered = renderer
             .render(
                 CharterBriefInput::builder()
@@ -542,43 +471,16 @@ async fn reconcile_charter_notifications_from_receivers(
         // snapshot reads never block ordinary inbox producers.
         let admission = inbox.admission();
         let _admission = admission.lock().await;
-        if inbox.existing(&name, now).await? {
+        if inbox.existing(&receiver_inbox, &name).await? {
             continue;
         }
-        let predecessor = inbox.open_to(&receiver).await?
-            .into_iter().filter(|message| message.spec.sender == FLEET_STORE_SENDER && message.spec.subject.as_ref().is_some_and(|subject| {
-                matches!(subject, MessageReference::ControlRecord { resource, .. } if resource.kind == "Project" && resource.namespace == namespace && resource.name == project_name)
-            })).max_by(|a, b| (a.metadata.creation_timestamp, &a.metadata.name).cmp(&(b.metadata.creation_timestamp, &b.metadata.name))).map(|message| message.metadata.name);
-        let spec = MessageSpec::builder()
-            .sender(FLEET_STORE_SENDER.into())
-            .receiver(receiver)
-            .relation(MessageRelation::System)
-            .body(format!("Project charter updated: charter@{revision}\n\n{rendered}"))
-            .references(vec![subject.clone()])
-            .subject(subject)
-            .expectation(MessageExpectation::None)
-            .maybe_supersedes(predecessor)
-            .build();
-        inbox.admit(&name, &spec, now).await?;
+        let predecessor = inbox.open_charter_notice(&receiver_inbox, &sender, &project_name).await?;
+        let body = format!("Project charter updated: charter@{revision}\n\n{rendered}");
+        let mut intent = Intent::new(sender.clone(), receiver_inbox, MessageRelation::System, body);
+        intent.references = vec![subject];
+        intent.expectation = IntentExpectation::Nothing;
+        intent.supersedes = predecessor;
+        inbox.admit(&name, &intent).await?;
     }
     Ok(())
-}
-
-// Caller owns the admission lock. A concurrent/restarted pass uses the stored
-// intent, even if rendering live contacts would now produce different prose.
-async fn repair_existing_charter_notification(
-    inbox: &crate::MessageInbox,
-    name: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<bool, ResourceError> {
-    match inbox.messages.get(name).await {
-        Ok(existing) => {
-            if existing.status.is_none() {
-                inbox.accept_locked(&crate::InputMeta::from(&existing.metadata), &existing.spec, now).await?;
-            }
-            Ok(true)
-        }
-        Err(ResourceError::NotFound { .. }) => Ok(false),
-        Err(error) => Err(error),
-    }
 }

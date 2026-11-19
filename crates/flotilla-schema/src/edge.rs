@@ -38,7 +38,7 @@ use crate::{
     descriptor::TableRole,
     history::{EdgeEvent, Labelled},
     inline::{Cbor, INLINE_LIMITS},
-    records::{Position, Records},
+    records::Position,
     state::{RowEdit, State, StateDelta},
     time::Timestamp,
     traits::{CodeEnum, Element, StateData},
@@ -263,7 +263,7 @@ impl EdgeHeader {
     }
 }
 
-/// A generation boundary replaces a bounded collection and its descendants atomically.
+/// An edge replaces a bounded child collection and its descendants atomically.
 /// Its prior rows are part of the version-checked edge; history remains in the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeCollection {
@@ -460,12 +460,6 @@ impl<K> Edge<K> {
         row: &R,
     ) -> Result<Edge<K>, EdgeError> {
         self.appended(RowPath::Record { table: records.name, position }, table, row)
-    }
-
-    /// Replaces a bounded generation's records. Positions start again at zero;
-    /// callers must ensure no reference to a position survives the generation.
-    pub fn replace_records<R: Element>(self, table: RecordsOf<K, R>, before: &Records<R>, after: &Records<R>) -> Result<Self, EdgeError> {
-        self.collection::<crate::adapt::AsRecords, _>(table.name, TableRole::Records, before, after)
     }
 
     /// Replaces a generation's child collection (for example its standing duties).

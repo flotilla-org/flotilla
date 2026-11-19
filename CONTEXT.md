@@ -64,6 +64,16 @@ dynamic, such as `coder-pr45`, with the role type as an attribute of the
 **Inbox**. A Message's sender is a declared role too: a person sends as their
 declared role, and each `system:<subsystem>` producer becomes a declared fleet
 role; there is no `system` address kind (#3424).)*
+*(ADR 0066 amendment, 2026-11-06: a role may also sit under a host,
+`host:<h>/role:<r>`, as one of that host's daemon's own inboxes, such as
+`host:kiwi/role:checkout-inspector`; messages sit under it as under any
+inbox, but a host's role has no artifact slots. A checkout is addressed
+under its host by name, `host:<h>/checkout:<name>`, which is valid nowhere
+else.)*
+*(ADR 0066 amendment, 2026-11-10: a convoy may also sit under its home host,
+`host:<h>/convoy:<launch>`, naming one launch of it, with the launch's `#`
+percent-encoded, as in `host:kiwi/convoy:coder%235`. A checkout's holder is
+written this way (#3108).)*
 
 **Resource**:
 A thing with its own identity that others refer to, which someone wants to
@@ -108,7 +118,7 @@ _Avoid_: mailbox, queue (bare).
 **Receipt**:
 A `Receive` edge on a consumer's own resource saying it received a given
 Message, with when and through which transport; its master is the Message. Every
-consumer kind writes one the same way: an **AgentSession**, or a controller's
+consumer kind writes one the same way: an **AgentSession**, or a **Service**'s
 own resource. A person's receipt is their acknowledgement or response, through
 any **Surface**, by them or an agent acting for them; a surface loading the
 Message is not a receipt, and on a shared Inbox the first acknowledgement claims
@@ -117,6 +127,17 @@ host writes it. The Inbox's home
 records the Message's `deliver` edge once it observes the receipt through
 replication, naming the receiver as a consumer identity: its kind, its
 resource's id and its host (ADR 0064, #3424).
+
+**Service**:
+The consumer record of daemon code that takes Messages from an **Inbox**, beside
+the **AgentSession** and the person consumer: the stored kind `Service` (code
+`sv`), where that code writes its **Receipts**. Daemon code that consumes no
+Inbox never has one. There is one record per such service per host, homed on
+that host, and only that host writes its receipts. It fills roles through
+ordinary **Role Bindings**; other hosts address the role, never the record. It
+lasts across daemon restarts, and is retired only when that service is removed
+from the host or the host is retired (#4351). The services are each host's
+checkout inspector, which answers inspection requests, and the forge observer.
 
 **Delivery Mode**:
 A consumer's choice of how a matching Message reaches it: `turn` (pushed),
@@ -347,6 +368,15 @@ workflows (e.g. a main dev vessel that fans out to platform-test vessels and
 collates results across iterations). A Vessel may also be **free-floating** —
 attached to no Convoy at all — e.g. housing a **PersistentAgent**. The Crew
 aboard the Vessels are the dramatis personae; the Legs are the script.
+On the engine (#3108) each Vessel is a **launch**, `<launch_of>#<n>`, where
+`launch_of` is `<convoy launch_of>-<work>`: every generation of a standing
+convoy launches its work under one `launch_of`, told apart by the convoy launch
+it serves. Its home is its single writer. The engine controller realises it
+with a finite failure limit, and a work's next launch replaces one that ended.
+What a Vessel holds (its environment, terminal sessions) names the launch as
+its holder (`vessel:<launch>`); its convoy's checkouts are held for the convoy
+launch. Readers see a launch's state joined with what it holds. A Released
+launch leaves listings, but is still read by name.
 _Avoid_: Task, TaskWorkspace, workspace, container.
 
 **Vessel Delivery**:
@@ -980,11 +1010,12 @@ retired (ADR 0058).
 _Avoid_: Bot, assistant.
 
 **Settlement Claim**:
-The crew's turn-ending report (ADR 0017), filed by `crew complete` — the
-crew *claims* its brief is fulfilled. Claims are never world-facts and never
-evidence of safety; integration conditions and observations judge the world.
-Since ADR 0061 it carries no deliverable reference and is refused while any
-of the crew member's **Promises** is open or submitted.
+The crew's turn-ending report (ADR 0017): the crew *claims* its brief is
+fulfilled. Claims are never world-facts and never evidence of safety;
+integration conditions and observations judge the world. Since ADR 0061 it
+carries no deliverable reference. Crews no longer file one: a crew member's
+part ends when its **Promises** are kept or retracted, and the only claim left
+is an operator's forced `crew complete --force`.
 _Avoid_: Completion (that is the admission-time stage), outcome, result.
 
 **Disposition**:

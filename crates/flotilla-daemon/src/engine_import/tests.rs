@@ -1,225 +1,24 @@
 use std::path::Path;
 
 use chrono::Utc;
+use flotilla_core::primitives::demand_import::retired;
+use flotilla_daemon_testkit::import_fixture::{
+    access_delivery, artifact, clone, demand, designation, document, ended_convoy, forge, live_convoy, message, own, populated, NS, THERE,
+};
 use flotilla_engine_store::ImportTarget;
-use flotilla_protocol::NodeId;
 use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
 use flotilla_resources::{
-    AccessDelivery, Artifact, ChangeRequestReviewObservation, ChangeRequestStatus, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
-    CredentialSpec, FleetDesignation, Forge, FulfilmentKind, InputMeta, IssueStatus, Message, Observation, ObservedChangeRequestState,
-    ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, Project, Repository, RepositorySpec, Resource,
-    TerminalSession, Vessel,
+    Artifact, ChangeRequestReviewObservation, ChangeRequestStatus, FulfilmentKind, IssueStatus, Message, Observation,
+    ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, TerminalSession,
 };
 use flotilla_schema::{Kind, Timestamp};
-use flotilla_store::{replica::StoredReplicaEventKind, ResourceKind};
 use flotilla_store_sqlite::SqliteBackend;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::*;
 
-const NS: &str = "flotilla";
 const HERE: &str = "host-a";
-const THERE: &str = "host-b";
-
-fn document(kind: &str, name: &str, spec: Value, status: Value) -> Value {
-    json!({
-        "apiVersion": "flotilla.work/v1", "kind": kind,
-        "metadata": {"name": name, "namespace": NS, "resourceVersion": "1", "creationTimestamp": "2026-10-19T00:00:00Z"},
-        "spec": spec,
-        "status": status,
-    })
-}
-
-fn designation() -> Value {
-    document("FleetDesignation", "fleet", json!({"fleet": "lab", "project": "project-map"}), Value::Null)
-}
-
-fn message(name: &str) -> Value {
-    document(
-        "Message",
-        name,
-        json!({"sender": "system:turn-rules", "receiver": "flotilla/demo/work/coder", "relation": "system", "body": "hello"}),
-        json!({"phase": "accepted", "since": "2026-10-19T00:00:00Z", "reason": "waiting", "acceptedSequence": 1}),
-    )
-}
-
-fn artifact(name: &str) -> Value {
-    document(
-        "Artifact",
-        name,
-        json!({"convoy": "demo", "producer": "coder", "kind": "brief", "subject": "demo", "summary": {"charter_commit": "abc"},
-            "digest": "ef37", "size": 1, "media_type": "text/markdown", "expires_at": "2026-11-19T00:00:00Z"}),
-        Value::Null,
-    )
-}
-
-/// An access delivery as r974's access layer wrote it: the digest-named record, two needs, and for
-/// a failed delivery a permanent retry.
-fn access_delivery(name: &str, failed: bool) -> Value {
-    let retry = if failed {
-        json!({"need": "account", "attempts": 3, "error": "permanent, not retried: authority refused", "next_at": i64::MAX})
-    } else {
-        Value::Null
-    };
-    document(
-        "AccessDelivery",
-        name,
-        json!({"access": "flotilla/demo/implement/coder", "place": "env-a", "harness": "claude-code", "home": "/home/crew/.claude",
-            "needs": {
-                "home": {"mechanism": "agent-push", "digest": "ab12", "at": 1_790_000_000_000_000_i64},
-                "skills": {"mechanism": "host-path-read-only-live", "digest": "cd34", "at": 1_790_000_001_000_000_i64},
-            },
-            "retry": retry}),
-        Value::Null,
-    )
-}
-
-fn clone(name: &str) -> Value {
-    document(
-        "Clone",
-        name,
-        json!({"repo_ref": "github.com/org/repo", "url": "https://github.com/org/repo", "env_ref": "env-a", "path": format!("/c/{name}")}),
-        json!({"phase": "Ready"}),
-    )
-}
-
-fn forge() -> Value {
-    document(
-        "Forge",
-        "lab",
-        json!({"forge_id": "lab", "git_ssh_host": "forge.example.invalid", "hosts": ["forge.example.invalid"],
-            "https_url": "https://forge.example.invalid", "kind": "forgejo"}),
-        Value::Null,
-    )
-}
-
-/// A record of this store, created (at the time of the write) as the daemon creates it.
-async fn own<R: Resource>(backend: &SqliteBackend, document: Value) -> Value {
-    let kind = ResourceKind::of::<R>();
-    let meta = InputMeta::builder().name(document["metadata"]["name"].as_str().expect("name").to_owned()).build();
-    let created = backend.create_raw(kind, NS, &meta, &document["spec"]).await.expect("create");
-    let created = if document["status"].is_null() {
-        created
-    } else {
-        let version = created.metadata.resource_version.clone();
-        backend.update_status_raw(kind, NS, &meta.name, &version, &document["status"]).await.expect("status")
-    };
-    kind.encode_object(&created).expect("encode")
-}
-
-/// A copy of `origin`'s record, as replication stores it.
-async fn replica<R: Resource>(backend: &SqliteBackend, origin: &str, document: Value) {
-    let kind = ResourceKind::of::<R>();
-    let object = kind.decode_object(document).expect("decode");
-    backend.apply_replica_raw(kind, &NodeId::new(origin), NS, StoredReplicaEventKind::Added, &object, Utc::now()).await.expect("replica");
-}
-
-/// An old store holding a record of each importer's kinds homed here, and copies of records
-/// homed at another host; open, as the daemon holds it while it imports.
-async fn populated(dir: &Path) -> SqliteBackend {
-    let backend = SqliteBackend::open(dir.join(OLD_STORE)).expect("old store");
-    own::<FleetDesignation>(&backend, designation()).await;
-    own::<Message>(&backend, message("waiting")).await;
-    own::<Artifact>(&backend, artifact("ours")).await;
-    own::<CloneResource>(&backend, clone("clone-a")).await;
-    own::<AccessDelivery>(&backend, access_delivery("access-delivered", false)).await;
-    own::<AccessDelivery>(&backend, access_delivery("access-failed", true)).await;
-    own::<Checkout>(
-        &backend,
-        document(
-            "Checkout",
-            "observed-a",
-            json!({"kind": "observed", "ref": "main", "path": "/repo", "repo_ref": "repo", "host_ref": "feta", "is_main": true}),
-            json!({"phase": "Ready"}),
-        ),
-    )
-    .await;
-    own::<Vessel>(
-        &backend,
-        document(
-            "Vessel",
-            "convoy-b-implement",
-            json!({"convoy_ref": "convoy-b", "vessel_name": "implement", "fulfilment_kind_ref": "p"}),
-            json!({"phase": "Ready", "environment_ref": "env-b",
-                "placement_decision": {"policy_name": "p", "target_host": {"ref": "feta", "display_name": "feta"}}}),
-        ),
-    )
-    .await;
-    own::<ConvoyEnsure>(
-        &backend,
-        document(
-            "ConvoyEnsure",
-            "standing-governor",
-            json!({"project_ref": "flotilla", "role": "governor", "repositories": []}),
-            json!({"convoy_ref": "governor-9"}),
-        ),
-    )
-    .await;
-    own::<Convoy>(&backend, document("Convoy", "governor-1", json!({"workflow_ref": "w", "inputs": {}}), Value::Null)).await;
-    own::<flotilla_resources::Demand>(
-        &backend,
-        demand(
-            "reclaim-refusal-governor-1",
-            ("Convoy", "governor-1"),
-            &[(flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION, "checkout is dirty")],
-            "raised",
-        ),
-    )
-    .await;
-    let repository = json!({"forge": {"repository": "org/repo", "service_url": "https://github.com"},
-        "identity": {"canonical_remote": "https://github.com/org/repo", "kind": "remote"}, "remotes": ["https://github.com/org/repo"]});
-    let key = serde_json::from_value::<RepositorySpec>(repository.clone()).expect("repository").key().0;
-    own::<Repository>(&backend, document("Repository", &key, repository, Value::Null)).await;
-    own::<Project>(
-        &backend,
-        document(
-            "Project",
-            "flotilla",
-            json!({"default_workflow_ref": "single-agent-contained", "display_name": "flotilla", "issue_source_bindings": [],
-                "repositories": [{"repo": key}]}),
-            Value::Null,
-        ),
-    )
-    .await;
-    own::<CredentialSpec>(
-        &backend,
-        document(
-            "CredentialSpec",
-            "claude",
-            json!({"consumer": {"account_email": "user@example.invalid", "adapter": "claude-oauth"}, "lifecycle": "static",
-                "placement": {"binaries": ["claude"]}, "source": {"kind": "file", "path": "/credentials/claude"}}),
-            Value::Null,
-        ),
-    )
-    .await;
-    own::<FulfilmentKind>(
-        &backend,
-        document(
-            "FulfilmentKind",
-            "docker",
-            json!({"grants": [{"kind": "platform", "value": "linux"}], "host_ref": "feta", "image": {"image_baseline_ref": "fleet-crew"},
-                "pool": "cleat", "realisation": "docker_per_vessel"}),
-            Value::Null,
-        ),
-    )
-    .await;
-    own::<TerminalSession>(
-        &backend,
-        document(
-            "TerminalSession",
-            "tool-a",
-            json!({"env_ref": "env", "role": "tool", "source": {"kind": "tool", "command": "true"}, "cwd": "/repo", "pool": "cleat"}),
-            json!({"phase": "Running", "session_id": "s1"}),
-        ),
-    )
-    .await;
-    replica::<Artifact>(&backend, THERE, artifact("theirs")).await;
-    replica::<AccessDelivery>(&backend, THERE, access_delivery("access-theirs", false)).await;
-    replica::<CloneResource>(&backend, THERE, clone("clone-b")).await;
-    replica::<Forge>(&backend, THERE, forge()).await;
-    backend
-}
 
 fn digest(path: &Path) -> Vec<u8> {
     Sha256::digest(std::fs::read(path).expect("read")).to_vec()
@@ -261,6 +60,37 @@ fn holds<K: Kind>(store: &mut flotilla_schema_sqlite::Store, name: &str, home: &
     read.resolve(K::CODE, name, home).expect("resolve").is_some()
 }
 
+/// The access deliveries `store` holds at [`HERE`], by name, in place order.
+fn held_deliveries(store: &mut flotilla_schema_sqlite::Store) -> Vec<(String, flotilla_resources::AccessDeliverySpec)> {
+    let mut read = store.read().expect("read");
+    let page = read.scan::<flotilla_resources::AccessDeliverySpec>(HERE, None, 64).expect("scan");
+    let mut held: Vec<_> = page
+        .ids
+        .into_iter()
+        .filter_map(|id| read.load::<flotilla_resources::AccessDeliverySpec>(id).expect("load"))
+        .map(|loaded| (loaded.name, loaded.value))
+        .collect();
+    held.sort_by(|(_, a), (_, b)| a.place.cmp(&b.place));
+    held
+}
+
+/// Whether `store` holds a launch of `of` at `home`, by the kind's launch index.
+fn holds_launch<K: flotilla_provisioning::stored::Launches>(store: &mut flotilla_schema_sqlite::Store, of: &str, home: &str) -> bool {
+    let mut read = store.read().expect("read");
+    !read.integer_index_keys_before(&K::by_launch(of), home, i64::MAX, 1).expect("launches").is_empty()
+}
+
+/// Asserts every old row in `report` is imported, dropped or another home's, once.
+fn every_row_accounted(report: &Value) {
+    let rows = report["rows"].as_object().expect("rows");
+    assert!(!rows.is_empty(), "{report:#}");
+    for (kind, counts) in rows {
+        let sum = ["imported", "dropped", "other_home"].iter().map(|field| counts[field].as_u64().expect(field)).sum::<u64>();
+        assert_eq!(counts["rows"].as_u64(), Some(sum), "{kind}: {counts}");
+        assert_eq!(counts["unaccounted"], 0, "{kind}: {counts}");
+    }
+}
+
 #[tokio::test]
 async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -282,7 +112,7 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
         "Artifact",
         "Clone",
         "Vessel",
-        "Ensure",
+        "ConvoyEnsure",
         "Repository",
         "Project",
         "CredentialSpec",
@@ -292,20 +122,42 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
         assert_eq!(kinds[kind]["imported"], 1, "{kind}: {report:#}");
     }
     assert_eq!(kinds["AccessDelivery"], json!({"imported": 2, "dropped": 0, "refused": 0}), "{report:#}");
-    assert_eq!(kinds["Checkout"], json!({"imported": 0, "dropped": 1, "refused": 0}), "an observed checkout is no request");
-    assert_eq!(kinds["Convoy"], json!({"imported": 0, "dropped": 1, "refused": 0}), "an unbootstrapped convoy stays old");
+    assert_eq!(
+        kinds["Checkout"],
+        json!({"imported": 1, "dropped": 0, "refused": 0}),
+        "an adopted (observed) checkout imports as an adopted launch: {report:#}"
+    );
+    assert_eq!(
+        kinds["Convoy"],
+        json!({"imported": 2, "dropped": 1, "refused": 0}),
+        "the live convoys import and an unbootstrapped one stays old: {report:#}"
+    );
     assert!(kinds.get("Forge").is_none(), "another host's records are not this host's to count: {report:#}");
+    every_row_accounted(&report);
+    assert_eq!(report["rows"]["Forge"]["other_home"], 1, "another host's record is counted as that home's: {report:#}");
 
     let mut store = engine(dir.path());
     assert!(holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut store, "ours", HERE));
-    assert!(holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-a", HERE));
-    for name in ["access-delivered", "access-failed"] {
-        assert!(holds::<flotilla_resources::AccessDeliverySpec>(&mut store, name, HERE), "{name}");
+    assert!(
+        holds_launch::<flotilla_provisioning::stored::clone::CloneKind>(&mut store, "clone-a", HERE),
+        "a clone is imported as a launch"
+    );
+    assert!(
+        holds_launch::<flotilla_provisioning::stored::checkout::CheckoutKind>(&mut store, "observed-a", HERE),
+        "an adopted checkout is imported as a launch"
+    );
+    let deliveries = held_deliveries(&mut store);
+    assert_eq!(deliveries.iter().map(|(_, spec)| spec.place.as_str()).collect::<Vec<_>>(), ["env-a", "env-b"]);
+    for (name, spec) in &deliveries {
+        let convoy = flotilla_resources::access_delivery::convoy_of_access(&spec.access).expect("a convoy");
+        assert!(convoy.starts_with("demo#"), "the key names the launch its convoy imported as: {}", spec.access);
+        assert!(holds::<flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy>>(&mut store, &convoy, HERE));
+        assert_eq!(*name, flotilla_resources::access_delivery::record_name(&spec.access, &spec.place), "named for its key");
     }
     for home in [HERE, THERE] {
         assert!(!holds::<flotilla_resources::AccessDeliverySpec>(&mut store, "access-theirs", home), "{home}");
         assert!(!holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut store, "theirs", home), "{home}");
-        assert!(!holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-b", home));
+        assert!(!holds_launch::<flotilla_provisioning::stored::clone::CloneKind>(&mut store, "clone-b", home));
         assert!(!holds::<flotilla_provisioning::stored::definition::ForgeDefinition>(&mut store, "lab", home), "{home}");
     }
     drop(store);
@@ -333,6 +185,7 @@ async fn moving_the_engine_store_aside_imports_the_same_records_again() {
 async fn an_imported_record_is_created_at_its_old_creation_time() {
     let dir = tempfile::tempdir().expect("tempdir");
     let backend = SqliteBackend::open(dir.path().join(OLD_STORE)).expect("old store");
+    own::<flotilla_resources::Convoy>(&backend, live_convoy("demo")).await;
     let stored = own::<Artifact>(&backend, artifact("ours")).await;
     drop(backend);
     first_start(dir.path(), HERE, None).expect("imports");
@@ -346,6 +199,72 @@ async fn an_imported_record_is_created_at_its_old_creation_time() {
     let change = read.last_change(id).expect("change").expect("a create");
     assert_eq!(change.at, Timestamp::from_datetime(&created));
     assert_eq!(change.writer, flotilla_engine_store::IMPORT_WRITER);
+    let exactly = flotilla_schema::CreatedAt::from_datetime(&created);
+    assert_eq!(read.creation_time(id).expect("created"), exactly, "its old creation time, to the nanosecond");
+}
+
+/// Gives the first kind table of the engine store in `dir` a column its kind does not declare, so
+/// the store is refused for its shape; `undo` drops it again.
+fn drift_shape(dir: &Path, undo: bool) {
+    let registry = crate::runtime::decided_registry().expect("registry");
+    let table = registry.iter().next().and_then(|set| set.tables.first()).expect("a kind table").name.clone();
+    let connection = rusqlite::Connection::open(dir.join(ENGINE_STORE)).expect("engine store");
+    let statement = if undo { "DROP COLUMN drifted" } else { "ADD COLUMN drifted TEXT" };
+    connection.execute_batch(&format!("ALTER TABLE \"{table}\" {statement}")).expect("drift");
+}
+
+/// Opens the engine store in `dir` as the daemon does, returning why it was refused.
+fn refusal(dir: &Path) -> String {
+    let identity = flotilla_core::in_process::EngineIdentity {
+        node_id: flotilla_protocol::NodeId::new(HERE),
+        host_id: flotilla_protocol::qualified_path::HostId::new(HERE),
+        clock: std::sync::Arc::new(flotilla_resources::SystemClock),
+    };
+    match flotilla_core::in_process::decided::open(dir, identity) {
+        Ok(_) => panic!("a drifted engine store opened"),
+        Err(error) => error,
+    }
+}
+
+// Behaviour (cut-over B6): a refused engine store is named safe to delete and re-import only while
+// it holds nothing this host wrote after its import. Once the daemon has written to it, the
+// refusal says not to delete it, that deleting it throws away every write since the roll, and
+// what to do instead, naming the sequences that tell the two apart.
+#[tokio::test]
+async fn a_refused_engine_store_is_named_deletable_only_while_it_holds_nothing_since_its_import() {
+    use flotilla_provisioning::stored::artifact::ArtifactRecord;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _held = populated(dir.path()).await;
+    let imported = report(&first_start(dir.path(), HERE, None).expect("imports").expect("a report"))["last_sequence"]
+        .as_u64()
+        .expect("the import's last sequence");
+
+    drift_shape(dir.path(), false);
+    let fresh = refusal(dir.path());
+    assert!(fresh.contains(&dir.path().join(ENGINE_STORE).display().to_string()), "{fresh}");
+    assert!(fresh.contains("it holds nothing written since its import"), "{fresh}");
+    assert!(fresh.contains("deleting it (with its -wal and -shm files) and restarting re-imports it from the old store"), "{fresh}");
+    assert!(!fresh.contains("do not delete"), "{fresh}");
+
+    drift_shape(dir.path(), true);
+    {
+        let mut store = engine(dir.path());
+        let ours = {
+            let mut read = store.read().expect("read");
+            let id = read.resolve(<ArtifactRecord as Kind>::CODE, "ours", HERE).expect("resolve").expect("imported");
+            read.load::<ArtifactRecord>(id).expect("load").expect("held").value
+        };
+        let mut write = store.write().expect("write");
+        write.insert("after-the-roll", &ours, &flotilla_schema::NewChange::new("daemon", Timestamp(1))).expect("a daemon write");
+        write.commit().expect("commit");
+    }
+    drift_shape(dir.path(), false);
+    let written = refusal(dir.path());
+    assert!(written.contains("do not delete it"), "{written}");
+    assert!(written.contains("deleting it throws away every write since the roll"), "{written}");
+    assert!(written.contains(&format!("the import ended at {imported}")), "{written}");
+    assert!(written.contains("install a generation that opens it"), "{written}");
+    assert!(!written.contains("restarting re-imports"), "{written}");
 }
 
 #[tokio::test]
@@ -422,6 +341,8 @@ fn rows_of_kinds_no_importer_reads_are_dropped_or_refused_here_only() {
         row("usages", HERE, "usage"),
         row("events", HERE, "event"),
         row("regards", HERE, "regard"),
+        // Purged before the retired list (#1931): the old store's row names it by kind.
+        row("MaterialPool", HERE, "pool"),
         row("widgets", HERE, "widget"),
         row("widgets", THERE, "their-widget"),
         row("regards", THERE, "their-regard"),
@@ -434,10 +355,52 @@ fn rows_of_kinds_no_importer_reads_are_dropped_or_refused_here_only() {
     assert_eq!(summary.kinds["Usage"].dropped, 1);
     assert_eq!(summary.kinds["Event"].dropped, 1);
     assert_eq!(summary.kinds["Regard"].dropped, 1, "only this home's row is dropped here");
+    assert_eq!(summary.kinds["MaterialPool"].dropped, 1);
     assert!(!summary.kinds.contains_key("FulfilmentKind"), "an imported kind's rows are its step's");
     assert_eq!(
         summary.refusals,
         vec![Refusal { kind: "widgets".into(), name: "widget".into(), reason: "no import plan for its kind".into() }]
+    );
+}
+
+// Behaviour (#3108): the engine has one namespace, so an old store holding records in another is
+// refused by namespace, with its counts, whichever home wrote them, and nothing is put in place.
+#[test]
+fn records_outside_the_engines_namespace_are_refused_by_namespace() {
+    let row = |namespace: &str, plural: &str, home: &str, name: &str| Row {
+        namespace: namespace.into(),
+        plural: plural.into(),
+        home: home.into(),
+        document: json!({"metadata": {"name": name}}),
+    };
+    let source = Source::new(vec![
+        row(NS, "usages", HERE, "usage"),
+        row("other", "usages", HERE, "usage"),
+        row("other", "events", THERE, "event"),
+        row("other", "events", HERE, "event-2"),
+        row("third", "usages", THERE, "usage"),
+    ]);
+    let summary = rehearse(&source, HERE);
+    assert!(summary.refused());
+    let namespaces: Vec<_> = summary.refusals.iter().filter(|refusal| refusal.kind == "namespace").collect();
+    assert_eq!(
+        namespaces,
+        vec![
+            &Refusal {
+                kind: "namespace".into(),
+                name: "other".into(),
+                reason: "3 records outside the engine's namespace `flotilla` (2 events, 1 usages); the engine has one namespace, so \
+                         they would collide with its records of the same names"
+                    .into(),
+            },
+            &Refusal {
+                kind: "namespace".into(),
+                name: "third".into(),
+                reason: "1 record outside the engine's namespace `flotilla` (1 usages); the engine has one namespace, so they would \
+                         collide with its records of the same names"
+                    .into(),
+            },
+        ]
     );
 }
 
@@ -510,23 +473,15 @@ fn messages_import_by_state_drop_what_nobody_can_act_on_and_name_each_refusal() 
         record["status"]["resolved_receiver"] = delivered_to_a_gone_session.clone();
         record
     };
-    let convoy = |name: &str, phase: &str| {
-        document(
-            "Convoy",
-            name,
-            serde_json::to_value(flotilla_resources::ConvoySpec::builder().workflow_ref("w".into()).project_ref("flotilla".into()).build())
-                .expect("spec"),
-            json!({"phase": phase}),
-        )
-    };
     let documents = vec![
         designation(),
-        convoy("landed", "Landed"),
-        convoy("live", "Active"),
+        ended_convoy("landed", "Landed", "2026-10-19T01:00:00Z", json!({"disposition": "merged"})),
+        live_convoy("live"),
+        live_convoy("demo"),
         message("waiting"),
         addressed("from-a-person", "principal:alice", "flotilla/demo/work/coder", Value::Null),
         awaiting("awaiting-in-landed", "landed"),
-        awaiting("awaiting-in-unheld", "demo"),
+        awaiting("awaiting-in-gone", "gone"),
         awaiting("awaiting-in-live", "live"),
         settled_elsewhere,
         addressed("orphan-reply", "flotilla/demo/work/coder", "system:turn-rules", json!({"in_reply_to": "gone"})),
@@ -537,6 +492,10 @@ fn messages_import_by_state_drop_what_nobody_can_act_on_and_name_each_refusal() 
     let messages: Vec<_> = refused(&summary).into_iter().filter(|(kind, _)| *kind == "Message").collect();
     assert_eq!(messages, [("Message", "broken"), ("Message", "awaiting-in-live"), ("Message", "orphan-reply")], "{summary:?}");
     assert!(summary.refusals[0].reason.starts_with("does not decode"), "{:?}", summary.refusals[0]);
+    // A record naming a convoy the old store no longer holds names its tombstone (#3108 ruling
+    // (a)): awaiting a crew whose session is gone, it is dropped as the one in a landed convoy is.
+    assert_eq!(summary.rows["Message"].drops.get("its delivered session is gone"), Some(&3), "{summary:?}");
+    assert_eq!(summary.tallies["Convoy"].get("tombstone: its convoy was gone before import"), Some(&1), "{summary:?}");
 
     let mut unnamed = documents;
     unnamed[0]["spec"].as_object_mut().expect("spec").remove("fleet");
@@ -545,6 +504,170 @@ fn messages_import_by_state_drop_what_nobody_can_act_on_and_name_each_refusal() 
     let designation = summary.refusals.iter().find(|refusal| refusal.name == "FleetDesignation").expect("named once");
     assert!(designation.reason.contains("FleetDesignation.spec.fleet is missing"), "{designation:?}");
     assert_eq!(summary.refusals.iter().filter(|refusal| refusal.name == "FleetDesignation").count(), 1);
+}
+
+// A message in flight to a crew (delivered, its reply awaited) names the launch its session
+// imported as, so the crew's consumer, named by that launch, is the one that settles it.
+#[test]
+fn an_in_flight_message_names_the_launch_its_crew_session_imported_as() {
+    let convoy = live_convoy("live");
+    let session = document(
+        "TerminalSession",
+        "terminal-live-work-coder",
+        json!({"env_ref": "env", "role": "coder", "cwd": "/repo", "pool": "cleat",
+            "source": {"kind": "agent", "selector": {"capability": "code"}, "brief": {"path": "brief.md", "content": ""},
+                "context": {"namespace": NS, "convoy": "live", "vessel_ref": "live-work"}}}),
+        json!({"phase": "Running", "session_id": "s-coder", "crew": {"id": "crew-coder", "adapter": "claude", "stance": "trusted"}}),
+    );
+    let mut in_flight = message("in-flight");
+    in_flight["spec"]["receiver"] = json!("flotilla/live/work/coder");
+    in_flight["spec"]["expectation"] = json!({"kind": "reply"});
+    in_flight["status"]["phase"] = json!("delivered");
+    in_flight["status"]["resolved_receiver"] =
+        json!({"crew_id": "crew-coder", "session": "s-coder", "delivered_at": "2026-10-19T00:00:00Z", "evidence": "turn confirmed"});
+    let source = rows(vec![designation(), convoy, session, in_flight]);
+
+    let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&source, &mut target);
+    assert_eq!(summary.kinds["Message"].imported, 1, "{summary:?}");
+    assert_eq!(summary.kinds["TerminalSession"].imported, 1, "{summary:?}");
+    let mut store = target.store();
+    let mut read = store.read().expect("read");
+    let launch = {
+        use flotilla_provisioning::stored::Launches as _;
+        let key = flotilla_provisioning::stored::terminal_session::TerminalSessionKind::by_launch("terminal-live-work-coder");
+        let numbers = read.integer_index_keys_before(&key, HERE, i64::MAX, 1).expect("launches");
+        format!("terminal-live-work-coder#{}", numbers.first().expect("the session's launch").1)
+    };
+    let inbox: flotilla_address::Address = "project:flotilla/convoy:live%231/role:coder".parse().expect("the convoy's launch's inbox");
+    let name = flotilla_core::primitives::import::imported_name(&inbox, "in-flight").expect("name");
+    let id = read.resolve(<MessageResource as Kind>::CODE, &name, HERE).expect("resolve").expect("message");
+    let message = read.load::<MessageResource>(id).expect("load").expect("message").value;
+    let flotilla_state_machines::machines::message::MessageState::Awaiting { receiver, .. } = message.state() else {
+        panic!("still awaiting its reply: {:?}", message.state())
+    };
+    assert_eq!(receiver.id, launch, "the crew's consumer is named by its launch");
+    assert_eq!(receiver.host, HERE);
+}
+
+// The first start imports a vessel as its work's first launch and holds what was held for the
+// old vessel, its environment and its crew's terminal session, for that launch: after the start
+// they keep the lease they were held under, rather than naming a vessel nothing holds (#3108).
+#[test]
+fn an_imported_environment_and_terminal_session_keep_their_lease_after_the_first_start() {
+    use flotilla_provisioning::stored::{environment::EnvironmentKind, terminal_session::TerminalSessionKind, Holder, Launches as _};
+    use flotilla_state_machines::machines::{
+        convoy::ConvoyId,
+        lifecycle::{Lifecycle, LifecycleState},
+        vessel::{Vessel as EngineVessel, VesselSpec},
+    };
+    use flotilla_state_machines::Resource as EngineResource;
+
+    let vessel = document(
+        "Vessel",
+        "live-work",
+        json!({"convoy_ref": "live", "vessel_name": "work", "fulfilment_kind_ref": "p"}),
+        json!({"phase": "Ready", "environment_ref": "env-live-work",
+            "placement_decision": {"policy_name": "p", "target_host": {"ref": HERE, "display_name": HERE}}}),
+    );
+    let spec = flotilla_resources::EnvironmentSpec {
+        host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec { host_ref: HERE.into(), repo_default_dir: "/work".into() }),
+        ..Default::default()
+    };
+    let mut environment =
+        document("Environment", "env-live-work", serde_json::to_value(&spec).expect("spec"), json!({"phase": "Ready", "ready": true}));
+    environment["metadata"]["labels"] = json!({ (flotilla_resources::VESSEL_REF_LABEL): "live-work" });
+    let session = document(
+        "TerminalSession",
+        "terminal-live-work-coder",
+        json!({"env_ref": "env-live-work", "role": "coder", "cwd": "/work", "pool": "cleat",
+            "source": {"kind": "agent", "selector": {"capability": "code"}, "brief": {"path": "brief.md", "content": ""},
+                "context": {"namespace": NS, "convoy": "live", "vessel_ref": "live-work"}}}),
+        json!({"phase": "Running", "session_id": "s-coder", "crew": {"id": "crew-coder", "adapter": "claude", "stance": "trusted"}}),
+    );
+    let source = rows(vec![live_convoy("live"), vessel, environment, session]);
+
+    let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&source, &mut target);
+    for kind in ["Vessel", "Environment", "TerminalSession"] {
+        assert_eq!(summary.kinds[kind].imported, 1, "{kind}: {summary:?}");
+    }
+    let mut store = target.store();
+    let mut read = store.read().expect("read");
+    let (id, _) = *read
+        .integer_index_keys_before(&VesselSpec::by_launch(&ConvoyId::new("live#1", HERE), &"live-work".to_owned()), HERE, i64::MAX, 1)
+        .expect("launches")
+        .first()
+        .expect("the vessel's launch");
+    let launch = read.load::<EngineResource<EngineVessel>>(id).expect("load").expect("launch").value;
+    assert!(launch.name().starts_with("live-work#"), "a launch of its work: {}", launch.name());
+    assert_eq!(launch.state(), &LifecycleState::Realised { identity: "env-live-work".into() }, "the lease holds");
+    let held = Some(Holder::vessel(launch.name()));
+
+    let id = read
+        .resolve(<EngineResource<Lifecycle<EnvironmentKind>> as Kind>::CODE, "env-live-work", HERE)
+        .expect("resolve")
+        .expect("the environment");
+    let imported = read.load::<EngineResource<Lifecycle<EnvironmentKind>>>(id).expect("load").expect("environment").value;
+    assert_eq!(imported.spec().holder, held, "the environment is held for the launch");
+
+    let (id, _) = *read
+        .integer_index_keys_before(&TerminalSessionKind::by_launch("terminal-live-work-coder"), HERE, i64::MAX, 1)
+        .expect("launches")
+        .first()
+        .expect("the session's launch");
+    let imported = read.load::<EngineResource<Lifecycle<TerminalSessionKind>>>(id).expect("load").expect("session").value;
+    assert_eq!(imported.spec().holder, held, "the crew's session is held for the launch");
+}
+
+// Behaviour (#3108 mapping): a live convoy imports as its launch, and its dependents name that
+// launch: its pending message waits in the inbox of the launch's seat, the one its crew's
+// consumer reads, and its placed vessel is a launch of the launch's work. The engine's own read
+// of what holds the convoy finds both, as it would for a convoy it launched.
+#[test]
+fn a_live_convoys_message_and_vessel_belong_to_its_launch() {
+    use flotilla_state_machines::machines::{
+        convoy::ConvoyId,
+        vessel::{Vessel as EngineVessel, VesselSpec},
+    };
+
+    let vessel = document(
+        "Vessel",
+        "demo-implement",
+        json!({"convoy_ref": "demo", "vessel_name": "implement", "fulfilment_kind_ref": "p"}),
+        json!({"phase": "Ready", "environment_ref": "env-demo",
+            "placement_decision": {"policy_name": "p", "target_host": {"ref": HERE, "display_name": HERE}}}),
+    );
+    let mut waiting = message("waiting");
+    waiting["spec"]["receiver"] = json!("flotilla/demo/implement/coder");
+    let source = rows(vec![designation(), live_convoy("demo"), vessel, waiting]);
+    let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&source, &mut target);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    let mut store = target.store();
+    let mut read = store.read().expect("read");
+    let (_, convoy) = convoy_launch(&mut read, "demo");
+    assert_eq!(convoy.name(), "demo#1");
+
+    let project = flotilla_address::Address::project("flotilla").expect("project");
+    let seat = flotilla_resources::convoy::engine::seat_address(&project, convoy.name(), "coder").expect("seat");
+    let name = flotilla_core::primitives::import::imported_name(&seat, "waiting").expect("name");
+    let id = read.resolve(<MessageResource as Kind>::CODE, &name, HERE).expect("resolve").expect("waits in the launch's seat inbox");
+    let message = read.load::<MessageResource>(id).expect("load").expect("message").value;
+    assert_eq!(*message.state(), flotilla_state_machines::machines::message::MessageState::Pending);
+
+    let work = flotilla_resources::vessel_resource_name("demo", "implement");
+    let (id, _) = *read
+        .integer_index_keys_before(&VesselSpec::by_launch(&ConvoyId::new(convoy.name(), HERE), &work), HERE, i64::MAX, 1)
+        .expect("launches")
+        .first()
+        .expect("the vessel is a launch of the launch's work");
+    let vessel = read.load::<flotilla_state_machines::Resource<EngineVessel>>(id).expect("load").expect("vessel").value;
+
+    let holds = flotilla_engine_convoys::holds::holds(&mut read, &convoy, HERE).expect("holds");
+    let kinds: Vec<&str> = holds.iter().map(|hold| hold.split(':').next().unwrap_or_default()).collect();
+    assert_eq!(kinds, ["message", "vessel"], "{holds:?}");
+    assert!(holds.contains(&format!("vessel:{}", vessel.name())), "{holds:?}");
 }
 
 #[test]
@@ -565,6 +688,7 @@ fn lifecycle_records_import_by_state_and_name_what_they_cannot_map() {
                 json!({"convoy_ref": "convoy-a", "vessel_name": "implement", "fulfilment_kind_ref": "p"}),
                 Value::Null,
             ),
+            live_convoy("convoy-b"),
             document(
                 "Vessel",
                 "convoy-b-implement",
@@ -584,18 +708,75 @@ fn lifecycle_records_import_by_state_and_name_what_they_cannot_map() {
                 json!({"project_ref": "flotilla", "role": "reviewer", "repositories": []}),
                 json!({"convoy_ref": "governor-1"}),
             ),
-            document("Convoy", "governor-1", json!({"workflow_ref": "w", "inputs": {}}), Value::Null),
+            document("Convoy", "governor-1", json!({"workflow_ref": "w", "inputs": {}, "project_ref": "flotilla"}), Value::Null),
         ]),
         HERE,
     );
     assert_eq!(summary.kinds["Clone"], Counts { imported: 1, dropped: 0, refused: 1 }, "{summary:?}");
-    assert_eq!(summary.kinds["Checkout"], Counts { imported: 0, dropped: 1, refused: 0 }, "an observed checkout is no request");
+    assert_eq!(
+        summary.kinds["Checkout"],
+        Counts { imported: 1, dropped: 0, refused: 0 },
+        "an adopted (observed) checkout imports at its path: {summary:?}"
+    );
     assert_eq!(summary.kinds["Vessel"].imported, 1, "a placed vessel is its lease: {summary:?}");
-    assert_eq!(summary.kinds["Ensure"].imported, 2);
+    // A standing role's declaration imports as a definition; its status is derived on the engine.
+    assert_eq!(summary.kinds["ConvoyEnsure"].imported, 2);
     assert_eq!(refused(&summary), [("Clone", "broken-a")]);
-    for expected in ["`convoy-a-implement` is not placed yet", "`governor-9`, which is not held", "`governor-1`, which has no status yet"] {
+    for expected in ["`convoy-a-implement` is not placed yet", "2 ConvoyEnsure statuses not carried"] {
         assert!(summary.notes.iter().any(|note| note.contains(expected)), "{expected}: {:?}", summary.notes);
     }
+}
+
+// Behaviour (#3108, R2): a checkout held for a convoy that never bootstrapped, so imports as no
+// launch, is refused by name and counted by why. One held for a convoy the old store no longer
+// holds names its tombstone (#3108 ruling (a)), ended, so it is left on disk as an orphaned
+// worktree, as one held for an ended convoy is.
+#[test]
+fn a_checkout_held_for_a_convoy_with_no_launch_is_refused() {
+    let held_for = |name: &str, convoy: &str| {
+        let mut held = document(
+            "Checkout",
+            name,
+            json!({"kind": "worktree", "repo_ref": "repo", "env_ref": "env-a", "ref": "feature", "target_path": "/w", "clone_ref": "clone-a"}),
+            json!({"phase": "Ready"}),
+        );
+        held["metadata"]["labels"] = json!({"flotilla.work/convoy": convoy});
+        held
+    };
+    let unbooted = document("Convoy", "unbooted", json!({"workflow_ref": "w", "project_ref": "flotilla", "inputs": {}}), Value::Null);
+    // Held here for a convoy another home holds, which ended there: left on disk as one held for
+    // an ended convoy here is.
+    let mut held_there = held_for("held-for-landed-there", "landed-there");
+    held_there["metadata"]["annotations"] = json!({ (flotilla_resources::ACTUATOR_SOURCE_ROOT_ANNOTATION): THERE });
+    let landed_there = homed(THERE, ended_convoy("landed-there", "Landed", "2026-10-19T01:00:00Z", json!({"disposition": "merged"})));
+    let documents = vec![
+        clone("clone-a"),
+        unbooted,
+        held_for("held-for-unbooted", "unbooted"),
+        held_for("held-for-gone", "gone"),
+        landed_there,
+        held_there,
+    ];
+    let summary = rehearse(&rows(documents.clone()), HERE);
+    assert_eq!(refused(&summary), [("Checkout", "held-for-unbooted")], "{summary:?}");
+    assert_eq!(summary.tallies["Checkout"].get("refused: names a convoy that never bootstrapped"), Some(&1), "{summary:?}");
+    let drops = &summary.rows["Checkout"].drops;
+    // No record names a project for `gone`: it has no tombstone, and the checkout naming it is
+    // dropped with why (owner ruling, #3108).
+    assert_eq!(drops.get(NAMES_UNADDRESSED), Some(&1), "{summary:?}");
+    assert_eq!(summary.tallies["Convoy"].get(UNADDRESSED), Some(&1), "{summary:?}");
+    assert_eq!(drops.get("an orphaned worktree left on disk: held for an ended convoy"), Some(&1), "{summary:?}");
+
+    // Once a record names its project, `gone` has a tombstone, and the checkout held for it is
+    // left on disk as one held for a convoy gone before import.
+    let mut in_gone = message("in-gone");
+    in_gone["spec"]["receiver"] = json!("flotilla/gone/implement/coder");
+    let mut named = documents;
+    named.extend([designation(), in_gone]);
+    let summary = rehearse(&rows(named), HERE);
+    assert_eq!(refused(&summary), [("Checkout", "held-for-unbooted")], "{summary:?}");
+    let drops = &summary.rows["Checkout"].drops;
+    assert_eq!(drops.get("an orphaned worktree left on disk: held for a convoy gone before import"), Some(&1), "{summary:?}");
 }
 
 #[test]
@@ -625,10 +806,315 @@ fn a_standing_convoys_generations_import_as_one_stable_identity() {
     ));
     let summary = rehearse(&rows(documents), HERE);
     assert!(summary.refusals.is_empty(), "{summary:?}");
-    assert_eq!(summary.kinds["Ensure"].imported, 1);
+    assert_eq!(summary.kinds["ConvoyEnsure"].imported, 1);
     for expected in ["2 standing convoy generations map to 1 stable identities (1 folded)", "Vessel `unlisted-vessel`"] {
         assert!(summary.notes.iter().any(|note| note.contains(expected)), "{expected}: {:?}", summary.notes);
     }
+}
+
+// Behaviour (#3108 retirement): a standing role's ended generations, which never bootstrapped and
+// so are not imported, carry on as its running values: three short failures under its
+// configuration are three strikes, backing off from the last one's end. Each keeps its
+// generation as its launch number with no launch, as a live admission that failed before
+// creating its launch leaves it, so the role has counted the last one's number, which its hold
+// names.
+#[test]
+fn a_standing_roles_dropped_generations_seed_its_strikes() {
+    use flotilla_provisioning::stored::standing_role::StandingRoleRecord;
+
+    let ensure = json!({"project_ref": "flotilla", "role": "governor", "repositories": []});
+    let mut documents: Vec<_> = (1..=3)
+        .map(|generation| {
+            let finished = format!("2026-10-19T00:0{generation}:00Z");
+            let mut convoy = document(
+                "Convoy",
+                &format!("governor-{generation}"),
+                json!({"workflow_ref": "w", "inputs": {}, "project_ref": "flotilla", "role": "governor", "generation": generation}),
+                json!({"phase": "Failed", "ensure_admission": ensure, "finished_at": finished, "message": "clone failed"}),
+            );
+            convoy["metadata"]["annotations"] = json!({"flotilla.work/ensured-from": "standing-governor"});
+            convoy
+        })
+        .collect();
+    documents.push(document("ConvoyEnsure", "standing-governor", ensure.clone(), Value::Null));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut target =
+        Import::create(&dir.path().join(ENGINE_STORE), HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&rows(documents), &mut target);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    // The role's next launch follows every number its generations took (a home's launches are
+    // numbered from its sequence, so ordered rather than gapless).
+    let mut home = flotilla_state_machines::Home::<flotilla_state_machines::machines::convoy::Convoy, _>::with_log("ensure", target.log())
+        .expect("home");
+    let standing = flotilla_resources::convoy::engine::standing_name("flotilla", "governor").expect("standing name");
+    let next = home.reserve_launch(&standing, Timestamp::from_datetime(&Utc::now())).expect("reserve");
+    assert!(next > 3, "the next launch, {next}, follows the imported 3");
+    drop(home);
+    drop(target);
+
+    let mut store = engine(dir.path());
+    let mut read = store.read().expect("read");
+    let id = read.resolve(StandingRoleRecord::CODE, "standing-governor", HERE).expect("resolve").expect("the role is seeded");
+    let role = read.load::<StandingRoleRecord>(id).expect("load").expect("held").value;
+    assert_eq!(role.strikes, 3);
+    assert_eq!(role.counted, Some(3), "the last generation's launch number");
+    assert_eq!(role.backoff_from, Some(Timestamp::from_datetime(&"2026-10-19T00:03:00Z".parse().expect("time"))));
+    assert_eq!(role.last_failure.as_deref(), Some("clone failed"));
+}
+
+// Behaviour (#3108 R1): a launch's number comes from its convoy: a standing role's generation 300
+// imports as the role's launch #300 though the import writes far fewer entries, an ordinary convoy
+// as #1 of its own name, and a launch made after the import numbers above #300.
+#[test]
+fn a_launch_is_numbered_by_its_convoy_and_later_launches_follow_it() {
+    let mut generation = ended_convoy("governor-300", "Failed", "2026-10-19T03:00:00Z", json!({"message": "vessel failed"}));
+    generation["spec"]["role"] = json!("governor");
+    generation["spec"]["generation"] = json!(300);
+    generation["metadata"]["annotations"] = json!({"flotilla.work/ensured-from": "standing-governor"});
+    let documents = vec![
+        designation(),
+        generation,
+        live_convoy("demo"),
+        document(
+            "ConvoyEnsure",
+            "standing-governor",
+            json!({"project_ref": "flotilla", "role": "governor", "repositories": []}),
+            Value::Null,
+        ),
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut target =
+        Import::create(&dir.path().join(ENGINE_STORE), HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&rows(documents), &mut target);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    let standing = flotilla_resources::convoy::engine::standing_name("flotilla", "governor").expect("standing name");
+    {
+        let mut store = target.store();
+        let mut read = store.read().expect("read");
+        assert_eq!(convoy_launch(&mut read, &standing).1.name(), format!("{standing}#300"));
+        assert_eq!(convoy_launch(&mut read, "demo").1.name(), "demo#1");
+    }
+    let mut home = flotilla_state_machines::Home::<flotilla_state_machines::machines::convoy::Convoy, _>::with_log("ensure", target.log())
+        .expect("home");
+    let next = home.reserve_launch(&standing, Timestamp::from_datetime(&Utc::now())).expect("reserve");
+    assert!(next > 300, "the next launch, {next}, follows the imported 300");
+}
+
+// Behaviour (#3108 R1): two records of one home that would import as one launch refuse the
+// import, each by name, rather than one taking another's number.
+#[test]
+fn records_that_would_import_as_one_launch_are_refused() {
+    let generation = |name: &str| {
+        let mut convoy = ended_convoy(name, "Failed", "2026-10-19T03:00:00Z", json!({"message": "vessel failed"}));
+        convoy["spec"]["role"] = json!("governor");
+        convoy["spec"]["generation"] = json!(7);
+        convoy["metadata"]["annotations"] = json!({"flotilla.work/ensured-from": "standing-governor"});
+        convoy
+    };
+    let summary = rehearse(&rows(vec![designation(), generation("governor-7"), generation("governor-7-again")]), HERE);
+    let refusals: Vec<_> =
+        summary.refusals.iter().filter(|refusal| refusal.reason.contains("governor#7")).map(|refusal| refusal.name.as_str()).collect();
+    assert_eq!(refusals, ["governor-7", "governor-7-again"], "{summary:?}");
+}
+
+/// The launch of `of` homed at [`HERE`] in `store`, with its id.
+fn convoy_launch(read: &mut flotilla_schema_sqlite::Read<'_>, of: &str) -> (flotilla_schema_sqlite::ResourceId, EngineConvoyResource) {
+    let page = read.scan::<EngineConvoyResource>(HERE, None, 64).expect("scan");
+    page.ids
+        .into_iter()
+        .filter_map(|id| read.load::<EngineConvoyResource>(id).expect("load").map(|loaded| (id, loaded.value)))
+        .find(|(_, convoy)| convoy.spec().launch_of == of)
+        .unwrap_or_else(|| panic!("a launch of {of}"))
+}
+
+type EngineConvoyResource = flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy>;
+
+// Behaviour (#3108 import, ruling (a)): an ended convoy imports as its creation and then its end
+// edge, Deliver or Abandon, made by the import at its old `finished_at`, the Abandon under the
+// import's grant. Once its dependents are imported, the import withdraws each message pending to
+// an ended convoy's crew, as the end does on the engine (#3108 ruling 2), so on start nothing but
+// the import has written. Then one nothing holds retires at its end's time, and one an access
+// delivery to its crew holds stays ended. The report counts each end, the withdrawals, the
+// retirements and what holds the rest, by kind.
+#[test]
+fn ended_convoys_import_with_their_end_and_retire_unless_held() {
+    use flotilla_schema::CodeEnum as _;
+    use flotilla_state_machines::machines::convoy::{AbandonCause, ConvoyEdge, ConvoyEdgeKind, ConvoyLabel};
+    use flotilla_state_machines::machines::message::{DropReason, MessageState};
+
+    let pending_to = |name: &str, convoy: &str| {
+        let mut waiting = message(name);
+        waiting["spec"]["receiver"] = json!(format!("flotilla/{convoy}/implement/coder"));
+        waiting
+    };
+    let mut delivery = access_delivery("access-held", false);
+    delivery["spec"]["access"] = json!("flotilla/held/implement/coder");
+    let documents = vec![
+        designation(),
+        ended_convoy("landed", "Landed", "2026-10-19T01:00:00Z", json!({"disposition": "merged"})),
+        ended_convoy("failed", "Failed", "2026-10-19T02:00:00Z", json!({"message": "vessel failed"})),
+        ended_convoy("held", "Abandoned", "2026-10-19T03:00:00Z", json!({"message": "stopped by an operator"})),
+        ended_convoy("waited", "Abandoned", "2026-10-19T04:00:00Z", json!({"message": "stopped by an operator"})),
+        pending_to("for-held", "held"),
+        pending_to("for-waited", "waited"),
+        delivery,
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut target =
+        Import::create(&dir.path().join(ENGINE_STORE), HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&rows(documents), &mut target);
+    drop(target);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    let tallies: Vec<(&str, usize)> = summary.tallies["Convoy"].iter().map(|(what, count)| (what.as_str(), *count)).collect();
+    assert_eq!(
+        tallies,
+        [
+            ("ended abandoned", 2),
+            ("ended failed", 1),
+            ("ended landed", 1),
+            ("held", 1),
+            ("held by access-delivery", 1),
+            ("launch numbers raised to 1", 1),
+            ("retired", 3)
+        ],
+        "{summary:?}"
+    );
+    assert_eq!(summary.tallies["Message"].get("withdrawn: its convoy ended"), Some(&2), "{summary:?}");
+
+    let at = |time: &str| Timestamp::from_datetime(&time.parse().expect("time"));
+    let mut store = engine(dir.path());
+    let mut read = store.read().expect("read");
+    // Each message pending to an ended convoy's crew is withdrawn by the import, on the authority
+    // of the convoy's launch, when the convoy ended.
+    for (name, convoy, finished) in [("for-held", "held", "2026-10-19T03:00:00Z"), ("for-waited", "waited", "2026-10-19T04:00:00Z")] {
+        let launch = format!("project:flotilla/convoy:{convoy}%231");
+        let record = format!("{launch}/role:coder/message:{name}");
+        let id = read.resolve(<MessageResource as Kind>::CODE, &record, HERE).expect("resolve").unwrap_or_else(|| panic!("{record}"));
+        let message = read.load::<MessageResource>(id).expect("load").expect("held").value;
+        match message.state() {
+            MessageState::Dropped { reason: DropReason::Withdrawn { by, authority }, .. } => {
+                assert_eq!((by.as_str(), authority.as_str()), (launch.as_str(), launch.as_str()), "{name}");
+            }
+            other => panic!("{name} is withdrawn, not {other:?}"),
+        }
+        let change = read.last_change(id).expect("entry").expect("its change");
+        assert_eq!((change.writer.as_str(), change.at), ("import", at(finished)), "{name}: the import withdraws it when its convoy ended");
+    }
+    for (of, finished, label) in [
+        ("landed", "2026-10-19T01:00:00Z", ConvoyLabel::Retired),
+        ("failed", "2026-10-19T02:00:00Z", ConvoyLabel::Retired),
+        ("held", "2026-10-19T03:00:00Z", ConvoyLabel::Abandoned),
+        ("waited", "2026-10-19T04:00:00Z", ConvoyLabel::Retired),
+    ] {
+        let (id, convoy) = convoy_launch(&mut read, of);
+        assert_eq!(convoy.label(), label, "{of}");
+        let edge = if of == "landed" { ConvoyEdgeKind::Deliver } else { ConvoyEdgeKind::Abandon };
+        let entry = read.last_edge(id, &edge.code()).expect("entry").unwrap_or_else(|| panic!("{of} ends"));
+        let change = read.change(HERE, entry.change).expect("change").expect("its change");
+        assert_eq!((change.writer.as_str(), change.at), ("import", at(finished)), "{of}: the import ends it when it ended");
+        match entry.arguments::<ConvoyEdge>().expect("an edge").expect("its arguments decode") {
+            ConvoyEdge::Deliver(deliver) => assert_eq!(deliver.disposition, "merged"),
+            ConvoyEdge::Abandon(abandon) => {
+                let cause = if of == "failed" { AbandonCause::Failed } else { AbandonCause::Operator };
+                assert_eq!(abandon.cause, cause, "{of}");
+                assert_eq!(abandon.authority.name(), format!("{of}/import"), "{of}: under the import's grant");
+            }
+            other => panic!("{of} ends by {other:?}"),
+        }
+        if label == ConvoyLabel::Retired {
+            let retired = read.last_edge(id, &ConvoyEdgeKind::Retire.code()).expect("entry").expect("retired");
+            let change = read.change(HERE, retired.change).expect("change").expect("its change");
+            assert_eq!((change.writer.as_str(), change.at), ("import", at(finished)), "{of} retires when it ended");
+        }
+    }
+}
+
+// Behaviour (#3108 import ruling (a)): records naming a convoy the old store's garbage collection
+// removed import against a tombstone, not as refusals. The tombstone is launch 1 of the name, in
+// the project its records address it under, homed at the lowest home whose records name it and
+// made at the earliest of their times, ended
+// with its end time marked unknown and retired by the import. A message pending to it is settled
+// by the import. A convoy only another home's records name is that home's to write.
+#[test]
+fn records_naming_a_convoy_the_old_store_lost_import_against_a_retired_tombstone() {
+    use flotilla_engine_convoys::convoy_import::TOMBSTONE_REASON;
+    use flotilla_provisioning::stored::artifact::ArtifactRecord;
+    use flotilla_schema::CodeEnum as _;
+    use flotilla_state_machines::machines::convoy::{ConvoyEdge, ConvoyEdgeKind, ConvoyLabel};
+    use flotilla_state_machines::machines::message::{DropReason, MessageState};
+
+    let named = |name: &str, convoy: &str, created: &str| {
+        let mut named = artifact(name);
+        named["spec"]["convoy"] = json!(convoy);
+        named["spec"]["subject"] = json!(convoy);
+        named["metadata"]["creationTimestamp"] = json!(created);
+        named
+    };
+    // Addressed under its own project, not the namespace's: the tombstone is in that project. Its
+    // reference to the convoy, which the old store spells under the namespace for a convoy whose
+    // record it lacks, reads the tombstone too.
+    let mut waiting = message("for-gone");
+    waiting["spec"]["receiver"] = json!("elsewhere/gone/implement/coder");
+    let convoy = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NS, "gone");
+    waiting["spec"]["references"] = json!([{"kind": "control_record", "resource": convoy, "revision": "1"}]);
+    let mut about = message("about-gone");
+    about["spec"]["receiver"] = json!("principal:alice");
+    about["spec"]["references"] = waiting["spec"]["references"].clone();
+    let documents = vec![
+        designation(),
+        named("brief-gone", "gone", "2026-10-18T00:00:00Z"),
+        homed(THERE, named("brief-gone-there", "gone", "2026-10-17T00:00:00Z")),
+        homed(THERE, named("brief-lost", "lost", "2026-10-17T00:00:00Z")),
+        waiting,
+        about,
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut target =
+        Import::create(&dir.path().join(ENGINE_STORE), HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&rows(documents), &mut target);
+    drop(target);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    let tallies: Vec<(&str, usize)> = summary.tallies["Convoy"].iter().map(|(what, count)| (what.as_str(), *count)).collect();
+    assert_eq!(
+        tallies,
+        [("launch numbers raised to 1", 1), ("tombstone retired", 1), ("tombstone: its convoy was gone before import", 1)],
+        "{summary:?}"
+    );
+    assert_eq!(summary.tallies["Message"].get("withdrawn: its convoy was gone before import"), Some(&1), "{summary:?}");
+
+    let at = |time: &str| Timestamp::from_datetime(&time.parse().expect("time"));
+    let mut store = engine(dir.path());
+    let mut read = store.read().expect("read");
+    let (id, tombstone) = convoy_launch(&mut read, "gone");
+    assert_eq!((tombstone.name(), tombstone.label()), ("gone#1", ConvoyLabel::Retired));
+    // Made, ended and retired by the import at its earliest dependent's time, every home's.
+    let earliest = at("2026-10-17T00:00:00Z");
+    for edge in [ConvoyEdgeKind::Abandon, ConvoyEdgeKind::Retire] {
+        let entry = read.last_edge(id, &edge.code()).expect("entry").unwrap_or_else(|| panic!("{edge:?}"));
+        let change = read.change(HERE, entry.change).expect("change").expect("its change");
+        assert_eq!((change.writer.as_str(), change.at), ("import", earliest), "{edge:?}");
+        if let ConvoyEdge::Abandon(abandon) = entry.arguments::<ConvoyEdge>().expect("an edge").expect("its arguments decode") {
+            assert_eq!(abandon.reason, TOMBSTONE_REASON);
+        }
+    }
+    let page = read.scan::<EngineConvoyResource>(HERE, None, 64).expect("scan");
+    assert_eq!(page.ids.len(), 1, "`lost` is only another home's records' to name, so that home writes it");
+
+    assert_eq!(tombstone.spec().project.as_str(), "project:elsewhere");
+    let record = "project:elsewhere/convoy:gone%231/role:coder/message:for-gone";
+    let id = read.resolve(<MessageResource as Kind>::CODE, record, HERE).expect("resolve").expect("the message");
+    let message = read.load::<MessageResource>(id).expect("load").expect("held").value;
+    assert!(matches!(message.state(), MessageState::Dropped { reason: DropReason::Withdrawn { .. }, .. }), "{:?}", message.state());
+    assert_eq!(read.last_change(id).expect("entry").expect("its change").writer, "import");
+
+    let artifacts = read.scan::<ArtifactRecord>(HERE, None, 64).expect("scan");
+    let convoys: Vec<String> = artifacts
+        .ids
+        .into_iter()
+        .filter_map(|id| read.load::<ArtifactRecord>(id).expect("load"))
+        .map(|loaded| loaded.value.convoy)
+        .collect();
+    assert_eq!(convoys, ["gone#1"]);
 }
 
 #[test]
@@ -639,6 +1125,7 @@ fn another_hosts_records_are_read_beside_ours_but_neither_written_nor_counted() 
     };
     let summary = rehearse(
         &rows(vec![
+            live_convoy("demo"),
             artifact("ours"),
             theirs(artifact("theirs")),
             theirs(json!({"kind": "Artifact", "metadata": {"name": "their-broken"}, "spec": 7})),
@@ -654,7 +1141,7 @@ fn another_hosts_records_are_read_beside_ours_but_neither_written_nor_counted() 
         HERE,
     );
     assert!(summary.refusals.is_empty(), "their unmappable records are theirs to refuse: {summary:?}");
-    assert_eq!(summary.kinds.keys().collect::<Vec<_>>(), ["Artifact"]);
+    assert_eq!(summary.kinds.keys().collect::<Vec<_>>(), ["Artifact", "Convoy"], "ours, and the convoy our artifact is about");
     assert_eq!(summary.kinds["Artifact"].imported, 1);
 }
 
@@ -805,7 +1292,8 @@ fn hosts_importing_together_write_each_observation_once_at_its_observer() {
         let summary = import(&source, &mut target);
         assert!(summary.refusals.is_empty(), "{home}: {:?}", summary.refusals);
         assert_eq!(summary.kinds.get("ForgeRead").map(|counts| counts.dropped), (home == HERE).then_some(1), "{home}");
-        let mut read = target.store().read().expect("read");
+        let mut store = target.store();
+        let mut read = store.read().expect("read");
         let held = [
             ("ChangeRequest", read.scan::<ChangeRequestRecord>(home, None, 64).expect("scan").ids.len()),
             ("Issue", read.scan::<IssueRecord>(home, None, 64).expect("scan").ids.len()),
@@ -820,28 +1308,12 @@ fn hosts_importing_together_write_each_observation_once_at_its_observer() {
 
 type MessageResource = flotilla_state_machines::Resource<flotilla_state_machines::machines::message::Message>;
 
-fn demand(name: &str, target: (&str, &str), annotations: &[(&str, &str)], state: &str) -> Value {
-    let target = flotilla_protocol::ResourceRef::new("flotilla.work/v1", target.0, NS, target.1);
-    let spec = flotilla_resources::DemandSpec::for_dispatching_principal(
-        target,
-        flotilla_resources::DemandKind::HumanGate,
-        flotilla_protocol::PrincipalRef::implicit_for_namespace(NS),
-    );
-    let mut record = document(
-        "Demand",
-        name,
-        serde_json::to_value(spec).expect("spec"),
-        json!({"state": state, "raised": {"as_of": "2026-10-20T00:00:00Z", "authority": "writer"}}),
-    );
-    record["metadata"]["annotations"] = annotations.iter().map(|(key, value)| ((*key).to_owned(), json!(value))).collect();
-    record
-}
-
 fn attention_records() -> Vec<Value> {
-    let convoy = |name: &str, project: Option<&str>, phase: &str| {
-        let spec = flotilla_resources::ConvoySpec::builder().workflow_ref("w".into()).maybe_project_ref(project.map(str::to_owned)).build();
-        document("Convoy", name, serde_json::to_value(spec).expect("spec"), json!({"phase": phase}))
-    };
+    let mut standing = live_convoy("standing-gui-1");
+    standing["spec"]["role"] = json!("gui");
+    standing["spec"]["generation"] = json!(1);
+    standing["metadata"]["annotations"] = json!({"flotilla.work/ensured-from": "standing-gui"});
+    let finished = ended_convoy("finished", "Landed", "2026-10-19T01:00:00Z", json!({"disposition": "merged"}));
     let mut terminal = document(
         "TerminalSession",
         "coder-session",
@@ -849,18 +1321,18 @@ fn attention_records() -> Vec<Value> {
         json!({"phase": "Running", "session_id": "s1"}),
     );
     terminal["metadata"]["labels"] = json!({"flotilla.work/convoy": "demo", "flotilla.work/role": "coder"});
-    let reclaim = flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION;
-    let credential = flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION;
-    let vessel = flotilla_resources::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
-    let drift = flotilla_charter::ops_entry::ENSURE_CONFIG_DRIFT_REASON_ANNOTATION;
-    let delivery = flotilla_resources::delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION;
+    let reclaim = retired::RECLAIM_REFUSAL_REASON_ANNOTATION;
+    let credential = retired::CREDENTIAL_REFRESH_REASON_ANNOTATION;
+    let vessel = retired::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
+    let drift = retired::ENSURE_CONFIG_DRIFT_REASON_ANNOTATION;
+    let delivery = retired::DELIVERY_HOLD_REASON_ANNOTATION;
     let mut pooled = demand("ensure-attention-pooled", ("Convoy", "standing-gui-1"), &[], "raised");
     pooled["spec"]["addressee"] = json!({"kind": "pool", "pool_ref": "reviewers"});
     vec![
         designation(),
-        convoy("standing-gui-1", Some("flotilla"), "Active"),
-        convoy("finished", None, "Landed"),
-        convoy("demo", Some("flotilla"), "Active"),
+        standing,
+        finished,
+        live_convoy("demo"),
         document(
             "ConvoyEnsure",
             "standing-gui",
@@ -898,9 +1370,17 @@ fn attention_records() -> Vec<Value> {
 
 #[test]
 fn open_demands_import_as_the_attentions_their_writers_send() {
-    let source = rows(attention_records());
+    use flotilla_state_machines::machines::message::{DropReason, MessageState};
+
+    // A message names the lost convoy `gone` under its project, so it has a tombstone there.
+    let mut records = attention_records();
+    let mut in_gone = message("in-gone");
+    in_gone["spec"]["receiver"] = json!("flotilla/gone/implement/coder");
+    records.push(in_gone);
+    let source = rows(records);
     let summary = rehearse(&source, HERE);
-    assert_eq!(summary.kinds["Demand"], Counts { imported: 5, dropped: 5, refused: 3 }, "{summary:?}");
+    // A demand about a convoy the source no longer holds reads its tombstone (#3108 ruling (a)).
+    assert_eq!(summary.kinds["Demand"], Counts { imported: 6, dropped: 4, refused: 3 }, "{summary:?}");
     assert_eq!(
         refused(&summary),
         [("Demand", "ensure-attention-pooled"), ("Demand", "surprise"), ("Demand", "terminal-delivery-misaimed")],
@@ -910,17 +1390,30 @@ fn open_demands_import_as_the_attentions_their_writers_send() {
     let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
     let imported = import(&source, &mut target);
     assert_eq!(imported.kinds["Demand"], summary.kinds["Demand"]);
-    let mut read = target.store().read().expect("read");
+    let mut store = target.store();
+    let mut read = store.read().expect("read");
     let mut load = |name: &str| {
         let id = read.resolve(<MessageResource as Kind>::CODE, name, HERE).expect("resolve").expect(name);
         read.load::<MessageResource>(id).expect("load").expect(name).value
     };
+    // Each convoy is the launch it imports as, numbered by the convoy (#1, or a standing
+    // generation's generation): a hold is on the role's generation by its launch, as the ensure
+    // pass raises and clears it. A standing launch is at its one address, the role's segment numbered (#3108 R4).
+    let generation = "project:flotilla/convoy:gui%231".to_owned();
     let cases = [
-        ("project:flotilla/role:operator/message:ensure-attention-standing-gui", "standing", "project:flotilla/convoy:standing-gui-1"),
+        ("project:flotilla/role:operator/message:ensure-attention-standing-gui", "standing", generation.as_str()),
         ("project:flotilla/role:operator/message:ensure-config-drift-standing-gui", "standing", "project:flotilla/role:gui"),
-        ("fleet:lab/role:operator/message:reclaim-refusal-finished", "teardown", "convoy:finished"),
-        ("project:flotilla/role:operator/message:credential-refresh-demo-work", "capabilities", "project:flotilla/convoy:demo/vessel:work"),
-        ("project:flotilla/role:operator/message:terminal-delivery-coder-session", "turn-rules", "project:flotilla/convoy:demo/role:coder"),
+        ("project:flotilla/role:operator/message:reclaim-refusal-finished", "teardown", "project:flotilla/convoy:finished%231"),
+        (
+            "project:flotilla/role:operator/message:credential-refresh-demo-work",
+            "capabilities",
+            "project:flotilla/convoy:demo%231/vessel:work",
+        ),
+        (
+            "project:flotilla/role:operator/message:terminal-delivery-coder-session",
+            "turn-rules",
+            "project:flotilla/convoy:demo%231/role:coder",
+        ),
     ];
     for (name, sender, subject) in cases {
         let message = load(name);
@@ -929,6 +1422,13 @@ fn open_demands_import_as_the_attentions_their_writers_send() {
         assert_eq!(*message.state(), flotilla_state_machines::machines::message::MessageState::Pending, "{name}");
         assert_eq!(message.since(), Timestamp::from_datetime(&"2026-10-20T00:00:00Z".parse().expect("time")), "{name}");
     }
+    // One about a convoy the source no longer holds is about its tombstone, and the import
+    // settles it: nobody can act on a convoy gone before the import (#3108 ruling (a)). It goes to
+    // the operator of the tombstone's project, as one about a held convoy does.
+    let gone = load("project:flotilla/role:operator/message:reclaim-refusal-gone");
+    assert_eq!(gone.spec().subject().map(|reference| reference.address.as_str()), Some("project:flotilla/convoy:gone%231"));
+    assert!(matches!(gone.state(), MessageState::Dropped { reason: DropReason::Withdrawn { .. }, .. }), "{:?}", gone.state());
+    assert_eq!(imported.tallies["Demand"].get("withdrawn: its convoy was gone before import"), Some(&1), "{imported:?}");
     let credential = load("project:flotilla/role:operator/message:credential-refresh-demo-work");
     assert_eq!(
         credential.spec().body.value(),
@@ -939,21 +1439,24 @@ fn open_demands_import_as_the_attentions_their_writers_send() {
 #[test]
 fn attentions_of_two_namespaces_at_one_home_take_distinct_admission_sequences() {
     let records = |namespace: &str| {
-        let spec = flotilla_resources::ConvoySpec::builder().workflow_ref("w".into()).project_ref(namespace.into()).build();
-        let reclaim = flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION;
-        [
-            designation(),
-            document("Convoy", "finished", serde_json::to_value(spec).expect("spec"), json!({"phase": "Landed"})),
-            demand("reclaim-refusal-finished", ("Convoy", "finished"), &[(reclaim, "checkout is dirty")], "raised"),
-        ]
-        .into_iter()
-        .map(|mut document| {
-            document["metadata"]["namespace"] = json!(namespace);
-            let kind = document["kind"].as_str().expect("kind").to_owned();
-            let plural = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.kind == kind).expect("registered").plural;
-            Row { namespace: namespace.into(), plural: plural.into(), home: HERE.into(), document }
-        })
-        .collect::<Vec<_>>()
+        let mut finished = ended_convoy("finished", "Landed", "2026-10-19T01:00:00Z", json!({"disposition": "merged"}));
+        finished["spec"]["project_ref"] = json!(namespace);
+        let reclaim = retired::RECLAIM_REFUSAL_REASON_ANNOTATION;
+        [designation(), finished, demand("reclaim-refusal-finished", ("Convoy", "finished"), &[(reclaim, "checkout is dirty")], "raised")]
+            .into_iter()
+            .map(|mut document| {
+                document["metadata"]["namespace"] = json!(namespace);
+                let kind = document["kind"].as_str().expect("kind").to_owned();
+                let plural = REGISTERED_RESOURCE_KINDS
+                    .iter()
+                    .map(|entry| (entry.kind, entry.plural))
+                    .chain(flotilla_store::RETIRED_RESOURCE_KINDS.iter().map(|retired| (retired.kind, retired.plural)))
+                    .find(|(registered, _)| *registered == kind)
+                    .expect("registered or retired")
+                    .1;
+                Row { namespace: namespace.into(), plural: plural.into(), home: HERE.into(), document }
+            })
+            .collect::<Vec<_>>()
     };
     let source = Source::new([records("alpha"), records("beta")].concat());
     let summary = rehearse(&source, HERE);
@@ -962,8 +1465,8 @@ fn attentions_of_two_namespaces_at_one_home_take_distinct_admission_sequences() 
 
 #[test]
 fn a_credential_group_with_no_vessel_drops_every_demand_for_that_reason() {
-    let credential = flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION;
-    let vessel = flotilla_resources::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
+    let credential = retired::CREDENTIAL_REFRESH_REASON_ANNOTATION;
+    let vessel = retired::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
     let mut records: Vec<Value> = attention_records().into_iter().filter(|record| record["kind"] != "Demand").collect();
     records.extend([
         demand("credential-refresh-demo-gone-a", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "gone")], "raised"),
@@ -979,8 +1482,8 @@ fn a_credential_group_with_no_vessel_drops_every_demand_for_that_reason() {
 
 #[test]
 fn a_credential_group_addressed_to_different_people_is_refused_whole() {
-    let credential = flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION;
-    let vessel = flotilla_resources::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
+    let credential = retired::CREDENTIAL_REFRESH_REASON_ANNOTATION;
+    let vessel = retired::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
     let mut records: Vec<Value> = attention_records().into_iter().filter(|record| record["kind"] != "Demand").collect();
     let mut other = demand("credential-refresh-demo-work-b", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "work")], "raised");
     other["status"]["raised"]["as_of"] = json!("2026-10-21T00:00:00Z");
@@ -1065,5 +1568,308 @@ async fn placement_rows_import_as_kinds_and_none_stay_on_the_old_store() {
     let mut store = engine(dir.path());
     for name in ["host-direct-feta", "docker-crew-image-feta", "placement-snapshot-0123456789ab"] {
         assert!(holds::<flotilla_provisioning::stored::placement::FulfilmentKindDefinition>(&mut store, name, HERE), "{name}");
+    }
+}
+
+// Behaviour (#3108): a placement snapshot written before admission labelled snapshots with their
+// convoy imports as the one live convoy's that references it, so that convoy releases it; one only
+// an ended convoy references is dropped, as nothing on the engine would release it.
+#[test]
+fn an_unowned_placement_snapshot_imports_with_its_live_convoy_or_is_dropped() {
+    let snapshot = |name: &str| {
+        let mut policy = document(
+            "PlacementPolicy",
+            name,
+            json!({"pool": "cleat", "host_direct": {"host_ref": HERE, "checkout": "worktree"}}),
+            Value::Null,
+        );
+        policy["metadata"]["labels"] = json!({ (flotilla_resources::PREPARED_SNAPSHOT_LABEL): "placement" });
+        policy
+    };
+    let referencing = |mut convoy: Value, snapshot: &str| {
+        convoy["metadata"]["annotations"][flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION] = json!(snapshot);
+        convoy
+    };
+    let mut ended = live_convoy("ended");
+    ended["status"]["phase"] = json!("Abandoned");
+    ended["status"]["message"] = json!("stopped by an operator");
+    ended["status"]["finished_at"] = json!("2026-10-19T00:00:00Z");
+    let documents = vec![
+        snapshot("placement-snapshot-live"),
+        snapshot("placement-snapshot-ended"),
+        referencing(live_convoy("live"), "placement-snapshot-live"),
+        referencing(ended, "placement-snapshot-ended"),
+    ];
+    let summary = rehearse(&rows(documents), HERE);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    let policies = &summary.rows["PlacementPolicy"];
+    assert_eq!((policies.imported, policies.dropped), (1, 1), "{policies:?}");
+    assert_eq!(policies.drops.get("a snapshot no live convoy references"), Some(&1), "{policies:?}");
+}
+
+// Behaviour (#3108): an ended convoy never tears down on the engine, so a labelled snapshot,
+// placement or workflow, that only an ended convoy references is dropped and counted, while the
+// live convoy's snapshots import.
+#[test]
+fn snapshots_only_an_ended_convoy_references_are_dropped() {
+    use flotilla_resources::{CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION};
+    let placement = |name: &str, convoy: &str| {
+        let mut kind = document(
+            "FulfilmentKind",
+            name,
+            json!({"grants": ["platform:linux"], "host_ref": HERE, "pool": "cleat", "realisation": "host_direct"}),
+            Value::Null,
+        );
+        kind["metadata"]["labels"] = json!({ (PREPARED_SNAPSHOT_LABEL): "placement", (CONVOY_LABEL): convoy });
+        kind
+    };
+    let workflow = |name: &str| {
+        let mut template = document("WorkflowTemplate", name, json!({"vessels": []}), Value::Null);
+        template["metadata"]["labels"] = json!({ (PREPARED_SNAPSHOT_LABEL): "workflow" });
+        template
+    };
+    let referencing = |mut convoy: Value, snapshots: &str| {
+        convoy["metadata"]["annotations"] = json!({
+            (PLACEMENT_SNAPSHOT_ANNOTATION): format!("placement-{snapshots}"),
+            (WORKFLOW_SNAPSHOT_ANNOTATION): format!("workflow-{snapshots}"),
+        });
+        convoy
+    };
+    let mut ended = live_convoy("ended");
+    ended["status"]["phase"] = json!("Abandoned");
+    ended["status"]["message"] = json!("stopped by an operator");
+    ended["status"]["finished_at"] = json!("2026-10-19T00:00:00Z");
+    let documents = vec![
+        placement("placement-live", "live"),
+        placement("placement-ended", "ended"),
+        workflow("workflow-live"),
+        workflow("workflow-ended"),
+        referencing(live_convoy("live"), "live"),
+        referencing(ended, "ended"),
+    ];
+    let summary = rehearse(&rows(documents), HERE);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    for kind in ["FulfilmentKind", "WorkflowTemplate"] {
+        let rows = &summary.rows[kind];
+        assert_eq!((rows.imported, rows.dropped), (1, 1), "{kind}: {rows:?}");
+        assert_eq!(rows.drops.get("a snapshot no live convoy references"), Some(&1), "{kind}: {rows:?}");
+    }
+}
+
+// Behaviour (#3108): a live convoy's labelled placement snapshot is labelled with the launch the
+// convoy imported as, so the release its teardown makes when it ends collects the snapshot. With
+// the old convoy's name kept, nothing on the engine would ever release it.
+#[tokio::test]
+async fn an_imported_live_convoys_labelled_snapshot_is_collected_when_it_ends() {
+    use std::sync::Arc;
+
+    use flotilla_resources::{CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_LABEL};
+    use flotilla_state_machines::{machines::convoy::Convoy as EngineConvoy, Resource as Record};
+
+    let mut snapshot = document(
+        "FulfilmentKind",
+        "placement-live",
+        json!({"grants": ["platform:linux"], "host_ref": HERE, "pool": "cleat", "realisation": "host_direct"}),
+        Value::Null,
+    );
+    snapshot["metadata"]["labels"] = json!({ (PREPARED_SNAPSHOT_LABEL): "placement", (CONVOY_LABEL): "live" });
+    let mut convoy = live_convoy("live");
+    convoy["metadata"]["annotations"][PLACEMENT_SNAPSHOT_ANNOTATION] = json!("placement-live");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(ENGINE_STORE);
+    let mut target = Import::create(&path, HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&rows(vec![snapshot, convoy]), &mut target);
+    drop(target);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    assert_eq!(summary.kinds["FulfilmentKind"].imported, 1, "{summary:?}");
+    let launch = {
+        let mut store = engine(dir.path());
+        let mut read = store.read().expect("read");
+        let page = read.scan::<Record<EngineConvoy>>(HERE, None, 8).expect("scan");
+        let names: Vec<_> =
+            page.ids.into_iter().filter_map(|id| read.load::<Record<EngineConvoy>>(id).expect("load")).map(|loaded| loaded.name).collect();
+        let [launch] = names.as_slice() else { panic!("one imported launch: {names:?}") };
+        launch.clone()
+    };
+
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(&path, HERE, crate::runtime::decided_registry().expect("registry")).expect("store"),
+    );
+    let backend = flotilla_store_memory::engine_home_backend();
+    let clock = Arc::new(flotilla_resources::SystemClock) as Arc<dyn flotilla_resources::Clock>;
+    // Composed as a daemon composes its engine: the release reads the launches the import wrote,
+    // their vessels, and the definitions their snapshots hold.
+    let ports = flotilla_provisioning::engine::decided::open_ports(&service, HERE, Arc::clone(&clock)).expect("decided store ports");
+    for records in &ports.records {
+        backend.install_engine_records(Arc::clone(records));
+    }
+    let reads = flotilla_provisioning_testkit::EngineFixture::over_service(&service).reads();
+    backend.install_engine_records(Arc::new(flotilla_store::VesselViews::new(backend.clone(), NS, Arc::clone(&reads))));
+    let _convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(&service, NS, &backend, clock, reads);
+    let kinds = backend.using::<FulfilmentKind>(NS);
+    assert!(kinds.get("placement-live").await.is_ok(), "the live convoy's snapshot is imported");
+    // The release an ended launch's teardown makes.
+    let released =
+        flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), NS).collect(Some(&launch)).await.expect("release");
+    assert_eq!(released.placements_deleted, 1, "{launch} releases its snapshot");
+    assert!(kinds.get("placement-live").await.is_err(), "collected");
+}
+
+// Behaviour (ADR 0047, #3108): a previous-generation manifest stamp named the declaring host, not
+// its root. Imported at its home with the root in the same import, the record names the root that
+// host and its source declare, and reads back with the root's source and the document's path; a
+// read re-applies, and a ConvoyEnsure's root resolves as this home's. A host stamp no live root
+// here matches, or several match, is refused, each with its own reason.
+#[tokio::test]
+async fn a_host_named_manifest_stamp_imports_as_the_root_it_names() {
+    use std::sync::Arc;
+
+    use flotilla_provisioning::engine::{definitions::EngineDefinitions, manifest_root::EngineManifestRoots, projects::EngineProjects};
+    use flotilla_resources::{
+        definition_provenance::{
+            MANIFEST_MANAGED_BY_VALUE, MANIFEST_PATH_ANNOTATION, MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION,
+            MANIFEST_SOURCE_ANNOTATION,
+        },
+        engine_records::KindRecords,
+        manifest_roots::ManifestRoots,
+        DocumentKey, DocumentPhase, DocumentState, ManifestRootStatus, MANAGED_BY_LABEL,
+    };
+
+    let root_name = |path: &str, source: &str| crate::resource_manifest::manifest_root_name(HERE, Path::new(path), source);
+    let root = |path: &str, source: &str, declared: &[(&str, &str, &str)]| {
+        let documents = declared
+            .iter()
+            .map(|(document, kind, name)| {
+                let key = DocumentKey { path: (*document).into(), kind: (*kind).into(), namespace: NS.into(), name: (*name).into() };
+                let state = DocumentState {
+                    phase: DocumentPhase::Applied,
+                    reason: None,
+                    live_hash: Some("h".into()),
+                    desired_hash: Some("h".into()),
+                    baseline_hash: Some("h".into()),
+                    observed_at: "2026-10-19T00:00:00Z".parse().expect("time"),
+                    resolved_token: None,
+                    resolution_outcome: None,
+                    removed_in: None,
+                };
+                (key, state)
+            })
+            .collect();
+        let status = ManifestRootStatus { applied_revision: Some("rev-1".into()), source_error: None, documents, stalled: None };
+        document(
+            "ManifestRoot",
+            &root_name(path, source),
+            json!({"host": HERE, "path": path, "source": source}),
+            serde_json::to_value(status).expect("status"),
+        )
+    };
+    let stamped = |mut record: Value, source: &str, path: &str| {
+        record["metadata"]["labels"] = json!({ (MANAGED_BY_LABEL): MANIFEST_MANAGED_BY_VALUE });
+        record["metadata"]["annotations"] = json!({
+            (MANIFEST_RECONCILER_ROOT_ANNOTATION): HERE,
+            (MANIFEST_SOURCE_ANNOTATION): source,
+            (MANIFEST_PATH_ANNOTATION): path,
+            (MANIFEST_REVISION_ANNOTATION): "rev-1",
+        });
+        record
+    };
+    let ensure =
+        document("ConvoyEnsure", "quartermaster", json!({"project_ref": "app", "role": "quartermaster", "repositories": []}), Value::Null);
+    // The records come before their root: the outcome does not depend on the order rows are read.
+    let source = rows(vec![
+        stamped(project("app", "2026-10-19T00:00:00Z", json!([])), "project-map", "projects/app.yaml"),
+        stamped(ensure, "project-map", "ensures/quartermaster.yaml"),
+        stamped(project("unmatched", "2026-10-19T00:00:00Z", json!([])), "elsewhere", "projects/unmatched.yaml"),
+        stamped(project("doubled", "2026-10-19T00:00:00Z", json!([])), "twice", "projects/doubled.yaml"),
+        root(
+            "/ops",
+            "project-map",
+            &[("projects/app.yaml", "Project", "app"), ("ensures/quartermaster.yaml", "ConvoyEnsure", "quartermaster")],
+        ),
+        root("/first", "twice", &[]),
+        root("/second", "twice", &[]),
+    ]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(ENGINE_STORE);
+    let mut target = Import::create(&path, HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&source, &mut target);
+    drop(target);
+    assert_eq!(summary.kinds["Project"].imported, 1, "{summary:?}");
+    assert_eq!(summary.kinds["ConvoyEnsure"].imported, 1, "{summary:?}");
+    let reasons: BTreeMap<&str, &str> = summary
+        .refusals
+        .iter()
+        .filter(|refusal| refusal.kind == "Project")
+        .map(|refusal| (refusal.name.as_str(), refusal.reason.as_str()))
+        .collect();
+    assert!(reasons["unmatched"].contains("no live root at its home declares host"), "{reasons:?}");
+    assert!(reasons["doubled"].contains("2 live roots at its home declare host"), "{reasons:?}");
+    assert_eq!(reasons.len(), 2, "{:?}", summary.refusals);
+
+    let declared = root_name("/ops", "project-map");
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(&path, HERE, crate::runtime::decided_registry().expect("registry")).expect("store"),
+    );
+    let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(flotilla_resources::SystemClock);
+    let projects = EngineProjects::open(service.clone(), clock.clone()).expect("projects");
+    let app = projects.get("app").await.expect("read").expect("imported");
+    // The manifest reconciler's "claimed by two sources" check passes once the stamp is its root's name.
+    assert_eq!(app.annotations[MANIFEST_RECONCILER_ROOT_ANNOTATION], declared);
+    assert_eq!(app.annotations[MANIFEST_SOURCE_ANNOTATION], "project-map");
+    assert_eq!(app.annotations[MANIFEST_PATH_ANNOTATION], "projects/app.yaml");
+    projects.apply("app", None, &app.labels, &app.annotations, &app.spec).await.expect("a read re-applies");
+
+    let definitions = EngineDefinitions::open(service.clone(), clock.clone()).expect("definitions");
+    let ensure =
+        KindRecords::<flotilla_resources::ConvoyEnsure>::get(&definitions, "quartermaster").await.expect("read").expect("imported");
+    assert_eq!(ensure.annotations[MANIFEST_RECONCILER_ROOT_ANNOTATION], declared);
+    assert_eq!(ensure.annotations[MANIFEST_PATH_ANNOTATION], "ensures/quartermaster.yaml");
+    // The acting-home check's primary path: the stamped root, read as this home's.
+    let roots = EngineManifestRoots::open(service, clock).expect("roots");
+    assert!(roots.root(NS, &declared).await.expect("root").expect("held").local);
+}
+
+// Rehearsal (#3108): the import of a copy of a real frozen-fleet store, named by
+// `FLOTILLA_IMPORT_REHEARSAL_STORE`, into a store in memory, with no daemon. The copy is only
+// read, and this prints counts, drop reasons, tallies and refusal reasons with every name in them
+// left out.
+#[test]
+#[ignore = "needs a real old store copy in FLOTILLA_IMPORT_REHEARSAL_STORE"]
+fn a_real_old_store_rehearses_its_import_in_memory() {
+    let store = std::path::PathBuf::from(std::env::var_os("FLOTILLA_IMPORT_REHEARSAL_STORE").expect("FLOTILLA_IMPORT_REHEARSAL_STORE"));
+    let source = Source::read(&store, "local").expect("read the old store");
+    let own_host = source.own_daemon_host("local");
+    let summary = rehearse(&source.with_own_host(own_host), "local");
+    // A reason names its records between backticks; a decoder's names only the stored shape.
+    let unnamed = |reason: &str| match reason.starts_with("does not decode") {
+        true => reason.to_owned(),
+        false => reason.split('`').enumerate().map(|(at, part)| if at % 2 == 1 { "`…`" } else { part }).collect::<String>(),
+    };
+    for (kind, rows) in &summary.rows {
+        println!(
+            "rows {kind}: {} = {} imported + {} dropped + {} other home, {} unaccounted",
+            rows.rows, rows.imported, rows.dropped, rows.other_home, rows.unaccounted
+        );
+        for (reason, count) in &rows.drops {
+            println!("dropped {count} {kind}: {reason}");
+        }
+    }
+    for (kind, tallies) in &summary.tallies {
+        for (what, count) in tallies {
+            println!("tally {kind}: {what}: {count}");
+        }
+    }
+    let mut reasons = BTreeMap::<(String, String), usize>::new();
+    for refusal in &summary.refusals {
+        *reasons.entry((refusal.kind.clone(), unnamed(&refusal.reason))).or_default() += 1;
+    }
+    for ((kind, reason), count) in reasons {
+        println!("refused {count} {kind}: {reason}");
+    }
+    // Named, only into a file the operator asks for beside the copy: never printed.
+    if let Some(names) = std::env::var_os("FLOTILLA_IMPORT_REHEARSAL_NAMES") {
+        let lines: String =
+            summary.refusals.iter().map(|refusal| format!("{}\t{}\t{}\n", refusal.kind, refusal.name, refusal.reason)).collect();
+        std::fs::write(names, lines).expect("write the named refusals");
     }
 }

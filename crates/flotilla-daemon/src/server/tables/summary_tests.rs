@@ -173,7 +173,7 @@ mod sources {
         super::{live, page, DerivedSet, Live, Query, TableSource, PROGRESS},
         *,
     };
-    use flotilla_resources::{Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta};
+    use flotilla_resources::{access_delivery::access_key, AccessDelivery, AccessDeliverySpec, InputMeta};
     use flotilla_schema::{ColumnType, Layout};
     use flotilla_store::ResourceBackend;
     use futures::{stream::BoxStream, FutureExt, StreamExt};
@@ -190,14 +190,19 @@ mod sources {
     const VALUES: &[&str] = &["phase", "group", "number"];
     const PHASES: [Option<&str>; 4] = [None, Some("Running"), Some("Landed"), Some("")];
 
+    /// The fields of the resource fixture, an engine-served AccessDelivery table: its convoy label
+    /// comes from the access key, and it has no status, so `status.phase` is always absent.
     const RESOURCE_FIELDS: &[Field] = &[
         Field { column: "status.phase", spelling: "status.phase", literals: &[r#""Pending""#, r#""Active""#, r#""Landed""#], has: true },
-        Field { column: "metadata.labels", spelling: r#"metadata.labels["group"]"#, literals: &[r#""a""#, r#""b""#], has: false },
+        Field {
+            column: "metadata.labels",
+            spelling: r#"metadata.labels["flotilla.work/convoy"]"#,
+            literals: &[r#""a""#, r#""b""#],
+            has: false,
+        },
         Field { column: "metadata.name", spelling: "metadata.name", literals: &[r#""r0""#, r#""r1""#, r#""r2""#], has: true },
     ];
     const RESOURCE_VALUES: &[&str] = &["status.phase", "metadata.labels", "metadata.name"];
-    const RESOURCE_PHASES: [Option<ConvoyPhase>; 4] =
-        [None, Some(ConvoyPhase::Pending), Some(ConvoyPhase::Active), Some(ConvoyPhase::Landed)];
 
     #[derive(Clone, Copy, Debug)]
     struct Sample {
@@ -396,18 +401,51 @@ mod sources {
         runtime().block_on(check_read(|params| read(&source, params), &[], &scope, &wheres, VALUES));
     }
 
-    async fn write_convoy(backend: &ResourceBackend, name: &str, sample: Sample) {
-        let convoys = backend.using::<Convoy>("test");
-        let labels = BTreeMap::from([("group".to_owned(), GROUPS[sample.group].to_owned())]);
-        let meta = InputMeta::builder().name(name.into()).labels(labels).build();
-        let spec = ConvoySpec::builder().workflow_ref(format!("workflow-{}", sample.number)).build();
-        let written = match convoys.get(name).await {
-            Ok(current) => convoys.update(&meta, &current.metadata.resource_version, &spec).await.unwrap(),
-            Err(_) => convoys.create(&meta, &spec).await.unwrap(),
+    /// An engine home serving AccessDelivery from a decided store in `test`, and its table; the
+    /// directory holds the store.
+    fn resource_source() -> (tempfile::TempDir, ResourceBackend, TableSource) {
+        use flotilla_provisioning::engine::access_deliveries::EngineAccessDeliveries;
+        let directory = tempfile::tempdir().unwrap();
+        let service = Arc::new(
+            flotilla_schema_sqlite::stream::Service::open(
+                &directory.path().join("decided.sqlite"),
+                "home",
+                flotilla_provisioning::stored::decided_registry().unwrap(),
+            )
+            .unwrap(),
+        );
+        let backend = flotilla_store_memory::engine_home_backend();
+        backend.serve_engine_in("test");
+        let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(flotilla_resources::SystemClock);
+        backend.install_engine_records(Arc::new(EngineAccessDeliveries::open(Arc::clone(&service), clock).unwrap()));
+        let source = TableSource::Resource {
+            backend: backend.clone(),
+            kind: "AccessDelivery",
+            name: "accessdeliveries".into(),
+            service,
+            positions: Arc::default(),
+            run: "test".into(),
+            subject: None,
         };
-        if let Some(phase) = RESOURCE_PHASES[sample.phase] {
-            let status = ConvoyStatus { phase, ..ConvoyStatus::default() };
-            convoys.update_status(name, &written.metadata.resource_version, &status).await.unwrap();
+        (directory, backend, source)
+    }
+
+    /// Writes `name` with `sample`'s group as its convoy (none for the empty group) and its number
+    /// in its place; its phase has no field to land in.
+    async fn write_delivery(backend: &ResourceBackend, name: &str, sample: Sample) {
+        let deliveries = backend.using::<AccessDelivery>("test");
+        let meta = InputMeta::builder().name(name.into()).build();
+        let spec = AccessDeliverySpec {
+            access: access_key("flotilla", GROUPS[sample.group], "implement", "coder"),
+            place: format!("place-{}", sample.number),
+            harness: "claude-code".into(),
+            home: "/home".into(),
+            needs: BTreeMap::new(),
+            retry: None,
+        };
+        match deliveries.get(name).await {
+            Ok(current) => drop(deliveries.update(&meta, &current.metadata.resource_version, &spec).await.unwrap()),
+            Err(_) => drop(deliveries.create(&meta, &spec).await.unwrap()),
         }
     }
 
@@ -417,19 +455,18 @@ mod sources {
         let (scope, wheres) = (clauses(&tc, RESOURCE_FIELDS, 2), clauses(&tc, RESOURCE_FIELDS, 3));
         let writes = ops(&tc);
         runtime().block_on(async move {
-            let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+            let (_directory, backend, source) = resource_source();
             let mut names = Names::default();
             for sample in initial {
-                write_convoy(&backend, &names.fresh(), sample).await;
+                write_delivery(&backend, &names.fresh(), sample).await;
             }
-            let source = TableSource::Resource { backend: backend.clone(), name: "convoys".into(), subject: None };
             let base = [("namespace".to_owned(), "test".to_owned())];
             contract(&source, &base, &scope, &wheres, RESOURCE_VALUES, writes, |op| {
                 let (backend, (name, sample)) = (backend.clone(), names.target(op));
                 async move {
                     match sample {
-                        Some(sample) => write_convoy(&backend, &name, sample).await,
-                        None => backend.using::<Convoy>("test").delete(&name).await.unwrap(),
+                        Some(sample) => write_delivery(&backend, &name, sample).await,
+                        None => backend.using::<AccessDelivery>("test").delete(&name).await.unwrap(),
                     }
                 }
             })
@@ -506,13 +543,12 @@ mod sources {
     // watch's list stays a fresh read's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn values_hold_the_hundred_most_frequent_through_deltas() {
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        // Every name is distinct; group `a` is the most frequent label and `b` the next.
+        let (_directory, backend, source) = resource_source();
+        // Every name is distinct; group `b` is the most frequent label and `a` the next.
         for index in 0..105 {
             let group = if index < 3 { 0 } else { 1 };
-            write_convoy(&backend, &format!("n{index:03}"), Sample { phase: 0, group, number: 1 }).await;
+            write_delivery(&backend, &format!("n{index:03}"), Sample { phase: 0, group, number: 1 }).await;
         }
-        let source = TableSource::Resource { backend: backend.clone(), name: "convoys".into(), subject: None };
         let summary = summarised(&params(&[("namespace".to_owned(), "test".to_owned())], [], []), &["metadata.name", "metadata.labels"]);
         let first = read(&source, summary.clone()).await;
         let names = first
@@ -531,7 +567,10 @@ mod sources {
         });
         assert_eq!(
             labels.unwrap(),
-            [ValueCount { value: json!({"group": "b"}), count: 102 }, ValueCount { value: json!({"group": "a"}), count: 3 }]
+            [
+                ValueCount { value: json!({"flotilla.work/convoy": "b"}), count: 102 },
+                ValueCount { value: json!({"flotilla.work/convoy": "a"}), count: 3 }
+            ]
         );
 
         let mut with_watch = summary.clone();
@@ -541,7 +580,7 @@ mod sources {
         while let Some(Some(message)) = stream.next().now_or_never() {
             mirror.apply(&message);
         }
-        backend.using::<Convoy>("test").delete("n000").await.unwrap();
+        backend.using::<AccessDelivery>("test").delete("n000").await.unwrap();
         signal.unbounded_send(()).unwrap();
         let mut deltas = Vec::new();
         deltas.push(stream.next().await.unwrap());

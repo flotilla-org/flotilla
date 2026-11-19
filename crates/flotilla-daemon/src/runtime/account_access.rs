@@ -28,19 +28,20 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_agent::account_access::{AccountProvisioner, AccountProvisioners, EnvironmentKind};
 use flotilla_core::in_process::InProcessDaemon;
+use flotilla_protocol::LifecycleReading;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provisioning::engine::terminal_actuator::TerminalProvider;
 use flotilla_resources::{
     account_access::{
         binding_name, material_generation, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords,
         BindingRecord, Delivered, ProvisionPlan, ProvisionRecord,
     },
-    Convoy, CredentialGrant, CredentialSpec, Environment, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance,
-    TerminalSession, TerminalSessionSource,
+    Convoy, CredentialGrant, CredentialSpec, ReadWatchEvent, ResourceError, ResourceObject, TerminalSession, TerminalSessionSource,
 };
 use flotilla_schema::{Ref, Timestamp};
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
-    ResourceBackend,
+    ConvoyViews, ResourceBackend,
 };
 use futures::StreamExt;
 
@@ -63,11 +64,7 @@ async fn place_environment_kind(state: &ControllerRuntimeState, launch: &Account
     if launch.env_ref == state.host_direct_environment_name {
         return Ok(EnvironmentKind::HostDirect);
     }
-    let environment = match state.daemon.resource_backend().including_replicas::<Environment>(launch.namespace).get(launch.env_ref).await {
-        Ok(environment) => Some(environment.object.spec),
-        Err(ResourceError::NotFound { .. }) => None,
-        Err(error) => return Err(error.to_string()),
-    };
+    let environment = state.environment(launch.env_ref).await?.map(|environment| environment.spec);
     EnvironmentKind::of_environment(environment.as_ref()).map_err(|reason| format!("environment `{}`: {reason}", launch.env_ref))
 }
 
@@ -221,7 +218,7 @@ impl Reconciler for AccountBindingReconciler {
 
 /// Reconciles one provision at its place against its binding.
 /// - A binding revoked, closed or gone: the delivered copy is deleted, the requester's harness
-///   session is stopped (its TerminalSession is deleted, so it waits), and the record removed.
+///   session's process is stopped, and the record removed.
 ///   No launch can record a delivery meanwhile: launch refuses a binding that is not open.
 /// - A binding reopened by a rebind since the delivery: the copy is deleted, the session
 ///   stopped so a fresh one starts, and the record's delivery cleared only at the version
@@ -236,11 +233,9 @@ async fn reconcile_provision(state: &Arc<ControllerRuntimeState>, namespace: &st
     let _withdrawing = lock.lock().await;
     let Some(provision) = accounts.provision(namespace, name).await? else { return Ok(()) };
     let spec = &provision.spec;
+    // A place that ended is gone: its environment is not launched again.
     if spec.place != state.host_direct_environment_name
-        && matches!(
-            state.daemon.resource_backend().including_replicas::<Environment>(namespace).get(&spec.place).await,
-            Err(ResourceError::NotFound { .. })
-        )
+        && state.environment(&spec.place).await?.is_none_or(|environment| environment.ended())
     {
         return accounts.delete_provision(namespace, name).await;
     }
@@ -326,12 +321,19 @@ async fn withdraw(
     };
     let runner = place_runner(state, &sessions, &spec.place).await?;
     implementation.remove(&spec.home, &*runner).await?;
-    let terminal_sessions = state.daemon.resource_backend().using::<TerminalSession>(namespace);
+    // Stopping a launch held here ends its process; the engine reads it ended at the next probe.
+    let reads = state.daemon.lifecycle_reads();
+    let terminals = reads.terminals()?;
+    let runtime = super::terminal::TerminalControllerRuntime { state: Arc::clone(state) };
     for session in sessions {
-        match terminal_sessions.delete(&session.metadata.name).await {
-            Ok(_) | Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(format!("stop harness session `{}`: {error}", session.metadata.name)),
+        let Some(record) = terminals.get(&session.metadata.name, None)? else { continue };
+        let Some(session_id) = record.session_id().map(str::to_owned) else { continue };
+        if !matches!(record.reading, LifecycleReading::Ready { .. }) {
+            continue;
         }
+        TerminalProvider::kill(&runtime, &record, &session_id)
+            .await
+            .map_err(|error| format!("stop harness session `{}`: {error}", record.name))?;
     }
     Ok(())
 }
@@ -372,27 +374,22 @@ async fn push_generation(
 }
 
 /// Grant and declaration events reach the convoys whose bindings use the credentials they name,
-/// and the live convoys here still waiting for a binding.
-struct CredentialConvoysWatch<K: flotilla_resources::Resource> {
+/// and the open convoys here still waiting for a binding. The open convoys are read from the
+/// Convoy views, which every reader shares: an event composes again only the convoys changed
+/// since the views last read.
+#[derive(Clone)]
+struct CredentialConvoysWatch {
     accounts: Arc<dyn AccountRecords>,
-    credentials: fn(&ResourceObject<K>) -> Vec<String>,
-    /// The credentials a deletion known only by name names, when the name alone says.
-    deleted: fn(&str) -> Option<Vec<String>>,
+    daemon: Arc<InProcessDaemon>,
 }
 
-impl<K: flotilla_resources::Resource> Clone for CredentialConvoysWatch<K> {
-    fn clone(&self) -> Self {
-        Self { accounts: Arc::clone(&self.accounts), credentials: self.credentials, deleted: self.deleted }
-    }
-}
-
-impl<K: flotilla_resources::Resource> CredentialConvoysWatch<K> {
+impl CredentialConvoysWatch {
     /// `credentials: None` (a grant deleted by name) reaches every convoy with a binding here.
     async fn enqueue(
         &self,
-        backend: &ResourceBackend,
         namespace: &str,
         sender: &WorkQueueSender,
+        views: &ConvoyViews,
         credentials: Option<Vec<String>>,
     ) -> Result<(), ResourceError> {
         let (mut convoys, bound) =
@@ -400,11 +397,7 @@ impl<K: flotilla_resources::Resource> CredentialConvoysWatch<K> {
         if credentials.is_none() {
             convoys.extend(bound.iter().cloned());
         }
-        for convoy in backend.query_declared::<Convoy>(namespace, &flotilla_store::live_convoys_query()).await?.items {
-            if matches!(convoy.provenance, ResourceProvenance::Local) && !bound.contains(&convoy.object.metadata.name) {
-                convoys.insert(convoy.object.metadata.name);
-            }
-        }
+        convoys.extend(views.open().await?.into_iter().filter(|convoy| !bound.contains(convoy)));
         for convoy in convoys {
             sender.send(convoy).await.map_err(|_| ResourceError::other("controller queue closed while forwarding a credential event"))?;
         }
@@ -412,7 +405,7 @@ impl<K: flotilla_resources::Resource> CredentialConvoysWatch<K> {
     }
 }
 
-impl<K: flotilla_resources::Resource> SecondaryWatch for CredentialConvoysWatch<K> {
+impl SecondaryWatch for CredentialConvoysWatch {
     type Primary = Convoy;
 
     fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Convoy>> {
@@ -426,15 +419,26 @@ impl<K: flotilla_resources::Resource> SecondaryWatch for CredentialConvoysWatch<
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let mut watch = backend.including_replicas::<K>(&namespace).watch().await?;
-            while let Some(event) = watch.next().await {
-                let credentials = match event? {
-                    ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => {
-                        Some((self.credentials)(&source.object))
+            let views = self.daemon.convoy_views().map_err(ResourceError::other)?;
+            let grants = backend.including_replicas::<CredentialGrant>(&namespace).watch().await?.map(|event| {
+                event.map(|event| match event {
+                    ReadWatchEvent::Added(grant) | ReadWatchEvent::Modified(grant) | ReadWatchEvent::Deleted(grant) => {
+                        Some(grant.object.spec.credentials.iter().cloned().collect())
                     }
-                    ReadWatchEvent::DeletedByName { tombstone, .. } => (self.deleted)(&tombstone.name),
-                };
-                self.enqueue(&backend, &namespace, &sender, credentials).await?;
+                    ReadWatchEvent::DeletedByName { .. } => None,
+                })
+            });
+            let specs = backend.including_replicas::<CredentialSpec>(&namespace).watch().await?.map(|event| {
+                event.map(|event| match event {
+                    ReadWatchEvent::Added(spec) | ReadWatchEvent::Modified(spec) | ReadWatchEvent::Deleted(spec) => {
+                        Some(vec![spec.object.metadata.name])
+                    }
+                    ReadWatchEvent::DeletedByName { tombstone, .. } => Some(vec![tombstone.name]),
+                })
+            });
+            let mut events = futures::stream::select(grants, specs);
+            while let Some(credentials) = events.next().await {
+                self.enqueue(&namespace, &sender, &views, credentials?).await?;
             }
             Ok(())
         })
@@ -487,16 +491,7 @@ pub(super) fn binding_controller(
     (
         vec![
             Box::new(AccountConvoysWatch { accounts: Arc::clone(&accounts) }),
-            Box::new(CredentialConvoysWatch::<CredentialGrant> {
-                accounts: Arc::clone(&accounts),
-                credentials: |grant| grant.spec.credentials.iter().cloned().collect(),
-                deleted: |_| None,
-            }),
-            Box::new(CredentialConvoysWatch::<CredentialSpec> {
-                accounts,
-                credentials: |spec| vec![spec.metadata.name.clone()],
-                deleted: |name| Some(vec![name.to_string()]),
-            }),
+            Box::new(CredentialConvoysWatch { accounts, daemon: Arc::clone(&daemon) }),
         ],
         AccountBindingReconciler { daemon, namespace },
     )
@@ -505,57 +500,63 @@ pub(super) fn binding_controller(
 /// The first retry delay of a provision whose reconcile failed, doubling to [`RETRY_CAP`].
 const RETRY_BASE: Duration = Duration::from_secs(1);
 const RETRY_CAP: Duration = Duration::from_secs(60);
+/// Failed reconciles of one provision before it is left until it or its binding changes.
+const RETRY_LIMIT: u32 = 10;
 
-/// The provision controller: reconciles each provision at this place when it or its binding
-/// changes, every provision once a `resync` and at start, and a failed one again with backoff.
-/// A failure to read the changes ends the run, for the supervisor to restart it.
-pub(super) async fn run_provision_controller(
-    state: Arc<ControllerRuntimeState>,
-    namespace: String,
-    resync: Duration,
-) -> Result<(), ResourceError> {
+/// The provision controller: reconciles every provision at this place at start, each one again
+/// when it or its binding changes, and a failed one again with backoff, up to [`RETRY_LIMIT`]
+/// tries; a change starts its count again. A failure to read the changes ends the run, for the
+/// supervisor to restart it.
+pub(super) async fn run_provision_controller(state: Arc<ControllerRuntimeState>, namespace: String) -> Result<(), ResourceError> {
     let accounts = state.daemon.account_records();
     let mut changes = accounts.changes(&namespace).await.map_err(ResourceError::other)?;
     let mut retries: BTreeMap<String, (u32, tokio::time::Instant)> = BTreeMap::new();
-    let mut due: BTreeSet<String> = BTreeSet::new();
-    let mut resync_at = tokio::time::Instant::now();
+    let mut failures: BTreeMap<String, u32> = BTreeMap::new();
+    // The changes stream opened first, so nothing changed since is missed by this list.
+    let mut due: BTreeSet<String> =
+        accounts.local_provisions(&namespace).await.map_err(ResourceError::other)?.into_iter().map(|provision| provision.name).collect();
     loop {
         let now = tokio::time::Instant::now();
-        if now >= resync_at {
-            due.extend(
-                accounts.local_provisions(&namespace).await.map_err(ResourceError::other)?.into_iter().map(|provision| provision.name),
-            );
-            resync_at = now + resync;
+        let ready: Vec<String> = retries.iter().filter(|(_, (_, at))| *at <= now).map(|(name, _)| name.clone()).collect();
+        for name in ready {
+            retries.remove(&name);
+            due.insert(name);
         }
-        due.extend(retries.iter().filter(|(_, (_, at))| *at <= now).map(|(name, _)| name.clone()));
         for name in std::mem::take(&mut due) {
             match reconcile_provision(&state, &namespace, &name).await {
                 Ok(()) => {
-                    retries.remove(&name);
+                    failures.remove(&name);
                 }
                 Err(error) => {
-                    let failures = retries.get(&name).map_or(0, |(failures, _)| *failures) + 1;
-                    let delay = RETRY_BASE.saturating_mul(1 << failures.min(6)).min(RETRY_CAP);
-                    tracing::warn!(provision = %name, %error, failures, "account provision reconcile failed; retrying");
-                    retries.insert(name, (failures, tokio::time::Instant::now() + delay));
+                    let failed = failures.entry(name.clone()).or_insert(0);
+                    *failed += 1;
+                    if *failed >= RETRY_LIMIT {
+                        tracing::error!(provision = %name, %error, failures = *failed, "account provision reconcile failed; left until it changes");
+                        continue;
+                    }
+                    let delay = RETRY_BASE.saturating_mul(1 << (*failed).min(6)).min(RETRY_CAP);
+                    tracing::warn!(provision = %name, %error, failures = *failed, "account provision reconcile failed; retrying");
+                    retries.insert(name, (*failed, tokio::time::Instant::now() + delay));
                 }
             }
         }
-        let wake = retries.values().map(|(_, at)| *at).chain([resync_at]).min().unwrap_or(resync_at);
+        let wake = retries.values().map(|(_, at)| *at).min();
         tokio::select! {
             change = changes.next() => match change {
                 Some(Ok(AccountChange::Provision { name, .. })) => {
+                    failures.remove(&name);
                     due.insert(name);
                 }
                 Some(Ok(AccountChange::Binding { name, .. })) => {
-                    due.extend(
-                        accounts.binding_provisions(&namespace, &[name], true).await.map_err(ResourceError::other)?.into_iter().map(|provision| provision.name),
-                    );
+                    for provision in accounts.binding_provisions(&namespace, &[name], true).await.map_err(ResourceError::other)? {
+                        failures.remove(&provision.name);
+                        due.insert(provision.name);
+                    }
                 }
                 Some(Err(error)) => return Err(ResourceError::other(error)),
                 None => return Err(ResourceError::other("account changes closed")),
             },
-            () = tokio::time::sleep_until(wake) => {}
+            () = async { match wake { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {}
         }
     }
 }

@@ -7,7 +7,7 @@ ADR 0064 and [the owner resolution](https://github.com/flotilla-org/flotilla/iss
 are fixed rules here. There are no design-option or mutant constants in the design.
 
 ```text
-machines/     Message, shared lifecycle, Convoy, Ensure, AwaitingReply, and the consumer kinds AgentSession and controller
+machines/     Message, shared lifecycle, Convoy, AwaitingReply, and the consumer kinds AgentSession and Service
 world/        per-home ordered streams, host death, clock, adapter acceptance
 scenarios/    compositions and their safety / conditional liveness properties
 mutants/      single-definition overrides; each must violate a property
@@ -30,7 +30,11 @@ A pure `step(state, event)` uses `match` and returns `Moved(state) | Refused(rea
 Every gate reads typed local evidence on the event inside `step`. Admission
 validates a typed request before creating a slot. Named actions look up a slot,
 run the rule and guard a single store assignment; `unchanged` composes with other
-machines. Refused actions are disabled and write nothing.
+machines. Refused actions are disabled and write nothing. Convoy keeps each part
+of a convoy (phase, fixed fields, retired duties, promises, seats and link
+rows) in its own variable keyed by convoy, and each named action writes only the
+parts its edge changes; `outcome` reads an edge's acceptance or refusal code from
+the current parts, which the conformance harness and scenario properties probe.
 
 Scenarios choose identities and model only the world: ordered streams, clock,
 host death, adapter acceptance and capacities. Their `any` lists pair machine
@@ -40,7 +44,7 @@ Every variable still receives an assignment, and world variables stay separate.
 The step blocks contain no assignment lists or machine rules. Imported variants use bare names in
 `match` patterns (constructors in expressions remain qualified).
 
-Convoy admission accepts `{project, promises, duties, seats, quota, priority}`
+Convoy admission accepts `{project, promises, duties, seats, priority}`
 (#3587 spec ruling). Admission needs an obligation: at least one promise or one
 convoy-lifetime duty (`NoObligations`). Each admitted promise keeps its opaque
 kind/target data, its source (template, dispatch or crew) and its owner seat.
@@ -55,8 +59,7 @@ caller, as `Abandon` is. Authority classes are worked out by the caller from
 these relations.
 Admission fixes the project, the duties and the priority; promises are work
 state, since the crew's `Declare` adds one while the convoy is Open (refused
-for an id ever used, retracted ids included), and the quota in force is work
-state, which readmission raises, so no admitted copy of it can go stale.
+for an id ever used, retracted ids included).
 
 A promise is `Pending → Submitted → Kept | Retracted`. Only its owner seat may
 `Submit`, with a reference the caller recorded as durable for the kind (as it
@@ -81,9 +84,17 @@ kept. A convoy-lifetime duty refuses `Deliver` (`DutyHolds`) until an
 authorised `RetireDuty`; a duty while some promises are open has no edges and
 ends with them, and a breach of terms is a message, not an edge. `Deliver` is
 refused while any promise is Pending or Submitted, or while a lifetime duty
-holds. Terminal variants retain the work record so delivery and finality remain
-state properties. A demo promise delivers a running demo plus a recipe to
-reactivate it.
+holds. Delivered and Abandoned retain the work record so delivery and finality
+remain state properties, and take no work edge, except that an abandoned
+convoy's Submitted promise still takes an observed `Keep` or a `Reject`, its
+phase unchanged (#3108 ruling 1): the world resolves a submission that holds
+the convoy, and no decision edge runs once it ended. Retired is the only end:
+`Retire` moves a delivered or abandoned convoy there once nothing holds it. Its
+holds are read from its dependents' own records, each named by kind and
+record; a non-empty set refuses (`Held`), and holds not read refuse too
+(`HoldsUnread`), since absent is not empty. A retired convoy keeps no retired
+duties, and refuses every edge. A demo promise delivers a running
+demo plus a recipe to reactivate it.
 
 AwaitingReply is the sender's half of a Reply or Outcome exchange (#3587
 awaiting-reply ruling), homed at the sender's home and written in the send's
@@ -95,31 +106,31 @@ sender withdraws with a reason. A stall is an open record whose kind is
 flight when the deadline passes can lose to `Expire`, and still lands in the
 inbox as a message.
 
-Admission grants a per-class cap, never a host reservation. Increasing a cap is
-readmission of the same convoy; the model keeps the class domain fixed and refuses decreases. Vessel placement
-fits one whole multidimensional request on one host and holds its lease through
-Requested and Realised until Gone. Waiting placement requests are not leased
-vessels. A lower-priority request cannot pass any waiting higher-priority request
-that fits that host's available capacity, even if that higher-priority convoy
-is currently capped. No borrowing or spend accounting is modeled.
+Admission grants no capacity: neither a cap nor a host reservation. Limits on
+what a convoy uses and costs come from telemetry, outside the convoy. Vessel
+placement reads only fit and priority: it fits one whole
+multidimensional request on one host and holds its lease through Requested and
+Realised until Gone. Waiting placement requests are not leased vessels. A
+lower-priority request cannot pass any waiting higher-priority request that
+fits that host's available capacity. No borrowing or spend accounting is
+modeled.
 
 The Vessel module composes the shared lifecycle's pure rules and owns placement
 state; it does not duplicate a lifecycle store. Placement evidence carries the
-observed caps, live counts, available capacity and waiting requests. A lease
+host's available capacity and the waiting requests. A lease
 holds only its request and host. The scenario keeps what each placement's
 priority rule read (available capacity and waiting requests), so the priority
-invariant checks the evidence the rule used. Ensure carries its binding,
-recorded fulfillers, attempt history and window on the relevant variants. Each
-attempt is an `Attempted` edge with its outcome; `Hold` needs the window's
-consecutive failures since its last success to reach `MAX_FAILURES` (2 in the
-model), or its last failure to be non-retryable. The shared lifecycle's
-Requested carries its own attempt history under the same rule, with no
-windows: `GiveUp` needs that history exhausted and its last failure to have
-the cause given up with. A receipt is a consumer's `Receive` edge on its own
+invariant checks the evidence the rule used. A standing role has no machine: its
+strike run, backoff and hold are derived from its convoy generations
+(ConvoyEnsure B, #3108). The shared lifecycle's Requested carries its
+own attempt history: `GiveUp` needs that history exhausted and its last
+failure to have the cause given up with. `FailedEarly` records a try made
+before its pending retry was due: it replaces that failure's cause without
+counting, and is refused unless a retry is pending. A receipt is a consumer's `Receive` edge on its own
 resource, whose master is the message; the inbox scenario publishes its stream
 row with that edge, so the message reads the receipts about it. Message stays
 abstract over who consumes it: each consumer kind (an agent session, a
-controller) is its own module, and `controller_delivery` binds one of each to a
+service) is its own module, and `service_delivery` binds one of each to a
 shared inbox, where the first accepted deliver claims the message and a lapsed
 delivery condition lets the turn-rules role withdraw it.
 
@@ -143,9 +154,8 @@ The scenarios encode these rulings:
 | Convoy | admission of a known project holds an obligation; deliver requires nothing Pending or Submitted and no holding lifetime duty; a submitted promise has a submission; settled promises refuse every promise edge; an owner's retraction closes once anything is submitted | once nothing is open and no lifetime duty holds, fair delivery ends the convoy |
 | Reply exchange | the record exists exactly when its message was sent; Answered names a reply to the awaited message in the sender's inbox; expiry follows the deadline and never beats a reply already in the inbox; ends are final | a reply that lands while the record is open is eventually its answer under fair answering |
 | Inbox / replacement / unbind | turn before receipt; per-session dedupe; drain observed receipts before bind; accept an old session's receipt; one receiver; no undeliverable drop with an observed receipt; unbound timeout starts at unbind | observed receipts make progress under fair home delivery; observed session ends and sustained silence trigger owner unbind reactions |
-| Ensure | record before create; bind only Realised/receiving; release and observe Gone before replacement; retire releases every created fulfiller, including Requested; a hold follows a failure in the current window; resume retains history and moves the window | a bound fulfiller observed Gone is eventually unbound under a fair owner reaction |
 | Message race | outcome may settle Pending; terminal edges refuse; expiry waits for the consumer prefix past the deadline and loses to visible evidence; supersede and withdrawn reasons | visible expected evidence eventually settles under fair settlement; ends remain final |
-| Admission / placement | two convoys, two hosts, three placement requests, two abstract classes and two capacity dimensions; convoy caps, host leases, Gone lease return, priority order | no availability fairness assumed |
+| Admission / placement | two convoys, two hosts, three placement requests, two abstract classes and two capacity dimensions; requests only for admitted convoys, host leases, Gone lease return, priority order | no availability fairness assumed |
 | Machine edges | all lifecycle and session edges (receipts too), matching/missing evidence, exhausted attempts, ended resources | finite gate/edge coverage in the fast tier |
 
 Safety is expressed over typed state wherever possible: delivery promises,
@@ -155,7 +165,7 @@ a receipt can arrive after binding. Per-session turn counts are adapter state.
 These are **conditional** liveness claims. An Awaiting message retains its
 receiver for expiry after inbox unbind or replacement. A permanently silent
 receiver blocks expiry. Deliberate unreachable/withdrawn drops need authority.
-No automatic Ensure retirement or Convoy abandonment is assumed.
+No automatic Convoy abandonment is assumed.
 
 ## Fast tier (CI)
 
@@ -206,8 +216,8 @@ Paths are breadth-first, so each path's prefixes are the paths of states already
 checked step by step; a probe replays its from-state's path checking each step's
 acceptance and the final state, then applies its event in a fresh subject.
 Each adaptor encodes the Rust state (with the immutable spec where the Quint state
-carries request data, and the `Attempted` log entries for the attempt histories
-of Ensure and the lifecycle) in the spec's shape and compares it whole,
+carries request data, and the `Attempted` log entries for the lifecycle's
+attempt history) in the spec's shape and compares it whole,
 checking each state's tally against those entries; its module doc lists the few remaining encoding choices.
 Harness events carry the evidence a home could observe, and the test maps each
 evidence field onto the world the gate reads. Each harness comment states its
@@ -220,9 +230,8 @@ through the decided store's log and reads the state back from the stored row and
 its log entries, under the spec's policy. TerminalSession (#3629 layer 6) runs
 the same graph there. `crates/flotilla-engine-store/tests/crew_conformance.rs`
 runs `vessel.qnt` against the production placement composition
-(`placement::Placements`) and `ensure.qnt` against the Ensure, both through the
-decided store, with the adaptors the engine's own conformance uses
-(`flotilla-quint-testkit`'s `vessel` and `ensure`).
+(`placement::Placements`) through the decided store, with the adaptor the
+engine's own conformance uses (`flotilla-quint-testkit`'s `vessel`).
 
 Rust replay (`crates/flotilla-state-machines/tests/quint_replay.rs`) reads
 `mbt::actionTaken` and the `Some`/`None` picks from `mbt::nondetPicks`, and

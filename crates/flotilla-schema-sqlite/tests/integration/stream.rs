@@ -1,6 +1,6 @@
 use flotilla_schema::{Code, Kind, Timestamp};
 use flotilla_schema_sqlite::{
-    stream::{self, Follower, Frame, Watermark},
+    stream::{self, Follower, Frame, Received, Watermark},
     Store, StoreError,
 };
 use hegel::generators as gs;
@@ -17,7 +17,7 @@ fn insert(store: &mut Store, name: &str) -> flotilla_schema_sqlite::Stamp {
     write.commit().expect("commit");
     stamp
 }
-fn sync(source: &mut Store, target: &mut Store, after: Option<u64>, time: i64) -> Result<(), StoreError> {
+fn sync(source: &mut Store, target: &mut Store, after: Option<u64>, time: i64) -> Result<Received, StoreError> {
     let home = source.home().to_owned();
     Follower::new(target).receive(&home, |sink| stream::serve(source, after, Timestamp(time), sink).map(|_| ()))
 }
@@ -60,6 +60,19 @@ fn snapshot_tail_resume_and_three_stores() {
     sync(&mut a, &mut b, Some(4), 3).expect("resume idle");
     assert_eq!(mark(&mut b, "a").home_seq, before.home_seq);
     assert_eq!(mark(&mut b, "a").applied_through, Timestamp(3));
+}
+
+// A round reports what it installed: a snapshot, then each log entry past the cursor once.
+// Entries a round re-sends at or behind the cursor are skipped and not counted.
+#[test]
+fn a_round_reports_its_snapshot_and_the_entries_it_applied() {
+    let mut a = store("a");
+    let mut b = store("b");
+    insert(&mut a, "a1");
+    assert_eq!(sync(&mut a, &mut b, None, 1).expect("snapshot"), Received { snapshot: true, applied: 0 });
+    insert(&mut a, "a2");
+    assert_eq!(sync(&mut a, &mut b, Some(2), 2).expect("tail"), Received { snapshot: false, applied: 1 });
+    assert_eq!(sync(&mut a, &mut b, Some(2), 3).expect("again"), Received { snapshot: false, applied: 0 });
 }
 
 // Expunge removes history and advances its floor in the same transaction. Rollback restores
@@ -128,7 +141,51 @@ fn stalled_stream_and_invalid_watermarks_do_not_advance() {
     }
     assert_eq!(b.applied_watermark("a").applied_through, Timestamp(12), "rolled-back marks never reach resident gate inputs");
     let b = Store::open(b.into_connection(), "b", registry()).expect("restart");
-    assert_eq!(b.applied_watermark("a").applied_through, Timestamp(12), "startup rebuilds committed resident inputs");
+    // A keepalive alone is heard in memory only: a restart reads the heard time of the last
+    // round that wrote, the snapshot's.
+    assert_eq!(b.applied_watermark("a").applied_through, Timestamp(10), "startup rebuilds committed resident inputs");
+}
+
+// A round that only hears from a home (a keepalive moving no sequence) writes and commits
+// nothing: the heard time moves in memory, and the heard listeners are told once it moves.
+#[test]
+fn a_keepalive_alone_is_heard_without_a_commit() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let mut a = store("a");
+    let mut b = store("b");
+    insert(&mut a, "m");
+    sync(&mut a, &mut b, None, 10).expect("snapshot");
+    let commits = Arc::new(AtomicUsize::new(0));
+    let heard = Arc::new(AtomicUsize::new(0));
+    let committed: Arc<stream::CommitListener> = {
+        let commits = Arc::clone(&commits);
+        Arc::new(move |_: &stream::Committed<'_>| {
+            commits.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let hearing: Arc<stream::HeardListener> = {
+        let heard = Arc::clone(&heard);
+        Arc::new(move |home: &str| {
+            assert_eq!(home, "a");
+            heard.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    b.on_commit(Arc::downgrade(&committed));
+    b.on_heard(Arc::downgrade(&hearing));
+    sync(&mut a, &mut b, Some(2), 12).expect("keepalive");
+    assert_eq!(b.applied_watermark("a").applied_through, Timestamp(12));
+    assert_eq!((commits.load(Ordering::SeqCst), heard.load(Ordering::SeqCst)), (0, 1), "heard, not committed");
+    sync(&mut a, &mut b, Some(2), 12).expect("the same keepalive");
+    assert_eq!((commits.load(Ordering::SeqCst), heard.load(Ordering::SeqCst)), (0, 1), "nothing new heard");
+    insert(&mut a, "n");
+    sync(&mut a, &mut b, Some(2), 13).expect("tail");
+    assert_eq!(b.applied_watermark("a").applied_through, Timestamp(13));
+    assert_eq!((commits.load(Ordering::SeqCst), heard.load(Ordering::SeqCst)), (1, 1), "a round that writes commits its heard time");
+    let b = Store::open(b.into_connection(), "b", registry()).expect("restart");
+    assert_eq!(b.applied_watermark("a"), Watermark { home_seq: 4, applied_through: Timestamp(13) }, "a written round persists both");
 }
 
 // The reserved code is supplied explicitly for writes and preserved on apply and CBOR replay.
@@ -175,7 +232,7 @@ fn generated_partition_resume(tc: hegel::TestCase) {
 #[hegel::test]
 fn snapshot_frames_preserve_all_kind_shapes(tc: hegel::TestCase) {
     use crate::fixtures::{
-        AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Person, Pick, Referral, TerminalSession, Ticket, Vessel,
+        AgentSession, AwaitingReply, Convoy, Dossier, Fixture, Person, Pick, Referral, Service, TerminalSession, Ticket, Vessel,
     };
     fn check<K: Fixture>(tc: &hegel::TestCase) {
         let mut a = store("a");
@@ -205,14 +262,14 @@ fn snapshot_frames_preserve_all_kind_shapes(tc: hegel::TestCase) {
     match tc.draw(gs::integers::<u8>().max_value(10)) {
         0 => check::<Resource<Message>>(&tc),
         1 => check::<Resource<Convoy>>(&tc),
-        2 => check::<Resource<Ensure>>(&tc),
-        3 => check::<Resource<Vessel>>(&tc),
-        4 => check::<Resource<AgentSession>>(&tc),
-        5 => check::<TerminalSession>(&tc),
-        6 => check::<Ticket>(&tc),
-        7 => check::<Dossier>(&tc),
-        8 => check::<Resource<AwaitingReply>>(&tc),
-        9 => check::<Resource<Person>>(&tc),
+        2 => check::<Resource<Vessel>>(&tc),
+        3 => check::<Resource<AgentSession>>(&tc),
+        4 => check::<TerminalSession>(&tc),
+        5 => check::<Ticket>(&tc),
+        6 => check::<Dossier>(&tc),
+        7 => check::<Resource<AwaitingReply>>(&tc),
+        8 => check::<Resource<Person>>(&tc),
+        9 => check::<Resource<Service>>(&tc),
         _ => check::<Referral>(&tc),
     }
 }

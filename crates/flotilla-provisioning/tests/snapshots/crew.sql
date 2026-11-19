@@ -8,6 +8,7 @@ CREATE TABLE resource_identity (
   id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),
   seq INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER,
   UNIQUE (kind, name, home)) STRICT;
 CREATE INDEX resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
@@ -47,113 +48,48 @@ CREATE TABLE stream_watermark (
 CREATE TABLE stream_history (
   home INTEGER PRIMARY KEY REFERENCES strings(id), home_seq INTEGER NOT NULL CHECK (home_seq >= 0)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE snapshot_cause (
+  resource INTEGER PRIMARY KEY REFERENCES resource_identity(id) ON DELETE CASCADE,
+  home INTEGER NOT NULL REFERENCES strings(id),
+  change_seq INTEGER NOT NULL,
+  FOREIGN KEY (home, change_seq) REFERENCES change(home, seq)) STRICT, WITHOUT ROWID;
 CREATE TABLE codes (
   kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
   PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
-CREATE TABLE "ensure" (
+CREATE TABLE "terminal_launch_facts" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "inbox" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "policy_max_failures" INTEGER NOT NULL,
-  "policy_base" INTEGER NOT NULL,
-  "policy_factor" INTEGER NOT NULL,
-  "policy_cap" INTEGER NOT NULL,
-  "state" TEXT NOT NULL CHECK ("state" IN ('fu', 'he', 'rt', 'un')),
-  "state_since" INTEGER NOT NULL,
-  "failures" INTEGER,
-  "last_failure_at" INTEGER,
-  "last_failure_cause_category" TEXT CHECK ("last_failure_cause_category" IN ('ex', 'mc', 'mx', 'rf', 'tr')),
-  "last_failure_cause_detail" TEXT,
-  "last_failure_retryable" INTEGER CHECK ("last_failure_retryable" IN (0, 1)),
-  "bound" INTEGER REFERENCES "strings" ("id"),
-  CHECK (CASE WHEN "last_failure_at" IS NOT NULL
-      THEN "last_failure_cause_category" IS NOT NULL
-      AND "last_failure_cause_detail" IS NOT NULL
-      AND "last_failure_retryable" IS NOT NULL
-      ELSE "last_failure_cause_category" IS NULL
-      AND "last_failure_cause_detail" IS NULL
-      AND "last_failure_retryable" IS NULL
+  "endpoint_runtime_root" TEXT,
+  "endpoint_daemon" TEXT,
+  "agent_adapter" INTEGER REFERENCES "strings" ("id"),
+  "agent_model" TEXT,
+  "agent_stance" TEXT,
+  "build_jobs" INTEGER,
+  CHECK (CASE WHEN "endpoint_runtime_root" IS NOT NULL
+      THEN "endpoint_daemon" IS NOT NULL
+      ELSE "endpoint_daemon" IS NULL
       END),
-  CHECK (CASE WHEN "state" = 'un'
-      THEN "failures" IS NOT NULL
-      AND "bound" IS NULL
-      END),
-  CHECK (CASE WHEN "state" = 'fu'
-      THEN "failures" IS NOT NULL
-      AND "bound" IS NOT NULL
-      END),
-  CHECK (CASE WHEN "state" = 'he'
-      THEN "failures" IS NOT NULL
-      AND "bound" IS NULL
-      END),
-  CHECK (CASE WHEN "state" = 'rt'
-      THEN "failures" IS NOT NULL
-      AND "bound" IS NULL
+  CHECK (CASE WHEN "agent_adapter" IS NOT NULL
+      THEN "agent_stance" IS NOT NULL
+      ELSE "agent_model" IS NULL
+      AND "agent_stance" IS NULL
       END)
 ) STRICT;
-CREATE TABLE "ensure_recorded" (
-  "ensure" INTEGER NOT NULL,
-  "value" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  PRIMARY KEY ("ensure", "value"),
-  FOREIGN KEY ("ensure") REFERENCES "ensure" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE TABLE "ensure_created" (
-  "ensure" INTEGER NOT NULL,
-  "value" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  PRIMARY KEY ("ensure", "value"),
-  FOREIGN KEY ("ensure") REFERENCES "ensure" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE INDEX "ensure_by_inbox" ON "ensure" ("inbox");
-INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
-  ('en', 'state', 'fu', 'Fulfilled'),
-  ('en', 'state', 'he', 'Held'),
-  ('en', 'state', 'rt', 'Retired'),
-  ('en', 'state', 'un', 'Unfulfilled'),
-  ('en', 'last_failure_cause_category', 'ex', 'External'),
-  ('en', 'last_failure_cause_category', 'mc', 'Misconfigured'),
-  ('en', 'last_failure_cause_category', 'mx', 'MissingCapability'),
-  ('en', 'last_failure_cause_category', 'rf', 'Refused'),
-  ('en', 'last_failure_cause_category', 'tr', 'Transient'),
-  ('en', 'log:edge', 'at', 'Attempted'),
-  ('en', 'log:edge', 'bi', 'Bind'),
-  ('en', 'log:edge', 'cr', 'Create'),
-  ('en', 'log:edge', 'ho', 'Hold'),
-  ('en', 'log:edge', 'rc', 'Record'),
-  ('en', 'log:edge', 'rs', 'Resume'),
-  ('en', 'log:edge', 'rt', 'Retire'),
-  ('en', 'log:edge', 'ub', 'Unbind'),
-  ('en', 'log:label', 'fu', 'Fulfilled'),
-  ('en', 'log:label', 'he', 'Held'),
-  ('en', 'log:label', 'rt', 'Retired'),
-  ('en', 'log:label', 'un', 'Unfulfilled');
-CREATE VIEW "ensure_view" AS SELECT
-  "ensure"."id",
-  "ensure"."version",
-  (SELECT "s" FROM "strings" WHERE "id" = "ensure"."inbox") AS "inbox",
-  "ensure"."policy_max_failures",
-  "ensure"."policy_base",
-  "ensure"."policy_factor",
-  "ensure"."policy_cap",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'state' AND "code" = "ensure"."state") AS "state",
-  "ensure"."state_since",
-  "ensure"."failures",
-  "ensure"."last_failure_at",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'en' AND "field" = 'last_failure_cause_category' AND "code" = "ensure"."last_failure_cause_category") AS "last_failure_cause_category",
-  "ensure"."last_failure_cause_detail",
-  "ensure"."last_failure_retryable",
-  (SELECT "s" FROM "strings" WHERE "id" = "ensure"."bound") AS "bound"
-FROM "ensure";
-CREATE VIEW "ensure_recorded_view" AS SELECT
-  "ensure_recorded"."ensure",
-  (SELECT "s" FROM "strings" WHERE "id" = "ensure_recorded"."value") AS "value"
-FROM "ensure_recorded";
-CREATE VIEW "ensure_created_view" AS SELECT
-  "ensure_created"."ensure",
-  (SELECT "s" FROM "strings" WHERE "id" = "ensure_created"."value") AS "value"
-FROM "ensure_created";
+CREATE VIEW "terminal_launch_facts_view" AS SELECT
+  "terminal_launch_facts"."id",
+  "terminal_launch_facts"."version",
+  "terminal_launch_facts"."endpoint_runtime_root",
+  "terminal_launch_facts"."endpoint_daemon",
+  (SELECT "s" FROM "strings" WHERE "id" = "terminal_launch_facts"."agent_adapter") AS "agent_adapter",
+  "terminal_launch_facts"."agent_model",
+  "terminal_launch_facts"."agent_stance",
+  "terminal_launch_facts"."build_jobs"
+FROM "terminal_launch_facts";
 CREATE TABLE "terminal_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "environment" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
   "holder" INTEGER REFERENCES "strings" ("id"),
   "role" INTEGER NOT NULL REFERENCES "strings" ("id"),
@@ -259,6 +195,7 @@ CREATE TABLE "terminal_session_env" (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX "terminal_session_by_environment" ON "terminal_session" ("environment");
 CREATE INDEX "terminal_session_by_holder" ON "terminal_session" ("holder") WHERE "holder" IS NOT NULL;
+CREATE INDEX "terminal_session_by_launch" ON "terminal_session" ("launch_of", "launch");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ts', 'source', 'ag', 'Agent'),
   ('ts', 'source', 'tl', 'Tool'),
@@ -280,6 +217,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ts', 'cause_category', 'rf', 'Refused'),
   ('ts', 'cause_category', 'tr', 'Transient'),
   ('ts', 'log:edge', 'at', 'Attempted'),
+  ('ts', 'log:edge', 'fe', 'FailedEarly'),
   ('ts', 'log:edge', 'gu', 'GiveUp'),
   ('ts', 'log:edge', 'rl', 'Realise'),
   ('ts', 'log:edge', 'rs', 'Release'),
@@ -291,6 +229,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "terminal_session_view" AS SELECT
   "terminal_session"."id",
   "terminal_session"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."launch_of") AS "launch_of",
+  "terminal_session"."launch",
   "terminal_session"."environment",
   (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."holder") AS "holder",
   (SELECT "s" FROM "strings" WHERE "id" = "terminal_session"."role") AS "role",
@@ -323,6 +263,8 @@ FROM "terminal_session_env";
 CREATE TABLE "vessel" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
   "convoy" INTEGER NOT NULL REFERENCES "resource_identity" ("id"),
   "class" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "priority" INTEGER NOT NULL,
@@ -407,7 +349,7 @@ CREATE TABLE "vessel_shape" (
   PRIMARY KEY ("vessel", "key"),
   FOREIGN KEY ("vessel") REFERENCES "vessel" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX "vessel_by_convoy" ON "vessel" ("convoy");
+CREATE INDEX "vessel_by_launch" ON "vessel" ("convoy", "launch_of", "launch");
 CREATE INDEX "vessel_live_by_host" ON "vessel" ("host") WHERE "state" IN ('rq', 'rl');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ve', 'state', 'go', 'Gone'),
@@ -428,6 +370,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ve', 'cause_category', 'rf', 'Refused'),
   ('ve', 'cause_category', 'tr', 'Transient'),
   ('ve', 'log:edge', 'at', 'Attempted'),
+  ('ve', 'log:edge', 'fe', 'FailedEarly'),
   ('ve', 'log:edge', 'gu', 'GiveUp'),
   ('ve', 'log:edge', 'rl', 'Realise'),
   ('ve', 'log:edge', 'rs', 'Release'),
@@ -439,6 +382,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "vessel_view" AS SELECT
   "vessel"."id",
   "vessel"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "vessel"."launch_of") AS "launch_of",
+  "vessel"."launch",
   "vessel"."convoy",
   (SELECT "s" FROM "strings" WHERE "id" = "vessel"."class") AS "class",
   "vessel"."priority",

@@ -9,8 +9,8 @@ use flotilla_provisioning::{
     engine::definition_import::{import_kind, rehearse_definitions, DefinitionCopies, DefinitionCopy, ImportedDefinition},
     engine::import::ImportReport,
     stored::definition::{
-        CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition, ForgeDefinition,
-        ImageLayerDefinition, WorkflowTemplateDefinition,
+        ConvoyEnsureDefinition, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition,
+        ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
     },
     stored::project::{DeclarationRefusal, EntriesReadiness, ProjectDefinition, ProjectOpsRecord},
 };
@@ -24,12 +24,13 @@ use flotilla_resources::{
         WHOLE_REPOSITORY_PROJECT_MANAGER,
     },
     definitions::{CharterOrigin, DefinitionOrigin},
-    CharterPointer, CharterSource, CharterStoreBinding, CredentialConsumer, CredentialGrantSelector, CredentialGrantSpec,
+    CharterPointer, CharterSource, CharterStoreBinding, ConvoyEnsureSpec, CredentialConsumer, CredentialGrantSelector, CredentialGrantSpec,
     CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpecSpec, CrewDefaultsSpec,
     DeclarationRefusedCondition, DispatchQueueAttention, FleetDesignationSpec, ForgeKind, ForgeSpec, HostActionSelector, HostImageAction,
-    ImageCacheBinding, ImageLayerResourceSpec, ImageSelection, LandingCredentialScope, ObjectMeta, OperationalEntriesCondition, Project,
-    ProjectRepositorySpec, ProjectSpec, ProjectStatus, RepositoryKey, RepositoryTrust, Resource, ResourceObject, RoleDefinition,
-    RoleSubscription, WorkflowTemplateSpec, BOOTSTRAP_PATH_ANNOTATION, MANAGED_BY_LABEL, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
+    ImageCacheBinding, ImageLayerResourceSpec, ImageSelection, LandingCredentialScope, ManifestRoot, ManifestRootSpec, ObjectMeta,
+    OperationalEntriesCondition, Project, ProjectRepositorySpec, ProjectSpec, ProjectStatus, RepositoryKey, RepositoryTrust, Resource,
+    ResourceObject, RoleDefinition, RoleSubscription, WorkflowTemplateSpec, BOOTSTRAP_PATH_ANNOTATION, MANAGED_BY_LABEL,
+    PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
 };
 use hegel::{generators as gs, TestCase};
 
@@ -64,6 +65,15 @@ fn copy<R: Resource>(
         object: ResourceObject { metadata: meta(name, labels, annotations, 1), spec, status: None },
         home: home.to_owned(),
     }
+}
+
+/// The old ManifestRoots the stamps in these tests name, each at its home.
+fn held_roots() -> Vec<(ResourceObject<ManifestRoot>, String)> {
+    let root = |name: &str, home: &str| {
+        let spec = ManifestRootSpec::builder().host(home.to_owned()).path(format!("/{name}")).source("src".to_owned()).build();
+        (ResourceObject { metadata: meta(name, BTreeMap::new(), BTreeMap::new(), 1), spec, status: None }, home.to_owned())
+    };
+    vec![root("root", "alpha"), root("a-root", "alpha"), root("b-root", "beta")]
 }
 
 fn pick<'a, T>(tc: &TestCase, items: &'a [T]) -> &'a T {
@@ -256,6 +266,22 @@ fn crew_defaults(tc: &TestCase) -> CrewDefaultsSpec {
     }
 }
 
+// A standing role's declaration: each optional part present or absent, repositories and agent
+// overrides in their authored order.
+fn convoy_ensure(tc: &TestCase) -> ConvoyEnsureSpec {
+    ConvoyEnsureSpec {
+        project_ref: word(tc),
+        role: word(tc),
+        driver_ref: maybe(tc, word),
+        workflow_ref: pick(tc, &["", "review"]).to_string(),
+        placement_policy: maybe(tc, word),
+        escalation_reason: maybe(tc, word),
+        repositories: words(tc).into_iter().rev().map(RepositoryKey).collect(),
+        presents_as: maybe(tc, word),
+        agent_overrides: maybe(tc, |tc| vec![pick(tc, &["claude", "review=codex:o3"]).parse().expect("an override")]).unwrap_or_default(),
+    }
+}
+
 fn forge(tc: &TestCase) -> ForgeSpec {
     ForgeSpec {
         forge_id: word(tc),
@@ -337,6 +363,7 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
     let (forge_spec, fleet_spec, credential, grant, defaults) =
         (forge(tc), fleet(tc), credential_spec(tc), credential_grant(tc), crew_defaults(tc));
     let (template, layer, project_spec) = (pick(tc, &templates).clone(), pick(tc, &layers).clone(), project(tc));
+    let ensure = convoy_ensure(tc);
     let copies = DefinitionCopies {
         forges: vec![copy("forge", "alpha", labels.clone(), annotations.clone(), forge_spec.clone())],
         fleet_designations: vec![copy("fleet", "alpha", labels.clone(), annotations.clone(), fleet_spec.clone())],
@@ -345,22 +372,32 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
         crew_defaults: vec![copy("defaults", "alpha", labels.clone(), annotations.clone(), defaults.clone())],
         image_layers: vec![copy("layer", "alpha", labels.clone(), annotations.clone(), layer.clone())],
         workflow_templates: vec![copy("template", "alpha", labels.clone(), annotations.clone(), template.clone())],
+        // A live convoy references the template, so a snapshot's stamp imports too.
+        live_workflow_snapshots: BTreeSet::from(["template".to_owned()]),
+        convoy_ensures: vec![copy("ensure", "alpha", labels.clone(), annotations.clone(), ensure.clone())],
         projects: vec![copy("project", "alpha", labels.clone(), annotations.clone(), project_spec.clone())],
+        manifest_roots: held_roots(),
     };
     let report = rehearse_definitions(&copies);
     assert!(report.refused.is_empty(), "{:?}", report.refused);
-    assert_eq!(report.imported.values().sum::<usize>(), 8, "{report:?}");
+    assert_eq!(report.imported.values().sum::<usize>(), 9, "{report:?}");
 
     let mut report = ImportReport::default();
-    let forge = only_imported(import_kind::<ForgeDefinition>(&copies.forges, &mut report));
-    let fleet = only_imported(import_kind::<FleetDesignationDefinition>(&copies.fleet_designations, &mut report));
-    let credential_record = only_imported(import_kind::<CredentialSpecDefinition>(&copies.credential_specs, &mut report));
-    let grant_record = only_imported(import_kind::<CredentialGrantDefinition>(&copies.credential_grants, &mut report));
-    let defaults_record = only_imported(import_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, &mut report));
-    let layer_record = only_imported(import_kind::<ImageLayerDefinition>(&copies.image_layers, &mut report));
-    let template_record = only_imported(import_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, &mut report));
-    let project_record = only_imported(import_kind::<ProjectDefinition>(&copies.projects, &mut report));
+    let forge = only_imported(import_kind::<ForgeDefinition>(&copies.forges, &copies.manifest_roots, &mut report));
+    let fleet = only_imported(import_kind::<FleetDesignationDefinition>(&copies.fleet_designations, &copies.manifest_roots, &mut report));
+    let credential_record =
+        only_imported(import_kind::<CredentialSpecDefinition>(&copies.credential_specs, &copies.manifest_roots, &mut report));
+    let grant_record =
+        only_imported(import_kind::<CredentialGrantDefinition>(&copies.credential_grants, &copies.manifest_roots, &mut report));
+    let defaults_record = only_imported(import_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, &copies.manifest_roots, &mut report));
+    let layer_record = only_imported(import_kind::<ImageLayerDefinition>(&copies.image_layers, &copies.manifest_roots, &mut report));
+    let template_record =
+        only_imported(import_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, &copies.manifest_roots, &mut report));
+    let project_record = only_imported(import_kind::<ProjectDefinition>(&copies.projects, &copies.manifest_roots, &mut report));
+    let ensure_record = only_imported(import_kind::<ConvoyEnsureDefinition>(&copies.convoy_ensures, &copies.manifest_roots, &mut report));
+    assert_eq!(ensure_record.record.spec(), ensure);
     for record_origin in [
+        &ensure_record.origin,
         &forge.origin,
         &fleet.origin,
         &credential_record.origin,
@@ -439,7 +476,7 @@ fn forge_spec(url: &str) -> ForgeSpec {
 fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
     let homes = |copies: &[DefinitionCopy<flotilla_resources::Forge>]| {
         let mut report = ImportReport::default();
-        let records = import_kind::<ForgeDefinition>(copies, &mut report);
+        let records = import_kind::<ForgeDefinition>(copies, &held_roots(), &mut report);
         (records.into_iter().map(|record| (record.namespace, record.name, record.home)).collect::<Vec<_>>(), report)
     };
     let row = |namespace: &str, name: &str, home: &str, created: i64| (namespace.to_owned(), name.to_owned(), home.to_owned(), created);
@@ -476,7 +513,7 @@ fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
     // Two homes' concurrent values: a conflict, imported with the merged value and noted.
     let conflicting = [at_home("alpha", None, forge_spec("https://x"), 1), at_home("beta", None, forge_spec("https://y"), 1)];
     let mut report = ImportReport::default();
-    let records = import_kind::<ForgeDefinition>(&conflicting, &mut report);
+    let records = import_kind::<ForgeDefinition>(&conflicting, &[], &mut report);
     let merged = flotilla_store::merge_definition_copies(
         conflicting.iter().map(|copy| (copy.object.clone(), flotilla_protocol::NodeId::new(copy.home.clone()))).collect(),
     )
@@ -526,6 +563,92 @@ fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
     let report = rehearse_definitions(&copies);
     assert!(report.imported.is_empty() && report.refused.is_empty(), "{report:?}");
     assert_eq!(report.dropped.values().sum::<usize>(), 3, "{:?}", report.dropped);
+}
+
+// Behaviour (#3108): a copy stamped with a root its home does not hold is refused and reported by
+// reason, as the engine's apply refuses it: the record is declared at the root's home. A copy of
+// the same name at the root's home still imports there.
+#[test]
+fn a_copy_stamped_with_another_homes_root_is_refused() {
+    let at_home = |home: &str| {
+        let (labels, annotations) = manifest_stamp("b-root");
+        copy::<flotilla_resources::Forge>("f", home, labels, annotations, forge_spec("https://x"))
+    };
+    let mut report = ImportReport::default();
+    let records = import_kind::<ForgeDefinition>(&[at_home("alpha"), at_home("beta")], &held_roots(), &mut report);
+    assert_eq!(records.into_iter().map(|record| record.home).collect::<Vec<_>>(), ["beta"]);
+    let refused: Vec<_> = report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str(), refusal.reason.as_str())).collect();
+    assert_eq!(
+        refused,
+        [(
+            "Forge",
+            "f",
+            "at `alpha`: its manifest stamp names root `b-root`, which this home does not hold: the record is declared at the root's home (beta)"
+        )],
+        "{report:?}"
+    );
+}
+
+// Behaviour (#3108, the rehearsal's ensures): project ops materialise a ConvoyEnsure or a
+// WorkflowTemplate at each home that refreshes the project, so a name held there is imported
+// there whichever home created its copy first, with or without the ops root's stamp. An
+// operator's copies still fold into the creating home's record.
+#[test]
+fn project_ops_copies_import_at_each_home_that_holds_them() {
+    let created = |mut copy: DefinitionCopy<flotilla_resources::ConvoyEnsure>, at_seconds: i64| {
+        copy.object.metadata.creation_timestamp = at(at_seconds);
+        copy
+    };
+    let ensure = ConvoyEnsureSpec {
+        project_ref: "p".into(),
+        role: "governor".into(),
+        driver_ref: Some("kiwi".into()),
+        workflow_ref: "review".into(),
+        placement_policy: None,
+        escalation_reason: None,
+        repositories: vec![RepositoryKey("repo".into())],
+        presents_as: Some("fleet".into()),
+        agent_overrides: Vec::new(),
+    };
+    let ensure_at = |home: &str, stamp: u8, at_seconds: i64| {
+        let (labels, annotations, _) = provenance(stamp);
+        created(copy("p--governor", home, labels, annotations, ensure.clone()), at_seconds)
+    };
+    let ensure_homes = |copies: &[DefinitionCopy<flotilla_resources::ConvoyEnsure>]| {
+        let mut report = ImportReport::default();
+        let homes =
+            import_kind::<ConvoyEnsureDefinition>(copies, &[], &mut report).into_iter().map(|record| record.home).collect::<Vec<_>>();
+        assert!(report.refused.is_empty(), "{report:?}");
+        (homes, report)
+    };
+
+    // Project ops at two homes, the other created earlier: each home imports its own, nothing folds.
+    for stamp in [3, 6] {
+        let (homes, report) = ensure_homes(&[ensure_at("alpha", stamp, 1), ensure_at("kiwi", stamp, 5)]);
+        assert_eq!(homes, ["alpha", "kiwi"], "stamp {stamp}");
+        assert!(report.notes.is_empty(), "{report:?}");
+    }
+
+    // An operator's copies at two homes: the creating home's record; the other folds into it.
+    let (homes, report) = ensure_homes(&[ensure_at("alpha", 0, 1), ensure_at("kiwi", 0, 5)]);
+    assert_eq!(homes, ["alpha"]);
+    assert_eq!(report.notes.len(), 1, "{report:?}");
+
+    // A project ops WorkflowTemplate alike.
+    let template_at = |home: &str, at_seconds: i64| {
+        let (labels, annotations, _) = provenance(3);
+        let mut copy =
+            copy::<flotilla_resources::WorkflowTemplate>("p--review", home, labels, annotations, WorkflowTemplateSpec::builder().build());
+        copy.object.metadata.creation_timestamp = at(at_seconds);
+        copy
+    };
+    let mut report = ImportReport::default();
+    let homes = import_kind::<WorkflowTemplateDefinition>(&[template_at("alpha", 1), template_at("kiwi", 5)], &[], &mut report)
+        .into_iter()
+        .map(|record| record.home)
+        .collect::<Vec<_>>();
+    assert_eq!(homes, ["alpha", "kiwi"]);
+    assert!(report.notes.is_empty() && report.refused.is_empty(), "{report:?}");
 }
 
 // Behaviour (#3824 layer 3b plan, the Project import's table): every Project the fleet held

@@ -1,71 +1,114 @@
-//! The lifecycle importer: Environment, ImageBuild, Clone, Checkout, TerminalSession, Vessel and
-//! ConvoyEnsure. A placed Vessel is a lease granted on its pinned host; one never placed is noted,
-//! not stored. An Ensure is bound while the convoy it records is live.
+//! The lifecycle importer: Vessel, TerminalSession, Environment, ImageBuild, Clone and Checkout. A
+//! placed Vessel is its work's first launch, a lease granted on its pinned host; one never placed
+//! is noted, not stored.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_core::primitives::ensures::import_ensures;
 use flotilla_engine_store::{Import, ImportTarget};
-use flotilla_provisioning::engine::{
-    checkout::CheckoutBinding,
-    clone::CloneBinding,
-    image_build::ImageBuildBinding,
-    import::{import_environments, import_records, import_vessels, ImportRefusal, ImportReport},
-    terminal_session::TerminalSessionBinding,
+use flotilla_provisioning::engine::import::{
+    import_checkouts, import_clones, import_environments, import_image_builds, import_terminal_sessions, import_vessels, ImportRefusal,
+    ImportReport,
 };
 use flotilla_resources::{
-    convoy::engine::engine_name, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure, Environment, ImageBuild, TerminalSession, Vessel,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    convoy::engine::engine_name, Checkout, Clone as CloneResource, Convoy, Environment, Host, ImageBuild, TerminalSession, Vessel,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
+use flotilla_schema::{Identity, Kind};
+use flotilla_state_machines::{machines::convoy::Convoy as EngineConvoy, Resource};
 
 use super::{Carried, Source};
 
-pub(super) const KINDS: [&str; 7] = ["environments", "imagebuilds", "clones", "checkouts", "terminalsessions", "vessels", "convoyensures"];
+pub(super) const KINDS: [&str; 4] = ["environments", "imagebuilds", "clones", "checkouts"];
 
-/// Refusals that are deliberate non-imports, counted as dropped. Both kind and complete reason
-/// match, so a new refusal (a decode or store failure on a Checkout among them) still refuses.
-const EXEMPT_REFUSALS: &[(&str, &str)] = &[("Checkout", "an observed checkout is no engine request")];
-
-fn exempt(refusal: &ImportRefusal) -> bool {
-    EXEMPT_REFUSALS.contains(&(refusal.kind, refusal.reason.as_str()))
-}
-
-pub(super) fn lifecycles(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
-    for namespace in source.namespaces(&KINDS) {
-        namespace_lifecycles(source, namespace, target, report);
-    }
-    let (exempted, refused): (Vec<_>, Vec<_>) = std::mem::take(&mut report.refused).into_iter().partition(exempt);
-    report.refused = refused;
-    for refusal in exempted {
-        *report
-            .dropped
-            .entry((refusal.kind, EXEMPT_REFUSALS.iter().find(|(kind, _)| *kind == refusal.kind).map_or("", |(_, reason)| reason)))
-            .or_default() += 1;
+/// Vessels import first, each as its work's first launch, so the environments and terminal
+/// sessions held for an old vessel are held for the launch it became: a launch's number is its
+/// home's sequence when it is written. A vessel keeps the old convoy it serves, which its home's
+/// vessel requester reads.
+pub(super) fn vessels(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
+    for namespace in source.namespaces(&["vessels"]) {
+        let vessels: Vec<_> = source
+            .owned::<Vessel>("vessels", Some(namespace), "Vessel", target, report)
+            .into_iter()
+            .map(|record| (record.object, record.home))
+            .collect();
+        carried.vessels.extend(import_vessels(&vessels, &carried.convoy_launches, target, report));
     }
 }
 
-fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, report: &mut ImportReport) {
+/// TerminalSessions import before the messages delivered to them, so each delivery names the
+/// launch its session became: a launch's number is its home's sequence when it is written.
+pub(super) fn terminal_sessions(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
+    for namespace in source.namespaces(&["terminalsessions"]) {
+        let sessions: Vec<_> = source
+            .owned::<TerminalSession>("terminalsessions", Some(namespace), "TerminalSession", target, report)
+            .into_iter()
+            .map(|record| (record.object, record.home))
+            .collect();
+        carried.launches.extend(import_terminal_sessions(&sessions, &carried.vessels, target, report));
+    }
+}
+
+pub(super) fn lifecycles(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
+    // A namespace with only convoys still notes how its standing generations fold.
+    for namespace in source.namespaces(&["environments", "imagebuilds", "clones", "checkouts", "convoys"]) {
+        namespace_lifecycles(source, namespace, target, carried, report);
+    }
+}
+
+/// The home of each host's daemon, from the source's Host records: a Host is homed with the
+/// daemon that describes it, so a host held at exactly one home is that home's.
+fn host_homes(source: &Source) -> BTreeMap<String, BTreeSet<String>> {
+    let mut homes = BTreeMap::<String, BTreeSet<String>>::new();
+    for host in source.context::<Host>("hosts", None) {
+        homes.entry(host.object.metadata.name).or_default().insert(host.home);
+    }
+    homes
+}
+
+fn host_home(homes: &BTreeMap<String, BTreeSet<String>>, host: &str) -> Result<String, String> {
+    match homes.get(host).map(|homes| homes.iter().collect::<Vec<_>>()).as_deref() {
+        Some([home]) => Ok((*home).clone()),
+        None | Some([]) => Err(format!("builder host `{host}` has no Host record in the source")),
+        Some(several) => Err(format!(
+            "builder host `{host}` is held at several homes: {}",
+            several.iter().map(|home| home.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, carried: &Carried, report: &mut ImportReport) {
     let namespace = Some(namespace);
-    macro_rules! records {
-        ($old:ty, $plural:literal, $kind:literal, $binding:ty) => {{
-            let records: Vec<_> = source
-                .owned::<$old>($plural, namespace, $kind, target, report)
-                .into_iter()
-                .map(|record| (record.object, record.home))
-                .collect();
-            import_records::<$binding>(&records, target, report);
-        }};
-    }
+    let hosts = host_homes(source);
+    // Each build's builder host, from any home's copy of the build, for the environments that
+    // name it.
+    let builders: BTreeMap<String, String> = source
+        .context::<ImageBuild>("imagebuilds", namespace)
+        .into_iter()
+        .filter_map(|build| Some((build.object.metadata.name.clone(), build.object.spec.current()?.host_ref.clone())))
+        .collect();
+    let build_home = |build: &str| {
+        let host = builders.get(build).ok_or_else(|| format!("image build `{build}` has no record in the source"))?;
+        host_home(&hosts, host)
+    };
     let environments: Vec<_> = source
         .owned::<Environment>("environments", namespace, "Environment", target, report)
         .into_iter()
         .map(|record| (record.object, record.home))
         .collect();
-    import_environments(&environments, target, report);
-    records!(ImageBuild, "imagebuilds", "ImageBuild", ImageBuildBinding);
-    records!(CloneResource, "clones", "Clone", CloneBinding);
-    records!(Checkout, "checkouts", "Checkout", CheckoutBinding);
-    records!(TerminalSession, "terminalsessions", "TerminalSession", TerminalSessionBinding);
+    import_environments(&environments, &carried.vessels, &build_home, target, report);
+    let builds: Vec<_> = source
+        .owned::<ImageBuild>("imagebuilds", namespace, "ImageBuild", target, report)
+        .into_iter()
+        .map(|record| (record.object, record.home))
+        .collect();
+    import_image_builds(&builds, &|host: &str| host_home(&hosts, host), target, report);
+    let clones: Vec<_> = source
+        .owned::<CloneResource>("clones", namespace, "Clone", target, report)
+        .into_iter()
+        .map(|record| (record.object, record.home))
+        .collect();
+    // The launch each clone imported as, by home and old name, for the worktrees that name it.
+    let clone_launches = import_clones(&clones, target, report);
     let convoys = source.context::<Convoy>("convoys", namespace);
     let aliases: BTreeMap<_, _> = convoys
         .iter()
@@ -73,23 +116,56 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, r
             engine_name(&convoy.object).ok().map(|name| ((convoy.home.clone(), convoy.object.metadata.name.clone()), name))
         })
         .collect();
-    let mut vessels: Vec<_> = source
-        .owned::<Vessel>("vessels", namespace, "Vessel", target, report)
-        .into_iter()
-        .map(|vessel| (vessel.object, vessel.home))
+    // Each checkout is held for the launch its convoy's record imported as, at the convoy's home,
+    // created under that launch's version. One whose convoy ended is not: nothing would release
+    // it. One whose convoy imports as no open launch at that home is refused with why (#3108).
+    let convoy_code = <Resource<EngineConvoy> as Kind>::CODE;
+    // Every home's ended convoys, as the source holds them: a checkout here may be held for a
+    // convoy homed at another, which that home imports.
+    let ended: BTreeSet<(&str, &str)> = convoys
+        .iter()
+        .filter(|convoy| convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
+        .map(|convoy| (convoy.home.as_str(), convoy.object.metadata.name.as_str()))
         .collect();
-    for (vessel, home) in &mut vessels {
-        let convoy_home = vessel.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).unwrap_or(home);
-        if let Some(stable) = aliases.get(&(convoy_home.clone(), vessel.spec.convoy_ref.clone())) {
-            vessel.spec.convoy_ref.clone_from(stable);
-        } else {
-            report.notes.push(format!(
-                "Vessel `{}` records convoy `{}` from home `{convoy_home}`, which is not held or has no mappable identity: left unchanged",
-                vessel.metadata.name, vessel.spec.convoy_ref
-            ));
+    for record in
+        source.owned::<Checkout>("checkouts", namespace, "Checkout", target, report).into_iter().map(|record| (record.object, record.home))
+    {
+        // Another home's checkout is that home's to import or drop.
+        if !target.imports(&record.1) {
+            continue;
         }
+        let convoy_home = record.0.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).unwrap_or(&record.1).clone();
+        let holder = |old: &str| {
+            let (launch, version) = carried.convoys.get(&(convoy_home.clone(), old.to_owned()))?;
+            Some((Identity { kind: convoy_code, name: launch.clone(), home: convoy_home.clone() }, *version))
+        };
+        if let Some(convoy) = record.0.metadata.labels.get(CONVOY_LABEL).filter(|convoy| holder(convoy).is_none()) {
+            // Nothing on the engine reacts to an imported end, so nothing would release it. The
+            // first-start counts say how many, by end.
+            if carried.ended.contains_key(&(convoy_home.clone(), convoy.clone()))
+                || ended.contains(&(convoy_home.as_str(), convoy.as_str()))
+            {
+                report.drop_rows("Checkout", "an orphaned worktree left on disk: held for an ended convoy", 1);
+                continue;
+            }
+            // A convoy gone before the import ended too, as its tombstone did (#3108 ruling (a)).
+            if carried.convoy_launches.is_tombstone(&record.0.metadata.namespace, convoy) {
+                report.drop_rows("Checkout", "an orphaned worktree left on disk: held for a convoy gone before import", 1);
+                continue;
+            }
+            let why = match carried.convoy_launches.launch(&record.0.metadata.namespace, convoy) {
+                Err(reason) => reason.to_string(),
+                Ok(launch) => format!("names a convoy imported as `{launch}`, not open at `{convoy_home}`"),
+            };
+            report.refused.push(ImportRefusal {
+                kind: "Checkout",
+                record: record.0.metadata.name.clone(),
+                reason: format!("at `{}`: its holder {why} (`{convoy}`)", record.1),
+            });
+            continue;
+        }
+        import_checkouts(std::slice::from_ref(&record), &holder, &clone_launches, target, report);
     }
-    import_vessels(&vessels, target, report);
     let standing: Vec<_> = aliases.iter().filter(|((home, old), stable)| target.imports(home) && old != *stable).collect();
     if !standing.is_empty() {
         let identities: std::collections::BTreeSet<_> = standing.iter().map(|((home, _), stable)| (home, stable)).collect();
@@ -100,43 +176,4 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, r
             standing.len() - identities.len()
         ));
     }
-    // Each convoy's liveness, and whether it has a status yet: one with none is a fresh convoy,
-    // read as live, and an Ensure bound to it is noted.
-    let live: BTreeMap<String, (bool, bool)> = convoys
-        .into_iter()
-        .map(|convoy| {
-            let live = convoy.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal());
-            (convoy.object.metadata.name, (live, convoy.object.status.is_some()))
-        })
-        .collect();
-    let mut ensures = Vec::new();
-    for ensure in source.owned::<ConvoyEnsure>("convoyensures", namespace, "Ensure", target, report) {
-        let (ensure, home) = (ensure.object, ensure.home);
-        let convoy = ensure.status.as_ref().and_then(|status| status.convoy_ref.clone());
-        let convoy_live = match convoy.as_ref().map(|convoy| (convoy, live.get(convoy))) {
-            Some((_, Some((live, true)))) => *live,
-            Some((convoy, Some((live, false)))) => {
-                report.notes.push(format!(
-                    "Ensure `{}` records convoy `{convoy}`, which has no status yet: read as live, imported bound",
-                    ensure.metadata.name
-                ));
-                *live
-            }
-            Some((convoy, None)) => {
-                // The safe direction: unfulfilled, so the first engine pass binds it again.
-                report.notes.push(format!(
-                    "Ensure `{}` records convoy `{convoy}`, which is not held (or did not decode): imported unfulfilled",
-                    ensure.metadata.name
-                ));
-                false
-            }
-            None => false,
-        };
-        ensures.push((ensure, home, convoy_live));
-    }
-    let (counts, refused) = import_ensures(&ensures, target);
-    for (label, count) in counts {
-        *report.imported.entry(("Ensure", label)).or_default() += count;
-    }
-    report.refused.extend(refused.into_iter().map(|(record, reason)| ImportRefusal { kind: "Ensure", record, reason }));
 }

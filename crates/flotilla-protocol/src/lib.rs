@@ -91,6 +91,9 @@ pub struct PrincipalRef {
 
 impl PrincipalRef {
     pub const IMPLICIT_NAME: &'static str = "implicit";
+    /// The person role a person sends as (#3938). With no person named for it in the charter, its
+    /// sender is `principal:operator`: the role, not a person named "operator".
+    pub const OPERATOR_ROLE: &'static str = "operator";
 
     pub fn implicit_for_namespace(namespace: impl Into<String>) -> Self {
         Self { namespace: namespace.into(), name: Self::IMPLICIT_NAME.to_string() }
@@ -101,118 +104,6 @@ impl Default for PrincipalRef {
     fn default() -> Self {
         Self::implicit_for_namespace("flotilla")
     }
-}
-
-/// Previous-generation attribution, used only to decode and adopt stored queues.
-/// New producers use Message sender addresses and relations. Serialization of
-/// unadopted envelopes is isolated in serialize_legacy_crew_sender so they survive
-/// an unrelated CAS; production inputs never construct this envelope.
-/// Remove after the first fleet roll deploying #2710 (ADR 0047).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum CrewMessageSender {
-    #[default]
-    Unknown,
-    FlotillaNudge,
-    FlotillaTurn {
-        source: String,
-    },
-    FlotillaEscalation {
-        from: String,
-    },
-    OperatorResume {
-        principal: Option<PrincipalRef>,
-    },
-    OperatorFollowUp {
-        principal: Option<PrincipalRef>,
-    },
-    Governor {
-        name: String,
-    },
-    Bosun {
-        name: String,
-    },
-    Handoff {
-        from: String,
-    },
-}
-
-/// Preserve an unadopted previous-generation envelope during unrelated status CAS.
-/// New Message writers must never call this shim. Remove after the first fleet
-/// roll deploying #2710, together with CrewMessageSender (ADR 0047).
-pub fn serialize_legacy_crew_sender<S: serde::Serializer>(sender: &CrewMessageSender, serializer: S) -> Result<S::Ok, S::Error> {
-    use serde::ser::SerializeMap;
-    let fields = match sender {
-        CrewMessageSender::Unknown | CrewMessageSender::FlotillaNudge => 1,
-        _ => 2,
-    };
-    let mut record = serializer.serialize_map(Some(fields))?;
-    let kind = match sender {
-        CrewMessageSender::Unknown => "unknown",
-        CrewMessageSender::FlotillaNudge => "flotilla-nudge",
-        CrewMessageSender::FlotillaTurn { .. } => "flotilla-turn",
-        CrewMessageSender::FlotillaEscalation { .. } => "flotilla-escalation",
-        CrewMessageSender::OperatorResume { .. } => "operator-resume",
-        CrewMessageSender::OperatorFollowUp { .. } => "operator-follow-up",
-        CrewMessageSender::Governor { .. } => "governor",
-        CrewMessageSender::Bosun { .. } => "bosun",
-        CrewMessageSender::Handoff { .. } => "handoff",
-    };
-    record.serialize_entry("kind", kind)?;
-    match sender {
-        CrewMessageSender::FlotillaTurn { source } => record.serialize_entry("source", source)?,
-        CrewMessageSender::FlotillaEscalation { from } | CrewMessageSender::Handoff { from } => record.serialize_entry("from", from)?,
-        CrewMessageSender::OperatorResume { principal } | CrewMessageSender::OperatorFollowUp { principal } => {
-            record.serialize_entry("principal", principal)?
-        }
-        CrewMessageSender::Governor { name } | CrewMessageSender::Bosun { name } => record.serialize_entry("name", name)?,
-        CrewMessageSender::Unknown | CrewMessageSender::FlotillaNudge => {}
-    }
-    record.end()
-}
-
-impl CrewMessageSender {
-    pub fn is_unknown(&self) -> bool {
-        matches!(self, Self::Unknown)
-    }
-    /// Compact identity and kind for line-oriented diagnostic output.
-    pub fn short_label(&self) -> String {
-        fn safe(value: &str) -> String {
-            value
-                .chars()
-                .map(
-                    |character| {
-                        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '@' | '.') {
-                            character
-                        } else {
-                            '_'
-                        }
-                    },
-                )
-                .collect()
-        }
-        match self {
-            Self::Unknown => "unknown".to_string(),
-            Self::FlotillaNudge => "flotilla/nudge".to_string(),
-            Self::FlotillaTurn { source } => format!("flotilla/turn:{}", safe(source)),
-            Self::FlotillaEscalation { from } => format!("flotilla/escalation:{}", safe(from)),
-            Self::OperatorResume { principal } | Self::OperatorFollowUp { principal } => {
-                format!("operator:{}", principal.as_ref().map_or_else(|| "unattributed".to_string(), |principal| safe(&principal.name)))
-            }
-            Self::Governor { name } => format!("governor:{}", safe(name)),
-            Self::Bosun { name } => format!("bosun:{}", safe(name)),
-            Self::Handoff { from } => format!("crew:{}", safe(from)),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum CrewMessageDelivery {
-    #[default]
-    Queued,
-    /// The framed message text is also the agent's launch brief, so startup delivered it.
-    LaunchBrief,
 }
 
 /// Auditable identity of a client that asked the daemon to mutate state.
@@ -286,11 +177,11 @@ pub use commands::{
     CliListKind, CliListResponse, CliListRow, Command, CommandAction, CommandValue, ConvoyAutoAttach, ConvoyContinuation,
     ConvoyExplanation, ConvoyNaming, ConvoyStartIntent, CrewSupervisionAction, DispatchPromiseRequest, EvidenceFreshness,
     ExplainedAccessDelivery, ExplainedAccountBinding, ExplainedAccountProvision, ExplainedArtifact, ExplainedChangeRequest,
-    ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedDeliveredNeed, ExplainedDeliveryRetry,
-    ExplainedEvent, ExplainedLeafFiring, ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription,
-    ExplainedTerminalCondition, ExplainedUnclaimedWork, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PromiseOwner,
-    RepoSelector, ResourceCursor, ResourceDigest, ResourceDigestQuery, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
-    ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition, StallReason, StepStatus, TurnDeliveryRung,
+    ExplainedCheckout, ExplainedClone, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedDeliveredNeed,
+    ExplainedDeliveryRetry, ExplainedHold, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedTerminalCondition,
+    ExplainedUnclaimedWork, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PromiseOwner, RepoSelector, ResourceCursor,
+    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition,
+    StallReason, StepStatus, TurnDeliveryRung,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
@@ -300,24 +191,25 @@ pub use provider_data::{
     Workspace,
 };
 pub use query::{
-    BlobSyncStatus, ChangeStreamStatus, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext,
-    CrewListMember, CrewListResponse, CrewProject, CrewProjectRepository, CrewStallRow, CrewStallsResponse, DeclarationAttentionKind,
-    DeclarationAttentionRow, DiscoveryEntry, DispatchBoardDependency, DispatchBoardIssue, DispatchBoardPullRequest,
-    DispatchBoardRepository, DispatchBoardResponse, DispatchQueueResponse, DispatchQueueRow, DispatchReadyKey, FleetHealthResponse,
-    FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaStatus, FleetStaleness,
-    FleetSurfaceCounts, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListEntry, HostListResponse,
-    HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, PersonInboxItem, PersonInboxResponse, ProjectListEntry,
-    ProjectListRepository, ProjectListResponse, ProjectRepositoryRole, ProviderHealthMap, ProviderInfo, RepoProvidersResponse, RepoSummary,
-    SleepInhibitionHealth, StallRung, StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
+    BlobSyncStatus, ChangeStreamPathStatus, ChangeStreamStatus, CredentialAttention, CredentialAttentionSeverity, CrewAttention,
+    CrewCommandContext, CrewListMember, CrewListResponse, CrewProject, CrewProjectRepository, CrewStallRow, CrewStallsResponse,
+    DeclarationAttentionKind, DeclarationAttentionRow, DiscoveryEntry, DispatchBoardDependency, DispatchBoardIssue,
+    DispatchBoardPullRequest, DispatchBoardRepository, DispatchBoardResponse, DispatchQueueResponse, DispatchQueueRow, DispatchReadyKey,
+    FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaStatus,
+    FleetStaleness, FleetSurfaceCounts, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListEntry,
+    HostListResponse, HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, PersonInboxItem, PersonInboxResponse,
+    ProjectListEntry, ProjectListRepository, ProjectListResponse, ProjectRepositoryRole, ProviderHealthMap, ProviderInfo,
+    RepoProvidersResponse, RepoSummary, SleepInhibitionHealth, StallRung, StatusResponse, TopologyResponse, TopologyRoute,
+    UnmetRequirementInfo,
 };
 pub use repository::{RepositoryRelation, RepositoryUpstream};
 pub use resource_ref::ResourceRef;
 pub use result_set::{
-    AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
-    AwarenessLink, AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow,
-    CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, ProjectRepositoriesRow, ProjectRepositoryMembership, QueryChanges,
-    QueryId, QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, Salience, SessionPhase, StandingRoleHold,
-    StandingRoleRow, VesselRow, WorkPhase,
+    AgentActivity, AgentSessionEnd, AgentSessionReading, AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary,
+    AwarenessGrouping, AwarenessKind, AwarenessLimit, AwarenessLink, AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow,
+    ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, ProjectRepositoriesRow,
+    ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows,
+    Salience, SessionPhase, StandingRoleHold, StandingRoleRow, VesselRow, WorkPhase,
 };
 use serde::{Deserialize, Serialize};
 
@@ -457,6 +349,10 @@ pub enum Request {
     },
     Execute {
         command: Command,
+        /// The caller's stable key for this request, kept across its retries. A retry with the
+        /// same key, from the same caller, follows the first execution rather than repeating it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_key: Option<String>,
     },
     Cancel {
         command_id: u64,
@@ -628,32 +524,6 @@ pub fn crew_claims_from(lookup: impl Fn(&str) -> Option<String>) -> std::collect
         .collect()
 }
 
-/// The refusal reason when two peers disagree on `[primitives]`.
-pub fn primitives_mismatch(peer: &str, peer_on: bool, local_on: bool) -> Option<String> {
-    let word = |on: bool| if on { "on" } else { "off" };
-    (peer_on != local_on).then(|| format!("peer {peer} has [primitives] {}, this host has it {}", word(peer_on), word(local_on)))
-}
-
-#[cfg(test)]
-mod primitives_mismatch_tests {
-    use super::*;
-
-    #[test]
-    fn a_mismatch_reason_is_recognised_and_a_match_is_not() {
-        for (peer_on, local_on) in [(true, false), (false, true)] {
-            let reason = primitives_mismatch("feta", peer_on, local_on).expect("differs");
-            assert!(is_primitives_mismatch(&reason));
-        }
-        assert_eq!(primitives_mismatch("feta", true, true), None);
-        assert!(!is_primitives_mismatch("peer node id mismatch: expected a, got b"));
-    }
-}
-
-/// Whether a dial error is a [`primitives_mismatch`] refusal.
-pub fn is_primitives_mismatch(error: &str) -> bool {
-    error.starts_with("peer ") && error.contains(" has [primitives] ")
-}
-
 /// Top-level message envelope for the JSON protocol.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -682,9 +552,6 @@ pub enum Message {
         /// already placed in the socket's Environment; other sockets ignore them.
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         crew_claims: std::collections::BTreeMap<String, String>,
-        /// Whether the sender runs with `[primitives]` on; peers refuse a mismatch.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        primitives: bool,
     },
     #[serde(rename = "peer")]
     Peer(Box<PeerWireMessage>),

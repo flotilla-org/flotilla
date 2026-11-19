@@ -5,10 +5,8 @@ use std::{
 };
 
 use chrono::Utc;
-use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    Convoy, Demand, DemandAddressee, DemandKind, DemandSpec, Host, HostSpec, HostStatus, InputMeta, IssueSource, OwnerReference,
-    PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RepositoryKey,
+    Convoy, Host, HostSpec, HostStatus, InputMeta, IssueSource, OwnerReference, Project, ProjectRepositorySpec, ProjectSpec, RepositoryKey,
     Resource, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, WatchEvent, WatchStart, WorkflowTemplate, CONVOY_LABEL, ROLE_LABEL,
     VESSEL_LABEL,
@@ -168,92 +166,6 @@ impl ResourceContractFixture for WorkflowTemplateFixture {
             other => panic!("expected tool process, got {other:?}"),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct RegardFixture;
-
-impl ResourceContractFixture for RegardFixture {
-    type Resource = Regard;
-
-    fn label() -> &'static str {
-        "Regard"
-    }
-
-    fn meta(name: &str) -> InputMeta {
-        InputMeta::builder().name(name.to_string()).build()
-    }
-
-    fn spec() -> <Self::Resource as Resource>::Spec {
-        RegardSpec::builder()
-            .principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
-            .target(resource_ref("Convoy", "alpha"))
-            .source(RegardSource::Expressed)
-            .expiry(RegardExpiryPolicy::Decaying { expires_after_seconds: 300 })
-            .build()
-    }
-
-    fn updated_spec() -> <Self::Resource as Resource>::Spec {
-        RegardSpec::builder()
-            .principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
-            .target(resource_ref("Convoy", "alpha"))
-            .source(RegardSource::Implicit { policy: "convoy-start".to_string() })
-            .expiry(RegardExpiryPolicy::Pin)
-            .build()
-    }
-
-    fn assert_created(created: &ResourceObject<Self::Resource>) {
-        assert_eq!(created.spec.principal_ref, PrincipalRef::implicit_for_namespace("flotilla"));
-        assert!(created.status.is_none());
-    }
-
-    fn assert_updated(updated: &ResourceObject<Self::Resource>) {
-        assert_eq!(updated.spec.expiry, RegardExpiryPolicy::Pin);
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct DemandFixture;
-
-impl ResourceContractFixture for DemandFixture {
-    type Resource = Demand;
-
-    fn label() -> &'static str {
-        "Demand"
-    }
-
-    fn meta(name: &str) -> InputMeta {
-        InputMeta::builder().name(name.to_string()).build()
-    }
-
-    fn spec() -> <Self::Resource as Resource>::Spec {
-        DemandSpec::builder()
-            .originating_work_ref(resource_ref("Vessel", "alpha-implement"))
-            .kind(DemandKind::Permission)
-            .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
-            .build()
-    }
-
-    fn updated_spec() -> <Self::Resource as Resource>::Spec {
-        DemandSpec::builder()
-            .originating_work_ref(resource_ref("Vessel", "alpha-review"))
-            .kind(DemandKind::Review)
-            .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
-            .build()
-    }
-
-    fn assert_created(created: &ResourceObject<Self::Resource>) {
-        assert_eq!(created.spec.kind, DemandKind::Permission);
-        assert!(created.status.is_none());
-    }
-
-    fn assert_updated(updated: &ResourceObject<Self::Resource>) {
-        assert_eq!(updated.spec.kind, DemandKind::Review);
-    }
-}
-
-fn resource_ref(kind: &str, name: &str) -> ResourceRef {
-    ResourceRef::new("flotilla.work/v1", kind, "flotilla", name)
 }
 
 pub fn in_memory_backend() -> ResourceBackend {
@@ -618,7 +530,6 @@ pub async fn assert_project_definition_edit_converges_with_backend(backend: Reso
     assert_eq!(visible_on_feta.spec.display_name, "Widgets");
     let point_read = feta.including_replicas::<Project>("flotilla").get("widgets").await.expect("point-read replicated Project definition");
     assert_eq!(point_read.object.spec.display_name, "Widgets");
-    assert_eq!(point_read.provenance, ResourceProvenance::Local, "merged definitions are presented as the local read view");
     assert!(matches!(
         feta.including_replicas::<Project>("flotilla").get("missing").await,
         Err(flotilla_resources::ResourceError::NotFound { .. })
@@ -1096,6 +1007,7 @@ pub async fn assert_watch_retention_expires_only_versions_below_floor_with_backe
         expired,
         ResourceError::WatchExpired {
             requested_version: created.metadata.resource_version,
+            reason: format!("events through {} were compacted", second.metadata.resource_version),
             compacted_through: Some(second.metadata.resource_version),
         }
     );

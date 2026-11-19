@@ -22,6 +22,9 @@ mod fleet_canary;
 
 /// Shared delimiter for the appended card and oversized-brief fallback.
 pub const CAPABILITIES_HEADING: &str = "\n\n## Your capabilities";
+/// Heads a launch brief's list of the promises the crew's role has kept: one line per promise,
+/// "- `<id>` (<kind>): <reference of its last submission>".
+pub const KEPT_PROMISES_HEADING: &str = "## Promises your role has kept";
 pub const TRUSTED_IMPLICIT_STANCE: &str = "trusted-implicit";
 pub const DEFAULT_CREW_BRIEF_TEMPLATE: &str = "crew.md";
 const BUILTIN_CREW_BRIEF_TEMPLATE: &str = include_str!("adapter/templates/crew.md");
@@ -44,6 +47,37 @@ pub struct CrewBriefMember {
     pub role: String,
     pub state: String,
     pub is_agent: bool,
+    /// The vessel holding this member, when it is not the brief's own.
+    pub vessel: Option<String>,
+}
+
+/// The crew of the convoy's vessels other than `own`, each with the vessel holding it, in the
+/// state its vessel launches it in.
+pub fn other_vessel_members(vessels: &[flotilla_resources::VesselRequirement], own: &str) -> Vec<CrewBriefMember> {
+    vessels
+        .iter()
+        .filter(|vessel| vessel.name != own)
+        .flat_map(|vessel| {
+            vessel.crew.iter().enumerate().map(move |(index, member)| CrewBriefMember {
+                role: member.role.clone(),
+                state: if vessel.starts_eagerly(index) { "active" } else { "latent" }.to_string(),
+                is_agent: matches!(member.source, flotilla_resources::CrewSource::Agent { .. }),
+                vessel: Some(vessel.name.clone()),
+            })
+        })
+        .collect()
+}
+
+/// The members `role` can hand off to by role name: its own vessel's other agents, and another
+/// vessel's agent whose role no other vessel holds (a handoff names its own vessel's holder
+/// first, and refuses a role that several other vessels hold).
+fn handoff_members<'a>(members: &'a [CrewBriefMember], role: &str) -> Vec<&'a CrewBriefMember> {
+    let holders = |role: &str| members.iter().filter(|member| member.role == role).collect::<Vec<_>>();
+    members
+        .iter()
+        .filter(|member| member.is_agent && member.role != role)
+        .filter(|member| member.vessel.is_none() || holders(&member.role).len() == 1)
+        .collect()
 }
 
 /// What the `## Assignment` section of a crew brief should say. Distinct from
@@ -242,7 +276,7 @@ fn build_crew_brief_with_options(
             charter_prose: &options.charter_prose,
             charter_commit: options.charter_commit.as_deref(),
             members,
-            handoff_members: members.iter().filter(|member| member.is_agent && member.role != role).collect(),
+            handoff_members: handoff_members(members, role),
             has_credential_scope: options.has_credential_scope,
             has_in_crew_reviewer: members.iter().any(|member| member.is_agent && member.role == "reviewer"),
             is_standing: options.is_standing,
@@ -391,12 +425,13 @@ pub fn append_convoy_work_context(
     if let Some(branch) = &convoy.spec.r#ref {
         content.push_str(&format!("- Branch: `{branch}`\n"));
     }
-    if let Some(project_ref) = &convoy.spec.project_ref {
-        content.push_str(&format!("- Island Project: `{project_ref}` — resolve current repositories and roles with `flotilla crew list` on each orientation sweep.\n"));
-    }
-    // Project-scoped governors orient against live membership. Delivery crews
+    content.push_str(&format!(
+        "- Island Project: `{}` — resolve current repositories and roles with `flotilla crew list` on each orientation sweep.\n",
+        convoy.spec.project_ref
+    ));
+    // Governors orient against live project membership. Delivery crews
     // retain admitted repository URLs and target refs as their delivery contract.
-    if convoy.spec.role != "governor" || convoy.spec.project_ref.is_none() {
+    if convoy.spec.role != "governor" {
         content.push_str("- Repositories:\n");
         let checkouts = work_dir.map(|dir| multi_repository_checkouts(&convoy.spec, repository_refs, dir)).unwrap_or_default();
         for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
@@ -661,6 +696,11 @@ pub trait AgentAdapter: Send + Sync {
     fn classify_screen_attention(&self, _screen: &str) -> Option<TerminalAttentionState> {
         None
     }
+    /// Whether this harness reports through Claude Code's hooks, and so takes a launch's hook
+    /// URL and token (`FLOTILLA_HOOK_URL`, `FLOTILLA_HOOK_TOKEN`) to post them over HTTP.
+    fn posts_claude_code_hooks(&self) -> bool {
+        false
+    }
     /// Why a screen that reads `Unobservable` shows an agent that is idle but
     /// cannot take a turn, so attention can name it (#3460). Never changes the
     /// attention state: delivery still refuses.
@@ -836,6 +876,10 @@ impl AgentAdapter for CliAgentAdapter {
     }
     async fn cleanup(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
         remove_agent_files(&*self.runner, cwd.as_path(), brief, self.flavor.managed_files()).await
+    }
+
+    fn posts_claude_code_hooks(&self) -> bool {
+        matches!(self.flavor, AdapterFlavor::ClaudeCode { .. })
     }
 
     fn classify_screen_attention(&self, screen: &str) -> Option<TerminalAttentionState> {
@@ -1548,7 +1592,7 @@ mod tests {
             "work",
             "coder",
             prompt.as_deref().map_or(CrewAssignment::Unassigned, CrewAssignment::Prompt),
-            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
+            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true, vessel: None }],
             &CrewBriefRenderOptions { has_credential_scope: true, ..CrewBriefRenderOptions::default() },
         )
         .expect("render scoped coder brief");
@@ -1576,9 +1620,48 @@ mod tests {
             "work",
             "coder",
             assignment,
-            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
+            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true, vessel: None }],
         )
         .content
+    }
+
+    // Behaviour (gap 1): a brief lists the convoy's other vessels' crew with their vessel, and
+    // offers a handoff by role to each one a bare role reaches: its own vessel's agents, and
+    // another vessel's agent whose role no other member holds.
+    #[test]
+    fn a_brief_shows_other_vessels_crew_and_the_handoffs_their_roles_reach() {
+        let member = |role: &str, vessel: Option<&str>| CrewBriefMember {
+            role: role.into(),
+            state: "latent".into(),
+            is_agent: true,
+            vessel: vessel.map(str::to_owned),
+        };
+        let content = build_crew_brief(
+            &TerminalCrewContext { namespace: "flotilla".into(), convoy: "fix-delivery".into(), vessel_ref: "fix-delivery-work#1".into() },
+            "work",
+            "coder",
+            CrewAssignment::Prompt("Fix it."),
+            &[
+                member("coder", None),
+                member("aide", None),
+                member("reviewer", Some("review")),
+                member("aide", Some("review")),
+                member("auditor", Some("audit")),
+                member("auditor", Some("review")),
+            ],
+        )
+        .content;
+        assert!(content.contains("- `reviewer` (vessel `review`): latent\n"), "{content}");
+        assert!(content.contains("- `aide`: latent\n"));
+        let handoffs = content.lines().filter(|line| line.starts_with("Hand off to ")).collect::<Vec<_>>();
+        assert_eq!(
+            handoffs,
+            [
+                "Hand off to aide with `flotilla crew aide handoff --message '...'`.",
+                "Hand off to reviewer with `flotilla crew reviewer handoff --message '...'`.",
+            ],
+            "the own vessel's aide answers to `aide`; two vessels hold `auditor`"
+        );
     }
 
     #[test]
@@ -1593,9 +1676,9 @@ mod tests {
             "coder",
             CrewAssignment::Prompt("Fix the flux capacitor."),
             &[
-                CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true },
-                CrewBriefMember { role: "reviewer".to_string(), state: "latent".to_string(), is_agent: true },
-                CrewBriefMember { role: "watcher".to_string(), state: "active".to_string(), is_agent: false },
+                CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true, vessel: None },
+                CrewBriefMember { role: "reviewer".to_string(), state: "latent".to_string(), is_agent: true, vessel: None },
+                CrewBriefMember { role: "watcher".to_string(), state: "active".to_string(), is_agent: false, vessel: None },
             ],
         )
         .content;
@@ -1638,7 +1721,7 @@ mod tests {
         assert!(settlement.contains("take a new clean final snapshot before resubmitting the ledger"));
         assert_eq!(content.matches("follows the settlement order in `## Decision ledger`").count(), 1);
         assert!(content.contains("Follow the settlement order in `## Decision ledger`: submit your PR"));
-        assert!(content.contains("`crew complete` is advisory"));
+        assert!(content.contains("Only an operator may force settlement, with `crew complete --force`."));
         assert!(content.contains("Background delegates and sub-agents must never run those verbs"));
         assert!(content.contains("Crews never enact failure"));
         assert!(content.contains("--propose <resume|reduce-scope|fail>"));
@@ -1659,7 +1742,7 @@ mod tests {
     fn governor_work_context_references_live_island() {
         let (mut convoy, repository_key) = convoy_brief_fixture();
         convoy.spec.role = "governor".into();
-        convoy.spec.project_ref = Some("porthole".into());
+        convoy.spec.project_ref = "porthole".into();
         let mut content = String::new();
         append_convoy_work_context(&mut content, &convoy, &[repository_key], &BTreeMap::new(), None);
         assert!(content.contains("Island Project: `porthole`"));
@@ -1681,7 +1764,7 @@ mod tests {
             "work",
             "steward",
             CrewAssignment::Unassigned,
-            &[CrewBriefMember { role: "steward".to_string(), state: "active".to_string(), is_agent: true }],
+            &[CrewBriefMember { role: "steward".to_string(), state: "active".to_string(), is_agent: true, vessel: None }],
             &CrewBriefRenderOptions { has_credential_scope: true, ..CrewBriefRenderOptions::default() },
         )
         .expect("render standing brief")
@@ -1716,8 +1799,8 @@ mod tests {
             "coder",
             CrewAssignment::Prompt("Fix the flux capacitor."),
             &[
-                CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true },
-                CrewBriefMember { role: "reviewer".to_string(), state: "latent".to_string(), is_agent: true },
+                CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true, vessel: None },
+                CrewBriefMember { role: "reviewer".to_string(), state: "latent".to_string(), is_agent: true, vessel: None },
             ],
         );
         assert!(reviewed.content.contains("apply the `in-vessel-review` label in the PR-create command itself"));
@@ -1746,16 +1829,17 @@ mod tests {
                 "work",
                 "coder",
                 CrewAssignment::Prompt("Complete the assignment."),
-                &[CrewBriefMember { role: "coder".into(), state: "active".into(), is_agent: true }],
+                &[CrewBriefMember { role: "coder".into(), state: "active".into(), is_agent: true, vessel: None }],
                 &CrewBriefRenderOptions { template: template.into(), ..CrewBriefRenderOptions::default() },
             )
             .expect("render variant")
             .content;
             assert!(content.contains("--propose <resume|reduce-scope|fail>"), "{template}");
             assert!(!content.contains("crew fail"), "{template}");
-            // #3703: each task variant must teach settlement even with no admitted promises.
+            // #3703: each task variant teaches settlement. Admission gives every agent seat a
+            // promise (#3108 owner ruling), so no variant asks a crew to declare its own ledger.
             assert!(!content.contains("flotilla crew complete"), "{template}");
-            assert!(content.contains("flotilla crew promise --promise"), "{template}");
+            assert!(!content.contains("If you hold no promises"), "{template}");
             assert!(content.contains("every promise is kept or retracted"), "{template}");
         }
     }
@@ -1774,7 +1858,7 @@ mod tests {
             "work",
             "coder",
             CrewAssignment::Prompt("Demo the override."),
-            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
+            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true, vessel: None }],
             &options,
         )
         .expect("render brief");
@@ -1797,7 +1881,7 @@ mod tests {
             "work",
             "driver",
             CrewAssignment::Prompt("Pair with the user."),
-            &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true }],
+            &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true, vessel: None }],
             &CrewBriefRenderOptions {
                 template: "interactive-session.md".to_string(),
                 overrides: Vec::new(),
@@ -1830,8 +1914,8 @@ mod tests {
             "reviewer",
             CrewAssignment::CarriedIssue,
             &[
-                CrewBriefMember { role: "coder".to_string(), state: "handed-off".to_string(), is_agent: true },
-                CrewBriefMember { role: "reviewer".to_string(), state: "active".to_string(), is_agent: true },
+                CrewBriefMember { role: "coder".to_string(), state: "handed-off".to_string(), is_agent: true, vessel: None },
+                CrewBriefMember { role: "reviewer".to_string(), state: "active".to_string(), is_agent: true, vessel: None },
             ],
             &CrewBriefRenderOptions {
                 template: "diff-review".to_string(),
@@ -1867,7 +1951,7 @@ mod tests {
             "work",
             "shepherd",
             CrewAssignment::Unassigned,
-            &[CrewBriefMember { role: "shepherd".to_string(), state: "active".to_string(), is_agent: true }],
+            &[CrewBriefMember { role: "shepherd".to_string(), state: "active".to_string(), is_agent: true, vessel: None }],
             &CrewBriefRenderOptions {
                 template: "shepherd".to_string(),
                 overrides: Vec::new(),
@@ -1917,7 +2001,7 @@ mod tests {
                 "work",
                 "coder",
                 CrewAssignment::Prompt("Review the PR."),
-                &[CrewBriefMember { role: "coder".into(), state: "active".into(), is_agent: true }],
+                &[CrewBriefMember { role: "coder".into(), state: "active".into(), is_agent: true, vessel: None }],
                 &options,
             )
             .expect("render review brief")
@@ -1963,7 +2047,7 @@ mod tests {
             "work",
             "driver",
             CrewAssignment::Prompt("Pair with the user."),
-            &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true }],
+            &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true, vessel: None }],
             &options,
         )
         .expect("render selected template");
@@ -1983,7 +2067,7 @@ mod tests {
             "work",
             "driver",
             CrewAssignment::Prompt("Pair with the user."),
-            &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true }],
+            &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true, vessel: None }],
             &CrewBriefRenderOptions {
                 template: "pairing.md".to_string(),
                 overrides: vec![CrewBriefTemplateOverride {
@@ -2024,7 +2108,7 @@ mod tests {
             "work",
             "coder",
             CrewAssignment::Prompt("Check precedence."),
-            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
+            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true, vessel: None }],
             &options,
         )
         .expect("render brief");
@@ -2092,7 +2176,7 @@ mod tests {
                     subpaths: Vec::new(),
                 }],
                 r#ref: Some("fix/batch".to_string()),
-                project_ref: None,
+                project_ref: "flotilla".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
                 subjects: Vec::new(),
                 issues: vec![issue("809", "First issue", "First issue body."), issue("810", "Second issue", "Second issue body.")],

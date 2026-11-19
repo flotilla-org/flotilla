@@ -1,0 +1,26 @@
+[package]
+name = "flotilla-engine-messages-testkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Dev-only: the engine Message path at a home over a temporary decided store, and the fleet its delivery reads"
+
+[dependencies]
+flotilla-engine-messages = { path = "../flotilla-engine-messages" }
+flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-inbox = { path = "../flotilla-inbox" }
+flotilla-messaging = { path = "../flotilla-messaging" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-schema = { path = "../flotilla-schema" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
+flotilla-state-machines = { path = "../flotilla-state-machines" }
+flotilla-store = { path = "../flotilla-store" }
+tempfile = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

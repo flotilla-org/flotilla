@@ -6,10 +6,7 @@ use flotilla_schema::{Edge, Hash, Kind, Records, State, Table, Timestamp};
 use flotilla_schema_sqlite::quote_ident;
 use flotilla_schema_sqlite::{Loaded, Stamp, Store, StoreError};
 use flotilla_state_machines::{
-    machines::{
-        ensure::{EnsureSpec, EnsureState, MemoryEnsureWorld, Record},
-        message::{Deliver, MemoryMessageWorld, MessageState, MessageWorld, Settle, Settlement},
-    },
+    machines::message::{Deliver, MemoryMessageWorld, MessageSpec, MessageState, MessageWorld, Settle, Settlement},
     Ref, Transport,
 };
 use hegel::TestCase;
@@ -18,9 +15,9 @@ use rusqlite::Connection;
 use crate::fixtures::{
     addr,
     engine::{step, NAME},
-    ensure, message, origin, registry, store,
+    message, origin, registry, store,
     synthetic::{workflow, Deliverable, DeliverableState, Evidence, InputValue, PromiseKind, PromiseSource},
-    AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource, TerminalSession, Vessel,
+    AgentSession, AwaitingReply, Convoy, Dossier, Fixture, Message, Person, Pick, Referral, Resource, Service, TerminalSession, Vessel,
     LOCAL,
 };
 
@@ -91,23 +88,21 @@ fn refused(result: Result<Stamp, StoreError>) -> String {
 #[test]
 fn spec_edits_refuse_what_only_edges_write() {
     let mut store = store();
-    let ensure = ensure::sample();
-    let current = insert(&mut store, "e", &ensure);
+    let current = insert(&mut store, "m", &message::sample());
     let dossier = Dossier { deliverables: records(vec![deliverable(vec![evidence("e0"), evidence("e1")])]), ..Dossier::sample(0) };
     let dossier_current = insert(&mut store, "d", &dossier);
-    let (ensure, dossier) = (&current.value, &dossier_current.value);
+    let (sent, dossier) = (&current.value, &dossier_current.value);
     let stamps = dossier.deliverables.iter().map(|row| row.version);
     assert_eq!(stamps.collect::<Vec<_>>(), [dossier_current.version], "the insert stamps every row");
+    let in_edited = MessageSpec { inbox: addr("edited"), ..sent.spec().clone() };
 
     let mut write = store.write().expect("write");
-    let held = EnsureState::Held { recorded: Default::default(), created: Default::default(), failures: 0, last_failure: None };
-    let moved = ensure.clone().with_state(State::new(held, ensure.since()));
-    assert_eq!(refused(write.update(&current, &moved, &origin())), "ensure.state");
-    let later = ensure
-        .clone()
-        .with_state(State::new(ensure.state().clone(), Timestamp(9)))
-        .with_spec(EnsureSpec { inbox: addr("edited"), ..ensure.spec().clone() });
-    assert_eq!(refused(write.update(&current, &later, &origin())), "ensure.state_since", "a spec field beside it does not excuse it");
+    // Settled with no receiver keeps every receiver column empty, as Pending does: only the label moves.
+    let settled = MessageState::Settled { receiver: None, delivered_at: None };
+    let moved = sent.clone().with_state(State::new(settled, sent.since()));
+    assert_eq!(refused(write.update(&current, &moved, &origin())), "message.state");
+    let later = sent.clone().with_state(State::new(sent.state().clone(), Timestamp(9))).with_spec(in_edited.clone());
+    assert_eq!(refused(write.update(&current, &later, &origin())), "message.state_since", "a spec field beside it does not excuse it");
     let deliverables = |f: Edit<Deliverable>| Dossier { deliverables: with_rows(&dossier.deliverables, f), ..dossier.clone() };
     let retracted = deliverables(&|rows| rows[0].1.state = State::new(DeliverableState::Retracted, Timestamp(5)));
     assert_eq!(refused(write.update(&dossier_current, &retracted, &origin())), "dossier_deliverables", "only an edge moves a record");
@@ -120,17 +115,20 @@ fn spec_edits_refuse_what_only_edges_write() {
     let fewer_evidence = deliverables(&|rows| rows[0].1.evidence = with_rows(&rows[0].1.evidence, |evidence| drop(evidence.pop())));
     assert_eq!(refused(write.update(&dossier_current, &fewer_evidence, &origin())), "dossier_deliverables_evidence");
 
-    // Allowed in the same transaction: a spec edit, then the engine's record edge appending its
-    // event and growing the state's recorded set, whatever stamps the caller's rows hold.
-    let edited = ensure.clone().with_spec(EnsureSpec { inbox: addr("edited"), ..ensure.spec().clone() });
+    // Allowed in the same transaction: a spec edit, then the engine's delivery edge appending its
+    // event and moving the state to Awaiting its receiver, whatever stamps the caller's rows hold.
+    let edited = sent.clone().with_spec(in_edited);
     let stamp = write.update(&current, &edited, &origin()).expect("spec edit");
-    let (edge, next) =
-        step(&edited, "dave", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(8)).expect("recorded");
+    let mut world = MemoryMessageWorld::default();
+    world.receipts.put(&Ref::new(NAME), [(message::agent("s", "h"), Transport::Turn)].into());
+    let deliver = Deliver { receiver: message::agent("s", "h"), transport: Transport::Turn };
+    let (edge, next) = step(&edited, "dave", deliver, &world, Timestamp(8)).expect("delivered");
     let stamp = write.apply_edge(stamp, edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("edge");
     write.commit().expect("commit");
-    let expected = next.stamped(Some(&edited), stamp.version).with_identity("e", stamp.version);
+    let expected = next.stamped(Some(&edited), stamp.version).with_identity("m", stamp.version);
     assert_eq!(load(&mut store, &current).value, expected);
-    assert!(expected.state().recorded().contains(&Ref::new("f")));
+    assert_eq!(expected.state().receiver(), Some(&message::agent("s", "h")));
+    assert_eq!(expected.spec().inbox, addr("edited"), "the spec edit survives the edge");
     assert_eq!(load(&mut store, &dossier_current).value, *dossier, "the refused writes changed nothing");
 }
 
@@ -177,7 +175,7 @@ fn writes_touch_only_their_rows() {
     let (mut store, _) = rows_written(store, |_| {});
     // The strings the edges write are interned first, so no `strings` row is counted below.
     for (n, (session, host)) in [("s", "h"), ("w", "w")].into_iter().enumerate() {
-        let awaiting = MessageState::Awaiting { receiver: message::agent(session, host) };
+        let awaiting = MessageState::Awaiting { receiver: message::agent(session, host), delivered_at: Timestamp(0) };
         let mut write = store.write().expect("pre-intern");
         write
             .insert(
@@ -344,6 +342,11 @@ fn deleting_a_resource_empties_every_table_person(tc: TestCase) {
 }
 
 #[hegel::test]
+fn deleting_a_resource_empties_every_table_service(tc: TestCase) {
+    delete_cascades::<Resource<Service>>(&tc);
+}
+
+#[hegel::test]
 fn deleting_a_resource_empties_every_table_awaiting_reply(tc: TestCase) {
     delete_cascades::<Resource<AwaitingReply>>(&tc);
 }
@@ -351,11 +354,6 @@ fn deleting_a_resource_empties_every_table_awaiting_reply(tc: TestCase) {
 #[hegel::test]
 fn deleting_a_resource_empties_every_table_convoy(tc: TestCase) {
     delete_cascades::<Resource<Convoy>>(&tc);
-}
-
-#[hegel::test]
-fn deleting_a_resource_empties_every_table_ensure(tc: TestCase) {
-    delete_cascades::<Resource<Ensure>>(&tc);
 }
 
 #[hegel::test]

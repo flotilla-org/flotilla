@@ -4,14 +4,14 @@
 #[path = "../../../flotilla-controllers/tests/common/mod.rs"]
 mod common;
 mod convoy_engine_path;
-mod convoy_in_memory;
+mod environment_vessels;
+mod message_reads;
 mod placement_tiebreak_capacity_wait;
+mod read_costs;
 mod review_bundle;
 mod review_bundle_aggregator;
-mod terminal_actuator;
-mod terminal_lifecycle;
-mod terminal_session_reconciler;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;
-mod vessel_finalization;
+// vessel_finalization deleted: a vessel is now a read view of its launch, with no finalizer to run (#3108).
 mod vessel_reconciler;
+mod vessel_views;

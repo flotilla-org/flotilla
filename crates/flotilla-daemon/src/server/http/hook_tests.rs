@@ -16,13 +16,12 @@ use axum::{
     Router,
 };
 use flotilla_agent::{ClaudeCodeHookTransport, SharedAgentStateStore, CLAUDE_CODE_HOOK_TOKEN_ENV};
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::{AgentHookTerminalRef, AgentStatus, AttachableId, EnvironmentId};
 use flotilla_resources::{
-    InputMeta, Selector, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+    Selector, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
 };
 use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
@@ -31,6 +30,9 @@ use super::{
     tcp::{TOKEN_DIRECTORY, TOKEN_FILE},
     CallerAuth, HookEndpoint, HookLaunch, HttpRouter, ListenAddress, ListenerOrigin, LoginStore, TcpListener,
 };
+use crate::server::tests::{empty_daemon, launch_of};
+use crate::testkits::engine::engine;
+use crate::testkits::engine::run_session;
 
 const NAMESPACE: &str = "flotilla";
 const CODER: &str = "terminal-work-coder";
@@ -48,9 +50,11 @@ fn attachable(session_name: &str) -> AttachableId {
     AttachableId::new(format!("terminal:{NAMESPACE}/{session_name}"))
 }
 
-/// A daemon's hook-handling state: its resource store with two running crew terminals,
-/// its agent state store, and the router over both.
+/// A daemon's hook-handling state: a daemon with its engine, running four crew terminals, its
+/// resource store, its agent state store, and the router over both.
 struct Daemon {
+    _tmp: tempfile::TempDir,
+    daemon: Arc<InProcessDaemon>,
     backend: ResourceBackend,
     agents: SharedAgentStateStore,
     logins: Arc<LoginStore>,
@@ -60,28 +64,27 @@ struct Daemon {
 
 impl Daemon {
     async fn new() -> Self {
-        Self::with_backend(ResourceBackend::new(InMemoryBackend::default())).await
-    }
-
-    async fn with_backend(backend: ResourceBackend) -> Self {
+        let (tmp, daemon) = empty_daemon().await;
         for session in [CODER, REVIEWER] {
-            running_crew_terminal(&backend, session).await;
+            running_crew_terminal(&daemon, session);
         }
         for (session, environment) in [(VESSEL_CODER, VESSEL), (OTHER_CODER, OTHER_VESSEL)] {
-            running_crew_terminal_in(&backend, session, environment).await;
+            running_crew_terminal_in(&daemon, session, environment);
         }
+        let backend = daemon.resource_backend();
         let agents = flotilla_agent::shared_in_memory_agent_state_store();
         let logins = Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock)));
         let hooks = HookEndpoint::with_key(HookKey::generate().expect("hook key"));
         let router = HttpRouter::builder()
             .backend(backend.clone())
+            .daemon(Arc::clone(&daemon))
             .agent_state_store(Arc::clone(&agents))
             .logins(Arc::clone(&logins))
             .tcp_origin(ListenerOrigin::default())
             .hooks(hooks.clone())
             .build()
             .into_router();
-        Self { backend, agents, logins, hooks, router }
+        Self { _tmp: tmp, daemon, backend, agents, logins, hooks, router }
     }
 
     async fn call(&self, caller: CallerAuth, request: Request<Body>) -> StatusCode {
@@ -92,7 +95,7 @@ impl Daemon {
 
     async fn hook_caller(&self, name: &str) -> CallerAuth {
         let session = self.backend.clone().using::<TerminalSession>(NAMESPACE).get(name).await.expect("session");
-        CallerAuth::Hook { terminal: terminal(name), generation: session.metadata.creation_timestamp.to_rfc3339() }
+        CallerAuth::Hook { terminal: terminal(name), generation: super::hooks::launch_generation(&session) }
     }
 
     async fn attention(&self, session_name: &str) -> Option<TerminalAttentionState> {
@@ -104,35 +107,31 @@ impl Daemon {
         let store = self.agents.lock().expect("agent state store");
         store.get(id).map(|entry| (entry.status.clone(), entry.session_id.clone()))
     }
+
+    /// Ends session `session_name`'s launch.
+    fn end(&self, session_name: &str) {
+        engine(&self.daemon).terminals.release(&launch_of(&self.daemon, session_name));
+    }
 }
 
-async fn running_crew_terminal(backend: &ResourceBackend, session_name: &str) {
-    running_crew_terminal_in(backend, session_name, "host-direct").await;
+fn running_crew_terminal(daemon: &InProcessDaemon, session_name: &str) {
+    running_crew_terminal_in(daemon, session_name, "host-direct");
 }
 
-async fn running_crew_terminal_in(backend: &ResourceBackend, session_name: &str, env_ref: &str) {
-    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
-    let created = sessions
-        .create(
-            &InputMeta::builder().name(session_name.to_string()).build(),
-            &TerminalSessionSpec {
-                env_ref: env_ref.into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector { capability: "code".into(), adapter: None, model: None },
-                    brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: "work".into(), copies: Vec::new() },
-                    context: Box::new(TerminalCrewContext { namespace: NAMESPACE.into(), convoy: "c".into(), vessel_ref: "v".into() }),
-                    message: None,
-                },
-                cwd: "/workspace".into(),
-                env: Default::default(),
-                pool: "test".into(),
-            },
-        )
-        .await
-        .expect("create terminal session");
-    let status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..TerminalSessionStatus::default() };
-    sessions.update_status(session_name, &created.metadata.resource_version, &status).await.expect("running status");
+fn running_crew_terminal_in(daemon: &InProcessDaemon, session_name: &str, env_ref: &str) {
+    let spec = TerminalSessionSpec {
+        env_ref: env_ref.into(),
+        role: "coder".into(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector { capability: "code".into(), adapter: None, model: None },
+            brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: "work".into(), copies: Vec::new() },
+            context: Box::new(TerminalCrewContext { namespace: NAMESPACE.into(), convoy: "c".into(), vessel_ref: "v".into() }),
+        },
+        cwd: "/workspace".into(),
+        env: Default::default(),
+        pool: "test".into(),
+    };
+    run_session(daemon, session_name, &spec, &Default::default());
 }
 
 /// The JSON Claude Code sends a hook: the documented common input fields and the event's own.
@@ -570,28 +569,23 @@ fn concurrent_hook_key_creation_agrees_on_one_key() {
     assert_eq!(leftovers, [std::ffi::OsString::from(HOOK_KEY_FILE)], "no staged files remain");
 }
 
-// A token belongs to one creation generation, even when a deleted name is reused.
+// A token belongs to one launch, even when the session's name is reused by its next launch.
 #[tokio::test]
 async fn recreated_terminal_refuses_old_hook_token() {
-    let database = tempfile::tempdir().expect("database");
-    for backend in [
-        ResourceBackend::new(InMemoryBackend::default()),
-        ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(database.path().join("sessions.sqlite")).expect("SQLite")),
-    ] {
-        let daemon = Daemon::with_backend(backend).await;
-        let state = tempfile::tempdir().expect("state");
-        let listener = Listening::start(&daemon, state.path()).await;
-        let old = listener.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("launch");
-        let route = "/v1/hooks/claude-code/stop";
-        assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 200);
-        daemon.backend.clone().using::<TerminalSession>(NAMESPACE).delete(CODER).await.expect("delete");
-        assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 401);
-        running_crew_terminal(&daemon.backend, CODER).await;
-        assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 401);
-        assert_eq!(daemon.attention(CODER).await, None);
-        let fresh = listener.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("new launch");
-        assert_eq!(listener.post(route, Some(&format!("Bearer {}", fresh.token))).await, 200);
-    }
+    let daemon = Daemon::new().await;
+    let state = tempfile::tempdir().expect("state");
+    let listener = Listening::start(&daemon, state.path()).await;
+    let old = listener.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("launch");
+    let route = "/v1/hooks/claude-code/stop";
+    assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 200);
+    daemon.end(CODER);
+    assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 401);
+    // The session's next launch is a new generation.
+    running_crew_terminal(&daemon.daemon, CODER);
+    assert_eq!(listener.post(route, Some(&format!("Bearer {}", old.token))).await, 401);
+    assert_eq!(daemon.attention(CODER).await, None);
+    let fresh = listener.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("new launch");
+    assert_eq!(listener.post(route, Some(&format!("Bearer {}", fresh.token))).await, 200);
 }
 
 // Internal processing failures are logged and returned as a generic 500 body.
@@ -755,9 +749,10 @@ async fn vessel_hook_posts_need_a_live_token_for_a_terminal_in_that_vessel() {
     assert_eq!(daemon.attention(VESSEL_CODER).await, Some(TerminalAttentionState::Idle));
     assert_eq!(daemon.agent(&attachable(VESSEL_CODER)).map(|(status, _)| status), Some(AgentStatus::Idle));
 
-    let generation =
-        daemon.backend.clone().using::<TerminalSession>(NAMESPACE).get(VESSEL_CODER).await.expect("session").metadata.creation_timestamp;
-    let foreign = HookKey::generate().expect("other key").mint(&terminal(VESSEL_CODER), &generation.to_rfc3339());
+    let generation = super::hooks::launch_generation(
+        &daemon.backend.clone().using::<TerminalSession>(NAMESPACE).get(VESSEL_CODER).await.expect("session"),
+    );
+    let foreign = HookKey::generate().expect("other key").mint(&terminal(VESSEL_CODER), &generation);
     let mut parts: Vec<&str> = token.split('.').collect();
     let other = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, OTHER_CODER);
     parts[2] = &other;
@@ -781,8 +776,8 @@ async fn vessel_hook_posts_need_a_live_token_for_a_terminal_in_that_vessel() {
         .expect("request");
     assert_eq!(daemon.call(vessel.clone(), resources).await, StatusCode::FORBIDDEN);
 
-    daemon.backend.clone().using::<TerminalSession>(NAMESPACE).delete(VESSEL_CODER).await.expect("delete");
-    assert_eq!(daemon.call(vessel, hook_post_with("stop", &stop, &token)).await, StatusCode::UNAUTHORIZED, "deleted terminal");
+    daemon.end(VESSEL_CODER);
+    assert_eq!(daemon.call(vessel, hook_post_with("stop", &stop, &token)).await, StatusCode::UNAUTHORIZED, "ended terminal");
 }
 
 // A Claude Code crew in a Docker vessel posts its hooks to the agent's loopback forward,

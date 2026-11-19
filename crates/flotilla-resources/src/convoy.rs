@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{
-    CommandCaller, IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef, Relationship, Subject,
-};
+use flotilla_protocol::{IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef, Relationship, Subject};
 pub use flotilla_protocol::{StallProposedDisposition, StallReason, StallRung, TurnDeliveryRung};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -15,14 +13,16 @@ use crate::{
     SettlementClaimEvidence, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
 };
 
+pub mod admission;
 pub mod engine;
 pub mod promises;
 #[doc(hidden)]
 pub mod reconcile;
+pub mod view;
 
 pub use reconcile::{
-    evaluate_crew_completion, evaluate_landing_settlement, observed_digest_claims, reconcile, ConvoyEvent, ConvoyTeardownRuntime,
-    CrewCompletionClaim, ReconcileOutcome, SettlementEvaluation, SettlementMode, SettlementSubject, UnmetSettlementExpectation,
+    evaluate_landing_settlement, observed_digest_claims, SettlementEvaluation, SettlementMode, SettlementSubject,
+    UnmetSettlementExpectation,
 };
 
 define_resource!(
@@ -46,8 +46,19 @@ define_resource!(
         "status.subjects.*.subject",
         "spec.repositories.*.repo_ref",
         "metadata.annotations.\"flotilla.work/ensured-from\"",
-    ]
+    ],
+    indexed_values = legacy_subjects
 );
+
+/// Stored N-generation Convoy specs may still carry legacy issues and a bound request: the
+/// subject path indexes the subjects they declare, without rewriting the stored body.
+fn legacy_subjects(spec: &ConvoySpec, path: &str) -> Option<Vec<String>> {
+    if path != "spec.subjects.*.subject" || (spec.change_request.is_none() && spec.issues.is_empty()) {
+        return None;
+    }
+    let subjects = spec.declared_subjects().ok()?;
+    Some(subjects.into_iter().filter_map(|entry| serde_json::to_value(entry.subject).ok()).map(|subject| subject.to_string()).collect())
+}
 
 /// The frozen admission decision is a creation input, like the prepared snapshots.
 /// Keeping it in metadata lets every authoritative backend seed the existing
@@ -56,17 +67,68 @@ define_resource!(
 /// is historical admission evidence; changing it does not update live placement.
 pub const ADMISSION_PLACEMENT_ANNOTATION: &str = "flotilla.work/admission-placement";
 
+/// The ensure configuration that admitted a standing generation, a creation input like the
+/// placement decision: it seeds `status.ensure_admission` in the create. A later status write
+/// could lose its retry budget to the convoy controller's bootstrap, and the role's strikes are
+/// counted from the generations admitted under its current configuration.
+pub const ENSURE_ADMISSION_ANNOTATION: &str = "flotilla.work/ensure-admission";
+
 fn initial_convoy_status(meta: &InputMeta) -> Result<Option<ConvoyStatus>, ResourceError> {
-    let Some(encoded) = meta.annotations.get(ADMISSION_PLACEMENT_ANNOTATION) else { return Ok(None) };
-    let placement_decision =
-        serde_json::from_str(encoded).map_err(|error| ResourceError::invalid(format!("invalid admission placement decision: {error}")))?;
-    Ok(Some(ConvoyStatus { placement_decision: Some(placement_decision), ..ConvoyStatus::default() }))
+    let placement_decision = meta
+        .annotations
+        .get(ADMISSION_PLACEMENT_ANNOTATION)
+        .map(|encoded| serde_json::from_str(encoded))
+        .transpose()
+        .map_err(|error| ResourceError::invalid(format!("invalid admission placement decision: {error}")))?;
+    let ensure_admission = meta
+        .annotations
+        .get(ENSURE_ADMISSION_ANNOTATION)
+        .map(|encoded| serde_json::from_str(encoded))
+        .transpose()
+        .map_err(|error| ResourceError::invalid(format!("invalid ensure admission: {error}")))?;
+    if placement_decision.is_none() && ensure_admission.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ConvoyStatus { placement_decision, ensure_admission, ..ConvoyStatus::default() }))
 }
 
 pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";
 pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapshot";
 pub const VESSEL_PLACEMENTS_ANNOTATION: &str = "flotilla.work/vessel-placements";
 pub const ENSURED_FROM_ANNOTATION: &str = "flotilla.work/ensured-from";
+
+/// The checkout a convoy adopts, as admission found it (#3108): the observed checkout spec its
+/// vessel requests on the engine, held for the convoy, once the engine holds the convoy. The
+/// engine Convoy is admitted after the old one is created, so admission cannot request it.
+/// When convoys leave the old store this becomes a field of the engine Convoy's request.
+pub const ADOPTED_CHECKOUT_ANNOTATION: &str = "flotilla.work/adopted-checkout";
+
+/// Why a launch's record could not be read, on its read view alone: the convoy views set it on a
+/// launch they list as unreadable (which has no status) and remove it from every readable one.
+pub const CONVOY_UNREADABLE_ANNOTATION: &str = "flotilla.work/convoy-unreadable";
+
+/// What convoy launch `name` (`<launch_of>#<n>`) is a launch of; a name with no launch number
+/// returns as is.
+pub fn launch_of(name: &str) -> &str {
+    match name.rsplit_once('#') {
+        Some((launch_of, n)) if !n.is_empty() && n.bytes().all(|byte| byte.is_ascii_digit()) => launch_of,
+        _ => name,
+    }
+}
+
+/// The checkout `convoy` adopts, if admission recorded one.
+pub fn adopted_checkout(convoy: &crate::ResourceObject<Convoy>) -> Result<Option<crate::CheckoutSpec>, String> {
+    convoy
+        .metadata
+        .annotations
+        .get(ADOPTED_CHECKOUT_ANNOTATION)
+        .map(|encoded| {
+            serde_json::from_str::<crate::ObservedCheckoutSpec>(encoded)
+                .map(crate::CheckoutSpec::Observed)
+                .map_err(|error| format!("convoy {} records an unreadable adopted checkout: {error}", convoy.metadata.name))
+        })
+        .transpose()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VesselPlacementPin {
@@ -79,6 +141,23 @@ pub struct VesselPlacementPin {
 pub fn vessel_placement_pin(convoy: &ResourceObject<Convoy>, vessel: &str) -> Option<VesselPlacementPin> {
     let encoded = convoy.metadata.annotations.get(VESSEL_PLACEMENTS_ANNOTATION)?;
     serde_json::from_str::<BTreeMap<String, VesselPlacementPin>>(encoded).ok()?.remove(vessel)
+}
+
+/// Every placement decision the convoy holds: its own, then each vessel pin's.
+pub fn placement_decisions(convoy: &ResourceObject<Convoy>) -> Vec<PlacementDecision> {
+    let pins = convoy
+        .metadata
+        .annotations
+        .get(VESSEL_PLACEMENTS_ANNOTATION)
+        .and_then(|encoded| serde_json::from_str::<BTreeMap<String, VesselPlacementPin>>(encoded).ok())
+        .unwrap_or_default();
+    convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.placement_decision.clone())
+        .into_iter()
+        .chain(pins.into_values().map(|pin| pin.decision))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -101,8 +180,9 @@ pub struct ConvoySpec {
     #[builder(default)]
     pub repositories: Vec<ConvoyRepositorySpec>,
     pub r#ref: Option<String>,
-    /// The [`Project`](crate::Project) whose repository set was snapshotted at admission.
-    pub project_ref: Option<String>,
+    /// The [`Project`](crate::Project) the convoy belongs to, whose repository set was
+    /// snapshotted at admission.
+    pub project_ref: String,
     #[builder(default)]
     pub adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
     #[builder(default)]
@@ -265,8 +345,7 @@ struct ConvoySpecRecord {
     repositories: Vec<ConvoyRepositorySpec>,
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     r#ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    project_ref: Option<String>,
+    project_ref: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -382,37 +461,26 @@ impl<'de> Deserialize<'de> for ConvoySpec {
     }
 }
 
-/// Checkout object names durably recorded as provisioned for this convoy.
-///
-/// Placements are copied onto work state before vessels can disappear, so the
-/// expected set remains available while federated checkout observations lag.
-/// Adopted refs are also declarations on the convoy itself and therefore count
-/// as expected even before a placement has repeated them.
-pub fn expected_checkout_refs(convoy: &crate::ResourceObject<Convoy>) -> Result<BTreeSet<String>, String> {
+/// The checkout names the convoy expects: those its launch holds on the engine (`held`, every
+/// checkout made for it, ended or not) and its adopted refs, which are declarations on the convoy
+/// itself and count before anything holds them.
+pub fn expected_checkout_refs<'a>(convoy: &crate::ResourceObject<Convoy>, held: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
     let mut expected = convoy.spec.adopted_checkout_refs.values().cloned().collect::<BTreeSet<_>>();
-    let Some(status) = &convoy.status else {
-        return Ok(expected);
-    };
-    for (work_name, work) in &status.work {
-        let Some(checkout_refs) = work.placement.as_ref().and_then(|placement| placement.fields.get("checkout_refs")) else {
-            continue;
-        };
-        let checkout_refs = serde_json::from_value::<BTreeMap<RepositoryKey, String>>(checkout_refs.clone()).map_err(|error| {
-            format!("convoy {}/{} has invalid checkout_refs in work {work_name}: {error}", convoy.metadata.namespace, convoy.metadata.name)
-        })?;
-        expected.extend(checkout_refs.into_values());
-    }
-    Ok(expected)
+    expected.extend(held.into_iter().map(str::to_owned));
+    expected
 }
 
-/// Change requests already known through the convoy's expected checkouts.
+/// Change requests already known through the convoy's expected checkouts: each checkout's
+/// inspection names the change request its branch is associated with, and `state_of` says what
+/// the forge observation of it last found. One whose state is not observed yet is not known.
 /// This is a home-side fact derived from local or replicated checkout evidence.
 pub fn observed_change_request_subjects(
     convoy: &crate::ResourceObject<Convoy>,
-    checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
+    checkouts: &BTreeMap<String, crate::checkout_records::CheckoutRecord>,
     forges: &[crate::ForgeSpec],
+    state_of: &dyn Fn(&Subject) -> Option<crate::ObservedChangeRequestState>,
 ) -> Result<Vec<Subject>, String> {
-    let expected = expected_checkout_refs(convoy)?;
+    let expected = expected_checkout_refs(convoy, checkouts.keys().map(String::as_str));
     let adopted = convoy
         .spec
         .declared_subjects()?
@@ -423,25 +491,17 @@ pub fn observed_change_request_subjects(
     let mut subjects = Vec::new();
     for name in expected {
         let Some(checkout) = checkouts.get(&name) else { continue };
-        let Some(observed) = checkout.status.as_ref().and_then(|status| status.integration.change_request.as_ref()) else {
-            continue;
-        };
-        let repository = convoy
-            .spec
-            .repositories
-            .iter()
-            .find(|repository| repository.repo_ref == *checkout.spec.repo_ref())
-            .ok_or_else(|| format!("checkout {name} repository {} is absent from convoy", checkout.spec.repo_ref()))?;
-        let subject = crate::address::remote_change_request_subject(&repository.url, &observed.id, forges)?;
-        let terminal = observed.state != crate::ChangeRequestState::Open;
-        let merged_during_checkout = checkout
-            .status
+        let Some(inspection) = checkout.inspection() else { continue };
+        let Some(observed) = inspection.change_request else { continue };
+        let subject = inspected_change_request_subject(convoy, &name, checkout, observed, forges)?;
+        let Some(state) = state_of(&subject) else { continue };
+        let terminal = !matches!(state, crate::ObservedChangeRequestState::Open | crate::ObservedChangeRequestState::Draft);
+        let merged_during_checkout = inspection
+            .landed_evidence
             .as_ref()
-            .and_then(|status| status.integration.landed_evidence.as_ref())
-            .filter(|evidence| evidence.change_request_id == observed.id)
-            .and_then(|evidence| evidence.merged_at.as_deref())
-            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-            .is_some_and(|at| at >= checkout.metadata.creation_timestamp);
+            .filter(|evidence| evidence.change_request == observed)
+            .and_then(|evidence| evidence.merged_at)
+            .is_some_and(|at| at >= checkout.requested_at);
         // A subject recorded in another spelling of the same request is the
         // same subject: compare addresses, not spellings.
         let same = |other: &Subject| crate::address::same_subject(other, &subject, forges);
@@ -451,6 +511,78 @@ pub fn observed_change_request_subjects(
         }
     }
     Ok(subjects)
+}
+
+/// The change request checkout `name`'s inspection names as `observed`, in its convoy repository's forge.
+fn inspected_change_request_subject(
+    convoy: &crate::ResourceObject<Convoy>,
+    name: &str,
+    checkout: &crate::checkout_records::CheckoutRecord,
+    observed: impl std::fmt::Display,
+    forges: &[crate::ForgeSpec],
+) -> Result<Subject, String> {
+    let repository = convoy
+        .spec
+        .repositories
+        .iter()
+        .find(|repository| repository.repo_ref == *checkout.spec.repo_ref())
+        .ok_or_else(|| format!("checkout {name} repository {} is absent from convoy", checkout.spec.repo_ref()))?;
+    crate::address::remote_change_request_subject(&repository.url, &observed.to_string(), forges)
+}
+
+/// The ChangeRequest records a convoy's pass reads, each by its record name: the change requests
+/// its expected checkouts' inspections name, those it produces, those its submitted PR promises
+/// name, and those its exit binds. A subject with no address names no record and is left out;
+/// the readers that need it report it.
+pub fn change_request_record_names(
+    convoy: &crate::ResourceObject<Convoy>,
+    checkouts: &BTreeMap<String, crate::checkout_records::CheckoutRecord>,
+    forges: &[crate::ForgeSpec],
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut add = |address: Result<crate::address::Address, String>| {
+        let address = address.ok().filter(|address| address.kind() == crate::address::AddressKind::ChangeRequest);
+        names.extend(address.and_then(|address| crate::address::record_name(&address)));
+    };
+    for name in expected_checkout_refs(convoy, checkouts.keys().map(String::as_str)) {
+        let Some(checkout) = checkouts.get(&name) else { continue };
+        let Some(observed) = checkout.inspection().and_then(|inspection| inspection.change_request) else { continue };
+        if let Ok(subject) = inspected_change_request_subject(convoy, &name, checkout, observed, forges) {
+            add(crate::address::subject_address(&subject, forges));
+        }
+    }
+    names.extend(convoy_change_request_names(convoy, forges));
+    names
+}
+
+/// The ChangeRequest records a convoy names itself, without its checkouts: those it produces,
+/// those its submitted PR promises name, and those its exit binds. With no forges only the forge
+/// id and public GitHub spellings name a record.
+pub fn convoy_change_request_names(convoy: &crate::ResourceObject<Convoy>, forges: &[crate::ForgeSpec]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut add = |address: Result<crate::address::Address, String>| {
+        let address = address.ok().filter(|address| address.kind() == crate::address::AddressKind::ChangeRequest);
+        names.extend(address.and_then(|address| crate::address::record_name(&address)));
+    };
+    if let Some(status) = convoy.status.as_ref() {
+        for subject in status.subjects.iter().filter(|subject| {
+            subject.relationship == Relationship::Produces && subject.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+        }) {
+            add(crate::address::subject_address(&subject.subject, forges));
+        }
+        let submitted = status.promises.values().flat_map(BTreeMap::values).flatten().filter(|promise| {
+            promise.kind == crate::promises::PromiseKind::Pr && promise.state == crate::promises::PromiseState::Submitted
+        });
+        for submission in submitted.filter_map(|promise| promise.submissions.last()) {
+            add(submission.subject_address(forges));
+        }
+    }
+    for leaf in bound_change_request_addresses(convoy, forges).unwrap_or_default() {
+        if let Ok(name) = crate::address::leaf_record_name(&leaf, forges) {
+            names.insert(name);
+        }
+    }
+    names
 }
 
 /// The one sanction for collecting a convoy's managed checkouts.
@@ -469,11 +601,6 @@ pub fn convoy_sanctions_checkout_reclaim(convoy: &crate::ResourceObject<Convoy>)
     convoy.metadata.deletion_timestamp.is_some()
         || convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landed | ConvoyPhase::Abandoned))
 }
-
-/// Explicit operator force on a convoy deletion. Checkout authorities use
-/// this durable metadata after replication, including while finalizers run.
-pub const FORCE_TEARDOWN_ANNOTATION: &str = "flotilla.work/force-teardown";
-pub const CONVOY_TEARDOWN_FINALIZER: &str = "flotilla.work/convoy-teardown";
 
 /// The address of a convoy's explicitly bound change request, resolving its
 /// repository's remote through `forges`.
@@ -779,9 +906,9 @@ pub fn instantiate_turn_delivery(
 /// Instantiate the convoy's pinned exit declaration over every bound subject.
 ///
 /// A table entry is an implicit universal over its subject role. With no bound
-/// subjects, a declared table collapses to the same claim exit as `exit: claim`.
-/// An absent declaration stays absent, leaving the convoy standing until an
-/// operator explicitly reaps it.
+/// subjects its entries have no leaves; settlement collapses such a table to the
+/// claim exit when the convoy expects no checkout either. An absent declaration
+/// stays absent, leaving the convoy standing until an operator explicitly reaps it.
 pub fn instantiate_exit(convoy: &crate::ResourceObject<Convoy>, forges: &[crate::ForgeSpec]) -> Result<InstantiatedExit, String> {
     let Some(declaration) =
         convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).and_then(|snapshot| snapshot.exit.clone())
@@ -793,9 +920,6 @@ pub fn instantiate_exit(convoy: &crate::ResourceObject<Convoy>, forges: &[crate:
     }
 
     let subjects = bound_change_request_addresses(convoy, forges)?;
-    if subjects.is_empty() && expected_checkout_refs(convoy)?.is_empty() {
-        return Ok(InstantiatedExit::Claim);
-    }
     let ExitDeclaration::Table(entries) = declaration else {
         unreachable!("claim declaration returned above");
     };
@@ -913,10 +1037,7 @@ impl ConvoyStatus {
     /// keys in `turn_deliveries`, so terminal row projection can ignore them.
     pub fn is_turn_delivery_attention(&self, attention: &ConvoyAttention) -> bool {
         self.turn_deliveries.contains_key(&attention.source)
-            || matches!(
-                attention.source.as_str(),
-                ConvoyAttention::QUEUED_TURN_SOURCE | ConvoyAttention::MISSING_TURN_HOOK_SOURCE | ConvoyAttention::SUPERVISOR_TURN_SOURCE
-            )
+            || matches!(attention.source.as_str(), ConvoyAttention::QUEUED_TURN_SOURCE | ConvoyAttention::MISSING_TURN_HOOK_SOURCE)
     }
 
     pub fn produces(&self, subject: &Subject) -> bool {
@@ -1008,10 +1129,8 @@ pub struct ConvoyStatus {
     pub landing_entry: Option<LandingEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing_settlement: Option<SettlementEvaluation>,
-    /// Per-vessel runtime evidence survives backing environment teardown.
-    /// ADR 0047: keep this decoder default for one roll.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub environment_observations: BTreeMap<String, flotilla_protocol::EnvironmentRuntimeObservation>,
+    // Retired with the vessel's move onto the engine (#3108): `environment_observations`, now its
+    // environments' home memory. Earlier records carrying it decode and drop it.
     /// Frozen ensure configuration that admitted this generation. Previous
     /// generations have no baseline; an explicit roll establishes one.
     /// Future ConvoyEnsureSpec changes must also decode this embedded stored
@@ -1032,8 +1151,13 @@ pub struct ConvoyStatus {
     pub branch_subject_scan_error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unlinked_subjects: Vec<Subject>,
+    /// The oldest of [`Self::stalls`], for a reader asking whether the launch is stalled at all.
+    /// Derived: each patch sets it from `stalls` once applied, so a stall is written there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalled: Option<StalledCondition>,
+    /// Every open stall, one about each stalled seat and one about no seat.
+    #[serde(default, skip_serializing_if = "Stalls::is_empty")]
+    pub stalls: Stalls,
     /// Actor obligation budgets outlive transient attention and visible stalls.
     /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1059,6 +1183,10 @@ pub struct ConvoyStatus {
     /// ADR 0061. Remove decoder default one roll after introduction (ADR 0047).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub promises: BTreeMap<String, BTreeMap<String, Vec<promises::Promise>>>,
+    /// The engine Convoy launch (`<launch_of>#<n>`) this generation became at admission: what its
+    /// checkouts are held for. `None` until the engine admits it. Goes with this kind (#3108).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_launch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1080,9 +1208,6 @@ pub struct ConvoyStatus {
     pub turn_deliveries: BTreeMap<String, TurnDeliveryStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<ConvoyAttention>,
-    /// Mutating lifecycle requests retained for operator explanation.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lifecycle_mutations: Vec<LifecycleMutation>,
 }
 
 // Keep one serde field definition while allowing decode-time lifecycle repair.
@@ -1246,18 +1371,9 @@ pub struct NudgeObligation {
     pub history: Vec<StallNudge>,
     #[builder(default)]
     pub progress: BTreeMap<String, String>,
-    pub quiet_since: Option<DateTime<Utc>>,
-    pub last_hook_at: Option<DateTime<Utc>>,
-    pub last_attention_at: Option<DateTime<Utc>>,
-    /// Beginning of a continuously observed turn; screen redraws are not tool progress.
-    /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_since: Option<DateTime<Utc>>,
     // Stored-data compatibility: defaults may be removed one fleet roll later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_after: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_tool_activity_at: Option<DateTime<Utc>>,
     pub message_id: Option<String>,
     pub delivered_message_id: Option<String>,
 }
@@ -1292,11 +1408,107 @@ pub struct StalledCondition {
     pub nudge_history: Vec<StallNudge>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LifecycleMutation {
-    pub action: String,
-    pub caller: CommandCaller,
-    pub at: DateTime<Utc>,
+impl StalledCondition {
+    /// The seat `(work, role)` the stall is about: the first crew phase among its leaves.
+    pub fn seat(&self) -> Option<(&str, &str)> {
+        leaves_seat(&self.leaves)
+    }
+
+    /// What its crew reported when it declared it, as `status` holds the stalled seat: none for
+    /// an inferred stall, where no crew declared anything.
+    pub fn report<'a>(&self, status: &'a ConvoyStatus) -> Option<&'a str> {
+        let (work, role) = self.seat().filter(|_| self.source == StallEvidenceSource::Crew)?;
+        let state = status.crew_work.get(work)?.get(role)?;
+        state.message.as_deref().filter(|_| state.phase == CrewWorkPhase::Stalled)
+    }
+
+    /// Whether any of its leaves is seat `(work, role)`'s crew phase.
+    pub fn names_seat(&self, work: &str, role: &str) -> bool {
+        self.leaves.iter().any(|leaf| {
+            matches!(&leaf.address, LeafAddress::Work { work: named, .. } if named == work)
+                && leaf.field_path.strip_prefix(".crew.").and_then(|path| path.strip_suffix(".phase")) == Some(role)
+        })
+    }
+}
+
+/// The seat `(work, role)` a stall judged from `leaves` is about: the first crew phase among
+/// them. Inferred leaves, such as a work's own phase, may come before it.
+pub fn leaves_seat(leaves: &[Leaf]) -> Option<(&str, &str)> {
+    leaves.iter().find_map(|leaf| {
+        let LeafAddress::Work { work, .. } = &leaf.address else { return None };
+        let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
+        Some((work.as_str(), role))
+    })
+}
+
+/// A launch's open stalls: at most one about each seat, and one about no seat (a cause no crew
+/// owns, such as capacity or an unable observer). Each climbs its own supervision ladder, so one
+/// seat's stall never replaces another's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Stalls(Vec<StalledCondition>);
+
+impl Stalls {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, StalledCondition> {
+        self.0.iter()
+    }
+
+    /// The stall about `seat`; about no seat for `None`.
+    pub fn about(&self, seat: Option<(&str, &str)>) -> Option<&StalledCondition> {
+        self.0.iter().find(|stall| stall.seat() == seat)
+    }
+
+    /// The stall naming seat `(work, role)` among its leaves.
+    pub fn naming(&self, work: &str, role: &str) -> Option<&StalledCondition> {
+        self.0.iter().find(|stall| stall.names_seat(work, role))
+    }
+
+    /// Notes `condition` in place of the stall about its seat.
+    pub fn set(&mut self, condition: StalledCondition) {
+        self.0.retain(|stall| stall.seat() != condition.seat());
+        self.0.push(condition);
+        self.0.sort_by(|left, right| left.seat().cmp(&right.seat()));
+    }
+
+    /// Ends the stall about `seat`.
+    pub fn end(&mut self, seat: Option<(&str, &str)>) {
+        self.0.retain(|stall| stall.seat() != seat);
+    }
+
+    pub fn retain(&mut self, keep: impl FnMut(&StalledCondition) -> bool) {
+        self.0.retain(keep);
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// The oldest: what a reader asking whether the launch is stalled at all reads.
+    pub fn oldest(&self) -> Option<&StalledCondition> {
+        self.0.iter().min_by_key(|stall| stall.began_at)
+    }
+}
+
+impl FromIterator<StalledCondition> for Stalls {
+    fn from_iter<I: IntoIterator<Item = StalledCondition>>(conditions: I) -> Self {
+        let mut stalls = Self::default();
+        for condition in conditions {
+            stalls.set(condition);
+        }
+        stalls
+    }
+}
+
+impl<'a> IntoIterator for &'a Stalls {
+    type Item = &'a StalledCondition;
+    type IntoIter = std::slice::Iter<'a, StalledCondition>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -1310,24 +1522,6 @@ pub struct CrewCompletionOverride {
 pub enum ConvoyProvisioningState {
     NotStarted,
     Started { started_at: DateTime<Utc> },
-}
-
-/// Previous-generation queue record, adopted into Message on read.
-/// Remove after the first fleet roll deploying #2710 (ADR 0047).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct PendingBrief {
-    pub vessel: String,
-    pub role: String,
-    pub content: String,
-    pub queued_at: DateTime<Utc>,
-    /// Decodes briefs queued before sender attribution; remove after the next fleet roll.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::CrewMessageSender::is_unknown",
-        serialize_with = "flotilla_protocol::serialize_legacy_crew_sender"
-    )]
-    #[builder(default)]
-    pub sender: crate::CrewMessageSender,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -1364,16 +1558,6 @@ pub struct TurnDeliveryStatus {
     pub failure: Option<TurnDeliveryFailure>,
     #[serde(default)]
     pub episodes: Vec<TurnDeliveryEpisode>,
-    /// Legacy operator queue, read only by Message adoption.
-    /// Remove after the first fleet roll deploying #2710 (ADR 0047).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_brief: Option<PendingBrief>,
-    /// Legacy remote turn queue, read only by Message adoption.
-    /// Remove after the first fleet roll deploying #2710 (ADR 0047).
-    /// Decodes turn delivery statuses stored before remote supervision; remove
-    /// the compatibility default one fleet roll after this field is deployed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_supervisor_turn: Option<PendingSupervisorTurn>,
 }
 
 impl TurnDeliveryStatus {
@@ -1422,34 +1606,6 @@ pub struct TurnDeliveryFailure {
     pub retry_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingSupervisorTurn {
-    pub vessel: String,
-    pub role: String,
-    pub message: crate::TerminalCrewMessage,
-    /// Order assigned when the convoy authority accepts the turn. Older
-    /// stored turns decode with zero; remove this default one roll later.
-    #[serde(default)]
-    pub queued_order: u64,
-}
-
-pub const PENDING_BRIEF_DELIVERY_SOURCE: &str = "operator";
-
-impl ConvoyStatus {
-    pub fn pending_brief(&self) -> Option<&PendingBrief> {
-        self.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).and_then(|delivery| delivery.pending_brief.as_ref())
-    }
-}
-
-fn clear_operator_pending_brief(status: &mut ConvoyStatus) {
-    if let Some(delivery) = status.turn_deliveries.get_mut(PENDING_BRIEF_DELIVERY_SOURCE) {
-        delivery.pending_brief = None;
-    }
-    if status.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).is_some_and(|delivery| delivery.episodes.is_empty()) {
-        status.turn_deliveries.remove(PENDING_BRIEF_DELIVERY_SOURCE);
-    }
-}
-
 fn is_same_crew_stall(
     status: &ConvoyStatus,
     convoy: &str,
@@ -1466,7 +1622,7 @@ fn is_same_crew_stall(
         .get(vessel)
         .and_then(|crew| crew.get(role))
         .is_some_and(|state| state.phase == CrewWorkPhase::Stalled && state.message.as_deref() == Some(message))
-        && status.stalled.as_ref().is_some_and(|stall| {
+        && status.stalls.iter().any(|stall| {
             stall.source == StallEvidenceSource::Crew
                 && stall.reason == Some(reason)
                 && stall.proposed_disposition == proposed_disposition
@@ -1482,28 +1638,13 @@ fn clear_nudge_budget(status: &mut ConvoyStatus, vessel: &str, role: &str) {
         if matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role: actor_role } if actor_vessel == vessel && actor_role == role)
         {
             obligation.history.clear();
-            obligation.quiet_since = None;
             obligation.reply_after = None;
         }
     }
 }
 
 fn clear_stall_for_crew(status: &mut ConvoyStatus, vessel: &str, role: &str) {
-    let field_path = format!(".crew.{role}.phase");
-    if status.stalled.as_ref().is_some_and(|stalled| {
-        stalled
-            .leaves
-            .iter()
-            .any(|leaf| matches!(&leaf.address, LeafAddress::Work { work, .. } if work == vessel) && leaf.field_path == field_path)
-    }) {
-        status.stalled = None;
-    }
-}
-
-fn clear_pending_brief_for(status: &mut ConvoyStatus, vessel: &str, role: &str) {
-    if status.pending_brief().is_some_and(|brief| brief.vessel == vessel && brief.role == role) {
-        clear_operator_pending_brief(status);
-    }
+    status.stalls.retain(|stall| !stall.names_seat(vessel, role));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -1515,14 +1656,17 @@ pub struct TurnDeliveryEpisode {
     pub evidence_at: DateTime<Utc>,
     pub judged_claim_at: DateTime<Utc>,
     pub outcome: TurnDeliveryOutcome,
-    /// Decodes episodes stored before sender attribution; remove after the next fleet roll.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::CrewMessageSender::is_unknown",
-        serialize_with = "flotilla_protocol::serialize_legacy_crew_sender"
-    )]
-    #[builder(default)]
-    pub sender: crate::CrewMessageSender,
+    /// Whether the turn asked its target to act: its rule's [`owes`](crate::TurnDeliveryRule::owes)
+    /// as it fired (run 4). A turn that only informed (checks passed) leaves a seat that has
+    /// submitted every promise owing nothing. Episodes recorded without it asked to act.
+    #[serde(default = "asked_to_act")]
+    #[builder(default = true)]
+    pub owes: bool,
+}
+
+/// An episode recorded before [`TurnDeliveryEpisode::owes`] asked its target to act.
+fn asked_to_act() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1580,7 +1724,6 @@ impl TurnDeliveryOutcome {
 }
 
 impl ConvoyAttention {
-    pub const SUPERVISOR_TURN_SOURCE: &'static str = "supervisor-turn-delivery";
     pub const QUEUED_TURN_SOURCE: &'static str = "queued-turn-delivery";
     pub const MISSING_TURN_HOOK_SOURCE: &'static str = "missing-turn-hook";
 }
@@ -1609,10 +1752,6 @@ impl ConvoyPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct WorkState {
-    /// Provisioning retry budget survives vessel teardown and controller restart.
-    /// ADR 0047: remove this decoder default one fleet roll after #2875.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provisioning_retry: Option<crate::ControllerRetry>,
     pub phase: WorkPhase,
     /// Authority responsible for settling this work at the roll-up level.
     #[builder(default)]
@@ -1628,6 +1767,8 @@ pub struct WorkState {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<PlacementStatus>,
+    // Retired with the vessel's move onto the engine (#3108): `provisioning_retry`, now the
+    // vessel requester's replacement backoff. Earlier records carrying it decode and drop it.
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1704,6 +1845,14 @@ pub struct CrewWorkState {
     pub finished_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// A stalled seat's declared reason and proposed disposition as its stall record carries them
+    /// to every home (#3108); none where no crew declared the stall. Where the home notes the stall
+    /// itself, its condition holds them. Remove the decoder defaults one fleet roll after this
+    /// change (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_reason: Option<StallReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_proposed_disposition: Option<StallProposedDisposition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
     /// Optional pointer to the PR projection of the claim's decision ledger.
@@ -1781,11 +1930,14 @@ pub enum CrewWorkPhase {
     Done,
     HandedBack,
     Failed,
+    /// The launch ended before the seat finished: derived by the engine's view from the end, with
+    /// the end's reason or disposition as its message. Nothing stores it.
+    Ended,
 }
 
 impl CrewWorkPhase {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Done | Self::HandedBack | Self::Failed)
+        matches!(self, Self::Done | Self::HandedBack | Self::Failed | Self::Ended)
     }
 }
 
@@ -1810,8 +1962,11 @@ pub enum ConvoyStatusPatch {
     },
     /// The engine admitted the convoy and now holds its promises (#3587
     /// layer 8): the declarations bootstrap seeded are dropped, so no reader
-    /// or recheck sees a stale copy. Written once, at engine admission.
-    HandPromisesToEngine,
+    /// or recheck sees a stale copy. Written once, at engine admission, with
+    /// the launch admission made of this generation.
+    HandPromisesToEngine {
+        launch: String,
+    },
     HoldTurnDelivery {
         source: String,
         hold: ConvoyAttention,
@@ -1823,15 +1978,8 @@ pub enum ConvoyStatusPatch {
         activated: Box<ConvoyStatus>,
         previous: Box<ConvoyStatus>,
     },
-    ObserveEnvironment {
-        vessel: String,
-        observation: flotilla_protocol::EnvironmentRuntimeObservation,
-    },
     RecordNaming {
         naming: flotilla_protocol::ConvoyNaming,
-    },
-    RecordEnsureAdmission {
-        config: crate::ConvoyEnsureSpec,
     },
     DiscoverSubjects {
         subjects: Vec<(Subject, Relationship)>,
@@ -1847,17 +1995,19 @@ pub enum ConvoyStatusPatch {
     UnlinkSubject {
         subject: Subject,
     },
-    SetStalled {
-        condition: Option<StalledCondition>,
+    /// Notes `condition` in place of the stall about its seat.
+    SetStall {
+        condition: StalledCondition,
+    },
+    /// Ends the stall about `seat`, `(work, role)`; about no seat for `None`.
+    EndStall {
+        seat: Option<(String, String)>,
     },
     SetNudgeObligations {
         obligations: Vec<NudgeObligation>,
     },
     SetTeardownWait {
         message: String,
-    },
-    RecordLifecycleMutation {
-        mutation: LifecycleMutation,
     },
     SetPlacementDecision {
         placement_decision: PlacementDecision,
@@ -1871,6 +2021,8 @@ pub enum ConvoyStatusPatch {
         /// The spec's frozen dispatch promises, carried so Bootstrap seeds them
         /// in the same patch as the template declarations.
         dispatch_promises: Vec<promises::DispatchPromise>,
+        /// A standing convoy's seats get no default decision ledger.
+        standing: bool,
         phase: ConvoyPhase,
         started_at: Option<DateTime<Utc>>,
     },
@@ -1915,12 +2067,6 @@ pub enum ConvoyStatusPatch {
         reason: Option<String>,
         observed_at: DateTime<Utc>,
     },
-    QueueSupervisorTurn {
-        turn: PendingSupervisorTurn,
-    },
-    AcknowledgeSupervisorTurn {
-        message_id: String,
-    },
     WorkLaunching {
         work: String,
         started_at: DateTime<Utc>,
@@ -1932,11 +2078,6 @@ pub enum ConvoyStatusPatch {
         /// Crew whose sessions the vessel actually launched. Latent agents are
         /// absent and stay `Pending` until a handoff starts them.
         launched_roles: BTreeSet<String>,
-    },
-    WorkProvisioningRetry {
-        work: String,
-        retry: crate::ControllerRetry,
-        message: String,
     },
     WorkInterrupted {
         work: String,
@@ -2061,6 +2202,10 @@ pub enum ConvoyStatusPatch {
 pub enum ResumeIntent {
     Reminder,
     Reopen,
+    /// New work from a turn that is not guidance, such as a peer's handoff: it reopens the
+    /// seat as [`Self::Reopen`] does, but the seat's stall stays. Only a supervisor's or the
+    /// operator's guidance, or the stalled crew's own progress, ends a stall.
+    Turn,
 }
 
 impl ConvoyStatus {
@@ -2076,25 +2221,23 @@ impl ConvoyStatus {
     }
 }
 
-impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
-    fn diagnostic_name(&self) -> Option<&'static str> {
-        Some(match self {
+impl ConvoyStatusPatch {
+    fn name(&self) -> &'static str {
+        match self {
             Self::Promise { .. } => "Promise",
             Self::ObservePromise { .. } => "ObservePromise",
-            Self::HandPromisesToEngine => "HandPromisesToEngine",
+            Self::HandPromisesToEngine { .. } => "HandPromisesToEngine",
             Self::HoldTurnDelivery { .. } => "HoldTurnDelivery",
             Self::RestoreTurnActivation { .. } => "RestoreTurnActivation",
-            Self::ObserveEnvironment { .. } => "ObserveEnvironment",
             Self::RecordNaming { .. } => "RecordNaming",
-            Self::RecordEnsureAdmission { .. } => "RecordEnsureAdmission",
             Self::DiscoverSubjects { .. } => "DiscoverSubjects",
             Self::RecordBranchSubjectScan { .. } => "RecordBranchSubjectScan",
             Self::RecordBranchSubjectScanFailure { .. } => "RecordBranchSubjectScanFailure",
             Self::UnlinkSubject { .. } => "UnlinkSubject",
-            Self::SetStalled { .. } => "SetStalled",
+            Self::SetStall { .. } => "SetStall",
+            Self::EndStall { .. } => "EndStall",
             Self::SetNudgeObligations { .. } => "SetNudgeObligations",
             Self::SetTeardownWait { .. } => "SetTeardownWait",
-            Self::RecordLifecycleMutation { .. } => "RecordLifecycleMutation",
             Self::SetPlacementDecision { .. } => "SetPlacementDecision",
             Self::Bootstrap { .. } => "Bootstrap",
             Self::BackfillCrewWork { .. } => "BackfillCrewWork",
@@ -2106,11 +2249,8 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::Settle { .. } => "Settle",
             Self::SetSettlementAttention { .. } => "SetSettlementAttention",
             Self::ObserveTurnHookHealth { .. } => "ObserveTurnHookHealth",
-            Self::QueueSupervisorTurn { .. } => "QueueSupervisorTurn",
-            Self::AcknowledgeSupervisorTurn { .. } => "AcknowledgeSupervisorTurn",
             Self::WorkLaunching { .. } => "WorkLaunching",
             Self::WorkRunning { .. } => "WorkRunning",
-            Self::WorkProvisioningRetry { .. } => "WorkProvisioningRetry",
             Self::WorkInterrupted { .. } => "WorkInterrupted",
             Self::ForceWorkCompleted { .. } => "ForceWorkCompleted",
             Self::MarkWorkFailed { .. } => "MarkWorkFailed",
@@ -2129,22 +2269,21 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::FailTurnDelivery { .. } => "FailTurnDelivery",
             Self::RefuseTurnDelivery { .. } => "RefuseTurnDelivery",
             Self::RollUpWork { .. } => "RollUpWork",
-        })
+        }
     }
 
-    fn apply(&self, status: &mut ConvoyStatus) {
+    fn change(&self, status: &mut ConvoyStatus) {
         // Optimistic retry can reapply a patch computed from an older phase.
         // Terminal outcomes reject stale and duplicate patches. An explicit
         // abandon may override a terminal outcome only when its caller saw
-        // that exact phase. Mutation audit records remain appendable, and
-        // SetStalled and queued-turn observations may clear stale attention.
+        // that exact phase. Landing events remain appendable, and
+        // stall writes and queued-turn observations may clear stale attention.
         if status.phase.is_terminal()
             && !matches!(
                 self,
-                Self::ObserveEnvironment { .. }
-                    | Self::RecordLandingEvent { .. }
-                    | Self::RecordLifecycleMutation { .. }
-                    | Self::SetStalled { .. }
+                Self::RecordLandingEvent { .. }
+                    | Self::SetStall { .. }
+                    | Self::EndStall { .. }
                     | Self::SetTeardownWait { .. }
                     | Self::ObserveQueuedTurnDeliveries { .. }
             )
@@ -2181,19 +2320,13 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 {
                     status.phase = previous.phase;
                     status.finished_at = previous.finished_at;
-                    if status.stalled == activated.stalled {
-                        status.stalled = previous.stalled.clone();
+                    if status.stalls == activated.stalls {
+                        status.stalls = previous.stalls.clone();
                     }
                 }
             }
-            Self::ObserveEnvironment { vessel, observation } => {
-                status.environment_observations.entry(vessel.clone()).or_default().merge(observation)
-            }
             Self::RecordNaming { naming } => {
                 status.naming = Some(naming.clone());
-            }
-            Self::RecordEnsureAdmission { config } => {
-                status.ensure_admission.get_or_insert_with(|| config.clone());
             }
             Self::Promise { vessel, role, operation } => {
                 if status.crew_work.get(vessel).and_then(|crew| crew.get(role)).is_none_or(|work| work.phase != CrewWorkPhase::Done) {
@@ -2203,7 +2336,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::ObservePromise { vessel, role, operation } => {
                 promises::apply(status, vessel, role, operation);
             }
-            Self::HandPromisesToEngine => status.promises.clear(),
+            Self::HandPromisesToEngine { launch } => {
+                status.promises.clear();
+                status.engine_launch = Some(launch.clone());
+            }
             Self::DiscoverSubjects { subjects, source, at } => {
                 for (subject, relationship) in subjects {
                     status.discover_subject(subject.clone(), *relationship, *source, *at);
@@ -2215,18 +2351,14 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::RecordBranchSubjectScanFailure { error } => status.branch_subject_scan_error = Some(error.clone()),
             Self::UnlinkSubject { subject } => status.unlink_subject(subject),
-            Self::SetStalled { condition } => {
-                status.stalled = if status.phase.is_terminal() { None } else { condition.clone() };
-            }
-            Self::SetNudgeObligations { obligations } => status.nudge_obligations = obligations.clone(),
-            Self::SetTeardownWait { message } => status.message = Some(message.clone()),
-            Self::RecordLifecycleMutation { mutation } => {
-                const RETAINED_MUTATIONS: usize = 32;
-                status.lifecycle_mutations.push(mutation.clone());
-                if status.lifecycle_mutations.len() > RETAINED_MUTATIONS {
-                    status.lifecycle_mutations.remove(0);
+            Self::SetStall { condition } => {
+                if !status.phase.is_terminal() {
+                    status.stalls.set(condition.clone());
                 }
             }
+            Self::EndStall { seat } => status.stalls.end(seat.as_ref().map(|(work, role)| (work.as_str(), role.as_str()))),
+            Self::SetNudgeObligations { obligations } => status.nudge_obligations = obligations.clone(),
+            Self::SetTeardownWait { message } => status.message = Some(message.clone()),
             Self::SetPlacementDecision { placement_decision } => {
                 status.placement_decision.get_or_insert_with(|| placement_decision.clone());
             }
@@ -2237,6 +2369,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 work,
                 crew_work,
                 dispatch_promises,
+                standing,
                 phase,
                 started_at,
             } => {
@@ -2246,7 +2379,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.observed_workflows = Some(observed_workflows.clone());
                 status.work = work.clone();
                 status.crew_work = crew_work.clone();
-                for (vessel, role, operation) in promises::admitted_declarations(dispatch_promises, status) {
+                for (vessel, role, operation) in promises::admitted_declarations(dispatch_promises, status, *standing) {
                     promises::apply(status, &vessel, &role, &operation);
                 }
                 status.phase = *phase;
@@ -2272,9 +2405,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.phase = *phase;
                 status.message = Some(message.clone());
                 status.finished_at.get_or_insert(*finished_at);
-                if phase.is_terminal() {
-                    clear_operator_pending_brief(status);
-                }
             }
             Self::AdvanceWorkToReady { ready } => {
                 if !matches!(status.provisioning, Some(ConvoyProvisioningState::Started { .. })) {
@@ -2305,7 +2435,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         }
                     }
                 }
-                clear_operator_pending_brief(status);
             }
             Self::RollUpPhase { phase, started_at, finished_at } => {
                 // Derived Active roll-up is a continuation of the convoy voyage, not a new attempt.
@@ -2323,9 +2452,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         status.finished_at = None;
                     }
                     status.finished_at.get_or_insert(*finished_at);
-                }
-                if phase.is_terminal() {
-                    clear_operator_pending_brief(status);
                 }
             }
             Self::RecordLandingEvent { transition } => {
@@ -2352,7 +2478,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 status.finished_at.get_or_insert(*finished_at);
                 status.attention = None;
-                clear_operator_pending_brief(status);
             }
             Self::SetSettlementAttention { attention } => status.attention = attention.clone(),
             Self::ObserveTurnHookHealth { reason, observed_at } => {
@@ -2370,37 +2495,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     }
                 }
             }
-            Self::QueueSupervisorTurn { turn } => {
-                let existing_order = status
-                    .turn_deliveries
-                    .get(&turn.message.id)
-                    .and_then(|delivery| delivery.pending_supervisor_turn.as_ref())
-                    .map(|turn| turn.queued_order);
-                let next_order = status
-                    .turn_deliveries
-                    .values()
-                    .filter_map(|delivery| delivery.pending_supervisor_turn.as_ref().map(|turn| turn.queued_order))
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                let mut queued = turn.clone();
-                queued.queued_order = existing_order.unwrap_or(next_order);
-                status.turn_deliveries.entry(turn.message.id.clone()).or_default().pending_supervisor_turn = Some(queued);
-            }
-            Self::AcknowledgeSupervisorTurn { message_id } => {
-                if let Some(delivery) = status.turn_deliveries.get_mut(message_id) {
-                    delivery.pending_supervisor_turn = None;
-                    if delivery.episodes.is_empty() && delivery.pending_brief.is_none() {
-                        status.turn_deliveries.remove(message_id);
-                    }
-                }
-                // One-generation cleanup for attention written by the original #2285 patch.
-                if !status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some())
-                    && status.attention.as_ref().is_some_and(|attention| attention.source == ConvoyAttention::SUPERVISOR_TURN_SOURCE)
-                {
-                    status.attention = None;
-                }
-            }
             Self::WorkLaunching { work, started_at, placement } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Launching;
@@ -2410,8 +2504,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::WorkRunning { work, started_at, launched_roles } => {
                 if let Some(state) = status.work.get_mut(work) {
-                    // Running ends this provisioning episode; later runtime failures start a new episode.
-                    state.provisioning_retry = None;
                     state.phase = WorkPhase::Running;
                     state.completion_authority = WorkCompletionAuthority::CrewRollup;
                     state.message = None;
@@ -2430,20 +2522,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         state.phase = CrewWorkPhase::Working;
                         state.message = None;
                     }
-                }
-            }
-            Self::WorkProvisioningRetry { work, retry, message } => {
-                let roles = status
-                    .crew_work
-                    .get(work)
-                    .into_iter()
-                    .flat_map(|crew| crew.iter())
-                    .filter(|(_, state)| state.phase == CrewWorkPhase::Working)
-                    .map(|(role, _)| role.clone())
-                    .collect();
-                Self::WorkInterrupted { work: work.clone(), roles, message: message.clone() }.apply(status);
-                if let Some(state) = status.work.get_mut(work) {
-                    state.provisioning_retry = Some(retry.clone());
                 }
             }
             Self::WorkInterrupted { work, roles, message } => {
@@ -2521,7 +2599,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(reason.clone());
                 }
-                clear_operator_pending_brief(status);
             }
             Self::DeriveCrewDone { vessel, role, at, engine } => {
                 if status.phase.is_terminal() {
@@ -2619,7 +2696,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(message.clone());
                 }
-                clear_pending_brief_for(status, vessel, role);
                 clear_stall_for_crew(status, vessel, role);
             }
             Self::MarkCrewStalled { convoy, vessel, role, at, reason, proposed_disposition, message } => {
@@ -2640,7 +2716,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at = None;
                     state.message = Some(message.clone());
                 }
-                status.stalled = Some(StalledCondition {
+                status.stalls.set(StalledCondition {
                     leaves: vec![Leaf {
                         address: LeafAddress::Work { convoy: convoy.clone(), work: vessel.clone() },
                         field_path: format!(".crew.{role}.phase"),
@@ -2663,9 +2739,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 });
             }
             Self::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message } => {
-                if status.crew_work.get(vessel).is_some_and(|crew| crew.contains_key(target_role)) {
-                    promises::handoff(status, vessel, sender_role, target_role);
-                }
                 if let Some(work) = status.work.get_mut(vessel) {
                     work.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }
@@ -2690,7 +2763,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         sender.finished_at = Some(*handed_off_at);
                         sender.message = Some(message.clone());
                     }
-                    clear_pending_brief_for(status, vessel, sender_role);
                 }
             }
             Self::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id, intent } => {
@@ -2735,8 +2807,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.decision_ledger_digest = None;
                     state.message = Some(prompt.clone());
                 }
-                status.stalled = None;
-                clear_pending_brief_for(status, vessel, role);
+                // Guidance ends the resumed seat's stall, and the stall about no seat; another
+                // seat's stays, as does any stall under a turn that is not guidance.
+                if *intent != ResumeIntent::Turn {
+                    status.stalls.retain(|stall| stall.seat().is_some() && !stall.names_seat(vessel, role));
+                }
             }
             Self::QueueMessageFollowUp { vessel, role, message } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
@@ -2799,6 +2874,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.decision_ledger_digest = None;
                     state.message = Some(prompt.clone());
                 }
+                // The new turn resumes the crew, which ends the stall it declared.
+                status
+                    .stalls
+                    .retain(|stall| stall.source != StallEvidenceSource::Crew || stall.seat() != Some((vessel.as_str(), role.as_str())));
                 status.phase = ConvoyPhase::Active;
                 status.finished_at = None;
             }
@@ -2898,8 +2977,20 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
         // Terminal state and its stall condition are one atomic write. The
         // judge may never see this convoy again after settlement or teardown.
         if status.phase.is_terminal() {
-            status.stalled = None;
+            status.stalls.clear();
         }
+    }
+}
+
+impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
+    fn diagnostic_name(&self) -> Option<&'static str> {
+        Some(self.name())
+    }
+
+    fn apply(&self, status: &mut ConvoyStatus) {
+        self.change(status);
+        // `stalled` reads the stalls the patch left.
+        status.stalled = status.stalls.oldest().cloned();
     }
 }
 
@@ -2915,6 +3006,7 @@ pub mod controller_patches {
         work: BTreeMap<String, WorkState>,
         crew_work: BTreeMap<String, BTreeMap<String, CrewWorkState>>,
         dispatch_promises: Vec<promises::DispatchPromise>,
+        standing: bool,
         phase: ConvoyPhase,
         started_at: Option<DateTime<Utc>>,
     ) -> ConvoyStatusPatch {
@@ -2925,6 +3017,7 @@ pub mod controller_patches {
             work,
             crew_work,
             dispatch_promises,
+            standing,
             phase,
             started_at,
         }
@@ -3204,7 +3297,6 @@ pub mod external_patches {
 #[cfg(test)]
 mod subject_tests {
     use super::*;
-    use crate::{CrewMessageDelivery, CrewMessageSender, TerminalCrewMessage};
 
     // #2684: confirmation is monotonic, and clearing one queued episode must
     // retain attention for another overdue episode and unrelated operator attention.
@@ -3225,6 +3317,7 @@ mod subject_tests {
                         subject_revision: "head".into(),
                         evidence_at: start,
                         judged_claim_at: start,
+                        owes: true,
                         outcome: TurnDeliveryOutcome::Queued {
                             rung: TurnDeliveryRung::WarmSession,
                             queued_at: start,
@@ -3233,7 +3326,6 @@ mod subject_tests {
                             message_id: source.into(),
                             blocking_reason: "Pending".into(),
                         },
-                        sender: Default::default(),
                     }],
                     ..Default::default()
                 },
@@ -3489,7 +3581,7 @@ mod subject_tests {
                     creation_timestamp: Utc::now(),
                     merge: None,
                 },
-                spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).build(),
+                spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).project_ref("default".to_string()).build(),
                 status: Some(status),
             }
         };
@@ -3536,7 +3628,7 @@ mod subject_tests {
                 creation_timestamp: Utc::now(),
                 merge: None,
             },
-            spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).build(),
+            spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).project_ref("default".to_string()).build(),
             status: Some(status),
         };
         let addresses =
@@ -3745,12 +3837,13 @@ mod subject_tests {
             message: "needs decision".into(),
         };
         report(now).apply(&mut status);
-        let stall = status.stalled.as_mut().expect("stall");
+        let mut stall = status.stalled.clone().expect("stall");
         stall.supervision_index = Some(1);
         stall.maker = Some(LeafMaker::Supervisor { convoy: "governor".into(), vessel: "watch".into(), role: "governor".into() });
         stall.evidence.push_str("; supervisor reconnecting");
         stall.supervision_message = Some(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "notice"));
         let expected = stall.clone();
+        status.stalls.set(stall);
         report(now + chrono::Duration::seconds(1)).apply(&mut status);
         assert_eq!(status.stalled.as_ref(), Some(&expected));
     }
@@ -3869,74 +3962,11 @@ mod subject_tests {
         assert_eq!(status.attention, Some(unrelated));
     }
 
-    #[test]
-    fn supervisor_turn_acknowledgment_clears_only_prior_generation_delivery_attention() {
-        let old_attention = ConvoyAttention {
-            source: ConvoyAttention::SUPERVISOR_TURN_SOURCE.to_string(),
-            reason: "Pending delivery".to_string(),
-            raised_at: Utc::now(),
-        };
-        let mut status = ConvoyStatus {
-            attention: Some(old_attention.clone()),
-            turn_deliveries: BTreeMap::from([(
-                "turn-1".to_string(),
-                TurnDeliveryStatus {
-                    pending_supervisor_turn: Some(PendingSupervisorTurn {
-                        queued_order: 0,
-                        vessel: "govern".to_string(),
-                        role: "governor".to_string(),
-                        message: TerminalCrewMessage {
-                            id: "turn-1".to_string(),
-                            text: "Supervise".to_string(),
-                            sender: CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
-                            delivery: CrewMessageDelivery::Queued,
-                            acknowledged: Default::default(),
-                            following: Vec::new(),
-                        },
-                    }),
-                    ..Default::default()
-                },
-            )]),
-            ..Default::default()
-        };
-        ConvoyStatusPatch::AcknowledgeSupervisorTurn { message_id: "turn-1".to_string() }.apply(&mut status);
-        assert!(status.attention.is_none());
-
-        status.attention = Some(ConvoyAttention { source: "settlement".to_string(), ..old_attention });
-        ConvoyStatusPatch::AcknowledgeSupervisorTurn { message_id: "turn-1".to_string() }.apply(&mut status);
-        assert_eq!(status.attention.as_ref().map(|attention| attention.source.as_str()), Some("settlement"));
-    }
-
-    #[test]
-    fn supervisor_turns_keep_enqueue_order_independent_of_message_ids() {
-        let mut status = ConvoyStatus::default();
-        for id in ["z-first", "a-second"] {
-            ConvoyStatusPatch::QueueSupervisorTurn {
-                turn: PendingSupervisorTurn {
-                    vessel: "work".into(),
-                    role: "coder".into(),
-                    message: TerminalCrewMessage {
-                        id: id.into(),
-                        text: id.into(),
-                        sender: CrewMessageSender::FlotillaNudge,
-                        delivery: CrewMessageDelivery::Queued,
-                        acknowledged: Default::default(),
-                        following: Vec::new(),
-                    },
-                    queued_order: 0,
-                },
-            }
-            .apply(&mut status);
-        }
-        assert_eq!(status.turn_deliveries["z-first"].pending_supervisor_turn.as_ref().expect("first").queued_order, 1);
-        assert_eq!(status.turn_deliveries["a-second"].pending_supervisor_turn.as_ref().expect("second").queued_order, 2);
-    }
-
     // ADR 0047: previous-generation specs carry no dispatch promises and still
     // decode; empty sets stay unwritten, and frozen promises round-trip.
     #[test]
     fn dispatch_promises_are_an_additive_spec_field() {
-        let old = serde_json::json!({"workflow_ref": "implement-review", "role": "api", "instruction": "Split the API"});
+        let old = serde_json::json!({"workflow_ref": "implement-review", "project_ref": "flotilla", "role": "api", "instruction": "Split the API"});
         let spec: ConvoySpec = serde_json::from_value(old.clone()).expect("previous-generation spec decodes");
         assert!(spec.promises.is_empty());
         assert_eq!(serde_json::to_value(&spec).expect("write").get("promises"), None);
@@ -3958,6 +3988,7 @@ mod subject_tests {
     fn legacy_subject_fields_decode_and_write_only_the_new_set() {
         let old = serde_json::json!({
             "workflow_ref": "interactive",
+            "project_ref": "flotilla",
             "repositories": [{
                 "url": "https://github.com/flotilla-org/flotilla",
                 "repo_ref": "github-flotilla",
@@ -3984,6 +4015,7 @@ mod subject_tests {
 
         let opaque = serde_json::json!({
             "workflow_ref": "interactive",
+            "project_ref": "flotilla",
             "issues": [{
                 "reference": {"source": {"service": "tracker.example", "scope": "team/project"}, "id": "ABC-42"},
                 "snapshot": {"title": "Opaque issue", "state": "open", "as_of": "2026-09-29T00:00:00Z"}
@@ -4321,6 +4353,26 @@ mod admission_tests {
         let initial = Convoy::initial_status(&meta).expect("valid admission metadata");
         assert_eq!(initial, present.then(|| ConvoyStatus { placement_decision: Some(decision), ..ConvoyStatus::default() }));
     }
+
+    // A standing generation's ensure configuration is in its status from the create on.
+    #[test]
+    fn initial_status_holds_the_ensure_admission() {
+        let config = crate::ConvoyEnsureSpec {
+            project_ref: "project".into(),
+            role: "role".into(),
+            driver_ref: None,
+            workflow_ref: "workflow".into(),
+            placement_policy: None,
+            escalation_reason: None,
+            repositories: Vec::new(),
+            presents_as: None,
+            agent_overrides: Vec::new(),
+        };
+        let mut meta = crate::InputMeta::builder().name("admitted".into()).build();
+        meta.annotations.insert(ENSURE_ADMISSION_ANNOTATION.into(), serde_json::to_string(&config).unwrap());
+        let initial = Convoy::initial_status(&meta).expect("valid admission metadata");
+        assert_eq!(initial, Some(ConvoyStatus { ensure_admission: Some(config), ..ConvoyStatus::default() }));
+    }
 }
 
 #[cfg(test)]
@@ -4446,7 +4498,7 @@ mod selected_child_provenance_tests {
                 creation_timestamp: chrono::DateTime::UNIX_EPOCH,
                 merge: None,
             },
-            spec: ConvoySpec::builder().workflow_ref("workflow".into()).build(),
+            spec: ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("test".into()).build(),
             status: None,
         };
         let mut child = convoy.clone();
@@ -4493,5 +4545,25 @@ mod selected_child_provenance_tests {
         let mut unrelated = untrusted;
         unrelated.object.metadata.labels.insert(CONVOY_LABEL.into(), "other-crew".into());
         assert!(select_convoy_children(&convoy, &[unrelated]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod retired_field_tests {
+    use super::*;
+
+    // ADR 0047: a convoy status stored before the vessel's move onto the engine (#3108) still
+    // decodes; its copied environment observations and its works' provisioning retries are dropped.
+    #[test]
+    fn a_status_with_its_retired_vessel_fields_decodes() {
+        let stored = serde_json::json!({
+            "phase": "Active",
+            "work": { "work": { "phase": "Running", "provisioning_retry": { "attempts": 2, "next_attempt_at": "2026-10-05T10:13:00Z" } } },
+            "environment_observations": { "work": { "memory_usage_bytes": 123 } },
+        });
+        let status: ConvoyStatus = serde_json::from_value(stored).expect("old status decodes");
+        assert_eq!((status.phase, status.work["work"].phase), (ConvoyPhase::Active, WorkPhase::Running));
+        let encoded = serde_json::to_string(&status).expect("encode");
+        assert!(!encoded.contains("provisioning_retry") && !encoded.contains("environment_observations"), "{encoded}");
     }
 }

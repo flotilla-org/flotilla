@@ -177,6 +177,25 @@ struct ArchiveKind {
     ended: Ended,
     delete: Delete,
     expunge: Expunge,
+    /// Plain kinds whose record of the same name and home ends with this resource.
+    companions: Vec<Companion>,
+}
+
+/// A plain kind archived with a machine's resource: its record of the same name and home is
+/// bundled with it, deleted in the same change and expunged in the same pass. A companion is
+/// written once and never changes, so the version it is deleted at is the version bundled.
+struct Companion {
+    code: KindCode,
+    delete: Delete,
+    expunge: Expunge,
+}
+
+fn delete_kind<K: Kind>(write: &mut Write<'_>, stamp: Stamp, change: flotilla_schema_sqlite::ChangeId) -> Result<(), StoreError> {
+    write.delete::<K>(stamp, change)
+}
+
+fn expunge_kind<K: Kind>(write: &mut Write<'_>, id: ResourceId, change: flotilla_schema_sqlite::ChangeId) -> Result<u64, StoreError> {
+    write.expunge::<K>(id, change)
 }
 
 /// The machines whose ended resources archive, each by its stored kind.
@@ -206,20 +225,31 @@ impl ArchiveKinds {
                 Some(_) => Status::Live,
             })
         }
-        fn delete<M: Machine>(write: &mut Write<'_>, stamp: Stamp, change: flotilla_schema_sqlite::ChangeId) -> Result<(), StoreError>
-        where
-            Resource<M>: Kind,
-        {
-            write.delete::<Resource<M>>(stamp, change)
-        }
-        fn expunge<M: Machine>(write: &mut Write<'_>, id: ResourceId, change: flotilla_schema_sqlite::ChangeId) -> Result<u64, StoreError>
-        where
-            Resource<M>: Kind,
-        {
-            write.expunge::<Resource<M>>(id, change)
-        }
         let ends = M::definition().ends().iter().map(|end| end.state.code()).collect();
-        self.kinds.insert(Resource::<M>::CODE, ArchiveKind { ends, ended: ended::<M>, delete: delete::<M>, expunge: expunge::<M> });
+        self.kinds.insert(
+            Resource::<M>::CODE,
+            ArchiveKind {
+                ends,
+                ended: ended::<M>,
+                delete: delete_kind::<Resource<M>>,
+                expunge: expunge_kind::<Resource<M>>,
+                companions: Vec::new(),
+            },
+        );
+        self
+    }
+
+    /// Archive `K`'s record named and homed as each of `M`'s resources with that resource: a
+    /// plain record fixed for one resource's life (an Environment launch's facts), which reaches
+    /// no end of its own. `M` must already archive.
+    pub fn companion<M, K>(mut self) -> Self
+    where
+        M: Machine,
+        Resource<M>: Kind,
+        K: Kind,
+    {
+        let kind = self.kinds.get_mut(&Resource::<M>::CODE).expect("a companion's machine archives");
+        kind.companions.push(Companion { code: K::CODE, delete: delete_kind::<K>, expunge: expunge_kind::<K> });
         self
     }
 
@@ -271,8 +301,10 @@ pub enum Due {
 #[derive(Debug)]
 pub enum Prepared {
     Ready {
-        bundle: Bundle,
+        bundle: Box<Bundle>,
         version: u64,
+        /// The bundles of its companions' records, each shipped under its own identity.
+        companions: Vec<Bundle>,
     },
     /// It is no longer stored, or no longer at an end.
     Gone,
@@ -416,22 +448,15 @@ impl Archiver {
         if !matches!((kind.ended)(&mut read, id, &kind.ends)?, Status::Ended(_)) {
             return Ok(Prepared::Gone);
         }
-        let Some(snapshot) = read.load_snapshot(id)? else { return Ok(Prepared::Gone) };
-        let mut entries: Vec<Event> = Vec::new();
-        loop {
-            let after = entries.last().map_or(0, |entry| entry.home_seq);
-            let page = read.changes(id, after, MAX_PAGE)?;
-            if page.is_empty() {
-                break;
-            }
-            entries.extend(page);
+        let Some(bundle) = bundle_of(&mut read, id, identity)? else { return Ok(Prepared::Gone) };
+        let mut companions = Vec::new();
+        for companion in &kind.companions {
+            let held = Identity { kind: companion.code, ..identity.clone() };
+            let Some(id) = read.resolve(held.kind, &held.name, &held.home)? else { continue };
+            companions.extend(bundle_of(&mut read, id, &held)?);
         }
-        let mut changes = Vec::new();
-        for seq in entries.iter().map(|entry| entry.change).collect::<BTreeSet<_>>() {
-            changes.push(read.change(&identity.home, seq)?.ok_or_else(|| ArchiveError::Missing(identity.clone()))?);
-        }
-        let version = snapshot.version;
-        Ok(Prepared::Ready { bundle: Bundle { format: BUNDLE_FORMAT, snapshot, entries, changes }, version })
+        let version = bundle.snapshot.version;
+        Ok(Prepared::Ready { bundle: Box::new(bundle), version, companions })
     }
 
     /// Deletes a shipped resource at the version its bundle holds; a resource that moved since is
@@ -442,6 +467,11 @@ impl Archiver {
         let id = write.resolve(identity.kind, &identity.name, &identity.home)?.ok_or_else(|| ArchiveError::Missing(identity.clone()))?;
         let change = write.open_change(&NewChange::new(ARCHIVE_WRITER, at))?;
         (kind.delete)(&mut write, Stamp { id, version }, change)?;
+        for companion in &kind.companions {
+            let Some(id) = write.resolve(companion.code, &identity.name, &identity.home)? else { continue };
+            let Some(held) = write.load_snapshot(id)? else { continue };
+            (companion.delete)(&mut write, Stamp { id, version: held.version }, change)?;
+        }
         write.commit()?;
         Ok(())
     }
@@ -454,6 +484,12 @@ impl Archiver {
         let mut write = store.write()?;
         let Some(id) = write.resolve(identity.kind, &identity.name, &identity.home)? else { return Ok(true) };
         let change = write.open_change(&NewChange::new(ARCHIVE_WRITER, at))?;
+        // Companions refer to nothing, so theirs go first, in the same change.
+        for companion in &kind.companions {
+            if let Some(held) = write.resolve(companion.code, &identity.name, &identity.home)? {
+                (companion.expunge)(&mut write, held, change)?;
+            }
+        }
         match (kind.expunge)(&mut write, id, change) {
             Ok(_) => {}
             Err(StoreError::Referenced { .. }) => return Ok(false),
@@ -462,6 +498,26 @@ impl Archiver {
         write.commit()?;
         Ok(true)
     }
+}
+
+/// The bundle of resource `id`, known as `identity`: its stored snapshot, every entry about it and
+/// those entries' changes. `None` when it holds no row.
+fn bundle_of(read: &mut Read<'_>, id: ResourceId, identity: &Identity) -> Result<Option<Bundle>, ArchiveError> {
+    let Some(snapshot) = read.load_snapshot(id)? else { return Ok(None) };
+    let mut entries: Vec<Event> = Vec::new();
+    loop {
+        let after = entries.last().map_or(0, |entry| entry.home_seq);
+        let page = read.changes(id, after, MAX_PAGE)?;
+        if page.is_empty() {
+            break;
+        }
+        entries.extend(page);
+    }
+    let mut changes = Vec::new();
+    for seq in entries.iter().map(|entry| entry.change).collect::<BTreeSet<_>>() {
+        changes.push(read.change(&identity.home, seq)?.ok_or_else(|| ArchiveError::Missing(identity.clone()))?);
+    }
+    Ok(Some(Bundle { format: BUNDLE_FORMAT, snapshot, entries, changes }))
 }
 
 /// The change `entry` belongs to, as this store holds it.

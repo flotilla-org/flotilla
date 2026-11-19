@@ -25,7 +25,7 @@ pub const PLAN: &[(&str, Plan)] = &[
     ("Checkout", Plan::Imported("lifecycle import (#3629)")),
     ("TerminalSession", Plan::Imported("lifecycle import (#3629)")),
     ("Vessel", Plan::Imported("lifecycle import (#3629)")),
-    ("ConvoyEnsure", Plan::Imported("lifecycle import (#3629)")),
+    ("ConvoyEnsure", Plan::Imported("definitions import (#3108): its status is derived, not carried")),
     ("Convoy", Plan::Imported("Convoy import (#3587)")),
     ("AccountBinding", Plan::Imported("account import (#3824 layer 1)")),
     ("AccountProvision", Plan::Imported("account import (#3824 layer 1)")),
@@ -55,18 +55,24 @@ pub const PLAN: &[(&str, Plan)] = &[
     ("Issue", Plan::Imported("forge observations import (#3824 layer 5)")),
     ("ForgeRead", Plan::Retired("#4333: forge reads are a per-host cache until 5c")),
     ("Artifact", Plan::Imported("Artifact import (#3824 layer 7)")),
+    // Retired; each open demand becomes the attention its writer sends.
     ("Demand", Plan::Imported("attention import (#3824 layer 8)")),
     ("Regard", Plan::Retired("#3824 layer 8, 2026-11-01: dropped with its salience boost")),
     ("AccessDelivery", Plan::Imported("access delivery import (#3824)")),
 ];
 
-/// The plan for the kind listed under `plural`, if it has one.
+/// The plan for the kind listed under `plural`, if it has one. A kind retired before the retired
+/// list (MaterialPool, #1931) has no plural any more: the old store's rows name it by kind, and
+/// its ruling drops them.
 pub fn plan(plural: &str) -> Option<(&'static str, Plan)> {
-    let kind = REGISTERED_RESOURCE_KINDS
+    let Some(kind) = REGISTERED_RESOURCE_KINDS
         .iter()
         .find(|entry| entry.plural == plural)
         .map(|entry| entry.kind)
-        .or_else(|| retired_resource_kind(plural).map(|retired| retired.kind))?;
+        .or_else(|| retired_resource_kind(plural).map(|retired| retired.kind))
+    else {
+        return PLAN.iter().find(|(name, plan)| *name == plural && matches!(plan, Plan::Retired(_))).copied();
+    };
     PLAN.iter().find(|(name, _)| *name == kind).copied()
 }
 
@@ -112,6 +118,8 @@ mod tests {
     #[test]
     fn a_retired_unregistered_kind_listed_by_an_older_daemon_is_dropped() {
         assert!(is_retired("crewimagebaselines"));
-        assert!(!is_retired("events"), "a retired kind still registered keeps its decoder");
+        assert!(is_retired("events"));
+        assert!(is_retired("MaterialPool"), "a kind purged before the retired list is read under its kind name");
+        assert!(!is_retired("demands"), "a retired kind the import converts is not dropped");
     }
 }

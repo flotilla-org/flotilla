@@ -8,6 +8,7 @@ CREATE TABLE resource_identity (
   id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
   name INTEGER NOT NULL REFERENCES strings(id), home INTEGER NOT NULL REFERENCES strings(id),
   seq INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER,
   UNIQUE (kind, name, home)) STRICT;
 CREATE INDEX resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
@@ -47,6 +48,11 @@ CREATE TABLE stream_watermark (
 CREATE TABLE stream_history (
   home INTEGER PRIMARY KEY REFERENCES strings(id), home_seq INTEGER NOT NULL CHECK (home_seq >= 0)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE snapshot_cause (
+  resource INTEGER PRIMARY KEY REFERENCES resource_identity(id) ON DELETE CASCADE,
+  home INTEGER NOT NULL REFERENCES strings(id),
+  change_seq INTEGER NOT NULL,
+  FOREIGN KEY (home, change_seq) REFERENCES change(home, seq)) STRICT, WITHOUT ROWID;
 CREATE TABLE codes (
   kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
   PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
@@ -60,6 +66,9 @@ CREATE TABLE "awaiting_reply" (
   "kind" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "awaited" TEXT NOT NULL CHECK ("awaited" IN ('ou', 're')),
   "deadline" INTEGER,
+  "report" TEXT,
+  "stall_reason" TEXT CHECK ("stall_reason" IN ('ac', 'de', 'in', 'ot', 'sc')),
+  "proposed_disposition" TEXT CHECK ("proposed_disposition" IN ('fa', 're', 'rs')),
   "state" TEXT NOT NULL CHECK ("state" IN ('an', 'ex', 'op', 'wd')),
   "state_since" INTEGER NOT NULL,
   "reason" TEXT,
@@ -83,6 +92,14 @@ CREATE INDEX "awaiting_reply_open_by_subject" ON "awaiting_reply" ("subject") WH
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ar', 'awaited', 'ou', 'Outcome'),
   ('ar', 'awaited', 're', 'Reply'),
+  ('ar', 'stall_reason', 'ac', 'Access'),
+  ('ar', 'stall_reason', 'de', 'Decision'),
+  ('ar', 'stall_reason', 'in', 'Infra'),
+  ('ar', 'stall_reason', 'ot', 'Other'),
+  ('ar', 'stall_reason', 'sc', 'Scope'),
+  ('ar', 'proposed_disposition', 'fa', 'Fail'),
+  ('ar', 'proposed_disposition', 're', 'ReduceScope'),
+  ('ar', 'proposed_disposition', 'rs', 'Resume'),
   ('ar', 'state', 'an', 'Answered'),
   ('ar', 'state', 'ex', 'Expired'),
   ('ar', 'state', 'op', 'Open'),
@@ -104,6 +121,9 @@ CREATE VIEW "awaiting_reply_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "awaiting_reply"."kind") AS "kind",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ar' AND "field" = 'awaited' AND "code" = "awaiting_reply"."awaited") AS "awaited",
   "awaiting_reply"."deadline",
+  "awaiting_reply"."report",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ar' AND "field" = 'stall_reason' AND "code" = "awaiting_reply"."stall_reason") AS "stall_reason",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'ar' AND "field" = 'proposed_disposition' AND "code" = "awaiting_reply"."proposed_disposition") AS "proposed_disposition",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ar' AND "field" = 'state' AND "code" = "awaiting_reply"."state") AS "state",
   "awaiting_reply"."state_since",
   "awaiting_reply"."reason"
@@ -111,23 +131,49 @@ FROM "awaiting_reply";
 CREATE TABLE "convoy" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "launch_of" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "launch" INTEGER NOT NULL,
+  "workflow_ref" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "admission" BLOB NOT NULL REFERENCES "objects" ("hash"),
   "project" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "promise_floor" INTEGER NOT NULL DEFAULT 0,
   "priority" INTEGER NOT NULL,
   "kinds" BLOB NOT NULL REFERENCES "objects" ("hash"),
-  "state" TEXT NOT NULL CHECK ("state" IN ('ab', 'de', 'op')),
+  "state" TEXT NOT NULL CHECK ("state" IN ('ab', 'de', 'op', 're')),
   "state_since" INTEGER NOT NULL,
+  "disposition" TEXT,
+  "cause" TEXT CHECK ("cause" IN ('fa', 'op')),
   "reason" TEXT,
   CHECK (CASE WHEN "state" = 'op'
-      THEN "reason" IS NULL
+      THEN "disposition" IS NULL
+      AND "cause" IS NULL
+      AND "reason" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'de'
-      THEN "reason" IS NULL
+      THEN "disposition" IS NOT NULL
+      AND "cause" IS NULL
+      AND "reason" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'ab'
-      THEN "reason" IS NOT NULL
+      THEN "cause" IS NOT NULL
+      AND "reason" IS NOT NULL
+      AND "disposition" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 're'
+      THEN "disposition" IS NULL
+      AND "cause" IS NULL
+      AND "reason" IS NULL
       END)
 ) STRICT;
+CREATE TABLE "convoy_subjects" (
+  "convoy" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "version" INTEGER NOT NULL,
+  "subject" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "source" TEXT NOT NULL CHECK ("source" IN ('br', 'cl', 'op', 'rl')),
+  "unlinked" INTEGER NOT NULL CHECK ("unlinked" IN (0, 1)),
+  PRIMARY KEY ("convoy", "pos"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
 CREATE TABLE "convoy_duties" (
   "convoy" INTEGER NOT NULL,
   "key" INTEGER NOT NULL,
@@ -154,8 +200,9 @@ CREATE TABLE "convoy_seats" (
   "parent_role" INTEGER REFERENCES "strings" ("id"),
   "parent_seat" INTEGER REFERENCES "strings" ("id"),
   "supervised_by" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "retired" INTEGER NOT NULL CHECK ("retired" IN (0, 1)) DEFAULT 0,
-  "replacements" INTEGER NOT NULL DEFAULT 0,
+  "failed" TEXT,
+  "retired" INTEGER NOT NULL CHECK ("retired" IN (0, 1)),
+  "replacements" INTEGER NOT NULL,
   PRIMARY KEY ("convoy", "pos"),
   FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE,
   CHECK (CASE WHEN "parent_role" IS NOT NULL
@@ -191,19 +238,13 @@ CREATE TABLE "convoy_promises_submissions" (
   PRIMARY KEY ("convoy", "promises_pos", "pos"),
   FOREIGN KEY ("convoy", "promises_pos") REFERENCES "convoy_promises" ("convoy", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "convoy_quota" (
-  "convoy" INTEGER NOT NULL,
-  "key" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "value" INTEGER NOT NULL,
-  PRIMARY KEY ("convoy", "key"),
-  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
-CREATE TABLE "convoy_retired" (
+CREATE TABLE "convoy_retired_duties" (
   "convoy" INTEGER NOT NULL,
   "value" INTEGER NOT NULL,
   PRIMARY KEY ("convoy", "value"),
   FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
+CREATE INDEX "convoy_by_launch" ON "convoy" ("project", "launch_of", "launch");
 CREATE INDEX "convoy_open_by_project" ON "convoy" ("project") WHERE "state" IN ('op');
 CREATE UNIQUE INDEX "convoy_promises_by_label" ON "convoy_promises" ("convoy", "label");
 CREATE INDEX "convoy_promises_submissions_by_address" ON "convoy_promises_submissions" ("address");
@@ -211,6 +252,13 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'state', 'ab', 'Abandoned'),
   ('cv', 'state', 'de', 'Delivered'),
   ('cv', 'state', 'op', 'Open'),
+  ('cv', 'state', 're', 'Retired'),
+  ('cv', 'cause', 'fa', 'Failed'),
+  ('cv', 'cause', 'op', 'Operator'),
+  ('cv', 'subjects.source', 'br', 'Branch'),
+  ('cv', 'subjects.source', 'cl', 'Claim'),
+  ('cv', 'subjects.source', 'op', 'Operator'),
+  ('cv', 'subjects.source', 'rl', 'Relay'),
   ('cv', 'duties.scope', 'lt', 'Lifetime'),
   ('cv', 'duties.scope', 'wo', 'WhileOpen'),
   ('cv', 'promises.source', 'cr', 'Crew'),
@@ -224,31 +272,47 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'log:edge', 'as', 'AddSeat'),
   ('cv', 'log:edge', 'dc', 'Declare'),
   ('cv', 'log:edge', 'de', 'Deliver'),
+  ('cv', 'log:edge', 'fs', 'FailSeat'),
   ('cv', 'log:edge', 'ke', 'Keep'),
-  ('cv', 'log:edge', 'ra', 'Readmit'),
+  ('cv', 'log:edge', 'lk', 'Link'),
   ('cv', 'log:edge', 'rd', 'RetireDuty'),
+  ('cv', 'log:edge', 're', 'Retire'),
   ('cv', 'log:edge', 'rj', 'Reject'),
-  ('cv', 'log:edge', 'ro', 'Rollover'),
   ('cv', 'log:edge', 'rp', 'ReplaceSeat'),
   ('cv', 'log:edge', 'rs', 'Reassign'),
   ('cv', 'log:edge', 'rt', 'Retract'),
   ('cv', 'log:edge', 'sr', 'RetireSeat'),
   ('cv', 'log:edge', 'su', 'Submit'),
   ('cv', 'log:edge', 'sv', 'Resupervise'),
+  ('cv', 'log:edge', 'ul', 'Unlink'),
   ('cv', 'log:label', 'ab', 'Abandoned'),
   ('cv', 'log:label', 'de', 'Delivered'),
-  ('cv', 'log:label', 'op', 'Open');
+  ('cv', 'log:label', 'op', 'Open'),
+  ('cv', 'log:label', 're', 'Retired');
 CREATE VIEW "convoy_view" AS SELECT
   "convoy"."id",
   "convoy"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy"."launch_of") AS "launch_of",
+  "convoy"."launch",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy"."workflow_ref") AS "workflow_ref",
+  "convoy"."admission",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy"."project") AS "project",
-  "convoy"."promise_floor",
   "convoy"."priority",
   "convoy"."kinds",
   (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'state' AND "code" = "convoy"."state") AS "state",
   "convoy"."state_since",
+  "convoy"."disposition",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'cause' AND "code" = "convoy"."cause") AS "cause",
   "convoy"."reason"
 FROM "convoy";
+CREATE VIEW "convoy_subjects_view" AS SELECT
+  "convoy_subjects"."convoy",
+  "convoy_subjects"."pos",
+  "convoy_subjects"."version",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_subjects"."subject") AS "subject",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cv' AND "field" = 'subjects.source' AND "code" = "convoy_subjects"."source") AS "source",
+  "convoy_subjects"."unlinked"
+FROM "convoy_subjects";
 CREATE VIEW "convoy_duties_view" AS SELECT
   "convoy_duties"."convoy",
   "convoy_duties"."key",
@@ -271,6 +335,7 @@ CREATE VIEW "convoy_seats_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."parent_role") AS "parent_role",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."parent_seat") AS "parent_seat",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_seats"."supervised_by") AS "supervised_by",
+  "convoy_seats"."failed",
   "convoy_seats"."retired",
   "convoy_seats"."replacements"
 FROM "convoy_seats";
@@ -298,15 +363,10 @@ CREATE VIEW "convoy_promises_submissions_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises_submissions"."by_role") AS "by_role",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises_submissions"."by_seat") AS "by_seat"
 FROM "convoy_promises_submissions";
-CREATE VIEW "convoy_quota_view" AS SELECT
-  "convoy_quota"."convoy",
-  (SELECT "s" FROM "strings" WHERE "id" = "convoy_quota"."key") AS "key",
-  "convoy_quota"."value"
-FROM "convoy_quota";
-CREATE VIEW "convoy_retired_view" AS SELECT
-  "convoy_retired"."convoy",
-  "convoy_retired"."value"
-FROM "convoy_retired";
+CREATE VIEW "convoy_retired_duties_view" AS SELECT
+  "convoy_retired_duties"."convoy",
+  "convoy_retired_duties"."value"
+FROM "convoy_retired_duties";
 CREATE VIEW "log_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
   "l"."home_seq",

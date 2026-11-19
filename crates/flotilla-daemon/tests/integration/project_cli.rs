@@ -1,6 +1,6 @@
 //! Integration tests for ProjectAdd/ProjectApply and Project-backed convoy metadata.
 
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
@@ -11,16 +11,13 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_admission::repository_inspection::LocalCheckoutInspection;
 use flotilla_admission::repository_inspection::ProjectDeclarationInspection;
 use flotilla_admission::repository_inspection::RepositoryInspection;
 use flotilla_admission::repository_inspection::RepositoryInspector;
 use flotilla_charter::ops_entry::materialized_workflow_name;
 use flotilla_charter::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
-use flotilla_charter::ops_entry::PRESENTS_AS_ANNOTATION;
 use flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION;
-use flotilla_charter::ops_entry::SOURCE_ENTRY_PATH_ANNOTATION;
 use flotilla_charter::ops_entry::SOURCE_REPOSITORY_ANNOTATION;
 use flotilla_charter::ops_entry::VERIFICATION_PROJECT_ANNOTATION;
 use flotilla_charter::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION;
@@ -35,11 +32,11 @@ use flotilla_discovery_testkit::fake_discovery_on_host_os;
 use flotilla_discovery_testkit::git_process_discovery;
 use flotilla_discovery_testkit::init_git_repo_with_remote;
 use flotilla_protocol::{
-    commands::RepositoryIdentityChange, AgentOverride, Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId, RepoSelector,
+    commands::RepositoryIdentityChange, AgentOverride, Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector,
 };
 use flotilla_resources::{
-    Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectRepositoryRole,
-    ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
+    CheckoutSpec, Convoy, ConvoyEnsure, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectRepositoryRole, ProjectSpec,
+    Repository, RepositoryKey, RepositorySpec, RepositoryStatus, WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use tracing::instrument::WithSubscriber;
@@ -77,7 +74,7 @@ fn symlinked_fixture(tmp: &tempfile::TempDir) -> PathBuf {
 async fn start_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigStore>, DaemonRuntime, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -226,10 +223,6 @@ async fn track_repository(daemon: &Arc<InProcessDaemon>, tmp: &tempfile::TempDir
 async fn replicated_remote_declaration_resolution_preserves_existing_mirror_project_residue() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let kiwi_root = NodeId::new("kiwi-root");
-    let feta_root = NodeId::new("feta-root");
-    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
-    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(feta_root);
     let canonical = "https://github.com/flotilla-org/flotilla";
     let mirror = "https://forgejo.lab/lab/flotilla";
     let declared =
@@ -238,15 +231,21 @@ async fn replicated_remote_declaration_resolution_preserves_existing_mirror_proj
     let mirror_spec = RepositorySpec::remote(mirror).expect("provisional mirror repository");
     let mirror_key = mirror_spec.key();
 
-    kiwi.using::<Repository>("flotilla")
-        .create(&InputMeta::builder().name(canonical_key.to_string()).build(), &declared)
-        .await
-        .expect("author declaration on kiwi");
-    let kiwi_repositories = kiwi.using::<Repository>("flotilla").list().await.expect("list kiwi repositories");
-    feta.replica_writer::<Repository>(kiwi_root, "flotilla")
-        .replace(&kiwi_repositories, Utc::now())
-        .await
-        .expect("replicate declaration to feta");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("feta"),
+        engine_home_backend(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    crate::engine(&daemon);
+    let feta = daemon.resource_backend();
+    // kiwi authors the declaration at its home; it reaches feta as kiwi's log does.
+    let kiwi = flotilla_provisioning_testkit::other_home::OtherHome::open("kiwi-root");
+    kiwi.repository(&canonical_key.to_string(), &declared).await;
+    kiwi.replicate_to(&daemon.decided_store().expect("decided store"));
 
     feta.using::<Repository>("flotilla")
         .create(&InputMeta::builder().name(mirror_key.to_string()).build(), &mirror_spec)
@@ -267,15 +266,6 @@ async fn replicated_remote_declaration_resolution_preserves_existing_mirror_proj
         .await
         .expect("seed retired mirror Project residue");
 
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        vec![],
-        Arc::clone(&config),
-        fake_discovery(false),
-        HostName::new("feta"),
-        feta.clone(),
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: mirror_spec, host_ref: "feta".to_string() })).await;
     let checkout_path = tmp.path().join("mirror-checkout");
     std::fs::create_dir(&checkout_path).expect("mirror checkout dir");
@@ -293,30 +283,27 @@ async fn replicated_remote_declaration_resolution_preserves_existing_mirror_proj
 async fn independently_observed_same_repository_remains_resolvable_after_replication() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let kiwi_root = NodeId::new("kiwi-root");
-    let feta_root = NodeId::new("feta-root");
-    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
-    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(feta_root);
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     let repository_key = repository_spec.key();
     let meta = InputMeta::builder().name(repository_key.to_string()).build();
-    kiwi.using::<Repository>("flotilla").create(&meta, &repository_spec).await.expect("observe repository on kiwi");
-    feta.using::<Repository>("flotilla").create(&meta, &repository_spec).await.expect("observe repository on feta");
-    let kiwi_repositories = kiwi.using::<Repository>("flotilla").list().await.expect("list kiwi repositories");
-    feta.replica_writer::<Repository>(kiwi_root, "flotilla")
-        .replace(&kiwi_repositories, Utc::now())
-        .await
-        .expect("replicate kiwi observation to feta");
 
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
         fake_discovery(false),
         HostName::new("feta"),
-        feta.clone(),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    crate::engine(&daemon);
+    let feta = daemon.resource_backend();
+    // kiwi observes the same repository at its home; it reaches feta as kiwi's log does.
+    let kiwi = flotilla_provisioning_testkit::other_home::OtherHome::open("kiwi-root");
+    kiwi.repository(&repository_key.to_string(), &repository_spec).await;
+    kiwi.replicate_to(&daemon.decided_store().expect("decided store"));
+    feta.using::<Repository>("flotilla").create(&meta, &repository_spec).await.expect("observe repository on feta");
+
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "feta".to_string() })).await;
     let checkout_path = tmp.path().join("canonical-checkout");
     std::fs::create_dir(&checkout_path).expect("canonical checkout dir");
@@ -431,15 +418,15 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
         vec![Some("app"), Some("operations")]
     );
     for member in &split.spec.repositories {
+        // A Repository keeps no bootstrap stamps on the engine: nothing reads them from it.
         let repository = backend.using::<Repository>("flotilla").get(&member.repo.to_string()).await.expect("member repository");
-        assert_eq!(repository.metadata.annotations.get(BOOTSTRAP_COMMIT_ANNOTATION).map(String::as_str), Some("0123456789abcdef"));
         assert!(!repository.metadata.annotations.contains_key(BOOTSTRAP_PATH_ANNOTATION));
     }
 }
 
-// An upgraded Project may have portable bootstrap identity but no observed
-// bootstrap on this host. Never adopt a replicated legacy path; explain how to
-// establish the host-local observation explicitly.
+// An upgraded Project may have portable bootstrap identity (its declaring
+// repository at a commit) but no observed bootstrap on this host. Never adopt a
+// replicated legacy path; explain how to establish the host-local observation explicitly.
 #[tokio::test]
 async fn legacy_project_without_local_bootstrap_requires_reregistration() {
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
@@ -452,6 +439,7 @@ async fn legacy_project_without_local_bootstrap_requires_reregistration() {
                 .name("legacy".to_string())
                 .annotations(BTreeMap::from([
                     (BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), key.to_string()),
+                    (BOOTSTRAP_COMMIT_ANNOTATION.to_string(), "legacy-commit".to_string()),
                     (BOOTSTRAP_PATH_ANNOTATION.to_string(), "/another-host/bootstrap".to_string()),
                 ]))
                 .build(),
@@ -486,7 +474,7 @@ async fn selected_detached_ops_checkout_loads_without_rederiving_identity() {
         .expect("ops entry");
     git(&ops, &["add", "verify.md"]);
     git(&ops, &["commit", "-m", "declare verification"]);
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = Arc::new(
         InProcessDaemon::new_with_resource_backend(
             vec![ops.clone()],
@@ -498,6 +486,8 @@ async fn selected_detached_ops_checkout_loads_without_rederiving_identity() {
         )
         .await,
     );
+    // The engine's readings, which a running daemon always has: they hold no clone here.
+    crate::engine(&daemon);
     git(&ops, &["remote", "add", "lab", "https://forgejo.example.org/example/ops"]);
     git(&ops, &["checkout", "--detach"]);
     let mut rx = daemon.subscribe();
@@ -565,6 +555,82 @@ async fn declaration_adoption_survives_whole_repository_project_reconciliation()
     assert_eq!(reconciled.spec.repositories[0].roles.len(), 3);
 }
 
+/// Writes Project `name` as manifest root `ops`'s reconciler applies it once it has taken the
+/// project over: the manifest is its one origin, so it holds no bootstrap repository.
+async fn manifest_project(daemon: &InProcessDaemon, backend: &ResourceBackend, name: &str, charter: bool) -> ProjectSpec {
+    use flotilla_resources::definitions::{stamp, DefinitionOrigin};
+    use flotilla_resources::manifest_roots::RootDeclaration;
+    let root = RootDeclaration { host: "local".into(), path: "/ops".into(), source: "ops".into(), binding: None, ops: false };
+    daemon.manifest_roots().declare("flotilla", "ops", root).await.expect("the manifest root");
+    let (labels, annotations) = stamp(&DefinitionOrigin::Manifest {
+        root: "ops".into(),
+        source: Some("ops".into()),
+        path: Some(format!("projects/{name}.json")),
+        revision: "first".into(),
+        charter: None,
+        materialized_project: None,
+    });
+    let charter = charter.then(|| flotilla_resources::CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() });
+    let spec = ProjectSpec::builder()
+        .display_name(name.to_string())
+        .default_workflow_ref("single-agent".to_string())
+        .maybe_charter(charter)
+        .build();
+    backend
+        .definitions::<Project>("flotilla")
+        .create(&InputMeta::builder().name(name.to_string()).labels(labels).annotations(annotations).build(), &spec)
+        .await
+        .expect("the manifest's Project")
+        .spec
+}
+
+// A project a manifest declares is the manifest's: project apply refuses it as declared, though it
+// holds no bootstrap repository, and leaves it as the manifest wrote it.
+#[tokio::test]
+async fn project_apply_refuses_a_project_a_manifest_declares() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    let declared = manifest_project(&daemon, &backend, "app", false).await;
+    let mut rx = daemon.subscribe();
+    let result = execute_project_command(
+        &daemon,
+        &mut rx,
+        CommandAction::ProjectApply {
+            name: "app".to_string(),
+            spec_yaml: format!(
+                "display_name: overwritten\ndefault_workflow_ref: single-agent\nrepositories:\n  - repo: {}\n",
+                RepositorySpec::remote("https://github.com/example/app").expect("repository").key()
+            ),
+        },
+    )
+    .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("managed by a declaration")),
+        "unexpected command result: {result:?}"
+    );
+    assert_eq!(backend.definitions::<Project>("flotilla").get("app").await.expect("project").spec, declared);
+}
+
+// Refreshing a project a manifest took over reports it as its charter's, as before the takeover,
+// rather than asking for a declaration it no longer names.
+#[tokio::test]
+async fn project_refresh_reports_a_project_a_manifest_declares_as_its_charters() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    daemon.set_repository_inspector(Arc::new(FailingInspector)).await;
+    manifest_project(&daemon, &backend, "app", true).await;
+    let mut rx = daemon.subscribe();
+    let result = execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "app".to_string() }).await;
+    assert_eq!(
+        result,
+        CommandValue::ProjectRefreshed {
+            name: "app".to_string(),
+            members: 0,
+            converged: false,
+            changes: Vec::new(),
+            operational_entries: vec!["project managed by registered charter".to_string()],
+        }
+    );
+}
+
 #[tokio::test]
 async fn project_refresh_accepts_every_declared_lab_forge_url_for_an_observed_checkout() {
     use flotilla_resources::{Forge, ForgeKind, ForgeSpec};
@@ -624,9 +690,9 @@ async fn project_refresh_accepts_every_declared_lab_forge_url_for_an_observed_ch
         assert!(matches!(result, CommandValue::ProjectRegistered { .. } | CommandValue::ProjectRefreshed { .. }), "{result:?}");
         // Each spelling describes the same physical main checkout, so refresh
         // must never see two bootstrap candidates for the aliased directory.
-        let checkouts = daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("observed checkouts");
-        assert_eq!(checkouts.items.len(), 1);
-        let CheckoutSpec::Observed(observed) = &checkouts.items[0].spec else { panic!("observed checkout") };
+        let checkouts = daemon.discovered_checkouts().all();
+        assert_eq!(checkouts.len(), 1);
+        let observed = &checkouts[0].spec;
         assert_eq!(Path::new(&observed.path), checkout.canonicalize().expect("physical checkout"));
         assert!(observed.is_main);
         let project = backend.definitions::<Project>("flotilla").get("ghostty").await.expect("project");
@@ -742,7 +808,8 @@ async fn ops_entries_materialization_scenario() {
     .expect("write scoped workflow");
     std::fs::write(
         tmp.path().join("all-code.entry"),
-        "---\nkind: workflow_template\nname: all-code\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo check\n",
+        // A crew owes a promise to be admitted on the engine, so the tool crew keeps a decision ledger.
+        "---\nkind: workflow_template\nname: all-code\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo check\n        promises:\n          - kind: decision-ledger\n            owner: verify\n",
     )
     .expect("write default-scoped workflow");
     std::fs::write(
@@ -774,11 +841,8 @@ async fn ops_entries_materialization_scenario() {
     assert_eq!(scoped.spec.repository_refs.as_deref(), Some(std::slice::from_ref(&app.repo)));
     assert!(scoped.spec.vessels.is_empty());
     assert_eq!(scoped.metadata.annotations.get(SOURCE_REPOSITORY_ANNOTATION), Some(&ops_spec.key().to_string()));
+    // Its change names the ops repository at its commit; the entry's path is not kept (#4024).
     assert_eq!(scoped.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
-    assert_eq!(
-        scoped.metadata.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).map(String::as_str),
-        Some("verification-commands/this-is-a-workflow.md")
-    );
     let all_code = workflows.get(&all_code_name).await.expect("default-scoped workflow");
     assert_eq!(all_code.spec.vessels[0].repository_refs.as_deref(), Some([app.repo.clone(), docs.repo.clone()].as_slice()));
     let app_repository = backend.using::<Repository>("flotilla").get(&app.repo.to_string()).await.expect("app repository");
@@ -794,7 +858,7 @@ async fn ops_entries_materialization_scenario() {
     assert_eq!(ensure.spec.repositories, vec![operations.repo.clone()]);
     assert!(ensure.spec.agent_overrides.is_empty());
     assert_eq!(ensure.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
-    assert_eq!(ensure.metadata.annotations.get(PRESENTS_AS_ANNOTATION).map(String::as_str), Some("fleet"));
+    assert_eq!(ensure.spec.presents_as.as_deref(), Some("fleet"));
 
     let repositories = backend.using::<flotilla_resources::Repository>("flotilla");
     for source in repositories.list().await.expect("list repositories").items {
@@ -807,13 +871,20 @@ async fn ops_entries_materialization_scenario() {
             .await
             .expect("resolve repository default branch");
     }
-    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("start ensured standing convoy");
-    let ensured_convoy_ref = ensures
-        .get(&ensure_name)
+    // Message delivery reads the fleet roles from the FleetDesignation record.
+    backend
+        .clone()
+        .using::<flotilla_resources::FleetDesignation>("flotilla")
+        .create(
+            &InputMeta::builder().name(flotilla_resources::FLEET_DESIGNATION_NAME.to_string()).build(),
+            &flotilla_resources::FleetDesignationSpec { fleet: Some("lab".into()), project: "demo".into(), image_cache: None },
+        )
         .await
-        .expect("reconciled ensure")
-        .status
-        .and_then(|status| status.convoy_ref)
+        .expect("designate the fleet");
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("start ensured standing convoy");
+    let ensured_convoy_ref = flotilla_projections::ports::StandingRoles::reading(&*daemon, "flotilla", "demo", "quartermaster")
+        .await
+        .and_then(|role| role.convoy_ref)
         .expect("ensured convoy ref");
     let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
     convoys.get(&ensured_convoy_ref).await.expect("ensured standing convoy record");
@@ -862,8 +933,11 @@ async fn ops_entries_materialization_scenario() {
     let refusal = project.status.expect("status").declaration_refused.expect("visible refusal condition");
     assert!(refusal.message.contains("unknown_option"));
     assert_eq!(refusal.entry_path, "quartermaster: named.entry");
-    let ensure = ensures.get(&ensure_name).await.expect("last accepted ensure remains");
-    assert!(ensure.status.expect("ensure status").declaration_refused.is_some());
+    ensures.get(&ensure_name).await.expect("last accepted ensure remains");
+    // The standing role shows its project's refusal, read from the Project.
+    let role =
+        flotilla_projections::ports::StandingRoles::reading(&*daemon, "flotilla", "demo", "quartermaster").await.expect("the role reads");
+    assert!(role.last_failure.is_some_and(|failure| failure.starts_with("DeclarationRefused:") && failure.contains("unknown_option")));
     let refused = |fleet: flotilla_protocol::FleetListResponse| {
         fleet
             .declaration_attention
@@ -888,7 +962,10 @@ async fn ops_entries_materialization_scenario() {
         .expect("status")
         .declaration_refused
         .is_none());
-    assert!(ensures.get(&ensure_name).await.expect("retained ensure").status.expect("status").declaration_refused.is_none());
+    ensures.get(&ensure_name).await.expect("retained ensure");
+    let role =
+        flotilla_projections::ports::StandingRoles::reading(&*daemon, "flotilla", "demo", "quartermaster").await.expect("the role reads");
+    assert!(!role.last_failure.is_some_and(|failure| failure.starts_with("DeclarationRefused:")), "the repair clears the role's refusal");
     assert!(!refused(daemon.fleet_list_internal().await.expect("fleet list")), "a repaired declaration needs no one");
 
     std::fs::remove_file(ensure_path).expect("remove ensure entry");
@@ -907,8 +984,11 @@ async fn ops_entries_materialization_scenario() {
         }
     );
     assert!(matches!(ensures.get(&ensure_name).await, Err(flotilla_resources::ResourceError::NotFound { .. })));
-    assert!(
-        matches!(convoys.get(&ensured_convoy_ref).await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+    // A convoy ends on the engine and is never deleted: the torn-down standing convoy reads Abandoned.
+    let ended = convoys.get(&ensured_convoy_ref).await.expect("the ended standing convoy");
+    assert_eq!(
+        ended.status.map(|status| status.phase),
+        Some(flotilla_resources::ConvoyPhase::Abandoned),
         "removing the ops entry must tear down its live standing convoy"
     );
 
@@ -970,47 +1050,39 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
     )
     .expect("write operational entry");
 
-    let authority = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("project-home"));
+    // The Project is written at its own home and arrives here as that home's log does.
+    let authority = flotilla_provisioning_testkit::other_home::OtherHome::open("project-home");
     let mut annotations = BTreeMap::new();
     annotations.insert(BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), ops_spec.key().to_string());
     annotations.insert(BOOTSTRAP_COMMIT_ANNOTATION.to_string(), "replica-commit".to_string());
     annotations.insert(BOOTSTRAP_PATH_ANNOTATION.to_string(), tmp.path().to_string_lossy().into_owned());
     let app = RepositorySpec::remote("https://github.com/example/app").expect("app spec");
-    authority
-        .definitions::<Project>("flotilla")
-        .apply(
-            &InputMeta::builder().name("replicated".to_string()).annotations(annotations).build(),
-            &ProjectSpec::builder()
-                .display_name("replicated".to_string())
-                .default_workflow_ref("single-agent".to_string())
-                .repositories(vec![
-                    flotilla_resources::ProjectRepositorySpec {
-                        charter_store: None,
-                        repo: app.key(),
-                        alias: Some("app".to_string()),
-                        roles: [ProjectRepositoryRole::Code].into_iter().collect(),
-                        subpath: None,
-                        default_branch: None,
-                    },
-                    flotilla_resources::ProjectRepositorySpec {
-                        charter_store: None,
-                        repo: ops_spec.key(),
-                        alias: Some("operations".to_string()),
-                        roles: [ProjectRepositoryRole::Ops].into_iter().collect(),
-                        subpath: None,
-                        default_branch: None,
-                    },
-                ])
-                .build(),
-        )
-        .await
-        .expect("author Project at its home");
-    let snapshot = authority.using::<Project>("flotilla").list().await.expect("list home Project");
-    backend
-        .replica_writer::<Project>(NodeId::new("project-home"), "flotilla")
-        .replace(&snapshot, Utc::now())
-        .await
-        .expect("replicate Project");
+    let spec = ProjectSpec::builder()
+        .display_name("replicated".to_string())
+        .default_workflow_ref("single-agent".to_string())
+        .repositories(vec![
+            flotilla_resources::ProjectRepositorySpec {
+                charter_store: None,
+                repo: app.key(),
+                alias: Some("app".to_string()),
+                roles: [ProjectRepositoryRole::Code].into_iter().collect(),
+                subpath: None,
+                default_branch: None,
+            },
+            flotilla_resources::ProjectRepositorySpec {
+                charter_store: None,
+                repo: ops_spec.key(),
+                alias: Some("operations".to_string()),
+                roles: [ProjectRepositoryRole::Ops].into_iter().collect(),
+                subpath: None,
+                default_branch: None,
+            },
+        ])
+        .build();
+    // Its declaration names the ops repository at its commit, as its home holds it.
+    authority.repository(&ops_spec.key().to_string(), &ops_spec).await;
+    authority.project("replicated", &BTreeMap::new(), &annotations, &spec).await;
+    authority.replicate_to(&daemon.decided_store().expect("decided store"));
 
     let log_output = Arc::new(Mutex::new(Vec::new()));
     let writer = LogCaptureWriter(Arc::clone(&log_output));
@@ -1189,7 +1261,7 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
     init_git_repo_with_remote(&checkout_path, "https://github.com/org/tracked.git");
     let repository_spec = RepositorySpec::remote("https://github.com/org/tracked.git").expect("repository spec");
     let repository_key = repository_spec.key();
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![checkout_path.clone()],
         config,
@@ -1199,6 +1271,7 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    crate::engine(&daemon);
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
 
     let projects = backend.definitions::<Project>("flotilla");
@@ -1243,7 +1316,7 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
     let mirror_url = "https://forgejo.lab/lab/flotilla";
     init_git_repo_with_remote(&mirror_root, mirror_url);
     init_git_repo_with_remote(&github_root, canonical_url);
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let config = test_config(tmp.path().join("config"));
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
@@ -1254,6 +1327,8 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has: they hold no clone here.
+    crate::engine(&daemon);
 
     let canonical = RepositorySpec::remote(mirror_url)
         .expect("mirror observation")
@@ -1330,7 +1405,7 @@ async fn tracked_repo_labels_matching_unlabelled_project_once() {
     std::fs::create_dir(&checkout_path).expect("checkout dir");
     let repository_spec = RepositorySpec::remote("https://github.com/org/tracked.git").expect("repository spec");
     let repository_key = repository_spec.key();
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![checkout_path.clone()],
         config,
@@ -1340,6 +1415,7 @@ async fn tracked_repo_labels_matching_unlabelled_project_once() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    crate::engine(&daemon);
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec.clone(), host_ref: "host-01".to_string() })).await;
 
     let projects = backend.definitions::<Project>("flotilla");
@@ -1456,10 +1532,10 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
                 .action(CommandAction::ConvoyCreate {
                     name: "identity-migrated".into(),
                     workflow_ref: "scratch".into(),
-                    inputs: Vec::new(),
-                    repository_url: None,
+                    // Admission freezes the workflow, so its declared input is given up front.
+                    inputs: vec![("topic".into(), "identity-migrated".into())],
                     r#ref: None,
-                    project_ref: Some("github-com-flotilla-org-andamento".into()),
+                    project_ref: "github-com-flotilla-org-andamento".into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -1467,10 +1543,12 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
         )
         .await
         .expect("convoy create");
-    assert_eq!(
-        await_command_result(&mut rx, convoy_id).await,
-        CommandValue::ConvoyCreated { name: "identity-migrated@github-com-flotilla-org-andamento".into() }
-    );
+    let created = await_command_result(&mut rx, convoy_id).await;
+    let CommandValue::ConvoyCreated { name } = created else { panic!("convoy create: {created:?}") };
+    // Creation reports the launch it admitted under the migrated project, by its address.
+    let address = name.parse::<flotilla_address::Address>().expect("launch address");
+    assert_eq!(address.parent().map(|project| project.to_string()).as_deref(), Some("project:github-com-flotilla-org-andamento"));
+    assert_eq!(address.kind(), flotilla_address::Kind::Convoy);
 }
 
 #[tokio::test]
@@ -1618,7 +1696,7 @@ async fn refresh_surfaces_repository_identity_change_without_materializing_a_pro
 }
 
 #[tokio::test]
-async fn identity_migration_marks_repository_retained_by_durable_checkout() {
+async fn identity_migration_marks_repository_retained_by_engine_checkout() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
     let checkout_path = tmp.path().join("retained");
@@ -1637,21 +1715,18 @@ async fn identity_migration_marks_repository_retained_by_durable_checkout() {
         .await
         .expect("initial repo add");
     assert!(matches!(await_command_result(&mut rx, add_id).await, CommandValue::RepoTracked { .. }));
-    backend
-        .clone()
-        .using::<Checkout>("flotilla")
-        .create(
-            &InputMeta::builder().name("durable-old-checkout".to_string()).build(),
-            &CheckoutSpec::Observed(ObservedCheckoutSpec {
-                r#ref: "main".to_string(),
-                path: checkout_path.to_string_lossy().into_owned(),
-                repo_ref: local_key.clone(),
-                host_ref: "host-01".to_string(),
-                is_main: true,
-            }),
-        )
-        .await
-        .expect("durable checkout");
+    // The engine holds a checkout of the old repository: it retains that repository.
+    flotilla_daemon_testkit::engine::runtime_checkouts(&daemon).put_ready(
+        "durable-old-checkout",
+        &CheckoutSpec::Observed(ObservedCheckoutSpec {
+            r#ref: "main".to_string(),
+            path: checkout_path.to_string_lossy().into_owned(),
+            repo_ref: local_key.clone(),
+            host_ref: "host-01".to_string(),
+            is_main: true,
+        }),
+        None,
+    );
 
     let remote_spec = RepositorySpec::remote("https://github.com/flotilla-org/retained").expect("remote repository spec");
     let remote_key = remote_spec.key();
@@ -1686,7 +1761,7 @@ async fn daemon_start_and_restart_do_not_backfill_projects() {
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("backfilled");
     std::fs::create_dir(&checkout_path).expect("checkout dir");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![checkout_path],
         Arc::clone(&config),
@@ -1712,9 +1787,23 @@ async fn daemon_start_and_restart_do_not_backfill_projects() {
     let projects = backend.clone().using::<Project>("flotilla");
     assert!(projects.list().await.expect("project list").items.is_empty());
     drop(runtime);
+    drop(daemon);
 
-    let _restarted = DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime restart");
+    // A restart composes a new daemon over the same stores, as a restarted flotillad does.
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![tmp.path().join("backfilled")],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let repository_spec = RepositorySpec::remote("https://github.com/org/backfilled.git").expect("repository spec");
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
+    let _restarted = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime restart");
 
+    let projects = daemon.resource_backend().using::<Project>("flotilla");
     assert!(projects.list().await.expect("project list").items.is_empty());
 }
 
@@ -1724,7 +1813,7 @@ async fn daemon_restart_does_not_create_project_while_preserving_applied_project
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("flotilla");
     std::fs::create_dir(&checkout_path).expect("checkout dir");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![checkout_path.clone()],
         Arc::clone(&config),
@@ -1773,10 +1862,25 @@ async fn daemon_restart_does_not_create_project_while_preserving_applied_project
     let remote_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("remote repository spec");
     let remote_key = remote_spec.key();
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
+    let host_ref = daemon.local_host_id().expect("local Host").to_string();
     drop(runtime);
+    drop(daemon);
 
-    let _restarted =
-        DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime should restart after project overlap");
+    // A restart composes a new daemon over the same stores, as a restarted flotillad does.
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![checkout_path],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec), host_ref })).await;
+    let _restarted = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options)
+        .await
+        .expect("runtime should restart after project overlap");
+    let projects = daemon.resource_backend().using::<Project>("flotilla");
 
     let presentation = projects.get("presentation").await.expect("overlapping applied project should survive restart");
     assert_eq!(
@@ -1792,7 +1896,7 @@ async fn daemon_start_skips_a_tracked_repo_that_cannot_be_backfilled() {
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("uninspectable");
     std::fs::create_dir(&checkout_path).expect("checkout dir");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![checkout_path],
         Arc::clone(&config),
@@ -1903,8 +2007,7 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
         backend.clone().using::<Repository>("flotilla").get(&repository_key.to_string()).await.expect("repository should exist");
     assert_eq!(repository.spec, repository_spec);
     repository.spec.verify_key(&repository_key).expect("repository key should verify");
-    let checkouts = daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("checkout list");
-    assert_eq!(checkouts.items.len(), 1);
+    assert_eq!(daemon.discovered_checkouts().all().len(), 1);
     let project = backend.using::<Project>("flotilla").get("my-project").await.expect("project should exist");
     assert_eq!(project.spec.display_name, "My Project");
     // #2719: generated Projects leave workflow choice to the cascade.
@@ -1924,7 +2027,7 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
 
 async fn project_checkout_set_with_store_history(tmp: &tempfile::TempDir, with_history: bool) -> Vec<CheckoutSpec> {
     let config = test_config(tmp.path().join(if with_history { "history-config" } else { "cold-config" }));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -1982,16 +2085,8 @@ async fn project_checkout_set_with_store_history(tmp: &tempfile::TempDir, with_h
         CommandValue::ProjectAdded { name: "view-only".into() }
     );
     assert!(daemon.tracked_repo_paths().await.is_empty(), "project materialization must not depend on Plane-A tracking");
-    let mut specs = daemon
-        .observed_resource_backend()
-        .using::<Checkout>("flotilla")
-        .list()
-        .await
-        .expect("checkout list")
-        .items
-        .into_iter()
-        .map(|checkout| checkout.spec)
-        .collect::<Vec<_>>();
+    let mut specs =
+        daemon.discovered_checkouts().all().into_iter().map(|checkout| CheckoutSpec::Observed(checkout.spec)).collect::<Vec<_>>();
     specs.sort_by_key(|spec| spec.target_path().map(str::to_string));
     specs
 }
@@ -2031,19 +2126,18 @@ async fn repeated_project_materialization_updates_and_retracts_worktree_observat
     checkouts.write().expect("checkout inspection lock should not be poisoned")[1].git_ref = "renamed-feature".to_string();
     execute_project_add(&daemon, &mut rx, main_path.to_string_lossy().into_owned(), None, None).await;
 
-    let observed = daemon.observed_resource_backend().using::<Checkout>("flotilla");
-    let after_update = observed.list().await.expect("updated checkout list").items;
+    let after_update = daemon.discovered_checkouts().all();
     assert_eq!(after_update.len(), 2);
-    assert!(after_update.iter().any(|checkout| {
-        matches!(&checkout.spec, CheckoutSpec::Observed(spec) if spec.path == worktree_path.to_string_lossy() && spec.r#ref == "renamed-feature")
-    }));
+    assert!(after_update
+        .iter()
+        .any(|checkout| checkout.spec.path == worktree_path.to_string_lossy() && checkout.spec.r#ref == "renamed-feature"));
 
     checkouts.write().expect("checkout inspection lock should not be poisoned").pop();
     execute_project_add(&daemon, &mut rx, main_path.to_string_lossy().into_owned(), None, None).await;
 
-    let after_removal = observed.list().await.expect("checkout list after removal").items;
+    let after_removal = daemon.discovered_checkouts().all();
     assert_eq!(after_removal.len(), 1);
-    assert!(matches!(&after_removal[0].spec, CheckoutSpec::Observed(spec) if spec.path == main_path.to_string_lossy()));
+    assert_eq!(after_removal[0].spec.path, main_path.to_string_lossy());
 }
 
 #[tokio::test]
@@ -2062,7 +2156,7 @@ async fn project_add_catalog_slug_needs_no_local_checkout() {
     let result = execute_project_add(&daemon, &mut rx, "catalog-only".to_string(), None, None).await;
 
     assert_eq!(result, CommandValue::ProjectAdded { name: "catalog-only".into() });
-    assert!(daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("checkout list").items.is_empty());
+    assert!(daemon.discovered_checkouts().all().is_empty());
     let project = backend.using::<Project>("flotilla").get("catalog-only").await.expect("project should exist");
     assert_eq!(project.spec.repositories[0].repo, key);
 }
@@ -2215,9 +2309,8 @@ repositories:
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ProjectApplied { name: "labelled".into() });
     let project = projects.get("labelled").await.expect("Project should remain");
     assert_eq!(project.spec.display_name, "After");
+    // The writer's provenance is kept; other labels and annotations are not stamps a Project keeps.
     assert_eq!(project.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
-    assert_eq!(project.metadata.labels.get("example.com/preserved").map(String::as_str), Some("true"));
-    assert_eq!(project.metadata.annotations.get("example.com/note").map(String::as_str), Some("keep"));
 }
 
 #[tokio::test]
@@ -2252,10 +2345,10 @@ async fn convoy_create_carries_project_ref() {
                 .action(CommandAction::ConvoyCreate {
                     name: "linked".into(),
                     workflow_ref: "scratch".into(),
-                    inputs: vec![],
-                    repository_url: None,
+                    // Admission freezes the workflow, so its declared input is given up front.
+                    inputs: vec![("topic".into(), "linked".into())],
                     r#ref: None,
-                    project_ref: Some("my-project".into()),
+                    project_ref: "my-project".into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -2263,7 +2356,7 @@ async fn convoy_create_carries_project_ref() {
         )
         .await
         .expect("execute");
-    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "linked@my-project".into() });
+    let created = await_command_result(&mut rx, id).await;
     let convoy = backend
         .using::<Convoy>("flotilla")
         .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "linked".to_string())]))
@@ -2273,7 +2366,12 @@ async fn convoy_create_carries_project_ref() {
         .into_iter()
         .next()
         .expect("convoy");
-    assert_eq!(convoy.spec.project_ref.as_deref(), Some("my-project"));
+    // Creation reports the launch it admitted, by its address in the linked project.
+    let address =
+        flotilla_resources::convoy::engine::launch_address(&"project:my-project".parse().expect("project"), &convoy.metadata.name)
+            .expect("launch address");
+    assert_eq!(created, CommandValue::ConvoyCreated { name: address.to_string() });
+    assert_eq!(convoy.spec.project_ref, "my-project");
     assert_eq!(convoy.spec.repositories.len(), 1);
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");
     assert_eq!(convoy.spec.repositories[0].target_ref, "main");
@@ -2304,9 +2402,8 @@ async fn unresolved_replicated_project_refs_store_but_block_convoy_admission() {
                     name: "blocked".into(),
                     workflow_ref: "scratch".into(),
                     inputs: Vec::new(),
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: Some("waiting".into()),
+                    project_ref: "waiting".into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -2394,19 +2491,8 @@ async fn image_check_command_reads_the_ref_and_reports_its_build() {
     let inspector = LayerInspector::default();
     daemon.set_repository_inspector(Arc::new(inspector.clone())).await;
     let host = daemon.local_host_id().expect("local host").to_string();
-    let hosts = backend.using::<flotilla_resources::Host>("flotilla");
-    let current = match hosts.get(&host).await {
-        Ok(current) => current,
-        Err(_) => hosts.create(&InputMeta::builder().name(host.clone()).build(), &Default::default()).await.expect("host"),
-    };
-    let mut status = current.status.clone().unwrap_or_default();
-    let mut description = match status.description.clone() {
-        Some(description) => description,
-        None => daemon.local_host_summary().await,
-    };
-    description.system.arch = Some("x86_64".into());
-    status.description = Some(description);
-    hosts.update_status(&host, &current.metadata.resource_version, &status).await.expect("host arch");
+    // The build's architecture is the host's own: the runtime's startup heartbeat publishes it
+    // before `start_daemon` returns, and the heartbeats after it publish the same one.
 
     let repository = RepositorySpec::remote("https://github.com/example/demo").expect("repository");
     backend
@@ -2425,10 +2511,10 @@ async fn image_check_command_reads_the_ref_and_reports_its_build() {
     project.image = Some(flotilla_resources::ImageSelection { base: Some("base".into()), layers: Vec::new() });
     let meta = InputMeta::builder()
         .name("demo".into())
-        .annotations(BTreeMap::from([(
-            flotilla_resources::definition_provenance::BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(),
-            repository.key().to_string(),
-        )]))
+        .annotations(BTreeMap::from([
+            (flotilla_resources::definition_provenance::BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), repository.key().to_string()),
+            (BOOTSTRAP_COMMIT_ANNOTATION.to_string(), "demo-commit".to_string()),
+        ]))
         .build();
     backend.using::<Project>("flotilla").create(&meta, &project).await.expect("project");
     let layer = |name: &str, tier: ImageLayerTier, provides: &[&str]| {

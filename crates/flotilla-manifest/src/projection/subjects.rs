@@ -121,15 +121,26 @@ fn observe<T: PresentationValue>(
 
 pub(super) fn project_role_attempts(catalog: &mut Catalog, role: &StandingRoleRow, convoys: &[ConvoyRow]) {
     let attempts = standing_attempts(role, convoys);
-    let current = attempts.iter().rev().find(|convoy| !convoy.phase.is_terminal()).copied();
+    let current = attempts.iter().rev().find(|convoy| convoy.is_live()).copied();
     let convoy_ref =
         |convoy: &ConvoyRow| entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
     let mut facts = vec![
         (KEY_ROLE_ATTEMPTS, MetadataValue::EntityRefs(attempts.iter().map(|convoy| convoy_ref(convoy)).collect())),
         (KEY_ROLE_DESIRED_STATE, MetadataValue::text("running")),
-        (KEY_ROLE_STATE, MetadataValue::text(if role.hold.is_some() { "held" } else { "active" })),
-        (KEY_ROLE_RESTART_COUNT, MetadataValue::Integer(i64::from(role.strikes))),
+        (
+            KEY_ROLE_STATE,
+            MetadataValue::text(if role.state_unknown {
+                "unknown"
+            } else if role.hold.is_some() {
+                "held"
+            } else {
+                "active"
+            }),
+        ),
     ];
+    if !role.state_unknown {
+        facts.push((KEY_ROLE_RESTART_COUNT, MetadataValue::Integer(i64::from(role.strikes))));
+    }
     if let Some(next) = role.next_attempt {
         facts.push((KEY_ROLE_NEXT_ATTEMPT, MetadataValue::text(next.to_rfc3339())));
     }
@@ -173,17 +184,18 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     let mut convoy_edges = BTreeMap::new();
     for convoy in input.convoys {
         let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
-        if let Some((project, _)) = super::project_fact(convoy.project_ref.as_deref(), "fleet") {
+        if let Some((project, _)) = super::project_fact(Some(&convoy.project_ref), "fleet") {
             projects.insert(convoy_entity.clone(), project.id);
         }
         // A future finished_at from clock skew remains in the window until
         // the local clock catches up; it must not disappear prematurely.
-        let visible = !convoy.phase.is_terminal()
-            || (convoy.phase == ConvoyPhase::Landed
+        let landed_convoy = convoy.phase == Some(ConvoyPhase::Landed);
+        let visible = !convoy.is_ended()
+            || (landed_convoy
                 && convoy.finished_at.zip(observations.now).is_some_and(|(finished, now)| (now - finished).num_seconds() < 86_400));
         let mut forward: BTreeMap<Relationship, BTreeSet<EntityRef>> = BTreeMap::new();
         for entry in &convoy.subjects {
-            if convoy.phase == ConvoyPhase::Landed {
+            if landed_convoy {
                 landed.insert(entry.subject.clone());
             }
             if !visible {
@@ -218,7 +230,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         let role_ref = role_entity(role);
         projects.insert(role_ref.clone(), entity::project(&role.resource.namespace, super::role_project(role), "fleet").id);
         let attempts = standing_attempts(role, input.convoys);
-        let current = attempts.iter().rev().find(|convoy| !convoy.phase.is_terminal()).copied();
+        let current = attempts.iter().rev().find(|convoy| convoy.is_live()).copied();
         let mut facts = Vec::new();
         if let Some(convoy) = current {
             let target = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
@@ -351,7 +363,7 @@ pub fn change_request_facts(status: Option<&flotilla_resources::ChangeRequestSta
     let mut facts = vec![(
         KEY_CHANGE_REQUEST_READINESS,
         MetadataValue::text(
-            status.map(|status| super::change_request_readiness(status, landed).as_str()).unwrap_or("awaiting_review_response"),
+            status.map(|status| super::change_request_readiness(status, landed)).unwrap_or(super::ChangeRequestReadiness::Unknown).as_str(),
         ),
     )];
     if let Some(status) = status {

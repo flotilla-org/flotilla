@@ -7,15 +7,12 @@
 //! and a branch defining both is refused as the sync refuses it. The
 //! composition then resolves exactly as
 //! admission resolves it (the project's `image:` or the cascaded installation
-//! defaults, `--need`, and the harness adapters), and its ImageBuild is
-//! planned and get-or-created through admission's machinery. Builds are once
-//! per identity, so a check of an unchanged composition reuses the existing
-//! build and its result. Definition errors and resolution refusals are
+//! defaults, `--need`, and the harness adapters), and its image build is
+//! planned and demanded at this home through admission's machinery. Builds are
+//! once per identity, so a check of an unchanged composition reuses the
+//! existing build and its result. Definition errors and resolution refusals are
 //! reported per layer and create no build.
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_charter::charter_store::{
@@ -26,11 +23,11 @@ use flotilla_protocol::image_check::{
     ImageCheckRequest, ImageCheckShadow, ImageLayerReport, ImageProbeReport,
 };
 use flotilla_protocol::LifecycleReading;
-use flotilla_resources::lifecycle_reads::LifecycleReads;
+use flotilla_provisioning::engine::image_build_actuator::build_logs_of;
+use flotilla_resources::{image_build_records::ImageBuildRecord, lifecycle_reads::LifecycleReads};
 use flotilla_resources::{
-    parse_layer_directory, CapabilityNeed, CharterSource, ImageBuildFailureClass, ImageBuildPhase, ImageBuildSpec, ImageBuildStatus,
-    ImageCatalogue, ImageDelivery, ImageLayerResourceSpec, ImageLayerSource, ImageLayerSpec, ImageProbeOutcome, ImageRequest,
-    ImageResolutionError, Project, ProjectSpec, ResourceError, MANAGED_BY_LABEL,
+    parse_layer_directory, CapabilityNeed, CharterSource, ImageBuildSpec, ImageCatalogue, ImageDelivery, ImageLayerResourceSpec,
+    ImageLayerSource, ImageLayerSpec, ImageRequest, ImageResolutionError, Project, ProjectSpec, ResourceError, MANAGED_BY_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
@@ -198,9 +195,9 @@ pub async fn check_image(
         request.architecture.as_deref(),
     )
     .await?;
-    let created = flotilla_admission::image_build::create_planned_builds(backend, namespace, std::slice::from_ref(&planned)).await?;
-    report.reused = created.is_empty();
-    report.build = Some(image_build_report(backend, namespace, &planned.name, reads).await?);
+    let demanded = flotilla_admission::image_build::demand_planned_builds(Arc::clone(&reads), std::slice::from_ref(&planned)).await?;
+    report.reused = demanded.is_empty();
+    report.build = Some(image_build_report(reads, &planned.name).await?);
     Ok(report)
 }
 
@@ -251,74 +248,45 @@ fn resolution_layers(error: &ImageResolutionError) -> Vec<String> {
     }
 }
 
-/// One ImageBuild as a check reports it, from the most advanced copy.
-pub async fn image_build_report(
-    backend: &ResourceBackend,
-    namespace: &str,
-    name: &str,
-    reads: Arc<dyn LifecycleReads>,
-) -> Result<ImageBuildReport, String> {
-    let selected = match flotilla_store::read_image_build(backend, namespace, name, reads).await {
-        Ok(selected) => selected,
-        Err(ResourceError::NotFound { .. }) => return Err(format!("ImageBuild `{name}` does not exist")),
-        Err(error) => return Err(error.to_string()),
-    };
-    let build = selected.build.object;
-    let spec = build.spec.current().ok_or_else(|| format!("ImageBuild `{name}` is a retired record"))?;
-    Ok(build_report(name, spec, build.status.as_ref(), selected.lifecycle.as_ref()))
+/// One image build as a check reports it: its newest launch at its builder, or its demand here
+/// before the builder has launched it.
+pub async fn image_build_report(reads: Arc<dyn LifecycleReads>, name: &str) -> Result<ImageBuildReport, String> {
+    let owned = name.to_owned();
+    let (launched, demanded) = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+        let builds = reads.image_builds()?;
+        match builds.get(&owned)? {
+            Some(launched) => Ok((Some(launched), None)),
+            None => Ok::<_, String>((None, builds.demanded(&owned)?)),
+        }
+    }))
+    .await
+    .map_err(|error| format!("read image build {name}: {error}"))??;
+    match (launched, demanded) {
+        (Some(launched), _) => Ok(build_report(name, &launched.spec, Some(&launched))),
+        (None, Some(spec)) => Ok(build_report(name, &spec, None)),
+        (None, None) => Err(format!("image build `{name}` is neither demanded here nor launched")),
+    }
 }
 
-/// Combine ordered layers and actuator observations with the selected lifecycle judgement.
-/// Old phase, digest and failure decide the report only when the engine holds no resource.
-fn build_report(
-    name: &str,
-    spec: &ImageBuildSpec,
-    status: Option<&ImageBuildStatus>,
-    lifecycle: Option<&LifecycleReading>,
-) -> ImageBuildReport {
-    let status = status.cloned().unwrap_or_default();
-    let legacy_failure = || {
-        status.failure.as_ref().map(|failure| ImageBuildFailureReport {
-            class: match failure.class {
-                ImageBuildFailureClass::Infrastructure => "infrastructure".to_string(),
-                ImageBuildFailureClass::Recipe => "recipe".to_string(),
-            },
-            reason: failure.reason.clone(),
-        })
-    };
-    let lifecycle_failure = |reason: String| Some(ImageBuildFailureReport { class: "lifecycle".into(), reason });
-    let running = status.attempt_started_since(None);
-    let pending_phase = if running { ImageBuildReportPhase::Building } else { ImageBuildReportPhase::Queued };
-    let (phase, settled, digest, failure) = match lifecycle {
+/// The report of build `name` building `spec`: `launched` is its newest launch, `None` while
+/// only demanded. Probe outcomes are kept in each try's build log, not here.
+fn build_report(name: &str, spec: &ImageBuildSpec, launched: Option<&ImageBuildRecord>) -> ImageBuildReport {
+    let failure_of = |class: &str, reason: &str| Some(ImageBuildFailureReport { class: class.into(), reason: reason.to_owned() });
+    let lifecycle_failure = |reason: String| failure_of("lifecycle", &reason);
+    let (phase, settled, digest, failure) = match launched.map(|launched| &launched.reading) {
+        None => (ImageBuildReportPhase::Queued, false, None, None),
         Some(LifecycleReading::Ready { identity }) => (ImageBuildReportPhase::Built, true, Some(identity.clone()), None),
-        Some(LifecycleReading::InProgress) => (pending_phase, false, None, None),
-        Some(LifecycleReading::Retrying { next, cause, .. }) => {
-            // A started attempt is an actuator observation; the engine alone decides whether it may retry.
-            let phase =
-                if status.attempt_started_since(Some(*next)) { ImageBuildReportPhase::Building } else { ImageBuildReportPhase::Queued };
-            (phase, false, None, lifecycle_failure(cause.clone()))
-        }
-        Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause }) => {
-            (ImageBuildReportPhase::Failed, true, None, lifecycle_failure(cause.clone()))
-        }
-        Some(ending @ (LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Failed { .. })) => {
+        Some(LifecycleReading::InProgress) => (ImageBuildReportPhase::Building, false, None, None),
+        Some(LifecycleReading::Retrying { cause, .. }) => (ImageBuildReportPhase::Queued, false, None, failure_of("infrastructure", cause)),
+        // A build gives up at once only on a recipe failure, whose cause names its owning layer;
+        // it is exhausted by infrastructure failures.
+        Some(LifecycleReading::GaveUp { cause }) => (ImageBuildReportPhase::Failed, true, None, failure_of("recipe", cause)),
+        Some(LifecycleReading::Exhausted { cause }) => (ImageBuildReportPhase::Failed, true, None, failure_of("infrastructure", cause)),
+        Some(ending @ (LifecycleReading::Lost { .. } | LifecycleReading::Released | LifecycleReading::Failed { .. })) => {
             (ImageBuildReportPhase::Failed, true, None, lifecycle_failure(ending.reason().unwrap_or_default()))
         }
-        None => {
-            let phase = match status.phase {
-                ImageBuildPhase::Queued => ImageBuildReportPhase::Queued,
-                ImageBuildPhase::Building => ImageBuildReportPhase::Building,
-                ImageBuildPhase::Built => ImageBuildReportPhase::Built,
-                ImageBuildPhase::Failed => ImageBuildReportPhase::Failed,
-            };
-            (phase, status.is_settled(), status.digest.clone(), legacy_failure())
-        }
     };
-    let finished = match lifecycle {
-        Some(_) => settled,
-        None => matches!(status.phase, ImageBuildPhase::Built | ImageBuildPhase::Failed),
-    };
-    let probes = status.probes.iter().map(|probe| (probe.layer.as_str(), &probe.outcome)).collect::<BTreeMap<_, _>>();
+    let tried = launched.is_some_and(|launched| settled || launched.failures > 0);
     let layers = spec
         .layers
         .iter()
@@ -327,17 +295,12 @@ fn build_report(
             source: layer.source.to_string(),
             version: layer.version.clone(),
             tier: layer.tier.to_string(),
-            probe: match probes.get(layer.name.as_str()) {
-                Some(ImageProbeOutcome::Passed) => ImageProbeReport::Passed,
-                Some(ImageProbeOutcome::Failed { reason }) => ImageProbeReport::Failed { reason: reason.clone() },
-                Some(ImageProbeOutcome::NotRun) => ImageProbeReport::NotRun,
-                None if finished => ImageProbeReport::NotRun,
-                None => ImageProbeReport::Pending,
-            },
+            probe: if tried { ImageProbeReport::InBuildLog } else { ImageProbeReport::Pending },
         })
         .collect();
     ImageBuildReport {
         name: name.to_string(),
+        launch: launched.map(|launched| launched.launch.clone()),
         identity: spec.identity.clone(),
         architecture: spec.architecture.clone(),
         builder_host: spec.host_ref.clone(),
@@ -347,86 +310,10 @@ fn build_report(
         },
         phase,
         settled,
-        attempt: match lifecycle {
-            Some(LifecycleReading::InProgress) => u32::from(running),
-            Some(LifecycleReading::Retrying { failures, next, .. }) => {
-                failures.saturating_add(u32::from(status.attempt_started_since(Some(*next))))
-            }
-            _ => status.attempt,
-        },
+        attempt: launched.map_or(0, |launched| launched.failures),
         digest,
         layers,
         failure,
-        log_ref: status.log_ref.clone().filter(|reference| !reference.is_empty()),
-    }
-}
-
-#[cfg(test)]
-mod lifecycle_contract {
-    use super::*;
-    use flotilla_provisioning::engine::image_build::ImageBuildBinding;
-    use flotilla_provisioning_testkit::{image_build, store_object, Ending, LifecycleFixture};
-    use flotilla_resources::ImageBuild;
-    use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
-
-    // A retry's in-flight observation counts only at or after the engine's deadline.
-    #[test]
-    fn retry_report_observation_crosses_deadline() {
-        let obj = image_build(ImageBuildPhase::Built);
-        let spec = obj.spec.current().expect("live image");
-        let next = chrono::DateTime::from_timestamp(100, 0).expect("fixed deadline");
-        let lifecycle = LifecycleReading::Retrying { failures: 1, next, cause: "network".into() };
-        for (offset, expected) in
-            [(-1, ImageBuildReportPhase::Queued), (0, ImageBuildReportPhase::Building), (1, ImageBuildReportPhase::Building)]
-        {
-            let mut status = obj.status.clone().expect("observations");
-            status.started_at = Some(next + chrono::Duration::seconds(offset));
-            status.finished_at = None;
-            let report = build_report("image", spec, Some(&status), Some(&lifecycle));
-            assert_eq!(report.phase, expected);
-            assert!(!report.settled);
-            assert_eq!(report.failure.expect("engine cause").reason, "network");
-        }
-    }
-
-    // Reports select engine digest/cause at the chosen origin while old Built evidence stays unchanged.
-    #[tokio::test]
-    async fn image_reports_follow_engine_without_a_copy() {
-        for replica in [false, true] {
-            let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_read_counts();
-            let author = if replica {
-                flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())
-            } else {
-                backend.clone()
-            };
-            let obj = image_build(ImageBuildPhase::Built);
-            let name = obj.metadata.name.as_str();
-            store_object(&author, obj.clone()).await;
-            if replica {
-                backend
-                    .replica_writer::<ImageBuild>(flotilla_protocol::NodeId::new("home"), "flotilla")
-                    .replace(&author.using::<ImageBuild>("flotilla").list().await.expect("snapshot"), chrono::Utc::now())
-                    .await
-                    .expect("replica");
-            }
-            let fixture = LifecycleFixture::<ImageBuildBinding>::new(replica);
-            fixture.request(&obj);
-            let report = || image_build_report(&backend, "flotilla", name, fixture.reads.clone());
-            let (requested, counts) = measure_reads(report()).await;
-            counts.of(&backend).assert_no_lists("one named image report");
-            let requested = requested.expect("requested");
-            assert_eq!((requested.phase, requested.attempt), (ImageBuildReportPhase::Queued, 0));
-            assert!(requested.digest.is_none());
-            fixture.retry(&obj, "network");
-            assert_eq!(report().await.expect("retry").attempt, 1);
-            fixture.finish(&obj, Ending::Ready("engine digest"));
-            assert_eq!(report().await.expect("ready").digest.as_deref(), Some("engine digest"));
-            fixture.finish(&obj, Ending::Lost("engine digest"));
-            let lost = report().await.expect("lost");
-            assert_eq!(lost.phase, ImageBuildReportPhase::Failed);
-            assert_eq!(lost.failure.expect("reason").reason, "observed absent");
-            fixture.poison();
-            assert!(report().await.expect_err("checked read").contains("poisoned"));
-        }
+        log_ref: launched.filter(|_| tried).map(|launched| build_logs_of(&launched.launch)),
     }
 }

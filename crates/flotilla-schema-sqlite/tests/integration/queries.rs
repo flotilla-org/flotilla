@@ -2,20 +2,20 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::{Address, IndexQuery, Kind, Ref, State, Timestamp};
+use flotilla_schema::{Address, IndexQuery, Kind, Labelled, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{Cursor, Page, ResourceId, Store, StoreError, MAX_PAGE};
 use flotilla_state_machines::machines::{
+    awaiting_reply::{AwaitingReplySpec, AwaitingReplyState},
     convoy::{ConvoySpec, ConvoyState},
-    ensure::EnsureSpec,
     lifecycle::LifecycleState,
-    message::{MessageSpec, MessageState},
+    message::{MessageLabel, MessageSpec, MessageState},
 };
 use hegel::{generators as gs, TestCase};
 use rusqlite::Connection;
 
 use crate::fixtures::{
-    convoy, ensure, message, origin, registry, store, terminal, terminal::TerminalRequest, AgentSession, Convoy, Ensure, Fixture, Message,
-    Pick, Referral, Resource, TerminalSession, Vessel, LOCAL,
+    awaiting_reply, convoy, message, origin, registry, store, terminal, terminal::TerminalRequest, AgentSession, AwaitingReply, Convoy,
+    Fixture, Message, Pick, Referral, Resource, TerminalSession, Vessel, LOCAL,
 };
 
 /// Every id of `query`, page by page with `limit`. Each page holds at most `limit` ids, a page
@@ -37,6 +37,32 @@ fn collect<K>(store: &mut Store, query: &IndexQuery<K>, limit: u32) -> Vec<Resou
         }
     }
     panic!("paging {} did not end", query.index());
+}
+
+/// Every id of `query` from the top, page by page with `limit`, under the same page rules.
+fn collect_back<K>(store: &mut Store, query: &IndexQuery<K>, limit: u32) -> Vec<ResourceId> {
+    let mut read = store.read().expect("read");
+    let mut ids = Vec::new();
+    let mut before: Option<Cursor> = None;
+    for _ in 0..1_000 {
+        let page = read.page_back(query, before.as_ref(), limit).expect("page back");
+        assert!(page.ids.len() <= limit as usize);
+        if page.next.is_some() {
+            assert_eq!(page.ids.len(), limit as usize, "only a full page has a successor");
+        }
+        ids.extend(page.ids);
+        match page.next {
+            Some(cursor) => before = Some(cursor),
+            None => return ids,
+        }
+    }
+    panic!("paging {} back did not end", query.index());
+}
+
+/// `collect` and `collect_back` both match `want`, the one ascending and the other reversed.
+fn both_ways<K>(store: &mut Store, query: &IndexQuery<K>, limit: u32, want: Vec<ResourceId>, what: &str) {
+    assert_eq!(collect(store, query, limit), want, "{what}");
+    assert_eq!(collect_back(store, query, limit), want.into_iter().rev().collect::<Vec<_>>(), "{what} from the top");
 }
 
 /// Every id the startup scan returns for `home`, page by page.
@@ -70,7 +96,7 @@ fn small_time(tc: &TestCase) -> Timestamp {
 /// A drawn message whose indexed fields come from small domains, so equal order values (ties
 /// broken by id) and shared inboxes occur, in every label.
 fn drawn_message(tc: &TestCase) -> Resource<Message> {
-    drawn_spec(tc, message::generate(tc, Pick::Draw).with_state(State::new(message::state_value(tc, Pick::Draw), Timestamp(0))))
+    drawn_spec(tc, message::generate(tc, Pick::Draw).with_state(State::new(message::state_value(tc, Pick::Draw), small_time(tc))))
 }
 
 /// `message` with a drawn inbox and deadline from the small domains.
@@ -93,11 +119,22 @@ fn check_messages(tc: &TestCase, store: &mut Store, model: &BTreeMap<ResourceId,
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
     for inbox in ["i0", "i1"] {
         let inbox = project(inbox);
-        let want = expected(model, |m| *m.state() == MessageState::Pending && m.spec().inbox == inbox, |m| m.spec().admitted_seq);
-        assert_eq!(collect(store, &MessageSpec::pending_by_inbox(&inbox), limit), want, "pending_by_inbox {inbox}");
+        for label in [MessageLabel::Pending, MessageLabel::Awaiting, MessageLabel::Settled] {
+            let want = expected(model, |m| *m.state().label() == label && m.spec().inbox == inbox, |m| m.spec().admitted_seq);
+            both_ways(store, &MessageSpec::by_inbox(&inbox, &label), limit, want, &format!("by_inbox {inbox} {label:?}"));
+        }
+        let want = expected(
+            model,
+            |m| m.state().delivered_at().is_some() && m.spec().inbox == inbox,
+            |m| m.state().delivered_at().map(Timestamp::micros),
+        );
+        both_ways(store, &MessageSpec::delivered_by_inbox(&inbox), limit, want, &format!("delivered_by_inbox {inbox}"));
+        let settled = |m: &Resource<Message>| matches!(m.state(), MessageState::Settled { .. });
+        let want = expected(model, |m| settled(m) && m.spec().inbox == inbox, |m| m.since().micros());
+        both_ways(store, &MessageSpec::settled_by_inbox(&inbox), limit, want, &format!("settled_by_inbox {inbox}"));
     }
     let want = expected(model, |m| open(m) && m.spec().deadline.is_some(), |m| m.spec().deadline.map(Timestamp::micros));
-    assert_eq!(collect(store, &MessageSpec::deadline(), limit), want, "deadline");
+    both_ways(store, &MessageSpec::deadline(), limit, want, "deadline");
     let all: Vec<ResourceId> = model.keys().copied().collect();
     assert_eq!(scan_all::<Resource<Message>>(store, LOCAL, limit), all, "scan");
     assert_eq!(scan_all::<Resource<Message>>(store, "elsewhere", limit), Vec::<ResourceId>::new());
@@ -145,7 +182,7 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
         assert!(identities.values().any(|id| id.0 == boundary));
         assigned_ids.push(identities);
 
-        let ids = collect(&mut replica, &MessageSpec::pending_by_inbox(&project("inbox")), limit);
+        let ids = collect(&mut replica, &MessageSpec::by_inbox(&project("inbox"), &MessageLabel::Pending), limit);
         let mut read = replica.read().expect("read");
         let rows: Vec<_> = ids
             .iter()
@@ -165,7 +202,7 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
         // The key-only lower-bound route returns the same home order without bodies,
         // excluding tied admissions at other homes before applying each page limit.
         for home in ["sender-a", "sender-b"] {
-            let query = MessageSpec::pending_by_inbox(&project("inbox"));
+            let query = MessageSpec::by_inbox(&project("inbox"), &MessageLabel::Pending);
             let mut after = 0;
             let mut keys = Vec::new();
             loop {
@@ -186,11 +223,31 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
             assert!(read.integer_index_keys(&query, home, i64::MAX, 1).unwrap().is_empty());
             assert_eq!(read.integer_index_keys(&query, home, i64::MIN, 1).unwrap()[0].1, 1);
             assert!(matches!(
-                read.integer_index_keys(&EnsureSpec::by_inbox(&project("inbox")), home, 0, 1),
+                read.integer_index_keys(&ConvoySpec::open_by_project(&project("inbox")), home, 0, 1),
                 Err(StoreError::IntegerIndex { .. })
             ));
             assert!(read.integer_index_keys(&query, "missing", 0, limit).unwrap().is_empty());
             assert!(matches!(read.integer_index_keys(&query, home, 0, 0), Err(StoreError::ZeroLimit)));
+            // The upper-bound route walks the same home's keys down from the bound, highest first.
+            let mut before = i64::MAX;
+            let mut down = Vec::new();
+            loop {
+                let page = read.integer_index_keys_before(&query, home, before, limit).expect("keys before");
+                assert!(page.len() <= limit as usize);
+                let Some(&(_, last)) = page.last() else { break };
+                before = last;
+                for (id, seq) in page {
+                    assert_eq!(read.identity(id).unwrap().unwrap().0.home, home);
+                    down.push(seq);
+                }
+            }
+            assert_eq!(down, (1..=12).rev().collect::<Vec<_>>());
+            assert_eq!(read.integer_index_keys_before(&query, home, 7, 1).unwrap()[0].1, 6);
+            assert!(read.integer_index_keys_before(&query, home, 1, 1).unwrap().is_empty());
+            assert!(matches!(
+                read.integer_index_keys_before(&ConvoySpec::open_by_project(&project("inbox")), home, 0, 1),
+                Err(StoreError::IntegerIndex { .. })
+            ));
         }
         snapshots.reverse();
     }
@@ -309,12 +366,13 @@ fn project(name: &str) -> Address {
 
 // Behaviour (DESIGN queries): the other engine kinds' indexes, an interned `eq` under a label
 // predicate (Convoy's open convoys of a project, a terminal session pool's live sessions), a
-// reference `eq` ordered by a spec column (a vessel's sessions) and a bare interned `eq` (an
-// Ensure's inbox), select and order as declared.
+// reference `eq` ordered by a spec column (a vessel's sessions), an interned address `eq` under a
+// label predicate (an AwaitingReply's open records of a sender) and a bare reference `eq` (an
+// AwaitingReply's message), select and order as declared.
 #[hegel::test(test_cases = 40)]
 fn other_fixture_indexes_match_the_model(tc: TestCase) {
     let mut store = store();
-    let (mut convoys, mut sessions, mut ensures) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+    let (mut convoys, mut sessions, mut records) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
     let pick = |names: &[&str]| tc.draw(gs::sampled_from(names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>()));
     let mut write = store.write().expect("write");
     for n in 0..tc.draw(gs::integers::<usize>().max_value(8)) {
@@ -334,9 +392,14 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
         sessions.insert(write.insert(&format!("t{n}"), &session, &origin()).expect("insert").id, session);
     }
     for n in 0..tc.draw(gs::integers::<usize>().max_value(6)) {
-        let ensure = ensure::generate(&tc, Pick::Draw);
-        let ensure = ensure.clone().with_spec(EnsureSpec { inbox: project(&pick(&["i0", "i1"])), ..ensure.spec().clone() });
-        ensures.insert(write.insert(&format!("e{n}"), &ensure, &origin()).expect("insert").id, ensure);
+        let record = awaiting_reply::generate(&tc, Pick::Draw);
+        let spec = AwaitingReplySpec {
+            sender: project(&pick(&["s0", "s1"])),
+            message: Ref::new(pick(&["m0", "m1"]), LOCAL),
+            ..record.spec().clone()
+        };
+        let record = record.clone().with_spec(spec);
+        records.insert(write.insert(&format!("a{n}"), &record, &origin()).expect("insert").id, record);
     }
     write.commit().expect("commit");
     let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
@@ -355,10 +418,15 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
         let want = expected(&sessions, |s: &TerminalSession| live(s) && s.spec().pool == pool, |_| ());
         assert_eq!(collect(&mut store, &TerminalRequest::live_by_pool(&pool.to_owned()), limit), want);
     }
-    for inbox in ["i0", "i1", "i2"] {
-        let inbox = project(inbox);
-        let want = expected(&ensures, |e: &Resource<Ensure>| e.spec().inbox == inbox, |_| ());
-        assert_eq!(collect(&mut store, &EnsureSpec::by_inbox(&inbox), limit), want);
+    for sender in ["s0", "s1", "s2"] {
+        let sender = project(sender);
+        let open = |a: &Resource<AwaitingReply>| matches!(a.state(), AwaitingReplyState::Open);
+        let want = expected(&records, |a: &Resource<AwaitingReply>| open(a) && a.spec().sender == sender, |_| ());
+        assert_eq!(collect(&mut store, &AwaitingReplySpec::open_by_sender(&sender), limit), want);
+    }
+    for message in ["m0", "m1", "m2"] {
+        let want = expected(&records, |a: &Resource<AwaitingReply>| a.spec().message.name == message, |_| ());
+        assert_eq!(collect(&mut store, &AwaitingReplySpec::by_message(&Ref::new(message, LOCAL)), limit), want);
     }
 }
 
@@ -370,6 +438,30 @@ fn insert_messages(store: &mut Store, count: usize, value: impl Fn(usize) -> Res
     write.commit().expect("commit");
 }
 
+// Behaviour: rows tied on a Timestamp order (messages delivered in the same microsecond) continue by
+// id across a page boundary both ways: every row once, none skipped at the tie, ascending from the
+// bottom and descending from the top.
+#[test]
+fn rows_tied_on_delivered_at_page_across_the_boundary_both_ways() {
+    let mut store = store();
+    let at = |n: usize| Timestamp(if (1..=4).contains(&n) { 50 } else { n as i64 * 10 });
+    insert_messages(&mut store, 6, |n| {
+        message::sample().with_state(State::new(
+            MessageState::Awaiting { receiver: message::agent(&format!("s{n}"), LOCAL), delivered_at: at(n) },
+            at(n),
+        ))
+    });
+    let mut read = store.read().expect("read");
+    let ids: Vec<ResourceId> =
+        (0..6).map(|n| read.resolve(Resource::<Message>::CODE, &format!("m{n}"), LOCAL).expect("resolve").expect("present")).collect();
+    drop(read);
+    // m0 at 0, m1..m4 tied at 50, m5 at 50 too (5 * 10): five rows tied, ordered by id.
+    let want = ids.clone();
+    for limit in [1, 2, 3] {
+        both_ways(&mut store, &MessageSpec::delivered_by_inbox(&project("inbox")), limit, want.clone(), &format!("tied, limit {limit}"));
+    }
+}
+
 // Behaviour (DESIGN queries): an `eq` argument this store has never seen (an unknown inbox, an
 // unknown session reference, an unknown pool) matches nothing, and running the query creates no
 // identity or string.
@@ -378,7 +470,7 @@ fn unknown_arguments_give_an_empty_page_and_create_nothing() {
     let mut store = store();
     insert_messages(&mut store, 2, |_| message::sample());
     let mut read = store.read().expect("read");
-    let page = read.page(&MessageSpec::pending_by_inbox(&project("never")), None, 10).expect("page");
+    let page = read.page(&MessageSpec::by_inbox(&project("never"), &MessageLabel::Pending), None, 10).expect("page");
     assert_eq!(page, Page { ids: vec![], next: None });
     let page = read.page(&Referral::by_session(&Ref::new("never", LOCAL)), None, 10).expect("page");
     assert!(page.ids.is_empty());
@@ -408,10 +500,10 @@ fn cursors_are_bound_to_their_query() {
     write.commit().expect("commit");
 
     let mut read = store.read().expect("read");
-    let inbox = MessageSpec::pending_by_inbox(&project("inbox"));
+    let inbox = MessageSpec::by_inbox(&project("inbox"), &MessageLabel::Pending);
     let cursor = read.page(&inbox, None, 1).expect("page").next.expect("more follow");
     assert_eq!(read.page(&inbox, Some(&cursor), 5).expect("continue").ids.len(), 2);
-    let other_inbox = MessageSpec::pending_by_inbox(&project("other"));
+    let other_inbox = MessageSpec::by_inbox(&project("other"), &MessageLabel::Pending);
     assert!(matches!(read.page(&other_inbox, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
     let deadline = MessageSpec::deadline();
     assert!(matches!(read.page(&deadline, Some(&cursor), 5), Err(StoreError::CursorMismatch { .. })));
@@ -426,7 +518,7 @@ fn limits_are_required_and_capped() {
     let mut store = store();
     insert_messages(&mut store, MAX_PAGE as usize + 1, |_| message::sample());
     let mut read = store.read().expect("read");
-    let inbox = MessageSpec::pending_by_inbox(&project("inbox"));
+    let inbox = MessageSpec::by_inbox(&project("inbox"), &MessageLabel::Pending);
     assert!(matches!(read.page(&inbox, None, 0), Err(StoreError::ZeroLimit)));
     assert!(matches!(read.scan::<Resource<Message>>(LOCAL, None, 0), Err(StoreError::ZeroLimit)));
     let page = read.page(&inbox, None, u32::MAX).expect("page");

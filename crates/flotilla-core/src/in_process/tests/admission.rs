@@ -1,39 +1,39 @@
 use flotilla_admission::support::{ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot, prepared_snapshot_name};
 use flotilla_resources::checkout_integration::change_request_subjects_from_claim;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use chrono::Utc;
-use flotilla_config::ConfigStore;
-use flotilla_protocol::result_set::ConvoyChangeRequest;
-use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId};
-use flotilla_resources::{
-    BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus,
-    CheckoutWorktreeSpec as ResourceCheckoutWorktreeSpec, ConditionValue, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec,
-    ConvoyStatusPatch, CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
-    FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, ImageAcquisitionCost, InputMeta,
-    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec, ResourceObject,
-    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
-};
-use flotilla_store::ResourceBackend;
-
-use super::support::{create_host_direct_placement, test_meta, ForgeAwareTestChangeRequestFactory};
-use crate::in_process::{CheckoutArchiveStatus, CheckoutIntegrationStatus, InProcessDaemon, IntegrationCondition};
+use super::support::{admit, convoy_engine, create_host_direct_placement, test_meta, ForgeAwareTestChangeRequestFactory};
+use crate::in_process::{CheckoutArchiveStatus, InProcessDaemon};
 use crate::testkits::discovery::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
 use crate::testkits::replay::testing::MockRunner;
+use async_trait::async_trait;
+use chrono::Utc;
 use flotilla_admission::convoy_admission::{KindCandidate, PlacementResolution, PlacementTieBreak};
 use flotilla_admission::repository_inspection::LocalCheckoutInspection;
 use flotilla_admission::repository_inspection::RepositoryContinuity;
 use flotilla_admission::repository_inspection::RepositoryInspection;
 use flotilla_admission::repository_inspection::RepositoryInspector;
+use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_engine_convoys_testkit::single_agent;
+use flotilla_protocol::result_set::ConvoyChangeRequest;
 use flotilla_protocol::ChangeRequest;
+use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName};
 use flotilla_provider_runtime::available_space::AvailableSpaceProbe;
+use flotilla_provisioning_testkit::{replicate_home, EngineBackend};
+use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecords as _, Inspection};
+use flotilla_resources::{
+    BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutWorktreeSpec as ResourceCheckoutWorktreeSpec, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, CredentialConsumer,
+    CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, FulfilmentGrant, FulfilmentKind,
+    FulfilmentKindSpec, FulfilmentRealisation, ImageAcquisitionCost, InputMeta, ObservedChangeRequestState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec, Resource, ResourceObject, ResourceProvenance,
+    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+};
 use flotilla_store_testkit::cr_name;
 
 #[tokio::test]
@@ -46,7 +46,33 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     .expect("daemon config");
     let token_path = temp.path().join("forgejo-token");
     std::fs::write(&token_path, "test-token").expect("token file");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
+    let provider = Arc::new(FakeChangeRequest::new());
+    provider
+        .add_change_requests(vec![(
+            "17".to_string(),
+            ChangeRequest {
+                title: "Fix ghostty".to_string(),
+                branch: "governor".to_string(),
+                status: flotilla_protocol::ChangeRequestStatus::Open,
+                body: None,
+                provider_name: "forgejo".to_string(),
+                provider_display_name: "Forgejo".to_string(),
+            },
+        )])
+        .await;
+    let mut discovery = fake_discovery(false);
+    discovery.factories.change_requests = vec![Box::new(ForgeAwareTestChangeRequestFactory(provider))];
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::new("test-host"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    super::test_engine(&daemon);
     let forge = flotilla_resources::ForgeSpec::builder()
         .forge_id("lab".to_string())
         .kind(flotilla_resources::ForgeKind::Forgejo)
@@ -81,32 +107,17 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         )
         .await
         .expect("credential");
-    let provider = Arc::new(FakeChangeRequest::new());
-    provider
-        .add_change_requests(vec![(
-            "17".to_string(),
-            ChangeRequest {
-                title: "Fix ghostty".to_string(),
-                branch: "governor".to_string(),
-                status: flotilla_protocol::ChangeRequestStatus::Open,
-                body: None,
-                provider_name: "forgejo".to_string(),
-                provider_display_name: "Forgejo".to_string(),
-            },
-        )])
-        .await;
-    let mut discovery = fake_discovery(false);
-    discovery.factories.change_requests = vec![Box::new(ForgeAwareTestChangeRequestFactory(provider))];
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(temp.path())),
-        discovery,
-        HostName::new("test-host"),
-        backend,
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
     daemon.set_provisioning_namespace("flotilla".to_string()).await;
+    // The forge observer's branch probe looks the branch up with the forge-aware provider and its
+    // credential and records what it finds; resolution reads those records (#3108).
+    let probe = |url: &'static str| {
+        let (daemon, forge) = (&daemon, &forge);
+        async move {
+            let address = flotilla_resources::address::repository_address(url, std::slice::from_ref(forge)).expect("address");
+            daemon.observe_change_request_branch(&address, "governor").await.expect("branch probe");
+        }
+    };
+    probe("https://forgejo.lab.flotilla.work/robert/ghostty-ops").await;
     let resolved =
         daemon.resolve_convoy_change_request(std::slice::from_ref(&repository_key), "governor", None).await.expect("resolve Forgejo PR");
     assert_eq!(
@@ -137,8 +148,10 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         .create(&test_meta(&second_key.to_string()), &second_repository)
         .await
         .expect("second repository");
+    probe(second_url).await;
     let convoy_spec = ConvoySpec::builder()
         .workflow_ref("workflow".to_string())
+        .project_ref("flotilla".to_string())
         .repositories(vec![
             ConvoyRepositorySpec {
                 url: "https://forgejo.lab.flotilla.work/robert/ghostty-ops".into(),
@@ -160,9 +173,9 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         .r#ref("governor".to_string())
         .build();
     let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
-    convoys.create(&test_meta("multi-repo"), &convoy_spec).await.expect("convoy");
-    daemon.discover_convoy_branch_subjects("flotilla", "multi-repo", "governor").await.expect("branch discovery");
-    let convoy = convoys.get("multi-repo").await.expect("convoy after discovery");
+    let multi_repo = admit(&daemon, "multi-repo", convoy_spec, single_agent("coder")).await;
+    daemon.discover_convoy_branch_subjects("flotilla", &multi_repo, "governor").await.expect("branch discovery");
+    let convoy = convoys.get(&multi_repo).await.expect("convoy after discovery");
     assert_eq!(convoy.status.as_ref().expect("status").subjects.len(), 2);
     assert!(convoy
         .status
@@ -178,42 +191,26 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         &[forge],
     );
     assert_eq!(claim.len(), 1);
-    flotilla_store::apply_status_patch(
-        &convoys,
-        "multi-repo",
-        &ConvoyStatusPatch::DiscoverSubjects {
-            subjects: vec![(claim[0].clone(), flotilla_protocol::Relationship::Produces)],
-            source: flotilla_resources::SubjectDiscoverySource::Claim,
-            at: Utc::now(),
-        },
-    )
-    .await
-    .expect("claim discovery");
-    let with_followup = convoys.get("multi-repo").await.expect("convoy with follow-up");
+    // A crew's claim links the change request it produced.
+    convoy_engine(&daemon)
+        .link(&convoy, &claim[0], flotilla_resources::SubjectDiscoverySource::Claim, "coder")
+        .await
+        .expect("claim discovery");
+    let with_followup = convoys.get(&multi_repo).await.expect("convoy with follow-up");
     let leaves = flotilla_resources::expected_change_request_leaves(&with_followup, &[]).expect("subject leaves");
     assert_eq!(leaves.len(), 6, "all three produced change requests require terminal observations");
     assert!(daemon
-        .link_convoy_subject("flotilla", "multi-repo", "wheelhouze/cleat!12", Some(flotilla_protocol::Relationship::Produces))
+        .link_convoy_subject("flotilla", &multi_repo, "wheelhouze/cleat!12")
         .await
         .expect_err("unknown GitHub repository must be rejected")
         .contains("outside this convoy's repositories"));
     assert!(daemon
-        .link_convoy_subject(
-            "flotilla",
-            "multi-repo",
-            "https://forgejo.lab.flotilla.work/robert/foreign/pulls/12",
-            Some(flotilla_protocol::Relationship::Produces)
-        )
+        .link_convoy_subject("flotilla", &multi_repo, "https://forgejo.lab.flotilla.work/robert/foreign/pulls/12",)
         .await
         .expect_err("foreign Forgejo repository must be rejected")
         .contains("outside this convoy's repositories"));
-    daemon
-        .link_convoy_subject("flotilla", "multi-repo", "lab:robert/ghostty-ops!18", Some(flotilla_protocol::Relationship::Supersedes))
-        .await
-        .expect("operator resolution");
-    let superseded = convoys.get("multi-repo").await.expect("convoy with superseded request");
-    let leaves = flotilla_resources::expected_change_request_leaves(&superseded, &[]).expect("subject leaves");
-    assert_eq!(leaves.len(), 4, "supersedes releases only the replaced change request");
+    // An operator link no longer takes a relationship (TL-4): a linked change request is
+    // produced, so a supersedes link and its release of the replaced request are gone.
 }
 
 struct ConcurrentCreateRepositoryInspector;
@@ -271,14 +268,15 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
         Arc::new(ConfigStore::with_base(temp.path())),
         discovery,
         HostName::local(),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    super::test_engine(&daemon);
     daemon.set_repository_inspector(Arc::new(ConcurrentCreateRepositoryInspector)).await;
     let backend = daemon.resource_backend();
     let local_host = daemon.local_host_id().expect("local host id").to_string();
-    create_host_direct_placement(&backend, "host-direct-local", &local_host, BTreeSet::new()).await;
+    create_host_direct_placement(&daemon, "host-direct-local", &local_host, BTreeSet::new()).await;
     backend
         .using::<WorkflowTemplate>("flotilla")
         .create(
@@ -286,23 +284,26 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
             &WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
+                    // A convoy owes something to be admitted: its tool crew owes a decision ledger.
                     .crew(vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Tool { command: "true".to_string() })
+                        .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("coder")])
                         .build()])
                     .build()])
                 .build(),
         )
         .await
         .expect("workflow");
+    let repository = RepositorySpec::remote("https://github.com/owner/repo").expect("repository");
+    flotilla_store_testkit::fixtures::project_on_repository(&backend, "flotilla", "owner-repo", &repository, "main").await;
     let command = Command::builder()
         .action(CommandAction::ConvoyCreate {
             name: "duplicate".to_string(),
             workflow_ref: "work".to_string(),
             inputs: Vec::new(),
-            repository_url: None,
             r#ref: None,
-            project_ref: None,
+            project_ref: "owner-repo".to_string(),
             placement_policy: None,
             adopted_checkout: Some(Box::new(repo)),
         })
@@ -326,32 +327,52 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
     );
     let convoys = backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items;
     assert_eq!(convoys.len(), 1);
+    // The winner records the checkout it adopts for its vessel to request (#3108); the loser
+    // publishes no checkout of its own.
+    assert_eq!(convoys[0].spec.adopted_checkout_refs.len(), 1);
+    assert!(flotilla_resources::convoy::adopted_checkout(&convoys[0]).expect("readable").is_some(), "adopted checkout recorded");
     let owned = convoys[0].spec.adopted_checkout_refs.values().cloned().collect::<BTreeSet<_>>();
-    let durable = backend.using::<ResourceCheckout>("flotilla").list().await.expect("durable checkouts").items;
-    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla").list().await.expect("observed checkouts").items;
-    assert_eq!(durable.len(), 1, "loser must not author a durable checkout");
-    assert_eq!(observed.len(), 1, "loser must not publish an orphan observed checkout");
-    assert!(durable.iter().chain(&observed).all(|checkout| owned.contains(&checkout.metadata.name)));
+    let discovered = daemon.discovered_checkouts().all();
+    assert!(discovered.iter().all(|checkout| owned.contains(&checkout.name)), "loser must not publish an orphan discovered checkout");
+}
+
+/// Every copy of snapshot `name` that `backend` holds: the home each came from, and its version.
+async fn snapshot_sources<T: Resource>(backend: &EngineBackend, name: &str) -> Vec<(String, String)> {
+    let sources = backend.including_replicas::<T>("flotilla").list_replica_sources().await.expect("read snapshot sources");
+    sources
+        .items
+        .into_iter()
+        .filter(|read| read.object.metadata.name == name)
+        .map(|read| {
+            let home = match read.provenance {
+                ResourceProvenance::Local => backend.home().to_owned(),
+                ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
+            };
+            (home, read.object.metadata.resource_version)
+        })
+        .collect()
+}
+
+/// Asserts `before` is the snapshot-home's copy alone and `after` is that same copy: the driver
+/// wrote no snapshot of its own.
+fn assert_still_the_homes_copy(before: &[(String, String)], after: &[(String, String)]) {
+    assert!(matches!(before, [(home, _)] if home == "snapshot-home"), "the driver holds the home's snapshot alone: {before:?}");
+    assert_eq!(after, before, "the driver still holds only the home's copy, unchanged");
 }
 
 #[tokio::test]
 async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
-    let home_root = NodeId::new("snapshot-home");
-    let driver_root = NodeId::new("snapshot-driver");
-    let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(home_root.clone());
-    let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(driver_root);
+    let home = EngineBackend::open("snapshot-home");
+    let driver = EngineBackend::open("snapshot-driver");
     let spec = flotilla_resources::single_agent_workflow_spec();
     let name = prepared_snapshot_name("workflow", &serde_json::to_value(&spec).expect("serialize workflow")).expect("snapshot name");
 
     ensure_prepared_workflow_snapshot(&home, "flotilla", &name, &spec).await.expect("author snapshot on home");
-    driver
-        .replica_writer::<WorkflowTemplate>(home_root, "flotilla")
-        .replace(&home.using::<WorkflowTemplate>("flotilla").list().await.expect("home workflow log"), Utc::now())
-        .await
-        .expect("replicate snapshot to driver");
+    replicate_home(&home.service, home.home(), &driver.service);
+    let before = snapshot_sources::<WorkflowTemplate>(&driver, &name).await;
 
     ensure_prepared_workflow_snapshot(&driver, "flotilla", &name, &spec).await.expect("reuse identical replicated snapshot");
-    assert!(driver.using::<WorkflowTemplate>("flotilla").list().await.expect("driver local workflow log").items.is_empty());
+    assert_still_the_homes_copy(&before, &snapshot_sources::<WorkflowTemplate>(&driver, &name).await);
 }
 
 fn snapshot_kind(pool: &str) -> FulfilmentKindSpec {
@@ -360,44 +381,48 @@ fn snapshot_kind(pool: &str) -> FulfilmentKindSpec {
 
 #[tokio::test]
 async fn prepared_placement_snapshot_reuses_an_identical_replica() {
-    let home_root = NodeId::new("snapshot-home");
-    let driver_root = NodeId::new("snapshot-driver");
-    let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(home_root.clone());
-    let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(driver_root);
+    let home = EngineBackend::open("snapshot-home");
+    let driver = EngineBackend::open("snapshot-driver");
     let spec = snapshot_kind("passthrough");
     let name = prepared_snapshot_name("placement", &serde_json::to_value(&spec).expect("serialize placement")).expect("snapshot name");
 
     ensure_prepared_placement_snapshot(&home, "flotilla", &name, "convoy", &spec).await.expect("author snapshot on home");
-    driver
-        .replica_writer::<FulfilmentKind>(home_root, "flotilla")
-        .replace(&home.using::<FulfilmentKind>("flotilla").list().await.expect("home placement log"), Utc::now())
-        .await
-        .expect("replicate snapshot to driver");
+    replicate_home(&home.service, home.home(), &driver.service);
+    let before = snapshot_sources::<FulfilmentKind>(&driver, &name).await;
 
     ensure_prepared_placement_snapshot(&driver, "flotilla", &name, "convoy", &spec).await.expect("reuse identical replicated snapshot");
-    assert!(driver.using::<FulfilmentKind>("flotilla").list().await.expect("driver local placement log").items.is_empty());
+    assert_still_the_homes_copy(&before, &snapshot_sources::<FulfilmentKind>(&driver, &name).await);
 }
 
 #[tokio::test]
 async fn prepared_placement_snapshot_rejects_a_different_replica_spec() {
-    let home_root = NodeId::new("snapshot-home");
-    let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(home_root.clone());
-    let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("snapshot-driver"));
+    let home = EngineBackend::open("snapshot-home");
+    let driver = EngineBackend::open("snapshot-driver");
     let name = "placement-snapshot-collision";
     let authored = snapshot_kind("passthrough");
     let requested = snapshot_kind("cleat");
     home.using::<FulfilmentKind>("flotilla").create(&test_meta(name), &authored).await.expect("author snapshot on home");
-    driver
-        .replica_writer::<FulfilmentKind>(home_root, "flotilla")
-        .replace(&home.using::<FulfilmentKind>("flotilla").list().await.expect("home placement log"), Utc::now())
-        .await
-        .expect("replicate snapshot to driver");
+    replicate_home(&home.service, home.home(), &driver.service);
+    let before = snapshot_sources::<FulfilmentKind>(&driver, name).await;
 
     let error = ensure_prepared_placement_snapshot(&driver, "flotilla", name, "convoy", &requested)
         .await
         .expect_err("mismatched replica must be refused");
     assert_eq!(error, format!("prepared placement snapshot {name} already exists with different contents"));
-    assert!(driver.using::<FulfilmentKind>("flotilla").list().await.expect("driver local placement log").items.is_empty());
+    assert_still_the_homes_copy(&before, &snapshot_sources::<FulfilmentKind>(&driver, name).await);
+}
+
+/// Admits a launch of convoy `name` on `daemon`'s engine, which its checkouts are held for.
+/// Returns the holder of its checkouts and the launch's name.
+async fn archive_convoy(daemon: &InProcessDaemon, name: &str) -> (CheckoutHolder, String) {
+    let launch = admit(
+        daemon,
+        name,
+        ConvoySpec::builder().workflow_ref("work".into()).project_ref("flotilla".into()).build(),
+        single_agent("coder"),
+    )
+    .await;
+    (CheckoutHolder::Convoy(launch.clone()), launch)
 }
 
 #[tokio::test]
@@ -415,7 +440,7 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
         Err("base unknown".to_string()),
         Ok("archived stale head".to_string()),
     ]));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let mut discovery = fake_discovery_with_runner(false, runner.clone());
     discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -427,50 +452,33 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine holds the convoy's checkouts here, as its inspections last found them; one
+    // whose inspections are failing has no fresh pushed judgement (#3108).
+    let fixture = super::test_engine(&daemon);
+    let engine = &fixture.checkouts;
+    let (holder, archive) = archive_convoy(&daemon, "archive-convoy").await;
     let repository = RepositorySpec::remote("https://github.com/acme/archive").expect("repository spec").key();
-    let checkouts = backend.using::<ResourceCheckout>("flotilla");
-    let fresh = Utc::now().to_rfc3339();
-    for (name, pushed, observed_at) in [
-        ("already-pushed", ConditionValue::True, fresh.as_str()),
-        ("needs-push", ConditionValue::False, fresh.as_str()),
-        ("push-fails", ConditionValue::False, fresh.as_str()),
-        ("stale-pushed", ConditionValue::True, "2020-01-01T00:00:00Z"),
-    ] {
-        let checkout = checkouts
-            .create(
-                &InputMeta::builder()
-                    .name(name.to_string())
-                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "archive-convoy".to_string())]))
-                    .build(),
-                &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                    r#ref: name.to_string(),
-                    path: format!("/checkouts/{name}"),
-                    repo_ref: repository.clone(),
-                    host_ref: "archive-test".to_string(),
-                    is_main: false,
-                }),
-            )
-            .await
-            .expect("checkout");
-        checkouts
-            .update_status(
-                name,
-                &checkout.metadata.resource_version,
-                &ResourceCheckoutStatus::builder()
-                    .phase(ResourceCheckoutPhase::Ready)
-                    .path(format!("/checkouts/{name}"))
-                    .integration(CheckoutIntegrationStatus {
-                        head_revision: None,
-                        pushed: IntegrationCondition::builder().value(pushed).observed_at(observed_at.to_string()).build(),
-                        ..CheckoutIntegrationStatus::default()
-                    })
-                    .build(),
-            )
-            .await
-            .expect("checkout status");
+    for (name, pushed, stale) in
+        [("already-pushed", true, false), ("needs-push", false, false), ("push-fails", false, false), ("stale-pushed", true, true)]
+    {
+        let launch = engine.put_ready(
+            name,
+            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                r#ref: name.to_string(),
+                path: format!("/checkouts/{name}"),
+                repo_ref: repository.clone(),
+                host_ref: "archive-test".to_string(),
+                is_main: false,
+            }),
+            Some(&holder),
+        );
+        engine.checkouts.inspected(&launch, Inspection { pushed: Some(pushed), ..Default::default() }).expect("inspection");
+        if stale {
+            engine.checkouts.inspection_failed(&launch).expect("inspections failing");
+        }
     }
 
-    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.expect("best-effort archive");
+    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", &archive).await.expect("best-effort archive");
 
     assert_eq!(
         outcomes.iter().map(|outcome| (outcome.checkout.as_str(), outcome.status)).collect::<Vec<_>>(),
@@ -495,9 +503,7 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
 async fn abandon_archive_names_replica_checkouts_left_to_their_own_host() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").unwrap();
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("udder-root"));
-    let feta_root = NodeId::new("feta-root");
-    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(feta_root.clone());
+    let backend = engine_home_backend();
     let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
     discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -509,30 +515,29 @@ async fn abandon_archive_names_replica_checkouts_left_to_their_own_host() {
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The convoy is held here; its checkout is held at feta: this host reads it, replicated in,
+    // but cannot inspect it.
+    let (holder, archive) = archive_convoy(&daemon, "archive-convoy").await;
+    let decided = daemon.decided_store().expect("decided store");
+    let feta = flotilla_provisioning_testkit::other_home_for(&decided, "feta");
+    let feta_engine = flotilla_provisioning_testkit::EngineFixture::over_service(feta.service());
+    // Feta hears this home's launch before it holds a checkout for it.
+    flotilla_provisioning_testkit::replicate_home(&decided, daemon.node_id().as_str(), feta.service());
     let repository = RepositorySpec::remote("https://github.com/acme/archive").unwrap().key();
-    feta.using::<ResourceCheckout>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("remote-work".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "archive-convoy".to_string())]))
-                .build(),
-            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                r#ref: "remote-work".to_string(),
-                path: "/feta/work".to_string(),
-                repo_ref: repository,
-                host_ref: "feta".into(),
-                is_main: false,
-            }),
-        )
-        .await
-        .unwrap();
-    backend
-        .replica_writer::<ResourceCheckout>(feta_root, "flotilla")
-        .replace(&feta.using::<ResourceCheckout>("flotilla").list().await.unwrap(), Utc::now())
-        .await
-        .unwrap();
+    feta_engine.checkouts.put_ready(
+        "remote-work",
+        &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+            r#ref: "remote-work".to_string(),
+            path: "/feta/work".to_string(),
+            repo_ref: repository,
+            host_ref: "feta".into(),
+            is_main: false,
+        }),
+        Some(&holder),
+    );
+    feta.replicate_to(&decided);
 
-    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.unwrap();
+    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", &archive).await.unwrap();
 
     assert_eq!(outcomes.len(), 1);
     assert_eq!(outcomes[0].checkout, "remote-work");
@@ -554,7 +559,7 @@ async fn abandon_archive_pushes_only_checkout_with_commits_beyond_base() {
     };
     let remote = temp.path().join("remote.git");
     git(temp.path(), &["init", "--bare", "-b", "main", remote.to_str().unwrap()]);
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
     discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -566,6 +571,9 @@ async fn abandon_archive_pushes_only_checkout_with_commits_beyond_base() {
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    let fixture = super::test_engine(&daemon);
+    let engine = &fixture.checkouts;
+    let (holder, archive) = archive_convoy(&daemon, "archive-convoy").await;
     let repository = RepositorySpec::remote("https://github.com/acme/archive").unwrap().key();
     for (name, advanced) in [("at-base", false), ("advanced", true)] {
         let path = temp.path().join(name);
@@ -579,25 +587,19 @@ async fn abandon_archive_pushes_only_checkout_with_commits_beyond_base() {
         if advanced {
             git(&path, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "work"]);
         }
-        backend
-            .using::<ResourceCheckout>("flotilla")
-            .create(
-                &InputMeta::builder()
-                    .name(name.to_string())
-                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "archive-convoy".to_string())]))
-                    .build(),
-                &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-                    r#ref: name.to_string(),
-                    path: path.to_str().unwrap().to_string(),
-                    repo_ref: repository.clone(),
-                    host_ref: "archive-test".into(),
-                    is_main: false,
-                }),
-            )
-            .await
-            .unwrap();
+        engine.put_ready(
+            name,
+            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                r#ref: name.to_string(),
+                path: path.to_str().unwrap().to_string(),
+                repo_ref: repository.clone(),
+                host_ref: "archive-test".into(),
+                is_main: false,
+            }),
+            Some(&holder),
+        );
     }
-    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.unwrap();
+    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", &archive).await.unwrap();
     assert_eq!(
         outcomes.iter().map(|o| (o.checkout.as_str(), o.status)).collect::<Vec<_>>(),
         vec![("advanced", CheckoutArchiveStatus::Archived), ("at-base", CheckoutArchiveStatus::NothingToArchive)]
@@ -615,7 +617,7 @@ async fn abandon_archive_pushes_only_checkout_with_commits_beyond_base() {
 async fn abandon_archive_of_a_checkout_in_an_unreachable_environment_names_it_and_where_the_work_stayed() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").unwrap();
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
     discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -627,27 +629,24 @@ async fn abandon_archive_of_a_checkout_in_an_unreachable_environment_names_it_an
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    backend
-        .using::<ResourceCheckout>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("remote-work".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "archive-convoy".to_string())]))
+    let fixture = super::test_engine(&daemon);
+    let engine = &fixture.checkouts;
+    let (holder, archive) = archive_convoy(&daemon, "archive-convoy").await;
+    engine.put_ready(
+        "remote-work",
+        &ResourceCheckoutSpec::Worktree(
+            ResourceCheckoutWorktreeSpec::builder()
+                .repo_ref(RepositorySpec::remote("https://github.com/acme/archive").unwrap().key())
+                .env_ref("ssh-b1".to_string())
+                .r#ref("feature/remote".to_string())
+                .target_path("/only/on/b1".to_string())
+                .clone_ref("clone".to_string())
                 .build(),
-            &ResourceCheckoutSpec::Worktree(
-                ResourceCheckoutWorktreeSpec::builder()
-                    .repo_ref(RepositorySpec::remote("https://github.com/acme/archive").unwrap().key())
-                    .env_ref("ssh-b1".to_string())
-                    .r#ref("feature/remote".to_string())
-                    .target_path("/only/on/b1".to_string())
-                    .clone_ref("clone".to_string())
-                    .build(),
-            ),
-        )
-        .await
-        .unwrap();
+        ),
+        Some(&holder),
+    );
 
-    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.unwrap();
+    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", &archive).await.unwrap();
 
     assert_eq!(outcomes.len(), 1);
     assert_eq!(outcomes[0].status, CheckoutArchiveStatus::Failed);
@@ -662,7 +661,7 @@ async fn abandon_archive_of_a_checkout_in_an_unreachable_environment_names_it_an
 
 // #4032: a host-direct checkout on the daemon's own host records the host's
 // Environment resource name as `env_ref`, not the local environment id. Archive
-// and delete's fresh inspection resolve it to the local environment.
+// resolves it to the local environment, as delete's fresh inspection does.
 #[tokio::test]
 async fn host_direct_checkout_on_the_daemon_host_is_archived_and_passes_delete_inspection() {
     let temp = tempfile::tempdir().unwrap();
@@ -682,7 +681,7 @@ async fn host_direct_checkout_on_the_daemon_host_is_archived_and_passes_delete_i
     git(&path, &["remote", "set-head", "origin", "-a"]);
     git(&path, &["switch", "-c", "governor"]);
     git(&path, &[&commit[..], &["work"]].concat());
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
     discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -694,50 +693,35 @@ async fn host_direct_checkout_on_the_daemon_host_is_archived_and_passes_delete_i
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    let fixture = super::test_engine(&daemon);
+    let engine = &fixture.checkouts;
     let env_ref = flotilla_resources::host_direct_environment_name(daemon.local_host_id().unwrap().as_str());
     assert_ne!(env_ref, daemon.local_environment_id.as_str());
     let repository = RepositorySpec::remote("https://github.com/acme/archive").unwrap();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository.key().to_string()), &repository).await.unwrap();
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let convoy = convoys.create(&test_meta("governor"), &ConvoySpec::builder().workflow_ref("governor".into()).build()).await.unwrap();
-    convoys
-        .update_status(
-            "governor",
-            &convoy.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus { phase: flotilla_resources::ConvoyPhase::Active, ..Default::default() },
-        )
-        .await
-        .unwrap();
-    let checkouts = backend.using::<ResourceCheckout>("flotilla");
-    let checkout = checkouts
-        .create(
-            &InputMeta::builder()
-                .name("governor-checkout".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "governor".to_string())]))
+    let governor = admit(
+        &daemon,
+        "governor",
+        ConvoySpec::builder().workflow_ref("governor".into()).project_ref("flotilla".into()).build(),
+        single_agent("governor"),
+    )
+    .await;
+    engine.put_ready(
+        "governor-checkout",
+        &ResourceCheckoutSpec::Worktree(
+            ResourceCheckoutWorktreeSpec::builder()
+                .repo_ref(repository.key())
+                .env_ref(env_ref)
+                .r#ref("governor".to_string())
+                .base_ref("main".to_string())
+                .target_path(path.to_str().unwrap().to_string())
+                .clone_ref("clone".to_string())
                 .build(),
-            &ResourceCheckoutSpec::Worktree(
-                ResourceCheckoutWorktreeSpec::builder()
-                    .repo_ref(repository.key())
-                    .env_ref(env_ref)
-                    .r#ref("governor".to_string())
-                    .base_ref("main".to_string())
-                    .target_path(path.to_str().unwrap().to_string())
-                    .clone_ref("clone".to_string())
-                    .build(),
-            ),
-        )
-        .await
-        .unwrap();
-    checkouts
-        .update_status(
-            "governor-checkout",
-            &checkout.metadata.resource_version,
-            &ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).path(path.to_str().unwrap().to_string()).build(),
-        )
-        .await
-        .unwrap();
+        ),
+        Some(&CheckoutHolder::Convoy(governor.clone())),
+    );
 
-    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "governor").await.unwrap();
+    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", &governor).await.unwrap();
     assert_eq!(
         outcomes.iter().map(|o| (o.checkout.as_str(), o.status, o.detail.clone())).collect::<Vec<_>>(),
         vec![("governor-checkout", CheckoutArchiveStatus::Archived, None)]
@@ -747,14 +731,31 @@ async fn host_direct_checkout_on_the_daemon_host_is_archived_and_passes_delete_i
         "governor\nmain\n"
     );
 
-    daemon.crew.teardown("flotilla", "governor", false).await.expect("fresh inspection of the archived checkout permits delete");
+    // Delete's fresh inspection is the checkout inspector's, served on the Message path by the
+    // daemon's runtime (#3108); it reaches the checkout through the same environment resolution.
+    assert_eq!(
+        daemon
+            .resolve_environment_ref(&flotilla_resources::host_direct_environment_name(daemon.local_host_id().unwrap().as_str()))
+            .map(|environment| environment.id),
+        Some(daemon.local_environment_id.clone())
+    );
 }
 
 #[tokio::test]
 async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_checkout() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"bound-pr-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    daemon.set_provisioning_namespace("flotilla".to_string()).await;
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla")
         .expect("repository spec")
         .with_remotes(["https://github.com/flotilla-org/flotilla".to_string(), "https://forgejo.example/flotilla/flotilla".to_string()])
@@ -766,16 +767,6 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
         .create(&test_meta(&repository_key.to_string()), &repository_spec)
         .await
         .expect("repository");
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(temp.path())),
-        fake_discovery(false),
-        HostName::new("test-host"),
-        backend,
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
-    daemon.set_provisioning_namespace("flotilla".to_string()).await;
     let change_requests = daemon.resource_backend().using::<ResourceChangeRequest>("flotilla");
     let change_request_name = cr_name("github.com", "flotilla-org/flotilla", 1696);
     let observation = change_requests
@@ -897,7 +888,18 @@ async fn rehearsal_binding_preserves_copied_forge_data() {
                 token.to_str().expect("path")
             ),
         ).expect("daemon config");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = engine_home_backend();
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let discovery = fake_discovery(false);
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            config.clone(),
+            discovery,
+            HostName::new("rehearsal"),
+            backend.clone(),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
         let mut repository = RepositorySpec::remote(format!("{service}/team/repo")).expect("copied repository");
         if declared {
             let github = service == "https://github.com";
@@ -922,17 +924,6 @@ async fn rehearsal_binding_preserves_copied_forge_data() {
             .create(&test_meta(&repository.key().to_string()), &repository)
             .await
             .expect("copied record");
-        let config = Arc::new(ConfigStore::with_base(temp.path()));
-        let discovery = fake_discovery(false);
-        let daemon = InProcessDaemon::new_with_resource_backend(
-            Vec::new(),
-            config.clone(),
-            discovery,
-            HostName::new("rehearsal"),
-            backend.clone(),
-            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-        )
-        .await;
         let bag = super::super::repository_discovery::repository_provider_bag(
             &backend,
             &config,

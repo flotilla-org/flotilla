@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, fmt::Write as _, time::Duration};
 
-use flotilla_store::load_metrics::{HistogramSnapshot, LatencySummary};
+use flotilla_store::load_metrics::{counts_since, HistogramSnapshot, LatencySummary, ReadCounts, StoreLoadSnapshot};
 use serde::Serialize;
 
 use crate::target::{HomeSample, TargetSample};
@@ -28,6 +28,8 @@ pub struct LoadReport {
     pub target_errors: TargetErrors,
     pub window: WindowSummary,
     pub home_metrics: Vec<HomeReport>,
+    /// The process's named callers' engine reads over the window, every home's summed.
+    pub reads: BTreeMap<String, ReadCounts>,
     pub resident_bytes: Option<u64>,
     /// Convoys still open when the window ended, by the target's breakdown.
     pub open_at_end: BTreeMap<String, u64>,
@@ -90,7 +92,7 @@ pub struct MixSummary {
 /// One home's metrics over the window, as rates and summaries.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HomeReport {
-    pub store: Option<StoreReport>,
+    pub decided_store: Option<StoreReport>,
     pub controllers: BTreeMap<String, ControllerReport>,
     pub replication: ReplicationReport,
     pub turn_delivery: LatencySummary,
@@ -113,6 +115,12 @@ pub struct StoreReport {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ControllerReport {
     pub wakes_per_second: f64,
+    /// Objects asked for by its watches, resyncs and requeues; those already queued coalesce.
+    pub enqueued_per_second: f64,
+    pub enqueued_coalesced: u64,
+    /// The engine reads of its passes and of its watches over the window.
+    pub reads: ReadCounts,
+    pub watch_reads: ReadCounts,
     pub requeues_per_second: f64,
     pub requeues_coalesced: u64,
     pub resync_enqueued_per_second: f64,
@@ -121,12 +129,13 @@ pub struct ControllerReport {
     pub queue_wait: LatencySummary,
     pub busy_fraction: f64,
     pub queue_peak: u64,
+    /// Objects parked at the end of the window.
+    pub parked: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ReplicationReport {
     pub snapshots: u64,
-    pub lag_resets: u64,
     pub stream_failures: u64,
     pub events_per_second: f64,
     pub lag: LatencySummary,
@@ -149,6 +158,15 @@ fn per_second(count: u64, seconds: f64) -> f64 {
     }
 }
 
+/// The process's named callers' engine reads between two samples of the target.
+pub fn window_reads(start: &TargetSample, end: &TargetSample) -> BTreeMap<String, ReadCounts> {
+    end.reads
+        .iter()
+        .map(|(caller, end)| (caller.clone(), counts_since(end, start.reads.get(caller).unwrap_or(&ReadCounts::new()))))
+        .filter(|(_, reads)| !reads.is_empty())
+        .collect()
+}
+
 /// Every home's metrics between two samples of the target.
 pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration) -> Vec<HomeReport> {
     let seconds = window.as_secs_f64();
@@ -158,20 +176,23 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
         .enumerate()
         .map(|(index, end)| {
             let start = start.homes.get(index).unwrap_or(&empty);
-            let store = end.store.as_ref().map(|end| {
-                let phase = end.since(start.store.as_ref().unwrap_or(&Default::default()));
-                StoreReport {
-                    write_wait: phase.write_wait.summary(),
-                    write_execution: phase.write_execution.summary(),
-                    writes_per_second: per_second(phase.write_execution.count(), seconds),
-                    write_queue_peak: phase.write_queue_peak,
-                    read_wait: phase.read_wait.summary(),
-                    read_execution: phase.read_execution.summary(),
-                    reads_per_second: per_second(phase.read_execution.count(), seconds),
-                    read_queue_peak: phase.read_queue_peak,
-                    reads_shed: phase.reads_shed,
-                }
-            });
+            let store_report = |end: &Option<StoreLoadSnapshot>, start: &Option<StoreLoadSnapshot>| {
+                end.as_ref().map(|end| {
+                    let phase = end.since(start.as_ref().unwrap_or(&Default::default()));
+                    StoreReport {
+                        write_wait: phase.write_wait.summary(),
+                        write_execution: phase.write_execution.summary(),
+                        writes_per_second: per_second(phase.write_execution.count(), seconds),
+                        write_queue_peak: phase.write_queue_peak,
+                        read_wait: phase.read_wait.summary(),
+                        read_execution: phase.read_execution.summary(),
+                        reads_per_second: per_second(phase.read_execution.count(), seconds),
+                        read_queue_peak: phase.read_queue_peak,
+                        reads_shed: phase.reads_shed,
+                    }
+                })
+            };
+            let decided_store = store_report(&end.decided_store, &start.decided_store);
             let controllers = end
                 .controllers
                 .iter()
@@ -179,6 +200,8 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
                     let phase = end.since(start.controllers.get(kind).unwrap_or(&Default::default()));
                     let report = ControllerReport {
                         wakes_per_second: per_second(phase.wakes, seconds),
+                        enqueued_per_second: per_second(phase.enqueued, seconds),
+                        enqueued_coalesced: phase.enqueued_coalesced,
                         requeues_per_second: per_second(phase.requeues, seconds),
                         requeues_coalesced: phase.requeues_coalesced,
                         resync_enqueued_per_second: per_second(phase.resync_enqueued, seconds),
@@ -187,17 +210,19 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
                         queue_wait: phase.queue_wait.summary(),
                         busy_fraction: if seconds > 0.0 { phase.busy_micros as f64 / (seconds * 1_000_000.0) } else { 0.0 },
                         queue_peak: phase.queue_peak,
+                        parked: phase.parked,
+                        reads: phase.reads,
+                        watch_reads: phase.watch_reads,
                     };
                     (kind.clone(), report)
                 })
                 .collect();
             let replication = end.replication.since(&start.replication);
             HomeReport {
-                store,
+                decided_store,
                 controllers,
                 replication: ReplicationReport {
                     snapshots: replication.snapshots,
-                    lag_resets: replication.lag_resets,
                     stream_failures: replication.stream_failures,
                     events_per_second: per_second(replication.events_applied, seconds),
                     lag: end.replication_lag.since(&start.replication_lag).summary(),
@@ -304,7 +329,7 @@ impl LoadReport {
         }
         for (index, home) in self.home_metrics.iter().enumerate() {
             let _ = writeln!(out, "\n**Daemon {index}**\n\n| Measure | Value |\n|---|---|");
-            if let Some(store) = &home.store {
+            if let Some(store) = &home.decided_store {
                 let _ = writeln!(out, "| Write queue wait | {} (peak depth {}) |", latency(&store.write_wait), store.write_queue_peak);
                 let _ = writeln!(out, "| Write execution | {} ({:.1}/s) |", latency(&store.write_execution), store.writes_per_second);
                 let _ = writeln!(out, "| Read queue wait | {} (peak depth {}) |", latency(&store.read_wait), store.read_queue_peak);
@@ -321,20 +346,20 @@ impl LoadReport {
             let _ = writeln!(out, "| Replication lag (admitted → replica) | {} |", latency(&replication.lag));
             let _ = writeln!(
                 out,
-                "| Replication | {:.1} events/s, {} snapshots, {} lag resets, {} stream failures |",
-                replication.events_per_second, replication.snapshots, replication.lag_resets, replication.stream_failures
+                "| Replication | {:.1} events/s, {} snapshots, {} stream failures |",
+                replication.events_per_second, replication.snapshots, replication.stream_failures
             );
             if let Some(bytes) = home.database_bytes {
                 let _ = writeln!(out, "| Database (with WAL) | {} |", mebibytes(bytes));
             }
             let _ = writeln!(
                 out,
-                "\n| Controller | Wakes/s | Requeues/s (coalesced) | Resync enqueued/s | Reconcile | Queue wait | Busy | Queue peak | Failures |\n|---|---|---|---|---|---|---|---|---|"
+                "\n| Controller | Wakes/s | Requeues/s (coalesced) | Resync enqueued/s | Reconcile | Queue wait | Busy | Queue peak | Failures | Parked |\n|---|---|---|---|---|---|---|---|---|---|"
             );
             for (kind, controller) in &home.controllers {
                 let _ = writeln!(
                     out,
-                    "| {kind} | {:.1} | {:.1} ({}) | {:.1} | {} | {} | {:.1}% | {} | {} |",
+                    "| {kind} | {:.1} | {:.1} ({}) | {:.1} | {} | {} | {:.1}% | {} | {} | {} |",
                     controller.wakes_per_second,
                     controller.requeues_per_second,
                     controller.requeues_coalesced,
@@ -343,7 +368,8 @@ impl LoadReport {
                     latency(&controller.queue_wait),
                     controller.busy_fraction * 100.0,
                     controller.queue_peak,
-                    controller.failures
+                    controller.failures,
+                    controller.parked
                 );
             }
         }

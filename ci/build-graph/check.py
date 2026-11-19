@@ -28,11 +28,6 @@ C_FREE_BASE = frozenset({
 RESOURCE_EXEMPTIONS = frozenset({
     "flotilla-manifest", "flotilla-tui", "flotilla",
 })
-# Composition, daemon and transport crates the replication engine must not reach.
-REPLICATION_FORBIDDEN = (
-    "flotilla-core", "flotilla-daemon", "flotilla-daemon-api", "flotilla-projections",
-    "flotilla-credentials", "flotilla-controllers", "flotilla-store-http",
-)
 # ADR 0060 step 4: capabilities read resources through the store and receive
 # higher orchestration through ports. Register each new capability here.
 CAPABILITY_CRATES = frozenset({"flotilla-executor", "flotilla-projections", "flotilla-admission", "flotilla-provisioning", "flotilla-crew"})
@@ -73,14 +68,28 @@ STATE_MACHINES_ALLOWED = ("flotilla-schema", "flotilla-schema-derive", *SCHEMA_A
 STATE_MACHINE_DEPENDENTS = frozenset({
     "flotilla-engine-store", "flotilla-inbox", "flotilla-inbox-testkit", "flotilla-quint-testkit",
     # #3317: the composition root and its Message path, behind `[primitives]`.
-    "flotilla-core", "flotilla-daemon",
+    "flotilla-core", "flotilla-daemon", "flotilla-engine-messages",
+    # Dev-only: tests drive the real engine Message path.
+    "flotilla-engine-messages-testkit",
     # #3629: the provisioning lifecycle kinds declare their specs beside their requests.
     "flotilla-provisioning",
     # Dev-only reader contracts drive the real provisioning engine.
     "flotilla-provisioning-testkit",
+    # Dev-only: the ensure scenarios run this home's vessels as the daemon runs them.
+    "flotilla-orchestration-testkit",
+    # #3108: Convoy on the engine, below the composition root so crew and testkits can seed launches.
+    "flotilla-engine-convoys",
 })
 # #3317: the Message switch composes the engine inbox; only these use it directly.
-INBOX_DEPENDENTS = frozenset({"flotilla-core", "flotilla-daemon"})
+INBOX_DEPENDENTS = frozenset({"flotilla-daemon", "flotilla-engine-messages"})
+# #3108: the engine Message path sits beside the capabilities, below the composition root;
+# crew takes it only as a dev-dependency for its tests.
+ENGINE_MESSAGES = "flotilla-engine-messages"
+ENGINE_MESSAGES_FORBIDDEN = (*CAPABILITY_FORBIDDEN, *sorted(CAPABILITY_CRATES))
+# #3108: the engine Convoy path sits beside engine Message, over provisioning's engine reads;
+# crew and the testkits take it only as a dev-dependency.
+ENGINE_CONVOYS = "flotilla-engine-convoys"
+ENGINE_CONVOYS_FORBIDDEN = (*CAPABILITY_FORBIDDEN, *sorted(CAPABILITY_CRATES - {"flotilla-provisioning"}))
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a
 # compiler without these drivers need an explicit entry when introduced.
@@ -189,6 +198,12 @@ def violations(metadata):
     for target in TERMINAL_FORBIDDEN:
         if "flotilla-terminal" in packages and target in production["flotilla-terminal"]:
             errors.append(f"flotilla-terminal: must not depend directly on {target}")
+    for target in ENGINE_MESSAGES_FORBIDDEN:
+        if ENGINE_MESSAGES in packages and target in packages and reaches(ENGINE_MESSAGES, target):
+            errors.append(f"{ENGINE_MESSAGES}: must not depend on {target}, directly or transitively")
+    for target in ENGINE_CONVOYS_FORBIDDEN:
+        if ENGINE_CONVOYS in packages and target in packages and reaches(ENGINE_CONVOYS, target):
+            errors.append(f"{ENGINE_CONVOYS}: must not depend on {target}, directly or transitively")
     for target in DISCOVERY_FORBIDDEN:
         if DISCOVERY in packages and target in packages and reaches(DISCOVERY, target):
             errors.append(f"{DISCOVERY}: must not depend on {target}, directly or transitively")
@@ -224,10 +239,6 @@ def violations(metadata):
         dev_core = any(d["kind"] == "dev" and d["name"] == "flotilla-core" for d in packages["flotilla-credentials"]["dependencies"])
         if reaches("flotilla-credentials", "flotilla-core") or dev_core:
             errors.append("flotilla-credentials: must not depend on flotilla-core, directly, transitively or as a dev-dependency")
-    # ADR 0060: replication syncs over dyn Store; hosts supply its ports and transports.
-    for target in REPLICATION_FORBIDDEN:
-        if "flotilla-replication" in packages and target in packages and reaches("flotilla-replication", target):
-            errors.append(f"flotilla-replication: must not depend on {target}, directly or transitively")
     def reached_from(start):
         pending, reached = list(production[start]), set()
         while pending:
