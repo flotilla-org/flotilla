@@ -12,7 +12,7 @@ use flotilla_protocol::{
     table::Row,
     AgentActivity, AgentSessionReading, CommandAction, QueryId, ResultSet,
 };
-use flotilla_resources::{Convoy, ConvoyPhase, ResourceObject, TerminalSession};
+use flotilla_resources::{ChangeRequest, Convoy, ConvoyPhase, ObservedChangeRequestState, ResourceObject, TerminalSession};
 
 fn text<'a>(row: &'a Row, column: &str) -> &'a str {
     row.get(column).and_then(serde_json::Value::as_str).unwrap_or_default()
@@ -257,6 +257,48 @@ async fn a_restarted_daemon_adopts_its_running_vessels() {
         .wait_row("its environment Gone", "environment", "", |row| text(row, "resource.name") == name && text(row, "state") == "Gone")
         .await;
     assert_eq!(daemon.counts().environments_destroyed, 1);
+}
+
+// A convoy idle on a change request that is not changing is not stalled on its observer (run 5
+// R5-1): the observer's reads keep confirming the record though they write nothing, and the stall
+// judge counts those confirmations, before a restart and after it, when the record's last write
+// is older than the observer's staleness bound. The daemons' clock follows tokio's paused time.
+#[tokio::test(start_paused = true)]
+async fn a_convoy_idle_on_an_unchanged_change_request_is_not_stalled_across_a_restart() {
+    let clock = std::sync::Arc::new(flotilla_store_testkit::PausedClock::start());
+    // The change request is never merged while the scenario runs.
+    let daemon = TestDaemon::builder().clock(clock.clone()).change_request("merge_after_ms = 86400000").start().await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    daemon
+        .wait("its open change request", |found: &ResourceObject<ChangeRequest>| {
+            found.status.as_ref().is_some_and(|status| status.state.value == Some(ObservedChangeRequestState::Open))
+        })
+        .await;
+    let reading = |set: &ResultSet| -> Option<AgentSessionReading> {
+        let row = set.rows.as_convoys()?.iter().find(|row| row.resource.name == convoy)?;
+        row.vessels.iter().flat_map(|vessel| &vessel.crew).find_map(|crew| crew.agent_session.clone())
+    };
+    daemon
+        .wait_query(QueryId::Convoys { scope: None }, |set| {
+            reading(set).is_some_and(|reading| reading.activity == Some(AgentActivity::Idle))
+        })
+        .await;
+    // Past the staleness bound and the grace of the observer's next read, with nothing changing.
+    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+    assert_unstalled(&daemon, &convoy, "idle before the restart").await;
+    let daemon = daemon.restart().await;
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    assert_unstalled(&daemon, &convoy, "after the restart").await;
+    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+    assert_unstalled(&daemon, &convoy, "idle after the restart").await;
+}
+
+/// `convoy` is still Active and has no stall, `when`.
+async fn assert_unstalled(daemon: &TestDaemon, convoy: &str, when: &str) {
+    let found = daemon.get::<Convoy>(convoy).await.expect("the convoy");
+    let status = found.status.expect("convoy status");
+    assert_eq!(status.phase, ConvoyPhase::Active, "{when}: {status:?}");
+    assert!(status.stalls.is_empty() && status.stalled.is_none(), "{when}: stalled: {:?}", status.stalled);
 }
 
 // A vendor that refuses to provision fails the convoy before any crew launches;

@@ -332,6 +332,8 @@ impl ReconcilerWake {
         let views = cell.get().expect("initialized views");
         let mut convoy_watch = views.convoys.subscribe_local_keys();
         let mut change_request_watch = views.change_requests.subscribe_keys();
+        // The observer confirms an unchanged record without writing it, so no watch sees that.
+        let mut change_request_confirmations = self.subscriptions.inner.change_requests.confirmations();
         let mut vessel_watch = views.vessels.subscribe_keys();
         let mut forge_watch = views.forges.subscribe();
         // Clones are the engine's (#3108): where it serves none, no worktree's clone row is armed.
@@ -494,6 +496,19 @@ impl ReconcilerWake {
                     let selected = affected_rows(views, &views.change_requests, event).await?;
                     self.rows_changed(&namespace, &convoy_objects, selected.as_ref(), &mut schedule).await?;
                 }
+                // A record confirmed is current again, though nothing in it changed: the convoys
+                // whose rows read it are judged again, and a stall on its staleness ends (run 5
+                // R5-1). Their rows read its values, which did not change, so they stand.
+                confirmed = change_request_confirmations.recv() => match confirmed {
+                    Ok(name) => {
+                        let selected = views.row_dependencies.lock().await.by_record.get(&name).cloned().unwrap_or_default();
+                        if !selected.is_empty() {
+                            schedule.changed(Some(&selected));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => schedule.changed(None),
+                    Err(broadcast::error::RecvError::Closed) => return Err("change request confirmations stopped".into()),
+                },
                 event = vessel_watch.recv() => {
                     let selected = affected_rows(views, &views.vessels, event).await?;
                     self.rows_changed(&namespace, &convoy_objects, selected.as_ref(), &mut schedule).await?;

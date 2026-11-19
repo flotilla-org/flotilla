@@ -649,6 +649,54 @@ impl From<Result<(), (String, StallEvidenceSource)>> for RowJudgement {
     }
 }
 
+/// What a change request observation shows a leaf on its field `field_path`.
+struct ObservationJudgement {
+    /// The field has a value.
+    has_value: bool,
+    /// It is merged: nothing observed later can change what the leaf waits on.
+    final_settlement: bool,
+    /// Until when it answers the row's demand: it goes stale then.
+    fresh_until: Option<DateTime<Utc>>,
+}
+
+impl ObservationJudgement {
+    fn fresh(&self, now: DateTime<Utc>) -> bool {
+        self.final_settlement || self.fresh_until.is_some_and(|until| now < until)
+    }
+}
+
+/// Judges `status`, a change request's observation, for a leaf on `field_path` whose row demands
+/// freshness from `demand`; a value is current for `stale_after` from when it was last confirmed.
+fn judge_change_request_observation(
+    status: Option<&flotilla_resources::ChangeRequestStatus>,
+    field_path: &str,
+    demand: Option<DateTime<Utc>>,
+    stale_after: chrono::Duration,
+) -> ObservationJudgement {
+    let has_value = status.is_some_and(|status| match field_path {
+        ".state" => status.state.value.is_some(),
+        ".ready" => status.state.value.is_some() && status.checks.value.is_some(),
+        ".head-sha" => status.head_sha.value.is_some(),
+        ".checks" => status.checks.value.is_some(),
+        ".review.actionable-at-head" => status.review.actionable_at_head.value.is_some(),
+        ".mergeable" => status.mergeable.value.is_some(),
+        _ => false,
+    });
+    let final_settlement = status.is_some_and(|status| status.state.value == Some(flotilla_resources::ObservedChangeRequestState::Merged));
+    let fresh_until = status.filter(|_| has_value).and_then(|status| {
+        let at = match field_path {
+            ".ready" => status.state.observed_at.min(status.checks.observed_at),
+            ".head-sha" => status.head_sha.observed_at,
+            ".checks" => status.checks.observed_at,
+            ".review.actionable-at-head" => status.review.actionable_at_head.observed_at,
+            ".mergeable" => status.mergeable.observed_at,
+            _ => status.state.observed_at,
+        };
+        demand.is_none_or(|demand| at >= demand).then_some(at + stale_after)
+    });
+    ObservationJudgement { has_value, final_settlement, fresh_until }
+}
+
 /// A convoy's rows, judged together.
 struct RowsVerdict<'a> {
     progress_changed: bool,
@@ -1636,6 +1684,19 @@ impl ReconcilerWake {
         RowJudgement::from(judgement)
     }
 
+    /// Change request `name`'s observation as its copies read now, the most recently confirmed.
+    async fn current_change_request(&self, namespace: &str, name: &str) -> Result<Option<flotilla_resources::ChangeRequestStatus>, String> {
+        let copies = self
+            .subscriptions
+            .inner
+            .backend
+            .including_replicas::<flotilla_resources::ChangeRequest>(namespace)
+            .get_all(name)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(copies.items.into_iter().filter_map(|copy| copy.object.status).max_by_key(|status| status.state.observed_at))
+    }
+
     /// Judges an observed row from the freshness of its change-request observations.
     async fn judge_observed_row(&self, tick: StallTick<'_>, row: &LeafSubscriptionRow) -> RowJudgement {
         let StallTick { namespace, now, .. } = tick;
@@ -1647,37 +1708,32 @@ impl ReconcilerWake {
                 if let LeafAddress::ChangeRequest { .. } = &leaf.address {
                     let address = leaf_address(&leaf.address, forges);
                     let name = address.as_ref().ok().and_then(record_name);
-                    let observation = observations
+                    let stale_after = chrono::Duration::from_std(self.subscriptions.change_request_stale_after()).expect("duration fits");
+                    let judged = |status: Option<&flotilla_resources::ChangeRequestStatus>| {
+                        judge_change_request_observation(status, &leaf.field_path, row.freshness_demand, stale_after)
+                    };
+                    let viewed = observations
                         .iter()
                         .filter(|source| name.as_ref() == Some(&source.object.metadata.name))
-                        .filter_map(|source| source.object.status.as_ref())
+                        .filter_map(|source| source.object.status.clone())
                         .max_by_key(|status| status.state.observed_at);
-                    let has_value = observation.is_some_and(|status| match leaf.field_path.as_str() {
-                        ".state" => status.state.value.is_some(),
-                        ".ready" => status.state.value.is_some() && status.checks.value.is_some(),
-                        ".head-sha" => status.head_sha.value.is_some(),
-                        ".checks" => status.checks.value.is_some(),
-                        ".review.actionable-at-head" => status.review.actionable_at_head.value.is_some(),
-                        ".mergeable" => status.mergeable.value.is_some(),
-                        _ => false,
-                    });
-                    let merged = observation
-                        .is_some_and(|status| status.state.value == Some(flotilla_resources::ObservedChangeRequestState::Merged));
-                    let final_settlement = merged;
-                    // Until when the observation answers the row's demand: it goes stale then.
-                    let fresh_until = observation.filter(|_| has_value).and_then(|status| {
-                        let at = match leaf.field_path.as_str() {
-                            ".ready" => status.state.observed_at.min(status.checks.observed_at),
-                            ".head-sha" => status.head_sha.observed_at,
-                            ".checks" => status.checks.observed_at,
-                            ".review.actionable-at-head" => status.review.actionable_at_head.observed_at,
-                            ".mergeable" => status.mergeable.observed_at,
-                            _ => status.state.observed_at,
-                        };
-                        let stale_after =
-                            chrono::Duration::from_std(self.subscriptions.change_request_stale_after()).expect("duration fits");
-                        row.freshness_demand.is_none_or(|demand| at >= demand).then_some(at + stale_after)
-                    });
+                    let (mut observation, mut judgement) = (viewed.clone(), judged(viewed.as_ref()));
+                    // The view holds each record as its last write left it, but the observer
+                    // confirms an unchanged record without writing it: when it is current is read
+                    // from the record itself, by name (run 5 R5-1).
+                    if !judgement.fresh(now) {
+                        if let Some(name) = &name {
+                            match self.current_change_request(namespace, name).await {
+                                Ok(current) => {
+                                    judgement = judged(current.as_ref());
+                                    observation = current;
+                                }
+                                Err(error) => tracing::debug!(change_request = %name, %error, "change request read for freshness failed"),
+                            }
+                        }
+                    }
+                    let observation = observation.as_ref();
+                    let ObservationJudgement { has_value, final_settlement, fresh_until } = judgement;
                     if !final_settlement {
                         if let Some(until) = fresh_until {
                             tick.due(until);

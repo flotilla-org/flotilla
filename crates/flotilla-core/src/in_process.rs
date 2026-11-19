@@ -1365,11 +1365,12 @@ impl InProcessDaemon {
             checkout_vcs: checkout_providers.clone() as Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>,
         });
         let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(resource_backend.clone(), Arc::clone(&query_port)));
-        let change_request_refresher = flotilla_observation::change_request_observer::ChangeRequestRefresher::new(
+        let change_request_refresher = flotilla_observation::change_request_observer::ChangeRequestRefresher::clocked(
             resource_backend.clone(),
             local_node_id.to_string(),
             observation_source.clone(),
             flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
+            Arc::clone(&clock),
         );
         // A board change marks the source's other forge reads out of date, so a pass it wakes reads current facts.
         let dispatch_board_cache = dispatch_board::DispatchBoardCache::new({

@@ -15,8 +15,8 @@ use flotilla_resources::{
     convoy_subject_rows,
     lifecycle_reads::LifecycleReads,
     merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestSpec, ChangeRequestStatus,
-    Convoy, ConvoyPhase, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks, ResourceError, ResourceObject,
-    ResourceProvenance,
+    Clock, Convoy, ConvoyPhase, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks, ResourceError, ResourceObject,
+    ResourceProvenance, SystemClock,
 };
 use flotilla_store::{
     load_metrics::{attributed, caller, carry},
@@ -34,7 +34,7 @@ use flotilla_store_http::HttpBackend;
 use flotilla_store_memory::InMemoryBackend;
 use futures::{FutureExt, StreamExt};
 use tokio::{
-    sync::{Mutex, Notify},
+    sync::{broadcast, Mutex, Notify},
     task::JoinHandle,
 };
 
@@ -143,6 +143,11 @@ struct ChangeRequestRefresherInner {
     /// The engine's checkouts, by which a convoy's demand is held until its checkouts are
     /// released; without them a convoy's demand ends with the convoy.
     lifecycle: std::sync::OnceLock<Arc<dyn LifecycleReads>>,
+    /// The daemon's clock, which the observer's schedule and a record's age are measured on.
+    clock: Arc<dyn Clock>,
+    /// Each record name as the observer confirms it: a read that changes no value writes nothing
+    /// to the store, so no watch sees it, yet it makes the record current (run 5 R5-1).
+    confirmations: broadcast::Sender<String>,
 }
 
 impl ChangeRequestRefresher {
@@ -151,6 +156,17 @@ impl ChangeRequestRefresher {
         authority: String,
         source: Arc<dyn ChangeRequestObservationSource>,
         cadence: ChangeRequestRefreshCadence,
+    ) -> Self {
+        Self::clocked(backend, authority, source, cadence, Arc::new(SystemClock))
+    }
+
+    /// [`Self::new`], with the observer's schedule and records' ages measured on `clock`.
+    pub fn clocked(
+        backend: ResourceBackend,
+        authority: String,
+        source: Arc<dyn ChangeRequestObservationSource>,
+        cadence: ChangeRequestRefreshCadence,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             inner: Arc::new(ChangeRequestRefresherInner {
@@ -170,8 +186,20 @@ impl ChangeRequestRefresher {
                 branch_wake: Arc::new(Notify::new()),
                 branch_scheduler: std::sync::OnceLock::new(),
                 lifecycle: std::sync::OnceLock::new(),
+                clock,
+                confirmations: broadcast::channel(1024).0,
             }),
         }
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        self.inner.clock.now()
+    }
+
+    /// The names of the records this observer confirms from now on, each as its read is
+    /// recorded, whether or not a value changed. A lagging receiver has missed some.
+    pub fn confirmations(&self) -> broadcast::Receiver<String> {
+        self.inner.confirmations.subscribe()
     }
 
     /// Installs the forge lookup the branch probes use, once the daemon that serves it is composed.
@@ -746,7 +774,7 @@ impl ChangeRequestRefresher {
             let was_retained = refresh.demands.is_empty();
             refresh.demands.insert(subscription_id, freshness);
             if freshness.is_some() || was_retained {
-                refresh.next_refresh_at = Utc::now();
+                refresh.next_refresh_at = self.now();
                 refresh.scheduled_cadence = self.inner.cadence.freshness_demanded;
                 refresh.wake.notify_one();
             }
@@ -761,7 +789,7 @@ impl ChangeRequestRefresher {
                 demands: HashMap::from([(subscription_id, freshness)]),
                 wake: Arc::new(Notify::new()),
                 task,
-                next_refresh_at: Utc::now(),
+                next_refresh_at: self.now(),
                 scheduled_cadence: self.inner.cadence.freshness_demanded,
             },
         );
@@ -945,7 +973,7 @@ impl ChangeRequestRefresher {
                 demands: HashMap::new(),
                 wake: Arc::new(Notify::new()),
                 task,
-                next_refresh_at: Utc::now(),
+                next_refresh_at: self.now(),
                 scheduled_cadence: RETAINED_REFRESH_INTERVAL,
             },
         );
@@ -1160,7 +1188,7 @@ impl ChangeRequestRefresher {
             record.object.status.as_ref().map_or(record.object.metadata.creation_timestamp, |status| status.state.observed_at);
         let takeover_after =
             chrono::Duration::from_std(self.inner.cadence.stale_after.saturating_mul(2)).map_err(|error| error.to_string())?;
-        if Utc::now().signed_duration_since(observed_at) <= takeover_after {
+        if self.now().signed_duration_since(observed_at) <= takeover_after {
             return Ok(false);
         }
         let local = self.inner.backend.using::<ChangeRequest>(subject.namespace());
@@ -1190,7 +1218,7 @@ impl ChangeRequestRefresher {
 
     async fn wait_for_next(&self, subject: &ChangeRequestKey, delay: Duration, cadence: Duration) -> bool {
         let Some(wake) = self.inner.active.lock().await.get_mut(subject).map(|refresh| {
-            refresh.next_refresh_at = cadence_deadline(Utc::now(), delay);
+            refresh.next_refresh_at = cadence_deadline(self.now(), delay);
             refresh.scheduled_cadence = cadence;
             Arc::clone(&refresh.wake)
         }) else {
@@ -1224,12 +1252,14 @@ impl ChangeRequestRefresher {
         let stale_after = chrono::Duration::from_std(self.inner.cadence.stale_after).map_err(|error| error.to_string())?;
         if !heartbeat
             && current.status.as_ref().is_some_and(|current| {
-                observed_values_equal(current, &status) && Utc::now().signed_duration_since(current.state.observed_at) < stale_after
+                observed_values_equal(current, &status) && self.now().signed_duration_since(current.state.observed_at) < stale_after
             })
         {
             return Ok(());
         }
         records.update_status(name, &current.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
+        // Sent whether or not a value changed: an unchanged one is confirmed without a write.
+        let _ = self.inner.confirmations.send(name.to_owned());
         Ok(())
     }
 
