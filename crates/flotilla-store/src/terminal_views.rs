@@ -65,6 +65,8 @@ type Session = (String, String);
 struct ToldCounts {
     cursors: u64,
     joins: u64,
+    /// The held joins' commits alone, without their journal's evictions and full reads.
+    commits: u64,
     environments: u64,
     observations: u64,
 }
@@ -77,14 +79,25 @@ impl ToldCounts {
             && self.environments >= told.environments
             && self.observations >= told.observations
     }
+
+    /// Whether a session listed when read through `self` shows every change counted in `told`:
+    /// the joins' journal may have grown since only by evicting launches no view lists.
+    fn covers_listed(&self, told: &ToldCounts) -> bool {
+        self.cursors == told.cursors
+            && self.commits >= told.commits
+            && self.environments >= told.environments
+            && self.observations >= told.observations
+    }
 }
 
 /// The counts that tell a pass of a listing whose cursors are the `cursors`th started, with
 /// `environments` their environments' count: none where the held joins cannot tell.
 fn told_counts(reads: &dyn LifecycleReads, cursors: u64, environments: Option<&Told>) -> Option<ToldCounts> {
+    let joins = reads.joins().ok()?;
     Some(ToldCounts {
         cursors,
-        joins: reads.joins().ok()?.told()?,
+        commits: joins.commits()?,
+        joins: joins.told()?,
         environments: environments.map_or(0, Told::get),
         observations: reads.terminals().ok()?.observations().changed(),
     })
@@ -105,6 +118,9 @@ struct Published {
     /// The counts read before that pass: none where they cannot be told, or where a session's
     /// holder could not be read, which each pass composes again; no read is then served from here.
     through: Option<ToldCounts>,
+    /// The counts read before that pass, whether or not each holder was read: a session composed
+    /// with its holder is current through them.
+    counted: Option<ToldCounts>,
     /// The environments' count the pass read, to count a read's commits by.
     environments: Option<Told>,
     /// Where a reader stands that has read this listing.
@@ -122,6 +138,15 @@ impl Published {
     /// Whether this listing serves a read made after the commit counts `told` were read.
     fn serves(&self, told: Option<&ToldCounts>) -> bool {
         matches!((self.through.as_ref(), told), (Some(through), Some(told)) if through.covers(told))
+    }
+
+    /// Session `session`'s entry, where it serves a read of that session made now: the pass
+    /// read every commit counted, and composed the session with its holder.
+    fn serving(&self, reads: &dyn LifecycleReads, session: &Session) -> Option<&Entry> {
+        let counted = self.counted?;
+        let told = told_counts(reads, counted.cursors, self.environments.as_ref())?;
+        let entry = self.shown.sessions.get(session)?;
+        (counted.covers_listed(&told) && !entry.unresolved).then_some(entry.as_ref())
     }
 
     /// Where a reader stands that has read this listing.
@@ -159,6 +184,7 @@ impl Listing {
         Published {
             shown: Arc::clone(&self.shown),
             through: self.through.filter(|_| resolved && self.cursors.is_some()),
+            counted: self.through.filter(|_| self.cursors.is_some()),
             environments: self.cursors.as_ref().and_then(Cursors::environments_told).flatten(),
             read: self.journal().read(),
             position: self.position(),
@@ -448,6 +474,12 @@ impl TerminalViews {
         if let Some(last) = last.filter(|last| last.serves(told.as_ref())) {
             return Ok(last);
         }
+        self.pass_for(told).await
+    }
+
+    /// The listing once a pass that read the commits counted in `told` has completed: the one
+    /// running, or this read's own.
+    async fn pass_for(&self, told: Option<ToldCounts>) -> Result<Arc<Published>, ResourceError> {
         let waiters = &self.waiters;
         waiters
             .wait(async {
@@ -843,6 +875,13 @@ impl KindRecords<TerminalSession> for TerminalViews {
     /// another home's as listed. A released launch reads as absent, as from a listing.
     async fn get(&self, name: &str) -> Result<Option<Record<TerminalSession>>, String> {
         let here = self.home();
+        // While the listing holds every commit counted, this home's session is read from it: its
+        // newest launch, at the version a listing hands out, and none once released.
+        if let Some(published) = self.last_published() {
+            if let Some(entry) = published.serving(self.reads.as_ref(), &(here.clone(), name.to_owned())) {
+                return Ok(entry.view.clone());
+            }
+        }
         let owned = name.to_owned();
         let record = self.blocking(move |reads| reads.terminals()?.get(&owned, None)).instrument(info_span!("terminal_views.record"));
         let record = record.await.map_err(|error| error.to_string())?;

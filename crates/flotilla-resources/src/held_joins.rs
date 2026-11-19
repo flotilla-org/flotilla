@@ -230,6 +230,13 @@ impl HeldJoins {
         self.cursors_told().map(|told| told.saturating_add(journaled))
     }
 
+    /// The commits its cursors were told of, without the journal: a launch held changes only with
+    /// one of these, and the journal grows without one only to evict an ended launch no view needs
+    /// or to read every launch again as it was. None where [`Self::told`] is none.
+    pub fn commits(&self) -> Option<u64> {
+        self.cursors_told()
+    }
+
     /// The commits the cursors were told of, summed.
     fn cursors_told(&self) -> Option<u64> {
         locked(&self.told).as_ref().map(|told| told.iter().map(Told::get).fold(0, u64::saturating_add))
