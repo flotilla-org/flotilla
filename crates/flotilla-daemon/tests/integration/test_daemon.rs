@@ -472,3 +472,27 @@ async fn a_held_dirty_landed_checkout_stays_held_across_a_restart() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }
+
+// Fleet health counts a capped host's free vessel slots from the vessels the engine holds there:
+// `flotilla fleet check`, `fleet spread` and the plain `flotilla fleet` dashboard all ask it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fleet_health_counts_a_capped_hosts_free_slots_from_its_engine_vessels() {
+    use flotilla_resources::{Host, HostSpec};
+    let daemon = TestDaemon::builder().agent("turn_delay_ms = 60000").start().await;
+    let host = daemon.list::<Host>().await.into_iter().next().expect("the local host");
+    daemon.apply::<Host>(&host.metadata.name, HostSpec { max_vessels: Some(4), ..host.spec.clone() }).await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    daemon.wait_row("a Realised environment", "environment", "", of_convoy(&convoy, "Realised")).await;
+
+    let health = match daemon.execute(CommandAction::QueryFleetHealth {}).await {
+        CommandValue::FleetHealth(health) => health,
+        other => panic!("fleet health: {other:?}"),
+    };
+    let kind = health
+        .hosts
+        .iter()
+        .flat_map(|row| row.fulfilments.iter())
+        .find(|kind| kind.name == DUMMY_FULFILMENT_KIND)
+        .unwrap_or_else(|| panic!("the dummy fulfilment kind: {health:?}"));
+    assert_eq!((kind.max_vessels, kind.free_vessel_slots), (Some(4), Some(3)), "{kind:?}");
+}

@@ -509,6 +509,21 @@ impl ReadProjections<'_> {
         local_host_id: Option<String>,
         now: DateTime<Utc>,
     ) -> Result<FleetHealthResponse, String> {
+        let fulfilments = self.fulfilment_list(namespace).await?;
+        self.fleet_health_with(namespace, host_list, fleet_rows, fulfilments, local_host_id, now).await
+    }
+
+    /// Fleet health over `fulfilments`, listed by the caller from a backend that serves every
+    /// kind their free slots are counted from.
+    async fn fleet_health_with(
+        &self,
+        namespace: &str,
+        host_list: HostListResponse,
+        fleet_rows: Vec<FleetListRow>,
+        fulfilments: FulfilmentListResponse,
+        local_host_id: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<FleetHealthResponse, String> {
         let configured_hosts = self
             .config
             .load_hosts()
@@ -591,7 +606,7 @@ impl ReadProjections<'_> {
         }
 
         let mut fulfilments_by_host = HashMap::<HostName, Vec<FulfilmentRow>>::new();
-        for kind in self.fulfilment_list(namespace).await?.kinds {
+        for kind in fulfilments.kinds {
             if let Some(host_name) = host_refs.get(&kind.host_ref) {
                 fulfilments_by_host.entry(host_name.clone()).or_default().push(kind);
             }
@@ -1032,29 +1047,10 @@ impl ReadProjections<'_> {
         now: DateTime<Utc>,
     ) -> Result<FleetHealthResponse, String> {
         let reads = reads.clone();
-        let hosts = reads
-            .query_declared::<ResourceHost>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
-            .await
-            .map_err(|error| error.to_string())?;
-        // Local charter failures precede the first persisted Host heartbeat.
-        let host_names = hosts
-            .items
-            .iter()
-            .map(|source| source.object.metadata.name.clone())
-            .chain(local_host_id.iter().cloned())
-            .collect::<BTreeSet<_>>();
-        let kinds = self
-            .backend
-            .query_declared::<FulfilmentKind>(
-                namespace,
-                &StoreQuery {
-                    field_values: BTreeMap::from([("spec.host_ref".into(), host_names.into_iter().collect())]),
-                    include_replicas: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        // Free vessel slots count the convoys and vessels a capped host holds. The engine serves
+        // those, so they are read from the request's backend, never the snapshot below, which
+        // holds only what the rows are drawn from.
+        let fulfilments = self.with_backend(&reads).fulfilment_list(namespace).await?;
         let mut snapshot = project_ops::RequestSnapshot::new(&reads, namespace)?;
         let sessions = reads
             .query_declared::<ResourceTerminalSession>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
@@ -1074,10 +1070,9 @@ impl ReadProjections<'_> {
         snapshot.copy::<ResourceHost>(&reads).await?;
         snapshot.copy::<Project>(&reads).await?;
         snapshot.copy::<flotilla_resources::FleetDesignation>(&reads).await?;
-        snapshot.insert::<FulfilmentKind>(kinds)?;
         let reads = snapshot.finish();
         let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry, self.lifecycles).await?;
-        self.with_backend(&reads).fleet_health(namespace, host_list, rows, local_host_id, now).await
+        self.with_backend(&reads).fleet_health_with(namespace, host_list, rows, fulfilments, local_host_id, now).await
     }
 
     pub async fn fleet_inventory(
