@@ -374,15 +374,11 @@ impl LeafSubscriptionTable {
                 // later head observations (including a previously unknown head).
                 let revision = if merged_settlement {
                     format!("{}@merged", leaf.address)
-                } else if leaf.field_path == ".checks" {
-                    match cr.checks.value {
-                        Some(ObservedChecks::Pass) => format!("{head_sha}@pass"),
-                        Some(ObservedChecks::Fail) => format!("{head_sha}@fail"),
-                        Some(ObservedChecks::Pending) => format!("{head_sha}@pending"),
+                } else {
+                    match change_request_turn_revision(leaf, cr) {
+                        Some(revision) => revision,
                         None => return Ok(()),
                     }
-                } else {
-                    head_sha
                 };
                 // The change request at its head; at its observation's revision while the head is unknown.
                 let at = cr.head_sha.value.clone().unwrap_or_else(|| record.object.metadata.resource_version.clone());
@@ -653,9 +649,24 @@ impl LeafSubscriptionTable {
 /// target to act: its [`owes`](TurnDeliveryRule::owes) condition, read from the observation the
 /// turn fired on. A rule without one always asks; an observation that cannot answer may ask, so
 /// it counts as asking.
-fn asks_to_act(rule: &TurnDeliveryRule, address: &LeafAddress, subject: &dyn LeafSubject) -> Result<bool, String> {
+pub(super) fn asks_to_act(rule: &TurnDeliveryRule, address: &LeafAddress, subject: &dyn LeafSubject) -> Result<bool, String> {
     let Some(owes) = &rule.owes else { return Ok(true) };
     Ok(evaluate_leaf(&template_leaf(owes, address.clone()), Some(subject), None)?.result != ThreeValue::False)
+}
+
+/// The subject revision a turn on change-request leaf `leaf` (not a merged settlement) fires at
+/// while the change request is observed as `cr`: its head, with the checks' state for a checks
+/// leaf. `None` while the head, or a checks leaf's checks, is unknown.
+pub(super) fn change_request_turn_revision(leaf: &Leaf, cr: &flotilla_resources::ChangeRequestStatus) -> Option<String> {
+    let head = cr.head_sha.value.clone()?;
+    if leaf.field_path != ".checks" {
+        return Some(head);
+    }
+    Some(match cr.checks.value? {
+        ObservedChecks::Pass => format!("{head}@pass"),
+        ObservedChecks::Fail => format!("{head}@fail"),
+        ObservedChecks::Pending => format!("{head}@pending"),
+    })
 }
 
 /// True when an episode's recorded revision is `progress` itself or a repeat

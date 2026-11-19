@@ -550,6 +550,65 @@ async fn a_superseded_turn_never_typed_is_not_owed() {
     assert_not_nudged(coder).await;
 }
 
+// GitHub run GH2-2: the home's notes, which hold turn delivery's episodes, are in memory and empty
+// after a restart. A turn the coder owed when the daemon restarted is owed after it, from what is
+// durable: the turn's Message, the PR's observation and the promises. The idle coder is nudged.
+#[tokio::test]
+async fn a_turn_owed_at_a_restart_still_nudges_the_idle_seat_after_it() {
+    use flotilla_resources::StallRung;
+
+    let coder = coder().await;
+    submit_pr(&coder).await;
+    observe_pr(&coder, "head-1", flotilla_resources::ObservedChecks::Fail).await;
+    deliver_subject_turn(&coder, CHECKS_RULE, CHECKS_BRIEF, "head-1@fail", true, "head-1").await;
+    restart(&coder);
+    let Coder { daemon, backend, probe, clock, launch, .. } = coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let before = crew_messages(&daemon, "flotilla").await.len();
+
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert_eq!(status.stalls.about(Some(("work", "coder"))).map(|stalled| stalled.rung), Some(StallRung::Nudge), "{:?}", status.stalls);
+    let messages = crew_messages(&daemon, "flotilla").await;
+    assert_eq!(messages.len(), before + 1, "one nudge");
+    assert!(messages
+        .iter()
+        .any(|message| message.spec.body.contains(&format!("the newest turn that asked you to act is `{CHECKS_RULE}`"))));
+}
+
+// GH2-2: a turn the coder answered (it submitted again) before the restart is not owed after it.
+#[tokio::test]
+async fn a_turn_answered_before_a_restart_does_not_nudge_after_it() {
+    let coder = coder().await;
+    let pr = submit_pr(&coder).await;
+    observe_pr(&coder, "head-1", flotilla_resources::ObservedChecks::Fail).await;
+    deliver_subject_turn(&coder, CHECKS_RULE, CHECKS_BRIEF, "head-1@fail", true, "head-1").await;
+    resubmit_pr(&coder, &pr).await;
+    restart(&coder);
+    assert_not_nudged(coder).await;
+}
+
+/// What a restart loses: the home's in-memory notes on the coder's convoy, turn delivery's
+/// episodes among them.
+fn restart(coder: &Coder) {
+    coder.daemon.convoy_engine_path().get().expect("engine").memory().update(&coder.probe.convoy, |notes| *notes = Default::default());
+    let convoy = coder.daemon.convoy_engine_path().get().expect("engine").memory().get(&coder.probe.convoy);
+    assert!(convoy.turn_deliveries.is_empty());
+}
+
+/// Rule `source` fires about the coder's PR at `head`, as turn delivery names its subject, and the
+/// coder receives it.
+async fn deliver_subject_turn(coder: &Coder, source: &str, brief: &str, revision: &str, owes: bool, head: &str) {
+    use flotilla_resources::Clock;
+
+    let record = admit_rule_turn(coder, source, brief, revision, owes, Some(head)).await;
+    let message =
+        crew_messages(&coder.daemon, "flotilla").await.into_iter().find(|message| message.metadata.name == record).expect("the turn");
+    receive_turn(&coder.daemon, &message.spec.receiver, &record, "resume-staging-session", coder.clock.now()).await;
+}
+
 /// The coder submits its PR `pr` again: the same reference, no commit.
 async fn resubmit_pr(coder: &Coder, pr: &flotilla_resources::promises::Promise) {
     coder.clock.advance(chrono::Duration::seconds(1));

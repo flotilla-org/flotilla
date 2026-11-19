@@ -384,7 +384,7 @@ fn declared_seat_stalled(status: &ConvoyStatus, stall: &StalledCondition) -> boo
 /// when every open promise is submitted, the newest of `unanswered`, the turns that asked it to
 /// act and it has not answered. `None` when its status names neither, and the nudge says what the
 /// leaf it is armed on does.
-fn owed_now(status: &ConvoyStatus, vessel: &str, role: &str, unanswered: &[super::wake::OwedTurn<'_>]) -> Option<String> {
+fn owed_now(status: &ConvoyStatus, vessel: &str, role: &str, unanswered: &[super::wake::OwedTurn]) -> Option<String> {
     const BLOCKED: &str = "Run `crew stall --reason <infra|scope|decision|access|other> --message …` if blocked.";
     let unsubmitted: Vec<String> = flotilla_resources::promises::owned(status, vessel, role)
         .iter()
@@ -401,7 +401,7 @@ fn owed_now(status: &ConvoyStatus, vessel: &str, role: &str, unanswered: &[super
     let asked = status
         .workflow_snapshot
         .as_ref()
-        .and_then(|snapshot| snapshot.turn_delivery.get(turn.source))
+        .and_then(|snapshot| snapshot.turn_delivery.get(&turn.source))
         .and_then(|rule| rule.brief.lines().map(str::trim).find(|line| !line.is_empty()))
         .unwrap_or_default();
     // The revision of its subject the turn was delivered for. The seat has neither submitted nor
@@ -2055,9 +2055,7 @@ impl ReconcilerWake {
         let obligation = actor_obligation(leaf)?;
         let obligation = match convoy.status.as_ref() {
             Some(status) => {
-                let heads = super::wake::TurnHeads::read(convoy, &tick.inputs.forges, |name| {
-                    tick.progress_observations.get(name).and_then(|record| record.status.as_ref())
-                });
+                let heads = super::wake::TurnHeads::read(convoy, &tick.inputs.forges, |name| tick.progress_observations.get(name).copied());
                 // Unread, the nudge names no turn rather than one the seat may have answered.
                 let unanswered = self.unanswered_turns(namespace, convoy, vessel, role, None, &heads).await.unwrap_or_else(|error| {
                     tracing::debug!(convoy = %convoy.metadata.name, vessel, role, %error, "a nudge's owed turns are unread");

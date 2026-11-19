@@ -867,11 +867,8 @@ impl ReconcilerWake {
                                     Ok(promises) => latest_submission(promises, vessel, role, &open),
                                     Err(error) => Err(error.clone()),
                                 };
-                                let heads = heads.get_or_insert_with(|| {
-                                    TurnHeads::read(convoy, &forges, |name| {
-                                        observed_change_requests.get(name).and_then(|record| record.status.as_ref())
-                                    })
-                                });
+                                let heads = heads
+                                    .get_or_insert_with(|| TurnHeads::read(convoy, &forges, |name| observed_change_requests.get(name)));
                                 let unanswered = match latest {
                                     Ok(latest) => self.unanswered_turns(namespace, convoy, vessel, role, Some(latest), heads).await,
                                     Err(error) => Err(error),
@@ -1307,21 +1304,22 @@ fn latest_submission(
 
 /// A new turn a turn rule admitted to a seat that asked it to act (run 4).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct OwedTurn<'a> {
+pub(super) struct OwedTurn {
     /// Its rule's source.
-    pub(super) source: &'a str,
+    pub(super) source: String,
     pub(super) accepted_at: DateTime<Utc>,
     /// The revision of its subject it was delivered for.
-    pub(super) revision: &'a str,
+    pub(super) revision: String,
     /// Its message's record name.
-    message: &'a str,
+    message: String,
 }
 
-/// The new turns a turn rule targeting seat `vessel`/`role` admitted that asked it to act (run 4).
-/// A turn that only informed (checks passed) is not among them, and stall nudges and hand-offs
-/// record no turn delivery, so they never are. Whether the seat has answered one is
-/// [`ReconcilerWake::unanswered_turns`]'s to say.
-fn owed_turns<'a>(status: &'a flotilla_resources::ConvoyStatus, vessel: &'a str, role: &'a str) -> impl Iterator<Item = OwedTurn<'a>> + 'a {
+/// The new turns a turn rule targeting seat `vessel`/`role` admitted that asked it to act (run 4),
+/// as the home's notes on turn delivery hold them since it started. A turn that only informed
+/// (checks passed) is not among them, and stall nudges and hand-offs record no turn delivery, so
+/// they never are. Whether the seat has answered one is [`ReconcilerWake::unanswered_turns`]'s to
+/// say.
+fn noted_turns<'a>(status: &'a flotilla_resources::ConvoyStatus, vessel: &'a str, role: &'a str) -> impl Iterator<Item = OwedTurn> + 'a {
     status
         .workflow_snapshot
         .iter()
@@ -1331,84 +1329,158 @@ fn owed_turns<'a>(status: &'a flotilla_resources::ConvoyStatus, vessel: &'a str,
         .flat_map(|(source, delivery)| delivery.episodes.iter().map(move |episode| (source, episode)))
         .filter(|(_, episode)| episode.owes)
         .filter_map(|(source, episode)| match &episode.outcome {
-            TurnDeliveryOutcome::MessageAccepted { new_turn: true, accepted_at, message, .. } => {
-                Some(OwedTurn { source, accepted_at: *accepted_at, revision: &episode.subject_revision, message: &message.name })
-            }
+            TurnDeliveryOutcome::MessageAccepted { new_turn: true, accepted_at, message, .. } => Some(OwedTurn {
+                source: source.to_owned(),
+                accepted_at: *accepted_at,
+                revision: episode.subject_revision.clone(),
+                message: message.name.clone(),
+            }),
             _ => None,
         })
 }
 
-/// The observed heads of the change requests each turn rule of a convoy fires on, by the rule's
-/// source: a turn about a head that none of them is at any longer was answered by a push
-/// (GitHub run GH2-1).
+/// The change requests each turn rule of a convoy fires on, as observed: a turn about a head none
+/// of them is at any longer was answered by a push (GitHub run GH2-1), and the turn a rule fires
+/// at their current state is the one a seat may owe that the home's notes no longer hold (GH2-2).
 #[derive(Default)]
-pub(super) struct TurnHeads(BTreeMap<String, Vec<Option<String>>>);
+pub(super) struct TurnHeads(Vec<TurnSubject>);
+
+/// One change request a turn rule fires on, and its observation.
+struct TurnSubject {
+    delivery: flotilla_resources::InstantiatedTurnDelivery,
+    observed: Option<ResourceObject<ChangeRequest>>,
+}
 
 impl TurnHeads {
-    /// `convoy`'s rules' change requests' heads, as `observed` reads each record by its name.
+    /// `convoy`'s rules' change requests, as `observed` reads each record by its name.
     pub(super) fn read<'a>(
         convoy: &ResourceObject<Convoy>,
         forges: &[flotilla_resources::ForgeSpec],
-        observed: impl Fn(&str) -> Option<&'a flotilla_resources::ChangeRequestStatus>,
+        observed: impl Fn(&str) -> Option<&'a ResourceObject<ChangeRequest>>,
     ) -> Self {
-        let mut heads = BTreeMap::<String, Vec<Option<String>>>::new();
         // A change request rule's subjects are the convoy's own; no observation is needed to bind them.
-        for delivery in instantiate_turn_delivery(convoy, &BTreeMap::new(), forges).unwrap_or_default() {
-            if !matches!(delivery.leaf.address, LeafAddress::ChangeRequest { .. }) {
-                continue;
-            }
-            let Ok(name) = flotilla_resources::address::leaf_record_name(&delivery.leaf.address, forges) else { continue };
-            heads.entry(delivery.source).or_default().push(observed(&name).and_then(|status| status.head_sha.value.clone()));
-        }
-        Self(heads)
+        let subjects = instantiate_turn_delivery(convoy, &BTreeMap::new(), forges)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|delivery| matches!(delivery.leaf.address, LeafAddress::ChangeRequest { .. }))
+            .filter_map(|delivery| {
+                let name = flotilla_resources::address::leaf_record_name(&delivery.leaf.address, forges).ok()?;
+                Some(TurnSubject { observed: observed(&name).cloned(), delivery })
+            })
+            .collect();
+        Self(subjects)
     }
 
     /// Whether every change request rule `source` fires on is observed at a head other than the
     /// one `revision` was delivered for: the seat pushed after the turn.
     fn moved(&self, source: &str, revision: &str) -> bool {
-        self.0.get(source).is_some_and(|heads| {
-            !heads.is_empty()
-                && heads.iter().all(|head| head.as_deref().is_some_and(|head| !super::turn_delivery::same_progress(revision, head)))
-        })
+        let mut heads = self.0.iter().filter(|subject| subject.delivery.source == source).peekable();
+        heads.peek().is_some()
+            && heads.all(|subject| {
+                subject
+                    .observed
+                    .as_ref()
+                    .and_then(|record| record.status.as_ref()?.head_sha.value.as_deref())
+                    .is_some_and(|head| !super::turn_delivery::same_progress(revision, head))
+            })
+    }
+
+    /// The turns rules targeting seat `vessel`/`role` fire at their change requests' current
+    /// state that ask it to act, as rule source and subject revision: the turns it may owe now,
+    /// whatever the home has noted, its `owes` read at `now`. A merged settlement is not among them.
+    fn current<'a>(&'a self, vessel: &'a str, role: &'a str, now: DateTime<Utc>) -> impl Iterator<Item = (&'a str, String)> + 'a {
+        self.0
+            .iter()
+            .filter(move |subject| subject.delivery.rule.to.vessel == vessel && subject.delivery.rule.to.role == role)
+            .filter(|subject| !is_merged_settlement_probe(&subject.delivery.leaf))
+            .filter_map(move |subject| {
+                let record = subject.observed.as_ref()?;
+                let revision = super::turn_delivery::change_request_turn_revision(&subject.delivery.leaf, record.status.as_ref()?)?;
+                let observation =
+                    flotilla_resources::ChangeRequestLeafSubject { change_request: record, now, stale_after: std::time::Duration::MAX };
+                // As delivery reads its rule's `owes` as it fires: one that cannot answer asks.
+                super::turn_delivery::asks_to_act(&subject.delivery.rule, &subject.delivery.leaf.address, &observation)
+                    .unwrap_or(true)
+                    .then_some((subject.delivery.source.as_str(), revision))
+            })
     }
 }
 
 impl ReconcilerWake {
     /// The turns seat `vessel`/`role` of `convoy` owes and has not answered, accepted after
-    /// `since` (its latest submission) when given: a turn is answered by a submission after it or
+    /// `since` (its latest submission) when given. A turn is answered by a submission after it or
     /// a push past the head it was about (`heads`), and one superseded before it was typed was
     /// never put to the seat, which owes the turn that superseded it instead (GitHub run GH2-1).
-    /// The superseded are read by the messages' exact identities, only for turns left after the
-    /// rest.
-    pub(super) async fn unanswered_turns<'a>(
+    ///
+    /// The home's notes hold the turns delivered since it started. A turn delivered before is
+    /// found from what is durable (GH2-2): its rule's turn at its change request's current state
+    /// (`heads`) has a Message under a name its producer key fixes, read by that name with when
+    /// it was accepted. A turn at an earlier head was answered by the push past it. The messages
+    /// are read by their exact identities, once, only for turns left after the rest.
+    pub(super) async fn unanswered_turns(
         &self,
         namespace: &str,
-        convoy: &'a ResourceObject<Convoy>,
-        vessel: &'a str,
-        role: &'a str,
+        convoy: &ResourceObject<Convoy>,
+        vessel: &str,
+        role: &str,
         since: Option<DateTime<Utc>>,
         heads: &TurnHeads,
-    ) -> Result<Vec<OwedTurn<'a>>, String> {
+    ) -> Result<Vec<OwedTurn>, String> {
         let Some(status) = convoy.status.as_ref() else { return Ok(Vec::new()) };
-        let turns: Vec<_> = owed_turns(status, vessel, role)
+        let noted: Vec<_> = noted_turns(status, vessel, role)
             .filter(|turn| since.is_none_or(|since| turn.accepted_at > since))
-            .filter(|turn| !heads.moved(turn.source, turn.revision))
+            .filter(|turn| !heads.moved(&turn.source, &turn.revision))
             .collect();
-        if turns.is_empty() {
-            return Ok(turns);
+        let current: Vec<_> = heads.current(vessel, role, self.subscriptions.inner.clock.now()).collect();
+        if noted.is_empty() && current.is_empty() {
+            return Ok(noted);
         }
-        let seat = flotilla_resources::crew_role_address(&convoy.spec.project_ref, &convoy.metadata.name, vessel, role);
-        let named: Vec<_> = turns.iter().map(|turn| (seat.clone(), turn.message.to_owned())).collect();
         let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
-        let superseded: HashSet<String> = primitives
+        // The current turns' names: a turn is sent from the fleet's turn-rules role to the seat.
+        // A fleet with no such role admitted none.
+        let project = &convoy.spec.project_ref;
+        let seat = super::Party::Seat { project: project.clone(), convoy: convoy.metadata.name.clone(), role: role.to_owned() };
+        let current: Vec<_> = match super::Party::fleet("turn-rules").inbox(primitives.as_ref(), namespace, project).await {
+            Ok(sender) => {
+                let inbox = seat.inbox(primitives.as_ref(), namespace, project).await?;
+                current
+                    .into_iter()
+                    .filter(|(source, revision)| !noted.iter().any(|turn| turn.source == *source && turn.revision == *revision))
+                    .map(|(source, revision)| {
+                        let key = super::turn_delivery::turn_message_producer_key(source, &revision);
+                        let message = flotilla_resources::message_record_name(inbox.as_str(), sender.as_str(), &key);
+                        (source.to_owned(), revision, message)
+                    })
+                    .collect()
+            }
+            Err(error) => {
+                tracing::debug!(convoy = %convoy.metadata.name, %error, "no fleet turn-rules role: no turn was sent");
+                Vec::new()
+            }
+        };
+        let receiver = flotilla_resources::crew_role_address(project, &convoy.metadata.name, vessel, role);
+        let named: Vec<_> = noted
+            .iter()
+            .map(|turn| turn.message.clone())
+            .chain(current.iter().map(|(_, _, message)| message.clone()))
+            .map(|message| (receiver.clone(), message))
+            .collect();
+        if named.is_empty() {
+            return Ok(noted);
+        }
+        let read: BTreeMap<String, flotilla_messaging::SeatMessage> = primitives
             .sent_messages(namespace, &named)
             .await
             .map_err(|error| error.to_string())?
             .into_iter()
-            .filter(|message| message.standing.phase == flotilla_resources::MessagePhase::Superseded)
-            .map(|message| message.standing.name)
+            .map(|message| (message.standing.name.clone(), message.standing))
             .collect();
-        Ok(turns.into_iter().filter(|turn| !superseded.contains(turn.message)).collect())
+        let superseded = |message: &str| read.get(message).is_some_and(|read| read.phase == flotilla_resources::MessagePhase::Superseded);
+        let found = current.into_iter().filter_map(|(source, revision, message)| {
+            let accepted_at = read.get(&message)?.created;
+            since.is_none_or(|since| accepted_at > since).then_some(OwedTurn { source, accepted_at, revision, message })
+        });
+        Ok(noted.into_iter().chain(found).filter(|turn| !superseded(&turn.message)).collect())
     }
 }
 
