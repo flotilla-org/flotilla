@@ -19,8 +19,8 @@ use std::{
 };
 
 use flotilla_resources::{
-    Convoy, ConvoyEnsure, CrewDefaults, FleetDesignation, Project, ReadWatchEvent, Resource, ResourceProvenance, TerminalSession, Vessel,
-    CONVOY_LABEL, ROLE_ADDRESS_ANNOTATION,
+    Convoy, ConvoyEnsure, ConvoySpec, CrewDefaults, FleetDesignation, Project, ReadWatchEvent, Resource, ResourceProvenance, TerminalSession,
+    Vessel, VesselSpec, WorkflowSnapshot, CONVOY_LABEL, ROLE_ADDRESS_ANNOTATION,
 };
 use tracing::{info_span, Instrument};
 
@@ -36,6 +36,10 @@ pub enum Touched {
     Nothing,
     /// The records of convoy `0`'s launches: its sessions here are routed again.
     Convoy(String),
+    /// A record of convoy `convoy`'s launches that routing reads only in part changed, to `facts`,
+    /// or is gone (`None`): its sessions here are routed again unless what routing reads of the
+    /// record is as the last change reported it.
+    Record { convoy: String, record: RecordKey, facts: Option<Box<RoutingFacts>> },
     /// Session `name`, crew of `convoy` when its view names one, held `here` or at another home,
     /// and whether it claims an adopted role.
     Session { name: String, convoy: Option<String>, here: bool, claims: bool },
@@ -44,6 +48,38 @@ pub enum Touched {
     Claims,
     /// What any session's holding may turn on.
     Everything,
+}
+
+/// A record routing reads in part: its kind, its name and the home of the copy, `None` for this
+/// home's. Each copy is compared with its own last change.
+pub type RecordKey = (&'static str, String, Option<String>);
+
+/// What role routing reads of a record it reads only in part: a change that leaves this as it was
+/// changes no holding ([`RoleRouting`](crate::ports::RoleRouting) and the receiver snapshot it
+/// resolves over).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutingFacts {
+    /// A convoy launch's names, its spec (project, role, generation), the seats of its frozen
+    /// workflow and whether it ended; not its progress, which every handoff changes.
+    Convoy {
+        labels: BTreeMap<String, String>,
+        annotations: BTreeMap<String, String>,
+        spec: Box<ConvoySpec>,
+        ended: bool,
+        seats: Option<Box<WorkflowSnapshot>>,
+    },
+    /// A Vessel launch's names and spec: routing reads which launches a work has, and their
+    /// sessions, never a launch's state.
+    Vessel { labels: BTreeMap<String, String>, annotations: BTreeMap<String, String>, spec: VesselSpec },
+}
+
+/// The key of the copy an event is about.
+fn record_key<R: Resource>(kind: &'static str, read: &flotilla_resources::ReadResourceObject<R>) -> RecordKey {
+    let home = match &read.provenance {
+        ResourceProvenance::Local => None,
+        ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+    };
+    (kind, read.object.metadata.name.clone(), home)
 }
 
 /// A kind whose records role routing reads, and what a change to one touches.
@@ -96,14 +132,50 @@ impl RoutingInput for TerminalSession {
 
 impl RoutingInput for Convoy {
     fn touched(event: &ReadWatchEvent<Self>) -> Touched {
-        Touched::Convoy(name(event).to_owned())
+        let (record, facts) = match event {
+            ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) => {
+                let object = &read.object;
+                let facts = RoutingFacts::Convoy {
+                    labels: object.metadata.labels.clone(),
+                    annotations: object.metadata.annotations.clone(),
+                    spec: Box::new(object.spec.clone()),
+                    ended: object.status.as_ref().is_some_and(|status| status.phase.is_terminal()),
+                    seats: object.status.as_ref().and_then(|status| status.workflow_snapshot.clone()).map(Box::new),
+                };
+                (record_key("Convoy", read), Some(Box::new(facts)))
+            }
+            ReadWatchEvent::Deleted(read) => (record_key("Convoy", read), None),
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
+                let home = match provenance {
+                    ResourceProvenance::Local => None,
+                    ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+                };
+                (("Convoy", tombstone.name.clone(), home), None)
+            }
+        };
+        Touched::Record { convoy: name(event).to_owned(), record, facts }
     }
 }
 
 impl RoutingInput for Vessel {
     fn touched(event: &ReadWatchEvent<Self>) -> Touched {
-        // A vessel's sessions seat its convoy's roles; one deleted by name names no convoy.
-        object(event).map_or(Touched::Everything, |read| Touched::Convoy(read.object.spec.convoy_ref.clone()))
+        // A vessel's sessions seat its convoy's roles; one deleted by name names no convoy. A
+        // launch's name is never used again, so what is kept of it is never read for another.
+        match event {
+            ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) => {
+                let object = &read.object;
+                let facts = RoutingFacts::Vessel {
+                    labels: object.metadata.labels.clone(),
+                    annotations: object.metadata.annotations.clone(),
+                    spec: object.spec.clone(),
+                };
+                Touched::Record { convoy: object.spec.convoy_ref.clone(), record: record_key("Vessel", read), facts: Some(Box::new(facts)) }
+            }
+            ReadWatchEvent::Deleted(read) => {
+                Touched::Record { convoy: read.object.spec.convoy_ref.clone(), record: record_key("Vessel", read), facts: None }
+            }
+            ReadWatchEvent::DeletedByName { .. } => Touched::Everything,
+        }
     }
 }
 
@@ -165,25 +237,57 @@ pub struct RoutingChanges {
     /// The watches that stopped and were not opened again.
     unwatched: std::sync::atomic::AtomicUsize,
     wake: Arc<tokio::sync::Notify>,
+    /// What routing reads of each record it reads in part, as its last change reported it; a
+    /// record leaves when it is gone, and all leave when every session is routed again.
+    seen: Mutex<BTreeMap<RecordKey, Box<RoutingFacts>>>,
 }
 
 impl RoutingChanges {
     /// Changes waking `wake`; every session is routed at the first refresh.
     pub fn new(wake: Arc<tokio::sync::Notify>) -> Arc<Self> {
-        Arc::new(Self { dirty: Mutex::new(Dirty { all: true, ..Dirty::default() }), unwatched: Default::default(), wake })
+        Arc::new(Self {
+            dirty: Mutex::new(Dirty { all: true, ..Dirty::default() }),
+            unwatched: Default::default(),
+            wake,
+            seen: Mutex::default(),
+        })
     }
 
     fn dirty(&self) -> std::sync::MutexGuard<'_, Dirty> {
         self.dirty.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn seen(&self) -> std::sync::MutexGuard<'_, BTreeMap<RecordKey, Box<RoutingFacts>>> {
+        self.seen.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Records what a change touched, and wakes the reader when it touched anything.
     pub fn touched(&self, touched: Touched) {
+        let touched = match touched {
+            Touched::Record { convoy, record, facts } => {
+                let mut seen = self.seen();
+                match facts {
+                    // As routing last read it: the change touches no holding.
+                    Some(facts) if seen.get(&record) == Some(&facts) => return,
+                    Some(facts) => drop(seen.insert(record, facts)),
+                    None => drop(seen.remove(&record)),
+                }
+                Touched::Convoy(convoy)
+            }
+            Touched::Everything => {
+                // Every session is routed from what is held then: each record's next change is
+                // compared with nothing, so none is missed whatever a reopened watch skipped.
+                self.seen().clear();
+                Touched::Everything
+            }
+            touched => touched,
+        };
         {
             let mut dirty = self.dirty();
             match touched {
                 Touched::Nothing => return,
-                Touched::Convoy(convoy) => {
+                // A record's change reaches here as its convoy's, once compared above.
+                Touched::Convoy(convoy) | Touched::Record { convoy, .. } => {
                     dirty.convoys.insert(group(&convoy));
                 }
                 Touched::Session { name, convoy, here, claims } => {
@@ -494,6 +598,80 @@ mod tests {
         let other = FleetRoles::declared("other").expect("roles");
         held.refresh(&bindings, &other).await.expect("refresh");
         assert_eq!(bindings.routes(), vec![None]);
+    }
+
+    /// Convoy `name`'s view, held here, in `phase` with its seats `seats`, as its watch reports a
+    /// change to it.
+    fn convoy_event(name: &str, phase: flotilla_resources::ConvoyPhase, seats: Option<WorkflowSnapshot>) -> ReadWatchEvent<Convoy> {
+        let object = flotilla_resources::ResourceObject {
+            metadata: flotilla_resources::ObjectMeta {
+                name: name.into(),
+                namespace: "flotilla".into(),
+                resource_version: "1".into(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: chrono::Utc::now(),
+                merge: None,
+            },
+            spec: ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("lab".into()).build(),
+            status: Some(flotilla_resources::ConvoyStatus { phase, workflow_snapshot: seats, ..Default::default() }),
+        };
+        ReadWatchEvent::Modified(flotilla_resources::ReadResourceObject { object, provenance: ResourceProvenance::Local })
+    }
+
+    // A convoy change routing does not read (its progress, which each handoff moves) routes
+    // nothing; one to what it reads (its seats, its ending) and its leaving route its sessions.
+    // After every session is routed again, the next change of any record routes its convoy.
+    #[tokio::test]
+    async fn a_convoy_change_routes_only_when_routing_reads_it() {
+        use flotilla_resources::ConvoyPhase;
+        let bindings = Sessions::default();
+        bindings.run("a-coder", "alpha#1", false);
+        let roles = FleetRoles::declared("lab").expect("roles");
+        let changes = RoutingChanges::new(Arc::new(tokio::sync::Notify::new()));
+        let mut held = HeldRoles::new("flotilla", Arc::clone(&changes));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![None]);
+
+        changes.touched(Convoy::touched(&convoy_event("alpha#1", ConvoyPhase::Pending, None)));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder"])], "the first change seen of a record routes");
+
+        changes.touched(Convoy::touched(&convoy_event("alpha#1", ConvoyPhase::Active, None)));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), Vec::<Option<BTreeSet<String>>>::new(), "progress alone routes nothing");
+
+        let seats = WorkflowSnapshot {
+            cascade: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+            vessels: Vec::new(),
+        };
+        changes.touched(Convoy::touched(&convoy_event("alpha#1", ConvoyPhase::Active, Some(seats))));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder"])], "its seats are read");
+
+        changes.touched(Convoy::touched(&convoy_event("alpha#1", ConvoyPhase::Landed, None)));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder"])], "its ending is read");
+
+        let ReadWatchEvent::Modified(read) = convoy_event("alpha#1", ConvoyPhase::Landed, None) else { unreachable!() };
+        changes.touched(Convoy::touched(&ReadWatchEvent::Deleted(read)));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder"])], "its leaving routes");
+
+        changes.touched(Convoy::touched(&convoy_event("alpha#1", ConvoyPhase::Landed, None)));
+        changes.reopened();
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![None]);
+        changes.touched(Convoy::touched(&convoy_event("alpha#1", ConvoyPhase::Landed, None)));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder"])], "a reopened watch forgets what it saw");
     }
 
     // A watch that stopped leaves no change to follow for its kind: every refresh routes every
