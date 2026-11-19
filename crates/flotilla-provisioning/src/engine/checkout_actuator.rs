@@ -167,6 +167,12 @@ pub struct Against<'a> {
 #[async_trait]
 pub trait HolderInputs: Send + Sync + 'static {
     async fn inputs(&self, holder: Option<&CheckoutHolder>, spec: &CheckoutSpec) -> Result<CheckoutInputs, String>;
+
+    /// Establishes, for `holder`'s checkout being released, what judging its landing needs and
+    /// this daemon may not hold: the search for a change request from its branch, which is held
+    /// in memory and so is not held after a restart. Keyed by the holder being released; one
+    /// that cannot be established leaves landing unknown.
+    async fn associate(&self, _holder: Option<&CheckoutHolder>) {}
 }
 
 /// A holder that supplies nothing but its convoy's name as the owner: tests, and holders whose records
@@ -411,6 +417,26 @@ fn held_reason(launch: &str, inspection: &Inspection) -> String {
     reason
 }
 
+/// Why a checkout's removal is held when whether it landed could not be judged: the work its
+/// inspection found not clean, and why landing was not judged.
+fn unjudged_reason(launch: &str, inspection: &Inspection) -> String {
+    let mut reason = format!("checkout {launch} ended, but its removal is held: the checkout is not clean");
+    for detail in &inspection.clean_details {
+        reason.push_str("\n  ");
+        reason.push_str(detail);
+    }
+    reason.push_str("\nand whether it landed could not be judged");
+    for detail in &inspection.landed_details {
+        reason.push_str("\n  ");
+        reason.push_str(detail);
+    }
+    let checkout = launched(launch);
+    reason.push_str(&format!(
+        "\nclean it up and run `flotilla checkout {checkout} recheck`, or rule it archived with `flotilla checkout {checkout} archive`"
+    ));
+    reason
+}
+
 /// The Checkout kind's [`Actuator`] over the host's checkout provider.
 pub struct CheckoutActuator<P> {
     provider: Arc<P>,
@@ -611,6 +637,9 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
             Err(error) => return Err(transient(error)),
         }
         let holder = request.holder.as_ref().and_then(super::checkouts::checkout_holder);
+        if !archive {
+            self.inputs.associate(holder.as_ref()).await;
+        }
         let inputs = self.inputs.inputs(holder.as_ref(), &spec_of(request)).await.unwrap_or_else(|error| {
             warn!(checkout = name, %error, "a released checkout's inputs could not be read; it is inspected with none");
             CheckoutInputs::default()
@@ -628,6 +657,18 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
         // A person's ruling archives it, as integration that could not be judged is.
         let judged = if archive { None } else { integration.as_ref() };
         let Some(removal) = removal_for(request, clone_path, judged) else { return Ok(()) };
+        // Work not clean whose landing could not be judged is held for a person, as landed work
+        // that is not clean is: unknown is not false, so it is not archived on the strength of it.
+        if let (CheckoutRemoval::ForcedWorktree { .. }, Some(inspection), Some(CheckoutHolder::Convoy(convoy))) =
+            (&removal, judged, &holder)
+        {
+            if inspection.landed.is_none() && inspection.clean == Some(false) {
+                self.holds.held(convoy, &self.home, checkout, &unjudged_reason(name, inspection)).await;
+                return Err(transient(format!(
+                    "checkout {name} is not clean and whether it landed could not be judged; held for a person"
+                )));
+            }
+        }
         match self.provider.remove(environment, &removal).await {
             Ok(outcome) => {
                 removal_events(checkout, &self.home, environment, &outcome);

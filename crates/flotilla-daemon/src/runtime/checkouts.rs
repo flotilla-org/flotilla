@@ -141,6 +141,7 @@ impl BranchValidation for ForgeBranchValidation {
 /// branch, and, for a fresh clone, the credential grants of the vessel whose environment it is
 /// cloned into, from the convoy's frozen requirement.
 pub(super) struct ConvoyHolderInputs {
+    pub(super) daemon: Arc<InProcessDaemon>,
     pub(super) backend: ResourceBackend,
     pub(super) namespace: String,
     pub(super) lifecycle_reads: Arc<dyn LifecycleReads>,
@@ -218,6 +219,27 @@ impl HolderInputs for ConvoyHolderInputs {
             change_request: convoy_change_request_id(&convoy, repo_ref, &forges),
             change_request_searched: convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_at.is_some()),
         })
+    }
+
+    /// The convoy's branch is searched for its change request now, when this daemon has not
+    /// searched it since it started: the search is noted in memory, and the aggregator does not
+    /// search an ended convoy's branch again (d11 finding 1). Only the convoy released is searched.
+    async fn associate(&self, holder: Option<&CheckoutHolder>) {
+        let Some(CheckoutHolder::Convoy(launch)) = holder else { return };
+        let convoy = match self.backend.including_replicas::<Convoy>(&self.namespace).get(launch).await {
+            Ok(convoy) => convoy.object,
+            Err(error) => {
+                debug!(convoy = %launch, %error, "a released checkout's convoy did not read; its association is not searched");
+                return;
+            }
+        };
+        if convoy.spec.change_request.is_some() || convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_at.is_some()) {
+            return;
+        }
+        let Some(branch) = convoy.spec.r#ref.as_deref() else { return };
+        if let Err(error) = self.daemon.discover_convoy_branch_subjects(&self.namespace, launch, branch).await {
+            warn!(convoy = %launch, %branch, %error, "a released checkout's convoy branch could not be searched; its landing stays unknown");
+        }
     }
 }
 

@@ -1288,6 +1288,7 @@ fn spawn_checkout_controller(
     let actuator = CheckoutActuator::new(
         Arc::new(checkouts::EngineCheckoutProvider { routing }),
         Arc::new(checkouts::ConvoyHolderInputs {
+            daemon: Arc::clone(&state.daemon),
             backend: state.daemon.resource_backend(),
             namespace: state.namespace.clone(),
             lifecycle_reads: state.daemon.lifecycle_reads(),

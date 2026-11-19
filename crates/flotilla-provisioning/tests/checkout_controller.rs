@@ -14,7 +14,10 @@ use flotilla_provisioning::engine::{checkout_actuator::convoy_holding, checkouts
 use flotilla_provisioning::{
     checkout_runtime::{CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout},
     engine::{
-        checkout_actuator::{Against, BranchValidation, CheckoutActuator, CheckoutProvider, FreshClone, NamedHolderInputs},
+        checkout_actuator::{
+            Against, BranchValidation, CheckoutActuator, CheckoutHolds, CheckoutInputs, CheckoutProvider, FreshClone, HolderInputs,
+            NamedHolderInputs,
+        },
         controller::Controller,
         reads::StoreReads,
     },
@@ -62,6 +65,9 @@ struct Asked {
     protected: Vec<String>,
     /// How many inspections read the branch's ref on its remote.
     remote_reads: usize,
+    /// Each inspection judges `landed` only when its holder's branch was searched for a change
+    /// request, as the VCS inspection does: landed then, unknown otherwise.
+    landed_once_searched: bool,
 }
 
 #[derive(Default)]
@@ -124,7 +130,12 @@ impl CheckoutProvider for RecordingProvider {
         let mut asked = self.asked();
         asked.inspected.push(path.into());
         asked.remote_reads += usize::from(against.remote);
-        asked.inspection.clone().ok_or_else(|| "fatal: not a git repository".into())
+        let landed_once_searched = asked.landed_once_searched;
+        let inspection = asked.inspection.clone().ok_or_else(|| "fatal: not a git repository".to_owned())?;
+        Ok(match landed_once_searched {
+            true => Inspection { landed: against.change_request_searched.then_some(true), ..inspection },
+            false => inspection,
+        })
     }
 
     async fn remove(&self, _: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
@@ -150,6 +161,47 @@ impl CheckoutProvider for RecordingProvider {
     async fn protect(&self, _: &str, _: &str, target: &str, _: &str) -> Result<(), String> {
         self.asked().protected.push(target.into());
         Ok(())
+    }
+}
+
+/// Who was told of each held checkout: its convoy, checkout and reason.
+#[derive(Default)]
+struct RecordingHolds {
+    held: Mutex<Vec<(String, String, String)>>,
+}
+
+impl RecordingHolds {
+    fn held(&self) -> Vec<(String, String, String)> {
+        self.held.lock().expect("held").clone()
+    }
+}
+
+#[async_trait]
+impl CheckoutHolds for RecordingHolds {
+    async fn held(&self, convoy: &str, _: &str, checkout: &str, reason: &str) {
+        self.held.lock().expect("held").push((convoy.into(), checkout.into(), reason.into()));
+    }
+
+    async fn released(&self, _: &str, _: &str) {}
+}
+
+/// A holder whose branch this daemon has not searched since it started, as after a restart, until
+/// its checkout's release searches it.
+#[derive(Default)]
+struct SearchedOnRelease {
+    searched: Mutex<Vec<CheckoutHolder>>,
+}
+
+#[async_trait]
+impl HolderInputs for SearchedOnRelease {
+    async fn inputs(&self, holder: Option<&CheckoutHolder>, spec: &CheckoutSpec) -> Result<CheckoutInputs, String> {
+        let named = NamedHolderInputs.inputs(holder, spec).await?;
+        let searched = holder.is_some_and(|holder| self.searched.lock().expect("searched").contains(holder));
+        Ok(CheckoutInputs { change_request_searched: searched, ..named })
+    }
+
+    async fn associate(&self, holder: Option<&CheckoutHolder>) {
+        self.searched.lock().expect("searched").extend(holder.cloned());
     }
 }
 
@@ -179,6 +231,8 @@ struct World {
     validation: Arc<ScriptedValidation>,
     /// The controller's actuator, which a checkout's inspector shares.
     actuator: Arc<CheckoutActuator<RecordingProvider>>,
+    /// Who was told of a held checkout.
+    holds: Arc<RecordingHolds>,
     checkouts: CheckoutFixture,
     clones: CloneFixture,
     commits: Arc<Notify>,
@@ -207,6 +261,15 @@ impl World {
 
     /// As [`World::start`], each new branch validated by `validation`.
     fn validated(provider: RecordingProvider, validation: ScriptedValidation) -> Self {
+        Self::composed(provider, validation, Arc::new(NamedHolderInputs))
+    }
+
+    /// As [`World::start`], the holders' inputs read from `inputs`.
+    fn with_inputs(provider: RecordingProvider, inputs: Arc<dyn HolderInputs>) -> Self {
+        Self::composed(provider, ScriptedValidation::default(), inputs)
+    }
+
+    fn composed(provider: RecordingProvider, validation: ScriptedValidation, inputs: Arc<dyn HolderInputs>) -> Self {
         let directory = tempfile::tempdir().expect("directory");
         let service =
             Arc::new(Service::open(&directory.path().join("decided.sqlite"), HOME, decided_registry().expect("registry")).expect("store"));
@@ -223,16 +286,18 @@ impl World {
         let checkouts = CheckoutFixture::over(HOME, service.store());
         let provider = Arc::new(provider);
         let validation = Arc::new(validation);
+        let holds = Arc::new(RecordingHolds::default());
         let actuator = Arc::new(
             CheckoutActuator::new(
                 Arc::clone(&provider),
-                Arc::new(NamedHolderInputs),
+                inputs,
                 Arc::clone(&checkouts.checkouts) as Arc<dyn CheckoutRecords>,
                 StoreReads::new(service.store()),
                 HOME,
                 checkouts.staged.clone(),
             )
-            .with_branch_validation(Arc::clone(&validation) as Arc<dyn BranchValidation>),
+            .with_branch_validation(Arc::clone(&validation) as Arc<dyn BranchValidation>)
+            .with_holds(Arc::clone(&holds) as Arc<dyn CheckoutHolds>),
         );
         let controller =
             Controller::start(Arc::clone(&checkouts.lifecycles), Arc::clone(&actuator), Arc::new(SystemClock), Arc::clone(&service))
@@ -244,7 +309,7 @@ impl World {
             let _backing = backing;
             controller.run_with(receiver, recheck_receiver).await;
         });
-        Self { _directory: directory, provider, validation, actuator, checkouts, clones, commits, _listener: listener, rechecks }
+        Self { _directory: directory, provider, validation, actuator, holds, checkouts, clones, commits, _listener: listener, rechecks }
     }
 
     /// Requests the repository's clone in this host's environment, realised or not.
@@ -488,6 +553,59 @@ async fn a_refused_removal_waits_for_the_checkouts_integration_to_change() {
         .expect("write");
     world.until("released", |world| world.released(&launch)).await;
     assert_eq!(world.provider.asked().removal_tries, 2);
+}
+
+// Behaviour (d11 finding 1): a delivered convoy's worktree whose work is not clean, and whose
+// landing could not be judged, is held for a person as landed work that is not clean is, and is
+// not archived: unknown is not false. Once its work is clean it is removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dirty_worktree_whose_landing_is_unknown_is_held_for_a_person() {
+    let unjudged = Inspection { clean: Some(false), pushed: Some(true), landed: None, ..Inspection::default() };
+    let world = World::start(RecordingProvider { asked: Mutex::new(Asked { inspection: Some(unjudged), ..Asked::default() }) });
+    world.checkouts.open_convoy("c1");
+    let launch = world.ready_worktree("c1", "feature").await;
+    world.checkouts.deliver_convoy("c1");
+    world.until("held for a person", |world| !world.holds.held().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(world.provider.asked().removal_tries, 0, "nothing is removed: {:?}", world.provider.asked().removals);
+    assert!(world.ready(&launch));
+    let held = world.holds.held();
+    assert_eq!((held[0].0.as_str(), held[0].1.as_str()), (world.checkouts.launch("c1").as_str(), "feature"));
+    assert!(held[0].2.contains("whether it landed could not be judged"), "{}", held[0].2);
+    // The work is cleaned up and pushed: its next inspection is clean, and it is removed plainly.
+    world.provider.asked().inspection = Some(inspection(true, true, false));
+    world
+        .checkouts
+        .checkouts
+        .inspected(&launch, Inspection { head_revision: Some("def".into()), ..inspection(true, true, false) })
+        .expect("write");
+    world.until("released", |world| world.released(&launch)).await;
+    assert!(matches!(world.provider.asked().removals.as_slice(), [CheckoutRemoval::Worktree { .. }]));
+}
+
+// Behaviour (d11 finding 1): a released checkout's convoy branch is searched for its change
+// request at its release when it has not been since the daemon started, so the release judges
+// its landing: a dirty landed worktree takes the landed removal, whose refusal holds it for a
+// person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_searches_its_convoys_branch_to_judge_landing() {
+    let dirty = Inspection { clean: Some(false), pushed: Some(true), ..Inspection::default() };
+    let inputs = Arc::new(SearchedOnRelease::default());
+    let world = World::with_inputs(
+        RecordingProvider {
+            asked: Mutex::new(Asked { inspection: Some(dirty), landed_once_searched: true, refusals: 1, ..Asked::default() }),
+        },
+        Arc::clone(&inputs) as Arc<dyn HolderInputs>,
+    );
+    world.checkouts.open_convoy("c1");
+    let launch = world.ready_worktree("c1", "feature").await;
+    world.checkouts.deliver_convoy("c1");
+    world.until("a removal tried", |world| world.provider.asked().removal_tries == 1).await;
+    assert_eq!(*inputs.searched.lock().expect("searched"), vec![world.checkouts.holder("c1")], "searched for the convoy released");
+    assert_eq!(world.checkouts.record(&launch).integration.expect("recorded").inspection.landed, Some(true));
+    world.until("held for a person", |world| !world.holds.held().is_empty()).await;
+    assert!(world.holds.held()[0].2.contains("landed, but its removal is held"), "{:?}", world.holds.held());
+    assert!(world.ready(&launch));
 }
 
 /// Convoy `c1` at home `beta`, written as `write` says after a checkout at `alpha` read it, and
