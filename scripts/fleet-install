@@ -56,6 +56,14 @@ CONFIRMATION_DONE=""
 SOURCE_DIR=""
 # Set by --rollback --reason: the operator accepts installing an older flotilla.
 ROLLBACK_REASON=""
+# Set by --offline, --start and --no-rollback. Carried as the environment, as --skip-canary is,
+# so the bootstrap's handoff and the detached health watchdog see them.
+# --offline installs onto a stopped host: it validates the stores on disk, switches `current`,
+# and starts the daemon only with --start.
+OFFLINE="${FLEET_INSTALL_OFFLINE:-0}"
+START_DAEMON="${FLEET_INSTALL_START:-0}"
+# --no-rollback: a failed health confirmation is reported and the new generation stays current.
+NO_ROLLBACK="${FLEET_INSTALL_NO_ROLLBACK:-0}"
 readonly GENERATION_INCOMPLETE_EXIT=20
 
 die() {
@@ -599,7 +607,10 @@ reclaim_install_window() {
     die "the fleet-install for $owner abandoned the daemon install window ($DAEMON_INSTALL_MARKER); recover it by rerunning fleet-install with FLEET_INSTALL_ROOT=$owner"
   fi
   printf 'fleet-install: recovering an interrupted daemon install window\n'
-  if [[ "$PLATFORM" == darwin-* && -n "$(current_generation)" ]]; then
+  if ((OFFLINE)); then
+    # The operator stopped this host on purpose: clear the window without restarting a daemon.
+    printf 'fleet-install: --offline leaves the interrupted daemon stopped\n'
+  elif [[ "$PLATFORM" == darwin-* && -n "$(current_generation)" ]]; then
     read_darwin_service_disabled
     restart_darwin_daemon_service \
       || die "could not restore the interrupted launch agent; bootstrap $LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist and retry fleet-install"
@@ -622,7 +633,9 @@ prepare_darwin_daemon_service() {
   # Unload before publishing the refreshed plist. Enabled clients then defer
   # to launchd, whose kickstart cannot race the generation flip while the job
   # is absent from the domain.
-  if ((!DAEMON_SERVICE_DISABLED)); then
+  # Recovery restarts the old daemon on an interrupted install. An offline install found it
+  # stopped and leaves it stopped.
+  if ((!DAEMON_SERVICE_DISABLED && !OFFLINE)); then
     DARWIN_RECOVERY_GENERATION="$(current_generation)"
   fi
   launchctl bootout "$domain/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
@@ -761,6 +774,14 @@ confirmation_watchdog() {
     return 0
   fi
   confirmation_is_armed "$token" || return 0
+  if ((NO_ROLLBACK)); then
+    # Fix forward: never put the previous generation back over the stores the candidate may have
+    # written. Leave the candidate current and its daemon to its service manager.
+    disarm_health_confirmation "$token"
+    printf 'fleet-install: UNHEALTHY: generation %s failed health confirmation; automatic rollback is off (--no-rollback), so %s stays installed and current\n' \
+      "$generation" "$generation" >&2
+    return 11
+  fi
   local parent_pid="${token%%-*}"
   if ! kill -0 "$parent_pid" 2>/dev/null; then
     # The foreground installer normally holds this lock for the watchdog's
@@ -813,6 +834,7 @@ await_confirmation_watchdog() {
   case "$result" in
     0) return 0 ;;
     10) die "generation $generation failed health confirmation; rolled back to $rollback_generation" ;;
+    11) return 11 ;;
     *) die "generation $generation failed health confirmation and no healthy previous generation could be restored" ;;
   esac
 }
@@ -911,6 +933,48 @@ validate_live_store() {
   done
 }
 
+# An offline install refuses a host whose daemon runs or whose service manager would run it.
+require_daemon_stopped() {
+  local stop
+  if [[ "$PLATFORM" == darwin-* ]]; then
+    stop="launchctl bootout gui/$(id -u)/$LAUNCH_AGENT_LABEL"
+  else
+    stop='systemctl --user stop flotillad.service'
+  fi
+  if pgrep -u "$(id -u)" -x flotillad >/dev/null 2>&1; then
+    die "--offline installs onto a stopped host, but flotillad is running; stop it first ($stop); nothing changed"
+  fi
+  if [[ "$PLATFORM" == linux-* ]] && command -v systemctl >/dev/null \
+    && systemctl --user is-active --quiet flotillad.service 2>/dev/null; then
+    die "--offline installs onto a stopped host, but flotillad.service is active; stop it first ($stop); nothing changed"
+  fi
+  if [[ "$PLATFORM" == darwin-* ]] && command -v launchctl >/dev/null \
+    && launchctl print "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1; then
+    die "--offline installs onto a stopped host, but $LAUNCH_AGENT_LABEL is loaded and would restart flotillad; stop it first ($stop); nothing changed"
+  fi
+}
+
+# The stopped daemon's stores on disk, read by the candidate as its first start reads them: every
+# record decoded, the engine import rehearsed at the daemon's real home, the retirement preview,
+# frozen references and the operational entries in this host's observation roots.
+validate_stopped_store() {
+  local candidate="$1"
+  shift
+  "$candidate" --config-dir "$DAEMON_CONFIG_DIR" --state-dir "$DAEMON_STATE_DIR" resource validate --from-store "$@" 9>&-
+}
+
+# An offline install without --start: the links switch and the stopped service is pointed at the
+# new generation, and nothing starts it.
+install_without_starting() {
+  local generation="$1" old
+  old="$(current_generation)"
+  if [[ -n "$old" && "$old" != "$generation" ]]; then
+    atomic_link "releases/$old" "$PREVIOUS_LINK"
+  fi
+  atomic_link "releases/$generation" "$CURRENT_LINK"
+  refresh_darwin_tcc_payload || die "could not copy generation $generation into $DARWIN_TCC_ROOT; generation $generation is current; rerun fleet-install --offline $generation"
+}
+
 activate_staged_generation() {
   local generation="$1"
   local rollback_generation="$2"
@@ -918,19 +982,26 @@ activate_staged_generation() {
   local release="$RELEASES_DIR/$generation"
   host_preflight
   make_work_dir
+  ((!OFFLINE)) || require_daemon_stopped
   reclaim_install_window
   [[ -d "$release" ]] || die "staged generation is missing: $generation"
   [[ -f "$release/.generation.json" ]] || die "staged generation has no verified generation metadata: $generation"
   verify_installed_release "$release" "$release/.generation.json"
   run_generation_canary "$generation"
   if [[ -n "$(current_generation)" ]]; then
-    printf 'fleet-install: validating live stored records with candidate generation %s\n' "$generation"
     local validation_args=(--skill-sources "$release/share/flotilla/skills" --skill-catalog "$release/share/flotilla/skills/.flotilla-skill-catalog.json")
     if [[ -n "$SKILL_PROBE_TOKENS" ]]; then
       validation_args+=(--skill-probe-tokens "$SKILL_PROBE_TOKENS")
     fi
-    validate_live_store "$release/bin/flotilla" "${validation_args[@]}" \
-      || die "candidate generation $generation failed live-store or frozen-reference validation"
+    if ((OFFLINE)); then
+      printf 'fleet-install: validating the stopped daemon'"'"'s stores in %s with candidate generation %s\n' "$DAEMON_STATE_DIR" "$generation"
+      validate_stopped_store "$release/bin/flotilla" "${validation_args[@]}" \
+        || die "candidate generation $generation failed stopped-store or frozen-reference validation; no generation switched"
+    else
+      printf 'fleet-install: validating live stored records with candidate generation %s\n' "$generation"
+      validate_live_store "$release/bin/flotilla" "${validation_args[@]}" \
+        || die "candidate generation $generation failed live-store or frozen-reference validation"
+    fi
   fi
   # Verification is the only activation step that needs this process's work
   # directory. Release it before service mutation so interruption cannot leak
@@ -943,19 +1014,34 @@ activate_staged_generation() {
   prepare_darwin_daemon_service
   local replaced
   replaced="$(current_generation)"
+  if ((OFFLINE && !START_DAEMON)); then
+    install_without_starting "$generation"
+    end_darwin_install_window
+    if [[ "$replaced" != "$generation" ]] && ! record_roll "$generation" "$replaced" "${FLEET_INSTALL_ROLLBACK_REASON:-}"; then
+      printf 'fleet-install: could not record the roll in %s\n' "$ROLL_LOG" >&2
+    fi
+    check_siblings "$release" "$generation"
+    printf 'fleet-install: generation %s is current; flotillad was not started (--offline)\n' "$generation"
+    printf 'fleet-install: start it, confirm its health and drain cleat with: fleet-install --offline --start --no-rollback %s\n' "$generation"
+    return 0
+  fi
   switch_to "$generation" "$rollback_generation" "$confirmation_token"
   restart_linux_daemon_service
   restart_darwin_daemon_service
   end_darwin_install_window
+  local unhealthy=0
   if ((DAEMON_SERVICE_DISABLED)); then
     disarm_health_confirmation "$confirmation_token"
     printf 'fleet-install: health confirmation skipped while flotillad dev mode is active\n'
   else
-    await_confirmation_watchdog "$generation" "$rollback_generation"
-    prune_after_confirmation
+    await_confirmation_watchdog "$generation" "$rollback_generation" || unhealthy=$?
+    ((unhealthy)) || prune_after_confirmation
   fi
   if [[ "$replaced" != "$generation" ]] && ! record_roll "$generation" "$replaced" "${FLEET_INSTALL_ROLLBACK_REASON:-}"; then
     printf 'fleet-install: could not record the roll in %s\n' "$ROLL_LOG" >&2
+  fi
+  if ((unhealthy)); then
+    die "UNHEALTHY: generation $generation is installed and current but failed health confirmation; nothing was rolled back (--no-rollback); the cleat drain did not run; inspect the daemon's log and fix forward: install a fixed generation with --no-rollback, or rerun fleet-install --no-rollback $generation once its daemon is healthy, to confirm it and drain cleat"
   fi
   # Always use the incoming generation: the previous CLI may not have this
   # post-install step. Cleat alias turnover is outside the health rollback.
@@ -1223,7 +1309,9 @@ host_preflight() {
 }
 
 usage() {
-  echo 'usage: fleet-install [--min-free-bytes N] [--max-wait-seconds N] [--from DIR] [--rollback --reason WHY] [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
+  echo 'usage: fleet-install [--min-free-bytes N] [--max-wait-seconds N] [--from DIR] [--rollback --reason WHY] [--offline [--start]] [--no-rollback] [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
+  echo '--offline installs onto a stopped host: it refuses a running daemon, validates the stores on disk with the candidate (records decoded, engine import rehearsed, retirement, frozen references, operational entries), switches current, and does not start flotillad; --start then starts it and confirms its health and drains cleat as an online install does' >&2
+  echo '--no-rollback: a failed health confirmation is reported as UNHEALTHY and the new generation stays installed and current; without it, the previous generation is restored' >&2
   echo '--rollback --reason WHY installs a generation whose flotilla commit is older than the live one (on a forward install the flag is ignored and no reason is recorded); every install compares commits, which needs github.com (override: FLEET_INSTALL_FLOTILLA_REPOSITORY, for tests)' >&2
   echo 'defaults: --min-free-bytes 5368709120 (5 GiB); --max-wait-seconds 600; ordinary confirmation 90 seconds' >&2
   echo '--from DIR installs a named generation from a pushed package directory (DIR/<generation>/generation.json and archive) instead of Forgejo; no package token is read' >&2
@@ -1231,13 +1319,15 @@ usage() {
 }
 
 main() {
-  local rollback_requested=0
-  while [[ "${1:-}" == --min-free-bytes || "${1:-}" == --max-wait-seconds || "${1:-}" == --from || "${1:-}" == --reason || "${1:-}" == --rollback ]]; do
-    if [[ "$1" == --rollback ]]; then
-      rollback_requested=1
-      shift
-      continue
-    fi
+  local rollback_requested=0 mode_flags=0
+  while [[ "${1:-}" == --min-free-bytes || "${1:-}" == --max-wait-seconds || "${1:-}" == --from || "${1:-}" == --reason || "${1:-}" == --rollback \
+    || "${1:-}" == --offline || "${1:-}" == --start || "${1:-}" == --no-rollback ]]; do
+    case "$1" in
+      --rollback) rollback_requested=1; shift; continue ;;
+      --offline) OFFLINE=1; mode_flags=1; shift; continue ;;
+      --start) START_DAEMON=1; mode_flags=1; shift; continue ;;
+      --no-rollback) NO_ROLLBACK=1; mode_flags=1; shift; continue ;;
+    esac
     [[ $# -ge 2 ]] || usage
     case "$1" in
       --min-free-bytes) MIN_FREE_BYTES="$2" ;;
@@ -1256,6 +1346,14 @@ main() {
   else
     [[ -z "$ROLLBACK_REASON" ]] || die '--reason only goes with --rollback'
   fi
+  if ((mode_flags)); then
+    case "${*: -1}" in
+      ''|status|rollback|--prune|--prune-dry-run|-h|--help|__*) die '--offline, --start and --no-rollback only go with installing a generation' ;;
+    esac
+    [[ "${1:-}" != --canary ]] || die '--offline, --start and --no-rollback only go with installing a generation'
+  fi
+  [[ "$START_DAEMON" == 0 || "$OFFLINE" == 1 ]] || die '--start only goes with --offline: an online install always restarts the daemon'
+  export FLEET_INSTALL_OFFLINE="$OFFLINE" FLEET_INSTALL_START="$START_DAEMON" FLEET_INSTALL_NO_ROLLBACK="$NO_ROLLBACK"
   if [[ -n "$SOURCE_DIR" ]]; then
     [[ -d "$SOURCE_DIR" && ! -L "$SOURCE_DIR" ]] || die "pushed package directory is missing or not a directory: $SOURCE_DIR"
     # Only a named generation can come from a pushed directory: there is no

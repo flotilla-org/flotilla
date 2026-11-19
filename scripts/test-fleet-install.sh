@@ -154,6 +154,11 @@ fi
 if [[ "\${1:-}" == --socket && "\${3:-}" == resource && "\${4:-}" == validate && "\${5:-}" == --from-daemon && "\${FLEET_VALIDATE_FAIL_FOR:-}" == "$generation" ]]; then
   exit 1
 fi
+if [[ "\${1:-}" == --config-dir && "\${3:-}" == --state-dir && "\${5:-}" == resource && "\${6:-}" == validate && "\${7:-}" == --from-store ]]; then
+  if [[ -n "\${FLEET_VALIDATION_LOG:-}" ]]; then printf '%s\\n' "\$*" >>"\$FLEET_VALIDATION_LOG"; fi
+  if [[ "\${FLEET_VALIDATE_FAIL_FOR:-}" == "$generation" ]]; then printf 'fixture stopped-store refusal\\n' >&2; exit 1; fi
+  exit 0
+fi
 EOF
     fi
     if [[ "$name" == flotilla ]]; then
@@ -341,6 +346,10 @@ cat >"$fake_bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+if [[ "$*" == '--user is-active --quiet flotillad.service' ]]; then
+  [[ "${DAEMON_RUNNING:-0}" == 1 ]]
+  exit
+fi
 if [[ "$*" == '--user is-enabled flotillad.service' ]]; then
   if [[ "${SYSTEMD_UNIT_DISABLED:-false}" == true ]]; then
     printf 'disabled\n'
@@ -1386,6 +1395,112 @@ test "$(grep -c 'generation.json$' "$test_root/push-curl.log")" -eq 1 \
   || fail 'fleet-push should download the manifest once per push'
 test "$(grep -c '\.tar\.gz$' "$test_root/push-curl.log")" -eq 1 \
   || fail 'fleet-push downloaded the archive more than once for one platform'
+
+# Each runs the installer in its own Linux home, so the stopped-host and no-rollback cases start
+# from a healthy install of generation one.
+run_in_home() {
+  local home="$1"
+  shift
+  HOME="$home" XDG_CONFIG_HOME="$home/.config" PATH="$home/.local/bin:$fake_bin:$PATH" SHELL="$fake_bin/zsh" \
+    LOGIN_SHELL_PATH="$home/.local/bin:$fake_bin:/usr/bin:/bin" FIXTURE_ROOT="$fixture_root" \
+    SYSTEMCTL_LOG="$home.systemctl.log" LOGINCTL_LOG="$home.loginctl.log" \
+    FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
+    FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
+    FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS="${FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS:-30}" \
+    "$installer" "$@"
+}
+fresh_home() {
+  local home="$test_root/$1"
+  mkdir -p "$home/.config/flotilla"
+  cp "$test_root/home/.config/flotilla/fleet-reader-token" "$home/.config/flotilla/fleet-reader-token"
+  run_in_home "$home" "$generation_one" >"$home.install-one.out" 2>&1 || { cat "$home.install-one.out" >&2; fail "$1: first install failed"; }
+  : >"$home.systemctl.log"
+  printf '%s\n' "$home"
+}
+
+# Cut-over B1: --offline installs onto a stopped host. It refuses a running daemon, validates the
+# stores on disk with the candidate (never the socket), switches current and previous, records
+# the roll, and starts nothing; --start then starts it, confirms health and drains cleat.
+offline_home="$(fresh_home offline-home)"
+offline_root="$offline_home/.local/opt/flotilla-fleet"
+if DAEMON_RUNNING=1 run_in_home "$offline_home" --offline "$generation_two" >"$test_root/offline-running.out" 2>&1; then
+  fail '--offline installed onto a running daemon'
+fi
+grep -Fq -- '--offline installs onto a stopped host, but flotillad is running' "$test_root/offline-running.out" \
+  || fail '--offline did not say why it refused a running daemon'
+test "$(link_generation "$offline_root/current")" = "$generation_one" || fail '--offline refusal changed the generation'
+
+if FLEET_VALIDATE_FAIL_FOR="$generation_two" FLEET_VALIDATION_LOG="$test_root/offline-refused-validation.log" \
+  run_in_home "$offline_home" --offline "$generation_two" >"$test_root/offline-refused.out" 2>&1; then
+  fail '--offline ignored a stopped-store validation refusal'
+fi
+grep -Fq "failed stopped-store or frozen-reference validation; no generation switched" "$test_root/offline-refused.out" \
+  || fail '--offline validation refusal was unclear'
+test "$(link_generation "$offline_root/current")" = "$generation_one" || fail '--offline validation refusal changed the generation'
+if grep -Eq -- '(^| )(start|restart) flotillad' "$offline_home.systemctl.log"; then fail '--offline refusal started the daemon'; fi
+
+FLEET_VALIDATION_LOG="$test_root/offline-validation.log" FLEET_CHECK_LOG="$test_root/offline-check.log" \
+  POST_INSTALL_LOG="$test_root/offline-post-install.log" \
+  run_in_home "$offline_home" --offline "$generation_two" >"$test_root/offline.out" 2>&1 \
+  || { cat "$test_root/offline.out" >&2; fail '--offline install onto a stopped host failed'; }
+grep -Fq -- "--config-dir $offline_home/.config/flotilla --state-dir $offline_home/.local/state/flotilla resource validate --from-store --skill-sources $offline_root/releases/$generation_two/share/flotilla/skills" \
+  "$test_root/offline-validation.log" || fail '--offline did not validate the stopped stores with the candidate'
+grep -Fq -- '--from-daemon' "$test_root/offline-validation.log" && fail '--offline validated against a daemon socket'
+test "$(link_generation "$offline_root/current")" = "$generation_two" || fail '--offline did not switch current'
+test "$(link_generation "$offline_root/previous")" = "$generation_one" || fail '--offline did not keep the replaced generation as previous'
+if grep -Eq -- '(^| )(start|restart) flotillad' "$offline_home.systemctl.log"; then fail '--offline started the daemon unasked'; fi
+test ! -e "$test_root/offline-check.log" || fail '--offline probed the health of a daemon it did not start'
+test ! -e "$test_root/offline-post-install.log" || fail '--offline ran the cleat drain without a daemon'
+grep -Fq "generation $generation_two is current; flotillad was not started (--offline)" "$test_root/offline.out" \
+  || fail '--offline did not say the daemon stays stopped'
+grep -Fq "fleet-install --offline --start --no-rollback $generation_two" "$test_root/offline.out" \
+  || fail '--offline did not name how to start the installed generation'
+tail -n 1 "$offline_home/.config/flotilla/fleet-rolls.log" | cut -f2,3 | grep -Fxq "$generation_two"$'\t'"$generation_one" \
+  || fail '--offline did not record the roll'
+
+if run_in_home "$offline_home" --start "$generation_two" >"$test_root/start-online.out" 2>&1; then
+  fail '--start without --offline was accepted'
+fi
+FLEET_CHECK_LOG="$test_root/offline-start-check.log" POST_INSTALL_LOG="$test_root/offline-start-post-install.log" \
+  run_in_home "$offline_home" --offline --start --no-rollback "$generation_two" >"$test_root/offline-start.out" 2>&1 \
+  || { cat "$test_root/offline-start.out" >&2; fail '--offline --start failed'; }
+grep -Fxq -- '--user restart flotillad.service' "$offline_home.systemctl.log" || fail '--offline --start did not start the daemon'
+grep -Fq "generation $generation_two confirmed healthy" "$test_root/offline-start.out" || fail '--offline --start did not confirm health'
+test -s "$test_root/offline-start-post-install.log" || fail '--offline --start did not drain cleat'
+test "$(grep -c "$generation_two" "$offline_home/.config/flotilla/fleet-rolls.log")" = 1 || fail 'starting an installed generation recorded a second roll'
+
+# Cut-over B2: with --no-rollback a failed health confirmation is reported loudly and the new
+# generation stays installed and current; the previous generation is not put back, nothing is
+# pruned and the cleat drain does not run. The roll is still recorded: the generation is live.
+unhealthy_home="$(fresh_home unhealthy-home)"
+unhealthy_root="$unhealthy_home/.local/opt/flotilla-fleet"
+if FLEET_HEALTH_FAIL_FOR="$generation_two" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
+  PRUNE_LOG="$test_root/unhealthy-no-rollback-prune.log" POST_INSTALL_LOG="$test_root/unhealthy-no-rollback-post.log" \
+  run_in_home "$unhealthy_home" --no-rollback "$generation_two" >"$test_root/no-rollback.out" 2>&1; then
+  fail 'an unhealthy --no-rollback install reported success'
+fi
+grep -Fq "UNHEALTHY: generation $generation_two failed health confirmation; automatic rollback is off (--no-rollback)" "$test_root/no-rollback.out" \
+  || fail '--no-rollback did not report the failed confirmation loudly'
+grep -Fq "UNHEALTHY: generation $generation_two is installed and current" "$test_root/no-rollback.out" \
+  || fail '--no-rollback did not say the generation stays installed'
+grep -Fq "rolled back to $generation_one" "$test_root/no-rollback.out" && fail '--no-rollback rolled back'
+test "$(link_generation "$unhealthy_root/current")" = "$generation_two" || fail '--no-rollback put the previous generation back'
+test "$(link_generation "$unhealthy_root/previous")" = "$generation_one" || fail '--no-rollback lost the previous generation'
+test "$(grep -c -- '--user restart flotillad.service' "$unhealthy_home.systemctl.log")" = 1 \
+  || fail '--no-rollback restarted the daemon more than once (a rollback restarts it again)'
+test ! -e "$test_root/unhealthy-no-rollback-prune.log" || fail 'an unhealthy --no-rollback install pruned'
+test ! -e "$test_root/unhealthy-no-rollback-post.log" || fail 'an unhealthy --no-rollback install ran the cleat drain'
+tail -n 1 "$unhealthy_home/.config/flotilla/fleet-rolls.log" | cut -f2 | grep -Fxq "$generation_two" \
+  || fail 'an unhealthy --no-rollback install was not recorded'
+# The default is unchanged: without the flag the same failure restores the previous generation.
+default_home="$(fresh_home default-rollback-home)"
+if FLEET_HEALTH_FAIL_FOR="$generation_two" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
+  run_in_home "$default_home" "$generation_two" >"$test_root/default-rollback.out" 2>&1; then
+  fail 'an unhealthy install reported success'
+fi
+grep -Fq "failed health confirmation; rolled back to $generation_one" "$test_root/default-rollback.out" \
+  || fail 'the default no longer rolls an unhealthy generation back'
+test "$(link_generation "$default_home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'the default rollback did not restore'
 
 # The module unit tests cover Darwin copy policy through its public function.
 "$repo_root/scripts/test-fleet-canary.sh"

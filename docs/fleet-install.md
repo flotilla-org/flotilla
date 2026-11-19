@@ -112,6 +112,62 @@ Flags precede `--skip-canary`, `--canary`, or the operation, for example:
 scripts/fleet-install --min-free-bytes 8589934592 --max-wait-seconds 900 latest
 ```
 
+### No automatic rollback
+
+`--no-rollback` turns the automatic rollback off. A failed health confirmation
+is then reported as `UNHEALTHY`, the new generation stays installed and
+current, the roll is recorded, and nothing is pruned. The cleat drain does not
+run, and the installer exits non-zero. Fix forward: install a fixed generation
+with `--no-rollback`, or rerun `fleet-install --no-rollback <generation>` once
+its daemon is healthy, which confirms it and drains cleat.
+
+Without the flag, the previous generation is restored, as before. That stays
+the default for ordinary rolls. A restore is only as safe as the previous
+build's reading of what the candidate wrote: ADR 0047 promises N+1 reads N,
+not the reverse. Use `--no-rollback` for any roll whose candidate writes a
+store the previous generation cannot open or would ignore. The engine cut-over
+is such a roll: the old generation runs on `resources.sqlite` and ignores
+`decided.sqlite`.
+
+### Installing onto a stopped host
+
+`--offline` installs onto a host whose daemon an operator has stopped
+(`systemctl --user stop flotillad.service`, or `launchctl bootout
+gui/$(id -u)/work.flotilla.flotillad`). It refuses a running daemon, an active
+unit or a loaded launch agent, and changes nothing in that case. In place of
+the live-store validation, the candidate validates the stores on disk with
+`flotilla --config-dir … --state-dir … resource validate --from-store`. This
+check:
+
+- decodes every record of `resources.sqlite`, own and replicated;
+- rehearses the engine import over exactly the rows the first start reads, at
+  the daemon's real node id;
+- runs the workflow-retirement preview, the frozen-reference check and the
+  skill catalog;
+- inspects every registered Project's operational entries in this host's
+  observation roots.
+
+Only an engine daemon serves bound charter inputs, so that one live check
+cannot run offline; the validator names any manifest roots it skipped. A state
+directory that already holds `decided.sqlite` is refused, because validating an
+engine store on disk is not built.
+
+After validation, `--offline` switches `current` and `previous`, writes the
+unit or launch agent and the Darwin `tcc` copies, records the roll, and does
+not start flotillad. `--offline --start` also starts it and then confirms
+health and drains cleat as an online install does. Rerunning it for an
+installed generation starts that generation without a second roll record.
+For the stop-all cut-over:
+
+```sh
+scripts/fleet-install --offline --no-rollback --skip-canary <generation>          # each stopped host
+scripts/fleet-install --offline --start --no-rollback --skip-canary <generation>  # then start each
+```
+
+The flags travel as `FLEET_INSTALL_OFFLINE`, `FLEET_INSTALL_START` and
+`FLEET_INSTALL_NO_ROLLBACK`, as `--skip-canary` does, so they reach the
+incoming generation's installer and the health watchdog.
+
 ## Probe audit and configuration
 
 | Probe | Locations and policy |

@@ -117,6 +117,11 @@ impl Source {
         ))
     }
 
+    /// Every record read, own first and then each other home's, as [`Self::read`] lists them.
+    pub fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
     /// The host id of the daemon that wrote this store, read from its records: the one Host
     /// homed at `home` that describes a daemon, if exactly one does.
     pub fn own_daemon_host(&self, home: &str) -> Option<String> {

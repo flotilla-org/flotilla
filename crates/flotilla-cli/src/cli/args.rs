@@ -597,19 +597,23 @@ pub enum ResourceSubCommand {
     /// Validate resource documents against this binary's schema
     Validate {
         /// Resource document or directory containing JSON/YAML manifests
-        #[arg(required_unless_present = "from_daemon", conflicts_with = "from_daemon")]
+        #[arg(required_unless_present_any = ["from_daemon", "from_store"], conflicts_with_all = ["from_daemon", "from_store"])]
         path: Option<PathBuf>,
         /// Validate the running daemon's stored records using this binary's schema
-        #[arg(long)]
+        #[arg(long, group = "stored")]
         from_daemon: bool,
+        /// Validate a stopped daemon's stores on disk, in --state-dir, using this binary's schema:
+        /// the records and the engine import its first start would read
+        #[arg(long, group = "stored", conflicts_with = "host")]
+        from_store: bool,
         /// Resolve every CrewDefaults role and Project against this candidate skill catalog
         #[arg(long)]
         skill_catalog: Option<PathBuf>,
         /// Candidate skill supply directory containing .flotilla-sources.json
-        #[arg(long, requires = "from_daemon")]
+        #[arg(long, requires = "stored")]
         skill_sources: Option<PathBuf>,
         /// JSON map of declared credential names to operator-supplied probe token files
-        #[arg(long, requires = "from_daemon")]
+        #[arg(long, requires = "stored")]
         skill_probe_tokens: Option<PathBuf>,
         /// Read a peer's forwarded resource socket instead of the local daemon
         #[arg(long, requires = "from_daemon")]
@@ -1283,10 +1287,20 @@ mod tests {
         assert!(
             matches!(daemon.command, Some(SubCommand::Resource { command: ResourceSubCommand::Validate { path: None, from_daemon: true, host: Some(host), .. } }) if host == "feta")
         );
+        let store = Cli::try_parse_from(["flotilla", "resource", "validate", "--from-store", "--skill-sources", "skills"])
+            .expect("stopped-store validation should parse");
+        assert!(matches!(
+            store.command,
+            Some(SubCommand::Resource { command: ResourceSubCommand::Validate { path: None, from_daemon: false, from_store: true, .. } })
+        ));
         for args in [
             vec!["flotilla", "resource", "validate"],
             vec!["flotilla", "resource", "validate", "--host", "feta"],
             vec!["flotilla", "resource", "validate", "--from-daemon", "resource.yaml"],
+            vec!["flotilla", "resource", "validate", "--from-store", "resource.yaml"],
+            vec!["flotilla", "resource", "validate", "--from-store", "--from-daemon"],
+            vec!["flotilla", "resource", "validate", "--from-store", "--host", "feta"],
+            vec!["flotilla", "resource", "validate", "--skill-sources", "skills", "resource.yaml"],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }

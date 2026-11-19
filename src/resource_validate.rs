@@ -169,7 +169,6 @@ async fn validate_daemon_with_preview(
     let mut projects = BTreeMap::<String, Vec<ResourceObject<Project>>>::new();
     let mut frozen_inventory = Vec::new();
     let mut frozen_inventory_failed = false;
-    let mut retired = std::collections::BTreeSet::new();
     let mut retirement_templates = Vec::new();
     let mut retirement_projects = Vec::new();
     let mut retirement_designations = Vec::new();
@@ -303,47 +302,9 @@ async fn validate_daemon_with_preview(
     let summary = engine_import::rehearse(&engine_import::Source::new(import_rows).with_own_host(own_host), LOCAL_HOME);
     failed |= probes.require_import && summary.refused();
     print_import(&summary);
-    if !retirement_inventory_failed {
-        match retirement::preview(&retirement_templates, &retirement_projects, &retirement_designations) {
-            Ok(preview) => {
-                retired.extend(preview.definitions.iter().map(|definition| {
-                    (
-                        definition["metadata"]["namespace"].as_str().unwrap_or("flotilla").to_string(),
-                        definition["metadata"]["name"].as_str().unwrap_or("<unnamed>").to_string(),
-                    )
-                }));
-                if let Err(error) = report(&preview) {
-                    eprintln!("workflow retirement report: {error:#}");
-                    failed = true;
-                }
-            }
-            Err(error) => {
-                eprintln!("workflow retirement preview: {error:#}");
-                failed = true;
-            }
-        }
-    }
-    let image_provider = command_provider(EnvironmentInput::Docker, Arc::new(ProcessCommandRunner));
-    let mut frozen_report = frozen::check(
-        &frozen_inventory,
-        &retired,
-        &frozen::CandidateProbes {
-            options: probes,
-            inventory: &frozen_inventory,
-            runner: Arc::new(ProcessCommandRunner),
-            provider: image_provider.as_ref(),
-        },
-    )
-    .await?;
-    frozen_report.inventory_complete &= !frozen_inventory_failed && !retirement_inventory_failed;
-    println!("frozen-reference satisfiability: {}", serde_json::to_string(&frozen_report)?);
-    for error in &frozen_report.failures {
-        eprintln!("{error}");
-    }
-    for notice in &frozen_report.notices {
-        eprintln!("notice: {notice}");
-    }
-    failed |= !frozen_report.failures.is_empty();
+    let retirement_inventory =
+        (!retirement_inventory_failed).then_some((retirement_templates, retirement_projects, retirement_designations));
+    failed |= semantic_gates(retirement_inventory, &frozen_inventory, frozen_inventory_failed, probes, &mut report).await?;
     for namespace in charter_namespaces {
         let response = client.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/charterinputs")).send().await?;
         if !response.status().is_success() {
@@ -392,18 +353,7 @@ async fn validate_daemon_with_preview(
                     }
                     async {
                         if local_inventory.is_none() {
-                            let runner = Arc::new(ProcessCommandRunner);
-                            // Inspection only reads absolute repository paths. The checkout
-                            // strategy is required by the resolver but never creates worktrees.
-                            let vcs = FlotillaVcs::new(
-                                ExecutionEnvironmentPath::new("/"),
-                                runner.clone(),
-                                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
-                            );
-                            let inspector =
-                                GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), VALIDATION_INSPECTION_HOST);
-                            let paths = inspect_validation_roots(roots, &inspector).await;
-                            local_inventory = Some((inspector, paths));
+                            local_inventory = Some(local_ops_inventory(roots).await);
                         }
                         let (inspector, paths) = local_inventory.as_ref().expect("initialized local inventory");
                         validate_project_ops(&registered, paths, inspector).await
@@ -430,6 +380,232 @@ async fn validate_daemon_with_preview(
         println!("validated {count} stored records");
         Ok(count)
     }
+}
+
+/// The workflow-retirement preview, when its inventory is whole, then the frozen-reference check
+/// over `frozen_inventory`; whether either failed. Shared by the live and the stopped-store gates.
+#[cfg(unix)]
+async fn semantic_gates(
+    retirement_inventory: Option<(Vec<Value>, Vec<Value>, Vec<Value>)>,
+    frozen_inventory: &[Value],
+    frozen_inventory_failed: bool,
+    probes: &ValidationOptions,
+    report: &mut impl FnMut(&retirement::RetirementPreview) -> Result<()>,
+) -> Result<bool> {
+    let mut failed = false;
+    let mut retired = std::collections::BTreeSet::new();
+    let retirement_inventory_failed = retirement_inventory.is_none();
+    if let Some((templates, projects, designations)) = retirement_inventory {
+        match retirement::preview(&templates, &projects, &designations) {
+            Ok(preview) => {
+                retired.extend(preview.definitions.iter().map(|definition| {
+                    (
+                        definition["metadata"]["namespace"].as_str().unwrap_or("flotilla").to_string(),
+                        definition["metadata"]["name"].as_str().unwrap_or("<unnamed>").to_string(),
+                    )
+                }));
+                if let Err(error) = report(&preview) {
+                    eprintln!("workflow retirement report: {error:#}");
+                    failed = true;
+                }
+            }
+            Err(error) => {
+                eprintln!("workflow retirement preview: {error:#}");
+                failed = true;
+            }
+        }
+    }
+    let image_provider = command_provider(EnvironmentInput::Docker, Arc::new(ProcessCommandRunner));
+    let mut frozen_report = frozen::check(
+        frozen_inventory,
+        &retired,
+        &frozen::CandidateProbes {
+            options: probes,
+            inventory: frozen_inventory,
+            runner: Arc::new(ProcessCommandRunner),
+            provider: image_provider.as_ref(),
+        },
+    )
+    .await?;
+    frozen_report.inventory_complete &= !frozen_inventory_failed && !retirement_inventory_failed;
+    println!("frozen-reference satisfiability: {}", serde_json::to_string(&frozen_report)?);
+    for error in &frozen_report.failures {
+        eprintln!("{error}");
+    }
+    for notice in &frozen_report.notices {
+        eprintln!("notice: {notice}");
+    }
+    failed |= !frozen_report.failures.is_empty();
+    Ok(failed)
+}
+
+/// This host's checkouts under `roots`, inspected with the candidate's rules for the ops gate.
+#[cfg(unix)]
+async fn local_ops_inventory(roots: &[PathBuf]) -> (GitRepositoryInspector, BTreeMap<flotilla_resources::RepositoryKey, Vec<PathBuf>>) {
+    let runner = Arc::new(ProcessCommandRunner);
+    // Inspection only reads absolute repository paths. The checkout
+    // strategy is required by the resolver but never creates worktrees.
+    let vcs = FlotillaVcs::new(
+        ExecutionEnvironmentPath::new("/"),
+        runner.clone(),
+        GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
+    );
+    let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), VALIDATION_INSPECTION_HOST);
+    let paths = inspect_validation_roots(roots, &inspector).await;
+    (inspector, paths)
+}
+
+/// The kinds the frozen-reference check reads, merged over every home.
+#[cfg(unix)]
+const FROZEN_KINDS: &[&str] = &["convoys", "vessels", "environments", "credentialspecs", "hosts", "imagebuilds", "workflowtemplates"];
+
+/// Whose records a stopped daemon's store holds: the home its import writes as (the daemon's
+/// node id) and the host it describes (its host id), as its first start resolves them.
+#[cfg(unix)]
+pub(crate) struct StoreIdentity {
+    pub home: String,
+    pub own_host: Option<String>,
+}
+
+/// The pre-roll gate against a stopped daemon (cut-over B1): the stores in `state_dir` read from
+/// disk, as the candidate's first start reads them, instead of through a running daemon's socket.
+///
+/// It runs every check of [`validate_daemon_with_options`] that needs no daemon:
+/// - decodes every record of the old store, own and replicated, with the candidate (retired
+///   kinds skipped, as the live gate skips them);
+/// - rehearses the engine import over exactly the rows the first start reads, homed at the
+///   daemon's real node id (the live gate can only use a placeholder home);
+/// - runs the workflow-retirement preview, the frozen-reference check and the skill catalog over
+///   a merged view of each namespace (the own copy of a name first, then other homes' by home);
+/// - inspects every registered Project's operational entries in this host's observation roots.
+///
+/// The one live check it cannot run is the bound charter inputs of an engine daemon's manifest
+/// roots, which only an engine daemon serves; an old store has none, and it says so when it holds
+/// manifest roots. A state directory already holding an engine store is refused: validating an
+/// engine store on disk is not built (#2167, rollplan U8).
+#[cfg(unix)]
+pub(crate) async fn validate_store_with_options(
+    state_dir: &Path,
+    identity: StoreIdentity,
+    local_roots: &[PathBuf],
+    skill_catalog: Option<&Path>,
+    probes: &ValidationOptions,
+) -> Result<usize> {
+    validate_store_with_preview(state_dir, identity, local_roots, skill_catalog, probes, |preview| {
+        println!("workflow retirement preview: {}", serde_json::to_string(preview)?);
+        Ok(())
+    })
+    .await
+}
+
+#[cfg(unix)]
+async fn validate_store_with_preview(
+    state_dir: &Path,
+    identity: StoreIdentity,
+    local_roots: &[PathBuf],
+    skill_catalog: Option<&Path>,
+    probes: &ValidationOptions,
+    mut report: impl FnMut(&retirement::RetirementPreview) -> Result<()>,
+) -> Result<usize> {
+    let catalog = skill_catalog.map(load_catalog).transpose()?;
+    let engine = state_dir.join(engine_import::ENGINE_STORE);
+    if engine.exists() {
+        return Err(eyre!(
+            "{} is an engine store: validating an engine store on disk is not built (#2167); validate with the daemon running",
+            engine.display()
+        ));
+    }
+    let old = state_dir.join(engine_import::OLD_STORE);
+    if !old.exists() {
+        println!("no stored records: {} is absent, so the first start imports nothing", old.display());
+        return Ok(0);
+    }
+    let StoreIdentity { home, own_host } = identity;
+    let source = engine_import::Source::read(&old, &home).map_err(|error| eyre!(error))?.with_own_host(own_host);
+    let mut failed = false;
+    let mut projects = BTreeMap::<String, Vec<ResourceObject<Project>>>::new();
+    let mut manifest_roots = 0usize;
+    for row in source.rows() {
+        let name = row.document.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>");
+        let label = format!("{}/{}/{}/{name}", row.home, row.namespace, row.plural);
+        if row.plural == "projects" {
+            match serde_json::from_value::<K8sResourceObject<Project>>(row.document.clone())
+                .map_err(|error| error.to_string())
+                .and_then(|object| ResourceObject::from_k8s_object(object).map_err(|error| error.to_string()))
+            {
+                Ok(project) => projects.entry(row.namespace.clone()).or_default().push(project),
+                Err(error) => {
+                    eprintln!("{label}: {error}");
+                    failed = true;
+                }
+            }
+        }
+        manifest_roots += usize::from(row.plural == "manifestroots");
+        if engine_import::plan::is_retired(&row.plural) {
+            continue;
+        }
+        if let Err(error) = validate_stored_record(&row.document) {
+            eprintln!("{label}: {error}");
+            failed = true;
+        }
+    }
+    let count = source.rows().len();
+
+    let summary = engine_import::rehearse(&source, &home);
+    failed |= probes.require_import && summary.refused();
+    print_import(&summary);
+
+    let merged = |plural: &str| merged_rows(source.rows(), plural);
+    let frozen_inventory: Vec<Value> = FROZEN_KINDS.iter().flat_map(|plural| merged(plural)).collect();
+    let retirement_inventory = Some((merged("workflowtemplates"), merged("projects"), merged("fleetdesignations")));
+    failed |= semantic_gates(retirement_inventory, &frozen_inventory, false, probes, &mut report).await?;
+    let skill_documents: Vec<Value> = if catalog.is_some() {
+        ["projects", "crewdefaults", "fleetdesignations"].iter().flat_map(|plural| merged(plural)).collect()
+    } else {
+        Vec::new()
+    };
+
+    if manifest_roots > 0 {
+        println!(
+            "notice: {manifest_roots} manifest root records: their bound charter inputs are served only by a running engine daemon and are not validated offline"
+        );
+    }
+    if !projects.is_empty() {
+        let (inspector, paths) = local_ops_inventory(local_roots).await;
+        for (namespace, registered) in projects {
+            match validate_project_ops(&registered, &paths, &inspector).await {
+                Ok(0) => {}
+                Ok(entries) => println!("validated {entries} operational entries in {namespace}"),
+                Err(error) => {
+                    eprintln!("{namespace}: {error}");
+                    failed = true;
+                }
+            }
+        }
+    }
+    if failed {
+        return Err(eyre!("resource validation failed after checking {count} stored records in {}", old.display()));
+    }
+    if let Some(catalog) = &catalog {
+        validate_skill_documents(catalog, &skill_documents)?;
+    }
+    println!("validated {count} stored records in {}", old.display());
+    Ok(count)
+}
+
+/// Every namespace's records of `plural`, one per name: the own copy first, then other homes'
+/// in home order, as rows read from the old store are ordered.
+#[cfg(unix)]
+fn merged_rows(rows: &[engine_import::Row], plural: &str) -> Vec<Value> {
+    let mut seen = std::collections::BTreeSet::new();
+    rows.iter()
+        .filter(|row| row.plural == plural)
+        .filter(|row| {
+            let name = row.document.pointer("/metadata/name").and_then(Value::as_str).unwrap_or_default().to_owned();
+            seen.insert((row.namespace.clone(), name))
+        })
+        .map(|row| row.document.clone())
+        .collect()
 }
 
 /// One line per kind, then each note and each refusal.
@@ -924,6 +1100,75 @@ mod tests {
     // fails. Exhaust the finite on/off × store matrix, including empty stores,
     // duplicate Messages and a missing designation.
     // Named fleet-role Messages pass; an unnamed designation fails only when the candidate enables primitives.
+    // Behaviour (cut-over B1): with the daemon stopped, the candidate validates the old store on
+    // disk as its first start reads it, and leaves the file as it was. A store whose import would
+    // refuse a record fails, naming it; a state directory with no store has nothing to import; one
+    // already holding an engine store is refused, since validating that on disk is not built.
+    #[tokio::test]
+    async fn a_stopped_store_is_validated_on_disk_as_the_first_start_reads_it() {
+        use flotilla_daemon_testkit::import_fixture::{artifact, clone, designation, document, message, own, populated};
+        use flotilla_resources::{Artifact, Clone as CloneResource, FleetDesignation, Message, TerminalSession};
+
+        let identity = || super::StoreIdentity { home: "host-a".into(), own_host: Some("host-a".into()) };
+        let probes = super::ValidationOptions { require_import: true, ..Default::default() };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = dir.path().join(flotilla_daemon::engine_import::OLD_STORE);
+        let backend = flotilla_store_sqlite::SqliteBackend::open(&old).expect("old store");
+        own::<FleetDesignation>(&backend, designation()).await;
+        own::<Message>(&backend, message("waiting")).await;
+        own::<Artifact>(&backend, artifact("ours")).await;
+        own::<CloneResource>(&backend, clone("clone-a")).await;
+        drop(backend);
+        // Records, not bytes: the dropped backend may still checkpoint its own write-ahead log.
+        let records = || {
+            flotilla_store_sqlite::read_stored_rows(&old)
+                .expect("old store")
+                .into_iter()
+                .map(|row| (row.origin_root, row.kind, row.namespace, row.name, row.body))
+                .collect::<Vec<_>>()
+        };
+        let before = records();
+        let count = super::validate_store_with_options(dir.path(), identity(), &[], None, &probes).await.expect("a whole store validates");
+        assert_eq!(count, 4, "every stored record is checked");
+        assert_eq!(records(), before, "the old store is only read");
+        assert!(!dir.path().join(flotilla_daemon::engine_import::ENGINE_STORE).exists(), "the rehearsal writes no engine store");
+
+        let backend = flotilla_store_sqlite::SqliteBackend::open(&old).expect("old store");
+        own::<TerminalSession>(
+            &backend,
+            document(
+                "TerminalSession",
+                "missing-identity",
+                serde_json::json!({"env_ref": "env", "role": "tool", "source": {"kind": "tool", "command": "true"}, "cwd": "/repo", "pool": "cleat"}),
+                serde_json::json!({"phase": "Running"}),
+            ),
+        )
+        .await;
+        drop(backend);
+        let error = super::validate_store_with_options(dir.path(), identity(), &[], None, &probes)
+            .await
+            .expect_err("an import refusal fails the gate");
+        assert!(error.to_string().contains("resource validation failed"), "{error:#}");
+
+        // The semantic gates run too: live convoys naming an Environment and a workflow the
+        // store does not hold fail the frozen-reference check, as they fail the live gate.
+        let frozen = tempfile::tempdir().expect("tempdir");
+        drop(populated(frozen.path()).await);
+        let error = super::validate_store_with_options(frozen.path(), identity(), &[], None, &probes)
+            .await
+            .expect_err("unsatisfiable frozen references fail the gate");
+        assert!(error.to_string().contains("resource validation failed"), "{error:#}");
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(super::validate_store_with_options(empty.path(), identity(), &[], None, &probes).await.expect("nothing to import"), 0);
+
+        std::fs::write(empty.path().join(flotilla_daemon::engine_import::ENGINE_STORE), b"").expect("engine store");
+        let error = super::validate_store_with_options(empty.path(), identity(), &[], None, &probes)
+            .await
+            .expect_err("an engine store on disk is not validated");
+        assert!(error.to_string().contains("validating an engine store on disk is not built"), "{error:#}");
+    }
+
     // The HTTP stand-in is the resource-socket process boundary; mapping and
     // temporary-store restoration use the real rehearsal implementations.
     #[tokio::test]

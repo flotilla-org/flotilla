@@ -204,7 +204,9 @@ chrono = { workspace = true }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
 
 [dev-dependencies]
+flotilla-daemon-testkit = { path = "crates/flotilla-daemon-testkit" }
 flotilla-discovery-testkit = { path = "crates/flotilla-discovery-testkit" }
+flotilla-store-sqlite = { path = "crates/flotilla-store-sqlite" }
 tokio = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }
 flotilla-core = { path = "crates/flotilla-core" }
