@@ -554,24 +554,40 @@ impl Committed<'_> {
 #[derive(Default)]
 pub struct CommitSignal {
     listeners: Mutex<Vec<std::sync::Weak<CommitListener>>>,
+    /// Told first, before anything is woken: what counts the commits a reader reads through.
+    counters: Mutex<Vec<std::sync::Weak<CommitListener>>>,
 }
 pub(crate) type Commits = std::sync::Arc<CommitSignal>;
 
 impl CommitSignal {
     pub(crate) fn committed(&self, committed: &Committed<'_>) {
-        let mut listeners = self.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        listeners.retain(|listener| match listener.upgrade() {
-            Some(listener) => {
-                listener(committed);
-                true
-            }
-            None => false,
-        });
+        tell(&self.listeners, committed);
+    }
+
+    /// Tells the counters of `committed`, before any listener or applied listener is called: a
+    /// reader that learns of the commit, woken or told by anyone, then reads its count.
+    pub(crate) fn counted(&self, committed: &Committed<'_>) {
+        tell(&self.counters, committed);
     }
 
     pub(crate) fn listen(&self, listener: std::sync::Weak<CommitListener>) {
         self.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(listener);
     }
+
+    pub(crate) fn count(&self, counter: std::sync::Weak<CommitListener>) {
+        self.counters.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(counter);
+    }
+}
+
+fn tell(listeners: &Mutex<Vec<std::sync::Weak<CommitListener>>>, committed: &Committed<'_>) {
+    let mut listeners = listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    listeners.retain(|listener| match listener.upgrade() {
+        Some(listener) => {
+            listener(committed);
+            true
+        }
+        None => false,
+    });
 }
 
 /// Called with a home this store heard from without a write (a keepalive alone moves only the
@@ -622,6 +638,12 @@ impl Service {
     /// Calls `listener` after each commit to this store, while the caller keeps it alive.
     pub fn on_commit(&self, listener: std::sync::Weak<CommitListener>) {
         self.commits.listen(listener);
+    }
+    /// Calls `counter` after each commit to this store, while the caller keeps it alive, before
+    /// any [`Service::on_commit`] or [`Service::on_applied`] listener: for a count of commits a
+    /// reader compares without the store's lock, which must move before anyone can learn of them.
+    pub fn on_count(&self, counter: std::sync::Weak<CommitListener>) {
+        self.commits.count(counter);
     }
     /// Calls `listener` with each home heard from without a write, while the caller keeps it
     /// alive: with [`Service::on_commit`]'s [`Committed::heard`], every time a home is heard from.

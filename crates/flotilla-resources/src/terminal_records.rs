@@ -477,8 +477,8 @@ impl TerminalObservation {
 pub struct TerminalObservations {
     held: Mutex<HashMap<String, TerminalObservation>>,
     changes: tokio::sync::broadcast::Sender<String>,
-    /// How many times an observation changed since this home started, counted after each change.
-    changed: std::sync::atomic::AtomicU64,
+    /// How many times an observation changed since this home started: told and counted together.
+    changed: Mutex<u64>,
 }
 
 impl Default for TerminalObservations {
@@ -491,14 +491,16 @@ impl TerminalObservations {
     /// How many times an observation has changed since this home started. Counted after each
     /// change is in place, so a reader that reads this before the observations sees those changes.
     pub fn changed(&self) -> u64 {
-        self.changed.load(std::sync::atomic::Ordering::SeqCst)
+        *self.changed.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Tells the subscribers, then counts the change: a subscriber that reads the count and then
-    /// drains its receiver has received every change counted.
+    /// Tells the subscribers and counts the change as one step: a subscriber that reads the count
+    /// and then drains its receiver has received every change counted, and one woken by the change
+    /// reads a count that holds it.
     fn noted(&self, name: &str) {
+        let mut changed = self.changed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = self.changes.send(name.to_owned());
-        self.changed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *changed = changed.saturating_add(1);
     }
 
     /// What is observed of launch `name`, if anything.

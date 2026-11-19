@@ -398,6 +398,12 @@ impl Store {
         self.runtime.commits.listen(listener);
     }
 
+    /// Calls `counter` after each commit to this store, before any other listener, as
+    /// [`crate::stream::Service::on_count`] does.
+    pub fn on_count(&self, counter: std::sync::Weak<crate::stream::CommitListener>) {
+        self.runtime.commits.count(counter);
+    }
+
     pub(crate) fn heards(&self) -> crate::stream::Heards {
         std::sync::Arc::clone(&self.runtime.heards)
     }
@@ -1200,6 +1206,10 @@ impl Write<'_> {
             staged();
         }
         let heard: BTreeSet<String> = watermarks.keys().cloned().collect();
+        // Before anything that wakes a reader: a reader that learns of this commit, from any
+        // listener, reads counts that hold it. A reader passing on the new count waits on the
+        // store's lock, held until this returns, so it reads everything below as well.
+        self.runtime.commits.counted(&crate::stream::Committed { kinds: &kinds, homes: &moved, heard: &heard, rescan });
         self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner).extend(watermarks);
         if !applied.is_empty() {
             for listener in self.runtime.applied.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {

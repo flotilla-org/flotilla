@@ -387,3 +387,81 @@ async fn a_listing_read_with_no_commit_since_the_last_pass_reads_no_store() {
     let occupancy = shown[0].status.as_ref().map(|status| status.occupancy);
     assert_eq!(occupancy, Some(TerminalOccupancy::Occupied), "an observation is read at the next read");
 }
+
+// Behaviour (d16 finding 1): a read made by anyone who has learned of a commit sees it. Here the
+// read is made the moment the store tells its listeners of a session's realise, as a watcher woken
+// by the commit reads, from a listener told before the views' own. It reads the session realised,
+// never the listing published before the realise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_told_of_a_realise_commit_reads_the_session_realised() {
+    use std::{
+        sync::{mpsc, Arc, Mutex},
+        time::Duration,
+    };
+
+    use flotilla_resources::{
+        environment_records::LaunchFacts, EnvironmentSpec, HostDirectEnvironmentSpec, TerminalSession, TerminalSessionPhase,
+    };
+    use flotilla_schema_sqlite::stream::{CommitListener, Committed};
+    use flotilla_store::{ResourceBackend, TerminalViews};
+
+    type Read = Box<dyn FnOnce() + Send>;
+
+    async fn phase_of(backend: &ResourceBackend, session: &str) -> Option<TerminalSessionPhase> {
+        let listed = backend.including_replicas::<TerminalSession>("flotilla").list().await.expect("list");
+        listed.items.into_iter().find(|read| read.object.metadata.name == session)?.object.status.map(|status| status.phase)
+    }
+
+    let store = flotilla_provisioning_testkit::OtherHome::open("home");
+    // Listening before the views start: told of each commit before their cursors are.
+    let armed: Arc<Mutex<Option<Read>>> = Arc::default();
+    let listener: Arc<CommitListener> = {
+        let armed = Arc::clone(&armed);
+        Arc::new(move |_: &Committed<'_>| {
+            let read = armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            if let Some(read) = read {
+                read();
+            }
+        })
+    };
+    store.service().on_commit(Arc::downgrade(&listener));
+    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    backend.install_engine_records(Arc::new(TerminalViews::new("flotilla", engine.reads())));
+    backend.serve_engine_in("flotilla");
+
+    let spec = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "home".into(), repo_default_dir: "/work".into() }),
+        ..EnvironmentSpec::default()
+    };
+    engine.environments.request("env", &spec, None);
+    engine.environments.ready("env", "backing", LaunchFacts::default());
+    let runtime = tokio::runtime::Handle::current();
+    for n in 0..8 {
+        let vessel = engine.vessels.request(&format!("c{n}"), "work", "host");
+        let launch = engine.terminals.request(&TerminalsFixture::agent(&vessel, "coder", "env"));
+        let session = launched(&launch).to_owned();
+        let requested = phase_of(&backend, &session).await;
+        assert!(requested.is_some_and(|phase| phase != TerminalSessionPhase::Running), "requested, not yet realised: {requested:?}");
+
+        let (sent, read) = mpsc::channel();
+        let (backend_, runtime_, session_) = (backend.clone(), runtime.clone(), session.clone());
+        let reader: Read = Box::new(move || {
+            let (done, finished) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sent.send(runtime_.block_on(phase_of(&backend_, &session_)));
+                let _ = done.send(());
+            });
+            // A read served without the store's lock answers at once; one that reads the store
+            // waits for this commit to return.
+            let _ = finished.recv_timeout(Duration::from_millis(300));
+        });
+        *armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reader);
+        engine.terminals.ready(&launch, "sid", &facts());
+
+        let phase = tokio::task::spawn_blocking(move || read.recv_timeout(Duration::from_secs(30)).expect("the read answers"))
+            .await
+            .expect("the read");
+        assert_eq!(phase, Some(TerminalSessionPhase::Running), "a read told of the realise reads the session realised");
+    }
+}

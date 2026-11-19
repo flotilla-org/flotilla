@@ -658,8 +658,8 @@ pub trait ConvoyRecords: Send + Sync {
 pub struct ConvoyMemory {
     notes: Mutex<BTreeMap<String, ConvoyNotes>>,
     changes: tokio::sync::broadcast::Sender<String>,
-    /// How many times the notes changed since this home started, counted after each change.
-    changed: AtomicU64,
+    /// How many times the notes changed since this home started: told and counted together.
+    changed: Mutex<u64>,
     /// How many launches, at any home, the convoy views last listed as unreadable.
     unreadable: AtomicU64,
     /// The evidence records each launch's last pass read: a change of one wakes only the
@@ -672,7 +672,7 @@ impl Default for ConvoyMemory {
         Self {
             notes: Mutex::default(),
             changes: tokio::sync::broadcast::channel(256).0,
-            changed: AtomicU64::new(0),
+            changed: Mutex::new(0),
             unreadable: AtomicU64::new(0),
             evidence: Mutex::default(),
         }
@@ -730,15 +730,17 @@ impl ConvoyMemory {
     /// How many times the notes have changed since this home started. Counted after each change
     /// is in place, so a reader that reads this before the notes sees at least those changes.
     pub fn changed(&self) -> u64 {
-        self.changed.load(Ordering::SeqCst)
+        *self.changed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Tells the subscribers, then counts the change: a subscriber that reads the count and then
-    /// drains its receiver has received every change counted.
+    /// Tells the subscribers and counts the change as one step: a subscriber that reads the count
+    /// and then drains its receiver has received every change counted, and one woken by the change
+    /// reads a count that holds it.
     fn noted(&self, name: &str) {
+        let mut changed = self.changed.lock().unwrap_or_else(PoisonError::into_inner);
         // No follower is no reason to fail: one may subscribe later.
         drop(self.changes.send(name.to_owned()));
-        self.changed.fetch_add(1, Ordering::SeqCst);
+        *changed = changed.saturating_add(1);
     }
 
     /// The notes on launch `name`; empty when none are held.

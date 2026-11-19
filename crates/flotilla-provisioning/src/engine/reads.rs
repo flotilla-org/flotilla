@@ -296,8 +296,10 @@ impl StoreReads {
     }
 
     /// Calls `listener` after each commit to the store, while the caller keeps it alive.
-    pub(crate) fn on_commit(&self, listener: std::sync::Weak<flotilla_schema_sqlite::stream::CommitListener>) -> Result<(), ReadError> {
-        self.store.lock().map_err(|_| ReadError("decided store lock poisoned".into()))?.on_commit(listener);
+    /// Calls `counter` after each commit to the store, before anything is woken by it, while the
+    /// caller keeps it alive.
+    pub(crate) fn on_count(&self, counter: std::sync::Weak<flotilla_schema_sqlite::stream::CommitListener>) -> Result<(), ReadError> {
+        self.store.lock().map_err(|_| ReadError("decided store lock poisoned".into()))?.on_count(counter);
         Ok(())
     }
 

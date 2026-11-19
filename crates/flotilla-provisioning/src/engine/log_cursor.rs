@@ -55,7 +55,8 @@ impl<C> LogCursor<C> {
                 }
             })
         };
-        reads.on_commit(Arc::downgrade(&listener)).map_err(|error| error.to_string())?;
+        // Counted before any listener wakes a reader of the commit.
+        reads.on_count(Arc::downgrade(&listener)).map_err(|error| error.to_string())?;
         let mut follower = Follower::new(kinds.iter().copied());
         let held = homes();
         reads.read(|read| Ok(follower.start(read, &held)?)).map_err(|error| error.to_string())?;
