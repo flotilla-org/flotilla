@@ -105,6 +105,10 @@ struct Script {
     records: Option<Arc<LifecycleHome<ImageBuildKind, StoreLog>>>,
     /// While set, a release tells the notify that it runs and waits for a permit.
     release_gate: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
+    /// Each key's release results, in turn; an empty queue releases.
+    release: BTreeMap<String, VecDeque<Result<(), ProviderFailure>>>,
+    /// Each key's tries at releasing, failed or not.
+    release_tries: Vec<String>,
     /// How many times the controller has read a holder, as it does for each resource it looks at.
     reads: usize,
     /// `reads` at the latest try at realising: a later read is the look the try's end leads to.
@@ -158,8 +162,19 @@ impl Actuator<EnvironmentKind> for Scripted {
             releasing.notify_one();
             permits.acquire().await.expect("permits").forget();
         }
-        self.script().released.push((key(request), identity.map(str::to_owned)));
-        Ok(())
+        let key = key(request);
+        let released = {
+            let mut script = self.script();
+            script.release_tries.push(key.clone());
+            script.reads_at_try = script.reads;
+            let released = script.release.get_mut(&key).and_then(VecDeque::pop_front).unwrap_or(Ok(()));
+            if released.is_ok() {
+                script.released.push((key, identity.map(str::to_owned)));
+            }
+            released
+        };
+        self.progress.notify_waiters();
+        released
     }
 
     fn followed(&self) -> Vec<KindCode> {
@@ -636,6 +651,34 @@ async fn an_absence_pushed_while_releasing_ends_the_resource_released() {
     backing.send(BackingEvent { name: "b".into(), observed: Backing::Absent { reason: None } }).await.expect("send");
     world.until("b lost", |world| world.state("b").gone()).await;
     permits.add_permits(1);
+
+    world.until("a ended", |world| world.state("a").gone()).await;
+    let LifecycleState::Gone { ending } = world.state("a") else { unreachable!() };
+    assert_eq!(ending, flotilla_state_machines::machines::lifecycle::Ending::Released);
+    assert_eq!(world.actuator.script().released, [("a".to_owned(), Some("id-a".to_owned()))]);
+}
+
+// A release that has started owns the ending, also after a failed try: its backing found absent
+// later is what the release expects, not a loss (d13: a release failing after its container was
+// gone, then the host's probe reporting the container absent, would end the launch Lost).
+#[tokio::test]
+async fn an_absence_pushed_after_a_failed_release_ends_the_resource_released() {
+    let mut world = World::open();
+    world.actuator.script().release.insert("a".into(), VecDeque::from([Err(failure("container removed; cleanup failed", true))]));
+    world.record("holder-a");
+    world.start();
+    world.request("a");
+    world.request("b");
+    world.until("a and b realised", |world| world.state("a").realised() && world.state("b").realised()).await;
+
+    world.record_step("holder-a", Step::Released);
+    world.until("a's release tried and failed", |world| world.actuator.script().release_tries == ["a"] && world.actuator.settled()).await;
+    assert!(world.state("a").realised(), "a failed release leaves a realised");
+    let backing = world.backing.as_ref().expect("started");
+    backing
+        .send(BackingEvent { name: "a".into(), observed: Backing::Absent { reason: Some("container gone".into()) } })
+        .await
+        .expect("send");
 
     world.until("a ended", |world| world.state("a").gone()).await;
     let LifecycleState::Gone { ending } = world.state("a") else { unreachable!() };

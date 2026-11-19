@@ -326,9 +326,6 @@ pub struct Controller<K: LifecycleKind, A: Actuator<K>> {
     usable: BTreeMap<String, bool>,
     flights: JoinSet<(String, Done)>,
     in_flight: BTreeSet<String>,
-    /// The resources being released: a backing pushed meanwhile, as one found absent, is the
-    /// release's doing, and the release's end, not that push, ends them.
-    releasing: BTreeSet<String>,
     /// The resources whose last release failed: tried again only on a dependency's change or at
     /// their provider's time.
     release_failed: BTreeSet<String>,
@@ -388,7 +385,6 @@ where
             usable: BTreeMap::new(),
             flights: JoinSet::new(),
             in_flight: BTreeSet::new(),
-            releasing: BTreeSet::new(),
             release_failed: BTreeSet::new(),
             retries: BTreeMap::new(),
             holdings: BTreeMap::new(),
@@ -437,7 +433,6 @@ where
                 Some(joined) = self.flights.join_next(), if !self.flights.is_empty() => match joined {
                     Ok((name, done)) => {
                         self.in_flight.remove(&name);
-                        self.releasing.remove(&name);
                         let trigger = if matches!(done, Done::Held(Ok(_))) { Trigger::Held } else { Trigger::Own };
                         // A holding this call named first was not followed while it ran, and one
                         // that was may have changed meanwhile: either way its holdings are read
@@ -451,7 +446,7 @@ where
                             }
                             _ => false,
                         };
-                        self.finish(&name, done).await;
+                        let trigger = if self.finish(&name, done).await { Trigger::Recheck } else { trigger };
                         self.evaluate(BTreeMap::from([(name.clone(), trigger)])).await;
                         if unseen {
                             self.evaluate(BTreeMap::from([(name, Trigger::Dependency)])).await;
@@ -460,14 +455,13 @@ where
                     Err(error) => warn!(kind = K::NAME, %error, "controller flight did not finish"),
                 },
                 event = backing.recv() => match event {
-                    // A release kills what it releases, and a probe may see that first: the
-                    // release's end decides.
-                    Some(event) if self.releasing.contains(&event.name) => {
-                        debug!(kind = K::NAME, name = %event.name, observed = ?event.observed, "backing pushed while releasing");
-                    }
                     Some(event) => {
-                        self.finish(&event.name, Done::Observed(Ok(event.observed), None)).await;
-                        self.evaluate(BTreeMap::from([(event.name, Trigger::Own)])).await;
+                        let trigger = if self.finish(&event.name, Done::Observed(Ok(event.observed), None)).await {
+                            Trigger::Recheck
+                        } else {
+                            Trigger::Own
+                        };
+                        self.evaluate(BTreeMap::from([(event.name, trigger)])).await;
                     }
                     None => return,
                 },
@@ -656,7 +650,6 @@ where
                 }));
             }
             Action::Release { identity } => {
-                self.releasing.insert(owned.clone());
                 let ruled = self.ruled.as_deref() == Some(name);
                 self.flights.spawn(inherit(async move {
                     let released = if ruled {
@@ -671,10 +664,13 @@ where
         self.in_flight.insert(name.to_owned());
     }
 
-    /// Records what a flight, or a pushed backing fact, found.
-    async fn finish(&mut self, name: &str, done: Done) {
-        let Some(resource) = self.lifecycles.get(name) else { return };
+    /// Records what a flight, or a pushed backing fact, found. True when it found a realised
+    /// resource's backing gone or broken after its holder ended: its release owns the ending, so
+    /// the finding ends nothing and the release is tried again.
+    async fn finish(&mut self, name: &str, done: Done) -> bool {
+        let Some(resource) = self.lifecycles.get(name) else { return false };
         let state = resource.state().clone();
+        let mut left_to_release = false;
         // A new try ran: what it found decides any later one.
         let scheduled = if matches!(done, Done::Observed(..) | Done::Held(Ok(_))) { None } else { self.retries.remove(name) };
         if let Done::Observed(_, Some(holdings)) = &done {
@@ -726,13 +722,39 @@ where
                 self.write(name, Step::Realised { identity }).await;
             }
             (Done::Observed(Ok(Backing::Absent { reason }), _), LifecycleState::Realised { .. }) => {
-                self.write(name, Step::Vanished { cause: VanishCause::Lost { reason } }).await;
+                left_to_release = self.vanish(name, resource.spec(), VanishCause::Lost { reason }).await;
             }
             (Done::Observed(Ok(Backing::Failed { reason }), _), LifecycleState::Realised { .. }) => {
-                self.write(name, Step::Vanished { cause: VanishCause::Failed { reason } }).await;
+                left_to_release = self.vanish(name, resource.spec(), VanishCause::Failed { reason }).await;
             }
             (Done::Observed(Err(cause), _), _) => warn!(kind = K::NAME, name, ?cause, "observation failed"),
             _ => {}
+        }
+        left_to_release
+    }
+
+    /// Ends realised `name` vanished for `cause`, unless its holder has ended: then a release is
+    /// due, running, or failed and to be tried again, and a backing gone or broken is what
+    /// releasing it does, not a loss. Read from the store, not from what this controller holds in
+    /// memory, so a failed release try does not hand the ending back to the next finding. True
+    /// when the ending was left to the release.
+    async fn vanish(&self, name: &str, request: &K::Request, cause: VanishCause) -> bool {
+        let actuator = Arc::clone(&self.actuator);
+        let (owned, request) = (name.to_owned(), request.clone());
+        match self.watch.read(move |read| Ok(actuator.holder(read, &owned, &request)?.ended)).await {
+            Ok(true) => {
+                debug!(kind = K::NAME, name, ?cause, "backing gone after its holder ended: the release ends it");
+                true
+            }
+            Ok(false) => {
+                self.write(name, Step::Vanished { cause }).await;
+                false
+            }
+            // Judged again at its next observation.
+            Err(error) => {
+                warn!(kind = K::NAME, name, %error, "holder read failed; the finding is not recorded");
+                false
+            }
         }
     }
 
