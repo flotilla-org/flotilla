@@ -3582,9 +3582,15 @@ fn associated_change_request_name(
     }
 
     // A produced subject can retain PR identity after the checkout's inspection is gone.
-    // Require exactly one current PR for the repository if nothing singles one out.
+    // Require exactly one current PR for the repository if nothing singles one out. A convoy
+    // that expects no change request has none to single out, so its repository needs no forge
+    // (a forge-free `file://` remote, as the fleet canary uses).
+    let leaves = expected_change_request_leaves(convoy, forges)?;
+    if leaves.is_empty() {
+        return Ok(None);
+    }
     let repository = repository_address(&repository.url, forges)?;
-    let names = expected_change_request_leaves(convoy, forges)?
+    let names = leaves
         .into_iter()
         .filter_map(|leaf| leaf_address(&leaf.address, forges).ok())
         .filter(|address| address.kind() == AddressKind::ChangeRequest && address.parent().as_ref() == Some(&repository))

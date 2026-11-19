@@ -331,6 +331,47 @@ async fn landing_evidence_is_as_old_as_its_inspection() {
     assert_eq!(inspections(), 1, "the delete asks for the stale checkout once");
 }
 
+// A convoy that expects no change request judges its checkouts without reading a forge, so a
+// repository whose remote no Forge declares (the fleet canary's `file://` upstream) still has its
+// teardown sanctioned once its checkout is released.
+#[tokio::test]
+async fn a_forge_free_repository_needs_no_forge_to_tear_down() {
+    let spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
+        .workflow_ref("workflow".into())
+        .role("crew".into())
+        .repositories(vec![flotilla_resources::ConvoyRepositorySpec {
+            url: "file:///tmp/canary/upstream.git".into(),
+            repo_ref: flotilla_protocol::RepositoryKey("repo".into()),
+            source_ref: "main".into(),
+            target_ref: "main".into(),
+            workspace_slug: "upstream".into(),
+            subpaths: Vec::new(),
+        }])
+        .adopted_checkout_refs(BTreeMap::from([(flotilla_protocol::RepositoryKey("repo".into()), "checkout".into())]))
+        .build();
+    let (crew, backend, _, held) = spec_fixture(CrewWorkPhase::Done, spec).await;
+    let launch = held.engine.engine.checkouts.put_ready(
+        "checkout",
+        &flotilla_resources::CheckoutSpec::Observed(
+            flotilla_resources::ObservedCheckoutSpec::builder()
+                .r#ref("topic".into())
+                .path("/checkout".into())
+                .repo_ref(flotilla_protocol::RepositoryKey("repo".into()))
+                .host_ref("home".into())
+                .is_main(false)
+                .build(),
+        ),
+        Some(&CheckoutHolder::Convoy(held.launch.clone())),
+    );
+    held.engine.end(&backend, &held.launch, ConvoyPhase::Landed).await;
+    held.engine.engine.checkouts.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
+    let convoy = held.convoy(&backend).await;
+    let checkouts = crew.held_checkouts(&convoy).await.expect("held");
+
+    crew.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkouts, false).await.expect("no forge is needed");
+}
+
 // #3710: each manual Active-convoy delete forces one fresh checkout inspection,
 // including a second request inside the normal evidence freshness horizon.
 #[tokio::test]
