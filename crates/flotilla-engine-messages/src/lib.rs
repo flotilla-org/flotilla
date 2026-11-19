@@ -744,11 +744,16 @@ impl MessagePrimitives {
     /// Registers a crew session as a consumer: its record exists, and the
     /// inbox writes its receipts there.
     pub async fn register(&self, session: &str, now: Timestamp) -> Result<Receiver, String> {
+        let consumer = self.consumer(session);
+        // Registered consumers already have their record; skip the blocking hop and the
+        // session home's lock, which the Message loop would otherwise take per holder per pass.
+        if self.consumers.lock().expect("consumers").contains(&consumer) {
+            return Ok(consumer);
+        }
         let sessions = Arc::clone(&self.sessions);
         let name = session.to_owned();
         // A SQLite write: off the async workers.
         tokio::task::spawn_blocking(carry(move || sessions.ensure(&name, now))).await.map_err(|error| error.to_string())??;
-        let consumer = self.consumer(session);
         if self.consumers.lock().expect("consumers").insert(consumer.clone()) {
             let port =
                 SessionReceipts { sessions: Arc::clone(&self.sessions), name: session.to_owned(), scope: self.receipts.receipt_scope() };
