@@ -414,7 +414,8 @@ show_fleet_spread() {
 write_launcher() {
   local name="$1"
   local launcher="$FLEET_BIN_DIR/$name"
-  mkdir -p "$FLEET_BIN_DIR"
+  # On PATH for every login: its mode does not follow the installing shell's umask.
+  mkdir -p -m 755 "$FLEET_BIN_DIR"
   if [[ -e "$launcher" ]] && ! grep -Fq '# managed by fleet-install' "$launcher" 2>/dev/null; then
     die "refusing to replace unmanaged launcher: $launcher"
   fi

@@ -600,7 +600,11 @@ grep -Fq 'healthy installation remains active' "$test_root/prune-failure-install
 run_installer "$generation_one" >/dev/null
 test -x "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/bin/flotilla" || fail 'candidate binaries were not staged'
 test ! -w "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json" || fail 'selected generation is writable'
-test "$(file_mode "$test_root/home/.local/bin")" = 755 || fail 'credential umask leaked into the launcher directory'
+test "$(file_mode "$test_root/home/.local/bin")" = 755 || fail 'launcher directory was not created with mode 755'
+# A directory made after the credential download without an explicit mode follows the caller's
+# umask, whatever it is; the credential's umask 077 must not reach it.
+test "$(file_mode "$test_root/home/.config/systemd/user")" = "$(printf '%o' $((0777 & ~0$(umask))))" \
+  || fail 'credential umask leaked into later installer writes'
 for name in flotilla flotillad cleat; do
   grep -Fq '# managed by fleet-install' "$test_root/home/.local/bin/$name" || fail "missing stable $name launcher"
 done
