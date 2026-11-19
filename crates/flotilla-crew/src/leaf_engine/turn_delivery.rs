@@ -326,7 +326,7 @@ impl LeafSubscriptionTable {
                     }
                 };
                 let mut brief = if active_conflict {
-                    format!("{}\n\nPR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, and continue shepherding the PR.", rule.brief.trim())
+                    format!("{}\n\nPR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, and continue shepherding the PR. Stage only the files you resolved (`git add <path>`), never `git add -A` or `git add .` during a rebase.", rule.brief.trim())
                 } else if active_probe {
                     let checks = match cr.checks.value {
                         Some(ObservedChecks::Pass) => "pass",
