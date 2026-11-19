@@ -235,9 +235,13 @@ pub(super) async fn submit_and_confirm(
     // An abandoned draft is set aside in memory and typed back after the turn.
     let submission = drafts.guarded_deliver(pool, session_id, message, key).await;
     match submission {
-        Ok(TerminalSubmission::Submitted { keyed: true }) => {}
+        // Logged at info, as a keyed repeat is (run 5 R5-3): whether the pool took the turn as new,
+        // and under its key, tells a repeat after a crash that it typed from one it held.
+        Ok(TerminalSubmission::Submitted { keyed: true }) => {
+            info!(%session_id, %key, "the pool took the turn as a new submission under its key");
+        }
         Ok(TerminalSubmission::Submitted { keyed: false }) => {
-            debug!(%session_id, %key, "the pool could not record the turn's key: a retype of it may duplicate it");
+            info!(%session_id, %key, "the pool took the turn unkeyed: it could not record the key, so a retype of it may duplicate it");
         }
         Ok(TerminalSubmission::AlreadySubmitted { at_unix_ms }) => {
             return Ok(TerminalDeliveryOutcome::AlreadyTyped { at_unix_ms });
