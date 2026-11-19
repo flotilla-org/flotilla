@@ -792,6 +792,45 @@ async fn the_standing_governor_resumes_a_stalled_coder() {
     assert_eq!(fleet.counts().command_errors, 0);
 }
 
+// Behaviour: a standing role's launches are named in address form (`project:P/convoy:R#n`),
+// and the environment each vessel requests is named from its launch. That name becomes a
+// Docker container name, a volume spec and host paths, so it must be a plain name component:
+// no `:` or `/`, which Docker refuses with "too many colons".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standing_roles_environment_takes_a_docker_safe_name() {
+    use flotilla_resources::Environment;
+
+    let fleet = TestDaemon::builder().start().await;
+    for catalog::CatalogDocument { kind, name, document } in
+        catalog::standing_governor_documents(&catalog_forge_url(&fleet).await).expect("governor documents")
+    {
+        let applied = fleet.execute(CommandAction::ResourceApply { namespace: NAMESPACE.into(), document }).await;
+        assert!(matches!(applied, CommandValue::ResourceObject(_)), "apply {kind} {name}: {applied:?}");
+    }
+    let governor = fleet
+        .wait("the standing governor's generation", |convoy: &ResourceObject<Convoy>| {
+            convoy.metadata.annotations.get(flotilla_resources::ENSURED_FROM_ANNOTATION).map(String::as_str) == Some(catalog::GOVERNOR_ROLE)
+        })
+        .await
+        .metadata
+        .name;
+    assert!(governor.contains(':') && governor.contains('/'), "a standing launch is named in address form: {governor}");
+    fleet.wait("the governor Active", in_phase(&governor, ConvoyPhase::Active)).await;
+    fleet
+        .wait("the governor's vessel's environment", |environment: &ResourceObject<Environment>| {
+            environment.metadata.name.contains("governor")
+        })
+        .await;
+    let environments: Vec<String> = fleet.list::<Environment>().await.into_iter().map(|environment| environment.metadata.name).collect();
+    // Docker's container name rule, which also keeps the name one path component.
+    for name in &environments {
+        let mut chars = name.chars();
+        let valid = chars.next().is_some_and(|first| first.is_ascii_alphanumeric())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+        assert!(valid, "environment {name} is not a Docker-safe name; environments: {environments:?}");
+    }
+}
+
 // A daemon restart restores its active convoy while the crew process survives.
 // Its next submissions deliver the convoy without re-admission or a duplicate
 // process launch.
