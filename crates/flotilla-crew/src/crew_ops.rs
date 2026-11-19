@@ -1947,9 +1947,10 @@ impl CrewService {
     ) -> Result<(), String> {
         let carries =
             carries.into_iter().map(|carry| flotilla_messaging::IntentReference::new(carry.address, carry.revision)).collect::<Vec<_>>();
-        let context = self.resolve_crew_context(requested).await?;
+        let context = self.resolve_crew_context(requested).instrument(tracing::info_span!("crew_handoff.resolve_context")).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
-        let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
+        let convoy =
+            convoys.get(&context.convoy).instrument(tracing::info_span!("crew_handoff.convoy")).await.map_err(|err| err.to_string())?;
         if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             return Err(format!("convoy `{}` is terminal and cannot accept a crew handoff", context.convoy));
         }
@@ -1959,6 +1960,7 @@ impl CrewService {
         // Refuse a reassignment the engine would refuse before any turn is admitted; the engine's
         // `Reassign` checks again when it moves them.
         if !reassign.is_empty() {
+            let _checking = tracing::info_span!("crew_handoff.reassign_check").entered();
             let not_held = || format!("convoy `{}` is not held at this home", context.convoy);
             let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy).ok_or_else(not_held)?;
             let held = engine.promises(&convoy, None)?.ok_or_else(not_held)?;
@@ -2023,6 +2025,7 @@ impl CrewService {
                 return Err(self.refuse_undeliverable(&turn, reason).await);
             }
             let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &context.namespace, &receiver)
+                .instrument(tracing::info_span!("crew_handoff.resolve_receiver"))
                 .await
                 .map_err(|error| error.to_string())?;
             if holder.as_ref().is_some_and(|holder| {
@@ -2034,7 +2037,10 @@ impl CrewService {
             if !reassign.is_empty() {
                 let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
                     .ok_or_else(|| format!("convoy `{}` is not held at this home", context.convoy))?;
-                engine.reassign(&convoy, (&context.vessel, &context.caller_role), (target_vessel, target_role), reassign).await?;
+                engine
+                    .reassign(&convoy, (&context.vessel, &context.caller_role), (target_vessel, target_role), reassign)
+                    .instrument(tracing::info_span!("crew_handoff.reassign"))
+                    .await?;
             }
             self.deliver_turn(&turn).await?;
             return Ok(());
@@ -2961,7 +2967,7 @@ impl CrewService {
     /// routes deep (#3108).
     pub async fn deliver_turn(&self, request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String> {
         let managed_request;
-        let request = match off_frame(|| self.turn_receiver(request)).await? {
+        let request = match off_frame(|| self.turn_receiver(request).instrument(tracing::info_span!("crew_turn.receiver"))).await? {
             TurnReceiver::Addressed(inbox, spelled) => {
                 return off_frame(|| self.deliver_addressed_turn(request, inbox, spelled.as_deref())).await
             }
@@ -2971,12 +2977,12 @@ impl CrewService {
             }
             TurnReceiver::Convoy => request,
         };
-        let turn = match off_frame(|| self.prepare_crew_turn(request)).await? {
+        let turn = match off_frame(|| self.prepare_crew_turn(request).instrument(tracing::info_span!("crew_turn.prepare"))).await? {
             PreparedTurn::Admitted(admission) => return Ok(admission),
             PreparedTurn::Undeliverable(reason) => return Err(off_frame(|| self.refuse_undeliverable(request, reason)).await),
             PreparedTurn::New(turn) => turn,
         };
-        off_frame(|| self.publish_crew_turn(request, *turn)).await
+        off_frame(|| self.publish_crew_turn(request, *turn).instrument(tracing::info_span!("crew_turn.publish"))).await
     }
 
     /// Who a turn addresses: a receiver taken as addressed, a managed subscriber's crew member,
@@ -3019,25 +3025,38 @@ impl CrewService {
             .resource_backend
             .including_replicas::<ResourceConvoy>(&request.namespace)
             .get(&request.convoy)
+            .instrument(tracing::info_span!("crew_turn.convoy"))
             .await
             .map_err(|error| error.to_string())?;
         let convoy = &target.object;
         if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             return Ok(PreparedTurn::Undeliverable(terminal_convoy_refusal(&request.convoy, "is terminal")));
         }
-        self.ensure_vessel_backing_available(&request.namespace, &request.convoy, &request.vessel).await?;
+        self.ensure_vessel_backing_available(&request.namespace, &request.convoy, &request.vessel)
+            .instrument(tracing::info_span!("crew_turn.vessel_backing"))
+            .await?;
         let project = convoy.spec.project_ref.as_str();
         let receiver = crew_role_address(project, &request.convoy, &request.vessel, &request.role);
         let seat = Party::Seat { project: project.to_owned(), convoy: request.convoy.clone(), role: request.role.clone() };
-        let inbox = self.party_inbox(&request.namespace, &seat, project).await?;
-        let sender = self.party_inbox(&request.namespace, &request.sender, project).await?;
+        let inbox =
+            self.party_inbox(&request.namespace, &seat, project).instrument(tracing::info_span!("crew_turn.receiver_inbox")).await?;
+        let sender = self
+            .party_inbox(&request.namespace, &request.sender, project)
+            .instrument(tracing::info_span!("crew_turn.sender_inbox"))
+            .await?;
         let intent = turn_intent(request, sender, inbox);
         let name = turn_record_name(request, &intent);
-        let (holder, rung) = off_frame(|| self.turn_receiver_session(request, &receiver)).await?;
+        let (holder, rung) =
+            off_frame(|| self.turn_receiver_session(request, &receiver).instrument(tracing::info_span!("crew_turn.receiver_session")))
+                .await?;
         if let Some(reason) = no_holder_will_come(convoy, request, holder.as_ref()) {
             return Ok(PreparedTurn::Undeliverable(reason));
         }
-        if let Some(admission) = off_frame(|| self.earlier_turn_admission(request, &intent, &name, rung)).await? {
+        if let Some(admission) = off_frame(|| {
+            self.earlier_turn_admission(request, &intent, &name, rung).instrument(tracing::info_span!("crew_turn.earlier_admission"))
+        })
+        .await?
+        {
             return Ok(PreparedTurn::Admitted(admission));
         }
         Ok(PreparedTurn::New(Box::new(CrewTurn { target, intent, name, holder, rung })))
@@ -3136,8 +3155,8 @@ impl CrewService {
         turn: &CrewTurn,
         activation: &mut Option<(flotilla_resources::ConvoyStatus, flotilla_resources::ConvoyStatus)>,
     ) -> Result<ResourceRef, String> {
-        off_frame(|| self.activate_turn_work(request, turn, activation)).await?;
-        off_frame(|| self.publish_turn_message(request, turn)).await
+        off_frame(|| self.activate_turn_work(request, turn, activation).instrument(tracing::info_span!("crew_turn.activate"))).await?;
+        off_frame(|| self.publish_turn_message(request, turn).instrument(tracing::info_span!("crew_turn.publish_message"))).await
     }
 
     /// Workflow activation remains at the convoy authority and precedes publication, so a
@@ -3165,6 +3184,7 @@ impl CrewService {
                         turn_resume_intent(request),
                     ),
                 )
+                .instrument(tracing::info_span!("crew_turn.resume_work"))
                 .await
                 .map_err(|error| error.to_string())?;
                 *activation = Some((reopened.status.clone().expect("activated workflow"), previous.clone()));

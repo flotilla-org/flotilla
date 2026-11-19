@@ -51,7 +51,7 @@ use flotilla_state_machines::{
     Resource, Transport, WriteError,
 };
 use futures::TryStreamExt;
-use tracing::{debug, info, warn, Instrument};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use super::{
     state::ControllerRuntimeState,
@@ -241,7 +241,7 @@ impl MessageDelivery {
             let started = tokio::time::Instant::now();
             let result = {
                 let _busy = metrics.busy();
-                self.pass().await
+                self.pass().instrument(info_span!("message_delivery.pass")).await
             };
             // Failed passes too, as the object controllers' histogram counts them.
             metrics.reconcile.record(started.elapsed());
@@ -279,7 +279,7 @@ impl MessageDelivery {
 
     /// One pass; how long until the next deadline it found, if any.
     pub(super) async fn pass(&mut self) -> Result<Option<Duration>, String> {
-        let wait = self.primitives.delivery_wait(&self.namespace).await?;
+        let wait = self.primitives.delivery_wait(&self.namespace).instrument(info_span!("message_delivery.delivery_wait")).await?;
         self.health.report_delivery_wait(wait.clone());
         if wait.is_some() {
             return Ok(None);
@@ -287,20 +287,35 @@ impl MessageDelivery {
         let now = Timestamp::from_datetime(&Utc::now());
         // Receipts first: a turn confirmed before its session's teardown records
         // its receipt before rebind unbinds and ends that session (#3894).
-        self.collect_turns(false).await;
-        self.confirm_held_turns().await;
-        let holders = self.holders(now).await?;
-        let person = self.primitives.register_person(now).await?;
-        let mut consumers: BTreeSet<_> =
-            self.primitives.person_inboxes(&self.namespace).await?.into_iter().map(|inbox| (inbox, person.clone())).collect();
-        consumers.insert(self.inspector().await?);
-        self.rebind(&holders, consumers, now).await?;
-        for holder in holders.values() {
-            if !self.inflight.contains_key(&holder.session_id) {
-                self.start_turn(holder).await?;
+        self.collect_turns(false).instrument(info_span!("message_delivery.collect_turns")).await;
+        self.confirm_held_turns().instrument(info_span!("message_delivery.confirm_held_turns")).await;
+        let holders = self.holders(now).instrument(info_span!("message_delivery.holders")).await?;
+        let person = self.primitives.register_person(now).instrument(info_span!("message_delivery.register_person")).await?;
+        let mut consumers: BTreeSet<_> = self
+            .primitives
+            .person_inboxes(&self.namespace)
+            .instrument(info_span!("message_delivery.person_inboxes"))
+            .await?
+            .into_iter()
+            .map(|inbox| (inbox, person.clone()))
+            .collect();
+        consumers.insert(self.inspector().instrument(info_span!("message_delivery.inspector")).await?);
+        self.rebind(&holders, consumers, now).instrument(info_span!("message_delivery.rebind", holders = holders.len())).await?;
+        let starts = info_span!("message_delivery.start_turns", started = tracing::field::Empty);
+        async {
+            let mut started = 0_usize;
+            for holder in holders.values() {
+                if !self.inflight.contains_key(&holder.session_id) {
+                    self.start_turn(holder).instrument(info_span!("message_delivery.start_turn", session = %holder.session_id)).await?;
+                    started += 1;
+                }
             }
+            tracing::Span::current().record("started", started);
+            Ok::<_, String>(())
         }
-        let report = self.primitives.sweep(&self.namespace, now, &mut self.open).await?;
+        .instrument(starts)
+        .await?;
+        let report = self.primitives.sweep(&self.namespace, now, &mut self.open).instrument(info_span!("message_delivery.sweep")).await?;
         self.awaiting_heard.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone_from(&report.awaiting_heard);
         if report.acted() {
             debug!(namespace = %self.namespace, ?report, "engine message sweep");
@@ -311,6 +326,7 @@ impl MessageDelivery {
             let expired = awaiting.expire_due(now)?;
             Ok::<_, String>((expired, awaiting.next_deadline_after(now)?))
         }))
+        .instrument(info_span!("message_delivery.expire_due"))
         .await
         .map_err(|error| error.to_string())??;
         if !expired.is_empty() {
