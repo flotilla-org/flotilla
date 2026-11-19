@@ -75,9 +75,6 @@ const BUSY_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const STORE_BUSY_INTERACTIVE_MESSAGE: &str = "resource store busy: interactive request deadline exceeded";
 
-#[cfg(unix)]
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// The daemon's resource socket. Every request validation makes goes through [`Daemon::send`],
 /// which waits out a busy store's refusal for up to `busy_retry`.
 #[cfg(unix)]
