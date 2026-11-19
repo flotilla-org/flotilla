@@ -62,7 +62,7 @@ pub async fn session_card(
         _ => None,
     };
     let card = CardRead { backend, namespace, convoy: &convoy, work: work.as_deref() };
-    render_card(&card, spec, credentials, endpoints, reads, accounts).await
+    render_card(&card, spec, credentials, endpoints, reads, accounts).await.map(|(card, _)| card)
 }
 
 /// What a crew launched into `role` on vessel `vessel_ref` is told its role has already
@@ -112,8 +112,10 @@ async fn render_card(
     endpoints: &BTreeMap<String, String>,
     reads: Arc<dyn LifecycleReads>,
     accounts: &dyn AccountRecords,
-) -> Result<String, String> {
+) -> Result<(String, Option<(String, bool)>), String> {
     let CardRead { backend, namespace, convoy, work } = *read;
+    // The image build the card read, and whether it found it built.
+    let mut image = None;
     let convoy_name = convoy.metadata.name.as_str();
     let mut text = format!(
         "{}\n\nYou act as `{}` in project `{}`.\n\n### Repositories in scope\n",
@@ -183,13 +185,15 @@ async fn render_card(
     }
     if let Some(docker) = &environment.spec.docker {
         text.push_str(&reachable_paths(&docker.mounts));
-        if let Some(build) = &docker.image_build_ref {
-            let (reads, name) = (Arc::clone(&reads), build.clone());
+        if let Some(build_ref) = &docker.image_build_ref {
+            let (reads, name) = (Arc::clone(&reads), build_ref.clone());
             let build = tokio::task::spawn_blocking(carry(move || reads.image_builds()?.get(&name)))
                 .await
                 .map_err(|error| format!("image capability read: {error}"))??;
             // Only a built image has passed every layer's probe.
-            if let Some(spec) = build.filter(|build| build.digest().is_some()).map(|build| build.spec) {
+            let built = build.filter(|build| build.digest().is_some());
+            image = Some((build_ref.clone(), built.is_some()));
+            if let Some(spec) = built.map(|build| build.spec) {
                 let provides = spec.layers.iter().flat_map(|layer| layer.provides.iter().cloned()).collect::<BTreeSet<_>>();
                 text.push_str(&format!("Verified tools and runtimes: {}.\n", provides.into_iter().collect::<Vec<_>>().join(", ")));
             }
@@ -203,7 +207,7 @@ async fn render_card(
         text.push_str("No endpoints are recorded for this session.\n");
     }
     text.push_str("\nScope: use the repositories and credential permissions listed above. Run `flotilla crew capabilities` when unsure; it reports the current delivery.\n");
-    Ok(text)
+    Ok((text, image))
 }
 
 /// The fulfilment kind whose grants the card of `work` in `convoy` lists: the kind its placement
@@ -360,42 +364,79 @@ pub struct CapabilityCardTracker(
     crate::ports::MessagePath,
     /// By namespace, the sessions whose last card refresh failed.
     std::sync::Mutex<BTreeMap<String, BTreeSet<String>>>,
-    /// The fulfilment kind each refreshed card read its grants from, so a kind's change refreshes
-    /// only the cards that read it.
-    std::sync::Mutex<Placements>,
+    /// What each refreshed card read that changes without an event naming its session: the
+    /// fulfilment kind of its grants and the image build of its verified tools. A change to one
+    /// refreshes only the cards that read it.
+    std::sync::Mutex<CardReads>,
 );
 
 type SessionCardObservation = Arc<Mutex<CardObservation>>;
 
-/// Which fulfilment kind each session's card reads, and the reverse, by namespace.
+/// What each session's card read, by namespace.
 #[derive(Default)]
-struct Placements {
-    by_session: BTreeMap<(String, String), String>,
-    by_kind: BTreeMap<(String, String), BTreeSet<String>>,
+struct CardReads {
+    /// The fulfilment kind whose grants it lists.
+    kinds: ReadIndex<()>,
+    /// The image build of its environment, and whether the card found it built.
+    images: ReadIndex<bool>,
 }
 
-impl Placements {
-    fn place(&mut self, namespace: &str, session: &str, kind: Option<String>) {
+/// One thing each session's card read, named, with what the card found of it, and the reverse.
+struct ReadIndex<V> {
+    by_session: BTreeMap<(String, String), (String, V)>,
+    by_name: BTreeMap<(String, String), BTreeSet<String>>,
+}
+
+impl<V> Default for ReadIndex<V> {
+    fn default() -> Self {
+        Self { by_session: BTreeMap::new(), by_name: BTreeMap::new() }
+    }
+}
+
+impl<V: PartialEq> ReadIndex<V> {
+    fn note(&mut self, namespace: &str, session: &str, read: Option<(String, V)>) {
         let key = (namespace.to_owned(), session.to_owned());
-        if self.by_session.get(&key) == kind.as_ref() {
+        if self.by_session.get(&key) == read.as_ref() {
             return;
         }
         self.forget(namespace, session);
-        if let Some(kind) = kind {
-            self.by_kind.entry((namespace.to_owned(), kind.clone())).or_default().insert(session.to_owned());
-            self.by_session.insert(key, kind);
+        if let Some((name, found)) = read {
+            self.by_name.entry((namespace.to_owned(), name.clone())).or_default().insert(session.to_owned());
+            self.by_session.insert(key, (name, found));
         }
     }
 
     fn forget(&mut self, namespace: &str, session: &str) {
-        let Some(kind) = self.by_session.remove(&(namespace.to_owned(), session.to_owned())) else { return };
-        let key = (namespace.to_owned(), kind);
-        if let Some(sessions) = self.by_kind.get_mut(&key) {
+        let Some((name, _)) = self.by_session.remove(&(namespace.to_owned(), session.to_owned())) else { return };
+        let key = (namespace.to_owned(), name);
+        if let Some(sessions) = self.by_name.get_mut(&key) {
             sessions.remove(session);
             if sessions.is_empty() {
-                self.by_kind.remove(&key);
+                self.by_name.remove(&key);
             }
         }
+    }
+
+    /// The sessions whose card read one of `names`, with what each found.
+    fn readers<'a>(&'a self, namespace: &str, names: impl IntoIterator<Item = &'a String>) -> Vec<(&'a str, &'a String, &'a V)> {
+        names
+            .into_iter()
+            .filter_map(|name| self.by_name.get(&(namespace.to_owned(), name.clone())))
+            .flatten()
+            .filter_map(|session| {
+                self.by_session.get(&(namespace.to_owned(), session.clone())).map(|(name, found)| (session.as_str(), name, found))
+            })
+            .collect()
+    }
+
+    /// Every name some card in `namespace` read.
+    fn names(&self, namespace: &str) -> BTreeSet<String> {
+        self.by_name.keys().filter(|(space, _)| space == namespace).map(|(_, name)| name.clone()).collect()
+    }
+
+    /// The sessions in `namespace` it holds.
+    fn sessions(&self, namespace: &str) -> Vec<String> {
+        self.by_session.keys().filter(|(space, _)| space == namespace).map(|(_, session)| session.clone()).collect()
     }
 }
 
@@ -405,18 +446,13 @@ impl CapabilityCardTracker {
         Self(Mutex::default(), path, std::sync::Mutex::default(), std::sync::Mutex::default())
     }
 
-    fn placements(&self) -> std::sync::MutexGuard<'_, Placements> {
+    fn reads(&self) -> std::sync::MutexGuard<'_, CardReads> {
         self.3.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The sessions whose last refreshed card read the grants of one of `kinds`.
     fn placed_by(&self, namespace: &str, kinds: &BTreeSet<String>) -> BTreeSet<String> {
-        let placements = self.placements();
-        kinds
-            .iter()
-            .filter_map(|kind| placements.by_kind.get(&(namespace.to_owned(), kind.clone())))
-            .flat_map(|sessions| sessions.iter().cloned())
-            .collect()
+        self.reads().kinds.readers(namespace, kinds).into_iter().map(|(session, _, _)| session.to_owned()).collect()
     }
 
     fn failed(&self, namespace: &str) -> BTreeSet<String> {
@@ -644,6 +680,11 @@ pub struct CardScope {
     pub convoys: BTreeSet<String>,
     /// The sessions' whose cards read these fulfilment kinds' grants, as their last refresh found.
     pub kinds: BTreeSet<String>,
+    /// The sessions' whose cards read these image builds, as their last refresh found, and found
+    /// them built when they no longer are, or the reverse. Each build is read again by its name.
+    pub image_builds: BTreeSet<String>,
+    /// Any image build may have changed: as `image_builds`, for every build some card read.
+    pub image_builds_rescanned: bool,
 }
 
 impl CardScope {
@@ -654,8 +695,66 @@ impl CardScope {
 
     /// Whether it names no card.
     pub fn is_empty(&self) -> bool {
-        !self.every && self.environments.is_empty() && self.convoys.is_empty() && self.kinds.is_empty()
+        !self.every
+            && self.environments.is_empty()
+            && self.convoys.is_empty()
+            && self.kinds.is_empty()
+            && self.image_builds.is_empty()
+            && !self.image_builds_rescanned
     }
+}
+
+/// The sessions whose card read an image build `scope` names (every one some card read, when
+/// rescanned) and found it built when it no longer is, or the reverse. Each such build is read
+/// once by its name; one no card read is not read at all.
+async fn image_readers_changed(
+    tracker: &CapabilityCardTracker,
+    namespace: &str,
+    reads: &Arc<dyn LifecycleReads>,
+    scope: &CardScope,
+) -> Result<BTreeSet<String>, String> {
+    let (names, readers) = {
+        let held = tracker.reads();
+        let names = if scope.image_builds_rescanned {
+            held.images.names(namespace)
+        } else {
+            scope
+                .image_builds
+                .iter()
+                .filter(|name| held.images.by_name.contains_key(&(namespace.to_owned(), (*name).clone())))
+                .cloned()
+                .collect()
+        };
+        let readers: Vec<(String, String, bool)> = held
+            .images
+            .readers(namespace, &names)
+            .into_iter()
+            .map(|(session, name, found)| (session.to_owned(), name.clone(), *found))
+            .collect();
+        (names, readers)
+    };
+    if names.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let reads = Arc::clone(reads);
+    // Whether each is built now; unknown when it could not be read, which refreshes its readers.
+    let built: BTreeMap<String, Option<bool>> = tokio::task::spawn_blocking(carry(move || {
+        let builds = reads.image_builds();
+        names
+            .into_iter()
+            .map(|name| {
+                let now = builds
+                    .as_ref()
+                    .ok()
+                    .and_then(|builds| builds.get(&name).ok())
+                    .map(|build| build.is_some_and(|build| build.digest().is_some()));
+                (name, now)
+            })
+            .collect()
+    }))
+    .await
+    .map_err(|error| format!("image capability read: {error}"))?;
+    Ok(readers.into_iter().filter(|(_, name, found)| built.get(name) != Some(&Some(*found))).map(|(session, _, _)| session).collect())
 }
 
 /// The newest launch of each of this home's sessions that `scope` names or `by_name` names (by
@@ -707,6 +806,7 @@ pub async fn refresh_cards(
     let retried = tracker.failed(namespace);
     // The cards that read a changed kind, by their sessions' names: no read finds them otherwise.
     let mut named = tracker.placed_by(namespace, &scope.kinds);
+    named.extend(image_readers_changed(tracker, namespace, &reads, scope).await?);
     named.extend(retried.iter().cloned());
     if !scope.every && scope.environments.is_empty() && scope.convoys.is_empty() && named.is_empty() {
         return Ok(());
@@ -730,21 +830,22 @@ pub async fn refresh_cards(
         .await
         .retain(|(space, name), _| space != namespace || live.contains(name.as_str()) || (!scope.every && !named.contains(name.as_str())));
     {
-        // The same sessions leave the kinds' index: every one not live when every card was read,
-        // else those read and found not live.
-        let mut placements = tracker.placements();
-        let ended: Vec<String> = if scope.every {
-            placements
-                .by_session
-                .keys()
-                .filter(|(space, name)| space == namespace && !live.contains(name.as_str()))
-                .map(|(_, name)| name.clone())
+        // The same sessions leave the indexes of what cards read: every one not live when every
+        // card was read, else those read and found not live.
+        let mut held = tracker.reads();
+        let ended: BTreeSet<String> = if scope.every {
+            held.kinds
+                .sessions(namespace)
+                .into_iter()
+                .chain(held.images.sessions(namespace))
+                .filter(|name| !live.contains(name.as_str()))
                 .collect()
         } else {
             named.iter().filter(|name| !live.contains(*name)).map(|name| (*name).to_owned()).collect()
         };
         for name in ended {
-            placements.forget(namespace, &name);
+            held.kinds.forget(namespace, &name);
+            held.images.forget(namespace, &name);
         }
     }
     let mut errors = Vec::new();
@@ -817,7 +918,7 @@ async fn refresh_record_card(
         }
         let work = vessel.work();
         // Noted before the kind is read, so a change after the reading finds this card.
-        tracker.placements().place(namespace, record.session_name(), placement_kind(&convoy, work));
+        tracker.reads().kinds.note(namespace, record.session_name(), placement_kind(&convoy, work).map(|kind| (kind, ())));
         let credential_refs = convoy
             .status
             .as_ref()
@@ -829,7 +930,9 @@ async fn refresh_record_card(
         let credentials = source.credentials(&session.spec.env_ref, &credential_refs).await?;
         let endpoints = source.endpoints(&session.spec.env_ref, &session.metadata.name).await?;
         let read = CardRead { backend, namespace, convoy: &convoy, work: Some(work) };
-        let card = render_card(&read, &session.spec, &credentials, &endpoints, reads, accounts).await?;
+        let (card, image) = render_card(&read, &session.spec, &credentials, &endpoints, reads, accounts).await?;
+        // Noted with what the card found, so the next change to the build is judged against it.
+        tracker.reads().images.note(namespace, record.session_name(), image);
         let receiver = flotilla_resources::crew_role_address(&convoy.spec.project_ref, &vessel.convoy, work, &session.spec.role);
         observe(backend, namespace, &session, &card, tracker, Some(&receiver)).await
     }

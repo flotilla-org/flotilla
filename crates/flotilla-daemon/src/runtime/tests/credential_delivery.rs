@@ -1296,14 +1296,37 @@ async fn admitting_and_tearing_down_a_convoy_reads_only_its_cards() {
 }
 
 // Behaviour: an image build becoming built reaches the running card of a crew on its image, with
-// no other event: the card lists the image's verified tools.
+// no other event: the card lists the image's verified tools. A crew on no image is not read again.
 #[tokio::test]
 async fn a_built_image_reaches_a_running_sessions_card_with_no_other_event() {
     let cards = RunningCards::start().await;
     cards.source.settled("cards-session-0", 1).await;
+    let other = cards.source.settled("cards-session-1", 1).await;
     engine(&cards.daemon).image_builds.finish(&cards.build, flotilla_provisioning_testkit::Ending::Ready("sha256:built"));
 
     cards.card_naming(0, "Verified tools and runtimes: tool:verified.").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(cards.source.readings("cards-session-1"), other, "a card on no image is not read again");
+}
+
+// Behaviour: the build of an image no crew runs reaches no card: its launch and its becoming built
+// read no running crew's card again, neither the one on another image nor the one on none.
+#[tokio::test]
+async fn an_unrelated_images_build_reads_no_card() {
+    let cards = RunningCards::start().await;
+    let first = cards.source.settled("cards-session-0", 1).await;
+    let second = cards.source.settled("cards-session-1", 1).await;
+    let builds = &engine(&cards.daemon).image_builds;
+    let mut spec = flotilla_provisioning_testkit::image_build_spec();
+    spec.layers[0].version = "2".into();
+    spec.identity = flotilla_resources::image_identity(&spec.layers);
+    let unrelated = builds.put(&spec);
+    assert_ne!(unrelated, cards.build, "a build of another image");
+    builds.finish(&unrelated, flotilla_provisioning_testkit::Ending::Ready("sha256:unrelated"));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(cards.source.readings("cards-session-0"), first, "a card on another image is not read again");
+    assert_eq!(cards.source.readings("cards-session-1"), second, "a card on no image is not read again");
 }
 
 // Behaviour: a launch whose card could not be rendered gets its card at the next credential pass,

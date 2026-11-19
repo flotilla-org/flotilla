@@ -11,8 +11,8 @@
 //! Each pass also refreshes the capability cards its events touch: those of the environments it
 //! delivered or re-minted for, of a convoy whose account binding changed, and of a convoy whose
 //! change touched what its cards read, and of the sessions whose cards read a fulfilment kind whose
-//! grants changed; every card when it delivered every environment, or an image build became built
-//! or stopped being built. A
+//! grants changed, or that read an image build which became built or stopped being built; every
+//! card when it delivered every environment. A
 //! card's endpoints change only at its session's launch, which renders the card itself.
 //!
 //! A failed delivery is retried at a backoff a finite number of times, then waits for an event
@@ -986,43 +986,25 @@ async fn watch_fulfilment_kinds(backend: flotilla_store::ResourceBackend, namesp
     }
 }
 
-/// Refreshes every card when a build becomes built or stops being built: a card lists a built
-/// image's verified tools. No index finds the environments on one image, so no card is singled
-/// out; a launch's other steps refresh none.
+/// Names each image build whose launches changed: a card lists a built image's verified tools.
+/// The refresh reads only the cards that read that build, and refreshes those that found it built
+/// when it no longer is, or the reverse; a build no card read is not read at all. A rescan, or
+/// changes missed, judge every build some card read.
 async fn watch_image_builds(state: Arc<ControllerRuntimeState>, events: Arc<CredentialEvents>) {
-    let reads = state.daemon.lifecycle_reads();
-    let mut changes = match reads.image_builds() {
+    let mut changes = match state.daemon.lifecycle_reads().image_builds() {
         Ok(builds) => builds.changes(),
         Err(error) => {
             warn!(%error, "credential delivery cannot follow image builds; other events still wake it");
             return;
         }
     };
-    // Whether each build was built when last read; a build not read yet counts as changed.
-    let mut built = BTreeMap::<String, bool>::new();
     loop {
         match changes.recv().await {
-            Ok(ImageBuildChange::Changed(name)) => {
-                let (reads, read) = (Arc::clone(&reads), name.clone());
-                let read = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.image_builds()?.get(&read)))
-                    .await
-                    .unwrap_or_else(|error| Err(format!("image build read: {error}")));
-                let now = match read {
-                    Ok(build) => build.is_some_and(|build| build.digest().is_some()),
-                    Err(error) => {
-                        debug!(%error, build = %name, "credential delivery could not read an image build; refreshing every card");
-                        built.remove(&name);
-                        events.record(|pending| pending.cards.every = true);
-                        continue;
-                    }
-                };
-                if built.insert(name, now) != Some(now) {
-                    events.record(|pending| pending.cards.every = true);
-                }
-            }
+            Ok(ImageBuildChange::Changed(name)) => events.record(|pending| {
+                pending.cards.image_builds.insert(name);
+            }),
             Ok(ImageBuildChange::Rescanned) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                built.clear();
-                events.record(|pending| pending.cards.every = true);
+                events.record(|pending| pending.cards.image_builds_rescanned = true)
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
