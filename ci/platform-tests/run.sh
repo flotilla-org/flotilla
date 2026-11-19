@@ -2,11 +2,11 @@
 # Execute selected tests without evaluating shell code from the selector file.
 set -euo pipefail
 # Regex variables also work with the original Bash 3.2 parser.
-job_pattern='^(windows|macos|tender-ssh)$'
-scope_pattern='^(all|windows|macos|tender-ssh)$'
+job_pattern='^(windows|macos)$'
+scope_pattern='^(all|windows|macos)$'
 comment_pattern='^[[:space:]]*(#|$)'
 if [[ $# != 1 || ! "$1" =~ $job_pattern ]]; then
-  echo 'usage: run.sh <windows|macos|tender-ssh>' >&2
+  echo 'usage: run.sh <windows|macos>' >&2
   exit 2
 fi
 job=$1
@@ -23,7 +23,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   if [[ ! "$scope" =~ $scope_pattern || -z "${args//[[:space:]]/}" || "$args" == *'|'* ]]; then
     echo "invalid selector: $line" >&2; exit 2
   fi
-  if [[ "$scope" == "$job" || ( "$scope" == all && "$job" != tender-ssh ) ]]; then
+  if [[ "$scope" == "$job" || "$scope" == all ]]; then
     commands+=("$args")
   fi
 done < "$repo_root/ci/platform-tests/selectors.txt"

@@ -63,7 +63,7 @@ flotilla-protocol = { path = "../flotilla-protocol" }
 rigging-relay-protocol = { workspace = true }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-transport = { path = "../flotilla-transport" }
-tender = { path = "../tender" }
+rigging-ssh = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 serde = { workspace = true }

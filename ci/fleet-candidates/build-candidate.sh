@@ -236,9 +236,9 @@ done < <(python3 "$(dirname "${BASH_SOURCE[0]}")/generation_validation.py" sibli
   done
   # flotillad embeds the drydock daemon, which finds provider hosts beside itself.
   # drydock-host is only a dev-dependency here, which cargo cannot build as a package.
-  drydock_rev="$(sed -n 's/^drydock-host = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml)"
-  [[ -n "$drydock_rev" ]]
-  [[ "$(grep -c '^drydock[a-z-]* = { git = .*rev = "'"$drydock_rev"'"' Cargo.toml)" == "$(grep -c '^drydock[a-z-]* = { git' Cargo.toml)" ]]
+  # Cargo.toml declares drydock by branch; the lockfile holds the one commit.
+  drydock_rev="$(awk '$0 == "name = \"drydock-host\"" { found = 1 } found && /^source = / { sub(/.*#/, ""); sub(/"$/, ""); print; exit }' Cargo.lock)"
+  [[ "$drydock_rev" =~ ^[0-9a-f]{40}$ ]]
   cargo install --locked --force --git https://github.com/flotilla-org/drydock --rev "$drydock_rev" \
     --root "$flotilla_root/target/drydock-host-install" --bin drydock-host drydock-host
   # The TypeScript host comes from the same drydock revision.
