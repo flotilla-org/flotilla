@@ -12,9 +12,11 @@ flotilla-schema = { path = "../flotilla-schema" }
 rigging-condition = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 thiserror = "2"
+tracing = { workspace = true }
 
 [dev-dependencies]
 flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
+flotilla-log-testkit = { path = "../flotilla-log-testkit" }
 serde_json = { workspace = true }
 flotilla-address = { path = "../flotilla-address" }
 tempfile = { workspace = true }

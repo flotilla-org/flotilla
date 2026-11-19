@@ -3890,6 +3890,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-cbor",
+ "flotilla-log-testkit",
  "flotilla-quint-testkit",
  "flotilla-schema",
  "flotilla-state-machines",
@@ -3901,6 +3902,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

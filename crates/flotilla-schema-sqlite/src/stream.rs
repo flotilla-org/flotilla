@@ -505,6 +505,9 @@ pub struct Service {
     serve_observer: OnceLock<Arc<ServeObserver>>,
     /// The edges each kind's snapshots carry, shared with the readers that serve them.
     carriers: crate::store::Carriers,
+    checkpoints: Arc<crate::WalCheckpoints>,
+    /// The serving rounds reading now, which a starved checkpoint names.
+    readers: Arc<crate::wal::Readers>,
 }
 /// A completed serving round. Tail success does not prove snapshot servability.
 pub struct ServedRound {
@@ -652,10 +655,21 @@ impl Service {
         std::sync::Arc::clone(&self.store)
     }
     pub fn open(path: &std::path::Path, home: &str, kinds: flotilla_schema::KindRegistry) -> Result<Self, StoreError> {
+        Self::open_with_wal(path, home, kinds, crate::WalPolicy::default())
+    }
+    /// [`Service::open`], its writer checkpointing the write-ahead log under `policy`.
+    pub fn open_with_wal(
+        path: &std::path::Path,
+        home: &str,
+        kinds: flotilla_schema::KindRegistry,
+        policy: crate::WalPolicy,
+    ) -> Result<Self, StoreError> {
         let conn = rusqlite::Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let source = Source { path: path.to_owned(), home: home.to_owned(), kinds: kinds.clone() };
-        let store = Store::open(conn, home, kinds)?;
+        let mut store = Store::open(conn, home, kinds)?;
+        let readers = Arc::new(crate::wal::Readers::default());
+        let checkpoints = store.own_wal(policy, Arc::clone(&readers))?;
         let watermarks = store.watermarks();
         let applied = store.applied_listeners();
         let commits = store.commits();
@@ -670,7 +684,14 @@ impl Service {
             heards,
             serve_observer: OnceLock::new(),
             carriers,
+            checkpoints,
+            readers,
         })
+    }
+    /// What the writer's write-ahead log checkpoints have found: the log's frames, those a reader
+    /// kept the last checkpoint from copying back, and the checkpoints that completed or starved.
+    pub fn wal(&self) -> crate::WalReading {
+        self.checkpoints.reading()
     }
     /// From now on each snapshot of a resource of `kind` this service sends or reads carries the
     /// newest entry of each edge `edges` names for it: see [`Store::carry`].
@@ -709,7 +730,12 @@ impl Service {
         let heard = if home == self.source.home { now } else { watermark(&self.watermarks, home).applied_through };
         let round = Round { home, heard, homes: self.homes() };
         let mut reader = self.reader()?;
+        // The round holds one read transaction until its consumer has taken every frame, so a
+        // slow consumer keeps the writer's checkpoints from completing: registered to be named.
+        let from = after.map_or_else(|| "a snapshot".to_owned(), |seq| format!("sequence {seq}"));
+        let hold = self.readers.hold(format!("serving round of `{home}` from {from}"));
         let result = serve_round(&mut reader, &round, after, sink);
+        drop((reader, hold));
         if let Some(observer) = self.serve_observer.get() {
             observer(&result);
         }

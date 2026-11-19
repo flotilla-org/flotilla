@@ -64,3 +64,6 @@ pub use store::{
 
 mod table_read;
 pub use table_read::TableRead;
+
+mod wal;
+pub use wal::{WalCheckpoints, WalPolicy, WalReading};

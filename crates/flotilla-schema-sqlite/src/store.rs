@@ -195,6 +195,8 @@ struct Runtime {
     observers: Vec<std::sync::Arc<dyn Observing>>,
     /// The edges each kind's snapshots carry: see [`Store::carry`].
     carriers: Carriers,
+    /// The writer's checkpoints, when this store's connection owns its write-ahead log.
+    wal: Option<crate::wal::Checkpointer>,
 }
 
 /// What a write did to a resource of the kind an observer watches, told inside the write's
@@ -360,6 +362,7 @@ impl Store {
             change_page_bytes: options.change_page_bytes,
             observers: Vec::new(),
             carriers: Carriers::default(),
+            wal: None,
         };
         Ok(Store { conn, runtime, wrote: false })
     }
@@ -465,8 +468,24 @@ impl Store {
     /// Begins an immediate write transaction; many writes may share it.
     pub fn write(&mut self) -> Result<Write<'_>, StoreError> {
         self.wrote = true;
-        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Ok(Write { tx, runtime: &mut self.runtime, pending: Pending::default() })
+        // Unchecked only to keep the connection beside its transaction, for the checkpoint after
+        // the commit; `&mut self` still rules out a second transaction.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Ok(Write { tx, conn: &self.conn, runtime: &mut self.runtime, pending: Pending::default() })
+    }
+
+    /// Makes this store's writer run its write-ahead log's checkpoints under `policy`, in place of
+    /// SQLite's automatic ones: for a store whose file is in WAL mode, which it writes through
+    /// this connection alone.
+    pub(crate) fn own_wal(
+        &mut self,
+        policy: crate::WalPolicy,
+        readers: std::sync::Arc<crate::wal::Readers>,
+    ) -> Result<std::sync::Arc<crate::WalCheckpoints>, StoreError> {
+        let checkpointer = crate::wal::Checkpointer::own(&self.conn, policy, readers)?;
+        let checkpoints = checkpointer.checkpoints();
+        self.runtime.wal = Some(checkpointer);
+        Ok(checkpoints)
     }
 
     /// Begins a deferred read transaction, for consistent loads across tables.
@@ -772,6 +791,7 @@ impl Pending {
 /// its writes"; read versions from the stamps writes return.
 pub struct Write<'s> {
     tx: Transaction<'s>,
+    conn: &'s Connection,
     runtime: &'s mut Runtime,
     pending: Pending,
 }
@@ -1170,6 +1190,9 @@ impl Write<'_> {
     }
 
     pub fn commit(self) -> Result<(), StoreError> {
+        if let Some(wal) = &self.runtime.wal {
+            wal.committing();
+        }
         self.tx.commit()?;
         let Pending { strings, identities, ids, watermarks, applied, kinds, moved, rescan, staged, .. } = self.pending;
         // First, still under the store's lock: what any listener or later read sees follows them.
@@ -1194,6 +1217,10 @@ impl Write<'_> {
         }
         // Last, so a woken reader sees the new watermarks and interned names.
         self.runtime.commits.committed(&crate::stream::Committed { kinds: &kinds, homes: &moved, heard: &heard, rescan });
+        // After the listeners, so a woken reader does not wait on the checkpoint's copying.
+        if let Some(wal) = &mut self.runtime.wal {
+            wal.committed(self.conn);
+        }
         Ok(())
     }
 }

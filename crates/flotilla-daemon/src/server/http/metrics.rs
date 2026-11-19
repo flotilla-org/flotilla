@@ -55,6 +55,13 @@ impl Exposition {
             "flotilla_store_execution_seconds" => {
                 "Store read or write execution time, excluding queue wait (the decided store: its lock held), in seconds."
             }
+            "flotilla_store_wal_frames" => "Frames in the store's write-ahead log at its writer's last checkpoint.",
+            "flotilla_store_wal_uncheckpointed_frames" => {
+                "Write-ahead log frames the writer's last checkpoint could not copy back, because a reader holds them."
+            }
+            "flotilla_store_wal_checkpoints_total" => {
+                "The writer's write-ahead log checkpoints: complete, or starved by a reader holding the log."
+            }
             "flotilla_convoys_waiting_capacity" => "Convoys this home holds that wait for capacity on a host their placement chose.",
             "flotilla_convoys_unreadable" => "Convoy launches, at any home, whose records cannot be read; each is listed with why.",
             "flotilla_dispatch_time_from_ready_seconds" => {
@@ -130,6 +137,15 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
         let labels = format!(",store=\"decided\",operation=\"{operation}\"");
         out.histogram("flotilla_store_queue_wait_seconds", &labels, wait);
         out.histogram("flotilla_store_execution_seconds", &labels, execution);
+    }
+    if let Ok(service) = daemon.decided_store() {
+        let wal = service.wal();
+        let labels = ",store=\"decided\"";
+        out.number("flotilla_store_wal_frames", "gauge", labels, wal.frames);
+        out.number("flotilla_store_wal_uncheckpointed_frames", "gauge", labels, wal.uncheckpointed);
+        for (result, count) in [("complete", wal.complete), ("starved", wal.starved)] {
+            out.number("flotilla_store_wal_checkpoints_total", "counter", &format!("{labels},result=\"{result}\""), count);
+        }
     }
     if let Some(controllers) = metrics.controllers.get() {
         // Kinds are registered by the compiled controller set, never resource IDs.
@@ -378,6 +394,9 @@ mod tests {
             "flotilla_forge_budget_window_unreported_calls",
             "flotilla_forge_budget_window_start_seconds",
             "flotilla_dispatch_time_from_ready_seconds",
+            "flotilla_store_wal_frames",
+            "flotilla_store_wal_uncheckpointed_frames",
+            "flotilla_store_wal_checkpoints_total",
         ] {
             assert!(text.contains(&format!("# TYPE {family} ")), "missing {family}");
         }

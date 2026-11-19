@@ -33,3 +33,4 @@ mod tables;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;
 mod versions;
+mod wal;
