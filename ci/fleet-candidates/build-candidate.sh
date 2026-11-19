@@ -74,6 +74,11 @@ build_typescript_host() {
     tar -xzf "${archives[0]}" -C "$scratch/unpacked"
     cd "$scratch/unpacked/package"
     corepack pnpm install --prod --frozen-lockfile --node-linker=hoisted
+    # The host must be pure JavaScript: the Darwin signature does not cover a
+    # native add-on, and generation validation refuses one. Modal's cbor-x pulls
+    # in cbor-extract as an optional accelerator and falls back to JavaScript
+    # without it. `--no-optional` cannot be used: the frozen lockfile refuses it.
+    rm -rf node_modules/cbor-extract node_modules/@cbor-extract
     rm -rf "$destination"
     mkdir -p "$(dirname "$destination")"
     cp -R "$scratch/unpacked/package" "$destination"
