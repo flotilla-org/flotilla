@@ -19,8 +19,9 @@ use std::{
 };
 
 use flotilla_resources::{
-    Convoy, ConvoyEnsure, ConvoySpec, CrewDefaults, FleetDesignation, Project, ReadWatchEvent, Resource, ResourceProvenance,
-    TerminalSession, Vessel, VesselSpec, WorkflowSnapshot, CONVOY_LABEL, ROLE_ADDRESS_ANNOTATION,
+    Convoy, ConvoyEnsure, ConvoySpec, CrewDefaults, CrewSessionStatus, FleetDesignation, Project, ReadWatchEvent, Resource,
+    ResourceProvenance, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselSpec, WorkflowSnapshot, CONVOY_LABEL,
+    ROLE_ADDRESS_ANNOTATION,
 };
 use tracing::{info_span, Instrument};
 
@@ -41,8 +42,10 @@ pub enum Touched {
     /// record is as the last change reported it.
     Record { convoy: String, record: RecordKey, facts: Option<Box<RoutingFacts>> },
     /// Session `name`, crew of `convoy` when its view names one, held `here` or at another home,
-    /// and whether it claims an adopted role.
-    Session { name: String, convoy: Option<String>, here: bool, claims: bool },
+    /// and whether it claims an adopted role. Where its view is carried, `facts` holds the copy's
+    /// key and what routing reads of it (`None` once it is gone): the change touches nothing while
+    /// that is as the last change reported it.
+    Session { name: String, convoy: Option<String>, here: bool, claims: bool, facts: Option<(RecordKey, Option<Box<RoutingFacts>>)> },
     /// The declarations that validate adopted claims: every session is routed again while any
     /// session here claims a role.
     Claims,
@@ -71,6 +74,18 @@ pub enum RoutingFacts {
     /// A Vessel launch's names and spec: routing reads which launches a work has, and their
     /// sessions, never a launch's state.
     Vessel { labels: BTreeMap<String, String>, annotations: BTreeMap<String, String>, spec: VesselSpec },
+    /// A session's names (its convoy, vessel, role, launch and claim among them), its spec, its
+    /// phase, the agent session it runs and its crew harness: routing, the receiver snapshot it
+    /// resolves over and the holder delivery types into read these, never the session's
+    /// attention, occupancy or screen, which its agent's every turn changes.
+    Session {
+        labels: BTreeMap<String, String>,
+        annotations: BTreeMap<String, String>,
+        spec: Box<TerminalSessionSpec>,
+        phase: Option<TerminalSessionPhase>,
+        session_id: Option<String>,
+        crew: Option<CrewSessionStatus>,
+    },
 }
 
 /// The key of the copy an event is about.
@@ -126,7 +141,30 @@ impl RoutingInput for TerminalSession {
         if !here && convoy.is_none() && !claims && object(event).is_some() {
             return Touched::Nothing;
         }
-        Touched::Session { name: name(event).to_owned(), convoy, here, claims }
+        let facts = match event {
+            ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) => {
+                let object = &read.object;
+                let status = object.status.as_ref();
+                let facts = RoutingFacts::Session {
+                    labels: object.metadata.labels.clone(),
+                    annotations: object.metadata.annotations.clone(),
+                    spec: Box::new(object.spec.clone()),
+                    phase: status.map(|status| status.phase),
+                    session_id: status.and_then(|status| status.session_id.clone()),
+                    crew: status.and_then(|status| status.crew.clone()),
+                };
+                Some((record_key("TerminalSession", read), Some(Box::new(facts))))
+            }
+            ReadWatchEvent::Deleted(read) => Some((record_key("TerminalSession", read), None)),
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
+                let home = match provenance {
+                    ResourceProvenance::Local => None,
+                    ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+                };
+                Some((("TerminalSession", tombstone.name.clone(), home), None))
+            }
+        };
+        Touched::Session { name: name(event).to_owned(), convoy, here, claims, facts }
     }
 }
 
@@ -274,6 +312,16 @@ impl RoutingChanges {
                 }
                 Touched::Convoy(convoy)
             }
+            Touched::Session { name, convoy, here, claims, facts: Some((record, facts)) } => {
+                let mut seen = self.seen();
+                match facts {
+                    // As routing last read it: the change touches no holding.
+                    Some(facts) if seen.get(&record) == Some(&facts) => return,
+                    Some(facts) => drop(seen.insert(record, facts)),
+                    None => drop(seen.remove(&record)),
+                }
+                Touched::Session { name, convoy, here, claims, facts: None }
+            }
             Touched::Everything => {
                 // Every session is routed from what is held then: each record's next change is
                 // compared with nothing, so none is missed whatever a reopened watch skipped.
@@ -290,7 +338,7 @@ impl RoutingChanges {
                 Touched::Convoy(convoy) | Touched::Record { convoy, .. } => {
                     dirty.convoys.insert(group(&convoy));
                 }
-                Touched::Session { name, convoy, here, claims } => {
+                Touched::Session { name, convoy, here, claims, .. } => {
                     let convoy = convoy.map(|convoy| group(&convoy));
                     if claims {
                         dirty.all = true;
@@ -540,7 +588,7 @@ mod tests {
     }
 
     fn session(name: &str, convoy: &str) -> Touched {
-        Touched::Session { name: name.into(), convoy: Some(convoy.into()), here: true, claims: false }
+        Touched::Session { name: name.into(), convoy: Some(convoy.into()), here: true, claims: false, facts: None }
     }
 
     // A refresh routes only the sessions of the convoys a change touched, a standing role's
@@ -567,7 +615,13 @@ mod tests {
         assert_eq!(bindings.routes(), vec![names(&["a-coder", "a-reviewer"])]);
 
         // Another home's session of a convoy reroutes that convoy's sessions here.
-        changes.touched(Touched::Session { name: "b-elsewhere".into(), convoy: Some("beta#1".into()), here: false, claims: false });
+        changes.touched(Touched::Session {
+            name: "b-elsewhere".into(),
+            convoy: Some("beta#1".into()),
+            here: false,
+            claims: false,
+            facts: None,
+        });
         held.refresh(&bindings, &roles).await.expect("refresh");
         assert_eq!(bindings.routes(), vec![names(&["b-coder"])]);
 
@@ -584,7 +638,7 @@ mod tests {
 
         // A claim reroutes every session; the claimant is routed with every convoy after it.
         bindings.run("adopted", "", true);
-        changes.touched(Touched::Session { name: "adopted".into(), convoy: None, here: true, claims: true });
+        changes.touched(Touched::Session { name: "adopted".into(), convoy: None, here: true, claims: true, facts: None });
         held.refresh(&bindings, &roles).await.expect("refresh");
         assert_eq!(bindings.routes(), vec![None]);
         changes.touched(Touched::Convoy("beta#1".into()));
@@ -672,6 +726,84 @@ mod tests {
         changes.touched(Convoy::touched(&convoy_event("alpha#1", ConvoyPhase::Landed, None)));
         held.refresh(&bindings, &roles).await.expect("refresh");
         assert_eq!(bindings.routes(), vec![names(&["a-coder"])], "a reopened watch forgets what it saw");
+    }
+
+    /// Session `name`'s view, crew of `convoy`, held here, in `phase` with status message
+    /// `message`, as its watch reports a change to it.
+    fn session_event(
+        name: &str,
+        convoy: &str,
+        phase: TerminalSessionPhase,
+        message: Option<&str>,
+    ) -> ReadWatchEvent<flotilla_resources::TerminalSession> {
+        let object = flotilla_resources::ResourceObject {
+            metadata: flotilla_resources::ObjectMeta {
+                name: name.into(),
+                namespace: "flotilla".into(),
+                resource_version: "1".into(),
+                labels: BTreeMap::from([(CONVOY_LABEL.to_owned(), convoy.to_owned())]),
+                annotations: BTreeMap::new(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: chrono::Utc::now(),
+                merge: None,
+            },
+            spec: TerminalSessionSpec::builder()
+                .env_ref("env".into())
+                .role("coder".into())
+                .source(flotilla_resources::TerminalSessionSource::Tool { command: "true".into() })
+                .cwd("/work".into())
+                .pool("cleat".into())
+                .build(),
+            status: Some(flotilla_resources::TerminalSessionStatus {
+                phase,
+                session_id: Some("sid".into()),
+                message: message.map(str::to_owned),
+                ..Default::default()
+            }),
+        };
+        ReadWatchEvent::Modified(flotilla_resources::ReadResourceObject { object, provenance: ResourceProvenance::Local })
+    }
+
+    // A session change routing does not read (here its status message, as its agent's turns
+    // change it) routes nothing; one to what it reads (its phase) and its leaving route its
+    // convoy's sessions (d15: a session's every change routed its whole convoy).
+    #[tokio::test]
+    async fn a_session_change_routes_only_when_routing_reads_it() {
+        let bindings = Sessions::default();
+        bindings.run("a-coder", "alpha#1", false);
+        bindings.run("a-reviewer", "alpha#1", false);
+        let roles = FleetRoles::declared("lab").expect("roles");
+        let changes = RoutingChanges::new(Arc::new(tokio::sync::Notify::new()));
+        let mut held = HeldRoles::new("flotilla", Arc::clone(&changes));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![None]);
+
+        let touched = |phase, message| TerminalSession::touched(&session_event("a-coder", "alpha#1", phase, message));
+        changes.touched(touched(TerminalSessionPhase::Running, None));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder", "a-reviewer"])], "the first change seen of a session routes");
+
+        changes.touched(touched(TerminalSessionPhase::Running, Some("working")));
+        changes.touched(touched(TerminalSessionPhase::Running, Some("idle")));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), Vec::<Option<BTreeSet<String>>>::new(), "a turn's churn routes nothing");
+
+        changes.touched(touched(TerminalSessionPhase::Stopped, Some("idle")));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder", "a-reviewer"])], "its phase is read");
+
+        let ReadWatchEvent::Modified(read) = session_event("a-coder", "alpha#1", TerminalSessionPhase::Stopped, None) else {
+            unreachable!()
+        };
+        changes.touched(TerminalSession::touched(&ReadWatchEvent::Deleted(read)));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder", "a-reviewer"])], "its leaving routes");
+
+        changes.touched(touched(TerminalSessionPhase::Stopped, None));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder", "a-reviewer"])], "a session seen again after it left routes");
     }
 
     // A watch that stopped leaves no change to follow for its kind: every refresh routes every
