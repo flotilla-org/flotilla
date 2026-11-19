@@ -33,6 +33,12 @@ impl<Id> Default for ViewIndex<Id> {
     }
 }
 
+impl<Id: Clone> Clone for ViewIndex<Id> {
+    fn clone(&self) -> Self {
+        Self { entries: self.entries.clone(), keys: self.keys.clone() }
+    }
+}
+
 impl<Id: Ord + Clone> ViewIndex<Id> {
     /// Indexes view `id` under `keys` ([`crate::object_index_keys`]), in place of what it showed
     /// before.

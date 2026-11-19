@@ -749,6 +749,42 @@ async fn a_read_with_no_commit_since_the_last_pass_reads_no_store() {
     assert!(noted.is_some(), "a note is read at the next read");
 }
 
+// Behaviour (d15): reads made after a commit, while a pass over it is in progress, wait for that
+// pass and each reads the commit back, without reading the views' records again themselves. A
+// read the commit's count does not cover, made before it, reads the views as last published.
+#[tokio::test]
+async fn reads_after_a_commit_wait_for_the_pass_in_progress_and_read_it() {
+    let (reads, views) = views_of(&["fix-it#1", "other#1"]);
+    reads.convoys.counts.store(true, Ordering::SeqCst);
+    views.get("fix-it#1").await.expect("held, every count told");
+    let before = views.get("other#1").await.expect("held").status.expect("status").phase;
+    assert_eq!(before, ConvoyPhase::Active);
+
+    // The follower wakes for the commit and passes, and waits at the cursor's gate.
+    reads.convoys.passing.set(true);
+    let reaching = reads.convoys.passing.reaching.notified();
+    let mut ended = launch("fix-it#1", HERE);
+    ended.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    reads.convoys.commit(ended);
+    tokio::time::timeout(Duration::from_secs(5), reaching).await.expect("a pass reaches the gate");
+
+    let waiting: Vec<_> = (0..16)
+        .map(|_| {
+            let views = views.clone();
+            tokio::spawn(async move { views.get("fix-it#1").await.map(|convoy| convoy.status.map(|status| status.phase)) })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(waiting.iter().all(|read| !read.is_finished()), "a read after the commit waits for the pass over it");
+    let read = reads.convoys.read.load(Ordering::SeqCst);
+    reads.convoys.passing.set(false);
+    for waited in waiting {
+        let phase = tokio::time::timeout(Duration::from_secs(5), waited).await.expect("served").expect("joined").expect("read");
+        assert_eq!(phase, Some(ConvoyPhase::Abandoned), "each waiting read reads the commit back");
+    }
+    assert_eq!(reads.convoys.read.load(Ordering::SeqCst), read + 1, "one pass composed the launch for every waiting read");
+}
+
 /// The views converted by a read of one launch by name, with `others` unrelated launches held:
 /// its copies, then another home's launch read where this home holds none.
 async fn converted_by_one_read(others: usize) -> (u64, u64) {

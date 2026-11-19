@@ -21,10 +21,19 @@
 //!
 //! Installed as the backend's [`KindRecords`] for `Convoy`, it serves the typed reads, lists and
 //! watches of the kind; its writes are refused.
+//!
+//! A read takes no lock while the views are current: each pass or fill that completes publishes
+//! what the views show as an immutable [`Published`], with the commit counts it read through, and
+//! a read whose counts that covers reads it as published. Only a read the views have not yet
+//! caught up with takes the views' lock, and there it waits for the pass running, which may serve
+//! it, or runs one; it never waits on another read of the views.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, PoisonError, RwLock,
+    },
 };
 
 use chrono::DateTime;
@@ -34,7 +43,7 @@ use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     convoy::view::VesselReading,
     convoy_records::{ConvoyChange, ConvoyJoins, ConvoyListing, ConvoyNotes, ConvoyRecord, ConvoyRecords, UnreadableLaunch, WorkFacts},
-    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal, WriteError},
+    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal, UnloggedRead, WriteError},
     held_joins::{JoinChange, JoinChanges, JoinsReader},
     lifecycle_reads::{ChangeCursor, LifecycleReads, Told},
     terminal_records::{newest_launches, TerminalRecord},
@@ -57,24 +66,93 @@ pub struct ConvoyViews {
 /// The views held, by `(home, launch)`, and what each joins, kept current by one follower.
 #[derive(Default)]
 struct Held {
+    /// What passes and fills the views: one at a time, and only a read that needs one waits here.
     state: tokio::sync::Mutex<Option<HeldViews>>,
+    /// What the views showed when the last pass or fill completed, read without the state's lock.
+    /// None before the first fill.
+    published: RwLock<Option<Arc<Published>>>,
+    /// The launches whose view changed, in this run: what a reading resumes from. Written by a
+    /// pass, under the state's lock; a read takes it only to name the changes since a position.
+    changed: Arc<Mutex<UnloggedJournal>>,
+    /// How many view changes the watchers have read: one that asks what changed since a position
+    /// has read every change before it. Moved by reads without the state's lock.
+    delivered: Arc<AtomicU64>,
     ticks: Mutex<Option<tokio::sync::broadcast::Sender<()>>>,
     /// The measured reads waiting on a fill or pass of the views, which count its reads.
     waiters: reads::Waiters,
     /// The commits the convoys' cursor was told of, read without the state's lock: with the held
-    /// joins' count, whether the views hold every commit made before a read (see
-    /// [`HeldViews::current`]). Unset where the cursor cannot tell.
+    /// joins' count and this home's note count, whether the views hold every commit made before a
+    /// read (see [`HeldViews::current`]). Unset where the cursor cannot tell.
     told: std::sync::OnceLock<Told>,
 }
 
-/// The commits told to the convoys' cursor and to the held joins' cursors.
-type ToldCounts = (u64, u64);
+/// The commits told to the convoys' cursor and to the held joins' cursors, and how many times this
+/// home's notes changed.
+type ToldCounts = (u64, u64, u64);
+
+/// Whether views read through the counts `through` hold every change counted in `told`.
+fn covers(through: Option<ToldCounts>, told: Option<ToldCounts>) -> bool {
+    matches!((through, told), (Some(through), Some(told)) if through.0 >= told.0 && through.1 >= told.1 && through.2 >= told.2)
+}
 
 /// The caller the follower's reads count for.
 const FOLLOWER: &str = "Convoy views";
 
+/// Launches, by `(home, launch)`.
+type Launch = (String, String);
+
+/// What the views show to readers: replaced, never changed, once published.
+#[derive(Clone, Default)]
+struct Shown {
+    views: BTreeMap<Launch, Arc<HeldView>>,
+    /// The views held by each index key their labels and declared fields give, as the store's
+    /// query index names them: a selecting query reads only the views it may select.
+    index: ViewIndex<Launch>,
+    /// The launches held that have not ended. One that cannot be read counts: nothing says it
+    /// ended.
+    open: BTreeSet<Launch>,
+    /// The retired launches held, each with the count of the view change its watchers must read
+    /// before it leaves.
+    retiring: BTreeMap<Launch, u64>,
+}
+
+/// The views as the last pass or fill that completed left them, with the commit counts they hold
+/// every change of.
+struct Published {
+    shown: Arc<Shown>,
+    /// The counts read before that pass or fill: none where they cannot be told, and no read is
+    /// then served from here.
+    through: Option<ToldCounts>,
+    /// Where a reader stands that has read these views.
+    read: UnloggedRead,
+    /// How far the views had read: the log, by their cursors, and this home's notes.
+    position: u64,
+    /// How many entries the views held, over every launch they kept anything of.
+    entries: usize,
+}
+
+impl Published {
+    /// Whether these views serve a read made after the commit counts `told` were read: they hold
+    /// every change counted, and no retired launch is due to leave them, as one is once its
+    /// watchers have read it (through `delivered`) or once nothing watches.
+    fn serves(&self, told: Option<ToldCounts>, delivered: u64, watched: impl FnOnce() -> bool) -> bool {
+        covers(self.through, told)
+            && (self.shown.retiring.is_empty() || (self.shown.retiring.values().all(|told| *told > delivered) && watched()))
+    }
+
+    /// Where a reader stands that has read these views.
+    fn log_position(&self) -> LogPosition {
+        LogPosition { homes: BTreeMap::new(), unlogged: Some(self.read.clone()) }
+    }
+}
+
 struct HeldViews {
-    views: BTreeMap<(String, String), HeldView>,
+    /// What the views show, shared with the views last published: a pass changes a copy.
+    shown: Arc<Shown>,
+    /// [`Held::changed`].
+    changed: Arc<Mutex<UnloggedJournal>>,
+    /// [`Held::delivered`].
+    delivered: Arc<AtomicU64>,
     /// Where the next read takes the records' changes from; none where no log is held, and each
     /// read then reads every launch afresh.
     following: Option<Arc<Mutex<Following>>>,
@@ -97,24 +175,10 @@ struct HeldViews {
     refill_owed: bool,
     /// The launches held as unreadable, by `(home, launch)`, at the version last told.
     unreadable: BTreeMap<(String, String), u64>,
-    /// The launches whose view changed, in this run: what a reading resumes from.
-    changed: UnloggedJournal,
-    /// The views held by each index key their labels and declared fields give, as the store's
-    /// query index names them: a selecting query reads only the views it may select.
-    index: ViewIndex<(String, String)>,
-    /// The launches held, by `(home, launch)`, that have not ended. One that cannot be read
-    /// counts: nothing says it ended.
-    open: BTreeSet<(String, String)>,
     /// What each ended launch's works were last composed from, by `(home, launch)`: its Vessel
     /// launches are released, and once the held joins evict them a view composed again keeps
     /// these.
     ended_works: BTreeMap<(String, String), BTreeMap<String, WorkFacts>>,
-    /// The retired launches held, by `(home, launch)`, each with the count of the view change its
-    /// watchers must read before it leaves.
-    retiring: BTreeMap<(String, String), u64>,
-    /// How many view changes the watchers have read: one that asks what changed since a position
-    /// has read every change before it.
-    delivered: u64,
     /// The commit counts read before the last pass or fill that completed: the views hold every
     /// commit counted. None where the counts cannot be told, and each read then passes.
     through: Option<ToldCounts>,
@@ -233,14 +297,14 @@ impl ConvoyViews {
     /// Every launch at every home, as read sources: this home's are local, other homes' replicas
     /// of their home.
     pub async fn sources(&self) -> Result<Vec<ReadResourceObject<Convoy>>, ResourceError> {
-        self.with_held(|held| held.views.values().map(|held| held.view.clone()).collect()).await
+        self.with_shown(|shown| shown.views.values().map(|held| held.view.clone()).collect()).await
     }
 
     /// This home's launches.
     pub async fn here(&self) -> Result<Vec<ResourceObject<Convoy>>, ResourceError> {
         let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
-        self.with_held(move |held| {
-            held.views.iter().filter(|((home, _), _)| *home == here).map(|(_, held)| held.view.object.clone()).collect()
+        self.with_shown(move |shown| {
+            shown.views.iter().filter(|((home, _), _)| *home == here).map(|(_, held)| held.view.object.clone()).collect()
         })
         .await
     }
@@ -262,7 +326,7 @@ impl ConvoyViews {
             None => self.convoys().map_err(ResourceError::other)?.home().to_owned(),
         };
         let key = (home.clone(), name.to_owned());
-        match self.with_held(move |held| held.views.get(&key).cloned()).await? {
+        match self.with_shown(move |shown| shown.views.get(&key).map(|held| HeldView::clone(held))).await? {
             Some(held) => Ok(Some(held)),
             None => Ok(self.stored(name, Some(&home), BTreeSet::new()).await?.pop()),
         }
@@ -273,13 +337,13 @@ impl ConvoyViews {
     /// cannot be read counts as open: nothing says it ended.
     pub async fn open(&self) -> Result<BTreeSet<String>, ResourceError> {
         let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
-        self.with_held(move |held| held.open.iter().filter(|(home, _)| *home == here).map(|(_, name)| name.clone()).collect()).await
+        self.with_shown(move |shown| shown.open.iter().filter(|(home, _)| *home == here).map(|(_, name)| name.clone()).collect()).await
     }
 
     /// How many entries the views hold, over every launch they keep anything of: what grows with
     /// the launches held.
     pub async fn held(&self) -> Result<usize, ResourceError> {
-        self.with_held(|held| held.entries()).await
+        Ok(self.published().await?.entries)
     }
 
     /// The newest launch of `of` in `project` held at `home`, or at this home when `None`.
@@ -295,43 +359,82 @@ impl ConvoyViews {
     /// composition reads every launch, and a read waiting on it counts those reads.
     /// A composition that fails is logged, and the first read composes them.
     pub async fn opened(&self) {
-        if let Err(error) = self.with_held(|_| ()).await {
+        if let Err(error) = self.published().await {
             tracing::warn!(%error, "convoy views: composing them at open failed; the first read composes them");
         }
     }
 
-    /// Reads the views held, filling them on first use and starting the follower that keeps them.
-    /// Every change written before the read is read into them first: the commits counted before
-    /// it waits for the views are read in by a pass, its own or one that began after them; while
-    /// none is uncounted, the read reads the views as held and reads no store.
-    /// A measured read counts the fill or pass it waits on, the follower's included.
-    async fn with_held<T>(&self, read: impl FnOnce(&mut HeldViews) -> T) -> Result<T, ResourceError> {
-        // Before the lock: a pass that began while this read waited reads every commit counted.
+    /// Reads the views as published, once they hold every change written before the read
+    /// ([`Self::published`]).
+    async fn with_shown<T>(&self, read: impl FnOnce(&Shown) -> T) -> Result<T, ResourceError> {
+        Ok(read(&self.published().await?.shown))
+    }
+
+    /// The views as published, once they hold every change written before the read: the commits
+    /// counted before it are read in by a pass, one that began after them or its own. While the
+    /// views last published hold every commit counted, the read takes them without a lock and
+    /// reads no store; otherwise it waits for the pass running or runs one (see
+    /// [`Self::catch_up`]).
+    async fn published(&self) -> Result<Arc<Published>, ResourceError> {
+        // Before anything is read: a pass that began after this read the commits counted here.
         let told = self.told();
+        if let Some(published) = self.serving(told) {
+            return Ok(published);
+        }
+        Ok(self.catch_up(told, |_| ()).await?.0)
+    }
+
+    /// The views last published, where they serve a read made after the commit counts `told`
+    /// were read.
+    fn serving(&self, told: Option<ToldCounts>) -> Option<Arc<Published>> {
+        let published = self.held.published.read().unwrap_or_else(PoisonError::into_inner).clone()?;
+        let delivered = self.held.delivered.load(Ordering::SeqCst);
+        published.serves(told, delivered, || self.watched()).then_some(published)
+    }
+
+    /// Takes the views, filling them on first use and starting the follower that keeps them, and
+    /// passes them unless a pass that read the commits counted in `told` has completed, as one may
+    /// while this waits. Then `then` runs on the views, those due to leave leave, and the views are
+    /// published. The lock is held for the pass, if any, and no read of the views is made under it:
+    /// a read that waits here waits on a pass, never on another read.
+    /// A measured read counts the fill or pass it waits on, the follower's included.
+    async fn catch_up<T>(
+        &self,
+        told: Option<ToldCounts>,
+        then: impl FnOnce(&mut HeldViews) -> T,
+    ) -> Result<(Arc<Published>, T), ResourceError> {
         let waiters = &self.held.waiters;
         waiters
             .wait(async {
                 let mut state = self.held.state.lock().instrument(info_span!("convoy_views.lock_wait")).await;
-                waiters.serve(self.read_held(&mut state, told, read)).await
+                waiters.serve(self.read_held(&mut state, told, then)).await
             })
             .await
     }
 
-    /// The commits told so far to the convoys' cursor and the held joins' cursors; none where
-    /// either cannot tell.
+    /// The commits told so far to the convoys' cursor and the held joins' cursors, and how many
+    /// times this home's notes changed; none where either cursor cannot tell.
     fn told(&self) -> Option<ToldCounts> {
         let convoys = self.held.told.get()?.get();
         let joins = self.reads.joins().ok()?.told()?;
-        Some((convoys, joins))
+        let notes = self.convoys().ok()?.memory().changed();
+        Some((convoys, joins, notes))
     }
 
-    /// [`Self::with_held`] once the views are taken, with the commits `told` before it waited.
+    /// Publishes `held` as the views readers read.
+    fn publish(&self, held: &HeldViews) -> Arc<Published> {
+        let published = Arc::new(held.published());
+        *self.held.published.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&published));
+        published
+    }
+
+    /// [`Self::catch_up`] once the views are taken, with the commits `told` before it waited.
     async fn read_held<T>(
         &self,
         state: &mut Option<HeldViews>,
         told: Option<ToldCounts>,
-        read: impl FnOnce(&mut HeldViews) -> T,
-    ) -> Result<T, ResourceError> {
+        then: impl FnOnce(&mut HeldViews) -> T,
+    ) -> Result<(Arc<Published>, T), ResourceError> {
         if state.is_none() {
             // Follow before filling, so no change between the fill and the first pass is missed.
             let wakes = self.wakes()?;
@@ -344,7 +447,9 @@ impl ConvoyViews {
             }
             let cursors_read = cursors.as_ref().map_or(0, Cursors::position);
             let mut held = HeldViews {
-                views: BTreeMap::new(),
+                shown: Arc::default(),
+                changed: Arc::clone(&self.held.changed),
+                delivered: Arc::clone(&self.held.delivered),
                 following: cursors.map(|cursors| {
                     Arc::new(Mutex::new(Following {
                         cursors,
@@ -361,12 +466,7 @@ impl ConvoyViews {
                 logged: BTreeSet::new(),
                 refill_owed: false,
                 unreadable: BTreeMap::new(),
-                changed: UnloggedJournal::default(),
-                index: ViewIndex::default(),
-                open: BTreeSet::new(),
                 ended_works: BTreeMap::new(),
-                retiring: BTreeMap::new(),
-                delivered: 0,
                 through: None,
             };
             self.refill(&mut held).await?;
@@ -380,8 +480,9 @@ impl ConvoyViews {
                 self.refill(held).await?;
             }
         }
+        let then = then(held);
         held.evict(self.watched());
-        Ok(read(held))
+        Ok((self.publish(held), then))
     }
 
     /// Whether anything watches the views' changes: with nothing watching, a retired launch
@@ -434,6 +535,7 @@ impl ConvoyViews {
             let Some(held) = state.as_mut() else { return };
             let waiters = &self.held.waiters;
             waiters.serve(self.follow_wake(held, told)).await;
+            self.publish(held);
             drop(state);
             self.tick();
             if ended {
@@ -554,7 +656,7 @@ impl ConvoyViews {
         let mut gone = Vec::new();
         for (key, ConvoyListing { records: read, unreadable }) in owed.iter().zip(listings) {
             match (read.into_iter().next(), unreadable.first()) {
-                (Some(record), _) if record.retired && !held.views.contains_key(key) && !held.logged.contains(key) => gone.push(key),
+                (Some(record), _) if record.retired && !held.shown.views.contains_key(key) && !held.logged.contains(key) => gone.push(key),
                 (Some(record), _) => records.push(record),
                 (None, Some(launch)) => composed.push(Composed {
                     home: launch.home.clone(),
@@ -594,7 +696,7 @@ impl ConvoyViews {
         let told = self.told();
         held.refill_owed = true;
         let unlisted: BTreeSet<_> =
-            held.views.keys().chain(held.logged.iter()).filter(|key| !held.retiring.contains_key(*key)).cloned().collect();
+            held.shown.views.keys().chain(held.logged.iter()).filter(|key| !held.shown.retiring.contains_key(*key)).cloned().collect();
         let listing = self
             .blocking(move |reads| {
                 let convoys = reads.convoys()?;
@@ -627,7 +729,7 @@ impl ConvoyViews {
         // the retiring, which leave once their watchers have read them.
         let mut read =
             composed.iter().map(|composed| (composed.home.clone(), composed.view.object.metadata.name.clone())).collect::<BTreeSet<_>>();
-        read.extend(held.retiring.keys().cloned());
+        read.extend(held.shown.retiring.keys().cloned());
         held.retain(&read);
         let listed = listing.unreadable.iter().map(|launch| (launch.home.clone(), launch.name.clone())).collect::<BTreeSet<_>>();
         held.unreadable.retain(|key, _| listed.contains(key));
@@ -730,7 +832,7 @@ impl ConvoyViews {
         if views.is_empty() {
             return Ok(Vec::new());
         }
-        let position = self.with_held(|held| held.position()).await?;
+        let position = self.published().await?.position;
         Ok(views.into_iter().map(|view| HeldView { view, version: position }).collect())
     }
 
@@ -759,11 +861,44 @@ impl ConvoyViews {
         self.engine_records(move |held_name| held_name == name).await
     }
 
+    /// What changed since `position`, named from `published` without the views' lock, and whether
+    /// a retired launch is held; none where the read must take the lock: a retired launch is due
+    /// to leave once the watcher has read through `position`, or a pass has changed the views
+    /// since `published` and not yet published them.
+    fn changed_since_published(
+        &self,
+        published: &Published,
+        position: &LogPosition,
+        told: Option<ToldCounts>,
+        watched: bool,
+    ) -> Option<(Since, bool)> {
+        if let Some(read) = position.unlogged.as_ref().filter(|read| read.run == published.read.run && read.read <= published.read.read) {
+            self.held.delivered.fetch_max(read.read, Ordering::SeqCst);
+        }
+        if !published.serves(told, self.held.delivered.load(Ordering::SeqCst), || watched) {
+            return None;
+        }
+        let changed = self.held.changed.lock().unwrap_or_else(PoisonError::into_inner);
+        if changed.count() != published.read.read {
+            return None;
+        }
+        let since = match changed.since(position.unlogged.as_ref()) {
+            Ok(names) => Since::Changed { names, through: published.log_position() },
+            Err(reason) => Since::Expired(reason),
+        };
+        Some((since, !published.shown.retiring.is_empty()))
+    }
+
     /// The launches `named` selects, as the engine port's records, each at its home.
     async fn engine_records(&self, named: impl Fn(&str) -> bool + Send + 'static) -> Result<Vec<Record<Convoy>>, String> {
         let held: Vec<(String, HeldView)> = self
-            .with_held(move |held| {
-                held.views.iter().filter(|((_, name), _)| named(name)).map(|((home, _), held)| (home.clone(), held.clone())).collect()
+            .with_shown(move |shown| {
+                shown
+                    .views
+                    .iter()
+                    .filter(|((_, name), _)| named(name))
+                    .map(|((home, _), held)| (home.clone(), HeldView::clone(held)))
+                    .collect()
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -848,7 +983,8 @@ impl KindRecords<Convoy> for ConvoyViews {
     async fn get(&self, name: &str) -> Result<Option<Record<Convoy>>, String> {
         let home = self.home();
         let key = (home.clone(), name.to_owned());
-        if let Some(held) = self.with_held(move |held| held.views.get(&key).cloned()).await.map_err(|error| error.to_string())? {
+        let held = self.with_shown(move |shown| shown.views.get(&key).map(|held| HeldView::clone(held)));
+        if let Some(held) = held.await.map_err(|error| error.to_string())? {
             return Ok(Some(view_record(held, home)));
         }
         // This home's launch of the name where it has one, else another home's: the lexically
@@ -925,12 +1061,13 @@ impl KindRecords<Convoy> for ConvoyViews {
             Ok(convoys) => convoys.home().to_owned(),
             Err(error) => return Some(Err(error)),
         };
-        let held = self.with_held(move |held| {
-            held.index
+        let held = self.with_shown(move |shown| {
+            shown
+                .index
                 .covered(&cover)
                 .into_iter()
                 .filter(|(home, _)| !local || *home == here)
-                .filter_map(|launch| Some((launch.0.clone(), held.views.get(&launch)?.clone())))
+                .filter_map(|launch| Some((launch.0.clone(), HeldView::clone(shown.views.get(&launch)?))))
                 .collect::<Vec<_>>()
         });
         Some(
@@ -941,20 +1078,15 @@ impl KindRecords<Convoy> for ConvoyViews {
     }
 
     async fn positioned(&self) -> Result<(Vec<Record<Convoy>>, LogPosition), String> {
-        let (held, position) = self
-            .with_held(|held| {
-                // A listing reads every change before its position: its reader has read the retired.
-                let position = held.read();
-                held.delivered_to(&position);
-                (held.views.iter().map(|((home, _), held)| (home.clone(), held.clone())).collect::<Vec<_>>(), position)
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok((held.into_iter().map(|(home, held)| view_record(held, home)).collect(), position))
+        let published = self.published().await.map_err(|error| error.to_string())?;
+        // A listing reads every change before its position: its reader has read the retired.
+        self.held.delivered.fetch_max(published.read.read, Ordering::SeqCst);
+        let held = published.shown.views.iter().map(|((home, _), held)| view_record(HeldView::clone(held), home.clone())).collect();
+        Ok((held, published.log_position()))
     }
 
     async fn position(&self) -> Result<LogPosition, String> {
-        self.with_held(|held| held.read()).await.map_err(|error| error.to_string())
+        Ok(self.published().await.map_err(|error| error.to_string())?.log_position())
     }
 
     /// Named from the views' own changes, which take in this home's notes: within this run only.
@@ -964,14 +1096,25 @@ impl KindRecords<Convoy> for ConvoyViews {
     /// the watcher back to read it gone.
     async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
         let (position, watched) = (position.clone(), self.watched());
-        let (since, retiring) = self
-            .with_held(move |held| {
-                held.delivered_to(&position);
-                held.evict(watched);
-                (held.since(&position), !held.retiring.is_empty())
-            })
-            .await
-            .map_err(|error| error.to_string())?;
+        let told = self.told();
+        let read = match self.serving(told) {
+            Some(published) => self.changed_since_published(&published, &position, told, watched),
+            None => None,
+        };
+        let (since, retiring) = match read {
+            Some(read) => read,
+            None => {
+                let (_, read) = self
+                    .catch_up(told, move |held| {
+                        held.delivered_to(&position);
+                        held.evict(watched);
+                        (held.since(&position), !held.shown.retiring.is_empty())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                read
+            }
+        };
         if retiring {
             self.tick();
         }
@@ -1006,7 +1149,7 @@ impl KindRecords<Convoy> for ConvoyViews {
     /// observes of one, or a Vessel or terminal session its works join.
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
         // Hold the views first, so the follower that ticks is running.
-        self.with_held(|_| ()).await.map_err(|error| error.to_string())?;
+        self.published().await.map_err(|error| error.to_string())?;
         let ticks = self
             .held
             .ticks
@@ -1032,23 +1175,34 @@ struct Composed {
 
 impl HeldViews {
     /// Whether the views hold every change made before the commit counts `told` were read: a
-    /// pass that read the log at or after those counts completed, no note is unread, and nothing
+    /// pass that read the log and the notes at or after those counts completed, and nothing
     /// passed is left to compose. Each count moves before its writer's call returns, so a writer
     /// that reads after writing reads its write.
     fn current(&self, told: Option<ToldCounts>) -> bool {
-        let read = matches!((self.through, told), (Some(through), Some(told)) if through.0 >= told.0 && through.1 >= told.1);
-        read && self.notes.is_empty() && self.owed.is_empty() && !self.refill_owed
+        covers(self.through, told) && self.owed.is_empty() && !self.refill_owed
     }
 
-    /// Where a reader stands that has read the views held.
-    fn read(&self) -> LogPosition {
-        LogPosition { homes: BTreeMap::new(), unlogged: Some(self.changed.read()) }
+    /// The views as readers read them until the next are published.
+    fn published(&self) -> Published {
+        Published {
+            shown: Arc::clone(&self.shown),
+            // Views a pass left owed hold nothing they can be shown to hold.
+            through: self.through.filter(|_| self.owed.is_empty() && !self.refill_owed),
+            read: self.journal().read(),
+            position: self.position(),
+            entries: self.entries(),
+        }
+    }
+
+    fn journal(&self) -> std::sync::MutexGuard<'_, UnloggedJournal> {
+        self.changed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The launches whose view changed since `position`.
     fn since(&self, position: &LogPosition) -> Since {
-        match self.changed.since(position.unlogged.as_ref()) {
-            Ok(names) => Since::Changed { names, through: self.read() },
+        let changed = self.journal();
+        match changed.since(position.unlogged.as_ref()) {
+            Ok(names) => Since::Changed { names, through: LogPosition { homes: BTreeMap::new(), unlogged: Some(changed.read()) } },
             Err(reason) => Since::Expired(reason),
         }
     }
@@ -1061,16 +1215,22 @@ impl HeldViews {
     /// Holds each of `composed`, keeping the version of a view that shows what its held one shows:
     /// all of it, its launch's write in its resource version among it.
     fn insert(&mut self, composed: Vec<Composed>) -> Result<(), String> {
+        if composed.is_empty() {
+            return Ok(());
+        }
         let position = self.position();
+        // A copy of what was last published, where that still holds it: readers keep theirs.
+        let shown = Arc::make_mut(&mut self.shown);
+        let mut changed = self.changed.lock().unwrap_or_else(PoisonError::into_inner);
         for Composed { home, view, unreadable, ended, retired } in composed {
             let key = (home, view.object.metadata.name.clone());
             match ended {
                 Some(works) => {
-                    self.open.remove(&key);
+                    shown.open.remove(&key);
                     self.ended_works.insert(key.clone(), works);
                 }
                 None => {
-                    self.open.insert(key.clone());
+                    shown.open.insert(key.clone());
                     self.ended_works.remove(&key);
                 }
             }
@@ -1083,7 +1243,7 @@ impl HeldViews {
                 }
                 None => drop(self.unreadable.remove(&key)),
             }
-            let held = self.views.get(&key);
+            let held = shown.views.get(&key);
             let same = held.is_some_and(|held| {
                 held.view.object.metadata == view.object.metadata
                     && held.view.object.spec == view.object.spec
@@ -1091,45 +1251,51 @@ impl HeldViews {
             });
             let version = crate::held_listing::version(held.map(|held| held.version), same, position)?;
             if !same {
-                self.changed.record([key.1.clone()]);
-                self.index.set(&key, crate::object_index_keys(&view.object).map_err(|error| error.to_string())?);
+                changed.record([key.1.clone()]);
+                shown.index.set(&key, crate::object_index_keys(&view.object).map_err(|error| error.to_string())?);
             }
             // A watcher reading through the view's last change has read how it ended: an unchanged
             // view was last changed no later than now.
             match (retired, same) {
-                (true, false) => drop(self.retiring.insert(key.clone(), self.changed.count())),
-                (true, true) => drop(self.retiring.entry(key.clone()).or_insert(self.changed.count())),
-                (false, _) => drop(self.retiring.remove(&key)),
+                (true, false) => drop(shown.retiring.insert(key.clone(), changed.count())),
+                (true, true) => drop(shown.retiring.entry(key.clone()).or_insert(changed.count())),
+                (false, _) => drop(shown.retiring.remove(&key)),
             }
-            self.views.insert(key, HeldView { view, version });
+            shown.views.insert(key, Arc::new(HeldView { view, version }));
         }
         Ok(())
     }
 
     fn remove(&mut self, key: &(String, String)) {
-        if self.views.remove(key).is_some() {
-            self.changed.record([key.1.clone()]);
-            self.index.remove(key);
-        }
         self.unreadable.remove(key);
-        self.open.remove(key);
         self.ended_works.remove(key);
-        self.retiring.remove(key);
+        let held = &self.shown;
+        if !held.views.contains_key(key) && !held.open.contains(key) && !held.retiring.contains_key(key) {
+            return;
+        }
+        let shown = Arc::make_mut(&mut self.shown);
+        if shown.views.remove(key).is_some() {
+            self.changed.lock().unwrap_or_else(PoisonError::into_inner).record([key.1.clone()]);
+            shown.index.remove(key);
+        }
+        shown.open.remove(key);
+        shown.retiring.remove(key);
     }
 
     /// A watcher has read the views through `position`, of this run.
     fn delivered_to(&mut self, position: &LogPosition) {
-        let run = self.changed.read();
+        let run = self.journal().read();
         if let Some(read) = position.unlogged.as_ref().filter(|read| read.run == run.run && read.read <= run.read) {
-            self.delivered = self.delivered.max(read.read);
+            self.delivered.fetch_max(read.read, Ordering::SeqCst);
         }
     }
 
     /// Lets go of each retired launch its watchers have read retired, or of every one when
     /// nothing watches.
     fn evict(&mut self, watched: bool) {
-        let delivered = self.delivered;
-        let gone: Vec<_> = self.retiring.iter().filter(|(_, told)| !watched || **told <= delivered).map(|(key, _)| key.clone()).collect();
+        let delivered = self.delivered.load(Ordering::SeqCst);
+        let gone: Vec<_> =
+            self.shown.retiring.iter().filter(|(_, told)| !watched || **told <= delivered).map(|(key, _)| key.clone()).collect();
         for key in &gone {
             self.remove(key);
         }
@@ -1137,12 +1303,13 @@ impl HeldViews {
 
     /// How many entries the views hold, over every launch they keep anything of.
     fn entries(&self) -> usize {
-        self.views.len() + self.open.len() + self.ended_works.len() + self.retiring.len() + self.unreadable.len() + self.index.len()
+        let shown = &self.shown;
+        shown.views.len() + shown.open.len() + self.ended_works.len() + shown.retiring.len() + self.unreadable.len() + shown.index.len()
     }
 
     /// Keeps only the views `keep` names.
     fn retain(&mut self, keep: &BTreeSet<(String, String)>) {
-        let gone: Vec<_> = self.views.keys().filter(|key| !keep.contains(*key)).cloned().collect();
+        let gone: Vec<_> = self.shown.views.keys().filter(|key| !keep.contains(*key)).cloned().collect();
         for key in &gone {
             self.remove(key);
         }
