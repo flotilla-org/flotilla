@@ -1435,7 +1435,8 @@ impl TurnSubject {
             return Standing::At { head, revision: None, asks: true };
         }
         let revision = super::turn_delivery::change_request_turn_revision(&self.delivery.leaf, status);
-        let observation = flotilla_resources::ChangeRequestLeafSubject { change_request: record, now, stale_after: std::time::Duration::MAX };
+        let observation =
+            flotilla_resources::ChangeRequestLeafSubject { change_request: record, now, stale_after: std::time::Duration::MAX };
         let asks = super::turn_delivery::asks_now(&self.delivery.rule, &self.delivery.leaf, &observation);
         Standing::At { head, revision, asks }
     }
