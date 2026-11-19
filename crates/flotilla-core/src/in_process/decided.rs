@@ -49,18 +49,100 @@ pub fn opener_with(state_dir: impl Into<PathBuf>, before: BeforeOpen) -> EngineO
     })
 }
 
-/// What an operator does about a store this build refuses for its shape: the old store is the
-/// source the decided store is imported from at first start, so a fresh import replaces it.
-fn remedy(error: &flotilla_schema_sqlite::StoreError) -> &'static str {
+/// The old store the decided store is imported from at first start (the daemon's
+/// `engine_import::OLD_STORE`).
+const OLD_STORE: &str = "resources.sqlite";
+
+/// What an import report beside the stores (the daemon's `engine_import::Report`, written as
+/// `import-<UTC>.json`) says for this remedy: whether it imported, and its last write's sequence.
+#[derive(serde::Deserialize)]
+struct ImportReport {
+    outcome: String,
+    last_sequence: u64,
+}
+
+/// Whether the decided store at `path` holds writes of `home` made after its import.
+#[derive(Debug, PartialEq, Eq)]
+enum SinceImport {
+    /// Nothing after the import's last write: a fresh import makes the same store.
+    Nothing,
+    /// The store's sequence `held` is past the import's last write `imported`.
+    Writes { held: u64, imported: u64 },
+    /// It cannot be told, and why.
+    Unknown(String),
+}
+
+/// The import last written into `state_dir`: the newest report with the `imported` outcome. A
+/// refused import's report never put its store in place, so it says nothing about this one.
+fn last_import(state_dir: &Path) -> Result<u64, String> {
+    let entries = std::fs::read_dir(state_dir).map_err(|error| format!("read {}: {error}", state_dir.display()))?;
+    let mut reports: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("import-") && name.ends_with(".json"))
+        })
+        .collect();
+    // The names carry their UTC time, so the last in name order is the newest.
+    reports.sort();
+    for report in reports.iter().rev() {
+        let body = std::fs::read(report).map_err(|error| format!("read {}: {error}", report.display()))?;
+        let read: ImportReport = serde_json::from_slice(&body).map_err(|error| format!("read {}: {error}", report.display()))?;
+        if read.outcome == "imported" {
+            return Ok(read.last_sequence);
+        }
+    }
+    Err(format!("no import report with outcome \"imported\" in {}", state_dir.display()))
+}
+
+/// Whether the store at `path` holds `home`'s writes beyond its import, read without opening it
+/// as a store (it was just refused) and without writing.
+fn since_import(state_dir: &Path, path: &Path, home: &str) -> SinceImport {
+    let imported = match last_import(state_dir) {
+        Ok(imported) => imported,
+        Err(why) => return SinceImport::Unknown(why),
+    };
+    let held =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .map_err(flotilla_schema_sqlite::StoreError::from)
+            .and_then(|conn| flotilla_schema_sqlite::stored_last_sequence(&conn, home));
+    match held {
+        Ok(held) if held <= imported => SinceImport::Nothing,
+        Ok(held) => SinceImport::Writes { held, imported },
+        Err(error) => SinceImport::Unknown(format!("its sequence could not be read: {error}")),
+    }
+}
+
+/// What an operator does about a store this build refuses for its shape. Deleting it re-imports
+/// from the old store at the next start, which is safe only while the store holds nothing written
+/// after its import: once the daemon has written, deleting it throws those writes away, so the
+/// remedy is a build that opens it.
+fn remedy(state_dir: &Path, path: &Path, home: &str, error: &flotilla_schema_sqlite::StoreError) -> String {
     use flotilla_schema_sqlite::StoreError::*;
-    match error {
+    if !matches!(
+        error,
         LegacyDictionarySchema
-        | LegacyLogSchema
-        | KindTableDrift { .. }
-        | KindCodeDrift { .. }
-        | KindCodeRemoved { .. }
-        | KindCodeUnreadable { .. } => "; delete it and restart to re-import from the old store",
-        _ => "",
+            | LegacyLogSchema
+            | KindTableDrift { .. }
+            | KindCodeDrift { .. }
+            | KindCodeRemoved { .. }
+            | KindCodeUnreadable { .. }
+    ) {
+        return String::new();
+    }
+    const KEEP: &str = "keep it, back it up, and install a generation that opens it";
+    match since_import(state_dir, path, home) {
+        SinceImport::Nothing if state_dir.join(OLD_STORE).exists() => {
+            "; it holds nothing written since its import, so deleting it (with its -wal and -shm files) and restarting re-imports it from the old store".into()
+        }
+        SinceImport::Nothing => format!(
+            "; it holds nothing written since its import, but the old store {OLD_STORE} is gone, so deleting it starts an empty store: {KEEP}"
+        ),
+        SinceImport::Writes { held, imported } => format!(
+            "; do not delete it: it holds this host's writes since its import (sequence {held}, the import ended at {imported}), and deleting it throws away every write since the roll; {KEEP}"
+        ),
+        SinceImport::Unknown(why) => format!(
+            "; whether it holds writes since its import is unknown ({why}): do not delete it, since if it does, deleting it throws away every write since the roll; {KEEP}"
+        ),
     }
 }
 
@@ -80,7 +162,7 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
     }
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)
-            .map_err(|error| format!("open decided store {}: {error}{}", path.display(), remedy(&error)))?,
+            .map_err(|error| format!("open decided store {}: {error}{}", path.display(), remedy(state_dir, &path, &home, &error)))?,
     );
     flotilla_engine_convoys::convoys::declare_carried(&service);
     let DecidedPorts {
@@ -110,10 +192,12 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
 mod tests {
     use super::*;
 
-    // Behaviour: a decided store this build refuses for its shape names the file and tells the
-    // operator to delete it and restart, which re-imports it from the old store.
+    // Behaviour (cut-over B6): a decided store this build refuses for its shape, with no import
+    // report to say what it holds since its import, names the file and never suggests deleting
+    // it; it says deleting it may throw away every write since the roll. The engine_import tests
+    // cover the two states a report tells apart.
     #[test]
-    fn a_refused_store_names_its_remedy() {
+    fn a_refused_store_with_no_import_report_is_kept() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(ENGINE_STORE);
         let conn = rusqlite::Connection::open(&path).expect("connection");
@@ -126,7 +210,10 @@ mod tests {
         };
         let Err(error) = open(dir.path(), identity) else { panic!("an old dictionary is refused") };
         assert!(error.contains(&path.display().to_string()), "{error}");
-        assert!(error.ends_with("; delete it and restart to re-import from the old store"), "{error}");
+        assert!(error.contains("whether it holds writes since its import is unknown"), "{error}");
+        assert!(error.contains("do not delete it"), "{error}");
+        assert!(error.contains("throws away every write since the roll"), "{error}");
+        assert!(!error.contains("restarting re-imports"), "{error}");
     }
 
     fn identity(node: &str) -> EngineIdentity {

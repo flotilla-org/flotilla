@@ -203,6 +203,70 @@ async fn an_imported_record_is_created_at_its_old_creation_time() {
     assert_eq!(read.creation_time(id).expect("created"), exactly, "its old creation time, to the nanosecond");
 }
 
+/// Gives the first kind table of the engine store in `dir` a column its kind does not declare, so
+/// the store is refused for its shape; `undo` drops it again.
+fn drift_shape(dir: &Path, undo: bool) {
+    let registry = crate::runtime::decided_registry().expect("registry");
+    let table = registry.iter().next().and_then(|set| set.tables.first()).expect("a kind table").name.clone();
+    let connection = rusqlite::Connection::open(dir.join(ENGINE_STORE)).expect("engine store");
+    let statement = if undo { "DROP COLUMN drifted" } else { "ADD COLUMN drifted TEXT" };
+    connection.execute_batch(&format!("ALTER TABLE \"{table}\" {statement}")).expect("drift");
+}
+
+/// Opens the engine store in `dir` as the daemon does, returning why it was refused.
+fn refusal(dir: &Path) -> String {
+    let identity = flotilla_core::in_process::EngineIdentity {
+        node_id: flotilla_protocol::NodeId::new(HERE),
+        host_id: flotilla_protocol::qualified_path::HostId::new(HERE),
+        clock: std::sync::Arc::new(flotilla_resources::SystemClock),
+    };
+    match flotilla_core::in_process::decided::open(dir, identity) {
+        Ok(_) => panic!("a drifted engine store opened"),
+        Err(error) => error,
+    }
+}
+
+// Behaviour (cut-over B6): a refused engine store is named safe to delete and re-import only while
+// it holds nothing this host wrote after its import. Once the daemon has written to it, the
+// refusal says not to delete it, that deleting it throws away every write since the roll, and
+// what to do instead, naming the sequences that tell the two apart.
+#[tokio::test]
+async fn a_refused_engine_store_is_named_deletable_only_while_it_holds_nothing_since_its_import() {
+    use flotilla_provisioning::stored::artifact::ArtifactRecord;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _held = populated(dir.path()).await;
+    let imported = report(&first_start(dir.path(), HERE, None).expect("imports").expect("a report"))["last_sequence"]
+        .as_u64()
+        .expect("the import's last sequence");
+
+    drift_shape(dir.path(), false);
+    let fresh = refusal(dir.path());
+    assert!(fresh.contains(&dir.path().join(ENGINE_STORE).display().to_string()), "{fresh}");
+    assert!(fresh.contains("it holds nothing written since its import"), "{fresh}");
+    assert!(fresh.contains("deleting it (with its -wal and -shm files) and restarting re-imports it from the old store"), "{fresh}");
+    assert!(!fresh.contains("do not delete"), "{fresh}");
+
+    drift_shape(dir.path(), true);
+    {
+        let mut store = engine(dir.path());
+        let ours = {
+            let mut read = store.read().expect("read");
+            let id = read.resolve(<ArtifactRecord as Kind>::CODE, "ours", HERE).expect("resolve").expect("imported");
+            read.load::<ArtifactRecord>(id).expect("load").expect("held").value
+        };
+        let mut write = store.write().expect("write");
+        write.insert("after-the-roll", &ours, &flotilla_schema::NewChange::new("daemon", Timestamp(1))).expect("a daemon write");
+        write.commit().expect("commit");
+    }
+    drift_shape(dir.path(), false);
+    let written = refusal(dir.path());
+    assert!(written.contains("do not delete it"), "{written}");
+    assert!(written.contains("deleting it throws away every write since the roll"), "{written}");
+    assert!(written.contains(&format!("the import ended at {imported}")), "{written}");
+    assert!(written.contains("install a generation that opens it"), "{written}");
+    assert!(!written.contains("restarting re-imports"), "{written}");
+}
+
 #[tokio::test]
 async fn a_refused_record_keeps_the_import_for_inspection_and_puts_no_engine_store_in_place() {
     let dir = tempfile::tempdir().expect("tempdir");

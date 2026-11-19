@@ -52,7 +52,7 @@ mod store;
 
 pub mod stream;
 
-pub use audit::audit_domains;
+pub use audit::{audit_domains, stored_last_sequence};
 pub use error::{Malformed, StoreError, StreamResourceLimit};
 pub use handle::{Hold, HoldTimer, StoreGuard, StoreHandle};
 pub use query::{Cursor, Page, MAX_PAGE};
