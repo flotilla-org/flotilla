@@ -48,6 +48,9 @@ pub struct HeldJoins {
     /// The commits its cursors were told of, kept apart from the state so a view can tell it is
     /// current without waiting on a pass; none until the cursors start, or where they cannot tell.
     told: Mutex<Option<Vec<Told>>>,
+    /// The journal sequence the next change takes, stored as each read ends: the journal grows
+    /// with no commit counted when a read evicts or reads everything again.
+    journaled: AtomicU64,
 }
 
 #[derive(Default)]
@@ -114,6 +117,9 @@ struct Held {
     released_evicted: bool,
     /// Every launch is read again at the next read.
     refill_owed: bool,
+    /// The commits the cursors were told of before the last pass or full read that completed:
+    /// while the count has not moved, a pass would read nothing, and none is made.
+    passed: Option<u64>,
     /// Something changed that may let an ended launch go.
     unchecked: bool,
     /// The sequence every view had composed before at the last eviction; none where no view was
@@ -139,21 +145,31 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl HeldJoins {
     /// Reads what is held, once the changes since the last pass are taken in: filled on first use.
     /// Runs on the caller's thread, and reads the store while it passes.
+    /// A read made while no commit was counted since the last pass completed makes no pass: the
+    /// count is read before the pass, which then reads every commit counted.
     pub fn read<T>(&self, reads: &dyn LifecycleReads, read: impl FnOnce(Joins<'_>) -> T) -> Result<T, String> {
+        let told = self.cursors_told();
         let mut state = locked(&self.state);
         let State { held, readers, .. } = &mut *state;
         match held.as_mut() {
-            Some(current) if current.refill_owed => current.refill(reads)?,
+            Some(current) if current.refill_owed => {
+                current.refill(reads)?;
+                current.passed = told;
+            }
+            Some(current) if told.is_some() && current.passed == told => {}
             Some(current) => {
                 if let Err(error) = current.pass(reads) {
                     tracing::warn!(%error, "held joins: a change did not read; reading them all again");
                     current.refill(reads)?;
                 }
+                current.passed = told;
             }
             None => {
                 // Follow before filling, so no change between the fill and the first pass is missed.
                 let cursors = Cursors::start(reads);
-                *locked(&self.told) = cursors.as_ref().and_then(Cursors::told);
+                let told = cursors.as_ref().and_then(Cursors::told);
+                let passed = told.as_ref().map(|told| told.iter().map(Told::get).fold(0, u64::saturating_add));
+                *locked(&self.told) = told;
                 let mut filled = Held {
                     cursors,
                     vessels: BTreeMap::new(),
@@ -165,6 +181,7 @@ impl HeldJoins {
                     released: BTreeSet::new(),
                     released_evicted: false,
                     refill_owed: false,
+                    passed,
                     unchecked: false,
                     through: None,
                     journal: VecDeque::new(),
@@ -176,6 +193,24 @@ impl HeldJoins {
             }
         }
         let held = held.as_mut().expect("held above");
+        self.evict(held, readers);
+        let read = read(Joins { held });
+        self.journaled.store(held.next(), Ordering::Release);
+        Ok(read)
+    }
+
+    /// Evicts what no view needs now, without a pass: a view that has composed further may let
+    /// launches go while no read follows, its own reads served from what it last published.
+    fn settle(&self) {
+        let mut state = locked(&self.state);
+        let State { held, readers, .. } = &mut *state;
+        if let Some(held) = held.as_mut() {
+            self.evict(held, readers);
+            self.journaled.store(held.next(), Ordering::Release);
+        }
+    }
+
+    fn evict(&self, held: &mut Held, readers: &mut BTreeMap<u64, Arc<AtomicU64>>) {
         // A view whose reader was dropped has left: it no longer holds back an eviction.
         let registered = readers.len();
         readers.retain(|_, composed| Arc::strong_count(composed) > 1);
@@ -183,14 +218,20 @@ impl HeldJoins {
             held.unchecked = true;
         }
         held.evict(readers.values().map(|composed| composed.load(Ordering::Acquire)).min());
-        Ok(read(Joins { held }))
     }
 
     /// How many commits that may change the launches held its cursors have been told of, counted
-    /// before each writer's call returns: a read made after a pass that began at this count holds
-    /// every such commit counted. None before the first read, or where the cursors cannot tell.
-    /// Takes no lock a pass holds.
+    /// before each writer's call returns, plus the journal's sequence as the last read left it: a
+    /// view whose read began at this count reads every such commit counted and every change
+    /// journaled before it, evictions among them. None before the first read, or where the
+    /// cursors cannot tell. Takes no lock a pass holds.
     pub fn told(&self) -> Option<u64> {
+        let journaled = self.journaled.load(Ordering::Acquire);
+        self.cursors_told().map(|told| told.saturating_add(journaled))
+    }
+
+    /// The commits the cursors were told of, summed.
+    fn cursors_told(&self) -> Option<u64> {
         locked(&self.told).as_ref().map(|told| told.iter().map(Told::get).fold(0, u64::saturating_add))
     }
 
@@ -238,10 +279,15 @@ impl JoinsReader {
         self.reads.joins()?.read(self.reads.as_ref(), read)
     }
 
-    /// The view has composed every change before sequence `sequence`: the next read may evict
-    /// what it no longer needs. Takes no lock.
+    /// The view has composed every change before sequence `sequence`: what it no longer needs is
+    /// evicted now, as the views' reads need not read the joins again. Takes the joins' lock where
+    /// the sequence moves, so is not called inside a read of them.
     pub fn composed(&self, sequence: u64) {
-        self.composed.fetch_max(sequence, Ordering::Release);
+        if self.composed.fetch_max(sequence, Ordering::Release) < sequence {
+            if let Ok(joins) = self.reads.joins() {
+                joins.settle();
+            }
+        }
     }
 }
 
