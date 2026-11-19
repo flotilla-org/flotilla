@@ -130,18 +130,20 @@ pub async fn convoy_explain_names_retired_generations_by_record_only(factory: &d
     for name in [&one, &two] {
         land_convoy(&daemon, name).await;
     }
-    // Each leaves the listing as it retires.
-    let mut retired = BTreeSet::new();
-    while retired.len() < 2 {
-        let event =
-            tokio::time::timeout(std::time::Duration::from_secs(10), futures::StreamExt::next(&mut watch)).await.expect("retired in time");
-        match event.expect("watching").expect("event") {
-            flotilla_resources::ReadWatchEvent::Deleted(read) => retired.insert(read.object.metadata.name),
-            flotilla_resources::ReadWatchEvent::DeletedByName { tombstone, .. } => retired.insert(tombstone.name),
-            _ => false,
-        };
+    // Each leaves the listing as it retires. A watch reads what the views hold when it is read,
+    // so a launch that came and went before its first read shows no event in it: the listing is
+    // read again at each event, and at least every 50 ms, until it holds neither.
+    let convoys = backend.including_replicas::<ResourceConvoy>("flotilla");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let listed: BTreeSet<String> =
+            convoys.list().await.expect("listing").items.into_iter().map(|read| read.object.metadata.name).collect();
+        if !listed.contains(&one) && !listed.contains(&two) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "retired in time: still listed {listed:?}");
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), futures::StreamExt::next(&mut watch)).await;
     }
-    assert_eq!(retired, BTreeSet::from([one.clone(), two.clone()]));
 
     // `name@project` is a plain name: once every launch has retired it names the newest (#3108).
     assert_eq!(flotilla_store::resolve_convoy_record(&backend, "flotilla", "reviewer@flotilla").await, Ok(two.clone()));

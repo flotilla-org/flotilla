@@ -107,17 +107,19 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
             flotilla_engine_convoys_testkit::land(&path, &convoy).await;
         }
     }
-    // Every landed launch has retired before the aggregator reads the inventory.
-    let mut retired = 0;
-    while retired < landed {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(10), futures::StreamExt::next(&mut retiring))
-            .await
-            .expect("the landed launches retire")
-            .expect("watching")
-            .unwrap();
-        if matches!(event, flotilla_resources::ReadWatchEvent::Deleted(_) | flotilla_resources::ReadWatchEvent::DeletedByName { .. }) {
-            retired += 1;
+    // Every landed launch has retired before the aggregator reads the inventory. A watch reads what
+    // the views hold when it is read, so a launch that came and went before its first read shows no
+    // event in it: the listing is read again at each event, and at least every 50 ms, until it holds
+    // only the live launches.
+    let convoys = backend.including_replicas::<Convoy>("flotilla");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let listed = convoys.list().await.expect("listing").items.len();
+        if listed == live {
+            break;
         }
+        assert!(tokio::time::Instant::now() < deadline, "the landed launches retire: {listed} listed, {live} live");
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), futures::StreamExt::next(&mut retiring)).await;
     }
     drop(retiring);
     eprintln!("N={n} owner=engine_inventory live={}", counters().0);
