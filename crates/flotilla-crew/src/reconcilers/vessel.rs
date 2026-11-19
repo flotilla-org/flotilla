@@ -1,7 +1,7 @@
 use flotilla_resources::account_access::{AccountChange, AccountRecords};
 use flotilla_resources::checkout_path::checkout_path_component;
 use flotilla_resources::checkout_records::{CheckoutRecords, HOLDER_ENDED, HOLDER_NOT_OPEN};
-use flotilla_resources::convoy::engine::EngineConvoyPath;
+use flotilla_resources::convoy::engine::{launch_slug, EngineConvoyPath};
 use flotilla_resources::environment_records::{EnvironmentRecord, EnvironmentRecords};
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
 use flotilla_resources::vessel_planning::{Held, HeldKind, VesselPlan, VesselPlanner};
@@ -1553,12 +1553,9 @@ impl SecondaryWatch for ConvoyVesselWake {
     }
 }
 
-/// A launch's name as a name segment: environment and container names take no `#`.
-fn launch_slug(launch: &str) -> String {
-    launch.replace('#', "-")
-}
-
-/// The environment a launch requests for itself: a replacement launch has its own.
+/// The environment a launch requests for itself: a replacement launch has its own. Its name
+/// becomes Docker container and volume names and host paths, so it takes the launch's
+/// path-safe slug: a standing role's launch is named in address form (`project:P/convoy:R#n`).
 fn environment_name(launch: &str) -> String {
     format!("env-{}", launch_slug(launch))
 }
