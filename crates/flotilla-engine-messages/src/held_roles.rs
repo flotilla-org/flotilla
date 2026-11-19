@@ -19,8 +19,8 @@ use std::{
 };
 
 use flotilla_resources::{
-    Convoy, ConvoyEnsure, ConvoySpec, CrewDefaults, FleetDesignation, Project, ReadWatchEvent, Resource, ResourceProvenance, TerminalSession,
-    Vessel, VesselSpec, WorkflowSnapshot, CONVOY_LABEL, ROLE_ADDRESS_ANNOTATION,
+    Convoy, ConvoyEnsure, ConvoySpec, CrewDefaults, FleetDesignation, Project, ReadWatchEvent, Resource, ResourceProvenance,
+    TerminalSession, Vessel, VesselSpec, WorkflowSnapshot, CONVOY_LABEL, ROLE_ADDRESS_ANNOTATION,
 };
 use tracing::{info_span, Instrument};
 
