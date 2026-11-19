@@ -1077,13 +1077,27 @@ impl flotilla_capability_contract::SessionCapabilitySource for CountedCards {
     }
 }
 
-/// The fulfilment kind both crews of [`RunningCards`] were placed by.
+/// The fulfilment kind the first crew of [`RunningCards`] was placed by.
 const CARDS_KIND: &str = "cards-kind";
+/// The fulfilment kind the second crew of [`RunningCards`] was placed by.
+const OTHER_CARDS_KIND: &str = "cards-kind-other";
+
+/// The fulfilment kind [`CARDS_KIND`] or [`OTHER_CARDS_KIND`] is, on `host`.
+fn cards_kind(host: &str) -> FulfilmentKindSpec {
+    FulfilmentKindSpec {
+        host_ref: host.to_owned(),
+        pool: "test".to_string(),
+        cost_class: Default::default(),
+        grants: BTreeSet::from([flotilla_resources::FulfilmentGrant("network:scoped".to_string())]),
+        realisation: FulfilmentRealisation::HostDirect,
+    }
+}
 
 /// The credential delivery controller running over two crews, `cards-session-0` and
-/// `cards-session-1`, each in a convoy and environment of its own, both placed by [`CARDS_KIND`].
-/// The first convoy's coder is bound to an account, and its Docker environment runs the image of
-/// `build`, launched and not yet built. Each card was read once before the controller started.
+/// `cards-session-1`, each in a convoy and environment of its own, placed by [`CARDS_KIND`] and
+/// [`OTHER_CARDS_KIND`]. The first convoy's coder is bound to an account, and its Docker
+/// environment runs the image of `build`, launched and not yet built. Each card was read once
+/// before the controller started.
 struct RunningCards {
     daemon: Arc<InProcessDaemon>,
     source: Arc<CountedCards>,
@@ -1091,6 +1105,64 @@ struct RunningCards {
     build: String,
     _controller: AbortOnDropHandle<()>,
     _temp: TempDir,
+}
+
+/// Admits convoy `cards-{n}` as admission does: its placement snapshot of `kind`, then the convoy
+/// placed by `kind`, its vessel, environment and running coder session `cards-session-{n}`. The
+/// first convoy's environment runs the image of `build`. Returns the launch and the snapshot.
+async fn admit_card_crew(daemon: &Arc<InProcessDaemon>, n: usize, kind: &str, build: &str) -> (String, String) {
+    let fixture = engine(daemon);
+    let host = daemon.local_host_id().expect("local host").to_string();
+    let name = format!("cards-{n}");
+    let snapshot = format!("placement-snapshot-cards-{n}");
+    flotilla_admission::support::ensure_prepared_placement_snapshot(
+        &daemon.resource_backend(),
+        NAMESPACE,
+        &snapshot,
+        &name,
+        &cards_kind(&host),
+    )
+    .await
+    .expect("placement snapshot");
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        placement_decision: Some(
+            PlacementDecision::builder()
+                .kind(kind.to_string())
+                .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host.clone()), display_name: host.clone() })
+                .build(),
+        ),
+        workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            vessels: vec![VesselRequirement::builder()
+                .name("work".to_string())
+                .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                .build()],
+        }),
+        ..ConvoyStatus::default()
+    };
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("test".to_string()).build();
+    let launch = admit_convoy(daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, &name, spec, status)).await;
+    let vessel = fixture.vessels.request(&launch, "work", &host);
+    let environment = format!("cards-env-{n}");
+    let spec = if n == 0 {
+        let mut spec = docker_environment_spec(&host, BTreeSet::new());
+        spec.docker.as_mut().expect("docker").image_build_ref = Some(build.to_owned());
+        spec
+    } else {
+        EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+            ..Default::default()
+        }
+    };
+    engine_environments(daemon).request(&environment, &spec, Some(&vessel));
+    fixture.vessels.ready(&vessel, &environment);
+    create_credential_test_session(&fixture.terminals, &format!("cards-session-{n}"), &vessel, &environment);
+    (launch, snapshot)
 }
 
 impl RunningCards {
@@ -1103,65 +1175,19 @@ impl RunningCards {
         designate_fleet(&daemon).await;
         let fixture = engine(&daemon);
         let host = daemon.local_host_id().expect("local host").to_string();
-        daemon
-            .resource_backend()
-            .using::<FulfilmentKind>(NAMESPACE)
-            .create(
-                &empty_meta(CARDS_KIND),
-                &FulfilmentKindSpec {
-                    host_ref: host.clone(),
-                    pool: "test".to_string(),
-                    cost_class: Default::default(),
-                    grants: BTreeSet::from([flotilla_resources::FulfilmentGrant("network:scoped".to_string())]),
-                    realisation: FulfilmentRealisation::HostDirect,
-                },
-            )
-            .await
-            .expect("fulfilment kind");
+        for kind in [CARDS_KIND, OTHER_CARDS_KIND] {
+            daemon
+                .resource_backend()
+                .using::<FulfilmentKind>(NAMESPACE)
+                .create(&empty_meta(kind), &cards_kind(&host))
+                .await
+                .expect("fulfilment kind");
+        }
         fixture.image_builds.host("builder", "amd64");
         let build = fixture.image_builds.put(&flotilla_provisioning_testkit::image_build_spec());
         let mut convoys = Vec::new();
-        for n in 0..2 {
-            let status = ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                placement_decision: Some(
-                    PlacementDecision::builder()
-                        .kind(CARDS_KIND.to_string())
-                        .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host.clone()), display_name: host.clone() })
-                        .build(),
-                ),
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
-                        .build()],
-                }),
-                ..ConvoyStatus::default()
-            };
-            let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("test".to_string()).build();
-            let launch =
-                admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, &format!("cards-{n}"), spec, status)).await;
-            let vessel = fixture.vessels.request(&launch, "work", &host);
-            let environment = format!("cards-env-{n}");
-            let spec = if n == 0 {
-                let mut spec = docker_environment_spec(&host, BTreeSet::new());
-                spec.docker.as_mut().expect("docker").image_build_ref = Some(build.clone());
-                spec
-            } else {
-                EnvironmentSpec {
-                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
-                    ..Default::default()
-                }
-            };
-            engine_environments(&daemon).request(&environment, &spec, Some(&vessel));
-            fixture.vessels.ready(&vessel, &environment);
-            create_credential_test_session(&fixture.terminals, &format!("cards-session-{n}"), &vessel, &environment);
-            convoys.push(launch);
+        for (n, kind) in [CARDS_KIND, OTHER_CARDS_KIND].into_iter().enumerate() {
+            convoys.push(admit_card_crew(&daemon, n, kind, &build).await.0);
         }
         bind_account(&daemon, &convoys[0], "coder", "claude-max", "a@example.com").await;
         let source = Arc::new(CountedCards::default());
@@ -1232,11 +1258,12 @@ async fn a_rebind_reaches_a_running_sessions_card_with_no_other_event() {
 }
 
 // Behaviour: a change to the grants of the fulfilment kind a crew was placed by reaches its
-// running card, with no other event.
+// running card, with no other event, and no card of a crew placed by another kind.
 #[tokio::test]
 async fn a_fulfilment_kinds_grants_reach_a_running_sessions_card_with_no_other_event() {
     let cards = RunningCards::start().await;
     cards.source.settled("cards-session-0", 1).await;
+    let other = cards.source.settled("cards-session-1", 1).await;
     let kinds = cards.daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
     let kind = kinds.get(CARDS_KIND).await.expect("fulfilment kind");
     let mut spec = kind.spec.clone();
@@ -1244,6 +1271,28 @@ async fn a_fulfilment_kinds_grants_reach_a_running_sessions_card_with_no_other_e
     kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("grant host networking");
 
     cards.card_naming(0, "You can use host networking and its available egress.").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(cards.source.readings("cards-session-1"), other, "a card of another kind is not read again");
+}
+
+// Behaviour: admitting a convoy and tearing it down, which write and delete its placement
+// snapshot, read only that convoy's card: the running crews of the other convoys are not read
+// again. (d11 finding 2: each admission and teardown re-read every card, one after another.)
+#[tokio::test]
+async fn admitting_and_tearing_down_a_convoy_reads_only_its_cards() {
+    let cards = RunningCards::start().await;
+    let first = cards.source.settled("cards-session-0", 1).await;
+    let second = cards.source.settled("cards-session-1", 1).await;
+
+    let (_, snapshot) = admit_card_crew(&cards.daemon, 2, CARDS_KIND, &cards.build).await;
+    let admitted = cards.source.settled("cards-session-2", 0).await;
+    // Its release, at teardown, deletes its placement snapshot.
+    cards.daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE).delete(&snapshot).await.expect("release the placement snapshot");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert!(admitted >= 1, "the admitted convoy's card is read");
+    assert_eq!(cards.source.readings("cards-session-0"), first, "another convoy's card is not read again");
+    assert_eq!(cards.source.readings("cards-session-1"), second, "another convoy's card is not read again");
 }
 
 // Behaviour: an image build becoming built reaches the running card of a crew on its image, with

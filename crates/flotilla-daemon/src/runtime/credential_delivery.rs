@@ -10,8 +10,9 @@
 //!
 //! Each pass also refreshes the capability cards its events touch: those of the environments it
 //! delivered or re-minted for, of a convoy whose account binding changed, and of a convoy whose
-//! change touched what its cards read; every card when it delivered every environment, a
-//! fulfilment kind's grants changed, or an image build became built or stopped being built. A
+//! change touched what its cards read, and of the sessions whose cards read a fulfilment kind whose
+//! grants changed; every card when it delivered every environment, or an image build became built
+//! or stopped being built. A
 //! card's endpoints change only at its session's launch, which renders the card itself.
 //!
 //! A failed delivery is retried at a backoff a finite number of times, then waits for an event
@@ -40,9 +41,10 @@ use flotilla_resources::{
     account_access::AccountChange,
     environment_records::EnvironmentChange,
     image_build_records::ImageBuildChange,
+    is_prepared_snapshot,
     vessel_records::{environment_vessels, EnvironmentVessel, EnvironmentVessels, VesselWithoutConvoy},
     CredentialGrant, CredentialGrantSpec, CredentialSpec, FulfilmentGrant, FulfilmentKind, Project, ReadWatchEvent, Repository,
-    RepositoryKey, RepositoryTrust, ResourceError, TerminalSession, TerminalSessionPhase, WatchEvent,
+    RepositoryKey, RepositoryTrust, ResourceError, TerminalSession, TerminalSessionPhase, WatchEvent, PLACEMENT_SNAPSHOT_KIND,
 };
 use flotilla_store::load_metrics::{attributed, inherit, ControllerLoadMetrics};
 use futures::{stream, StreamExt};
@@ -895,40 +897,81 @@ async fn watch_bindings(state: Arc<ControllerRuntimeState>, namespace: String, e
     }
 }
 
-/// Refreshes every card when a fulfilment kind's grants change, at any home: a card lists the
-/// grants of its work's placement. Kinds change rarely, so no card is singled out.
+/// Refreshes the cards that read a fulfilment kind whose grants changed, at any home: a card lists
+/// the grants of the kind its work's placement decision chose. Admission's placement snapshots
+/// are never chosen, so no card reads one: a convoy's admission and teardown, which write and
+/// delete its snapshot, wake nothing here.
 async fn watch_fulfilment_kinds(backend: flotilla_store::ResourceBackend, namespace: String, events: Arc<CredentialEvents>) {
-    // Each kind's grants as last seen; a kind not seen since the watch opened counts as changed.
-    let mut grants = BTreeMap::<String, BTreeSet<FulfilmentGrant>>::new();
+    // Each live kind's grants as last seen; none until the watch first opens and reads them.
+    let mut seen: Option<BTreeMap<String, BTreeSet<FulfilmentGrant>>> = None;
     let mut failures = 0_u32;
     loop {
         match backend.including_replicas::<FulfilmentKind>(&namespace).watch().await {
             Ok(mut changes) => {
-                // Changes may have been missed while the watch was closed.
-                grants.clear();
-                events.record(|pending| pending.cards.every = true);
+                // Opened before the reading, so the watch holds every change after it. A change
+                // missed while the watch was closed is a kind whose grants differ from those seen.
+                // At the first opening nothing was seen: a card read before it is refreshed by
+                // its kind, which names only the cards already read.
+                match backend.including_replicas::<FulfilmentKind>(&namespace).list().await {
+                    Ok(listed) => {
+                        let listed: BTreeMap<String, BTreeSet<FulfilmentGrant>> = listed
+                            .items
+                            .into_iter()
+                            .filter(|kind| !is_prepared_snapshot(&kind.object.metadata.labels, PLACEMENT_SNAPSHOT_KIND))
+                            .map(|kind| (kind.object.metadata.name, kind.object.spec.grants))
+                            .collect();
+                        let changed: BTreeSet<String> = match &seen {
+                            Some(before) => {
+                                before.keys().chain(listed.keys()).filter(|name| before.get(*name) != listed.get(*name)).cloned().collect()
+                            }
+                            None => listed.keys().cloned().collect(),
+                        };
+                        if !changed.is_empty() {
+                            events.record(|pending| pending.cards.kinds.extend(changed));
+                        }
+                        seen = Some(listed);
+                    }
+                    Err(error) => {
+                        debug!(%error, "credential delivery could not read the fulfilment kinds; reopening their watch");
+                        failures = failures.saturating_add(1);
+                        if failures > WATCH_RETRY_LIMIT {
+                            warn!(failures, "credential delivery stops watching fulfilment kinds; other events still wake it");
+                            return;
+                        }
+                        tokio::time::sleep(RETRY_INITIAL.min(Duration::from_secs(u64::from(failures)))).await;
+                        continue;
+                    }
+                }
+                let held = seen.get_or_insert_default();
                 while let Some(change) = changes.next().await {
                     let changed = match change {
+                        // A snapshot is never a card's kind.
+                        Ok(ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) | ReadWatchEvent::Deleted(read))
+                            if is_prepared_snapshot(&read.object.metadata.labels, PLACEMENT_SNAPSHOT_KIND) =>
+                        {
+                            None
+                        }
                         Ok(ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read)) => {
                             let now = read.object.spec.grants;
-                            grants.insert(read.object.metadata.name, now.clone()).is_none_or(|before| before != now)
+                            let name = read.object.metadata.name;
+                            held.insert(name.clone(), now.clone()).is_none_or(|before| before != now).then_some(name)
                         }
                         Ok(ReadWatchEvent::Deleted(read)) => {
-                            grants.remove(&read.object.metadata.name);
-                            true
+                            let name = read.object.metadata.name;
+                            held.remove(&name).map(|_| name)
                         }
-                        Ok(ReadWatchEvent::DeletedByName { tombstone, .. }) => {
-                            grants.remove(&tombstone.name);
-                            true
-                        }
+                        // Only a kind held is a live kind: an unheld name is a snapshot's.
+                        Ok(ReadWatchEvent::DeletedByName { tombstone, .. }) => held.remove(&tombstone.name).map(|_| tombstone.name),
                         Err(error) => {
                             debug!(%error, "credential delivery fulfilment kind watch failed");
                             break;
                         }
                     };
                     failures = 0;
-                    if changed {
-                        events.record(|pending| pending.cards.every = true);
+                    if let Some(kind) = changed {
+                        events.record(|pending| {
+                            pending.cards.kinds.insert(kind);
+                        });
                     }
                 }
             }

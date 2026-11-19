@@ -126,10 +126,7 @@ async fn render_card(
     }
     let repository_scope = match work {
         Some(work) => {
-            let policy = vessel_placement_pin(convoy, work).map(|pin| pin.decision.kind).or_else(|| {
-                convoy.status.as_ref().and_then(|status| status.placement_decision.as_ref().map(|decision| decision.kind.clone()))
-            });
-            if let Some(policy) = policy {
+            if let Some(policy) = placement_kind(convoy, work) {
                 let kind =
                     backend.including_replicas::<FulfilmentKind>(namespace).get(&policy).await.map_err(|error| error.to_string())?.object;
                 text.push_str("\n### Environment grants\n");
@@ -207,6 +204,15 @@ async fn render_card(
     }
     text.push_str("\nScope: use the repositories and credential permissions listed above. Run `flotilla crew capabilities` when unsure; it reports the current delivery.\n");
     Ok(text)
+}
+
+/// The fulfilment kind whose grants the card of `work` in `convoy` lists: the kind its placement
+/// decision chose (the vessel's pin, else the convoy's). Always a live kind, never admission's
+/// placement snapshot: a snapshot is never a candidate, so no decision names one.
+fn placement_kind(convoy: &ResourceObject<Convoy>, work: &str) -> Option<String> {
+    vessel_placement_pin(convoy, work)
+        .map(|pin| pin.decision.kind)
+        .or_else(|| convoy.status.as_ref().and_then(|status| status.placement_decision.as_ref().map(|decision| decision.kind.clone())))
 }
 
 /// The requester's open account bindings (#3907): which managed credential and account its
@@ -354,14 +360,63 @@ pub struct CapabilityCardTracker(
     crate::ports::MessagePath,
     /// By namespace, the sessions whose last card refresh failed.
     std::sync::Mutex<BTreeMap<String, BTreeSet<String>>>,
+    /// The fulfilment kind each refreshed card read its grants from, so a kind's change refreshes
+    /// only the cards that read it.
+    std::sync::Mutex<Placements>,
 );
 
 type SessionCardObservation = Arc<Mutex<CardObservation>>;
 
+/// Which fulfilment kind each session's card reads, and the reverse, by namespace.
+#[derive(Default)]
+struct Placements {
+    by_session: BTreeMap<(String, String), String>,
+    by_kind: BTreeMap<(String, String), BTreeSet<String>>,
+}
+
+impl Placements {
+    fn place(&mut self, namespace: &str, session: &str, kind: Option<String>) {
+        let key = (namespace.to_owned(), session.to_owned());
+        if self.by_session.get(&key) == kind.as_ref() {
+            return;
+        }
+        self.forget(namespace, session);
+        if let Some(kind) = kind {
+            self.by_kind.entry((namespace.to_owned(), kind.clone())).or_default().insert(session.to_owned());
+            self.by_session.insert(key, kind);
+        }
+    }
+
+    fn forget(&mut self, namespace: &str, session: &str) {
+        let Some(kind) = self.by_session.remove(&(namespace.to_owned(), session.to_owned())) else { return };
+        let key = (namespace.to_owned(), kind);
+        if let Some(sessions) = self.by_kind.get_mut(&key) {
+            sessions.remove(session);
+            if sessions.is_empty() {
+                self.by_kind.remove(&key);
+            }
+        }
+    }
+}
+
 impl CapabilityCardTracker {
     /// A tracker publishing through `path` (the composition root's slot).
     pub fn with_message_path(path: crate::ports::MessagePath) -> Self {
-        Self(Mutex::default(), path, std::sync::Mutex::default())
+        Self(Mutex::default(), path, std::sync::Mutex::default(), std::sync::Mutex::default())
+    }
+
+    fn placements(&self) -> std::sync::MutexGuard<'_, Placements> {
+        self.3.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The sessions whose last refreshed card read the grants of one of `kinds`.
+    fn placed_by(&self, namespace: &str, kinds: &BTreeSet<String>) -> BTreeSet<String> {
+        let placements = self.placements();
+        kinds
+            .iter()
+            .filter_map(|kind| placements.by_kind.get(&(namespace.to_owned(), kind.clone())))
+            .flat_map(|sessions| sessions.iter().cloned())
+            .collect()
     }
 
     fn failed(&self, namespace: &str) -> BTreeSet<String> {
@@ -587,6 +642,8 @@ pub struct CardScope {
     pub environments: BTreeSet<String>,
     /// The sessions' of these convoys' vessels.
     pub convoys: BTreeSet<String>,
+    /// The sessions' whose cards read these fulfilment kinds' grants, as their last refresh found.
+    pub kinds: BTreeSet<String>,
 }
 
 impl CardScope {
@@ -597,16 +654,16 @@ impl CardScope {
 
     /// Whether it names no card.
     pub fn is_empty(&self) -> bool {
-        !self.every && self.environments.is_empty() && self.convoys.is_empty()
+        !self.every && self.environments.is_empty() && self.convoys.is_empty() && self.kinds.is_empty()
     }
 }
 
-/// The newest launch of each of this home's sessions that `scope` names or `retried` names, and
-/// the vessel launches read finding them, by name.
+/// The newest launch of each of this home's sessions that `scope` names or `by_name` names (by
+/// session name), and the vessel launches read finding them, by name.
 fn sessions_in(
     reads: &dyn LifecycleReads,
     scope: &CardScope,
-    retried: &BTreeSet<String>,
+    by_name: &BTreeSet<String>,
 ) -> Result<(Vec<TerminalRecord>, BTreeMap<String, VesselRecord>), String> {
     let terminals = reads.terminals()?;
     let here = terminals.home().to_owned();
@@ -627,7 +684,7 @@ fn sessions_in(
     // A launch found may not be its session's newest, which is read by the session's name.
     let mut named =
         found.iter().filter(|record| record.home == here).map(|record| record.session_name().to_owned()).collect::<BTreeSet<_>>();
-    named.extend(retried.iter().cloned());
+    named.extend(by_name.iter().cloned());
     let mut sessions = Vec::new();
     for name in named {
         sessions.extend(terminals.get(&name, None)?);
@@ -648,12 +705,15 @@ pub async fn refresh_cards(
     scope: &CardScope,
 ) -> Result<(), String> {
     let retried = tracker.failed(namespace);
-    if scope.is_empty() && retried.is_empty() {
+    // The cards that read a changed kind, by their sessions' names: no read finds them otherwise.
+    let mut named = tracker.placed_by(namespace, &scope.kinds);
+    named.extend(retried.iter().cloned());
+    if !scope.every && scope.environments.is_empty() && scope.convoys.is_empty() && named.is_empty() {
         return Ok(());
     }
     let (sessions, mut vessels) = {
-        let (reads, scope, retried) = (Arc::clone(&reads), scope.clone(), retried.clone());
-        tokio::task::spawn_blocking(carry(move || sessions_in(reads.as_ref(), &scope, &retried)))
+        let (reads, scope) = (Arc::clone(&reads), scope.clone());
+        tokio::task::spawn_blocking(carry(move || sessions_in(reads.as_ref(), &scope, &named)))
             .await
             .map_err(|error| format!("read the sessions for capability cards: {error}"))??
     };
@@ -669,6 +729,24 @@ pub async fn refresh_cards(
         .lock()
         .await
         .retain(|(space, name), _| space != namespace || live.contains(name.as_str()) || (!scope.every && !named.contains(name.as_str())));
+    {
+        // The same sessions leave the kinds' index: every one not live when every card was read,
+        // else those read and found not live.
+        let mut placements = tracker.placements();
+        let ended: Vec<String> = if scope.every {
+            placements
+                .by_session
+                .keys()
+                .filter(|(space, name)| space == namespace && !live.contains(name.as_str()))
+                .map(|(_, name)| name.clone())
+                .collect()
+        } else {
+            named.iter().filter(|name| !live.contains(*name)).map(|name| (*name).to_owned()).collect()
+        };
+        for name in ended {
+            placements.forget(namespace, &name);
+        }
+    }
     let mut errors = Vec::new();
     let mut failed = BTreeSet::new();
     for record in &sessions {
@@ -738,6 +816,8 @@ async fn refresh_record_card(
             return Ok(());
         }
         let work = vessel.work();
+        // Noted before the kind is read, so a change after the reading finds this card.
+        tracker.placements().place(namespace, record.session_name(), placement_kind(&convoy, work));
         let credential_refs = convoy
             .status
             .as_ref()
