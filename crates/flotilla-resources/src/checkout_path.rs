@@ -1,7 +1,7 @@
 //! Shared checkout path selection from durable and observed facts.
 use sha2::{Digest, Sha256};
 
-use crate::{CheckoutSpec, CheckoutStatus, Convoy, ResourceObject, ACTUATOR_SOURCE_ROOT_ANNOTATION};
+use crate::{convoy::engine::launch_slug, CheckoutSpec, CheckoutStatus, Convoy, ResourceObject, ACTUATOR_SOURCE_ROOT_ANNOTATION};
 
 /// The name of a managed checkout for `vessel_name`, scoped by
 /// [`checkout_placement_scope`] when it has one.
@@ -15,7 +15,7 @@ pub fn checkout_name(vessel_name: &str, workspace_slug: &str, multi_repository: 
 /// environment, its crew's sessions): the launch's path-safe slug, so the crew and the import
 /// name them alike.
 pub fn vessel_launch_slug(launch: &str) -> String {
-    crate::convoy::engine::launch_slug(launch)
+    launch_slug(launch)
 }
 
 /// Managed checkout `old`, which [`checkout_name`] named for `old_owner` (an old store's convoy or
