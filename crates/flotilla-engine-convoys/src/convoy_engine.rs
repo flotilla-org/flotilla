@@ -191,6 +191,20 @@ impl ConvoyEngine {
         })
         .await
     }
+
+    /// Retires `convoy` in the deleter's call when it has ended and nothing holds it, so a read
+    /// after the delete does not still list it; one still held is left to the home's retirement
+    /// follower ([`super::retire`]), which tries it again as its holds release. A failed try is
+    /// left to the follower too: the end has been written.
+    async fn retire(&self, convoy: &ResourceObject<OldConvoy>) {
+        let Some(name) = self.held(convoy).map(|launch| launch.name().to_owned()) else { return };
+        let (convoys, now, named) = (Arc::clone(&self.convoys), self.now(), name.clone());
+        match tokio::task::spawn_blocking(carry(move || convoys.retire(&named, now))).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(convoy = %name, %error, "an ended convoy was not retired; its home's follower tries it again"),
+            Err(error) => tracing::warn!(convoy = %name, %error, "retiring an ended convoy did not finish"),
+        }
+    }
 }
 
 #[async_trait]
@@ -484,6 +498,12 @@ impl EngineConvoys for ConvoyEngine {
 
     async fn abandon(&self, convoy: &ResourceObject<OldConvoy>, principal: &str, reason: &str) -> Result<(), String> {
         self.end(convoy, principal, reason, AbandonCause::Operator).await
+    }
+
+    async fn delete(&self, convoy: &ResourceObject<OldConvoy>, principal: &str) -> Result<(), String> {
+        self.end(convoy, principal, "deleted", AbandonCause::Operator).await?;
+        self.retire(convoy).await;
+        Ok(())
     }
 
     async fn fail(&self, convoy: &ResourceObject<OldConvoy>, principal: &str, reason: &str) -> Result<(), String> {

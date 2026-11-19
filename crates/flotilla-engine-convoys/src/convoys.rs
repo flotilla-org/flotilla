@@ -230,7 +230,11 @@ impl Convoys {
             return Ok(Retirement::Held(held));
         }
         let reference = format!("{name}/holds");
-        self.edit(name, now, move |_, world| {
+        self.edit(name, now, move |current, world| {
+            // Its ender and the home's follower may both try it: the second finds it retired.
+            if current.label() == ConvoyLabel::Retired {
+                return Ok((Vec::new(), ()));
+            }
             world.holds.put(&Ref::new(reference.as_str()), held);
             Ok((vec![Retire { holds: Ref::new(reference) }.into()], ()))
         })

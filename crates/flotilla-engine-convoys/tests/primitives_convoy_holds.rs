@@ -53,7 +53,7 @@ use flotilla_resources::{
     ConvoyEnsureSpec, MessageRelation, Observation, ObservedChangeRequestState, SystemClock, WorkflowSnapshot, ENSURED_FROM_ANNOTATION,
 };
 use flotilla_schema::{Address, Frozen, Kind, Records, State, Timestamp};
-use flotilla_schema_sqlite::stream::Service;
+use flotilla_schema_sqlite::stream::{Service, Watermark};
 use flotilla_state_machines::{
     kinds::{stock, Catalog},
     machines::{
@@ -486,6 +486,35 @@ async fn the_home_retires_a_convoy_when_its_last_hold_releases() {
         }
     };
     tokio::time::timeout(std::time::Duration::from_secs(30), retired).await.expect("retired once its checkout released");
+    follower.abort();
+}
+
+// Behaviour: a convoy that ends just before the store is told to rescan its log (another home newly
+// held here, as replication's first round with a peer does) still retires at once. The rescan
+// restarts the home's follower past the end's entry, so the end is found by the rescan, not by
+// the entry.
+#[tokio::test]
+async fn a_convoy_ended_behind_a_rescan_still_retires() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixture = Fixture::new(&dir);
+    let mut convoy_writes = EngineWatch::start(Arc::clone(&fixture.service), [<Resource<Convoy> as Kind>::CODE]).expect("watch");
+    let follower = retire::follow(Arc::clone(&fixture.convoys), Arc::new(SystemClock)).expect("follow");
+    // Both commits land before the follower is first polled, so its next pass is the rescan.
+    fixture.abandon();
+    fixture
+        .service
+        .with_store(|store| {
+            let mut write = store.write()?;
+            write.advance_watermark("home-b", Watermark::ZERO)?;
+            write.commit()
+        })
+        .expect("another home held here");
+    let retired = async {
+        while fixture.label() != ConvoyLabel::Retired {
+            convoy_writes.next(|_, _| Ok(())).await.expect("a convoy write");
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), retired).await.expect("retired though a rescan passed over its end");
     follower.abort();
 }
 

@@ -3537,19 +3537,20 @@ impl CrewService {
 
     /// A delete of convoy `name`. A convoy ends on the engine and is never deleted (#3108): once
     /// its teardown gate passes (force skips it), a live convoy is abandoned by `principal`
-    /// ("operator" when the delete carries none) and an ended one has nothing left to end. Its
-    /// vessels, checkouts and sessions are released by their controllers once it has ended.
+    /// ("operator" when the delete carries none) and an ended one has nothing left to end. Either
+    /// retires in the delete when nothing holds it, so a read after the delete does not list it.
+    /// Its vessels, checkouts and sessions are released by their controllers once it has ended,
+    /// and a convoy they still hold retires as they release it.
     pub async fn reap(&self, namespace: &str, name: &str, force: bool, principal: Option<&PrincipalRef>) -> Result<(), String> {
         self.teardown(namespace, name, force).await?;
         self.cascade_convoy_children(namespace, name).await?;
         let convoy = self.resource_backend.clone().using::<ResourceConvoy>(namespace).get(name).await.map_err(|error| error.to_string())?;
-        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-            return Ok(());
-        }
-        let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
-            .ok_or_else(|| format!("convoy `{name}` is not held at this home"))?;
+        let ended = convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal());
+        let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) else {
+            return if ended { Ok(()) } else { Err(format!("convoy `{name}` is not held at this home")) };
+        };
         let principal = principal.map_or("operator", |principal| principal.name.as_str());
-        engine.abandon(&convoy, principal, "deleted").await
+        engine.delete(&convoy, principal).await
     }
 }
 

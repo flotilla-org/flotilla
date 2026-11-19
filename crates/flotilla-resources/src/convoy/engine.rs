@@ -109,6 +109,11 @@ pub trait EngineConvoys: Send + Sync {
     /// An operator's abandonment, with a reason.
     async fn abandon(&self, convoy: &ResourceObject<Convoy>, principal: &str, reason: &str) -> Result<(), String>;
 
+    /// An operator's delete: `convoy` is abandoned if it is open, and retired in this call when
+    /// nothing holds it, so a read after the delete does not list it. One still held retires as
+    /// its holds release.
+    async fn delete(&self, convoy: &ResourceObject<Convoy>, principal: &str) -> Result<(), String>;
+
     /// Ends `convoy` as failed, as `principal` judged its work, with a reason. An ended convoy is
     /// left as it is.
     async fn fail(&self, convoy: &ResourceObject<Convoy>, principal: &str, reason: &str) -> Result<(), String>;
@@ -693,6 +698,9 @@ mod tests {
             unreachable!()
         }
         async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn delete(&self, _: &ResourceObject<Convoy>, _: &str) -> Result<(), String> {
             Ok(())
         }
         fn promises(&self, convoy: &ResourceObject<Convoy>, home: Option<&str>) -> Result<Option<OldPromises>, String> {

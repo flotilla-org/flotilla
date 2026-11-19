@@ -3,7 +3,8 @@
 //! naming it is written, so no timer runs. The ended convoys still held here are kept in memory,
 //! and a write of a hold kind is mapped to the convoy its record names; when nothing is held,
 //! no record is read for it. A dependent deleted outright names nothing any more, so its
-//! deletion tries every held convoy.
+//! deletion tries every held convoy. A rescan of the log, which passes over the entries written
+//! since the last pass, tries every ended convoy homed here, as the start does.
 
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -149,16 +150,21 @@ fn ended_here(read: &mut Read<'_>, home: &str) -> Result<BTreeSet<String>, Store
 }
 
 /// What `followed` may have retired: each convoy homed here that was written, and each held one
-/// that a written dependent names. A rescan, or a dependent gone without a trace, tries every
-/// held one. Nothing is read while nothing is held.
+/// that a written dependent names. A dependent gone without a trace tries every held one.
+/// Nothing is read for a dependent while nothing is held.
+///
+/// A rescan restarts the follower at each home's current sequence, passing over the entries
+/// written since the last pass, this home's convoy ends among them: it tries every ended convoy
+/// homed here, as the start does, not only the held ones.
 fn candidates(read: &mut Read<'_>, followed: Vec<Followed>, home: &str, held: &BTreeSet<String>) -> Result<Found, StoreError> {
     let convoy = <Resource<Convoy> as Kind>::CODE;
     let mut found = Found::default();
+    let mut rescanned = false;
     for followed in followed {
         let identity = match followed {
             Followed::Changed(identity) => identity,
             Followed::Rescan(_) => {
-                found.every = true;
+                rescanned = true;
                 continue;
             }
         };
@@ -180,6 +186,10 @@ fn candidates(read: &mut Read<'_>, followed: Vec<Followed>, home: &str, held: &B
             Some(names) => found.convoys.extend(names.into_iter().filter(|name| held.contains(name))),
             None => found.every = true,
         }
+    }
+    if rescanned {
+        // Every held convoy among them: a held one has ended and not retired.
+        found.convoys.extend(ended_here(read, home)?);
     }
     Ok(found)
 }

@@ -6,9 +6,11 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::Utc;
-use flotilla_engine_convoys::{convoy_engine::ConvoyEngine, convoy_map, convoys::Convoys};
+use flotilla_engine_convoys::{convoy_engine::ConvoyEngine, convoy_map, convoy_records::EngineConvoyRecords, convoys::Convoys};
+use flotilla_engine_messages::awaiting::OpenAwaiting;
 use flotilla_resources::{
     convoy::engine::{Actor, EngineConvoys, VerdictScope},
+    convoy_records::{ConvoyEnd, ConvoyRecords},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource as OldSource, PromiseState, Submission, SubmissionVerdict},
     Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, ResourceObject,
     SystemClock, VesselRequirement, WorkflowSnapshot,
@@ -34,10 +36,18 @@ fn fixture() -> Fixture {
 }
 
 fn fixture_at(home: &str) -> Fixture {
+    fixture_over(home, flotilla_engine_store::registry().expect("registry"))
+}
+
+/// A fixture over the decided store's whole registry: every kind that can hold a convoy, so its
+/// holds read.
+fn decided_fixture() -> Fixture {
+    fixture_over("home-a", flotilla_provisioning::stored::decided_registry().expect("registry"))
+}
+
+fn fixture_over(home: &str, registry: flotilla_schema::KindRegistry) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
-    let service = Arc::new(
-        Service::open(&dir.path().join("decided.sqlite"), home, flotilla_engine_store::registry().expect("registry")).expect("store"),
-    );
+    let service = Arc::new(Service::open(&dir.path().join("decided.sqlite"), home, registry).expect("store"));
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = Arc::new(Convoys::open(home, &service).expect("convoys"));
     let engine = ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), Arc::new(SystemClock));
@@ -374,6 +384,30 @@ async fn abandonment_ends_the_engine_convoy() {
     let engine = fixture.convoys.get("c").expect("held");
     assert_eq!(engine.state().reason(), Some("superseded"));
     fixture.engine.abandon(&convoy, "alice", "again").await.expect("already ended");
+}
+
+// Behaviour: an operator's delete abandons the convoy and, with nothing holding it, retires it in
+// the same call, with no retirement follower running: a listing read straight after the delete
+// leaves it out, and a read by name still says how it ended. Deleting it again is no error.
+#[tokio::test]
+async fn a_delete_retires_a_convoy_nothing_holds() {
+    let fixture = decided_fixture();
+    let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true)])])).await;
+    let records = EngineConvoyRecords::new(
+        "home-a",
+        Arc::clone(&fixture.service),
+        Arc::default(),
+        OpenAwaiting::open(&fixture.service).expect("open awaiting"),
+    );
+    assert_eq!(records.at("home-a").expect("listing").records.len(), 1);
+    let launch = fixture.convoys.get("c").expect("held").name().to_owned();
+
+    fixture.engine.delete(&convoy, "alice").await.expect("deleted");
+    assert_eq!(fixture.convoys.get("c").expect("held").label(), ConvoyLabel::Retired);
+    assert_eq!(records.at("home-a").expect("listing").records.len(), 0, "a deleted convoy is not listed");
+    let ended = records.get(&launch, None).expect("read").expect("a retired convoy reads by name");
+    assert_eq!(ended.ended.map(|(end, _)| end), Some(ConvoyEnd::Abandoned { reason: "deleted".into() }));
+    fixture.engine.delete(&convoy, "alice").await.expect("deleting a retired convoy again");
 }
 
 // Behaviour (#3108 C3'): a supervisor's or operator's Fail ruling is the engine's FailSeat on the

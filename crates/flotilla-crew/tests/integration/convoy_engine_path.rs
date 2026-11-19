@@ -90,6 +90,9 @@ impl EngineConvoys for Recording {
     async fn abandon(&self, _: &ResourceObject<Convoy>, _: &str, _: &str) -> Result<(), String> {
         Ok(())
     }
+    async fn delete(&self, _: &ResourceObject<Convoy>, _: &str) -> Result<(), String> {
+        Ok(())
+    }
     async fn fail(&self, _: &ResourceObject<Convoy>, _: &str, reason: &str) -> Result<(), String> {
         self.failures.lock().expect("failures").push(reason.to_owned());
         Ok(())
