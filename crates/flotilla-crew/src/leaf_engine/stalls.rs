@@ -715,6 +715,9 @@ struct RowsVerdict<'a> {
     unable: Vec<(&'a LeafSubscriptionRow, String, StallEvidenceSource)>,
     able: bool,
     unknown: bool,
+    /// A row other than a change request's observation is able or still to be judged: something
+    /// besides the forge can move the convoy.
+    moved_beyond_observation: bool,
     actionable_rows: usize,
 }
 
@@ -731,9 +734,11 @@ struct StallCause<'a> {
 /// What each stall is judged from this tick, by the seat it is about; `None` for a convoy no row
 /// moves. A crew's unable row declaring its stall is that stall's cause whatever other rows say
 /// (#3893). A declaration with no row to carry it (no exit, nothing actionable) is its cause once
-/// no maker is able or unjudged (`unmoved`): "I'm stuck" goes up the ladder either way. Every
-/// other unable row is a cause only while the convoy is `stuck`. Of two rows about one seat, the
-/// crew's declaration outranks other evidence, else the first stands.
+/// no maker is able or unjudged (`unmoved`): "I'm stuck" goes up the ladder either way. An
+/// armed seat's unable row is a cause while nothing but the forge's observation can move the
+/// convoy (`seats_stuck`). Every other unable row is a cause only while the convoy is `stuck`.
+/// Of two rows about one seat, the crew's declaration outranks other evidence, else the first
+/// stands.
 #[allow(clippy::type_complexity)]
 fn stall_causes<'a>(
     status: &ConvoyStatus,
@@ -741,11 +746,13 @@ fn stall_causes<'a>(
     holding: bool,
     unmoved: bool,
     stuck: bool,
+    seats_stuck: bool,
 ) -> BTreeMap<Option<(String, String)>, Option<StallCause<'a>>> {
     let mut causes = BTreeMap::new();
     for (row, evidence, source) in unable {
         let crew = source == StallEvidenceSource::Crew;
-        if !(stuck || (holding && crew)) {
+        let seat_owes = seats_stuck && matches!(row.maker, LeafMaker::Actor { .. });
+        if !(stuck || seat_owes || (holding && crew)) {
             continue;
         }
         let seat = owned_seat(flotilla_resources::leaves_seat(&row.leaves));
@@ -1087,12 +1094,16 @@ impl ReconcilerWake {
         let Some(crew) = self.observe_convoy_crew(tick, convoy, status).await? else { return Ok(()) };
         let ConvoyCrew { sessions: selected_sessions, vessels: selected_vessels, mut obligations, holding } = crew;
         let verdict = self.judge_convoy_rows(tick, convoy, status, &selected_sessions, &selected_vessels, &mut obligations).await?;
-        let RowsVerdict { progress_changed, unable, able, unknown, actionable_rows } = verdict;
+        let RowsVerdict { progress_changed, unable, able, unknown, moved_beyond_observation, actionable_rows } = verdict;
         // Nothing can move the convoy: no maker is able, and none is still to be judged.
         let unmoved = holding && !able && !unknown;
         let stuck = unmoved && (!launch_underway(status.phase) || actionable_rows > 0);
+        // Nothing but the forge can move it. An armed seat owes work (a turn delivered after its
+        // submissions, an open promise); that the forge could still merge or close its PR does
+        // not answer it (GitHub run GH-3).
+        let seats_stuck = holding && !moved_beyond_observation && (!launch_underway(status.phase) || actionable_rows > 0);
         let mut next = Stalls::default();
-        for (seat, cause) in stall_causes(status, unable, holding, unmoved, stuck) {
+        for (seat, cause) in stall_causes(status, unable, holding, unmoved, stuck, seats_stuck) {
             let seat = seat.as_ref().map(|(work, role)| (work.as_str(), role.as_str()));
             let held = status.stalls.about(seat);
             // A consumed ladder stays consumed until the crew makes progress.
@@ -1287,6 +1298,7 @@ impl ReconcilerWake {
         let mut unable = Vec::new();
         let mut able = false;
         let mut unknown = false;
+        let mut moved_beyond_observation = false;
         let mut actionable_rows = 0;
         let settlement_satisfied = convoy_rows.iter().any(|row| {
             matches!(&row.maker,
@@ -1360,13 +1372,16 @@ impl ReconcilerWake {
                     }
                 }
             };
+            let observation = matches!(row.maker, LeafMaker::Observed { .. });
             match judgement {
                 RowJudgement::Unknown => {
                     unknown = true;
+                    moved_beyond_observation |= !observation;
                     continue;
                 }
                 RowJudgement::Able => {
                     able = true;
+                    moved_beyond_observation |= !observation;
                     continue;
                 }
                 RowJudgement::Unable(evidence, source) => {
@@ -1379,7 +1394,7 @@ impl ReconcilerWake {
                 }
             };
         }
-        Ok(RowsVerdict { progress_changed, unable, able, unknown, actionable_rows })
+        Ok(RowsVerdict { progress_changed, unable, able, unknown, moved_beyond_observation, actionable_rows })
     }
 
     /// Judges an actor row from its crew session, recording its progress on its obligation.

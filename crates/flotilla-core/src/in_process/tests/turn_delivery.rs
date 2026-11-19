@@ -1,4 +1,5 @@
 use flotilla_store_memory::engine_home_backend;
+use flotilla_store_testkit::cr_name;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -340,7 +341,8 @@ async fn an_idle_seat_given_a_turn_after_its_submission_is_nudged() {
     );
 
     clock.advance(chrono::Duration::seconds(1));
-    judge_idle_past_observer_grace(&daemon, &probe, &clock, &launch).await;
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
     let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
     let stalled = status.stalls.about(Some(("work", "coder"))).expect("the seat is stalled");
     assert_eq!(stalled.rung, StallRung::Nudge);
@@ -434,7 +436,8 @@ async fn a_checks_failed_turn_after_submission_nudges_the_idle_seat_naming_the_t
     let before: BTreeSet<String> = crew_messages(&daemon, "flotilla").await.into_iter().map(|message| message.metadata.name).collect();
 
     clock.advance(chrono::Duration::seconds(1));
-    judge_idle_past_observer_grace(&daemon, &probe, &clock, &launch).await;
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
     let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
     assert_eq!(status.stalls.about(Some(("work", "coder"))).expect("the seat is stalled").rung, StallRung::Nudge);
     let nudges: Vec<_> = crew_messages(&daemon, "flotilla")
@@ -449,6 +452,81 @@ async fn a_checks_failed_turn_after_submission_nudges_the_idle_seat_naming_the_t
     assert!(!nudges[0].contains("have not answered"), "{}", nudges[0]);
     assert!(nudges[0].contains(CHECKS_BRIEF.lines().next().expect("first line")), "{}", nudges[0]);
     assert!(!nudges[0].contains("submit your PR"), "{}", nudges[0]);
+}
+
+// GitHub run GH-3: the observer keeps the coder's PR current, as it does against a real forge. The
+// PR's rows (its merge or close) are then able to move the convoy, yet the seat still owes the
+// checks-failed turn: the observer's ability does not answer what the idle seat was asked to do,
+// so the seat is nudged. Run 5's nudge came only because its PR's observation had gone stale.
+#[tokio::test]
+async fn a_checks_failed_turn_nudges_the_idle_seat_while_its_pr_is_observed_current() {
+    use flotilla_resources::{Clock, StallRung};
+
+    let coder = coder().await;
+    submit_pr(&coder).await;
+    observe_pr(&coder, flotilla_resources::ObservedChecks::Fail).await;
+    deliver_rule_turn(&coder, CHECKS_RULE, CHECKS_BRIEF, "head-1@fail", true).await;
+    let Coder { daemon, backend, probe, clock, launch, .. } = coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let before = crew_messages(&daemon, "flotilla").await.len();
+
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
+    let observed = records.get(&cr_name("github.com", "flotilla-org/flotilla", 2200)).await.expect("the PR's record");
+    let observed_at = observed.status.expect("observed").state.observed_at;
+    assert!(clock.now().signed_duration_since(observed_at) < chrono::Duration::minutes(1), "the PR is observed current");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert_eq!(status.stalls.about(Some(("work", "coder"))).map(|stalled| stalled.rung), Some(StallRung::Nudge), "{:?}", status.stalls);
+    assert!(status.stalls.about(None).is_none(), "the observer is not stalled: {:?}", status.stalls);
+    let messages = crew_messages(&daemon, "flotilla").await;
+    assert_eq!(messages.len(), before + 1, "one nudge");
+    assert!(messages
+        .iter()
+        .any(|message| message.spec.body.contains(&format!("the newest turn that asked you to act is `{CHECKS_RULE}`"))));
+}
+
+/// The observer reads the coder's PR now: open, mergeable, with `checks`.
+async fn observe_pr(coder: &Coder, checks: flotilla_resources::ObservedChecks) {
+    use flotilla_resources::{Clock, Observation};
+
+    let records = coder.backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
+    let name = cr_name("github.com", "flotilla-org/flotilla", 2200);
+    let record = match records.get(&name).await {
+        Ok(record) => record,
+        Err(_) => records
+            .create(
+                &super::support::test_meta(&name),
+                &flotilla_resources::ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("flotilla-org/flotilla".into())
+                    .number(2200)
+                    .observing_authority("test".into())
+                    .build(),
+            )
+            .await
+            .expect("the PR's record"),
+    };
+    let now = coder.clock.now();
+    records
+        .update_status(
+            &name,
+            &record.metadata.resource_version,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: Observation::known(flotilla_resources::ObservedChangeRequestState::Open, now),
+                head_sha: Observation::known("head-1".into(), now),
+                checks: Observation::known(checks, now),
+                review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, now) },
+                mergeable: Observation::known(flotilla_resources::ObservedMergeability::Mergeable, now),
+            },
+        )
+        .await
+        .expect("observe the PR");
 }
 
 /// The review rule fires while the coder's PR waits on the forge, as turn delivery does it: the
@@ -669,23 +747,6 @@ fn idle_coder(
     super::support::agent_sessions(daemon)
         .observe(launch, Activity::Idle, "Stop".into(), super::support::engine_at(now))
         .expect("hook activity");
-}
-
-/// Judges the idle coder's seat once the observer's refresh grace for its PR has passed. The fixture
-/// has no forge for the PR, so a turn's demand for a current observation of it is never answered:
-/// the first judgement finds the row inside the grace the observer schedules on this clock and pins
-/// it, and the seat is judged after the clock moves past it.
-async fn judge_idle_past_observer_grace(
-    daemon: &Arc<InProcessDaemon>,
-    probe: &super::support::SessionStagingProbe,
-    clock: &flotilla_store_testkit::VirtualClock,
-    launch: &str,
-) {
-    idle_coder(daemon, probe, clock, launch);
-    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement inside the grace");
-    clock.advance(chrono::Duration::minutes(2));
-    idle_coder(daemon, probe, clock, launch);
-    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
 }
 
 /// The coder's inbox in launch `convoy` of project flotilla.
