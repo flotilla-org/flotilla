@@ -590,6 +590,185 @@ async fn a_turn_answered_before_a_restart_does_not_nudge_after_it() {
     assert_not_nudged(coder).await;
 }
 
+// GitHub run GH3-1: an operator resumed a coder that owed a failing-checks turn, telling it to
+// leave the PR as it was, and the judge nudged it 58 ms later from an idle that predated the
+// resume. A resume holds supervision for its grace. A turn delivered after the resume is owed as
+// usual: once the coder idles after it and the grace has passed, it is nudged about that turn.
+#[tokio::test]
+async fn a_resumed_seat_that_owes_a_turn_is_not_nudged_inside_the_resume_grace() {
+    use flotilla_resources::StallRung;
+
+    let coder = owing_coder_resumed_from_its_stall().await;
+    {
+        let Coder { daemon, backend, probe, .. } = &coder;
+        let before = crew_messages(daemon, "flotilla").await.len();
+        daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement after the resume");
+        let status = backend.clone().using::<ResourceConvoy>("flotilla").get(&probe.convoy).await.expect("convoy").status.expect("status");
+        assert!(status.stalls.about(Some(("work", "coder"))).is_none(), "{:?} {:?}", status.stalls, status.crew_work["work"]["coder"]);
+        let after = crew_messages(daemon, "flotilla").await;
+        assert_eq!(after.len(), before, "no nudge: {:?}", after.iter().map(|message| &message.spec.body).collect::<Vec<_>>());
+    }
+
+    // A turn after the resume asks the coder to act; it idles after it, past the resume's grace.
+    deliver_subject_turn(&coder, REVIEW_RULE, "Address the actionable review and push the fix.", "head-1", true, "head-1").await;
+    let Coder { daemon, backend, probe, clock, launch, .. } = coder;
+    let before = crew_messages(&daemon, "flotilla").await.len();
+    clock.advance(chrono::Duration::minutes(3));
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement after the grace");
+    let status = backend.clone().using::<ResourceConvoy>("flotilla").get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert_eq!(status.stalls.about(Some(("work", "coder"))).map(|stalled| stalled.rung), Some(StallRung::Nudge), "{:?}", status.stalls);
+    let messages = crew_messages(&daemon, "flotilla").await;
+    assert_eq!(messages.len(), before + 1, "one nudge");
+    assert!(messages
+        .iter()
+        .any(|message| message.spec.body.contains(&format!("the newest turn that asked you to act is `{REVIEW_RULE}`"))));
+}
+
+// GitHub run N3-4 (ruled): an operator's resume answers the turns its seat owed before it; the
+// operator is the authority. The coder told to leave its PR as it is idles after the resume and
+// past its grace, and is neither nudged nor escalated, across a restart too.
+#[tokio::test]
+async fn a_resume_answers_the_turns_owed_before_it() {
+    let coder = owing_coder_resumed_from_its_stall().await;
+    coder.clock.advance(chrono::Duration::minutes(3));
+    assert_not_nudged_again(&coder).await;
+    restart(&coder);
+    coder.clock.advance(chrono::Duration::minutes(3));
+    assert_not_nudged(coder).await;
+}
+
+// GitHub run N3-2: the nudge ladder's position is the home's note, which a restart empties. The
+// nudges already sent for the idle episode are durable Messages, so the ladder continues from them
+// after a restart: the coder nudged once before it is nudged once more after it, then escalated to
+// the operator, rather than nudged from the first rung again.
+#[tokio::test]
+async fn the_nudge_ladder_continues_after_a_restart() {
+    use flotilla_resources::{Clock, StallRung};
+
+    let coder = coder().await;
+    submit_pr(&coder).await;
+    observe_pr(&coder, "head-1", flotilla_resources::ObservedChecks::Fail).await;
+    deliver_subject_turn(&coder, CHECKS_RULE, CHECKS_BRIEF, "head-1@fail", true, "head-1").await;
+    let judge_idle = |coder: &Coder| {
+        let (daemon, probe, clock, launch) = (coder.daemon.clone(), coder.probe.clone(), coder.clock.clone(), coder.launch.clone());
+        async move {
+            for nudge in crew_messages(&daemon, "flotilla").await {
+                if nudge.status.as_ref().is_some_and(|status| status.phase.is_waiting()) {
+                    receive_turn(&daemon, &nudge.spec.receiver, &nudge.metadata.name, "resume-staging-session", clock.now()).await;
+                }
+            }
+            clock.advance(chrono::Duration::seconds(5));
+            idle_coder(&daemon, &probe, &clock, &launch);
+            daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+        }
+    };
+    let stalled = |coder: &Coder| {
+        let (backend, convoy) = (coder.backend.clone(), coder.probe.convoy.clone());
+        async move {
+            let status = backend.using::<ResourceConvoy>("flotilla").get(&convoy).await.expect("convoy").status.expect("status");
+            status.stalls.about(Some(("work", "coder"))).cloned().expect("the seat is stalled")
+        }
+    };
+    let nudges = |coder: &Coder| {
+        let daemon = coder.daemon.clone();
+        async move {
+            crew_messages(&daemon, "flotilla")
+                .await
+                .into_iter()
+                .filter(|message| message.spec.body.contains("the newest turn that asked you to act"))
+                .count()
+        }
+    };
+
+    judge_idle(&coder).await;
+    let first = stalled(&coder).await;
+    assert_eq!((first.rung, first.nudge_history.len()), (StallRung::Nudge, 1));
+    assert_eq!(nudges(&coder).await, 1);
+
+    restart(&coder);
+    judge_idle(&coder).await;
+    let second = stalled(&coder).await;
+    assert_eq!((second.rung, second.nudge_history.len()), (StallRung::Nudge, 2), "{second:?}");
+    assert_eq!(second.nudge_history[0].at, first.nudge_history[0].at, "the first nudge is the one sent before the restart");
+    assert_eq!(nudges(&coder).await, 2);
+
+    restart(&coder);
+    judge_idle(&coder).await;
+    let third = stalled(&coder).await;
+    assert_eq!(third.rung, StallRung::Operator, "{third:?}");
+    assert_eq!(nudges(&coder).await, 2, "the ladder's nudges are spent");
+}
+
+/// A coder that owes a failing-checks turn, declared a stall and was resumed by the operator with
+/// guidance it received, its idle from before the resume.
+async fn owing_coder_resumed_from_its_stall() -> Coder {
+    use flotilla_resources::{Clock, StallRung};
+
+    let coder = coder().await;
+    submit_pr(&coder).await;
+    observe_pr(&coder, "head-1", flotilla_resources::ObservedChecks::Fail).await;
+    deliver_subject_turn(&coder, CHECKS_RULE, CHECKS_BRIEF, "head-1@fail", true, "head-1").await;
+    let Coder { daemon, backend, probe, clock, launch, context } = &coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(daemon, probe, clock, launch);
+    daemon
+        .crew
+        .stall(context, flotilla_resources::StallReason::Access, None, "cannot read the check's status".into())
+        .await
+        .expect("declare the stall");
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement of the declaration");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert_eq!(status.stalls.about(Some(("work", "coder"))).map(|stalled| stalled.rung), Some(StallRung::Operator), "{:?}", status.stalls);
+
+    // Minutes later the operator resumes it, and the coder receives the guidance.
+    clock.advance(chrono::Duration::minutes(4));
+    let before: BTreeSet<String> = crew_messages(daemon, "flotilla").await.into_iter().map(|message| message.metadata.name).collect();
+    let principal = flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "robert".into() };
+    daemon
+        .crew
+        .supervise(
+            flotilla_crew::crew_ops::CrewSupervisionRequest::builder()
+                .namespace("flotilla")
+                .convoy_name(&probe.convoy)
+                .vessel("work")
+                .role("coder")
+                .operation(flotilla_protocol::CrewSupervisionAction::Resume)
+                .message("Leave the PR as it is for now.")
+                .principal(&principal)
+                .build(),
+        )
+        .await
+        .expect("operator resume");
+    let guidance = crew_messages(daemon, "flotilla")
+        .await
+        .into_iter()
+        .find(|message| !before.contains(&message.metadata.name))
+        .expect("the operator's guidance");
+    assert_eq!(guidance.spec.body, "Leave the PR as it is for now.");
+    receive_turn(daemon, &guidance.spec.receiver, &guidance.metadata.name, "resume-staging-session", clock.now()).await;
+    coder
+}
+
+/// [`assert_not_nudged`], keeping the coder.
+async fn assert_not_nudged_again(coder: &Coder) {
+    let Coder { daemon, backend, probe, clock, launch, .. } = coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let before = crew_messages(daemon, "flotilla").await.len();
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(daemon, probe, clock, launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert!(
+        !status.stalls.iter().any(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { .. }))),
+        "{:?}",
+        status.stalls
+    );
+    let after = crew_messages(daemon, "flotilla").await;
+    assert_eq!(after.len(), before, "no nudge: {:?}", after.iter().map(|message| &message.spec.body).collect::<Vec<_>>());
+}
+
 /// What a restart loses: the home's in-memory notes on the coder's convoy, turn delivery's
 /// episodes among them.
 fn restart(coder: &Coder) {
