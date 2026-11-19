@@ -29,7 +29,7 @@ use std::{
 };
 
 use crate::{
-    lifecycle_reads::{ChangeCursor, LifecycleReads},
+    lifecycle_reads::{ChangeCursor, LifecycleReads, Told},
     terminal_records::{launched, TerminalChange, TerminalRecord},
     vessel_records::{VesselChange, VesselRecord},
 };
@@ -45,6 +45,9 @@ type Key = (String, String);
 #[derive(Default)]
 pub struct HeldJoins {
     state: Mutex<State>,
+    /// The commits its cursors were told of, kept apart from the state so a view can tell it is
+    /// current without waiting on a pass; none until the cursors start, or where they cannot tell.
+    told: Mutex<Option<Vec<Told>>>,
 }
 
 #[derive(Default)]
@@ -150,6 +153,7 @@ impl HeldJoins {
             None => {
                 // Follow before filling, so no change between the fill and the first pass is missed.
                 let cursors = Cursors::start(reads);
+                *locked(&self.told) = cursors.as_ref().and_then(Cursors::told);
                 let mut filled = Held {
                     cursors,
                     vessels: BTreeMap::new(),
@@ -180,6 +184,14 @@ impl HeldJoins {
         }
         held.evict(readers.values().map(|composed| composed.load(Ordering::Acquire)).min());
         Ok(read(Joins { held }))
+    }
+
+    /// How many commits that may change the launches held its cursors have been told of, counted
+    /// before each writer's call returns: a read made after a pass that began at this count holds
+    /// every such commit counted. None before the first read, or where the cursors cannot tell.
+    /// Takes no lock a pass holds.
+    pub fn told(&self) -> Option<u64> {
+        locked(&self.told).as_ref().map(|told| told.iter().map(Told::get).fold(0, u64::saturating_add))
     }
 
     /// How many launches are held.
@@ -244,6 +256,13 @@ impl Cursors {
             Err(_) => None,
         };
         Some(Self { vessels, terminals })
+    }
+
+    /// Each cursor's count of the commits it was told of; none where any cannot tell.
+    fn told(&self) -> Option<Vec<Told>> {
+        let vessels = self.vessels.as_ref().map(|cursor| cursor.told());
+        let terminals = self.terminals.as_ref().map(|cursor| cursor.told());
+        [vessels, terminals].into_iter().flatten().collect()
     }
 
     fn position(&self) -> u64 {

@@ -36,7 +36,7 @@ use flotilla_resources::{
     convoy_records::{ConvoyChange, ConvoyJoins, ConvoyListing, ConvoyNotes, ConvoyRecord, ConvoyRecords, UnreadableLaunch, WorkFacts},
     engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal, WriteError},
     held_joins::{JoinChange, JoinChanges, JoinsReader},
-    lifecycle_reads::{ChangeCursor, LifecycleReads},
+    lifecycle_reads::{ChangeCursor, LifecycleReads, Told},
     terminal_records::{newest_launches, TerminalRecord},
     vessel_records::{interrupted_message, VesselRecord},
     Convoy, ConvoySpec, ConvoyStatus, ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance,
@@ -61,7 +61,14 @@ struct Held {
     ticks: Mutex<Option<tokio::sync::broadcast::Sender<()>>>,
     /// The measured reads waiting on a fill or pass of the views, which count its reads.
     waiters: reads::Waiters,
+    /// The commits the convoys' cursor was told of, read without the state's lock: with the held
+    /// joins' count, whether the views hold every commit made before a read (see
+    /// [`HeldViews::current`]). Unset where the cursor cannot tell.
+    told: std::sync::OnceLock<Told>,
 }
+
+/// The commits told to the convoys' cursor and to the held joins' cursors.
+type ToldCounts = (u64, u64);
 
 /// The caller the follower's reads count for.
 const FOLLOWER: &str = "Convoy views";
@@ -108,6 +115,9 @@ struct HeldViews {
     /// How many view changes the watchers have read: one that asks what changed since a position
     /// has read every change before it.
     delivered: u64,
+    /// The commit counts read before the last pass or fill that completed: the views hold every
+    /// commit counted. None where the counts cannot be told, and each read then passes.
+    through: Option<ToldCounts>,
 }
 
 /// A launch's view and the version it is handed out at.
@@ -281,26 +291,47 @@ impl ConvoyViews {
     }
 
     /// Reads the views held, filling them on first use and starting the follower that keeps them.
-    /// Every change written before the read is read into them first.
+    /// Every change written before the read is read into them first: the commits counted before
+    /// it waits for the views are read in by a pass, its own or one that began after them; while
+    /// none is uncounted, the read reads the views as held and reads no store.
     /// A measured read counts the fill or pass it waits on, the follower's included.
     async fn with_held<T>(&self, read: impl FnOnce(&mut HeldViews) -> T) -> Result<T, ResourceError> {
+        // Before the lock: a pass that began while this read waited reads every commit counted.
+        let told = self.told();
         let waiters = &self.held.waiters;
         waiters
             .wait(async {
                 let mut state = self.held.state.lock().instrument(info_span!("convoy_views.lock_wait")).await;
-                waiters.serve(self.read_held(&mut state, read)).await
+                waiters.serve(self.read_held(&mut state, told, read)).await
             })
             .await
     }
 
-    /// [`Self::with_held`] once the views are taken.
-    async fn read_held<T>(&self, state: &mut Option<HeldViews>, read: impl FnOnce(&mut HeldViews) -> T) -> Result<T, ResourceError> {
+    /// The commits told so far to the convoys' cursor and the held joins' cursors; none where
+    /// either cannot tell.
+    fn told(&self) -> Option<ToldCounts> {
+        let convoys = self.held.told.get()?.get();
+        let joins = self.reads.joins().ok()?.told()?;
+        Some((convoys, joins))
+    }
+
+    /// [`Self::with_held`] once the views are taken, with the commits `told` before it waited.
+    async fn read_held<T>(
+        &self,
+        state: &mut Option<HeldViews>,
+        told: Option<ToldCounts>,
+        read: impl FnOnce(&mut HeldViews) -> T,
+    ) -> Result<T, ResourceError> {
         if state.is_none() {
             // Follow before filling, so no change between the fill and the first pass is missed.
             let wakes = self.wakes()?;
             let notes = self.convoys().map_err(ResourceError::other)?.memory().subscribe();
             let reads = Arc::clone(&self.reads);
             let cursors = self.blocking(move |_| Cursors::start(reads)).await?;
+            if let Some(told) = cursors.as_ref().and_then(|cursors| cursors.convoys.told()) {
+                // Set once: the views are filled once, and their cursors kept.
+                let _ = self.held.told.set(told);
+            }
             let cursors_read = cursors.as_ref().map_or(0, Cursors::position);
             let mut held = HeldViews {
                 views: BTreeMap::new(),
@@ -326,15 +357,18 @@ impl ConvoyViews {
                 ended_works: BTreeMap::new(),
                 retiring: BTreeMap::new(),
                 delivered: 0,
+                through: None,
             };
             self.refill(&mut held).await?;
             *state = Some(held);
             tokio::spawn(reads::attributed(reads::caller(FOLLOWER), self.clone().follow(wakes)));
         }
         let held = state.as_mut().expect("filled above");
-        if let Err(error) = self.pass(held).instrument(info_span!("convoy_views.pass", by = "read")).await {
-            tracing::warn!(%error, "convoy views: a change did not read; reading them all again");
-            self.refill(held).await?;
+        if !held.current(told) {
+            if let Err(error) = self.pass(held).instrument(info_span!("convoy_views.pass", by = "read")).await {
+                tracing::warn!(%error, "convoy views: a change did not read; reading them all again");
+                self.refill(held).await?;
+            }
         }
         held.evict(self.watched());
         Ok(read(held))
@@ -368,27 +402,39 @@ impl ConvoyViews {
         .boxed())
     }
 
-    /// Recomposes the views each wake's changes touch, and ticks the watchers.
+    /// Recomposes the views each wake's changes touch, and ticks the watchers. One pass reads
+    /// every wake waiting, and the views are let go between passes, so a read waits on at most
+    /// the pass running.
     ///
-    /// A read that takes the views before the follower has woken for a write composes that write's
-    /// launches itself, so a writer reads back what it wrote. That read's cost grows with the
-    /// writes not yet followed, not with the launches held: an occasional small cost in a read
-    /// right after a write is this read-your-writes, not a regression.
+    /// A read that takes the views before the follower has passed over a write composes that
+    /// write's launches itself, so a writer reads back what it wrote. That read's cost grows with
+    /// the writes not yet followed, not with the launches held, and a pass that began after the
+    /// read's commits were counted serves it.
     async fn follow(self, mut wakes: BoxStream<'static, ()>) {
-        let mut ended = false;
-        while !ended && wakes.next().await.is_some() {
+        while wakes.next().await.is_some() {
+            let mut ended = false;
+            while let Some(wake) = wakes.next().now_or_never() {
+                if wake.is_none() {
+                    ended = true;
+                    break;
+                }
+            }
+            let told = self.told();
             let mut state = self.held.state.lock().instrument(info_span!("convoy_views.lock_wait", by = "follower")).await;
             let Some(held) = state.as_mut() else { return };
             let waiters = &self.held.waiters;
-            waiters.serve(self.follow_wakes(held, &mut wakes, &mut ended)).await;
+            waiters.serve(self.follow_wake(held, told)).await;
             drop(state);
             self.tick();
+            if ended {
+                return;
+            }
         }
     }
 
-    /// Passes the views over one wake's changes and every wake waiting behind it.
-    async fn follow_wakes(&self, held: &mut HeldViews, wakes: &mut BoxStream<'static, ()>, ended: &mut bool) {
-        loop {
+    /// Passes the views over the changes since the last pass, unless a read already has.
+    async fn follow_wake(&self, held: &mut HeldViews, told: Option<ToldCounts>) {
+        if !held.current(told) {
             if let Err(error) = self.pass(held).instrument(info_span!("convoy_views.pass", by = "follower")).await {
                 // The views are read again in full; a failed read leaves them as they were.
                 tracing::warn!(%error, "convoy views: a change did not read; reading them all again");
@@ -396,21 +442,8 @@ impl ConvoyViews {
                     tracing::warn!(%error, "convoy views: reading them all again failed");
                 }
             }
-            held.evict(self.watched());
-            // The changes made during the pass are read before a waiting read takes the views, so
-            // it composes none of them; one pass reads every wake waiting.
-            let mut woken = false;
-            while let Some(wake) = wakes.next().now_or_never() {
-                *ended |= wake.is_none();
-                woken |= wake.is_some();
-                if *ended {
-                    break;
-                }
-            }
-            if !woken {
-                break;
-            }
         }
+        held.evict(self.watched());
     }
 
     /// Reads into the views the changes since the last pass: the records' from their cursors, and
@@ -418,6 +451,8 @@ impl ConvoyViews {
     async fn pass(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
         use tokio::sync::broadcast::error::TryRecvError;
         let Some(following) = held.following.clone() else { return self.refill(held).await };
+        // Before the cursors read the log: the commits counted are among what they read.
+        let told = self.told();
         let passing = Arc::clone(&following);
         // A failed pass still moved the cursors: the views take how far they read before failing.
         let (failed, seen) = self
@@ -482,41 +517,55 @@ impl ConvoyViews {
         }
         // Every launch whose joins changed before `seen` is composed again.
         following.lock().unwrap_or_else(PoisonError::into_inner).cursors.composed(seen);
+        held.through = told;
         Ok(())
     }
 
     /// Composes the launches owed again from their records; one with no record leaves the views,
     /// and one that cannot be read is held as unreadable, with why. A retired one not held is
     /// taken in only where its own record changed: it retired since the last pass, and its
-    /// watchers are yet to read how it ended. Each stays owed until its view is held.
+    /// watchers are yet to read how it ended. The launches owed are read in one read of the store
+    /// and composed together; each stays owed until its view is held.
     async fn recompose(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
         if held.refill_owed {
             return self.refill(held).await;
         }
         let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
-        while let Some((home, name)) = held.owed.first().cloned() {
-            let (key_home, key_name) = (home.clone(), name.clone());
-            let ConvoyListing { records, unreadable } =
-                self.blocking(move |reads| reads.convoys()?.named(&key_name, Some(&key_home))).await?;
-            let key = (home, name);
-            let composed = match (records.into_iter().next(), unreadable.first()) {
-                (Some(record), _) if record.retired && !held.views.contains_key(&key) && !held.logged.contains(&key) => None,
-                (Some(record), _) => Some(self.compose(vec![record], held).await?.0),
-                (None, Some(launch)) => Some(vec![Composed {
+        let owed: Vec<(String, String)> = held.owed.iter().cloned().collect();
+        let keys = owed.clone();
+        let listings = self
+            .blocking(move |reads| {
+                let convoys = reads.convoys()?;
+                keys.iter().map(|(home, name)| convoys.named(name, Some(home))).collect::<Result<Vec<_>, _>>()
+            })
+            .await?;
+        let mut records = Vec::new();
+        let mut composed = Vec::new();
+        let mut gone = Vec::new();
+        for (key, ConvoyListing { records: read, unreadable }) in owed.iter().zip(listings) {
+            match (read.into_iter().next(), unreadable.first()) {
+                (Some(record), _) if record.retired && !held.views.contains_key(key) && !held.logged.contains(key) => gone.push(key),
+                (Some(record), _) => records.push(record),
+                (None, Some(launch)) => composed.push(Composed {
                     home: launch.home.clone(),
                     view: unreadable_view(&self.namespace, &here, launch),
                     unreadable: Some((launch.version, launch.reason.clone())),
                     ended: None,
                     retired: false,
-                }]),
-                (None, None) => None,
-            };
-            match composed {
-                Some(composed) => held.insert(composed).map_err(ResourceError::other)?,
-                None => held.remove(&key),
+                }),
+                (None, None) => gone.push(key),
             }
-            held.owed.remove(&key);
-            held.logged.remove(&key);
+        }
+        if !records.is_empty() {
+            composed.extend(self.compose(records, held).await?.0);
+        }
+        held.insert(composed).map_err(ResourceError::other)?;
+        for key in gone {
+            held.remove(key);
+        }
+        for key in &owed {
+            held.owed.remove(key);
+            held.logged.remove(key);
         }
         self.convoys().map_err(ResourceError::other)?.memory().set_unreadable(held.unreadable.len() as u64);
         Ok(())
@@ -531,6 +580,8 @@ impl ConvoyViews {
 
     /// [`Self::refill`], unspanned.
     async fn refill_all(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
+        // Before the listing: the commits counted are among what it reads.
+        let told = self.told();
         held.refill_owed = true;
         let unlisted: BTreeSet<_> =
             held.views.keys().chain(held.logged.iter()).filter(|key| !held.retiring.contains_key(*key)).cloned().collect();
@@ -574,6 +625,7 @@ impl ConvoyViews {
         held.owed.clear();
         held.logged.clear();
         held.refill_owed = false;
+        held.through = told;
         if let Some(following) = held.following.as_ref() {
             following.lock().unwrap_or_else(PoisonError::into_inner).cursors.composed(joined.0);
         }
@@ -665,6 +717,9 @@ impl ConvoyViews {
             })
             .instrument(info_span!("convoy_views.stored"))
             .await?;
+        if views.is_empty() {
+            return Ok(Vec::new());
+        }
         let position = self.with_held(|held| held.position()).await?;
         Ok(views.into_iter().map(|view| HeldView { view, version: position }).collect())
     }
@@ -970,6 +1025,15 @@ struct Composed {
 }
 
 impl HeldViews {
+    /// Whether the views hold every change made before the commit counts `told` were read: a
+    /// pass that read the log at or after those counts completed, no note is unread, and nothing
+    /// passed is left to compose. Each count moves before its writer's call returns, so a writer
+    /// that reads after writing reads its write.
+    fn current(&self, told: Option<ToldCounts>) -> bool {
+        let read = matches!((self.through, told), (Some(through), Some(told)) if through.0 >= told.0 && through.1 >= told.1);
+        read && self.notes.is_empty() && self.owed.is_empty() && !self.refill_owed
+    }
+
     /// Where a reader stands that has read the views held.
     fn read(&self) -> LogPosition {
         LogPosition { homes: BTreeMap::new(), unlogged: Some(self.changed.read()) }

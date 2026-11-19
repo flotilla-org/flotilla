@@ -15,6 +15,40 @@ pub trait ChangeCursor<C>: Send {
     /// where it is, with each home's sequence they were read through. A home `at` does not name
     /// is read from the start of its log.
     fn since(&self, at: &std::collections::BTreeMap<String, u64>) -> Result<CursorSince, String>;
+    /// How many commits that may change its records have landed since it started, counted at each
+    /// commit before the writer's call returns; none where it cannot tell.
+    fn told(&self) -> Option<Told> {
+        None
+    }
+}
+
+/// A count of commits, moved at each commit before the writer's call returns. A pass that reads
+/// the count before it reads the log reads every commit counted: a reader holding what such a
+/// pass read is current while the count has not moved. It keeps counting while any holder keeps
+/// it, whatever became of the cursor that made it.
+#[derive(Clone)]
+pub struct Told {
+    count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// What moves the count, kept alive with it.
+    _source: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl Told {
+    /// A count `count`, moved by `source`, which it keeps alive.
+    pub fn new(count: std::sync::Arc<std::sync::atomic::AtomicU64>, source: std::sync::Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        Self { count, _source: source }
+    }
+
+    /// The commits counted so far.
+    pub fn get(&self) -> u64 {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Debug for Told {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("Told").field(&self.get()).finish()
+    }
 }
 
 /// What a [`ChangeCursor`] read of the records written since some sequences found.

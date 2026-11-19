@@ -2,15 +2,15 @@
 //! under the store's lock at each listing, so it reads every commit made before it.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
 
 use flotilla_engine_store::follow::{self, Followed, Follower, Resumed};
-use flotilla_resources::lifecycle_reads::CursorSince;
+use flotilla_resources::lifecycle_reads::{CursorSince, Told};
 use flotilla_schema::KindCode;
 use flotilla_schema_sqlite::stream::{CommitListener, Committed};
 
@@ -25,8 +25,10 @@ pub struct LogCursor<C> {
     follower: Follower,
     change: fn(Followed) -> C,
     resets: Arc<AtomicBool>,
-    // The store holds the listener weakly: it lapses with this cursor.
-    _listener: Arc<CommitListener>,
+    /// The commits that wrote its kinds or rescanned, counted by the listener.
+    told: Arc<AtomicU64>,
+    // The store holds the listener weakly: it lapses with this cursor and its counts.
+    listener: Arc<CommitListener>,
 }
 
 impl<C> LogCursor<C> {
@@ -37,21 +39,27 @@ impl<C> LogCursor<C> {
         kinds: impl IntoIterator<Item = KindCode>,
         change: fn(Followed) -> C,
     ) -> Result<Self, String> {
+        let kinds: Vec<KindCode> = kinds.into_iter().collect();
         let resets = Arc::new(AtomicBool::new(false));
+        let told = Arc::new(AtomicU64::new(0));
         let listener: Arc<CommitListener> = {
-            let resets = Arc::clone(&resets);
+            let (resets, told) = (Arc::clone(&resets), Arc::clone(&told));
+            let followed: BTreeSet<KindCode> = kinds.iter().copied().collect();
             Arc::new(move |committed: &Committed<'_>| {
                 if committed.rescan {
                     resets.store(true, Ordering::SeqCst);
                 }
+                // After the reset flag: a pass that reads the count reads the reset too.
+                if committed.touches(&followed) {
+                    told.fetch_add(1, Ordering::SeqCst);
+                }
             })
         };
         reads.on_commit(Arc::downgrade(&listener)).map_err(|error| error.to_string())?;
-        let kinds: Vec<KindCode> = kinds.into_iter().collect();
         let mut follower = Follower::new(kinds.iter().copied());
         let held = homes();
         reads.read(|read| Ok(follower.start(read, &held)?)).map_err(|error| error.to_string())?;
-        Ok(Self { reads, homes, kinds, follower, change, resets, _listener: listener })
+        Ok(Self { reads, homes, kinds, follower, change, resets, told, listener })
     }
 
     /// The resources of its kinds written since `at`, by identity, and each home's sequence they
@@ -94,5 +102,9 @@ impl<C: Send> flotilla_resources::lifecycle_reads::ChangeCursor<C> for LogCursor
             }
             Err(reason) => CursorSince::Expired(reason),
         })
+    }
+
+    fn told(&self) -> Option<Told> {
+        Some(Told::new(Arc::clone(&self.told), Arc::new(Arc::clone(&self.listener))))
     }
 }

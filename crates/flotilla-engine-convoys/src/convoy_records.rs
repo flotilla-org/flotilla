@@ -282,6 +282,10 @@ impl ChangeCursor<ConvoyChange> for ConvoyCursor {
         self.followed.position()
     }
 
+    fn told(&self) -> Option<flotilla_resources::lifecycle_reads::Told> {
+        self.followed.told()
+    }
+
     fn read_through(&self) -> BTreeMap<String, u64> {
         self.followed.read_through()
     }
