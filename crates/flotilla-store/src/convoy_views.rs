@@ -77,6 +77,9 @@ struct Held {
     /// How many view changes the watchers have read: one that asks what changed since a position
     /// has read every change before it. Moved by reads without the state's lock.
     delivered: Arc<AtomicU64>,
+    /// A read without the lock let a retired launch leave: the follower lets it go and publishes,
+    /// so the reads after it are not sent to the lock to.
+    due: tokio::sync::Notify,
     ticks: Mutex<Option<tokio::sync::broadcast::Sender<()>>>,
     /// The measured reads waiting on a fill or pass of the views, which count its reads.
     waiters: reads::Waiters,
@@ -381,7 +384,27 @@ impl ConvoyViews {
         if let Some(published) = self.serving(told) {
             return Ok(published);
         }
-        Ok(self.catch_up(told, |_| ()).await?.0)
+        let waiters = &self.held.waiters;
+        waiters
+            .wait(async {
+                let mut state = self.held.state.lock().instrument(info_span!("convoy_views.lock_wait")).await;
+                // A pass or eviction published while this read waited may serve it: then it
+                // passes nothing and publishes nothing.
+                if let Some(published) = self.serving(told) {
+                    return Ok(published);
+                }
+                Ok(waiters.serve(self.read_held(&mut state, told, |_| ())).await?.0)
+            })
+            .await
+    }
+
+    /// A watcher has read `published` through view change `read`: a retired launch it has now read
+    /// is due to leave, and the follower lets it go.
+    fn delivered(&self, published: &Published, read: u64) {
+        let before = self.held.delivered.fetch_max(read, Ordering::SeqCst);
+        if published.shown.retiring.values().any(|told| *told > before && *told <= read) {
+            self.held.due.notify_one();
+        }
     }
 
     /// The views last published, where they serve a read made after the commit counts `told`
@@ -522,7 +545,15 @@ impl ConvoyViews {
     /// the writes not yet followed, not with the launches held, and a pass that began after the
     /// read's commits were counted serves it.
     async fn follow(self, mut wakes: BoxStream<'static, ()>) {
-        while wakes.next().await.is_some() {
+        loop {
+            // A commit, or a retired launch a read let leave.
+            let woken = tokio::select! {
+                wake = wakes.next() => wake.is_some(),
+                () = self.held.due.notified() => true,
+            };
+            if !woken {
+                return;
+            }
             let mut ended = false;
             while let Some(wake) = wakes.next().now_or_never() {
                 if wake.is_none() {
@@ -873,7 +904,7 @@ impl ConvoyViews {
         watched: bool,
     ) -> Option<(Since, bool)> {
         if let Some(read) = position.unlogged.as_ref().filter(|read| read.run == published.read.run && read.read <= published.read.read) {
-            self.held.delivered.fetch_max(read.read, Ordering::SeqCst);
+            self.delivered(published, read.read);
         }
         if !published.serves(told, self.held.delivered.load(Ordering::SeqCst), || watched) {
             return None;
@@ -1079,8 +1110,9 @@ impl KindRecords<Convoy> for ConvoyViews {
 
     async fn positioned(&self) -> Result<(Vec<Record<Convoy>>, LogPosition), String> {
         let published = self.published().await.map_err(|error| error.to_string())?;
-        // A listing reads every change before its position: its reader has read the retired.
-        self.held.delivered.fetch_max(published.read.read, Ordering::SeqCst);
+        // A listing reads every change before its position: its reader has read the retired,
+        // which the follower then lets go.
+        self.delivered(&published, published.read.read);
         let held = published.shown.views.iter().map(|((home, _), held)| view_record(HeldView::clone(held), home.clone())).collect();
         Ok((held, published.log_position()))
     }
