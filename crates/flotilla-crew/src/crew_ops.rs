@@ -2091,8 +2091,12 @@ impl CrewService {
         let project = convoy.spec.project_ref.as_str();
         let seat = |role: &str| Party::Seat { project: project.to_owned(), convoy: context.convoy.clone(), role: role.to_owned() };
         let mut intent = Intent::new(
-            self.party_inbox(&context.namespace, &seat(&context.caller_role), project).await?,
-            self.party_inbox(&context.namespace, &seat(target), project).await?,
+            self.party_inbox(&context.namespace, &seat(&context.caller_role), project)
+                .instrument(tracing::info_span!("crew_handoff.sender_inbox"))
+                .await?,
+            self.party_inbox(&context.namespace, &seat(target), project)
+                .instrument(tracing::info_span!("crew_handoff.receiver_inbox"))
+                .await?,
             flotilla_resources::MessageRelation::Peer,
             message,
         );
@@ -2109,12 +2113,17 @@ impl CrewService {
             .labels(process.labels.clone())
             .build();
         let terminal_name = identity.name();
-        let target_source =
-            match self.resource_backend.including_replicas::<ResourceTerminalSession>(&context.namespace).get(&terminal_name).await {
-                Ok(session) => Some(session),
-                Err(ResourceError::NotFound { .. }) => None,
-                Err(error) => return Err(error.to_string()),
-            };
+        let target_source = match self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(&context.namespace)
+            .get(&terminal_name)
+            .instrument(tracing::info_span!("crew_handoff.target_session"))
+            .await
+        {
+            Ok(session) => Some(session),
+            Err(ResourceError::NotFound { .. }) => None,
+            Err(error) => return Err(error.to_string()),
+        };
         let target_origin = target_source.as_ref().and_then(|session| match &session.provenance {
             ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
             ResourceProvenance::Local => None,
@@ -2162,10 +2171,17 @@ impl CrewService {
         // Handoff is the engine's `Reassign` of the promises the sender names (#3574 decision 3); it
         // also seats a target the convoy has none for. An engine edge is not undone, so it is taken
         // once the target's credentials are staged.
-        let move_named = || engine.reassign(&convoy, (&context.vessel, &context.caller_role), (&context.vessel, target), reassign);
+        let move_named = || {
+            engine
+                .reassign(&convoy, (&context.vessel, &context.caller_role), (&context.vessel, target), reassign)
+                .instrument(tracing::info_span!("crew_handoff.reassign"))
+        };
         // Admit the turn before reopening its recipient: the reopened crew's
         // derived Done waits on that turn's delivery (#3894).
-        let admitted = self.publish_message_intent(&context.namespace, &message_name, &intent).await?;
+        let admitted = self
+            .publish_message_intent(&context.namespace, &message_name, &intent)
+            .instrument(tracing::info_span!("crew_handoff.publish"))
+            .await?;
         // Each branch below reuses the admitted turn once its target session is settled.
         let send = || async { Ok::<_, String>(admitted.clone()) };
         // A handoff that fails after its engine turn was admitted withdraws that
@@ -2183,6 +2199,7 @@ impl CrewService {
                     message.to_string(),
                 ),
             )
+            .instrument(tracing::info_span!("crew_handoff.reopen"))
             .await
             .map_err(|err| err.to_string())?;
             if reopened.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
@@ -2197,7 +2214,9 @@ impl CrewService {
                     Err(error) => Err(self.restore_crew_work_after_delivery_failure(&context.convoy, &previous_status, error).await),
                 };
             }
-            self.reconcile_or_restore_crew_work(&context.namespace, &environment_ref, &context.convoy, previous_status.clone()).await?;
+            self.reconcile_or_restore_crew_work(&context.namespace, &environment_ref, &context.convoy, previous_status.clone())
+                .instrument(tracing::info_span!("crew_handoff.stage_credentials"))
+                .await?;
             if let Err(error) = move_named().await {
                 return Err(self.restore_crew_work_after_delivery_failure(&context.convoy, &previous_status, error).await);
             }
@@ -2309,6 +2328,7 @@ impl CrewService {
                     Err(err) => Err(err.to_string()),
                 }
             }
+            .instrument(tracing::info_span!("crew_handoff.deliver"))
             .await;
             if let Err(error) = handoff_result {
                 return match flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, &context.convoy, &previous_status) {
