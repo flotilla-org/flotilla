@@ -5216,6 +5216,11 @@ impl InProcessDaemon {
                 }));
             }
         }
+        if let CommandAction::ResourceApply { namespace, document } = action {
+            if document.get("kind").and_then(serde_json::Value::as_str) == Some("Message") {
+                return off_frame(|| self.message_origin(namespace, document)).await;
+            }
+        }
         let target = match action {
             CommandAction::ConvoyEnsureRoll { namespace, name } => Some((namespace.as_str(), "ConvoyEnsure", name.as_str())),
             CommandAction::ResourceDelete { namespace, kind, name, replica_origin: None }
@@ -5237,14 +5242,7 @@ impl InProcessDaemon {
         let Some((namespace, kind, name)) = target else { return Ok(None) };
         let object = match get_resource_kind_including_replicas(&self.resource_backend, namespace, kind, name).await {
             Ok(object) => object,
-            Err(ResourceError::NotFound { .. }) => {
-                if kind == "Message" {
-                    if let CommandAction::ResourceApply { document, .. } = action {
-                        return off_frame(|| self.message_creation_origin(namespace, document)).await;
-                    }
-                }
-                return Ok(None);
-            }
+            Err(ResourceError::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.to_string()),
         };
         Ok(object.value.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(serde_json::Value::as_str).map(NodeId::new))
@@ -5292,6 +5290,19 @@ impl InProcessDaemon {
             }
         }
         Ok(if original.home == primitives.home() { self.node_id.clone() } else { NodeId::new(original.home) })
+    }
+
+    /// The home a Message document is admitted at: the home already holding it, read by its
+    /// inbox and name as admission's own repeat check reads it, else its receiver's home. A
+    /// document naming no message has none.
+    async fn message_origin(&self, namespace: &str, document: &serde_json::Value) -> Result<Option<NodeId>, String> {
+        let Some(name) = document.pointer("/metadata/name").and_then(serde_json::Value::as_str) else { return Ok(None) };
+        let intent = message_intent(document).map_err(|error| error.to_string())?;
+        let primitives = self.message_primitives().ok_or("no Message path is installed")?;
+        if let Some(admitted) = primitives.admitted(&intent.inbox, name).map_err(|error| error.to_string())? {
+            return Ok(Some(if admitted.home == primitives.home() { self.node_id.clone() } else { NodeId::new(admitted.home) }));
+        }
+        off_frame(|| self.message_creation_origin(namespace, document)).await
     }
 
     async fn message_creation_origin(&self, namespace: &str, document: &serde_json::Value) -> Result<Option<NodeId>, String> {
@@ -5693,13 +5704,26 @@ impl InProcessDaemon {
         if document.get("kind").and_then(serde_json::Value::as_str) != Some("Message") {
             return apply_resource_document(&self.resource_backend, namespace, document).await;
         }
+        self.admit_message_document(namespace, &document).await
+    }
+
+    /// Admits the Message `document` at this home, its receiver's, on the Message path: the
+    /// admitted record, or the delivered message that suppresses it (ADR 0055), annotated with
+    /// the home holding it. Its producers in this daemon call this directly once routing names
+    /// this home; a command applying a Message reaches it too.
+    #[tracing::instrument(name = "message.admit_document", skip_all)]
+    pub async fn admit_message_document(
+        &self,
+        namespace: &str,
+        document: &serde_json::Value,
+    ) -> Result<flotilla_store::DynamicResourceObject, ResourceError> {
         if document.get("apiVersion").and_then(serde_json::Value::as_str) != Some("flotilla.work/v1") {
             return Err(ResourceError::decode("a Message document's apiVersion is flotilla.work/v1"));
         }
         let namespace = document.pointer("/metadata/namespace").and_then(serde_json::Value::as_str).unwrap_or(namespace);
         let meta: InputMeta = serde_json::from_value(document.get("metadata").cloned().unwrap_or_default())
             .map_err(|error| ResourceError::decode(format!("message metadata: {error}")))?;
-        let intent = message_intent(&document)?;
+        let intent = message_intent(document)?;
         let primitives = self.message_primitives().ok_or_else(|| ResourceError::other("no Message path is installed"))?;
         let admitted = primitives.admit(&meta.name, &intent).await?;
         // The admitted record (or the one that suppressed it) and the home holding it.

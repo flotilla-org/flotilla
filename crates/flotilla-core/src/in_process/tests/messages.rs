@@ -273,9 +273,9 @@ async fn a_finite_launchs_seat_is_spelled_without_a_label_search() {
 // receiver's home and admitting it at that home read the same objects however
 // many unrelated convoys, holders and messages share the namespace. Daemon
 // background tasks share the counted backend, so only the request's own task
-// is measured.
+// is measured. Routing reads an admitted message by its inbox and name, never
+// the Message table.
 #[tokio::test]
-#[ignore = "scoped fleet listing reads grow with unrelated convoys; engine-fixes item in decisions.md"]
 async fn message_send_reads_ignore_unrelated_history() {
     use flotilla_resources::MessageRelation;
     use flotilla_store::load_metrics::{measure, ReadCounts};
@@ -328,6 +328,8 @@ async fn message_send_reads_ignore_unrelated_history() {
     // more for unrelated convoys and their messages.
     let (routing, admission) = send_reads(0).await;
     assert!(!routing.is_empty(), "routing reads the receiver's convoy");
+    assert!(routing.values().all(|counts| counts.whole_kind == 0), "routing lists no kind: {routing:?}");
+    assert_eq!(admission.get("Message").map_or(0, |counts| counts.whole_kind), 0, "admission lists no messages: {admission:?}");
     assert_eq!(send_reads(40).await, (routing, admission), "reads grow with unrelated history");
 }
 
