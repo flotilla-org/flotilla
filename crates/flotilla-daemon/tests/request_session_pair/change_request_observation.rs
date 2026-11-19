@@ -180,7 +180,7 @@ async fn remote_change_request_scenario(late_watcher: bool) {
             ChangeRequestRefreshCadence::default(),
         );
         let records = flotilla_provisioning::engine::observations::EngineObservations::open(
-            daemon.decided_store().expect("decided store"),
+            daemon.decided_store(),
             Arc::new(flotilla_resources::SystemClock),
         )
         .expect("engine observations");

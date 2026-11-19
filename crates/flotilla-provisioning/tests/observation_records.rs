@@ -1,7 +1,8 @@
-//! ChangeRequest's and Issue's reads and writes through the store's typed paths: one contract, run
-//! against the old store and against the engine's records installed behind `[primitives]`, and the
-//! engine's own rules: a write that changes no value writes nothing, a failed read ages the values
-//! from when it started, and another home's values are confirmed when that home was last heard.
+//! ChangeRequest's and Issue's reads and writes through the store's typed paths, served by the
+//! engine's records, the daemon's only path for those kinds. One contract, which also runs against
+//! the plain in-memory store that tests stand in with, and the engine's own rules: a write that
+//! changes no value writes nothing, a failed read ages the values from when it started, and another
+//! home's values are confirmed when that home was last heard.
 
 use std::{
     collections::BTreeMap,

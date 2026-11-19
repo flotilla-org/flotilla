@@ -505,7 +505,7 @@ async fn fleet_health_does_not_materialize_convoy_inventory() {
             )
             .await;
     }
-    flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", &daemon.decided_store().expect("decided store"));
+    flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", &daemon.decided_store());
     for _ in 0..2 {
         let (response, reads) = measure(daemon.fleet_health_internal()).await;
         response.unwrap();

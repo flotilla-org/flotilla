@@ -238,7 +238,7 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, opt
         watch_messages(&backend, Arc::clone(&view)).await;
     })
     .await;
-    let primitives = daemon.message_primitives().expect("the Message path is composed");
+    let primitives = daemon.message_primitives();
     watch_engine_messages(Arc::clone(primitives.service()), Arc::clone(&view));
     Home { daemon, fleet, runtime, database, operator, _front_door: front_door, replication: Arc::default(), view }
 }

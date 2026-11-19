@@ -81,10 +81,7 @@ pub(in crate::server) async fn respond(
         let Some(daemon) = daemon else {
             return Reply::error(503, "decided store unavailable");
         };
-        let service = match daemon.decided_store() {
-            Ok(service) => service,
-            Err(error) => return Reply::error(503, &error),
-        };
+        let service = daemon.decided_store();
         let query = parse_query(raw_query);
         let (Some(kind), Some(name)) = (query.get("kind"), query.get("name")) else {
             return Reply::error(400, "record requires kind and name");

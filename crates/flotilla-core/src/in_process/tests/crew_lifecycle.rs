@@ -374,11 +374,8 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
         .expect("stale observation");
     // The decided store keeps no observation times: the record's values age from when its
     // observer's reads began failing.
-    let failures = flotilla_provisioning::engine::observations::EngineObservations::open(
-        daemon.decided_store().expect("decided store"),
-        clock.clone(),
-    )
-    .expect("observations");
+    let failures =
+        flotilla_provisioning::engine::observations::EngineObservations::open(daemon.decided_store(), clock.clone()).expect("observations");
     flotilla_resources::engine_records::ObservationFailures::failing(&failures, "ChangeRequest", &record_name)
         .await
         .expect("observer reads failing");
@@ -448,7 +445,7 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
     )
     .await;
     super::test_engine(&daemon);
-    flotilla_provisioning_testkit::replicate_home(authority.service(), "authority", &daemon.decided_store().expect("decided store"));
+    flotilla_provisioning_testkit::replicate_home(authority.service(), "authority", &daemon.decided_store());
     let (sender, _receiver) = flotilla_store::controller::WorkQueueSender::channel();
     let watch = daemon.reconciler_wake_watch();
     let replica_check = replica.clone();

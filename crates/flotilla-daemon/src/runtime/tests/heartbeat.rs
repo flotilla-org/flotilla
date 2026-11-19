@@ -307,7 +307,7 @@ async fn host_description_watch_publishes_offline_replica_updates() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"host-watch-observer\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
-    let target = daemon.decided_store().expect("decided store");
+    let target = daemon.decided_store();
     let remote = flotilla_provisioning_testkit::other_home_for(&target, "remote-root");
     let environment_id = EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("remote-host"));
     let described = |arch: &str| HostStatus {
@@ -860,7 +860,7 @@ async fn unknown_observation_keeps_a_gui_grant() {
 /// What `tick` cost: its output, its reads of Hosts by kind, and the entries this home's log
 /// gained while it ran.
 async fn host_tick_cost<F: std::future::Future>(daemon: &InProcessDaemon, tick: F) -> (F::Output, HostReads, u64) {
-    let store = daemon.decided_store().expect("decided store");
+    let store = daemon.decided_store();
     let logged = || store.last_sequence(store.home()).expect("this home's sequence");
     let before = logged();
     // The Hosts' resident records read every earlier write first, so their catching up is not counted.

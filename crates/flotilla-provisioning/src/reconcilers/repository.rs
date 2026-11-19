@@ -45,19 +45,18 @@ impl RepositoryReconciler {
         self
     }
 
-    /// What a repository follows: its discovered checkouts, and with the engine's `service` its
+    /// What a repository follows: its discovered checkouts, and in the engine's `service` its
     /// checkouts and clones.
     pub fn secondary_watches(
         discovered: DiscoveredCheckouts,
-        service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
+        service: Arc<flotilla_schema_sqlite::stream::Service>,
     ) -> Vec<Box<dyn SecondaryWatch<Primary = Repository>>> {
-        let mut watches: Vec<Box<dyn SecondaryWatch<Primary = Repository>>> =
-            vec![Box::new(DiscoveredRepositoryWake(discovered)), Box::new(ForgeIdentityRepositoryWake)];
-        if let Some(service) = service {
-            watches.push(Box::new(CheckoutRepositoryWake::new(Arc::clone(&service))));
-            watches.push(Box::new(CloneRepositoryWake::new(service)));
-        }
-        watches
+        vec![
+            Box::new(DiscoveredRepositoryWake(discovered)),
+            Box::new(ForgeIdentityRepositoryWake),
+            Box::new(CheckoutRepositoryWake::new(Arc::clone(&service))),
+            Box::new(CloneRepositoryWake::new(service)),
+        ]
     }
 
     async fn checkout_host(&self, checkout: &CheckoutSpec) -> Result<String, String> {

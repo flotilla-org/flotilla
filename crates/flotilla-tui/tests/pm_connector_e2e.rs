@@ -217,7 +217,7 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     .await
     .expect("runtime");
     // The engine-served kinds are written once the runtime has installed the engine.
-    let remote = RemoteObserver::open(daemon.decided_store().expect("decided store")).await;
+    let remote = RemoteObserver::open(daemon.decided_store()).await;
     let first = seed(&daemon, &backend, "flotilla").await;
     remote.observe("initial", 1).await;
     let query_state = daemon.aggregator_projection_state().await;

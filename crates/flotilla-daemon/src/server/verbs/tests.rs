@@ -109,7 +109,7 @@ async fn the_registered_verbs_are_not_broken() {
     let (_dir, daemon) = super::super::tests::empty_daemon().await;
     let registry = crate::runtime::verb_registry(Some(Arc::clone(&daemon))).expect("each verb registered once");
     let subjects = tables::SubjectTables::new(registry.subjects());
-    let stores = tables::Catalog::stores(daemon.resource_backend(), daemon.decided_store().ok(), subjects, "test".into());
+    let stores = tables::Catalog::stores(daemon.resource_backend(), Some(daemon.decided_store()), subjects, "test".into());
     let catalog = Catalog::new(registry, &StoredSubjects::new(stores));
     for entry in catalog.entries() {
         assert_eq!(entry.broken, None, "{}", entry.declaration.name);

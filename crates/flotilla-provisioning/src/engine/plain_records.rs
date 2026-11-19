@@ -1,4 +1,4 @@
-//! One engine port for a plain kind, behind `[primitives]`.
+//! One engine port for a plain kind.
 //!
 //! [`PlainRecords`] is the [`KindRecords`] port of a [`PlainKind`] over the decided store. Each
 //! record is written at its home through the plain-kind port; every home's are read from a

@@ -509,7 +509,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     // A's engine readings, which read every home's records in its decided store.
     engine(&authority_daemon);
     // Checkout host B's log reaches A's decided store.
-    let decided = authority_daemon.decided_store().expect("authority decided store");
+    let decided = authority_daemon.decided_store();
     let at_checkout_host = flotilla_provisioning_testkit::CheckoutFixture::over("checkout-root", checkout_home.service.store());
 
     // The convoy, admitted at authority A, its coder owing a decision ledger.

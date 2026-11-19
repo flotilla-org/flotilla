@@ -1,4 +1,4 @@
-//! ManifestRoot on the engine, behind `[primitives]` (#3824 layer 2c).
+//! ManifestRoot on the engine, its only path (#3824 layer 2c).
 //!
 //! [`EngineManifestRoots`] is the [`ManifestRoots`] port over the decided store. This home writes
 //! its own roots through the ManifestRoot machine; every home's are read from a resident map kept

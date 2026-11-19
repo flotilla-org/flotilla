@@ -129,7 +129,7 @@ pub async fn declared_driver_derives_bounded_backoff_from_its_homed_generations(
 
     // The authority's Project and ConvoyEnsure reach the others through its log.
     let authority_root = authority.node_id().clone();
-    let decided = |daemon: &InProcessDaemon| daemon.decided_store().expect("decided store");
+    let decided = |daemon: &InProcessDaemon| daemon.decided_store();
     for daemon in [&driver, &other] {
         flotilla_provisioning_testkit::replicate_home(&decided(&authority), authority_root.as_str(), &decided(daemon));
     }

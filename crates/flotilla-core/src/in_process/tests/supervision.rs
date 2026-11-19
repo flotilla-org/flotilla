@@ -194,11 +194,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         },
     )
     .await;
-    flotilla_provisioning_testkit::replicate_home(
-        &daemon.decided_store().expect("home store"),
-        daemon.node_id().as_str(),
-        &placement_daemon.decided_store().expect("placement store"),
-    );
+    flotilla_provisioning_testkit::replicate_home(&daemon.decided_store(), daemon.node_id().as_str(), &placement_daemon.decided_store());
     // The governor's session runs on the placement host, held for its work's launch there.
     let vessel = placement_engine.vessels.request(&governor, "govern", "placement");
     let governor_session = placement_engine.terminals.request(&TerminalLaunchRequest {

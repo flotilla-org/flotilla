@@ -17,8 +17,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[path = "request_session_pair/message_homes.rs"]
 mod message_homes;
 
-/// A daemon whose Message path [`message_homes::engine`] opens once its mesh is up, in a
-/// temporary home removed when the daemon's harness drops it.
+/// A daemon composed with its Message path, in a temporary home removed when the daemon's
+/// harness drops it.
 async fn message_home_daemon(name: &str) -> HomedDaemon {
     let home = tempfile::tempdir().expect("config");
     std::fs::write(home.path().join("daemon.toml"), "machine_id = 'test-machine'\n").expect("config");

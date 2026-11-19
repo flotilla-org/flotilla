@@ -10,7 +10,6 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     let temp = tempfile::tempdir().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"credential-refresh-test\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
-    daemon.open_message_primitives().expect("message path");
     designate_fleet(&daemon).await;
     let backend = daemon.resource_backend();
     let engine = engine(&daemon);
@@ -56,7 +55,7 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     let attentions = daemon.attentions();
     let open = || async { attentions.open(NAMESPACE, None, None).await.expect("open attentions") };
     // A person acknowledges every open attention: each is a Message pending at this home.
-    let primitives = daemon.message_primitives().expect("message path");
+    let primitives = daemon.message_primitives();
     let acknowledge_all = || async {
         for (_, message) in primitives.person_messages(NAMESPACE).await.expect("messages") {
             primitives.acknowledge(NAMESPACE, &record_name(message.name()).expect("record")).await.expect("acknowledge attention");
@@ -311,7 +310,7 @@ async fn daemon_forgejo_credential_mapping_waits_for_forge_replication() {
     daemon.publish_peer_connection_status(&peer, PeerConnectionState::Connected).await;
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("pending Forge replication").is_none());
     // The authority's decided log arrives, holding no Forge: its absence is settled.
-    let target = daemon.decided_store().expect("decided store");
+    let target = daemon.decided_store();
     flotilla_provisioning_testkit::other_home_for(&target, peer_id.as_str()).replicate_to(&target);
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("settled absence").is_some());
     // The declaration itself is a decided record: it arrives as the authority's log does.
@@ -895,7 +894,7 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
     .await;
     // The work's launch and its live crew, running before this start as the last run's controller left them.
     // Written on its decided store before the runtime starts, as the runtime's engine finds them.
-    let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store().expect("decided store"));
+    let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store());
     let vessel = vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
     vessels.ready(&vessel, env_id.as_str());
     create_credential_test_session(&runtime_terminals(&daemon), "live-crew", &vessel, env_id.as_str());
@@ -1171,7 +1170,6 @@ impl RunningCards {
         fs::write(temp.path().join("daemon.toml"), "machine_id = \"capability-cards-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
-        daemon.open_message_primitives().expect("message path");
         designate_fleet(&daemon).await;
         let fixture = engine(&daemon);
         let host = daemon.local_host_id().expect("local host").to_string();
@@ -1221,7 +1219,7 @@ impl RunningCards {
     /// The body of the open capability Message to convoy `n`'s coder that names `text`.
     async fn card_naming(&self, n: usize, text: &str) -> String {
         let receiver = flotilla_resources::crew_role_address(NAMESPACE, &self.convoys[n], "work", "coder");
-        let primitives = self.daemon.message_primitives().expect("message path");
+        let primitives = self.daemon.message_primitives();
         let inbox = primitives.inbox_for(NAMESPACE, &receiver).await.expect("the coder's inbox");
         let capabilities = primitives.roles(NAMESPACE).await.expect("fleet roles").system_sender("system:capabilities");
         tokio::time::timeout(Duration::from_secs(10), async {

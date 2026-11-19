@@ -82,7 +82,7 @@ pub(super) async fn declare_mapping_forge(backend: &ResourceBackend, namespace: 
 /// The mapping's Forge declared at another home, `home`, under a record name of its own (a
 /// name is held at one home), and replicated to `daemon` as that home's log arrives.
 pub(super) async fn declare_mapping_forge_at_home(daemon: &InProcessDaemon, home: &str) {
-    let target = daemon.decided_store().expect("decided store");
+    let target = daemon.decided_store();
     let other = flotilla_provisioning_testkit::other_home_for(&target, home);
     other.definition::<flotilla_resources::Forge>(&format!("lab-{home}"), &mapping_forge_spec()).await;
     other.replicate_to(&target);

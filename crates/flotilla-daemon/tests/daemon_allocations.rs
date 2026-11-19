@@ -86,7 +86,6 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
     )
     .await;
     // Composed with its Message path and engine, as the runtime composes a daemon.
-    daemon.open_message_primitives().expect("the engine Message path");
     flotilla_daemon_testkit::engine::engine(&daemon);
     // The inventory is the engine's launches: every other one landed, which retires and leaves the
     // listing, and the rest active, so the live inventory scales with n.

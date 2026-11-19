@@ -102,8 +102,8 @@ impl InMemoryRequestTopology {
     /// the follower has committed so far. The leader keeps what came before and installs nothing
     /// the follower commits after, so a scenario can prove an outcome needs none of it there.
     pub async fn hold_follower_stream_at_leader(&self) {
-        let follower = self.follower.decided_store().expect("follower engine store");
-        let leader = self.leader.decided_store().expect("leader engine store");
+        let follower = self.follower.decided_store();
+        let leader = self.leader.decided_store();
         let home = follower.home().to_owned();
         tokio::time::timeout(Duration::from_secs(5), async {
             while leader.watermark(&home).expect("leader watermark").home_seq < follower.last_sequence(&home).expect("follower log") {

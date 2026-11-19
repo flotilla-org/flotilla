@@ -175,7 +175,7 @@ async fn land_convoy(daemon: &InProcessDaemon, name: &str) {
 /// Holds launch `name` of project `flotilla` as an unread message to its `role` seat does: ended,
 /// it stays unretired while the message waits.
 async fn hold_with_message(daemon: &InProcessDaemon, name: &str, role: &str) {
-    let messages = daemon.message_primitives().expect("the engine Message path");
+    let messages = daemon.message_primitives();
     let receiver = format!("flotilla/{name}/work/{role}");
     let intent =
         flotilla_engine_messages_testkit::intent("fleet/operator", &receiver, flotilla_resources::MessageRelation::Supervisor, "hold");
@@ -205,8 +205,6 @@ async fn seed_convoy_routing_row(
 /// Installs the engine `daemon` reads its environments, clones and checkouts from, on its decided
 /// store, as the runtime's composition does; a scenario daemon is not composed by the runtime.
 fn install_engine(daemon: &InProcessDaemon) {
-    // Attentions are Messages on the engine, and convoys its launches, as the daemon composes them.
-    daemon.open_message_primitives().expect("the engine Message and Convoy paths");
     daemon.install_lifecycle_reads(engine(daemon).reads()).expect("install the engine's readings");
 }
 
@@ -223,7 +221,7 @@ async fn open_attentions(backend: &ResourceBackend) -> Vec<OpenAttention> {
 
 /// A person acknowledges every message waiting for them at `daemon`'s home, and says how many.
 async fn acknowledge_waiting(daemon: &InProcessDaemon) -> usize {
-    let messages = daemon.message_primitives().expect("the engine Message path");
+    let messages = daemon.message_primitives();
     let waiting = messages.person_messages("flotilla").await.expect("person messages");
     for (_, message) in &waiting {
         let record = flotilla_engine_messages::view::record_name(message.name()).expect("a message record");
@@ -238,7 +236,7 @@ fn engine(daemon: &InProcessDaemon) -> Arc<flotilla_provisioning_testkit::Engine
     type Engines =
         std::sync::Mutex<Vec<(std::sync::Weak<dyn std::any::Any + Send + Sync>, Arc<flotilla_provisioning_testkit::EngineFixture>)>>;
     static ENGINES: std::sync::OnceLock<Engines> = std::sync::OnceLock::new();
-    let service = daemon.decided_store().expect("decided store");
+    let service = daemon.decided_store();
     let held: Arc<dyn std::any::Any + Send + Sync> = service.clone();
     let mut engines = ENGINES.get_or_init(Engines::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     engines.retain(|(store, _)| store.strong_count() > 0);
@@ -264,12 +262,12 @@ fn project_ops_stamps(project: &str, repository: &RepositoryKey) -> BTreeMap<Str
 /// written only at its home; one written there reaches `daemon` as that home's log would, once
 /// [`replicate_other_home`] sends it.
 fn other_home(daemon: &InProcessDaemon, home: &str) -> Arc<flotilla_provisioning_testkit::OtherHome> {
-    flotilla_provisioning_testkit::other_home_for(&daemon.decided_store().expect("decided store"), home)
+    flotilla_provisioning_testkit::other_home_for(&daemon.decided_store(), home)
 }
 
 /// Sends what the other home `home` holds to `daemon`, heard now.
 fn replicate_other_home(daemon: &InProcessDaemon, home: &str) {
-    other_home(daemon, home).replicate_to(&daemon.decided_store().expect("decided store"));
+    other_home(daemon, home).replicate_to(&daemon.decided_store());
 }
 
 /// Writes `project` at the other home `home` with its stamps, and sends that home to `daemon`.
@@ -619,7 +617,7 @@ async fn create_placement_host(
     };
     match at {
         HostsAt::Daemon(daemon) => {
-            let target = daemon.decided_store().expect("decided store");
+            let target = daemon.decided_store();
             flotilla_provisioning_testkit::put_host_at_its_home_heard(&target, host_ref, &spec, Some(&status), fresh_until).await;
         }
         HostsAt::Store(backend) => {

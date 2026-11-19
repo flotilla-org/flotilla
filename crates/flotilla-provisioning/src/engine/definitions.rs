@@ -1,4 +1,4 @@
-//! The declared definition kinds on the engine, behind `[primitives]` (#3824 layer 2b-ii).
+//! The declared definition kinds on the engine, their only path (#3824 layer 2b-ii).
 //!
 //! [`EngineDefinitions`] is the [`KindRecords`] port of each definition kind over the decided
 //! store. This home writes its own definitions through the plain-kind port; every home's are read

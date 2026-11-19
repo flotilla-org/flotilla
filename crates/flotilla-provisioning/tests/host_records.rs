@@ -1,6 +1,6 @@
-//! Host's reads and writes through the store's typed paths behind `[primitives]`: the engine's
-//! records are the only copy, an observation is written only when a value changes, and a Host
-//! reads back with the judgements its readers expect.
+//! Host's reads and writes through the store's typed paths, served by the engine's records, the
+//! daemon's only path for the kind: they are the only copy, an observation is written only when a
+//! value changes, and a Host reads back with the judgements its readers expect.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

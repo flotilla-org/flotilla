@@ -1,4 +1,4 @@
-//! Host on the engine, behind `[primitives]`.
+//! Host on the engine, its only path.
 //!
 //! [`EngineHosts`] is the [`KindRecords`] port of Host over the decided store. A Host is two plain
 //! records homed at the daemon that writes them: `Host`, the spec, and `HostObservation`, what that

@@ -111,8 +111,6 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
     // Each daemon reads the engine's environments and attentions, as its runtime installs them.
     crate::engine_environments(&kiwi);
     crate::engine_environments(&feta);
-    kiwi.open_message_primitives().expect("kiwi message path");
-    feta.open_message_primitives().expect("feta message path");
     let feta_host_id = feta.local_host_id().expect("feta host id").to_string();
     let feta_hosts = feta.resource_backend().using::<Host>("flotilla");
     let host =
