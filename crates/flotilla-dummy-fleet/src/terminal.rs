@@ -4,7 +4,7 @@
 //! dummy agent adapter classifies exactly as a real harness's screen would be.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -142,11 +142,17 @@ impl DummySession {
 /// Every session the fleet's pools host, by session name. Pools are probed
 /// per environment; sessions belong to the fleet so a re-probed pool keeps them.
 #[derive(Default)]
-pub(crate) struct DummySessions(Mutex<HashMap<String, Arc<DummySession>>>);
+pub(crate) struct DummySessions {
+    live: Mutex<HashMap<String, Arc<DummySession>>>,
+    /// The environments whose backings were destroyed: cleat cannot start a session inside a
+    /// container that is gone, so a launch there is refused.
+    destroyed: Mutex<HashSet<String>>,
+}
 
 impl DummySessions {
     pub(crate) fn destroy_environment(&self, fleet: &DummyFleet, environment: &str) {
         fleet.record(&Event::SessionsDestroyed { environment: environment.into() });
+        self.destroyed(environment);
         self.lock().retain(|_, session| {
             if session.environment == environment {
                 session.stop();
@@ -157,8 +163,24 @@ impl DummySessions {
         });
     }
 
+    /// `environment`'s backing is gone, as a previous process's fleet recorded: its sessions
+    /// went with it, and none starts there again.
+    pub(crate) fn restore_destroyed(&self, environment: String) {
+        self.lock().retain(|_, session| session.environment != environment);
+        self.destroyed(&environment);
+    }
+
+    fn destroyed(&self, environment: &str) {
+        self.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(environment.to_owned());
+    }
+
+    /// Whether `environment`'s backing was destroyed.
+    fn is_destroyed(&self, environment: &str) -> bool {
+        self.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(environment)
+    }
+
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<DummySession>>> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// A session a previous process launched, its crew not yet running.
@@ -215,6 +237,9 @@ impl DummySessions {
             }));
             events.extend(record.outcomes.iter().map(|outcome| Event::Acted { session: name.clone(), outcome: outcome.clone() }));
         }
+        let mut destroyed: Vec<String> = self.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect();
+        destroyed.sort();
+        events.extend(destroyed.into_iter().map(|environment| Event::SessionsDestroyed { environment }));
         events
     }
 
@@ -263,6 +288,9 @@ impl DummyTerminalPool {
     }
 
     fn launch(&self, name: &str, command: &str, cwd: &ExecutionEnvironmentPath, environment: &TerminalEnvVars) -> Result<(), String> {
+        if self.fleet.sessions.is_destroyed(&self.environment) {
+            return Err(format!("session {name} cannot start: environment {} is gone", self.environment));
+        }
         let identity = CrewIdentity::from_environment(environment);
         let script = environment.iter().rev().find(|(key, _)| key == DUMMY_SCRIPT_ENV).map(|(_, script)| script.as_str());
         let launched = match (identity, script) {
@@ -522,6 +550,23 @@ mod tests {
         assert_eq!(fleet.snapshot().live_sessions, 1);
         assert!(fleet.sessions.get("one-session").is_none());
         assert!(fleet.sessions.get("two-session").is_some());
+    }
+
+    // As cleat in a container that is gone: once an environment's backing is destroyed, no
+    // session starts in it again, while another environment's pool still launches.
+    #[tokio::test]
+    async fn a_destroyed_environment_starts_no_session() {
+        let fleet = DummyFleet::new(DummyFleetConfig::default());
+        let one = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "one".into() };
+        let two = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "two".into() };
+        let path = ExecutionEnvironmentPath::new("/workspace");
+        one.ensure_session("before", "shell", &path, &vec![], &[]).await.expect("launched before");
+        fleet.sessions.destroy_environment(&fleet, "one");
+        let refused = one.ensure_session("after", "shell", &path, &vec![], &[]).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(fleet.sessions.get("after").is_none());
+        two.ensure_session("elsewhere", "shell", &path, &vec![], &[]).await.expect("another environment launches");
+        assert_eq!(fleet.snapshot().sessions_launched, 2);
     }
 
     // As cleat inside one container: a pool lists, captures, sends to and kills only its own
