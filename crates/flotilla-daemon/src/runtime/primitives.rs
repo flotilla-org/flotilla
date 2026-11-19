@@ -34,6 +34,7 @@ use super::terminal::{TerminalDeliveryFailure, TerminalDeliveryOutcome};
 use chrono::Utc;
 use flotilla_address::Address;
 use flotilla_engine_messages::{
+    held_roles::{HeldRoles, RoutingChanges, RoutingInput, Touched},
     sweep::{held_turns_superseded, OpenMessages, TurnHolds},
     view::turn_header,
     MessagePrimitives,
@@ -94,6 +95,19 @@ pub(super) struct MessageDelivery {
     pub(super) primitives: Arc<MessagePrimitives>,
     pub(super) namespace: String,
     health: super::health::RuntimeHealth,
+    /// This home's role holders, kept as the records routing reads change.
+    routing: HeldRoles,
+    /// Each live crew session's holding with its registered consumer, by session name.
+    holders: BTreeMap<String, Holder>,
+    /// The holders of each inbox, by session name.
+    inbox_holders: BTreeMap<Address, BTreeSet<String>>,
+    /// The watches that report the changes delivery reads; opened at the first pass.
+    watches: Option<tokio::task::JoinSet<()>>,
+    /// The person and service consumers' bindings the last rebind wanted.
+    consumers: BTreeSet<(Address, Receiver)>,
+    /// Whether the next pass rebinds though nothing it follows changed: a bind waited on an
+    /// earlier delivery, or a session no longer holding waits on its turn to end.
+    rebind_due: bool,
     bound: BTreeSet<(Address, Receiver)>,
     sessions: BTreeSet<String>,
     inflight: BTreeMap<String, InFlight>,
@@ -154,11 +168,19 @@ impl MessageDelivery {
         namespace: String,
         health: super::health::RuntimeHealth,
     ) -> Self {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let routing = HeldRoles::new(&namespace, RoutingChanges::new(Arc::clone(&wake)));
         Self {
             state,
             primitives,
             namespace,
             health,
+            routing,
+            holders: BTreeMap::new(),
+            inbox_holders: BTreeMap::new(),
+            watches: None,
+            consumers: BTreeSet::new(),
+            rebind_due: true,
             bound: BTreeSet::new(),
             sessions: BTreeSet::new(),
             inflight: BTreeMap::new(),
@@ -167,7 +189,7 @@ impl MessageDelivery {
             holding: Arc::default(),
             showing_held: BTreeSet::new(),
             open: OpenMessages::default(),
-            wake: Arc::new(tokio::sync::Notify::new()),
+            wake,
             awaiting_heard: Arc::default(),
         }
     }
@@ -208,28 +230,7 @@ impl MessageDelivery {
             })
         };
         self.state.daemon.crew_progress().on_turn_evidence(Arc::downgrade(&evidence));
-        let backend = self.state.daemon.resource_backend();
-        let mut watches = tokio::task::JoinSet::new();
-        macro_rules! watch {
-            ($kind:ty) => {
-                watches.spawn(flotilla_schema::reads::inherit(watch_changes::<$kind>(
-                    backend.clone(),
-                    self.namespace.clone(),
-                    Arc::clone(&wake),
-                )));
-            };
-        }
-        // Role routing's records (`MessageReceiverSnapshot`, the designation) and the records the
-        // conditions read, as the old store's Message controller followed them.
-        watch!(TerminalSession);
-        watch!(flotilla_resources::Convoy);
-        watch!(flotilla_resources::ConvoyEnsure);
-        watch!(flotilla_resources::FleetDesignation);
-        watch!(flotilla_resources::Project);
-        watch!(flotilla_resources::ChangeRequest);
-        watch!(flotilla_resources::Issue);
-        watch!(flotilla_resources::Artifact);
-        watch!(flotilla_resources::Vessel);
+        self.watch();
         let stops = Arc::clone(&self.state.delivery_stop);
         stops.running.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut stop = stops.requested.subscribe();
@@ -272,13 +273,52 @@ impl MessageDelivery {
                         None => std::future::pending().await,
                     }
                 } => { metrics.requeues.increment(); }
-                Some(_) = watches.join_next(), if !watches.is_empty() => {}
             }
         }
     }
 
+    /// Opens the watches of the old-store records delivery reads, once: role routing's records
+    /// report what each change touched to the holder view, and every change wakes a pass, as
+    /// the records the conditions read do.
+    fn watch(&mut self) {
+        if self.watches.is_some() {
+            return;
+        }
+        let backend = self.state.daemon.resource_backend();
+        let mut watches = tokio::task::JoinSet::new();
+        let changes = self.routing.changes();
+        macro_rules! watch {
+            ($kind:ty, $routing:expr) => {
+                watches.spawn(flotilla_schema::reads::inherit(watch_changes::<$kind>(
+                    backend.clone(),
+                    self.namespace.clone(),
+                    Arc::clone(&self.wake),
+                    $routing,
+                )));
+            };
+            (routing $kind:ty) => {
+                watch!($kind, Some((Arc::clone(changes), <$kind as RoutingInput>::touched as fn(&_) -> Touched)))
+            };
+        }
+        // Role routing's records (`MessageReceiverSnapshot`, the designation, the declarations
+        // validating adopted claims).
+        watch!(routing TerminalSession);
+        watch!(routing flotilla_resources::Convoy);
+        watch!(routing flotilla_resources::ConvoyEnsure);
+        watch!(routing flotilla_resources::FleetDesignation);
+        watch!(routing flotilla_resources::Project);
+        watch!(routing flotilla_resources::CrewDefaults);
+        watch!(routing flotilla_resources::Vessel);
+        // The records the conditions read, as the old store's Message controller followed them.
+        watch!(flotilla_resources::ChangeRequest, None);
+        watch!(flotilla_resources::Issue, None);
+        watch!(flotilla_resources::Artifact, None);
+        self.watches = Some(watches);
+    }
+
     /// One pass; how long until the next deadline it found, if any.
     pub(super) async fn pass(&mut self) -> Result<Option<Duration>, String> {
+        self.watch();
         let wait = self.primitives.delivery_wait(&self.namespace).instrument(info_span!("message_delivery.delivery_wait")).await?;
         self.health.report_delivery_wait(wait.clone());
         if wait.is_some() {
@@ -287,9 +327,9 @@ impl MessageDelivery {
         let now = Timestamp::from_datetime(&Utc::now());
         // Receipts first: a turn confirmed before its session's teardown records
         // its receipt before rebind unbinds and ends that session (#3894).
-        self.collect_turns(false).instrument(info_span!("message_delivery.collect_turns")).await;
+        let collected = self.collect_turns(false).instrument(info_span!("message_delivery.collect_turns")).await;
         self.confirm_held_turns().instrument(info_span!("message_delivery.confirm_held_turns")).await;
-        let holders = self.holders(now).instrument(info_span!("message_delivery.holders")).await?;
+        let changed = self.holders(now).instrument(info_span!("message_delivery.holders")).await?;
         let person = self.primitives.register_person(now).instrument(info_span!("message_delivery.register_person")).await?;
         let mut consumers: BTreeSet<_> = self
             .primitives
@@ -300,21 +340,15 @@ impl MessageDelivery {
             .map(|inbox| (inbox, person.clone()))
             .collect();
         consumers.insert(self.inspector().instrument(info_span!("message_delivery.inspector")).await?);
-        self.rebind(&holders, consumers, now).instrument(info_span!("message_delivery.rebind", holders = holders.len())).await?;
-        let starts = info_span!("message_delivery.start_turns", started = tracing::field::Empty);
-        async {
-            let mut started = 0_usize;
-            for holder in holders.values() {
-                if !self.inflight.contains_key(&holder.session_id) {
-                    self.start_turn(holder).instrument(info_span!("message_delivery.start_turn", session = %holder.session_id)).await?;
-                    started += 1;
-                }
-            }
-            tracing::Span::current().record("started", started);
-            Ok::<_, String>(())
+        // Rebinding follows what changed: a holding, the person's or service's inboxes, a turn
+        // settled (its session may wait on it to end), or a bind or end left for a later pass.
+        if changed || collected || self.rebind_due || consumers != self.consumers {
+            let span = info_span!("message_delivery.rebind", holders = self.holders.len());
+            self.rebind(consumers, now).instrument(span).await?;
         }
-        .instrument(starts)
-        .await?;
+        // The pending messages here, as of now: only their inboxes' holders have a turn to start.
+        self.open.refresh_off_thread(&self.primitives).instrument(info_span!("message_delivery.follow_open")).await?;
+        self.start_turns().await?;
         let report = self.primitives.sweep(&self.namespace, now, &mut self.open).instrument(info_span!("message_delivery.sweep")).await?;
         self.awaiting_heard.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone_from(&report.awaiting_heard);
         if report.acted() {
@@ -350,38 +384,67 @@ impl MessageDelivery {
         Ok((inbox, consumer))
     }
 
-    /// Today's role routing, through the bindings port, names which live crew
-    /// session holds each role, and so which inboxes its record is bound to.
-    async fn holders(&self, now: Timestamp) -> Result<BTreeMap<String, Holder>, String> {
+    /// Today's role routing, through the bindings port, names which live crew session holds each
+    /// role, and so which inboxes its record is bound to. Only the sessions a change touched are
+    /// routed again (`HeldRoles`), and only those whose holding changed are registered again:
+    /// whether any did.
+    async fn holders(&mut self, now: Timestamp) -> Result<bool, String> {
         let roles = self.primitives.roles(&self.namespace).instrument(info_span!("message_delivery.roles")).await?;
-        let mut holders = BTreeMap::new();
-        let bound = self.primitives.bindings().holders(&self.namespace, &roles).instrument(info_span!("message_delivery.bindings")).await?;
-        for holder in bound {
+        let refreshed =
+            self.routing.refresh(self.primitives.bindings().as_ref(), &roles).instrument(info_span!("message_delivery.bindings")).await?;
+        let changed: Vec<_> = refreshed.changed.into_iter().collect();
+        for (index, name) in changed.iter().enumerate() {
+            if let Some(gone) = self.holders.remove(name) {
+                for inbox in &gone.inboxes {
+                    if let Some(names) = self.inbox_holders.get_mut(inbox) {
+                        names.remove(name);
+                        if names.is_empty() {
+                            self.inbox_holders.remove(inbox);
+                        }
+                    }
+                }
+            }
+            let Some(holder) = self.routing.holders().get(name) else { continue };
             // One AgentSession per launch, named by it (#3108).
             let Some(launch) = flotilla_resources::terminal_records::launch_of(&holder.terminal) else {
                 debug!(session = %holder.terminal.metadata.name, "a live session's view names no launch");
                 continue;
             };
-            let consumer = self.primitives.register(launch, now).instrument(info_span!("message_delivery.register")).await?;
-            holders.insert(
-                holder.session_id.clone(),
-                Holder { terminal: holder.terminal, session_id: holder.session_id, consumer, inboxes: holder.inboxes },
+            let consumer = match self.primitives.register(launch, now).instrument(info_span!("message_delivery.register")).await {
+                Ok(consumer) => consumer,
+                Err(error) => {
+                    // These are routed again at the next refresh, which registers them then.
+                    for name in &changed[index..] {
+                        self.routing.retry(name);
+                    }
+                    return Err(error);
+                }
+            };
+            for inbox in &holder.inboxes {
+                self.inbox_holders.entry(inbox.clone()).or_default().insert(name.clone());
+            }
+            self.holders.insert(
+                name.clone(),
+                Holder {
+                    terminal: holder.terminal.clone(),
+                    session_id: holder.session_id.clone(),
+                    consumer,
+                    inboxes: holder.inboxes.clone(),
+                },
             );
         }
-        Ok(holders)
+        // A session routed again may have stopped though it held nothing: rebind ends its record.
+        Ok(refreshed.routed)
     }
 
     /// Binds each live session's record to the inboxes it holds, and the
     /// person and service consumers to `consumers`, unbinds the rest, and
     /// ends the records of sessions no longer live.
-    async fn rebind(
-        &mut self,
-        holders: &BTreeMap<String, Holder>,
-        consumers: BTreeSet<(Address, Receiver)>,
-        now: Timestamp,
-    ) -> Result<(), String> {
+    async fn rebind(&mut self, consumers: BTreeSet<(Address, Receiver)>, now: Timestamp) -> Result<(), String> {
+        self.rebind_due = false;
+        self.consumers.clone_from(&consumers);
         let mut desired: BTreeSet<_> =
-            holders.values().flat_map(|holder| holder.inboxes.iter().map(|inbox| (inbox.clone(), holder.consumer.clone()))).collect();
+            self.holders.values().flat_map(|holder| holder.inboxes.iter().map(|inbox| (inbox.clone(), holder.consumer.clone()))).collect();
         desired.extend(consumers);
         let inbox = self.primitives.inbox();
         for (address, consumer) in self.bound.difference(&desired).cloned().collect::<Vec<_>>() {
@@ -406,10 +469,16 @@ impl MessageDelivery {
                     result.map_err(|error| error.to_string())?;
                     self.bound.insert((address, consumer));
                 }
-                Err(_) => debug!(%address, consumer = %consumer.id, "binding waits for an earlier receipt's delivery"),
+                Err(_) => {
+                    debug!(%address, consumer = %consumer.id, "binding waits for an earlier receipt's delivery");
+                    self.rebind_due = true;
+                }
             }
         }
-        let live: BTreeSet<_> = holders.values().map(|holder| holder.consumer.id.clone()).collect();
+        // A session's record ends once it holds nothing: one whose launch still runs is looked at
+        // again when routing reroutes it, as its launch's end does; one whose turn is settling, when
+        // the turn is collected.
+        let live: BTreeSet<_> = self.holders.values().map(|holder| holder.consumer.id.clone()).collect();
         for name in self.sessions.difference(&live).cloned().collect::<Vec<_>>() {
             // A turn still settling ends its session only once its receipt is recorded.
             if self.inflight.values().any(|turn| turn.consumer.id == name) {
@@ -443,7 +512,8 @@ impl MessageDelivery {
 
     /// Settles finished turns, or with `settle` every turn once it finishes: a confirmed one
     /// records its receipts, then each message's deliver; an unconfirmed one stays pending, held.
-    async fn collect_turns(&mut self, settle: bool) {
+    /// Whether any turn was settled.
+    async fn collect_turns(&mut self, settle: bool) -> bool {
         let finished: Vec<_> = {
             let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
             self.inflight
@@ -458,6 +528,7 @@ impl MessageDelivery {
                 })
                 .collect()
         };
+        let settled = !finished.is_empty();
         for (session, delivery) in finished {
             let Some(turn) = self.inflight.remove(&session) else { continue };
             let outcome = match delivery {
@@ -499,6 +570,7 @@ impl MessageDelivery {
         for message in self.held.expire(std::time::Instant::now()) {
             warn!(message_id = %message, "a held turn's hold ran out unconfirmed; it may be typed again");
         }
+        settled
     }
 
     /// A graceful stop (d8): waits for each turn being typed to settle, then records the receipts
@@ -507,6 +579,57 @@ impl MessageDelivery {
     async fn settle_turns(&mut self) {
         self.collect_turns(true).await;
         self.confirm_held_turns().await;
+    }
+
+    /// Starts a turn for each holder with a message pending in an inbox it holds and no turn in
+    /// flight: the holders of the inboxes [`OpenMessages`] holds pending messages in, never every
+    /// holder. Each start reads its own session's inboxes and messages, so the starts are prepared
+    /// concurrently, at most [`TURN_STARTS`] at once; each is then started in turn, at most one
+    /// turn in flight per session, its messages in admission order.
+    async fn start_turns(&mut self) -> Result<(), String> {
+        use futures::StreamExt;
+        let span = info_span!("message_delivery.start_turns", due = tracing::field::Empty, started = tracing::field::Empty);
+        async {
+            let due: BTreeSet<&String> = self.open.pending_inboxes().filter_map(|inbox| self.inbox_holders.get(inbox)).flatten().collect();
+            let due: Vec<&Holder> = due
+                .into_iter()
+                .filter_map(|name| self.holders.get(name))
+                .filter(|holder| !self.inflight.contains_key(&holder.session_id))
+                .collect();
+            tracing::Span::current().record("due", due.len());
+            let this = &*self;
+            let mut queue = due.into_iter();
+            let mut preparing = futures::stream::FuturesUnordered::new();
+            let mut prepared = Vec::new();
+            loop {
+                while preparing.len() < TURN_STARTS {
+                    let Some(holder) = queue.next() else { break };
+                    preparing.push(this.prepare_named(holder));
+                }
+                match preparing.next().await {
+                    Some(done) => prepared.push(done),
+                    None => break,
+                }
+            }
+            drop(preparing);
+            let mut started = 0_usize;
+            let mut failed = None;
+            for (name, prepared) in prepared {
+                match prepared {
+                    Ok(Some(prepared)) => match self.start_prepared(&name, prepared).await {
+                        Ok(true) => started += 1,
+                        Ok(false) => {}
+                        Err(error) => failed = failed.or(Some(error)),
+                    },
+                    Ok(None) => {}
+                    Err(error) => failed = failed.or(Some(error)),
+                }
+            }
+            tracing::Span::current().record("started", started);
+            failed.map_or(Ok(()), Err)
+        }
+        .instrument(span)
+        .await
     }
 
     /// Shows on each launch's observation when the turn it holds unconfirmed was submitted, and
@@ -674,9 +797,17 @@ impl MessageDelivery {
             .map_err(|error| error.to_string())
     }
 
-    /// Types one session's pending turns as one turn, through the same
-    /// terminal reservation every other turn takes.
-    async fn start_turn(&mut self, holder: &Holder) -> Result<(), String> {
+    /// [`Self::prepare_turn`], with the name of the session it was prepared for.
+    async fn prepare_named(&self, holder: &Holder) -> (String, Result<Option<PreparedTurn>, String>) {
+        let prepared = self.prepare_turn(holder).instrument(info_span!("message_delivery.start_turn", session = %holder.session_id)).await;
+        (holder.terminal.metadata.name.clone(), prepared)
+    }
+
+    /// Reads one session's pending turns and frames them as one turn, with the transport that
+    /// types it; `None` when no turn is due. Notify and mute messages are delivered as they are
+    /// pulled. It reads only that session's inboxes and records, and changes nothing delivery
+    /// holds, so sessions' turns are prepared concurrently.
+    async fn prepare_turn(&self, holder: &Holder) -> Result<Option<PreparedTurn>, String> {
         let inbox = self.primitives.inbox();
         let mut turns = Vec::new();
         let mut held = Vec::new();
@@ -709,7 +840,7 @@ impl MessageDelivery {
             }
         }
         if turns.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // Framing reads the records the turns' headers name: only once a turn is due.
         let mut records = flotilla_engine_messages::OldStoreRecords::empty(&self.namespace);
@@ -742,7 +873,6 @@ impl MessageDelivery {
             }
             members.push(message);
         }
-        self.supersede_held_system_turns(&due, held, &roles, &mut records).await?;
         let runtime = TerminalControllerRuntime { state: Arc::clone(&self.state) };
         let (pool, adapter) = async {
             Ok::<_, String>((
@@ -752,10 +882,23 @@ impl MessageDelivery {
         }
         .instrument(info_span!("message_delivery.transport"))
         .await?;
-        let text = texts.join("\n\n");
+        Ok(Some(PreparedTurn { members, text: texts.join("\n\n"), due, held, roles, records, pool, adapter }))
+    }
+
+    /// Types prepared turn `prepared` into session `name`'s holder, through the same terminal
+    /// reservation every other turn takes, after dropping the held system turns it supersedes:
+    /// whether it started. A session with a turn in flight starts none.
+    async fn start_prepared(&mut self, name: &str, prepared: PreparedTurn) -> Result<bool, String> {
+        let PreparedTurn { members, text, due, held, roles, mut records, pool, adapter } = prepared;
+        let Some(holder) = self.holders.get(name) else { return Ok(false) };
+        if self.inflight.contains_key(&holder.session_id) {
+            return Ok(false);
+        }
+        self.supersede_held_system_turns(&due, held, &roles, &mut records).await?;
+        let Some(holder) = self.holders.get(name) else { return Ok(false) };
         let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
         if deliveries.contains_key(&holder.session_id) {
-            return Ok(());
+            return Ok(false);
         }
         let session = holder.session_id.clone();
         let typed = text.clone();
@@ -785,10 +928,30 @@ impl MessageDelivery {
             .instrument(primary_span),
         ));
         deliveries.insert(holder.session_id.clone(), PendingTerminalDelivery { task, engine_turn: EngineTurn::new(stop) });
-        self.inflight
-            .insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members, submitted_at, confirmed: false });
-        Ok(())
+        let (session_id, consumer) = (holder.session_id.clone(), holder.consumer.clone());
+        drop(deliveries);
+        self.inflight.insert(session_id, InFlight { consumer, members, submitted_at, confirmed: false });
+        Ok(true)
     }
+}
+
+/// How many sessions' turns one pass prepares at once: each preparation awaits its session's
+/// pending reads, message loads and framing, off the async workers, and typing itself runs in a
+/// task of its own per session.
+const TURN_STARTS: usize = 16;
+
+/// One session's due messages framed as one turn, and the transport that types it.
+struct PreparedTurn {
+    members: Vec<String>,
+    text: String,
+    /// The due messages' headers, for the held system turns an operator turn supersedes.
+    due: Vec<(String, TurnHeader)>,
+    /// The session's messages typed earlier and held.
+    held: Vec<String>,
+    roles: flotilla_engine_messages::roles::FleetRoles,
+    records: flotilla_engine_messages::OldStoreRecords,
+    pool: Arc<dyn flotilla_terminal::TerminalPool>,
+    adapter: Option<Arc<dyn flotilla_agent::adapter::AgentAdapter>>,
 }
 
 /// How many times one pass retypes a turn judged lost under a new key before it gives up.
@@ -883,12 +1046,17 @@ fn delivery_kinds() -> BTreeSet<flotilla_schema::KindCode> {
     ])
 }
 
-/// Wakes delivery at each change to `R` in the old store, local or replicated. A watch that
-/// fails is reopened at a backoff, a finite number of times in a row.
+/// What a change to a kind role routing reads touches, and where it is reported.
+type Routing<R> = (Arc<RoutingChanges>, fn(&flotilla_resources::ReadWatchEvent<R>) -> Touched);
+
+/// Wakes delivery at each change to `R` in the old store, local or replicated, and reports what
+/// each touched to `routing`, for a kind role routing reads. A watch that fails is reopened at a
+/// backoff, a finite number of times in a row.
 async fn watch_changes<R: flotilla_resources::Resource>(
     backend: flotilla_store::ResourceBackend,
     namespace: String,
     wake: Arc<tokio::sync::Notify>,
+    routing: Option<Routing<R>>,
 ) {
     use futures::StreamExt;
     let mut failures = 0_u32;
@@ -896,13 +1064,22 @@ async fn watch_changes<R: flotilla_resources::Resource>(
         match backend.including_replicas::<R>(&namespace).watch().await {
             Ok(mut events) => {
                 // A reopened watch may have missed changes: read again.
+                if let Some((changes, _)) = &routing {
+                    changes.reopened();
+                }
                 wake.notify_one();
                 while let Some(event) = events.next().await {
-                    if let Err(error) = event {
-                        debug!(kind = R::API_PATHS.kind, %error, "delivery watch failed");
-                        break;
-                    }
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(error) => {
+                            debug!(kind = R::API_PATHS.kind, %error, "delivery watch failed");
+                            break;
+                        }
+                    };
                     failures = 0;
+                    if let Some((changes, touched)) = &routing {
+                        changes.touched(touched(&event));
+                    }
                     wake.notify_one();
                 }
             }
@@ -911,6 +1088,10 @@ async fn watch_changes<R: flotilla_resources::Resource>(
         failures = failures.saturating_add(1);
         if failures > RETRY_LIMIT {
             warn!(kind = R::API_PATHS.kind, failures, "delivery stops watching this kind; other events still wake it");
+            if let Some((changes, _)) = &routing {
+                // No change of this kind can be followed: every pass routes every session.
+                changes.stopped();
+            }
             return;
         }
         tokio::time::sleep(RETRY.delay(failures)).await;

@@ -46,21 +46,50 @@ async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
     );
     let profile = build_local_profile(&daemon, &registry).await.expect("profile");
     ensure_host_direct_environment_exists(engine_environments(&daemon).reads.clone(), &profile).await.expect("environment");
+    let (convoy, launch) = launch_crew(&daemon, &profile, adapter, "turns", "agent").await;
+    designate_fleet(&daemon).await;
+    super::super::open_message_primitives(&daemon).await.expect("open the Message path");
+    let primitives = daemon.message_primitives().expect("Message path");
+    let state = runtime_state(&daemon, &config, &registry, &profile);
+    EngineCrew { _temp: temp, daemon, state, primitives, launch, convoy, config, registry, profile }
+}
+
+/// Admits convoy `name` with a single `coder` crew and runs its agent, under `adapter`, as pool
+/// session `session` of the probe pool: the convoy's launch and the session's launch.
+async fn launch_crew(
+    daemon: &Arc<InProcessDaemon>,
+    profile: &LocalProvisioningProfile,
+    adapter: &str,
+    name: &str,
+    session: &str,
+) -> (String, String) {
     let convoy = admit_convoy(
-        &daemon,
+        daemon,
         flotilla_engine_convoys_testkit::convoy(
             NAMESPACE,
-            "turns",
+            name,
             ConvoySpec::builder().workflow_ref("test".into()).project_ref(NAMESPACE.into()).build(),
             flotilla_engine_convoys_testkit::single_agent("coder"),
         ),
     )
     .await;
-    // The crew's vessel holds its session, which runs its agent under pool session `agent`.
-    let vessel = engine(&daemon).vessels.request(&convoy, "work", &profile.host_id);
-    let terminals = &engine(&daemon).terminals;
-    let launch = terminals.request(&flotilla_resources::terminal_records::TerminalLaunchRequest {
-        session: "agent".into(),
+    let launch = request_crew_session(daemon, profile, adapter, &convoy, session);
+    run_crew_session(daemon, adapter, &launch, session);
+    (convoy, launch)
+}
+
+/// Requests the crew session of `convoy`'s `work` vessel, under pool session `session`: its launch.
+fn request_crew_session(
+    daemon: &Arc<InProcessDaemon>,
+    profile: &LocalProvisioningProfile,
+    adapter: &str,
+    convoy: &str,
+    session: &str,
+) -> String {
+    // The crew's vessel holds its session, which runs its agent under pool session `session`.
+    let vessel = engine(daemon).vessels.request(convoy, "work", &profile.host_id);
+    engine(daemon).terminals.request(&flotilla_resources::terminal_records::TerminalLaunchRequest {
+        session: session.into(),
         environment: profile.host_direct_environment_name(),
         vessel: Some(vessel),
         role: "coder".into(),
@@ -78,19 +107,18 @@ async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
                 copies: Vec::new(),
             },
         },
-    });
+    })
+}
+
+/// Marks crew launch `launch` running its agent under pool session `session`.
+fn run_crew_session(daemon: &Arc<InProcessDaemon>, adapter: &str, launch: &str, session: &str) {
     let agent =
         flotilla_resources::terminal_records::AgentLaunch { adapter: adapter.into(), model: None, stance: "trusted-implicit".into() };
-    terminals.ready(
-        &launch,
-        "agent",
+    engine(daemon).terminals.ready(
+        launch,
+        session,
         &flotilla_resources::terminal_records::TerminalLaunchFacts { agent: Some(agent), ..Default::default() },
     );
-    designate_fleet(&daemon).await;
-    super::super::open_message_primitives(&daemon).await.expect("open the Message path");
-    let primitives = daemon.message_primitives().expect("Message path");
-    let state = runtime_state(&daemon, &config, &registry, &profile);
-    EngineCrew { _temp: temp, daemon, state, primitives, launch, convoy, config, registry, profile }
 }
 
 fn runtime_state(
@@ -129,6 +157,18 @@ impl EngineCrew {
     /// Sends `body` to the crew from `sender`: a fleet role (`system:<role>`) or a person
     /// (`principal:<name>`), who sends as the role they hold in the convoy's project.
     async fn send(&self, name: &str, sender: &str, relation: MessageRelation, body: &str) {
+        self.send_to(&self.convoy, name, sender, relation, body).await;
+    }
+
+    /// Whether message `name` to the crew of `convoy` is received.
+    async fn delivered_to(&self, convoy: &str, name: &str) -> bool {
+        let receiver = flotilla_resources::crew_role_address(NAMESPACE, convoy, "work", "coder");
+        let message = self.primitives.view_to(NAMESPACE, &receiver, name).await.expect("message view");
+        message.and_then(|message| message.object.status).is_some_and(|status| status.phase.has_delivery_evidence())
+    }
+
+    /// [`Self::send`] to the crew of `convoy`.
+    async fn send_to(&self, convoy: &str, name: &str, sender: &str, relation: MessageRelation, body: &str) {
         use flotilla_crew::leaf_engine::Party;
         let messages: &dyn flotilla_messaging::EngineMessages = self.primitives.as_ref();
         let party = match (sender.strip_prefix("system:"), sender.strip_prefix("principal:")) {
@@ -136,7 +176,7 @@ impl EngineCrew {
             (_, Some(principal)) => Party::Person(principal.to_owned()),
             _ => panic!("`{sender}` is no fleet role or person"),
         };
-        let crew = Party::Seat { project: NAMESPACE.into(), convoy: self.convoy.clone(), role: "coder".into() };
+        let crew = Party::Seat { project: NAMESPACE.into(), convoy: convoy.to_owned(), role: "coder".into() };
         let sender = party.inbox(messages, NAMESPACE, NAMESPACE).await.expect("the sender's inbox");
         let inbox = crew.inbox(messages, NAMESPACE, NAMESPACE).await.expect("the crew's inbox");
         let mut intent = flotilla_messaging::Intent::new(sender, inbox, relation, body);
@@ -313,6 +353,140 @@ async fn read_typing_turns(count: usize) -> (u64, u64) {
 async fn typing_a_turn_loads_each_due_message_once_and_converts_none() {
     assert_eq!(read_typing_turns(5).await, (5, 0), "five due turns");
     assert_eq!(read_typing_turns(60).await, (60, 0), "sixty due turns");
+}
+
+/// The store reads of one delivery pass, once delivery has settled, with `idle` crews running
+/// beside the one turns go to, none of them sent anything, and nothing changed since the last pass.
+async fn settled_pass_reads(idle: usize) -> flotilla_store::load_metrics::ReadCounts {
+    let crew = engine_crew("claude-code", lossy_pool()).await;
+    for n in 0..idle {
+        launch_crew(&crew.daemon, &crew.profile, "claude-code", &format!("idle-{n}"), &format!("idle-agent-{n}")).await;
+    }
+    let mut delivery = crew.delivery();
+    passes(&mut delivery, 10).await;
+    let (pass, reads) = flotilla_store::load_metrics::measure(delivery.pass()).await;
+    pass.expect("delivery pass");
+    reads
+}
+
+/// The store reads of the pass that types one turn to one crew, with `idle` crews running beside
+/// it that were sent nothing.
+async fn typing_pass_reads(idle: usize) -> flotilla_store::load_metrics::ReadCounts {
+    let pool = lossy_pool();
+    let crew = engine_crew("claude-code", pool.clone()).await;
+    for n in 0..idle {
+        launch_crew(&crew.daemon, &crew.profile, "claude-code", &format!("idle-{n}"), &format!("idle-agent-{n}")).await;
+    }
+    let mut delivery = crew.delivery();
+    passes(&mut delivery, 10).await;
+    crew.send("one-turn", "system:turn-rules", MessageRelation::System, "Continue the work.").await;
+    let (pass, reads) = flotilla_store::load_metrics::measure(delivery.pass()).await;
+    pass.expect("delivery pass");
+    assert_eq!(pool.inputs.lock().expect("typed inputs").len(), 1, "the pass types the turn");
+    reads
+}
+
+// Behaviour (d12, d13): a pass costs the same however many idle crews run. A pass with nothing
+// changed, and one that types a turn to one crew, neither route every session again nor read
+// every idle session's inboxes.
+#[tokio::test(start_paused = true)]
+async fn a_pass_reads_nothing_per_idle_session() {
+    assert_eq!(settled_pass_reads(2).await, settled_pass_reads(12).await, "a settled pass's reads do not grow with idle sessions");
+    assert_eq!(typing_pass_reads(2).await, typing_pass_reads(12).await, "a typing pass's reads do not grow with idle sessions");
+}
+
+// Behaviour (d13): holdings follow the changes to the records routing reads, not a re-read every
+// pass. A crew that starts after delivery settled takes its turn; once its launch ends its
+// AgentSession is ended; its next launch takes the next turn as a consumer of its own.
+#[tokio::test(start_paused = true)]
+async fn holders_follow_changes_to_the_sessions() {
+    /// Sends `name` to the crew of `convoy`, whose agent runs as pool session `session`, and
+    /// passes until its turn is typed, the agent takes it up and it is received.
+    async fn received(
+        crew: &EngineCrew,
+        delivery: &mut MessageDelivery,
+        pool: &DeliveryProbePool,
+        convoy: &str,
+        session: &str,
+        name: &str,
+    ) {
+        let typed = pool.inputs.lock().expect("typed inputs").len();
+        crew.send_to(convoy, name, "system:turn-rules", MessageRelation::System, name).await;
+        for _ in 0..40 {
+            passes(delivery, 1).await;
+            if pool.inputs.lock().expect("typed inputs").len() > typed {
+                break;
+            }
+        }
+        assert_eq!(pool.inputs.lock().expect("typed inputs").len(), typed + 1, "{name}'s turn is typed once");
+        crew.daemon.crew_progress().prompt_submit(session, Utc::now());
+        for _ in 0..40 {
+            passes(delivery, 1).await;
+            if crew.delivered_to(convoy, name).await {
+                break;
+            }
+        }
+        assert!(crew.delivered_to(convoy, name).await, "{name} is received by the crew's session");
+    }
+    let pool = lossy_pool();
+    let crew = engine_crew("claude-code", pool.clone()).await;
+    let mut delivery = crew.delivery();
+    passes(&mut delivery, 5).await;
+
+    // A crew started after delivery settled takes its turn.
+    let (later, first) = launch_crew(&crew.daemon, &crew.profile, "claude-code", "later", "later-agent").await;
+    crew.primitives.sessions().observe_screen(&first, Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
+    received(&crew, &mut delivery, &pool, &later, "later-agent", "to-first").await;
+
+    // Once its launch ends, its AgentSession is ended.
+    engine(&crew.daemon).terminals.exited(&first, "the agent exited");
+    let reads = crew.daemon.lifecycle_reads();
+    let agents = reads.agent_sessions().expect("agent sessions");
+    for _ in 0..40 {
+        passes(&mut delivery, 1).await;
+        if agents.read(&first, None).expect("read").is_some_and(|agent| agent.reading.ended.is_some()) {
+            break;
+        }
+    }
+    let ended = agents.read(&first, None).expect("read").expect("the first launch's AgentSession");
+    assert!(ended.reading.ended.is_some(), "the ended launch's AgentSession is ended");
+
+    // Its next launch takes the next turn, as a consumer of its own.
+    let second = request_crew_session(&crew.daemon, &crew.profile, "claude-code", &later, "later-agent");
+    assert_ne!(second, first, "a new launch of the session");
+    run_crew_session(&crew.daemon, "claude-code", &second, "later-agent");
+    crew.primitives.sessions().observe_screen(&second, Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
+    received(&crew, &mut delivery, &pool, &later, "later-agent", "to-second").await;
+    let receiver = agents.read(&second, None).expect("read").expect("the second launch's AgentSession");
+    assert!(receiver.reading.ended.is_none(), "the next launch's AgentSession is live");
+}
+
+// Behaviour: turns to several crews start in one pass, and each crew's turn is typed once, its
+// messages in the order they were sent.
+#[tokio::test(start_paused = true)]
+async fn turns_to_several_crews_are_typed_once_each_in_order() {
+    let pool = lossy_pool();
+    let crew = engine_crew("claude-code", pool.clone()).await;
+    let mut convoys = vec![crew.convoy.clone()];
+    for n in 0..5 {
+        convoys.push(launch_crew(&crew.daemon, &crew.profile, "claude-code", &format!("crew-{n}"), &format!("crew-agent-{n}")).await.0);
+    }
+    let mut delivery = crew.delivery();
+    passes(&mut delivery, 5).await;
+    for (n, convoy) in convoys.iter().enumerate() {
+        for step in ["first", "second", "third"] {
+            crew.send_to(convoy, &format!("c{n}-{step}"), "system:turn-rules", MessageRelation::System, &format!("crew {n} {step}")).await;
+        }
+    }
+    passes(&mut delivery, 20).await;
+    let inputs = pool.inputs.lock().expect("typed inputs").clone();
+    assert_eq!(inputs.len(), convoys.len(), "one turn per crew: {inputs:?}");
+    for n in 0..convoys.len() {
+        let typed: Vec<_> = inputs.iter().filter(|input| input.contains(&format!("crew {n} first"))).collect();
+        assert_eq!(typed.len(), 1, "crew {n}'s turn is typed once");
+        let at = |step: &str| typed[0].find(&format!("crew {n} {step}")).unwrap_or_else(|| panic!("crew {n} {step} in its turn"));
+        assert!(at("first") < at("second") && at("second") < at("third"), "crew {n}'s messages in the order sent");
+    }
 }
 
 // A confirmed turn whose receipt is refused stays held: later passes retry the receipt and never

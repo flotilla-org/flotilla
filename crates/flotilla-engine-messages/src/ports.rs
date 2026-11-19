@@ -121,8 +121,11 @@ impl Observed {
         name: &str,
     ) -> Result<Option<(ResourceObject<Convoy>, String)>, String> {
         if !self.convoys.contains_key(name) {
-            let copies =
-                keyed.convoy_copies(namespace, name).instrument(info_span!("role_routing.convoy")).await.map_err(|error| error.to_string())?;
+            let copies = keyed
+                .convoy_copies(namespace, name)
+                .instrument(info_span!("role_routing.convoy"))
+                .await
+                .map_err(|error| error.to_string())?;
             self.convoys.insert(name.to_owned(), copies);
         }
         // This home's copy, else the first listed.

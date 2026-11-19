@@ -38,6 +38,10 @@ pub struct OpenMessages {
     withdrawn: BTreeMap<String, Address>,
     /// Consecutive refused sweeps per open message, for a warning when one persists.
     refusals: BTreeMap<String, u32>,
+    /// The pending messages here, each by its inbox: who may have a turn to take.
+    pending: BTreeMap<Address, BTreeSet<String>>,
+    /// Each pending message's inbox.
+    pending_in: BTreeMap<String, Address>,
 }
 
 /// What one sweep did, by outcome.
@@ -111,6 +115,12 @@ impl OpenMessages {
         self.open.iter().map(String::as_str)
     }
 
+    /// The inboxes with a message pending here, as of the last refresh: only a consumer bound to
+    /// one of them has anything to take.
+    pub fn pending_inboxes(&self) -> impl Iterator<Item = &Address> {
+        self.pending.keys()
+    }
+
     /// Reads every followed home's log entries since the last refresh. A home
     /// seen for the first time, or one whose resume floor has passed this
     /// cursor (its log compacted below it), is seeded from one scan of its
@@ -122,7 +132,7 @@ impl OpenMessages {
 
     /// [`OpenMessages::refresh`] on a blocking thread: it reads the store under its lock, which an
     /// async task must not wait on.
-    async fn refresh_off_thread(&mut self, primitives: &MessagePrimitives) -> Result<(), String> {
+    pub async fn refresh_off_thread(&mut self, primitives: &MessagePrimitives) -> Result<(), String> {
         let sources = LogSources::of(primitives);
         let mut taken = std::mem::take(self);
         let (taken, refreshed) = tokio::task::spawn_blocking(carry(move || {
@@ -261,6 +271,11 @@ impl OpenMessages {
         }
         if home == own {
             if matches!(message.state(), MessageState::Pending | MessageState::Awaiting { .. }) {
+                if *message.state() == MessageState::Pending {
+                    self.pend(&name, &spec.inbox);
+                } else {
+                    self.unpend(&name);
+                }
                 self.open.insert(name);
             } else {
                 self.forget(&name);
@@ -277,7 +292,27 @@ impl OpenMessages {
         }
     }
 
+    fn pend(&mut self, name: &str, inbox: &Address) {
+        if self.pending_in.get(name) == Some(inbox) {
+            return;
+        }
+        self.unpend(name);
+        self.pending_in.insert(name.to_owned(), inbox.clone());
+        self.pending.entry(inbox.clone()).or_default().insert(name.to_owned());
+    }
+
+    fn unpend(&mut self, name: &str) {
+        let Some(inbox) = self.pending_in.remove(name) else { return };
+        if let Some(names) = self.pending.get_mut(&inbox) {
+            names.remove(name);
+            if names.is_empty() {
+                self.pending.remove(&inbox);
+            }
+        }
+    }
+
     fn forget(&mut self, name: &str) {
+        self.unpend(name);
         self.open.remove(name);
         self.replied.remove(name);
         self.superseded.remove(name);

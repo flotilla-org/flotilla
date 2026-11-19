@@ -14,6 +14,7 @@ pub mod admission;
 pub mod attention;
 pub mod attentions;
 pub mod awaiting;
+pub mod held_roles;
 pub mod keyed_reads;
 pub mod ports;
 mod principal_roles;
