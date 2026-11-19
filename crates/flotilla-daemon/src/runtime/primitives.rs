@@ -353,15 +353,16 @@ impl MessageDelivery {
     /// Today's role routing, through the bindings port, names which live crew
     /// session holds each role, and so which inboxes its record is bound to.
     async fn holders(&self, now: Timestamp) -> Result<BTreeMap<String, Holder>, String> {
-        let roles = self.primitives.roles(&self.namespace).await?;
+        let roles = self.primitives.roles(&self.namespace).instrument(info_span!("message_delivery.roles")).await?;
         let mut holders = BTreeMap::new();
-        for holder in self.primitives.bindings().holders(&self.namespace, &roles).await? {
+        let bound = self.primitives.bindings().holders(&self.namespace, &roles).instrument(info_span!("message_delivery.bindings")).await?;
+        for holder in bound {
             // One AgentSession per launch, named by it (#3108).
             let Some(launch) = flotilla_resources::terminal_records::launch_of(&holder.terminal) else {
                 debug!(session = %holder.terminal.metadata.name, "a live session's view names no launch");
                 continue;
             };
-            let consumer = self.primitives.register(launch, now).await?;
+            let consumer = self.primitives.register(launch, now).instrument(info_span!("message_delivery.register")).await?;
             holders.insert(
                 holder.session_id.clone(),
                 Holder { terminal: holder.terminal, session_id: holder.session_id, consumer, inboxes: holder.inboxes },
@@ -680,13 +681,17 @@ impl MessageDelivery {
         let mut turns = Vec::new();
         let mut held = Vec::new();
         for address in &holder.inboxes {
-            let pending: Vec<_> = inbox
-                .pending(address, &holder.consumer, &delivery_rules())
-                .await
-                .map_err(|error| error.to_string())?
-                .try_collect()
-                .await
-                .map_err(|error| error.to_string())?;
+            let pending: Vec<_> = async {
+                inbox
+                    .pending(address, &holder.consumer, &delivery_rules())
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .try_collect()
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            .instrument(info_span!("message_delivery.pending"))
+            .await?;
             for item in pending {
                 if item.mode != Transport::Turn {
                     // Notify and Mute record their receipts on pull; deliver them now.
@@ -707,15 +712,20 @@ impl MessageDelivery {
             return Ok(());
         }
         // Framing reads the records the turns' headers name: only once a turn is due.
-        let roles = self.primitives.roles(&self.namespace).await?;
-        let mut loaded = Vec::new();
-        for message in turns {
-            if let Some(resource) = self.primitives.message(&message).await.map_err(|error| error.to_string())? {
-                loaded.push((message, resource));
-            }
-        }
         let mut records = flotilla_engine_messages::OldStoreRecords::empty(&self.namespace);
-        let headers = self.headers(&loaded, &roles, &mut records).await?;
+        let (roles, loaded, headers) = async {
+            let roles = self.primitives.roles(&self.namespace).await?;
+            let mut loaded = Vec::new();
+            for message in turns {
+                if let Some(resource) = self.primitives.message(&message).await.map_err(|error| error.to_string())? {
+                    loaded.push((message, resource));
+                }
+            }
+            let headers = self.headers(&loaded, &roles, &mut records).await?;
+            Ok::<_, String>((roles, loaded, headers))
+        }
+        .instrument(info_span!("message_delivery.frame"))
+        .await?;
         let mut members = Vec::new();
         let mut texts = Vec::new();
         let mut due = Vec::new();
@@ -734,8 +744,14 @@ impl MessageDelivery {
         }
         self.supersede_held_system_turns(&due, held, &roles, &mut records).await?;
         let runtime = TerminalControllerRuntime { state: Arc::clone(&self.state) };
-        let pool = runtime.pool_for_spec((&holder.terminal).into()).await?;
-        let adapter = runtime.adapter_for_spec((&holder.terminal).into()).await?;
+        let (pool, adapter) = async {
+            Ok::<_, String>((
+                runtime.pool_for_spec((&holder.terminal).into()).await?,
+                runtime.adapter_for_spec((&holder.terminal).into()).await?,
+            ))
+        }
+        .instrument(info_span!("message_delivery.transport"))
+        .await?;
         let text = texts.join("\n\n");
         let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
         if deliveries.contains_key(&holder.session_id) {

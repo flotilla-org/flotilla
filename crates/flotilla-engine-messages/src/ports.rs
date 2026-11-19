@@ -24,6 +24,7 @@ use flotilla_resources::{
     TerminalSessionSource, ThreeValue, CONVOY_LABEL, ENSURED_FROM_ANNOTATION, ROLE_ADDRESS_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{ResourceBackend, WeakResourceBackend};
+use tracing::{info_span, Instrument};
 
 use super::{
     keyed_reads::{snapshot_work, KeyedReads},
@@ -39,10 +40,40 @@ pub struct RoleHolder {
     pub inboxes: BTreeSet<Address>,
 }
 
+/// Role routing over some of this home's sessions.
+#[derive(Debug, Clone, Default)]
+pub struct Routed {
+    /// The holders among them.
+    pub holders: Vec<RoleHolder>,
+    /// Every one of them that is a running crew session here, holder or not.
+    pub candidates: Vec<RoutedSession>,
+}
+
+/// A running crew session here that routing considered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedSession {
+    /// Its session name.
+    pub session: String,
+    /// The convoy it is crew of: routing it again needs that convoy's records.
+    pub convoy: String,
+    /// Whether it claims an adopted role.
+    pub claims: bool,
+}
+
 /// The bindings port: who holds each role at this home.
 #[async_trait]
 pub trait RoleBindings: Send + Sync {
-    async fn holders(&self, namespace: &str, roles: &FleetRoles) -> Result<Vec<RoleHolder>, String>;
+    /// Every holder at this home.
+    async fn holders(&self, namespace: &str, roles: &FleetRoles) -> Result<Vec<RoleHolder>, String> {
+        Ok(self.route(namespace, roles, None).await?.holders)
+    }
+
+    /// Role routing over this home's sessions named `sessions`, or over every running crew
+    /// session here when `None`. A session's holding is decided by its own convoy's records, the
+    /// adopted claims among the sessions routed with it and the declarations validating them, so
+    /// routing a convoy's sessions with every claimant gives what routing every session gives
+    /// for them ([`crate::held_roles`]).
+    async fn route(&self, namespace: &str, roles: &FleetRoles, sessions: Option<&BTreeSet<String>>) -> Result<Routed, String>;
 }
 
 /// The conditions port: a condition's current value.
@@ -90,7 +121,8 @@ impl Observed {
         name: &str,
     ) -> Result<Option<(ResourceObject<Convoy>, String)>, String> {
         if !self.convoys.contains_key(name) {
-            let copies = keyed.convoy_copies(namespace, name).await.map_err(|error| error.to_string())?;
+            let copies =
+                keyed.convoy_copies(namespace, name).instrument(info_span!("role_routing.convoy")).await.map_err(|error| error.to_string())?;
             self.convoys.insert(name.to_owned(), copies);
         }
         // This home's copy, else the first listed.
@@ -112,8 +144,9 @@ impl Observed {
 
     /// The sessions holding `role` in work `work` of `convoy`, read by their names.
     async fn seat(&mut self, keyed: &KeyedReads, namespace: &str, convoy: &str, home: &str, work: &str, role: &str) -> Result<(), String> {
-        for session in keyed.work_sessions(convoy, home, work, role).await? {
-            if let Some(terminal) = keyed.read::<TerminalSession>(namespace, &session).await.map_err(|error| error.to_string())? {
+        for session in keyed.work_sessions(convoy, home, work, role).instrument(info_span!("role_routing.work_sessions")).await? {
+            let read = keyed.read::<TerminalSession>(namespace, &session).instrument(info_span!("role_routing.seat_session")).await;
+            if let Some(terminal) = read.map_err(|error| error.to_string())? {
                 self.hold(terminal);
             }
         }
@@ -123,14 +156,25 @@ impl Observed {
 
 #[async_trait]
 impl RoleBindings for RoleRouting {
-    async fn holders(&self, namespace: &str, roles: &FleetRoles) -> Result<Vec<RoleHolder>, String> {
+    async fn route(&self, namespace: &str, roles: &FleetRoles, sessions: Option<&BTreeSet<String>>) -> Result<Routed, String> {
         let keyed = &self.keyed;
         let backend = keyed.backend()?;
         let mut observed = Observed::default();
         let mut candidates = Vec::new();
-        for launch in keyed.running_here().await? {
-            let Some(source) = keyed.read::<TerminalSession>(namespace, launch.session_name()).await.map_err(|error| error.to_string())?
-            else {
+        let mut routed = Routed::default();
+        let names = match sessions {
+            Some(sessions) => sessions.clone(),
+            None => keyed
+                .running_here()
+                .instrument(info_span!("role_routing.running_here"))
+                .await?
+                .iter()
+                .map(|launch| launch.session_name().to_owned())
+                .collect::<BTreeSet<_>>(),
+        };
+        for name in names {
+            let read = keyed.read::<TerminalSession>(namespace, &name).instrument(info_span!("role_routing.session")).await;
+            let Some(source) = read.map_err(|error| error.to_string())? else {
                 continue;
             };
             if !matches!(source.provenance, ResourceProvenance::Local) {
@@ -141,6 +185,11 @@ impl RoleBindings for RoleRouting {
             let TerminalSessionSource::Agent { context, .. } = &terminal.spec.source else { continue };
             let Some(status) = terminal.status.as_ref().filter(|status| status.phase == TerminalSessionPhase::Running) else { continue };
             let Some(session_id) = status.session_id.clone() else { continue };
+            routed.candidates.push(RoutedSession {
+                session: terminal.metadata.name.clone(),
+                convoy: context.convoy.clone(),
+                claims: terminal.metadata.annotations.contains_key(ROLE_ADDRESS_ANNOTATION),
+            });
             let held = observed.convoy(keyed, namespace, &context.convoy).await?;
             let project = held.as_ref().map(|(convoy, _)| convoy.spec.project_ref.clone());
             let labels = &terminal.metadata.labels;
@@ -154,7 +203,9 @@ impl RoleBindings for RoleRouting {
                     observed.seat(keyed, namespace, convoy, &home, vessel, role).await?;
                 }
                 // A standing role is held by its declared standing convoy's crew.
-                if self.standing(&mut observed, namespace, convoy, &project, role).await? {
+                let standing =
+                    self.standing(&mut observed, namespace, convoy, &project, role).instrument(info_span!("role_routing.standing")).await?;
+                if standing {
                     addresses.push(format!("{project}/{role}"));
                 }
             }
@@ -167,9 +218,9 @@ impl RoleBindings for RoleRouting {
             observed.convoys.into_values().flatten().collect(),
             observed.terminals.into_values().collect(),
         )
+        .instrument(info_span!("role_routing.snapshot"))
         .await
         .map_err(|error| error.to_string())?;
-        let mut holders = Vec::new();
         for Candidate { terminal, session_id, addresses } in candidates {
             let mut inboxes = BTreeSet::new();
             for address in addresses {
@@ -185,10 +236,10 @@ impl RoleBindings for RoleRouting {
                 }
             }
             if !inboxes.is_empty() {
-                holders.push(RoleHolder { terminal, session_id, inboxes });
+                routed.holders.push(RoleHolder { terminal, session_id, inboxes });
             }
         }
-        Ok(holders)
+        Ok(routed)
     }
 }
 
