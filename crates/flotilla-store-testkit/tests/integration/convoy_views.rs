@@ -5,7 +5,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
     time::Duration,
@@ -22,7 +22,7 @@ use flotilla_resources::{
     },
     engine_records::KindRecords,
     held_joins::HeldJoins,
-    lifecycle_reads::{ChangeCursor, CursorSince, LifecycleReads, ProvisioningKind},
+    lifecycle_reads::{ChangeCursor, CursorSince, LifecycleReads, ProvisioningKind, Told},
     promises::{Promise, PromiseKind, PromiseSource, PromiseState},
     terminal_records::{
         TerminalChange, TerminalLaunchRequest, TerminalLaunchSource, TerminalObservations, TerminalRecord, TerminalRecords, TerminalRenewal,
@@ -148,6 +148,11 @@ impl<C> ChangeCursor<C> for Unchanging {
     fn since(&self, _: &BTreeMap<String, u64>) -> Result<CursorSince, String> {
         Ok(CursorSince::Changed { written: Vec::new(), through: BTreeMap::new() })
     }
+
+    /// No commit ever changes its records.
+    fn told(&self) -> Option<Told> {
+        Some(Told::new(Arc::default(), Arc::new(())))
+    }
 }
 
 /// A gate a blocking read waits at while it is closed, telling `reaching` that it waits.
@@ -180,6 +185,8 @@ struct Written {
     passed: u64,
     gate: Arc<Gate>,
     failing: Arc<AtomicBool>,
+    /// The commits counted, where it counts them.
+    told: Option<Told>,
 }
 
 impl ChangeCursor<ConvoyChange> for Written {
@@ -204,6 +211,10 @@ impl ChangeCursor<ConvoyChange> for Written {
     fn since(&self, _: &BTreeMap<String, u64>) -> Result<CursorSince, String> {
         Ok(CursorSince::Expired("the written changes hold no log".into()))
     }
+
+    fn told(&self) -> Option<Told> {
+        self.told.clone()
+    }
 }
 
 struct Convoys {
@@ -226,6 +237,11 @@ struct Convoys {
     unreadable: Mutex<Vec<UnreadableLaunch>>,
     /// What tells the follower a record changed, as a commit does.
     told: tokio::sync::broadcast::Sender<ConvoyChange>,
+    /// Whether the cursor counts the commits [`Convoys::commit`] makes, as the log's does; a test
+    /// that writes into the cursor alone leaves it off, and every read then passes.
+    counts: AtomicBool,
+    /// The commits [`Convoys::commit`] made.
+    commits: Arc<AtomicU64>,
 }
 
 impl Convoys {
@@ -242,6 +258,8 @@ impl Convoys {
             gate: (Mutex::new(false), Condvar::new()),
             reading: tokio::sync::Notify::new(),
             told: tokio::sync::broadcast::channel(16).0,
+            counts: AtomicBool::new(false),
+            commits: Arc::default(),
         }
     }
 
@@ -258,6 +276,7 @@ impl Convoys {
         records.push(record);
         drop(records);
         self.written.lock().expect("written").push(change.clone());
+        self.commits.fetch_add(1, Ordering::SeqCst);
         let _ = self.told.send(change);
     }
 
@@ -334,6 +353,7 @@ impl ConvoyRecords for Convoys {
             passed: 0,
             gate: Arc::clone(&self.passing),
             failing: Arc::clone(&self.failing),
+            told: self.counts.load(Ordering::SeqCst).then(|| Told::new(Arc::clone(&self.commits), Arc::new(()))),
         }))
     }
 }
@@ -698,6 +718,35 @@ async fn a_failed_pass_keeps_the_cursors() {
     assert!(views.get("other#1").await.is_err(), "the next read takes the change from the cursor");
     assert!(views.get("other#1").await.is_err(), "read again");
     assert_eq!(reads.convoys.listed.load(Ordering::SeqCst), listed + 1, "no later read lists every launch again");
+}
+
+// Behaviour (d14): a read made while no commit has landed since the views last passed reads the
+// views as held: it reads no store, the log included, so it waits on no pass. A writer still reads
+// its commit back at its next read, and a note at the next read after it.
+#[tokio::test]
+async fn a_read_with_no_commit_since_the_last_pass_reads_no_store() {
+    let (reads, views) = views_of(&["fix-it#1", "other#1"]);
+    reads.convoys.counts.store(true, Ordering::SeqCst);
+    views.get("fix-it#1").await.expect("held");
+    views.get("fix-it#1").await.expect("held, every count told");
+
+    // With the cursor's gate closed, a read that passed would wait at it.
+    reads.convoys.passing.set(true);
+    let read = reads.convoys.read.load(Ordering::SeqCst);
+    let other = tokio::time::timeout(Duration::from_secs(5), views.get("other#1")).await.expect("read without passing");
+    other.expect("held");
+    assert_eq!(reads.convoys.read.load(Ordering::SeqCst), read, "a read with nothing committed reads no record");
+    reads.convoys.passing.set(false);
+
+    let mut ended = launch("fix-it#1", HERE);
+    ended.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    reads.convoys.commit(ended);
+    let phase = views.get("fix-it#1").await.expect("read").status.expect("status").phase;
+    assert_eq!(phase, ConvoyPhase::Abandoned, "the writer reads its commit back");
+
+    assert!(reads.convoys.memory.update("other#1", attention).1);
+    let noted = views.get("other#1").await.expect("read").status.expect("status").attention;
+    assert!(noted.is_some(), "a note is read at the next read");
 }
 
 /// The views converted by a read of one launch by name, with `others` unrelated launches held:
