@@ -7,20 +7,27 @@
 //!
 //! Installed as the backend's [`KindRecords`] for `TerminalSession`, it serves the typed reads,
 //! lists and watches of the kind; its writes are refused.
+//!
+//! A read takes no lock while the listing is current: each pass that completes publishes what the
+//! listing holds as an immutable [`Published`], with the commit counts it read through, and a read
+//! whose counts that covers reads it as published. Only a read the listing has not yet caught up
+//! with takes the listing's lock, and there it waits for the pass running, which may serve it, or
+//! runs one; it never waits on another read of the listing.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock},
 };
 
 use futures::{stream::BoxStream, StreamExt};
+use tracing::{info_span, Instrument};
 
 use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
-    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal, WriteError},
+    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal, UnloggedRead, WriteError},
     environment_records::{EnvironmentChange, EnvironmentRecord},
     held_joins::{self, JoinChange, JoinChanges, JoinsReader},
-    lifecycle_reads::{ChangeCursor, LifecycleReads},
+    lifecycle_reads::{ChangeCursor, LifecycleReads, Told},
     terminal_records::{launched, newest_launches, TerminalHolderView, TerminalRecord, TerminalRecords},
     vessel_seats::VesselSeats,
     ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionSpec, TerminalSessionStatus,
@@ -37,7 +44,13 @@ use crate::held_listing::{drained, ticks, Joins, ViewIndex};
 pub struct TerminalViews {
     namespace: String,
     reads: Arc<dyn LifecycleReads>,
+    /// What passes the listing: one pass at a time, and only a read that needs one waits here.
     listing: Arc<tokio::sync::Mutex<Listing>>,
+    /// What the listing held when the last pass completed, read without the listing's lock.
+    published: Arc<RwLock<Option<Arc<Published>>>>,
+    /// The sessions whose view changed, in this run: what a reading resumes from. Written by a
+    /// pass, under the listing's lock; a read takes it only to name the changes since a position.
+    changed: Arc<Mutex<UnloggedJournal>>,
     /// The measured reads waiting on another read's pass of the listing, which count its reads.
     waiters: Arc<flotilla_schema::reads::Waiters>,
 }
@@ -45,27 +58,125 @@ pub struct TerminalViews {
 /// A session at a home, as [`newest_launches`] keys it: its home and its session name.
 type Session = (String, String);
 
-/// Each session's newest launch at every home, as the last pass composed it.
-#[derive(Default)]
-struct Listing {
-    /// Where the next pass reads the changes since this one; none before the first.
-    cursors: Option<Cursors>,
-    sessions: BTreeMap<Session, Entry>,
-    /// The sessions whose view changed, in this run: what a reading resumes from.
-    changed: UnloggedJournal,
+/// What a pass read through, counted before it read: the commits told to the held joins' cursors
+/// and to the environments' cursor, and how many times this home's observations changed. The
+/// environments' count is of the cursor started at `cursors`, the listing's count of cursor starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ToldCounts {
+    cursors: u64,
+    joins: u64,
+    environments: u64,
+    observations: u64,
+}
+
+impl ToldCounts {
+    /// Whether a listing read through `self` holds every change counted in `told`.
+    fn covers(&self, told: &ToldCounts) -> bool {
+        self.cursors == told.cursors
+            && self.joins >= told.joins
+            && self.environments >= told.environments
+            && self.observations >= told.observations
+    }
+}
+
+/// The counts that tell a pass of a listing whose cursors are the `cursors`th started, with
+/// `environments` their environments' count: none where the held joins cannot tell.
+fn told_counts(reads: &dyn LifecycleReads, cursors: u64, environments: Option<&Told>) -> Option<ToldCounts> {
+    Some(ToldCounts {
+        cursors,
+        joins: reads.joins().ok()?.told()?,
+        environments: environments.map_or(0, Told::get),
+        observations: reads.terminals().ok()?.observations().changed(),
+    })
+}
+
+/// What the listing shows to readers: replaced, never changed, once published.
+#[derive(Clone, Default)]
+struct Shown {
+    sessions: BTreeMap<Session, Arc<Entry>>,
     /// The listed views, under each of their index keys.
     index: ViewIndex<Session>,
 }
 
+/// The listing as the last pass that completed left it, with the commit counts it holds every
+/// change of.
+struct Published {
+    shown: Arc<Shown>,
+    /// The counts read before that pass: none where they cannot be told, or where a session's
+    /// holder could not be read, which each pass composes again; no read is then served from here.
+    through: Option<ToldCounts>,
+    /// The environments' count the pass read, to count a read's commits by.
+    environments: Option<Told>,
+    /// Where a reader stands that has read this listing.
+    read: UnloggedRead,
+    /// How far the listing had read: the log and this home's observations, by its cursors.
+    position: u64,
+}
+
+impl Published {
+    /// The commit counts now, as this listing counts them.
+    fn told(&self, reads: &dyn LifecycleReads) -> Option<ToldCounts> {
+        told_counts(reads, self.through?.cursors, self.environments.as_ref())
+    }
+
+    /// Whether this listing serves a read made after the commit counts `told` were read.
+    fn serves(&self, told: Option<&ToldCounts>) -> bool {
+        matches!((self.through.as_ref(), told), (Some(through), Some(told)) if through.covers(told))
+    }
+
+    /// Where a reader stands that has read this listing.
+    fn log_position(&self) -> LogPosition {
+        LogPosition { homes: BTreeMap::new(), unlogged: Some(self.read.clone()) }
+    }
+}
+
+/// Each session's newest launch at every home, as the last pass composed it.
+struct Listing {
+    /// Where the next pass reads the changes since this one; none before the first.
+    cursors: Option<Cursors>,
+    /// How many times cursors were started: a count told by one is no count of another's.
+    started: u64,
+    /// What the listing shows, shared with the listing last published: a pass changes a copy.
+    shown: Arc<Shown>,
+    /// [`TerminalViews::changed`].
+    changed: Arc<Mutex<UnloggedJournal>>,
+    /// The counts read before the last pass that completed; none where they cannot be told.
+    through: Option<ToldCounts>,
+}
+
 impl Listing {
+    fn new(changed: Arc<Mutex<UnloggedJournal>>) -> Self {
+        Self { cursors: None, started: 0, shown: Arc::default(), changed, through: None }
+    }
+
+    fn journal(&self) -> MutexGuard<'_, UnloggedJournal> {
+        self.changed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The listing as readers read it until the next is published.
+    fn published(&self) -> Published {
+        let resolved = !self.shown.sessions.values().any(|entry| entry.unresolved);
+        Published {
+            shown: Arc::clone(&self.shown),
+            through: self.through.filter(|_| resolved && self.cursors.is_some()),
+            environments: self.cursors.as_ref().and_then(Cursors::environments_told).flatten(),
+            read: self.journal().read(),
+            position: self.position(),
+        }
+    }
+
     /// Holds `entries` in place of every session held.
     fn replace(&mut self, entries: Vec<(Session, Entry)>) {
         let entries: BTreeMap<Session, Entry> = entries.into_iter().collect();
-        let gone: Vec<Session> = self.sessions.keys().filter(|session| !entries.contains_key(*session)).cloned().collect();
-        for session in gone {
-            self.index.remove(&session);
-            if self.sessions.remove(&session).is_some_and(|entry| entry.view.is_some()) {
-                self.changed.record([session.1]);
+        let gone: Vec<Session> = self.shown.sessions.keys().filter(|session| !entries.contains_key(*session)).cloned().collect();
+        if !gone.is_empty() {
+            let shown = Arc::make_mut(&mut self.shown);
+            let mut changed = self.changed.lock().unwrap_or_else(PoisonError::into_inner);
+            for session in gone {
+                shown.index.remove(&session);
+                if shown.sessions.remove(&session).is_some_and(|entry| entry.view.is_some()) {
+                    changed.record([session.1]);
+                }
             }
         }
         self.extend(entries);
@@ -73,46 +184,49 @@ impl Listing {
 
     /// Holds each of `entries`, counting each whose view changed.
     fn extend(&mut self, entries: impl IntoIterator<Item = (Session, Entry)>) {
+        let mut entries = entries.into_iter().peekable();
+        if entries.peek().is_none() {
+            return;
+        }
+        let shown = Arc::make_mut(&mut self.shown);
+        let mut changed = self.changed.lock().unwrap_or_else(PoisonError::into_inner);
         for (session, mut entry) in entries {
-            let shown = |entry: &Entry| entry.view.as_ref().map(|view| view.version);
-            if self.sessions.get(&session).map(shown) != Some(shown(&entry)) {
-                self.changed.record([session.1.clone()]);
+            let version = |entry: &Entry| entry.view.as_ref().map(|view| view.version);
+            if shown.sessions.get(&session).map(|held| version(held)) != Some(version(&entry)) {
+                changed.record([session.1.clone()]);
             }
             match entry.view {
-                Some(_) => self.index.set(&session, std::mem::take(&mut entry.keys)),
-                None => self.index.remove(&session),
+                Some(_) => shown.index.set(&session, std::mem::take(&mut entry.keys)),
+                None => shown.index.remove(&session),
             }
-            self.sessions.insert(session, entry);
+            shown.sessions.insert(session, Arc::new(entry));
         }
     }
 
     /// Stops holding `session` where `launch` is its launch held: the held joins evicted it, so
     /// it ended and no view lists it.
     fn evict(&mut self, session: &Session, launch: &str) {
-        if self.sessions.get(session).is_some_and(|entry| entry.record.name == launch) {
-            self.index.remove(session);
-            if self.sessions.remove(session).is_some_and(|entry| entry.view.is_some()) {
-                self.changed.record([session.1.clone()]);
+        if self.shown.sessions.get(session).is_some_and(|entry| entry.record.name == launch) {
+            let shown = Arc::make_mut(&mut self.shown);
+            shown.index.remove(session);
+            if shown.sessions.remove(session).is_some_and(|entry| entry.view.is_some()) {
+                self.changed.lock().unwrap_or_else(PoisonError::into_inner).record([session.1.clone()]);
             }
         }
     }
 
-    /// Where a reader stands that has read the sessions held.
-    fn read(&self) -> LogPosition {
-        LogPosition { homes: BTreeMap::new(), unlogged: Some(self.changed.read()) }
+    /// The sessions whose view changed since `position`.
+    fn since(&self, position: &LogPosition) -> Since {
+        let changed = self.journal();
+        match changed.since(position.unlogged.as_ref()) {
+            Ok(names) => Since::Changed { names, through: LogPosition { homes: BTreeMap::new(), unlogged: Some(changed.read()) } },
+            Err(reason) => Since::Expired(reason),
+        }
     }
 
     /// How far the listing has read: the log and this home's observations, by its cursors.
     fn position(&self) -> u64 {
         self.cursors.as_ref().map_or(0, Cursors::position)
-    }
-
-    /// `view`, of launch `launch` of `session`, at the version it is handed out at: the held
-    /// view's while it is of the same launch and shows the same.
-    fn version(&self, session: &Session, launch: &str, view: &Record<TerminalSession>, position: u64) -> Result<u64, String> {
-        let held = self.sessions.get(session).and_then(|held| Some((held.record.name == launch, held.view.as_ref()?)));
-        let same = held.is_some_and(|(same_launch, held)| same_launch && crate::held_listing::shows_the_same(view, held));
-        crate::held_listing::version(held.map(|(_, held)| held.version), same, position)
     }
 
     /// `entries`, composed again, with the versions their views are handed out at.
@@ -122,12 +236,25 @@ impl Listing {
             .into_iter()
             .map(|(session, mut entry)| {
                 if let Some(view) = entry.view.as_mut() {
-                    view.version = self.version(&session, &entry.record.name, view, position).map_err(ResourceError::other)?;
+                    view.version = version(&self.shown, &session, &entry.record.name, view, position).map_err(ResourceError::other)?;
                 }
                 Ok((session, entry))
             })
             .collect()
     }
+}
+
+/// The records `published` lists that `keep` selects: only those are copied out of it.
+fn listed_in(published: &Published, keep: impl Fn(&Record<TerminalSession>) -> bool) -> Vec<Record<TerminalSession>> {
+    published.shown.sessions.values().filter_map(|entry| entry.view.as_ref().filter(|view| keep(view)).cloned()).collect()
+}
+
+/// `view`, of launch `launch` of `session`, at the version it is handed out at: the version of the
+/// view `shown` holds while it is of the same launch and shows the same.
+fn version(shown: &Shown, session: &Session, launch: &str, view: &Record<TerminalSession>, position: u64) -> Result<u64, String> {
+    let held = shown.sessions.get(session).and_then(|held| Some((held.record.name == launch, held.view.as_ref()?)));
+    let same = held.is_some_and(|(same_launch, held)| same_launch && crate::held_listing::shows_the_same(view, held));
+    crate::held_listing::version(held.map(|(_, held)| held.version), same, position)
 }
 
 /// A session's newest launch.
@@ -197,6 +324,20 @@ impl Cursors {
             .fold(0, u64::saturating_add)
     }
 
+    /// The commits the environments' cursor was told of: `Some(None)` where no environment is
+    /// followed, and none where the cursor cannot tell.
+    fn environments_told(&self) -> Option<Option<Told>> {
+        match self.environments.as_ref() {
+            Some(cursor) => cursor.told().map(Some),
+            None => Some(None),
+        }
+    }
+
+    /// The counts a pass of these cursors, the `started`th, reads through, read before it reads.
+    fn told(&self, reads: &dyn LifecycleReads, started: u64) -> Option<ToldCounts> {
+        told_counts(reads, started, self.environments_told()?.as_ref())
+    }
+
     /// Where the listing stands in the held joins once it has composed from them as `joins` holds
     /// them.
     fn joined(&mut self, joins: &held_joins::Joins<'_>) {
@@ -257,7 +398,15 @@ impl Dirt {
 
 impl TerminalViews {
     pub fn new(namespace: &str, reads: Arc<dyn LifecycleReads>) -> Self {
-        Self { namespace: namespace.to_owned(), reads, listing: Arc::default(), waiters: Arc::default() }
+        let changed = Arc::<Mutex<UnloggedJournal>>::default();
+        Self {
+            namespace: namespace.to_owned(),
+            reads,
+            listing: Arc::new(tokio::sync::Mutex::new(Listing::new(Arc::clone(&changed)))),
+            published: Arc::default(),
+            changed,
+            waiters: Arc::default(),
+        }
     }
 
     /// Each session's newest launch at every home, as the engine port lists it: this home's
@@ -268,18 +417,8 @@ impl TerminalViews {
 
     /// The listed records `keep` selects: only those are copied out of the listing.
     async fn listed_where(&self, keep: impl Fn(&Record<TerminalSession>) -> bool) -> Result<Vec<Record<TerminalSession>>, ResourceError> {
-        Ok(self.positioned_where(keep, |_| ()).await?.0)
-    }
-
-    /// [`Self::listed_where`], and what `at` reads of the listing they were copied from.
-    async fn positioned_where<T>(
-        &self,
-        keep: impl Fn(&Record<TerminalSession>) -> bool,
-        at: impl FnOnce(&Listing) -> T,
-    ) -> Result<(Vec<Record<TerminalSession>>, T), ResourceError> {
-        let listing = self.passed().await?;
-        let listed = listing.sessions.values().filter_map(|entry| entry.view.as_ref().filter(|view| keep(view)).cloned()).collect();
-        Ok((listed, at(&listing)))
+        let published = self.passed().await?;
+        Ok(listed_in(&published, keep))
     }
 
     /// The views `cover` selects, from the listing's index, this home's alone when `local`: only
@@ -287,42 +426,79 @@ impl TerminalViews {
     async fn covered_views(&self, cover: &IndexCover, local: bool) -> Result<Vec<Record<TerminalSession>>, ResourceError> {
         let here = self.terminals().map_err(ResourceError::other)?.home().to_owned();
         let listing = self.passed().await?;
-        Ok(listing
+        let shown = &listing.shown;
+        Ok(shown
             .index
             .covered(cover)
             .into_iter()
             .filter(|(home, _)| !local || *home == here)
-            .filter_map(|session| listing.sessions.get(&session)?.view.clone())
+            .filter_map(|session| shown.sessions.get(&session)?.view.clone())
             .collect())
     }
 
-    /// The listing, once it has taken in what changed since the last pass. A measured read counts
+    /// The listing as published, once it holds every change written before the read: the commits
+    /// counted before it are read in by a pass, one that began after them or its own. While the
+    /// listing last published holds every commit counted, the read takes it without a lock and
+    /// reads no store; otherwise it waits for the pass running or runs one. A measured read counts
     /// the pass it waits on, another read's included.
-    async fn passed(&self) -> Result<tokio::sync::MutexGuard<'_, Listing>, ResourceError> {
+    async fn passed(&self) -> Result<Arc<Published>, ResourceError> {
+        // Before anything is read: a pass that began after this read the commits counted here.
+        let last = self.last_published();
+        let told = last.as_ref().and_then(|last| last.told(self.reads.as_ref()));
+        if let Some(last) = last.filter(|last| last.serves(told.as_ref())) {
+            return Ok(last);
+        }
         let waiters = &self.waiters;
         waiters
             .wait(async {
-                let mut listing = self.listing.lock().await;
-                waiters.serve(self.pass_listing(&mut listing)).await?;
-                Ok(listing)
+                let mut listing = self.listing.lock().instrument(info_span!("terminal_views.lock_wait")).await;
+                // A pass that completed while this read waited may have read every commit counted.
+                if let Some(last) = self.last_published().filter(|last| last.serves(told.as_ref())) {
+                    return Ok(last);
+                }
+                waiters.serve(self.pass_listing(&mut listing)).instrument(info_span!("terminal_views.pass")).await?;
+                Ok(self.publish(&listing))
             })
             .await
+    }
+
+    fn last_published(&self) -> Option<Arc<Published>> {
+        self.published.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Publishes `listing` as the listing readers read.
+    fn publish(&self, listing: &Listing) -> Arc<Published> {
+        let published = Arc::new(listing.published());
+        *self.published.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&published));
+        published
     }
 
     /// Takes into `listing` what changed since its last pass.
     async fn pass_listing(&self, listing: &mut Listing) -> Result<(), ResourceError> {
         let held = listing.cursors.take();
         let reads = Arc::clone(&self.reads);
-        let (cursors, dirt) = self
-            .blocking(move |_| match held {
+        let started = listing.started;
+        let (cursors, dirt, told, started) = self
+            .blocking(move |reads_now| match held {
                 Some(mut cursors) => {
+                    // Before the cursors read the log: the commits counted are among what they read.
+                    let told = cursors.told(reads_now, started);
                     let dirt = cursors.pass();
-                    Ok((Some(cursors), dirt))
+                    Ok((Some(cursors), dirt, told, started))
                 }
-                // Started before the full read: a change after it is read again at the next pass.
-                None => Ok((Cursors::start(reads)?, Dirt { all: true, ..Dirt::default() })),
+                // Started before the full read: a change after it is read again at the next pass,
+                // and the commits counted after the start are among what the full read reads.
+                None => {
+                    let cursors = Cursors::start(reads)?;
+                    let started = started.saturating_add(1);
+                    let told = cursors.as_ref().and_then(|cursors| cursors.told(reads_now, started));
+                    Ok((cursors, Dirt { all: true, ..Dirt::default() }, told, started))
+                }
             })
             .await?;
+        listing.started = started;
+        // Set again once the pass completes.
+        listing.through = None;
         let follows = cursors.is_some();
         listing.cursors = cursors;
         if dirt.all || !follows {
@@ -360,7 +536,7 @@ impl TerminalViews {
                     return Err(error);
                 }
             }
-        } else if !dirt.is_clean() || listing.sessions.values().any(|entry| entry.unresolved) {
+        } else if !dirt.is_clean() || listing.shown.sessions.values().any(|entry| entry.unresolved) {
             if let Err(error) = self.pass(listing, dirt).await {
                 listing.cursors = None;
                 return Err(error);
@@ -369,6 +545,7 @@ impl TerminalViews {
         if let Some(cursors) = listing.cursors.as_ref() {
             cursors.composed();
         }
+        listing.through = told;
         Ok(())
     }
 
@@ -390,6 +567,7 @@ impl TerminalViews {
         }
         let here = self.terminals().map_err(ResourceError::other)?.home().to_owned();
         let mut again: BTreeSet<Session> = listing
+            .shown
             .sessions
             .iter()
             .filter(|(_, entry)| {
@@ -404,14 +582,18 @@ impl TerminalViews {
         let mut records = BTreeMap::new();
         for record in changed {
             let session = (record.home.clone(), record.session_name().to_owned());
-            if listing.sessions.get(&session).is_some_and(|held| held.record.launch_number() > record.launch_number()) {
+            if listing.shown.sessions.get(&session).is_some_and(|held| held.record.launch_number() > record.launch_number()) {
                 continue;
             }
             again.remove(&session);
             records.insert(session, record);
         }
-        records.extend(again.into_iter().filter_map(|session| listing.sessions.get(&session).map(|entry| (session, entry.record.clone()))));
-        let entries = self.entries(records.into_values().collect(), Joins::Keyed).await?;
+        records.extend(
+            again.into_iter().filter_map(|session| listing.shown.sessions.get(&session).map(|entry| (session, entry.record.clone()))),
+        );
+        let records: Vec<_> = records.into_values().collect();
+        let span = info_span!("terminal_views.recompose", sessions = records.len());
+        let entries = self.entries(records, Joins::Keyed).instrument(span).await?;
         let entries = listing.stamped(entries)?;
         listing.extend(entries);
         Ok(())
@@ -443,7 +625,7 @@ impl TerminalViews {
 
     /// How many sessions the listing holds: what grows with the sessions held.
     pub async fn held(&self) -> Result<usize, ResourceError> {
-        Ok(self.passed().await?.sessions.len())
+        Ok(self.passed().await?.shown.sessions.len())
     }
 
     /// This home's sessions' newest launches.
@@ -490,8 +672,8 @@ impl TerminalViews {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        let holders = self.holders(&records).await;
-        let environments = self.environments(&records, joins).await;
+        let holders = self.holders(&records).instrument(info_span!("terminal_views.holders", sessions = records.len())).await;
+        let environments = self.environments(&records, joins).instrument(info_span!("terminal_views.environments")).await;
         let terminals = self.reads.terminals().map_err(ResourceError::other)?;
         let here = terminals.home().to_owned();
         Ok(records
@@ -606,10 +788,18 @@ impl TerminalViews {
     async fn here_record(&self, record: TerminalRecord) -> Result<Option<Record<TerminalSession>>, String> {
         let launch = record.name.clone();
         let session = (record.home.clone(), record.session_name().to_owned());
-        let Some(view) = self.compose(vec![record]).await.map_err(|error| error.to_string())?.pop() else { return Ok(None) };
+        let composed = self.compose(vec![record]).instrument(info_span!("terminal_views.compose"));
+        let Some(view) = composed.await.map_err(|error| error.to_string())?.pop() else { return Ok(None) };
         let mut view = crate::held_listing::view_record(view.object, session.0.clone(), 0);
-        let listing = self.listing.lock().await;
-        view.version = listing.version(&session, &launch, &view, listing.position())?;
+        // The listing as last published, as one read made now would take it; the listing itself
+        // before the first is.
+        view.version = match self.last_published() {
+            Some(published) => version(&published.shown, &session, &launch, &view, published.position)?,
+            None => {
+                let listing = self.listing.lock().instrument(info_span!("terminal_views.lock_wait", by = "version")).await;
+                version(&listing.shown, &session, &launch, &view, listing.position())?
+            }
+        };
         Ok(Some(view))
     }
 
@@ -654,7 +844,8 @@ impl KindRecords<TerminalSession> for TerminalViews {
     async fn get(&self, name: &str) -> Result<Option<Record<TerminalSession>>, String> {
         let here = self.home();
         let owned = name.to_owned();
-        let record = self.blocking(move |reads| reads.terminals()?.get(&owned, None)).await.map_err(|error| error.to_string())?;
+        let record = self.blocking(move |reads| reads.terminals()?.get(&owned, None)).instrument(info_span!("terminal_views.record"));
+        let record = record.await.map_err(|error| error.to_string())?;
         if let Some(record) = record.filter(|record| record.home == here) {
             if record.reading == LifecycleReading::Released {
                 return Ok(None);
@@ -684,21 +875,37 @@ impl KindRecords<TerminalSession> for TerminalViews {
     }
 
     async fn positioned(&self) -> Result<(Vec<Record<TerminalSession>>, LogPosition), String> {
-        self.positioned_where(|_| true, Listing::read).await.map_err(|error| error.to_string())
+        let published = self.passed().await.map_err(|error| error.to_string())?;
+        Ok((listed_in(&published, |_| true), published.log_position()))
     }
 
     async fn position(&self) -> Result<LogPosition, String> {
-        Ok(self.positioned_where(|_| false, Listing::read).await.map_err(|error| error.to_string())?.1)
+        Ok(self.passed().await.map_err(|error| error.to_string())?.log_position())
     }
 
     /// Named from the listing's own changes, which take in this home's observations: within this
-    /// run only.
+    /// run only. Named from the journal while it holds no change the listing published does not:
+    /// otherwise a pass is changing the listing, and the read waits for it.
     async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
-        let since = |listing: &Listing| match listing.changed.since(position.unlogged.as_ref()) {
-            Ok(names) => Since::Changed { names, through: listing.read() },
+        let published = self.passed().await.map_err(|error| error.to_string())?;
+        let since = |changed: &UnloggedJournal| match changed.since(position.unlogged.as_ref()) {
+            Ok(names) => Since::Changed { names, through: LogPosition { homes: BTreeMap::new(), unlogged: Some(changed.read()) } },
             Err(reason) => Since::Expired(reason),
         };
-        Ok(self.positioned_where(|_| false, since).await.map_err(|error| error.to_string())?.1)
+        {
+            let changed = self.changed.lock().unwrap_or_else(PoisonError::into_inner);
+            if changed.count() == published.read.read {
+                return Ok(since(&changed));
+            }
+        }
+        let waiters = &self.waiters;
+        let since = waiters.wait(async {
+            let mut listing = self.listing.lock().instrument(info_span!("terminal_views.lock_wait", by = "changed_since")).await;
+            waiters.serve(self.pass_listing(&mut listing)).instrument(info_span!("terminal_views.pass")).await?;
+            self.publish(&listing);
+            Ok::<_, ResourceError>(listing.since(position))
+        });
+        since.await.map_err(|error| error.to_string())
     }
 
     /// Every home's listed copy of `name`, and this home's newest launch of it however it ended.

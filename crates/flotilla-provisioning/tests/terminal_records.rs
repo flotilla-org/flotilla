@@ -328,3 +328,62 @@ async fn the_session_listing_follows_each_launch_and_its_environment() {
     assert_eq!(next_session(&mut watch).await, ("deleted", request.session.clone(), None));
     assert!(listed().await.is_empty());
 }
+
+// Behaviour (d15): a listing read made while no commit has landed since the session listing last
+// passed reads it as published: it reads no store, so it waits on no pass. A writer still reads its
+// commit back at its next read, without waiting for any follower, and an observation at the next
+// read after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_read_with_no_commit_since_the_last_pass_reads_no_store() {
+    use std::sync::Arc;
+
+    use flotilla_resources::{
+        environment_records::LaunchFacts, EnvironmentSpec, HostDirectEnvironmentSpec, TerminalOccupancy, TerminalSession,
+        TerminalSessionPhase,
+    };
+    use flotilla_store::{load_metrics::measure, ResourceBackend, TerminalViews};
+
+    let store = flotilla_provisioning_testkit::OtherHome::open("home");
+    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    backend.install_engine_records(Arc::new(TerminalViews::new("flotilla", engine.reads())));
+    backend.serve_engine_in("flotilla");
+    let sessions = backend.including_replicas::<TerminalSession>("flotilla");
+    let listed = || async { sessions.list().await.expect("list").items.into_iter().map(|read| read.object).collect::<Vec<_>>() };
+
+    let spec = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "home".into(), repo_default_dir: "/work".into() }),
+        ..EnvironmentSpec::default()
+    };
+    engine.environments.request("env", &spec, None);
+    engine.environments.ready("env", "backing", LaunchFacts::default());
+    let vessel = engine.vessels.request("c", "work", "host");
+    let request = TerminalsFixture::agent(&vessel, "coder", "env");
+    let first = engine.terminals.request(&request);
+    assert_eq!(listed().await.len(), 1, "the writer reads its request back");
+
+    let (shown, reads) = measure(listed()).await;
+    assert_eq!(shown.len(), 1);
+    let stored: Vec<_> = reads
+        .iter()
+        .filter(|(kind, counts)| !kind.ends_with(" port") && counts.keyed + counts.index + counts.whole_kind > 0)
+        .map(|(kind, _)| kind.clone())
+        .collect();
+    assert!(stored.is_empty(), "a read with nothing committed since the last pass reads no store, but read {stored:?}");
+
+    engine.terminals.ready(&first, "sid", &facts());
+    let shown = listed().await;
+    assert_eq!(
+        shown[0].status.as_ref().map(|status| status.phase),
+        Some(TerminalSessionPhase::Running),
+        "the writer reads its commit back"
+    );
+
+    let observed = engine.terminals.terminals.observations().update(&first, |observation| {
+        observation.occupancy = TerminalOccupancy::Occupied;
+    });
+    assert!(observed);
+    let shown = listed().await;
+    let occupancy = shown[0].status.as_ref().map(|status| status.occupancy);
+    assert_eq!(occupancy, Some(TerminalOccupancy::Occupied), "an observation is read at the next read");
+}
