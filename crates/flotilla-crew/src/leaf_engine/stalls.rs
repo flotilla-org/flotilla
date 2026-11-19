@@ -485,6 +485,15 @@ fn nudge_backoff(grace_seconds: u32, delivered: usize) -> chrono::Duration {
     chrono::Duration::seconds(i64::from(grace_seconds.max(1)).saturating_mul(1_i64 << delivered.saturating_sub(1).min(20)))
 }
 
+/// The fleet role stall nudges are sent from.
+const NUDGE_SENDER: &str = "nudge";
+
+/// The turn source of the nudge sent after `nudges` others in its episode: with the episode, it
+/// fixes the nudge's Message name.
+fn nudge_source(nudges: usize) -> String {
+    format!("stall-nudge-{}", nudges + 1)
+}
+
 /// How long a resumed crew's turn holds off supervision while its brief is unconfirmed.
 const RESUMED_TURN_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 
@@ -1931,19 +1940,46 @@ impl ReconcilerWake {
             if idle_at.is_some() && declared.is_none() && !resume_grace {
                 let limit = nudge_policy(status, vessel, role).map_or(2, |policy| policy.max_per_episode) as usize;
                 let grace_seconds = idle_grace_seconds(status, vessel, role);
+                let delivery_failed = prior
+                    .is_some_and(|stalled| stalled.rung == StallRung::Operator && stalled.evidence.starts_with("nudge delivery failed:"));
+                let progress = obligations
+                    .iter()
+                    .find(|obligation| obligation.maker == row.maker && obligation.leaves == row.leaves)
+                    .map(|obligation| obligation.progress.clone())
+                    .unwrap_or_default();
+                // The ladder's place is the home's note, which a restart empties. The nudges sent
+                // in this episode are Messages its name fixes: read back, the ladder goes on from
+                // them rather than from its first rung (GitHub run N3-2).
+                let mut episode = None;
+                if condition.nudge_history.is_empty() && limit > 0 && !delivery_failed {
+                    let named = off_frame(|| self.nudge_episode(namespace, convoy, vessel, role, &progress)).await?;
+                    let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
+                    let sent = off_frame(|| self.episode_nudges(namespace, convoy, vessel, role, &named, limit, leaf)).await?;
+                    if !sent.is_empty() {
+                        condition.nudge_history = sent;
+                        if let Some(obligation) =
+                            obligations.iter_mut().find(|obligation| obligation.maker == row.maker && obligation.leaves == row.leaves)
+                        {
+                            obligation.history = condition.nudge_history.clone();
+                        }
+                    }
+                    episode = Some(named);
+                }
                 let backoff = nudge_backoff(grace_seconds, condition.nudge_history.len());
                 let due = condition.nudge_history.last().is_none_or(|nudge| now.signed_duration_since(nudge.at) >= backoff);
-                if prior
-                    .is_some_and(|stalled| stalled.rung == StallRung::Operator && stalled.evidence.starts_with("nudge delivery failed:"))
-                {
+                if delivery_failed {
                     condition.rung = StallRung::Operator;
                     condition.evidence = prior.expect("checked above").evidence.clone();
                 } else if condition.nudge_history.len() < limit {
                     condition.rung = StallRung::Nudge;
                     if due {
                         let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
-                        let delivered =
-                            off_frame(|| self.deliver_stall_nudge(tick, convoy, vessel, role, leaf, condition.nudge_history.len())).await?;
+                        let episode = match episode {
+                            Some(episode) => episode,
+                            None => off_frame(|| self.nudge_episode(namespace, convoy, vessel, role, &progress)).await?,
+                        };
+                        let nudges = condition.nudge_history.len();
+                        let delivered = off_frame(|| self.deliver_stall_nudge(tick, convoy, vessel, role, leaf, nudges, &episode)).await?;
                         match delivered {
                             Ok(_) => {
                                 condition.nudge_history.push(StallNudge { at: now, row: leaf.clone() });
@@ -2041,8 +2077,72 @@ impl ReconcilerWake {
         Ok(condition)
     }
 
-    /// Delivers a stall nudge to an idle actor, naming what it owes; the inner error is a failed
-    /// delivery.
+    /// The idle episode seat `vessel`/`role`'s nudges belong to, as their Messages' subject
+    /// revision: the `progress` its obligation observed and the newest guidance delivered to it.
+    /// Observed progress restarts the ladder, as the notes clear it, and guidance (an operator's
+    /// resume) starts a new episode. Neither is the home's note, so a restart reads the same one.
+    async fn nudge_episode(
+        &self,
+        namespace: &str,
+        convoy: &ResourceObject<Convoy>,
+        vessel: &str,
+        role: &str,
+        progress: &BTreeMap<String, String>,
+    ) -> Result<String, String> {
+        use sha2::Digest;
+
+        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        let receiver = crew_role_address(&convoy.spec.project_ref, &convoy.metadata.name, vessel, role);
+        let guidance = primitives.latest_guidance(namespace, &receiver, None).await.map_err(|error| error.to_string())?;
+        let mut digest = sha2::Sha256::new();
+        for (key, value) in progress {
+            digest.update(key.as_bytes());
+            digest.update([0]);
+            digest.update(value.as_bytes());
+            digest.update([0]);
+        }
+        if let Some(guidance) = &guidance {
+            digest.update(guidance.name.as_bytes());
+        }
+        Ok(digest.finalize().iter().take(16).map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    /// The nudges sent to seat `vessel`/`role` in `episode`, oldest first, up to `limit`: read by
+    /// the names their producer keys fix, each as of when it was admitted.
+    #[allow(clippy::too_many_arguments)]
+    async fn episode_nudges(
+        &self,
+        namespace: &str,
+        convoy: &ResourceObject<Convoy>,
+        vessel: &str,
+        role: &str,
+        episode: &str,
+        limit: usize,
+        leaf: &Leaf,
+    ) -> Result<Vec<StallNudge>, String> {
+        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        let project = &convoy.spec.project_ref;
+        let sender = Party::fleet(NUDGE_SENDER).inbox(primitives.as_ref(), namespace, project).await?;
+        let seat = Party::Seat { project: project.clone(), convoy: convoy.metadata.name.clone(), role: role.to_owned() };
+        let inbox = seat.inbox(primitives.as_ref(), namespace, project).await?;
+        let receiver = crew_role_address(project, &convoy.metadata.name, vessel, role);
+        let named: Vec<_> = (0..limit)
+            .map(|nudges| {
+                let key = super::turn_delivery::turn_message_producer_key(&nudge_source(nudges), episode);
+                (receiver.clone(), flotilla_resources::message_record_name(inbox.as_str(), sender.as_str(), &key))
+            })
+            .collect();
+        let sent = primitives.sent_messages(namespace, &named).await.map_err(|error| error.to_string())?;
+        Ok(named
+            .iter()
+            .filter_map(|(_, name)| sent.iter().find(|message| message.standing.name == *name))
+            .map(|message| StallNudge { at: message.standing.created, row: leaf.clone() })
+            .collect())
+    }
+
+    /// Delivers a stall nudge to an idle actor, naming what it owes, in `episode`; the inner error
+    /// is a failed delivery.
+    #[allow(clippy::too_many_arguments)]
     async fn deliver_stall_nudge(
         &self,
         tick: StallTick<'_>,
@@ -2051,8 +2151,9 @@ impl ReconcilerWake {
         role: &str,
         leaf: &Leaf,
         nudges: usize,
+        episode: &str,
     ) -> Result<Result<(), String>, String> {
-        let StallTick { namespace, now, .. } = tick;
+        let StallTick { namespace, .. } = tick;
         // The leaf's phrasing is the armability check; the nudge names what the seat owes.
         let obligation = actor_obligation(leaf)?;
         let obligation = match convoy.status.as_ref() {
@@ -2080,12 +2181,12 @@ impl ReconcilerWake {
         let request = CrewTurnIntent::builder()
             .namespace(namespace.to_string())
             .convoy(convoy.metadata.name.clone())
-            .source(format!("stall-nudge-{}", nudges + 1))
+            .source(nudge_source(nudges))
             .vessel(vessel.to_owned())
             .role(role.to_owned())
             .brief(brief)
-            .subject_revision(now.timestamp_micros().to_string())
-            .sender(Party::fleet("nudge"))
+            .subject_revision(episode.to_owned())
+            .sender(Party::fleet(NUDGE_SENDER))
             .expectation(flotilla_messaging::IntentExpectation::Outcome { condition })
             .references(vec![reference])
             .build();
