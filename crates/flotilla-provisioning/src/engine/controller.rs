@@ -56,7 +56,7 @@ use flotilla_state_machines::{
     Cause, Outcome, Resource,
 };
 use tokio::{sync::mpsc, task::JoinSet};
-use tracing::{debug, warn};
+use tracing::{debug, info_span, warn, Instrument};
 
 use super::{
     reads::{judge, Judgement},
@@ -513,8 +513,13 @@ where
         touched
     }
 
-    /// Decides and acts for each touched resource.
+    /// Decides and acts for each touched resource, in a span of its kind.
     async fn evaluate(&mut self, touched: BTreeMap<String, Trigger>) {
+        let span = info_span!("engine_controller.evaluate", kind = K::NAME, touched = touched.len());
+        self.evaluate_touched(touched).instrument(span).await
+    }
+
+    async fn evaluate_touched(&mut self, touched: BTreeMap<String, Trigger>) {
         let mut held = Vec::new();
         for (name, trigger) in touched {
             match self.lifecycles.get(&name).filter(|resource| resource.state().live()) {
@@ -625,10 +630,14 @@ where
             }
             Action::Hold => {
                 self.holding.insert(owned.clone());
-                self.flights.spawn(inherit(async move {
-                    let done = Done::Held(actuator.holdings(&owned, &request).await);
-                    (owned, done)
-                }));
+                let span = info_span!("engine_controller.holdings", kind = K::NAME, name);
+                self.flights.spawn(inherit(
+                    async move {
+                        let done = Done::Held(actuator.holdings(&owned, &request).await);
+                        (owned, done)
+                    }
+                    .instrument(span),
+                ));
             }
             Action::Observe => {
                 // A holding kind's observation reads what it holds too, so that one adopted at
@@ -637,28 +646,40 @@ where
                 if holds {
                     self.holding.insert(owned.clone());
                 }
-                self.flights.spawn(inherit(async move {
-                    let holdings = if holds { actuator.holdings(&owned, &request).await.ok() } else { None };
-                    let done = Done::Observed(actuator.observe(&owned, &request).await, holdings);
-                    (owned, done)
-                }));
+                let span = info_span!("engine_controller.observe", kind = K::NAME, name);
+                self.flights.spawn(inherit(
+                    async move {
+                        let holdings = if holds { actuator.holdings(&owned, &request).await.ok() } else { None };
+                        let done = Done::Observed(actuator.observe(&owned, &request).await, holdings);
+                        (owned, done)
+                    }
+                    .instrument(span),
+                ));
             }
             Action::Realise => {
-                self.flights.spawn(inherit(async move {
-                    let done = Done::Realised(actuator.realise(&owned, &request).await);
-                    (owned, done)
-                }));
+                let span = info_span!("engine_controller.realise", kind = K::NAME, name);
+                self.flights.spawn(inherit(
+                    async move {
+                        let done = Done::Realised(actuator.realise(&owned, &request).await);
+                        (owned, done)
+                    }
+                    .instrument(span),
+                ));
             }
             Action::Release { identity } => {
                 let ruled = self.ruled.as_deref() == Some(name);
-                self.flights.spawn(inherit(async move {
-                    let released = if ruled {
-                        actuator.release_ruled(&owned, &request, identity.as_deref()).await
-                    } else {
-                        actuator.release(&owned, &request, identity.as_deref()).await
-                    };
-                    (owned, Done::Released(released))
-                }));
+                let span = info_span!("engine_controller.release", kind = K::NAME, name);
+                self.flights.spawn(inherit(
+                    async move {
+                        let released = if ruled {
+                            actuator.release_ruled(&owned, &request, identity.as_deref()).await
+                        } else {
+                            actuator.release(&owned, &request, identity.as_deref()).await
+                        };
+                        (owned, Done::Released(released))
+                    }
+                    .instrument(span),
+                ));
             }
         }
         self.in_flight.insert(name.to_owned());
