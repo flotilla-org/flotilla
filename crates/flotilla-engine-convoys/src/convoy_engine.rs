@@ -282,19 +282,25 @@ impl EngineConvoys for ConvoyEngine {
                     Some(_) => Vec::new(),
                     None => vec![declare(&id, kind, source)?.into()],
                 },
-                (PromiseOperation::Submit { id, kind, source, .. }, Some((address, revision))) => {
+                (PromiseOperation::Submit { id, kind, source, .. }, Some((address, mut revision))) => {
                     let mut edges = Vec::new();
                     let (promise, owner) = match found(&id) {
                         Some(promise) => {
-                            // The same reference again is the submission already made, as on the
-                            // old path, which compared subjects: a kept or submitted promise takes
-                            // it as a no-op unless it brings a revision the current one lacks.
+                            // The same reference again is the submission already made: a kept
+                            // promise takes it as a no-op. A submitted one takes it from its crew
+                            // as a submission again at the current revision, when it brings no
+                            // newer one: the crew's answer to a turn it was handed, which the stall
+                            // judge reads by its time (GitHub run GH2-1). From anyone else it is a
+                            // no-op.
                             let current = promise.submissions.iter().last().map(|row| &row.record);
                             let same = current.is_some_and(|last| last.address == address);
                             let newer = current.is_some_and(|last| !revision.is_empty() && last.revision != revision);
                             match promise.progress.value {
                                 Progress::Kept if same => return Ok((Vec::new(), ())),
-                                Progress::Submitted if same && !newer => return Ok((Vec::new(), ())),
+                                Progress::Submitted if same && !newer && actor != Actor::Crew => return Ok((Vec::new(), ())),
+                                Progress::Submitted if same && !newer => {
+                                    revision = current.map(|last| last.revision.clone()).unwrap_or_default();
+                                }
                                 _ => {}
                             }
                             (promise.id, promise.owner.clone())

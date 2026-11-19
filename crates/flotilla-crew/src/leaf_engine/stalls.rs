@@ -13,8 +13,8 @@ use flotilla_resources::{
     address::{leaf_address, record_name},
     select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewWorkPhase, LeafMaker, NudgeObligation, ResourceObject,
     StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, Stalls, SupervisionTarget, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryOutcome,
-    TurnDeliveryRule, WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule,
+    WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{load_metrics::carry, off_frame};
 
@@ -381,9 +381,10 @@ fn declared_seat_stalled(status: &ConvoyStatus, stall: &StalledCondition) -> boo
 }
 
 /// What seat `vessel`/`role` owes, for its nudge (run 4): the promises it has yet to submit, or,
-/// when every open promise is submitted, the newest turn that asked it to act. `None` when its
-/// status names neither, and the nudge says what the leaf it is armed on does.
-fn owed_now(status: &ConvoyStatus, vessel: &str, role: &str) -> Option<String> {
+/// when every open promise is submitted, the newest of `unanswered`, the turns that asked it to
+/// act and it has not answered. `None` when its status names neither, and the nudge says what the
+/// leaf it is armed on does.
+fn owed_now(status: &ConvoyStatus, vessel: &str, role: &str, unanswered: &[super::wake::OwedTurn<'_>]) -> Option<String> {
     const BLOCKED: &str = "Run `crew stall --reason <infra|scope|decision|access|other> --message …` if blocked.";
     let unsubmitted: Vec<String> = flotilla_resources::promises::owned(status, vessel, role)
         .iter()
@@ -396,27 +397,21 @@ fn owed_now(status: &ConvoyStatus, vessel: &str, role: &str) -> Option<String> {
             unsubmitted.join(", ")
         ));
     }
-    let (source, accepted_at) = super::wake::owed_turns(status, vessel, role).max_by_key(|(_, accepted_at)| *accepted_at)?;
+    let turn = unanswered.iter().max_by_key(|turn| turn.accepted_at)?;
     let asked = status
         .workflow_snapshot
         .as_ref()
-        .and_then(|snapshot| snapshot.turn_delivery.get(source))
+        .and_then(|snapshot| snapshot.turn_delivery.get(turn.source))
         .and_then(|rule| rule.brief.lines().map(str::trim).find(|line| !line.is_empty()))
         .unwrap_or_default();
-    // The revision of its subject the turn was delivered for. Whether the seat has acted on it is
-    // not known here (no "head moved, so acted on" inference), so the nudge does not say (run 5 R5-2).
-    let revision = status
-        .turn_deliveries
-        .get(source)
-        .and_then(|delivery| {
-            delivery.episodes.iter().find(
-                |episode| matches!(episode.outcome, TurnDeliveryOutcome::MessageAccepted { accepted_at: at, .. } if at == accepted_at),
-            )
-        })
-        .map_or(String::new(), |episode| format!(" for `{}`", episode.subject_revision));
+    // The revision of its subject the turn was delivered for. The seat has neither submitted nor
+    // pushed since (`unanswered`), but it may have acted otherwise, so the nudge does not claim
+    // the turn went unanswered (run 5 R5-2).
     Some(format!(
-        "You owe deliverables for {vessel}/{role}: the newest turn that asked you to act is `{source}`, delivered at {}{revision}: {asked} Your submitted promises wait on it; act on it if you have not, and submit again where it changes them. {BLOCKED}",
-        accepted_at.to_rfc3339()
+        "You owe deliverables for {vessel}/{role}: the newest turn that asked you to act is `{}`, delivered at {} for `{}`: {asked} Your submitted promises wait on it; act on it if you have not, and submit again where it changes them. {BLOCKED}",
+        turn.source,
+        turn.accepted_at.to_rfc3339(),
+        turn.revision,
     ))
 }
 
@@ -2058,7 +2053,21 @@ impl ReconcilerWake {
         let StallTick { namespace, now, .. } = tick;
         // The leaf's phrasing is the armability check; the nudge names what the seat owes.
         let obligation = actor_obligation(leaf)?;
-        let obligation = convoy.status.as_ref().and_then(|status| owed_now(status, vessel, role)).unwrap_or(obligation);
+        let obligation = match convoy.status.as_ref() {
+            Some(status) => {
+                let heads = super::wake::TurnHeads::read(convoy, &tick.inputs.forges, |name| {
+                    tick.progress_observations.get(name).and_then(|record| record.status.as_ref())
+                });
+                // Unread, the nudge names no turn rather than one the seat may have answered.
+                let unanswered = self.unanswered_turns(namespace, convoy, vessel, role, None, &heads).await.unwrap_or_else(|error| {
+                    tracing::debug!(convoy = %convoy.metadata.name, vessel, role, %error, "a nudge's owed turns are unread");
+                    Vec::new()
+                });
+                owed_now(status, vessel, role, &unanswered)
+            }
+            None => None,
+        }
+        .unwrap_or(obligation);
         let brief =
             format!("For {role}@{vessel} in {} (resource ref: {}):\n{obligation}", convoy_message_address(convoy), convoy.metadata.name);
         // A condition or reference that names nothing fails this delivery like any other.

@@ -464,7 +464,7 @@ async fn a_checks_failed_turn_nudges_the_idle_seat_while_its_pr_is_observed_curr
 
     let coder = coder().await;
     submit_pr(&coder).await;
-    observe_pr(&coder, flotilla_resources::ObservedChecks::Fail).await;
+    observe_pr(&coder, "head-1", flotilla_resources::ObservedChecks::Fail).await;
     deliver_rule_turn(&coder, CHECKS_RULE, CHECKS_BRIEF, "head-1@fail", true).await;
     let Coder { daemon, backend, probe, clock, launch, .. } = coder;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -487,8 +487,108 @@ async fn a_checks_failed_turn_nudges_the_idle_seat_while_its_pr_is_observed_curr
         .any(|message| message.spec.body.contains(&format!("the newest turn that asked you to act is `{CHECKS_RULE}`"))));
 }
 
-/// The observer reads the coder's PR now: open, mergeable, with `checks`.
-async fn observe_pr(coder: &Coder, checks: flotilla_resources::ObservedChecks) {
+// GitHub run GH2-1: a coder handed a review fix pushes it and submits its PR again with the same
+// reference and no commit. It has answered the turn, and is not nudged when it goes idle.
+#[tokio::test]
+async fn a_turn_answered_by_a_push_and_a_resubmission_does_not_nudge_the_idle_seat() {
+    let coder = coder().await;
+    let pr = submit_pr(&coder).await;
+    observe_pr(&coder, "head-1", flotilla_resources::ObservedChecks::Pass).await;
+    deliver_review_fix(&coder).await;
+    observe_pr(&coder, "head-2", flotilla_resources::ObservedChecks::Pass).await;
+    resubmit_pr(&coder, &pr).await;
+    assert_not_nudged(coder).await;
+}
+
+// GH2-1: submitting the PR again after a turn answers it, even when the submission changes nothing
+// else (same reference, no commit) and the head has not moved: the crew acted after the turn.
+#[tokio::test]
+async fn a_resubmission_after_a_turn_answers_it_with_the_head_unchanged() {
+    let coder = coder().await;
+    let pr = submit_pr(&coder).await;
+    observe_pr(&coder, "head-1", flotilla_resources::ObservedChecks::Pass).await;
+    deliver_review_fix(&coder).await;
+    resubmit_pr(&coder, &pr).await;
+    let convoy = coder.backend.clone().using::<ResourceConvoy>("flotilla").get(&coder.probe.convoy).await.expect("convoy");
+    let recorded = coder.daemon.convoy_engine_path().get().expect("engine").recorded_promises(&convoy, None).expect("recorded read");
+    let resubmitted = recorded.expect("held")["work"]["coder"].iter().find(|promise| promise.id == pr.id).expect("the PR promise").clone();
+    assert_eq!(resubmitted.submissions.len(), 2, "the resubmission is recorded: {resubmitted:?}");
+    assert_not_nudged(coder).await;
+}
+
+// GH2-1: a new head on the PR after a turn answers it, without a resubmission.
+#[tokio::test]
+async fn a_push_after_a_turn_answers_it() {
+    let coder = coder().await;
+    submit_pr(&coder).await;
+    observe_pr(&coder, "head-1", flotilla_resources::ObservedChecks::Pass).await;
+    deliver_review_fix(&coder).await;
+    observe_pr(&coder, "head-2", flotilla_resources::ObservedChecks::Pass).await;
+    assert_not_nudged(coder).await;
+}
+
+// GH2-1: an actionable-review turn superseded in the same instant by a checks-passed turn about the
+// same head was never typed. The seat does not owe it; the turn that superseded it only informed.
+#[tokio::test]
+async fn a_superseded_turn_never_typed_is_not_owed() {
+    let coder = coder().await;
+    submit_pr(&coder).await;
+    observe_pr(&coder, "head-1", flotilla_resources::ObservedChecks::Pass).await;
+    let review =
+        admit_rule_turn(&coder, REVIEW_RULE, "Address the actionable review and push the fix.", "head-1", true, Some("head-1")).await;
+    let checks = admit_rule_turn(&coder, CHECKS_RULE, CHECKS_BRIEF, "head-1@pass", false, Some("head-1")).await;
+    let messages = crew_messages(&coder.daemon, "flotilla").await;
+    let phase = |name: &str| {
+        messages.iter().find(|message| message.metadata.name == name).and_then(|message| message.status.as_ref()).map(|status| status.phase)
+    };
+    assert_eq!(phase(&review), Some(flotilla_resources::MessagePhase::Superseded), "the review turn was never typed");
+    assert_ne!(phase(&checks), Some(flotilla_resources::MessagePhase::Superseded));
+    // The checks turn is typed, as in the run: nothing waits for delivery to hold a nudge back.
+    let typed = messages.iter().find(|message| message.metadata.name == checks).expect("the checks turn");
+    use flotilla_resources::Clock;
+    receive_turn(&coder.daemon, &typed.spec.receiver, &checks, "resume-staging-session", coder.clock.now()).await;
+    assert_not_nudged(coder).await;
+}
+
+/// The coder submits its PR `pr` again: the same reference, no commit.
+async fn resubmit_pr(coder: &Coder, pr: &flotilla_resources::promises::Promise) {
+    coder.clock.advance(chrono::Duration::seconds(1));
+    coder
+        .daemon
+        .crew
+        .promise(
+            &coder.context,
+            flotilla_protocol::commands::CrewPromiseOperation::Submit {
+                promise: Some(pr.id.clone()),
+                kind: "pr".into(),
+                reference: "https://github.com/flotilla-org/flotilla/pull/2200".into(),
+                metadata: Default::default(),
+            },
+        )
+        .await
+        .expect("submit the PR again");
+}
+
+/// The idle coder is judged and neither stalled nor sent anything.
+async fn assert_not_nudged(coder: Coder) {
+    let Coder { daemon, backend, probe, clock, launch, .. } = coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let before = crew_messages(&daemon, "flotilla").await.len();
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert!(
+        !status.stalls.iter().any(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { .. }))),
+        "{:?}",
+        status.stalls
+    );
+    let after = crew_messages(&daemon, "flotilla").await;
+    assert_eq!(after.len(), before, "no nudge: {:?}", after.iter().map(|message| &message.spec.body).collect::<Vec<_>>());
+}
+
+/// The observer reads the coder's PR now: open, mergeable, at `head`, with `checks`.
+async fn observe_pr(coder: &Coder, head: &str, checks: flotilla_resources::ObservedChecks) {
     use flotilla_resources::{Clock, Observation};
 
     let records = coder.backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
@@ -519,7 +619,7 @@ async fn observe_pr(coder: &Coder, checks: flotilla_resources::ObservedChecks) {
                 review_decision: Default::default(),
                 review_requested_from_owner: Default::default(),
                 state: Observation::known(flotilla_resources::ObservedChangeRequestState::Open, now),
-                head_sha: Observation::known("head-1".into(), now),
+                head_sha: Observation::known(head.into(), now),
                 checks: Observation::known(checks, now),
                 review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, now) },
                 mergeable: Observation::known(flotilla_resources::ObservedMergeability::Mergeable, now),
@@ -541,11 +641,26 @@ async fn deliver_review_fix(coder: &Coder) {
 /// it asked the coder to act, as delivery reads the rule's `owes` at firing), and the coder
 /// receives it.
 async fn deliver_rule_turn(coder: &Coder, source: &str, brief: &str, revision: &str, owes: bool) {
+    let record = admit_rule_turn(coder, source, brief, revision, owes, None).await;
+    let Coder { daemon, clock, .. } = coder;
+    let message =
+        crew_messages(daemon, "flotilla").await.into_iter().find(|message| message.metadata.name == record).expect("the turn's message");
+    use flotilla_resources::Clock;
+    receive_turn(daemon, &message.spec.receiver, &message.metadata.name, "resume-staging-session", clock.now()).await;
+}
+
+/// Rule `source` fires as [`deliver_rule_turn`] has it, about the coder's PR at `head` when given (as
+/// turn delivery names its subject), and the coder has not received it: its message's name.
+async fn admit_rule_turn(coder: &Coder, source: &str, brief: &str, revision: &str, owes: bool, head: Option<&str>) -> String {
     use flotilla_resources::{Clock, TurnDeliveryEpisode, TurnDeliveryOutcome};
 
     let Coder { daemon, backend, probe, clock, .. } = coder;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     clock.advance(chrono::Duration::seconds(1));
+    let subject = head.map(|head| {
+        let pr = flotilla_address::Address::change_request(&flotilla_address::Forge::github(), "flotilla-org/flotilla", 2200).expect("PR");
+        flotilla_messaging::IntentReference::subject(pr, flotilla_address::Revision::new(head.to_string()).expect("head"))
+    });
     let turn = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".into())
         .convoy(probe.convoy.clone())
@@ -555,6 +670,7 @@ async fn deliver_rule_turn(coder: &Coder, source: &str, brief: &str, revision: &
         .brief(brief.into())
         .subject_revision(revision.into())
         .sender(flotilla_crew::leaf_engine::Party::fleet("turn-rules"))
+        .references(subject.into_iter().collect())
         .build();
     let admission = daemon.crew.deliver_turn(&turn).await.expect("deliver the turn");
     let record = admission.message.name.clone();
@@ -584,9 +700,7 @@ async fn deliver_rule_turn(coder: &Coder, source: &str, brief: &str, revision: &
     )
     .await
     .expect("note the delivery");
-    let message =
-        crew_messages(daemon, "flotilla").await.into_iter().find(|message| message.metadata.name == record).expect("the turn's message");
-    receive_turn(daemon, &message.spec.receiver, &message.metadata.name, "resume-staging-session", clock.now()).await;
+    record
 }
 
 // F4 (run 3): a nudge is not a turn the seat owes after its submission. A coder nudged while its

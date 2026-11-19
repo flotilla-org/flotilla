@@ -664,7 +664,7 @@ fn asks_to_act(rule: &TurnDeliveryRule, address: &LeafAddress, subject: &dyn Lea
 /// artifact turn rules bind their subject to the convoy name or the PR head
 /// (`ArtifactSubjectBinding`). An issue's `address@updated-at` key is its own
 /// progress and carries no discriminator.
-fn same_progress(subject_revision: &str, progress: &str) -> bool {
+pub(super) fn same_progress(subject_revision: &str, progress: &str) -> bool {
     subject_revision.strip_prefix(progress).is_some_and(|rest| rest.is_empty() || rest.starts_with('@'))
 }
 

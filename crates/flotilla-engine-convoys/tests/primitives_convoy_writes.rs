@@ -174,10 +174,25 @@ async fn a_submitted_pr_is_kept_by_its_merge_and_the_convoy_delivers() {
     assert_eq!(copied.state, PromiseState::Submitted);
     assert_eq!(copied.submissions.len(), 1);
     assert!(copied.submissions[0].names(&copied.submissions[0].subject_address(&[]).expect("cr"), &[]));
-    // The same submission again writes nothing.
-    fixture.engine.promise(&convoy, "work", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("again");
+    // The same submission again from anyone but the crew writes nothing.
+    fixture.engine.promise(&convoy, "work", "coder", &submit("template/pr", PR), Actor::Observer).await.expect("again");
     let engine = fixture.convoys.get("c").expect("held");
     assert_eq!(engine.spec().promises.iter().next().expect("promise").record.submissions.len(), 1);
+    // The crew's is its answer to a turn, recorded as a submission again (GitHub run GH2-1).
+    fixture.engine.promise(&convoy, "work", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("again");
+    let engine = fixture.convoys.get("c").expect("held");
+    assert_eq!(engine.spec().promises.iter().next().expect("promise").record.submissions.len(), 2);
+    // One with no commit keeps the revision the current submission has.
+    let mut pushed = submit("template/pr", PR);
+    if let PromiseOperation::Submit { submission, .. } = &mut pushed {
+        submission.metadata.insert("commit".into(), "c1".into());
+    }
+    fixture.engine.promise(&convoy, "work", "coder", &pushed, Actor::Crew).await.expect("a new commit");
+    fixture.engine.promise(&convoy, "work", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("again");
+    let engine = fixture.convoys.get("c").expect("held");
+    let revisions: Vec<_> =
+        engine.spec().promises.iter().next().expect("promise").record.submissions.iter().map(|row| row.record.revision.clone()).collect();
+    assert_eq!(revisions, ["", "", "c1", "c1"]);
 
     fixture.engine.promise(&convoy, "work", "coder", &merged("template/pr"), Actor::Observer).await.expect("kept");
     let convoy = reread(&fixture, "c").await;
