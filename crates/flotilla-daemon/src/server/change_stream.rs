@@ -333,10 +333,7 @@ pub(super) fn follow(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use flotilla_projections::fleet::ChangeStreamUpdate;
-        let service = match daemon.decided_store() {
-            Ok(service) => service,
-            Err(_) => return,
-        };
+        let service = daemon.decided_store();
         let peer = flotilla_protocol::NodeId::new(&home);
         daemon.report_change_stream(
             &peer,

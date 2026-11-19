@@ -82,8 +82,6 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     let home = home_daemon.resource_backend();
     let placement = placement_daemon.resource_backend();
     // The runtime opens each daemon's Message path at startup.
-    home_daemon.open_message_primitives().expect("home message path");
-    placement_daemon.open_message_primitives().expect("placement message path");
     flotilla_engine_messages_testkit::designate_fleet(&home, "flotilla").await;
     flotilla_engine_messages_testkit::designate_fleet(&placement, "flotilla").await;
 
@@ -143,9 +141,9 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .expect("fulfilment kind");
     // A FulfilmentKind is an engine record: it reaches the placement as its home's log does.
     flotilla_provisioning_testkit::other_home::replicate_home(
-        &home_daemon.decided_store().expect("home decided store"),
+        &home_daemon.decided_store(),
         home_daemon.node_id().as_str(),
-        &placement_daemon.decided_store().expect("placement decided store"),
+        &placement_daemon.decided_store(),
     );
     crate::engine_environments(&placement_daemon).put_ready(
         "host-direct-placement-host",
@@ -178,7 +176,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
             .with_federated_dependencies(&placement, flotilla_protocol::CanonicalHostId::resolved("placement-host")),
         Arc::clone(&crate::engine(&placement_daemon).vessels.lifecycles),
         placement_daemon.lifecycle_reads(),
-        placement_daemon.decided_store().expect("placement decided store"),
+        placement_daemon.decided_store(),
     );
     let terminals = &crate::engine(&placement_daemon).terminals;
     let requested = || terminals.terminals.of_vessel(&held).expect("vessel sessions").pop();
@@ -195,9 +193,9 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     // The session's launch and its holder vessel reach the convoy's home as the placement's log does.
     crate::engine(&home_daemon);
     flotilla_provisioning_testkit::other_home::replicate_home(
-        &placement_daemon.decided_store().expect("placement decided store"),
+        &placement_daemon.decided_store(),
         placement_daemon.node_id().as_str(),
-        &home_daemon.decided_store().expect("home decided store"),
+        &home_daemon.decided_store(),
     );
 
     // #2287: replication wakes delivery and acknowledgment; no timer does.
@@ -271,9 +269,9 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     // A replicated dependency wakes the standing-turn task while its other
     // stream is closed; resubscription must happen before the periodic resync.
     flotilla_provisioning_testkit::other_home::replicate_home(
-        &home_daemon.decided_store().expect("home decided store"),
+        &home_daemon.decided_store(),
         home_daemon.node_id().as_str(),
-        &placement_daemon.decided_store().expect("placement decided store"),
+        &placement_daemon.decided_store(),
     );
     if closed_watch.is_some() {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -285,13 +283,10 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .expect("closed dependency watch resubscribes without a timer");
     }
     // The receiver's Messages as the crew reads them.
-    let records = flotilla_engine_messages_testkit::views(
-        &placement_daemon.message_primitives().expect("placement message path"),
-        &placement_daemon.resource_backend(),
-        "flotilla",
-    )
-    .await
-    .expect("receiver inbox");
+    let records =
+        flotilla_engine_messages_testkit::views(&placement_daemon.message_primitives(), &placement_daemon.resource_backend(), "flotilla")
+            .await
+            .expect("receiver inbox");
     assert_eq!(records.len(), 1);
     let nudge = &records[0].object;
     assert_eq!(nudge.spec.sender, "system:nudge");

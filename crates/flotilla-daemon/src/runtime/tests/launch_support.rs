@@ -57,7 +57,7 @@ pub(super) async fn bind_account_from_home(
     ahead: chrono::Duration,
 ) {
     use flotilla_resources::account_access::AccountRecords;
-    let target = daemon.decided_store().expect("decided store");
+    let target = daemon.decided_store();
     let other = flotilla_provisioning_testkit::other_home_for(&target, home);
     let accounts = flotilla_provisioning::engine::account::EngineAccounts::open(
         Arc::clone(other.service()),

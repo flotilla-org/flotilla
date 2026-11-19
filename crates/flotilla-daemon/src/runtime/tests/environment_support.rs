@@ -838,9 +838,6 @@ pub(super) async fn engine_startup(
 /// the fleet's forge observer role.
 pub(super) async fn engine_provisioning(daemon: &Arc<InProcessDaemon>) -> flotilla_provisioning::engine::ProvisioningLifecycles {
     designate_fleet(daemon).await;
-    if daemon.message_primitives().is_none() {
-        super::super::open_message_primitives(daemon).await.expect("open the Message path");
-    }
     let (lifecycles, _followers) = super::super::open_provisioning_lifecycles(daemon).await.expect("open the provisioning lifecycles");
     lifecycles
 }

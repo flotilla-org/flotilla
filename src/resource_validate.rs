@@ -1760,8 +1760,6 @@ mod tests {
             .expect("build in-process daemon server");
         // The ops inventory reads the engine's checkouts, as a composed daemon's does.
         flotilla_daemon_testkit::engine::engine(&server.daemon());
-        // Kind discovery reads every engine kind, Message among them, as a running daemon serves it.
-        server.daemon().open_message_primitives().expect("the engine Message path");
         let backend = server.daemon().resource_backend().clone();
         backend
             .using::<Project>("flotilla")

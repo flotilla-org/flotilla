@@ -561,7 +561,7 @@ pub(super) async fn resolve_daemon_forgejo_credential_condition(
     }
     // Forge definitions arrive with each connected peer's decided log: wait until this store has
     // committed a first round of every one of them.
-    let decided = daemon.decided_store()?;
+    let decided = daemon.decided_store();
     for peer in daemon.connected_peer_node_ids().await {
         if !decided.has_watermark(peer.as_str()) {
             return Ok(None);

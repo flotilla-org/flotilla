@@ -95,7 +95,6 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     // The work's launch, ready in its environment; the planner reads it as the old store's view.
     let engine = engine(&daemon);
     // Explain reads the launch's messages, which the engine's Message path serves.
-    daemon.open_message_primitives().expect("message path");
     let launch = engine.vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
     // Its container, requested for it and running.
     let host_ref = daemon.local_host_id().expect("local host").to_string();
@@ -161,7 +160,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         VesselPlanning::new(backend.clone(), NAMESPACE, daemon.account_records()).with_lifecycle_reads(daemon.lifecycle_reads()),
         Arc::clone(&engine.vessels.lifecycles),
         daemon.lifecycle_reads(),
-        daemon.decided_store().expect("decided store"),
+        daemon.decided_store(),
     );
     let reading = || engine.vessels.vessels.get(&launch, None).expect("read").expect("launch").reading;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {

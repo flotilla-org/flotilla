@@ -585,7 +585,7 @@ async fn agent_hook(
     daemon: Option<std::sync::Arc<InProcessDaemon>>,
     mut event: AgentHookEvent,
 ) -> Result<(), String> {
-    let primitives = daemon.as_ref().and_then(|daemon| daemon.message_primitives());
+    let primitives = daemon.as_ref().map(|daemon| daemon.message_primitives());
     use flotilla_protocol::AgentEventType;
 
     // Older notify clients allocate a candidate UUID on every invocation.

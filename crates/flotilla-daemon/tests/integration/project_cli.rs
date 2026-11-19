@@ -245,7 +245,7 @@ async fn replicated_remote_declaration_resolution_preserves_existing_mirror_proj
     // kiwi authors the declaration at its home; it reaches feta as kiwi's log does.
     let kiwi = flotilla_provisioning_testkit::other_home::OtherHome::open("kiwi-root");
     kiwi.repository(&canonical_key.to_string(), &declared).await;
-    kiwi.replicate_to(&daemon.decided_store().expect("decided store"));
+    kiwi.replicate_to(&daemon.decided_store());
 
     feta.using::<Repository>("flotilla")
         .create(&InputMeta::builder().name(mirror_key.to_string()).build(), &mirror_spec)
@@ -301,7 +301,7 @@ async fn independently_observed_same_repository_remains_resolvable_after_replica
     // kiwi observes the same repository at its home; it reaches feta as kiwi's log does.
     let kiwi = flotilla_provisioning_testkit::other_home::OtherHome::open("kiwi-root");
     kiwi.repository(&repository_key.to_string(), &repository_spec).await;
-    kiwi.replicate_to(&daemon.decided_store().expect("decided store"));
+    kiwi.replicate_to(&daemon.decided_store());
     feta.using::<Repository>("flotilla").create(&meta, &repository_spec).await.expect("observe repository on feta");
 
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "feta".to_string() })).await;
@@ -1082,7 +1082,7 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
     // Its declaration names the ops repository at its commit, as its home holds it.
     authority.repository(&ops_spec.key().to_string(), &ops_spec).await;
     authority.project("replicated", &BTreeMap::new(), &annotations, &spec).await;
-    authority.replicate_to(&daemon.decided_store().expect("decided store"));
+    authority.replicate_to(&daemon.decided_store());
 
     let log_output = Arc::new(Mutex::new(Vec::new()));
     let writer = LogCaptureWriter(Arc::clone(&log_output));

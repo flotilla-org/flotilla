@@ -21,7 +21,7 @@ impl InProcessDaemon {
     }
 
     async fn person_action(&self, action: &CommandAction) -> Result<CommandValue, String> {
-        let primitives = self.message_primitives().ok_or("a person's role inboxes are on the engine path; enable [primitives]")?;
+        let primitives = self.message_primitives();
         let namespace = match action {
             CommandAction::PersonInbox { namespace }
             | CommandAction::PersonAcknowledge { namespace, .. }

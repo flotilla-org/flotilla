@@ -48,8 +48,7 @@ async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
     ensure_host_direct_environment_exists(engine_environments(&daemon).reads.clone(), &profile).await.expect("environment");
     let (convoy, launch) = launch_crew(&daemon, &profile, adapter, "turns", "agent").await;
     designate_fleet(&daemon).await;
-    super::super::open_message_primitives(&daemon).await.expect("open the Message path");
-    let primitives = daemon.message_primitives().expect("Message path");
+    let primitives = daemon.message_primitives();
     let state = runtime_state(&daemon, &config, &registry, &profile);
     EngineCrew { _temp: temp, daemon, state, primitives, launch, convoy, config, registry, profile }
 }
@@ -517,7 +516,7 @@ async fn a_session_that_ends_after_a_restart_leaves_no_live_agent_session() {
     drop(delivery);
 
     // The restarted daemon opens the Message path over the same store.
-    let service = crew.daemon.decided_store().expect("the decided store");
+    let service = crew.daemon.decided_store();
     let reopened = Arc::new(
         MessagePrimitives::open(crew.daemon.node_id().as_str(), service, crew.daemon.resource_backend(), crew.daemon.clock_for_scenarios())
             .expect("reopen the Message path"),

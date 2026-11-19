@@ -188,11 +188,7 @@ pub async fn ensure_roll_targets_the_running_convoy_home_over_an_explicit_other_
     let (observer, _observer_backend, _observer_clock, _observer_temp) = standing_ensure_fixture_for(factory, "observer", false).await;
     // The driver's history reaches the observer through the driver's log.
     let driver_root = driver.node_id().clone();
-    flotilla_provisioning_testkit::replicate_home(
-        &driver.decided_store().expect("driver's decided store"),
-        driver_root.as_str(),
-        &observer.decided_store().expect("observer's decided store"),
-    );
+    flotilla_provisioning_testkit::replicate_home(&driver.decided_store(), driver_root.as_str(), &observer.decided_store());
     let target = observer
         .resolve_command_target(
             &CommandAction::ConvoyEnsureRoll { namespace: "flotilla".into(), name: "quartermaster".into() },

@@ -148,7 +148,6 @@ impl Host {
     fn snapshot<K: Kind>(&self, name: &str, home: &str) -> Option<Snapshot> {
         self.daemon()
             .decided_store()
-            .expect("engine store")
             .with_store(|store| {
                 let mut read = store.read()?;
                 let Some(id) = read.resolve(K::CODE, name, home)? else { return Ok(None) };
@@ -389,7 +388,7 @@ async fn imported_ended_convoys_pass_the_convoy_reconciler_and_write_nothing() {
     let _runtime = host.start().await.expect("runtime");
     let daemon = host.daemon();
     let home = host.home();
-    let service = daemon.decided_store().expect("engine store");
+    let service = daemon.decided_store();
     let mut convoy_writes =
         EngineWatch::start(Arc::clone(&service), [<flotilla_state_machines::Resource<EngineConvoy> as Kind>::CODE]).expect("watch");
     let writer_of = |launch: &str| {
@@ -458,7 +457,6 @@ async fn records_naming_a_lost_convoy_import_against_a_retired_tombstone_and_sta
     let writer_of = |code, name: &str| {
         daemon
             .decided_store()
-            .expect("engine store")
             .with_store(|store| {
                 let mut read = store.read()?;
                 let id = read.resolve(code, name, &home)?.unwrap_or_else(|| panic!("{name}"));

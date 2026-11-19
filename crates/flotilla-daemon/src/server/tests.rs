@@ -503,7 +503,6 @@ pub(super) async fn daemon_with_decided_store(
     )
     .await
     .expect("compose the daemon with the test's decided store");
-    daemon.open_message_primitives().expect("message path");
     (tmp, daemon)
 }
 
@@ -756,7 +755,7 @@ fn dropped_daemon_releases_its_stores() {
         .await
         .expect("daemon should compose");
         let backend = daemon.resource_backend().downgrade();
-        let decided = Arc::downgrade(&daemon.decided_store().expect("decided store should open"));
+        let decided = Arc::downgrade(&daemon.decided_store());
         drop(daemon);
         (backend, decided)
     });
@@ -783,7 +782,7 @@ fn dropped_daemon_releases_the_engine_a_test_installed() {
         .await;
         let engine = Arc::downgrade(&install_engine(&daemon));
         assert!(engine.upgrade().is_some(), "the daemon holds the engine installed in it");
-        Arc::downgrade(&daemon.decided_store().expect("decided store"))
+        Arc::downgrade(&daemon.decided_store())
     });
     // The engine's followers run on the test's runtime and end with it.
     drop(runtime);
@@ -1034,7 +1033,6 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
     let (_tmp, daemon) = empty_daemon().await;
     // Hooks record the crew's AgentSession on the Message path the runtime always opens, whose
     // delivery, and the stall judging after it, wait for a designated fleet.
-    crate::runtime::open_message_primitives(&daemon).await.expect("open the Message path");
     {
         use flotilla_resources::{FleetDesignation, FleetDesignationSpec, Project, ProjectSpec, FLEET_DESIGNATION_NAME};
         let backend = daemon.resource_backend();
@@ -1175,7 +1173,6 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                 // The terminal runtime records the same screen read on the crew's AgentSession.
                 daemon
                     .message_primitives()
-                    .expect("Message path")
                     .sessions()
                     .observe_screen(
                         &name,
@@ -1515,7 +1512,7 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
     let (_tmp, daemon) = empty_daemon().await;
     let home = HostName::new("feta");
     // Feta's launch, last seen when it was admitted there.
-    let decided = daemon.decided_store().expect("decided store");
+    let decided = daemon.decided_store();
     let feta = flotilla_provisioning_testkit::other_home_for(&decided, "feta");
     let feta_convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
         feta.service(),
@@ -1692,7 +1689,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
     // feta's Host and placement kind, written at its home and replicated to both daemons as its
     // log arrives.
-    let target = daemon.decided_store().expect("decided store");
+    let target = daemon.decided_store();
     let feta = flotilla_provisioning_testkit::other_home_for(&target, "feta");
     let remote_host_id = "feta-host-id".to_string();
     feta.host(
@@ -1725,7 +1722,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     let remote_policy_name = format!("host-direct-{remote_host_id}");
     feta.kind(&remote_policy_name, &host_direct_kind(&remote_host_id)).await;
     feta.replicate_to(&target);
-    feta.replicate_to(&remote_daemon.decided_store().expect("remote decided store"));
+    feta.replicate_to(&remote_daemon.decided_store());
     let remote_summary = HostSummary::builder()
         .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(&remote_host_id)))
         .host_name(HostName::new("feta"))
@@ -1888,7 +1885,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
             .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
         Arc::clone(&install_engine(&remote_daemon).vessels.lifecycles),
         remote_daemon.lifecycle_reads(),
-        remote_daemon.decided_store().expect("placement decided store"),
+        remote_daemon.decided_store(),
     );
     // Stands in for the placement's TerminalSession controller, whose own tests cover it: each
     // session its vessel requested is realised.
@@ -2024,7 +2021,7 @@ async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement()
     let (_tmp, daemon) = empty_daemon().await;
     // The stopped daemon's records, written at its home and replicated here as its log arrives.
     // Its Host is not ready: a blocking condition, as its daemon reports one.
-    let target = daemon.decided_store().expect("decided store");
+    let target = daemon.decided_store();
     let stopped = flotilla_provisioning_testkit::other_home_for(&target, "stopped");
     let host_name = "stopped-host-id";
     stopped
@@ -4824,7 +4821,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
     )
     .await;
     // Written on its decided store before the runtime starts, as the runtime's engine finds it.
-    let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store().expect("decided store"));
+    let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store());
     let vessel = vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
     vessels.ready(&vessel, &env_ref);
     // The live crew's launch, running before this start as the last run's controller left it.
@@ -5948,161 +5945,131 @@ fn bound_caller_surface_cannot_replace_principal() {
 
 // #3625 and owner ruling: native hook sequences on both transports expose a
 // keyed current observation; repeated Working hooks preserve cause, time and version.
-// Exercise both harnesses, both transports and the disabled primitives switch.
+// Exercise both harnesses and both transports.
 #[tokio::test]
 async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport() {
     use super::http::{CallerAuth, HttpRouter, ListenerOrigin, LoginStore};
     use axum::{body::Body, Extension};
     use flotilla_state_machines::machines::agent_session::Activity;
     use tower::ServiceExt;
-    for enabled in [false, true] {
-        let (_tmp, daemon) = empty_daemon().await;
-        // The primitives share the daemon's decided store and home, where its Convoy path is.
-        let service = daemon.decided_store().unwrap();
-        let home = daemon.node_id().as_str().to_owned();
-        let primitives = Arc::new(
-            flotilla_engine_messages::MessagePrimitives::open(
-                &home,
-                Arc::clone(&service),
-                daemon.resource_backend(),
-                Arc::new(flotilla_resources::SystemClock),
+    let (_tmp, daemon) = empty_daemon().await;
+    let service = daemon.decided_store();
+    let home = daemon.node_id().as_str().to_owned();
+    let primitives = daemon.message_primitives();
+    primitives.sessions().ensure("other-session", flotilla_schema::Timestamp(0)).unwrap();
+    let other = primitives.sessions().get("other-session").unwrap();
+    for harness_name in ["claude-code", "codex"] {
+        for http in [false, true] {
+            let name = format!("{harness_name}-{http}");
+            let terminal = flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() };
+            let terminals = daemon.resource_backend().using::<TerminalSession>("flotilla");
+            let spec = TerminalSessionSpec {
+                env_ref: "host-direct".into(),
+                role: "coder".into(),
+                source: TerminalSessionSource::Tool { command: harness_name.into() },
+                cwd: "/repo".into(),
+                env: Default::default(),
+                pool: "test".into(),
+            };
+            let launch = run_session(&daemon, &name, &spec, &Default::default());
+            let router = HttpRouter::for_daemon(
+                Arc::clone(&daemon),
+                Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))),
+                ListenerOrigin::default(),
             )
-            .unwrap(),
-        );
-        if enabled {
-            daemon.install_message_primitives(Arc::clone(&primitives)).unwrap();
-        }
-        primitives.sessions().ensure("other-session", flotilla_schema::Timestamp(0)).unwrap();
-        let other = primitives.sessions().get("other-session").unwrap();
-        for harness_name in ["claude-code", "codex"] {
-            for http in [false, true] {
-                let name = format!("{harness_name}-{http}");
-                let terminal = flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() };
-                let terminals = daemon.resource_backend().using::<TerminalSession>("flotilla");
-                let spec = TerminalSessionSpec {
-                    env_ref: "host-direct".into(),
-                    role: "coder".into(),
-                    source: TerminalSessionSource::Tool { command: harness_name.into() },
-                    cwd: "/repo".into(),
-                    env: Default::default(),
-                    pool: "test".into(),
-                };
-                let launch = run_session(&daemon, &name, &spec, &Default::default());
-                let router = HttpRouter::for_daemon(
-                    Arc::clone(&daemon),
-                    Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))),
-                    ListenerOrigin::default(),
-                )
-                .into_router()
-                .layer(Extension(CallerAuth::Hook {
-                    terminal: terminal.clone(),
-                    generation: super::http::hooks::launch_generation(&terminals.get(&name).await.expect("terminal")),
-                }));
-                let (harness, parser) = flotilla_agent::parser_for_harness(harness_name).unwrap();
-                let interrupt =
-                    if harness_name == "codex" { ("interrupt", "Interrupt") } else { ("post-tool-use-failure", "PostToolUseFailure") };
-                let mut previous = None;
-                let mut steps =
-                    vec![("user-prompt-submit", "UserPromptSubmit", Activity::Working), ("pre-tool-use", "PreToolUse", Activity::Working)];
-                // Claude Code reports a permission prompt through its Notification hook.
-                if harness_name == "claude-code" {
-                    steps.push(("notification", "Notification", Activity::NeedsInput));
-                }
-                steps.extend([("stop", "Stop", Activity::Idle), (interrupt.0, interrupt.1, Activity::Interrupted)]);
-                for (argument, native, activity) in steps {
-                    let payload = serde_json::json!({ "session_id":"native-1", "cwd":"/repo", "hook_event_name":native,
+            .into_router()
+            .layer(Extension(CallerAuth::Hook {
+                terminal: terminal.clone(),
+                generation: super::http::hooks::launch_generation(&terminals.get(&name).await.expect("terminal")),
+            }));
+            let (harness, parser) = flotilla_agent::parser_for_harness(harness_name).unwrap();
+            let interrupt =
+                if harness_name == "codex" { ("interrupt", "Interrupt") } else { ("post-tool-use-failure", "PostToolUseFailure") };
+            let mut previous = None;
+            let mut steps =
+                vec![("user-prompt-submit", "UserPromptSubmit", Activity::Working), ("pre-tool-use", "PreToolUse", Activity::Working)];
+            // Claude Code reports a permission prompt through its Notification hook.
+            if harness_name == "claude-code" {
+                steps.push(("notification", "Notification", Activity::NeedsInput));
+            }
+            steps.extend([("stop", "Stop", Activity::Idle), (interrupt.0, interrupt.1, Activity::Interrupted)]);
+            for (argument, native, activity) in steps {
+                let payload = serde_json::json!({ "session_id":"native-1", "cwd":"/repo", "hook_event_name":native,
                         "notification_type":"permission_prompt",
                         "is_interrupt":true, "stop_hook_active":false, "prompt":"work", "tool_name":"Bash",
                         "tool_input":{"command":"secret-call-detail"}, "tool_use_id":"call-detail" });
-                    if http {
-                        let response = router
-                            .clone()
-                            .oneshot(
-                                axum::http::Request::builder()
-                                    .method("POST")
-                                    .uri(format!("/v1/hooks/{harness_name}/{argument}"))
-                                    .header("content-type", "application/json")
-                                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
-                                    .unwrap(),
-                            )
-                            .await
-                            .unwrap();
-                        assert_eq!(response.status(), axum::http::StatusCode::OK);
-                    } else {
-                        let parsed = parser.parse_event(argument, &serde_json::to_vec(&payload).unwrap()).unwrap();
-                        let response = dispatch_request_with_state(
-                            &daemon,
-                            daemon.agent_state_store(),
-                            1,
-                            Request::AgentHook {
-                                event: AgentHookEvent::builder()
-                                    .attachable_id(AttachableId::new("candidate"))
-                                    .harness(harness.clone())
-                                    .event_type(parsed.event_type)
-                                    .hook_event(native.to_string())
-                                    .maybe_session_id(parsed.session_id)
-                                    .native_codex_hook(parsed.native_codex_hook)
-                                    .terminal(terminal.clone())
-                                    .build(),
-                            },
+                if http {
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            axum::http::Request::builder()
+                                .method("POST")
+                                .uri(format!("/v1/hooks/{harness_name}/{argument}"))
+                                .header("content-type", "application/json")
+                                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                                .unwrap(),
                         )
-                        .await;
-                        assert!(matches!(ok_response(response, 1), Response::AgentHook));
-                    }
-                    // A single name lookup returns this launch's session, and another session stays unchanged.
-                    assert_eq!(primitives.sessions().get("other-session").unwrap(), other);
-                    let current = primitives.sessions().get(&launch);
-                    if !enabled {
-                        assert!(current.is_none());
-                        continue;
-                    }
-                    let current = current.unwrap();
-                    let observation = current.state().observation().unwrap();
-                    assert_eq!(observation.activity, activity);
-                    if argument == "pre-tool-use" {
-                        assert_eq!(Some(current.clone()), previous, "same activity writes nothing, including cause and time");
-                        assert_eq!(observation.activity_cause, "UserPromptSubmit");
-                    } else {
-                        assert_eq!(observation.activity_cause, native);
-                    }
-                    previous = Some(current);
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), axum::http::StatusCode::OK);
+                } else {
+                    let parsed = parser.parse_event(argument, &serde_json::to_vec(&payload).unwrap()).unwrap();
+                    let response = dispatch_request_with_state(
+                        &daemon,
+                        daemon.agent_state_store(),
+                        1,
+                        Request::AgentHook {
+                            event: AgentHookEvent::builder()
+                                .attachable_id(AttachableId::new("candidate"))
+                                .harness(harness.clone())
+                                .event_type(parsed.event_type)
+                                .hook_event(native.to_string())
+                                .maybe_session_id(parsed.session_id)
+                                .native_codex_hook(parsed.native_codex_hook)
+                                .terminal(terminal.clone())
+                                .build(),
+                        },
+                    )
+                    .await;
+                    assert!(matches!(ok_response(response, 1), Response::AgentHook));
                 }
+                // A single name lookup returns this launch's session, and another session stays unchanged.
+                assert_eq!(primitives.sessions().get("other-session").unwrap(), other);
+                let current = primitives.sessions().get(&launch).unwrap();
+                let observation = current.state().observation().unwrap();
+                assert_eq!(observation.activity, activity);
+                if argument == "pre-tool-use" {
+                    assert_eq!(Some(current.clone()), previous, "same activity writes nothing, including cause and time");
+                    assert_eq!(observation.activity_cause, "UserPromptSubmit");
+                } else {
+                    assert_eq!(observation.activity_cause, native);
+                }
+                previous = Some(current);
             }
         }
-        // Reopening from the actual store preserves current activity and its cause.
-        let reopened = flotilla_engine_messages::MessagePrimitives::open(
-            &home,
-            service,
-            daemon.resource_backend(),
-            Arc::new(flotilla_resources::SystemClock),
-        )
-        .unwrap();
-        for harness in ["claude-code", "codex"] {
-            for http in [false, true] {
-                let name = format!("{harness}-{http}");
-                assert_eq!(reopened.sessions().get(&name), primitives.sessions().get(&name));
-            }
-        }
-        assert!(primitives.sessions().get("missing").is_none());
     }
+    // Reopening from the actual store preserves current activity and its cause.
+    let reopened = flotilla_engine_messages::MessagePrimitives::open(
+        &home,
+        service,
+        daemon.resource_backend(),
+        Arc::new(flotilla_resources::SystemClock),
+    )
+    .unwrap();
+    for harness in ["claude-code", "codex"] {
+        for http in [false, true] {
+            let name = format!("{harness}-{http}");
+            assert_eq!(reopened.sessions().get(&name), primitives.sessions().get(&name));
+        }
+    }
+    assert!(primitives.sessions().get("missing").is_none());
 }
 
 /// A daemon whose session `agent` runs, and the launch its AgentSession is named by.
 async fn activity_failure_test_daemon(
 ) -> (tempfile::TempDir, Arc<InProcessDaemon>, Arc<flotilla_engine_messages::MessagePrimitives>, String) {
     let (tmp, daemon) = empty_daemon().await;
-    // The primitives share the daemon's decided store and home, where its Convoy path is.
-    let service = daemon.decided_store().unwrap();
-    let primitives = Arc::new(
-        flotilla_engine_messages::MessagePrimitives::open(
-            daemon.node_id().as_str(),
-            service,
-            daemon.resource_backend(),
-            Arc::new(flotilla_resources::SystemClock),
-        )
-        .unwrap(),
-    );
-    daemon.install_message_primitives(Arc::clone(&primitives)).unwrap();
+    let primitives = daemon.message_primitives();
     let spec = TerminalSessionSpec {
         env_ref: "host-direct".into(),
         role: "coder".into(),

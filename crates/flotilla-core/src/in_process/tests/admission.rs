@@ -518,7 +518,7 @@ async fn abandon_archive_names_replica_checkouts_left_to_their_own_host() {
     // The convoy is held here; its checkout is held at feta: this host reads it, replicated in,
     // but cannot inspect it.
     let (holder, archive) = archive_convoy(&daemon, "archive-convoy").await;
-    let decided = daemon.decided_store().expect("decided store");
+    let decided = daemon.decided_store();
     let feta = flotilla_provisioning_testkit::other_home_for(&decided, "feta");
     let feta_engine = flotilla_provisioning_testkit::EngineFixture::over_service(feta.service());
     // Feta hears this home's launch before it holds a checkout for it.

@@ -1,6 +1,6 @@
-//! The account records contract (#3824 layer 1): one behaviour, run against the old store's
-//! records and the engine's, so either can stand behind admission, the launch path, explain and
-//! the account controllers.
+//! The account records contract (#3824 layer 1): the engine's records, the daemon's only path for
+//! the account kinds, behind admission, the launch path, explain and the account controllers. The
+//! same contract also runs against the plain in-memory store that tests stand in with.
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 

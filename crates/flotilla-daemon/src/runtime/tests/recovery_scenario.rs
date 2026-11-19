@@ -365,7 +365,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .expect("hand back to coder");
     assert_eq!(wait_for_command_result(&mut rx, hand_back_id).await, CommandValue::Ok);
     // Messages are the engine's: read them through the Message path's views.
-    let messages = daemon.message_primitives().expect("the engine Message path");
+    let messages = daemon.message_primitives();
     let backend = daemon.resource_backend();
     let coder_delivery_id = flotilla_engine_messages_testkit::views(&messages, &backend, NAMESPACE)
         .await

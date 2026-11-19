@@ -120,9 +120,8 @@ impl EnvironmentSummaries for InProcessDaemon {
     }
 }
 
-/// Receiver evidence, and the Messages on the engine path when the
-/// `[primitives]` switch is on.
-pub(super) struct MessageReceivers(pub(super) flotilla_engine_messages::MessagePath);
+/// Receiver evidence, and the Messages on the engine path.
+pub(super) struct MessageReceivers(pub(super) Arc<flotilla_engine_messages::MessagePrimitives>);
 #[async_trait]
 impl flotilla_projections::read_projections::MessageReceiverLoader for MessageReceivers {
     async fn load(
@@ -134,11 +133,12 @@ impl flotilla_projections::read_projections::MessageReceiverLoader for MessageRe
         receivers: &[String],
         named: &[(String, String)],
     ) -> Result<Box<dyn flotilla_projections::read_projections::MessageReceiverRead>, String> {
-        let messages = match self.0.get() {
-            // No message reads in the old shape until the fleet is designated.
-            Some(primitives) if primitives.delivery_wait(namespace).await?.is_some() => Some(Vec::new()),
-            Some(primitives) => Some(primitives.seat_messages(namespace, receivers, named).await.map_err(|e| e.to_string())?),
-            None => None,
+        let primitives = &self.0;
+        // No message reads in the old shape until the fleet is designated.
+        let messages = if primitives.delivery_wait(namespace).await?.is_some() {
+            Some(Vec::new())
+        } else {
+            Some(primitives.seat_messages(namespace, receivers, named).await.map_err(|e| e.to_string())?)
         };
         Ok(Box::new(MessageReceiverEvidence(
             flotilla_messaging::MessageReceiverSnapshot::load_from_observations(backend, namespace, convoys, terminals)
@@ -175,7 +175,7 @@ impl flotilla_projections::read_projections::MessageReceiverRead for MessageRece
 #[async_trait]
 impl flotilla_projections::ports::AgentSessions for InProcessDaemon {
     async fn follow(&self) -> Result<flotilla_projections::ports::AgentSessionFollow, String> {
-        agent_sessions::follow(self.decided_store()?).await
+        agent_sessions::follow(self.decided_store()).await
     }
 }
 

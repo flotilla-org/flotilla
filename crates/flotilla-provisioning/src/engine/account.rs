@@ -1,4 +1,4 @@
-//! The account kinds on the engine, behind `[primitives]` (#3824 layer 1).
+//! The account kinds on the engine, their only path (#3824 layer 1).
 //!
 //! [`EngineAccounts`] is the [`AccountRecords`] port over the decided store. This home writes its
 //! own bindings through the AccountBinding machine and its own provisions through the plain-kind

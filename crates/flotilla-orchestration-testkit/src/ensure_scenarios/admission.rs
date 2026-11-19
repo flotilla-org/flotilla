@@ -214,11 +214,7 @@ pub async fn changed_ensure_driver_waits_for_operator_roll_of_the_running_remote
     old_driver.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     let (new_driver, new_backend, _new_clock, _new_temp) = standing_ensure_fixture_for(factory, "new-driver", true).await;
     // The old driver's running generation reaches the new driver through the old driver's log.
-    flotilla_provisioning_testkit::replicate_home(
-        &old_driver.decided_store().expect("old driver's decided store"),
-        old_driver.node_id().as_str(),
-        &new_driver.decided_store().expect("new driver's decided store"),
-    );
+    flotilla_provisioning_testkit::replicate_home(&old_driver.decided_store(), old_driver.node_id().as_str(), &new_driver.decided_store());
     let ensures = new_backend.definitions::<ConvoyEnsure>("flotilla");
     let ensure = ensures.get("quartermaster").await.expect("ensure");
     let mut next = ensure.spec.clone();
@@ -440,7 +436,7 @@ pub async fn unavailable_declared_driver_surfaces_named_admission_conditions_wit
 
     // Known but unreachable: its daemon published its Host and nothing since.
     flotilla_provisioning_testkit::put_host_at_its_home(
-        &daemon.decided_store().expect("decided store"),
+        &daemon.decided_store(),
         "missing-driver",
         &HostSpec { display_name: "missing-driver".to_string(), connection: Default::default(), ..HostSpec::default() },
         None,
@@ -892,11 +888,7 @@ pub async fn driverless_ensure_home_case(
     let acting_backend = &hosts[acting_home].1;
     // One host's log replayed into another's decided store, as replication carries it.
     let replicate = |from: &EnsureFixture, to: &EnsureFixture| {
-        flotilla_provisioning_testkit::replicate_home(
-            &from.0.decided_store().expect("source decided store"),
-            from.0.node_id().as_str(),
-            &to.0.decided_store().expect("target decided store"),
-        );
+        flotilla_provisioning_testkit::replicate_home(&from.0.decided_store(), from.0.node_id().as_str(), &to.0.decided_store());
     };
     // Each peer registers its own Project copy before any of the home's records reach it.
     let project = home_backend.definitions::<Project>("flotilla").get("standing-project").await.expect("home project");
@@ -1040,11 +1032,7 @@ pub async fn a_declared_copy_owns_a_driverless_ensure_until_deleted(factory: &dy
     let feta = standing_ensure_fixture_for(factory, "feta", false).await;
     let udder = standing_ensure_fixture_for(factory, "udder", false).await;
     let replicate = |from: &InProcessDaemon, to: &InProcessDaemon| {
-        flotilla_provisioning_testkit::replicate_home(
-            &from.decided_store().expect("source decided store"),
-            from.node_id().as_str(),
-            &to.decided_store().expect("target decided store"),
-        );
+        flotilla_provisioning_testkit::replicate_home(&from.decided_store(), from.node_id().as_str(), &to.decided_store());
     };
     let convoys = |backend: &ResourceBackend| backend.clone().using::<ResourceConvoy>("flotilla");
     let project = kiwi.1.definitions::<Project>("flotilla").get("standing-project").await.expect("kiwi project");

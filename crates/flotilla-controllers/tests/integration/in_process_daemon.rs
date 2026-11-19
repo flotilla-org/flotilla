@@ -122,11 +122,8 @@ struct ReceiverIntentPublisher {
 }
 
 impl ReceiverIntentPublisher {
-    /// The publisher onto `home`'s Message path, opened if the daemon has none yet.
+    /// The publisher onto `home`'s Message path.
     fn onto(home: &Arc<InProcessDaemon>) -> Self {
-        if home.message_primitives().is_none() {
-            home.open_message_primitives().expect("the engine Message path");
-        }
         Self { home: Arc::clone(home) }
     }
 }
@@ -147,7 +144,7 @@ impl flotilla_crew::leaf_engine::ResourceIntentPublisher for ReceiverIntentPubli
         }
         let intent = serde_json::from_value(document["spec"].clone()).map_err(|error| error.to_string())?;
         let name = document["metadata"]["name"].as_str().ok_or("missing name")?;
-        let primitives = self.home.message_primitives().ok_or("the receiver home has no Message path")?;
+        let primitives = self.home.message_primitives();
         let admitted = primitives.admit(name, &intent).await.map_err(|error| error.to_string())?;
         Ok(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", namespace, admitted.record))
     }
@@ -973,7 +970,7 @@ fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
 /// arrive as that daemon's log is replicated in. Its Message path opens first, as at startup.
 async fn install_decided_engine(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EngineFixture {
     open_attentions(daemon).await;
-    let service = daemon.decided_store().expect("decided store");
+    let service = daemon.decided_store();
     let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&service);
     // Its vessels' and terminal sessions' watchers hear each launch change, as the runtime's do;
     // the followers run on the test's runtime and end with it.
@@ -989,20 +986,11 @@ fn install_engine_reads(daemon: &InProcessDaemon) -> flotilla_provisioning_testk
     install_engine(daemon).checkouts
 }
 
-/// [`install_engine_reads`], keeping the whole engine, with the Message path the daemon's
-/// readers read, as at startup.
+/// [`install_engine_reads`], keeping the whole engine.
 fn install_engine(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EngineFixture {
-    open_message_path(daemon);
     let engine = flotilla_provisioning_testkit::EngineFixture::default();
     daemon.install_lifecycle_reads(engine.reads()).expect("engine reads");
     engine
-}
-
-/// Opens `daemon`'s Message path unless it has one.
-fn open_message_path(daemon: &InProcessDaemon) {
-    if daemon.message_primitives().is_none() {
-        daemon.open_message_primitives().expect("the engine Message path");
-    }
 }
 
 /// Crew `role`'s agent session in `environment`, held by `vessel`, as its vessel requests it.
@@ -1587,11 +1575,7 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
     let spec = artifact_spec(b"remote");
     let artifacts = authority.resource_backend().using::<flotilla_resources::Artifact>("flotilla");
     artifacts.create(&InputMeta::builder().name("remote-artifact".to_string()).build(), &spec).await.expect("create artifact at authority");
-    flotilla_provisioning_testkit::replicate_home(
-        &authority.decided_store().expect("authority store"),
-        authority.node_id().as_str(),
-        &replica.decided_store().expect("replica store"),
-    );
+    flotilla_provisioning_testkit::replicate_home(&authority.decided_store(), authority.node_id().as_str(), &replica.decided_store());
     let replica_artifacts = replica.resource_backend().including_replicas::<flotilla_resources::Artifact>("flotilla");
     assert!(replica_artifacts.get("remote-artifact").await.is_ok(), "the authority's artifact reads at the replica");
 
@@ -1655,11 +1639,7 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
         .await
         .expect("create repository at authority");
     // The authority's log reaches the replica as a peer's does.
-    flotilla_provisioning_testkit::replicate_home(
-        &authority.decided_store().expect("authority store"),
-        authority.node_id().as_str(),
-        &replica.decided_store().expect("replica store"),
-    );
+    flotilla_provisioning_testkit::replicate_home(&authority.decided_store(), authority.node_id().as_str(), &replica.decided_store());
     let command_id = replica
         .execute(
             Command::builder()
@@ -1692,7 +1672,7 @@ async fn deleting_a_name_this_home_does_not_hold_is_not_found_and_appends_nothin
     .await;
     // The engine's readings, which a running daemon always has.
     let _engine = install_engine_reads(&daemon);
-    let store = daemon.decided_store().expect("decided store");
+    let store = daemon.decided_store();
     let home = daemon.node_id().as_str().to_string();
     let artifacts = daemon.resource_backend().using::<flotilla_resources::Artifact>("flotilla");
     artifacts.create(&InputMeta::builder().name("once-held".to_string()).build(), &artifact_spec(b"once")).await.expect("create artifact");
@@ -2431,7 +2411,7 @@ async fn other_host(daemon: &InProcessDaemon, name: &str) -> flotilla_resources:
 
 /// [`publish_other_host`], last heard from at `at`.
 async fn publish_other_host_at(daemon: &InProcessDaemon, name: &str, status: &HostStatus, at: chrono::DateTime<chrono::Utc>) {
-    let target = daemon.decided_store().expect("decided store");
+    let target = daemon.decided_store();
     flotilla_provisioning_testkit::put_host_at_its_home_heard(&target, name, &HostSpec::default(), Some(status), at).await;
 }
 
@@ -4772,10 +4752,8 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
     drop(temp);
 }
 
-/// Opens the engine Message path the daemon raises its attentions on, as a running daemon has it,
-/// with the fleet whose roles those attentions are sent as.
+/// Designates the fleet whose roles the daemon's attentions are sent as.
 async fn open_attentions(daemon: &InProcessDaemon) {
-    open_message_path(daemon);
     flotilla_engine_messages_testkit::designate_fleet(&daemon.resource_backend(), "flotilla").await;
 }
 
@@ -7276,7 +7254,7 @@ async fn forge_identity_sweep_includes_replica_only_legacy_repository() {
         .apply(&old.key().to_string(), None, &BTreeMap::new(), &BTreeMap::new(), &old)
         .await
         .expect("author legacy Repository");
-    source.replicate_to(&daemon.decided_store().expect("decided store"));
+    source.replicate_to(&daemon.decided_store());
     daemon
         .resource_backend()
         .definitions::<Forge>("flotilla")
@@ -8584,12 +8562,8 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
             .name()
     };
     // The vessel's launch reaches the session's home as the authority's home replicates there.
-    let authority_store = authority.decided_store().expect("authority store");
-    flotilla_provisioning_testkit::replicate_home(
-        &authority_store,
-        authority_store.home(),
-        &terminal_host.decided_store().expect("terminal host store"),
-    );
+    let authority_store = authority.decided_store();
+    flotilla_provisioning_testkit::replicate_home(&authority_store, authority_store.home(), &terminal_host.decided_store());
     // Each crew session is launched at the terminal host, and its log reaches the authority.
     let start_session = |role: &str, index| {
         let launch = terminal_engine.terminals.request(&TerminalLaunchRequest {
@@ -8614,9 +8588,9 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         });
         terminal_engine.terminals.ready(&launch, &format!("{role}-sid"), &Default::default());
         flotilla_provisioning_testkit::replicate_home(
-            &terminal_host.decided_store().expect("terminal host store"),
-            terminal_host.decided_store().expect("terminal host store").home(),
-            &authority.decided_store().expect("authority store"),
+            &terminal_host.decided_store(),
+            terminal_host.decided_store().home(),
+            &authority.decided_store(),
         );
     };
     let context = flotilla_protocol::CrewCommandContext {
@@ -8655,11 +8629,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     authority.crew_handoff_internal(&context, "reviewer", "Review this").await.expect("queue remote handoff");
     // The authority's log, with the handoff, reaches the session's home.
-    flotilla_provisioning_testkit::replicate_home(
-        &authority_store,
-        authority_store.home(),
-        &terminal_host.decided_store().expect("terminal host store"),
-    );
+    flotilla_provisioning_testkit::replicate_home(&authority_store, authority_store.home(), &terminal_host.decided_store());
     terminal_host.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver handoff at session origin");
     let inbox = terminal_host.resource_backend().using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
     assert_eq!(inbox.items.len(), 1);
@@ -8720,12 +8690,8 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     )
     .await
     .expect("mark stalled crew work");
-    let authority_store = authority.decided_store().expect("authority store");
-    flotilla_provisioning_testkit::replicate_home(
-        &authority_store,
-        authority_store.home(),
-        &terminal_host.decided_store().expect("terminal host store"),
-    );
+    let authority_store = authority.decided_store();
+    flotilla_provisioning_testkit::replicate_home(&authority_store, authority_store.home(), &terminal_host.decided_store());
     // The crew's session is launched at the terminal host, and its log reaches the authority.
     let launch = terminal_engine.terminals.request(&TerminalLaunchRequest {
         session: "split-session".to_string(),
@@ -8748,12 +8714,8 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         },
     });
     terminal_engine.terminals.ready(&launch, "coder-sid", &Default::default());
-    let terminal_store = terminal_host.decided_store().expect("terminal host store");
-    flotilla_provisioning_testkit::replicate_home(
-        &terminal_store,
-        terminal_store.home(),
-        &authority.decided_store().expect("authority store"),
-    );
+    let terminal_store = terminal_host.decided_store();
+    flotilla_provisioning_testkit::replicate_home(&terminal_store, terminal_store.home(), &authority.decided_store());
 
     let outcome = authority
         .convoy_resume_internal("flotilla", &convoy, "Continue", Some("work"), Some("coder"), ResumeIntent::Reminder)
@@ -8923,7 +8885,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     assert_eq!(waiting.crew_work["work"]["coder"].pending_follow_up.as_ref().expect("queued intent").name, first.metadata.name);
     // Stand in only for the receiver transport receipt, recorded on the daemon's engine Message
     // path. The ordinary admission and workflow continuation use the real daemon.
-    let primitives = daemon.message_primitives().expect("the engine Message path");
+    let primitives = daemon.message_primitives();
     let before_receipt = chrono::Utc::now();
     flotilla_engine_messages_testkit::deliver_turn(
         &primitives,
@@ -9585,7 +9547,7 @@ async fn message_apply_uses_document_namespace_and_status_patches_are_refused() 
     // The engine's readings, which a running daemon always has.
     let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
-    let primitives = daemon.message_primitives().expect("the engine Message path");
+    let primitives = daemon.message_primitives();
     flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
     // The receiver's convoy, a launch in the document's namespace, the engine's.
     let convoy = flotilla_engine_convoys_testkit::launch(

@@ -826,8 +826,8 @@ impl SecondaryWatch for EngineConvoyWake {
         sender: flotilla_store::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            // The daemon installs the engine path while it starts, before any controller (and so
-            // this watch) is spawned (runtime.rs, `open_message_primitives`).
+            // The daemon installs the engine path while it is composed, before any controller (and
+            // so this watch) is spawned.
             let Some(engine) = self.engine.get() else { return Err(ResourceError::other(NO_ENGINE)) };
             let mut changes = engine.changes();
             loop {

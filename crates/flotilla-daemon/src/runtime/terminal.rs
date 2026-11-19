@@ -178,8 +178,7 @@ impl TerminalControllerRuntime {
     /// its launch. Another observer: its errors are logged and
     /// never fail the terminal's own observation.
     async fn observe_agent_screen(&self, record: &str, activity: Activity, now: chrono::DateTime<Utc>) {
-        let Some(primitives) = self.state.daemon.message_primitives() else { return };
-        let sessions = Arc::clone(primitives.sessions());
+        let sessions = Arc::clone(self.state.daemon.message_primitives().sessions());
         let name = record.to_owned();
         let now = flotilla_schema::Timestamp::from_datetime(&now);
         match tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || sessions.observe_screen(&name, activity, now))).await {

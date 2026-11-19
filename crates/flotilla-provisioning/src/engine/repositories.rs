@@ -1,4 +1,4 @@
-//! Repository on the engine, behind `[primitives]` (#3824 layer 3a).
+//! Repository on the engine, its only path (#3824 layer 3a).
 //!
 //! [`EngineRepositories`] is the [`KindRecords`] port of Repository over the decided store. Each
 //! home writes its own record of each repository it observes, through the plain-kind port; every

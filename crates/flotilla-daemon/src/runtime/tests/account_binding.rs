@@ -9,7 +9,6 @@ use tokio_util::task::AbortOnDropHandle;
 async fn binding_daemon(temp: &Path) -> (Arc<InProcessDaemon>, String) {
     fs::write(temp.join("daemon.toml"), "machine_id = \"account-binding-test\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp))).await;
-    daemon.open_message_primitives().expect("message path");
     designate_fleet(&daemon).await;
     engine(&daemon);
     let bound = admit(&daemon, "credential-0").await;

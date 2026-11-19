@@ -52,7 +52,7 @@ async fn created_convoy_placement(daemon: &InProcessDaemon, workflow: &WorkflowT
 
 /// Writes FulfilmentKind `name` at `home`, another daemon, and replicates it to `daemon`.
 async fn put_kind_at_home(daemon: &InProcessDaemon, home: &str, name: &str, spec: &FulfilmentKindSpec) {
-    let target = daemon.decided_store().expect("decided store");
+    let target = daemon.decided_store();
     let home = flotilla_provisioning_testkit::other_home_for(&target, home);
     home.kind(name, spec).await;
     home.replicate_to(&target);
@@ -222,9 +222,9 @@ async fn placement_candidates_and_refusals_agree_across_roots() {
     let synced_at = Utc::now();
     for (destination, source) in [(&kiwi, &feta), (&feta, &kiwi)] {
         flotilla_provisioning_testkit::replicate_home_at(
-            &source.decided_store().expect("source store"),
+            &source.decided_store(),
             source.node_id().as_str(),
-            &destination.decided_store().expect("destination store"),
+            &destination.decided_store(),
             synced_at,
         );
     }

@@ -1,4 +1,4 @@
-//! AccessDelivery on the engine, behind `[primitives]`: each record is written at the home that
+//! AccessDelivery on the engine, its only path: each record is written at the home that
 //! launched the access. The convoy label old readers select by is read back from the access key,
 //! as the table keeps none.
 

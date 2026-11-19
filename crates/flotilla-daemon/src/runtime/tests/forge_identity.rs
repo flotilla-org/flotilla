@@ -329,7 +329,7 @@ async fn declaring_the_daemon_identity_wakes_the_repository_on_its_forge() {
     let discovered = forge.daemon.discovered_checkouts();
     let controller = flotilla_store::controller::ControllerLoop {
         primary: backend.clone().using::<Repository>(NAMESPACE).with_lifecycle_status_reads(forge.daemon.lifecycle_reads()),
-        secondaries: RepositoryReconciler::secondary_watches(discovered.clone(), forge.daemon.decided_store().ok()),
+        secondaries: RepositoryReconciler::secondary_watches(discovered.clone(), forge.daemon.decided_store()),
         reconciler: RepositoryReconciler::new(discovered, forge.daemon.lifecycle_reads())
             .with_forge_default_branch_resolver(lookups.clone()),
         backend: backend.clone(),

@@ -60,7 +60,7 @@ async fn a_message_commit_runs_a_pass_without_listing_messages() {
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"supervisor-turn-message-test\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
     let _engine = engine(&daemon);
-    let primitives = daemon.open_message_primitives().expect("message path");
+    let primitives = daemon.message_primitives();
     designate_fleet(&daemon).await;
     // The designated fleet here is `fleet`, so turn-rules sends as `fleet:fleet/role:turn-rules`.
     let intent = flotilla_engine_messages_testkit::intent(

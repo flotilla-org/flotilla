@@ -34,7 +34,7 @@ static ENGINES: LazyLock<Mutex<Vec<Installed>>> = LazyLock::new(Default::default
 /// its lifecycle reads on first use,
 /// and the same engine after, as a composed daemon has one.
 pub fn engine(daemon: &InProcessDaemon) -> Arc<EngineFixture> {
-    let service = daemon.decided_store().expect("decided store");
+    let service = daemon.decided_store();
     let mut engines = ENGINES.lock().unwrap_or_else(PoisonError::into_inner);
     engines.retain(|(_, engine)| engine.strong_count() > 0);
     if let Some(engine) =
@@ -155,7 +155,7 @@ pub fn run_session(daemon: &InProcessDaemon, name: &str, spec: &TerminalSessionS
 /// Checkouts written at the home of a daemon the runtime composed, on its decided store, as its
 /// Checkout controller writes them.
 pub fn runtime_checkouts(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::CheckoutFixture {
-    let service = daemon.decided_store().expect("decided store");
+    let service = daemon.decided_store();
     flotilla_provisioning_testkit::CheckoutFixture::over(service.home(), service.store())
 }
 
@@ -163,7 +163,7 @@ pub fn runtime_checkouts(daemon: &InProcessDaemon) -> flotilla_provisioning_test
 /// as its TerminalSession controller writes them: written before the runtime starts, they are the
 /// launches its engine finds there.
 pub fn runtime_terminals(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::TerminalsFixture {
-    flotilla_provisioning_testkit::TerminalsFixture::over_service(&daemon.decided_store().expect("decided store"))
+    flotilla_provisioning_testkit::TerminalsFixture::over_service(&daemon.decided_store())
 }
 
 /// The environments of `daemon`'s [`engine`].
@@ -190,5 +190,5 @@ pub async fn admit_convoy(daemon: &InProcessDaemon, convoy: ResourceObject<Convo
 
 /// The newest launch of convoy `of` at `daemon`'s engine.
 pub fn current_launch(daemon: &InProcessDaemon, of: &str) -> String {
-    daemon.engine_convoys().expect("the Convoy path is installed").get(of).unwrap_or_else(|| panic!("a launch of {of}")).name().to_owned()
+    daemon.engine_convoys().get(of).unwrap_or_else(|| panic!("a launch of {of}")).name().to_owned()
 }

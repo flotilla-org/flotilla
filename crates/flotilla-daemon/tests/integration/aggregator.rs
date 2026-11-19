@@ -584,7 +584,7 @@ async fn an_undecodable_launch_is_listed_and_the_daemon_serves_the_others() {
     let mut forged = engine_convoy("forged", convoy_spec("w"));
     forged.metadata.annotations.insert(CONVOY_UNREADABLE_ANNOTATION.to_owned(), "not the views' to say".to_owned());
     let forged = admit_convoy(&daemon, forged).await;
-    let convoys = daemon.engine_convoys().expect("the Convoy path is installed");
+    let convoys = daemon.engine_convoys();
     let mut request = convoy_map::request(&engine_convoy("broken", convoy_spec("w"))).expect("request");
     request.admission = Frozen::new(AdmissionBytes::new(vec![0xff, 0x00])).expect("freeze");
     let now = Timestamp::from_datetime(&chrono::Utc::now());
@@ -785,7 +785,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     .await;
     // The sessions are the engine's launches, written at the daemon's home before its runtime
     // starts; the convoy-bound one is held for the daemon's launch of work `coder` of the convoy.
-    let vessel = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store().expect("decided store")).request(
+    let vessel = flotilla_provisioning_testkit::VesselsFixture::over_service(&daemon.decided_store()).request(
         &convoy_a,
         "coder",
         &host_id.to_string(),

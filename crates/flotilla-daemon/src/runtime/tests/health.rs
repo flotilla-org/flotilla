@@ -81,7 +81,6 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     );
     daemon.install_lifecycle_reads(Arc::clone(&reads)).expect("engine reads");
     // Explain reads the convoy's messages too.
-    daemon.open_message_primitives().expect("message path");
     let clone_path = temp.path().join("clone").display().to_string();
     engine.environments.put_ready(
         "host-direct-test",

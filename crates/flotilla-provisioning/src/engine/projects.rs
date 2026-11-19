@@ -1,4 +1,4 @@
-//! Project on the engine, behind `[primitives]` (#3824 layer 3b).
+//! Project on the engine, its only path (#3824 layer 3b).
 //!
 //! [`EngineProjects`] is the [`KindRecords`] port of Project over the decided store. Each home
 //! writes the Projects it declares through the plain-kind port, and project operations' record of

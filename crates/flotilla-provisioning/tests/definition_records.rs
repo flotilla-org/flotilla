@@ -1,7 +1,7 @@
 //! The definition kinds' reads and writes through the store's definition paths (#3824 layer
-//! 2b-ii): one contract, run against the old store and against the engine's records installed
-//! behind `[primitives]`, so the readers and writers that go through those paths keep their
-//! behaviour on either.
+//! 2b-ii), served by the engine's records, the daemon's only path for those kinds. The readers and
+//! writers that go through those paths hold to one contract; it also runs against the plain
+//! in-memory store that tests stand in with.
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
