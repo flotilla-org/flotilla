@@ -307,6 +307,108 @@ async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing
     }
 }
 
+/// A Docker provider whose container listing runs `during_listing` first, then lists no
+/// container: what the pass reads after its live read happens while it lists.
+struct ListingInterleaving {
+    during_listing: Box<dyn Fn() + Send + Sync>,
+}
+
+#[async_trait]
+impl flotilla_environment::environment::EnvironmentProvider for ListingInterleaving {
+    flotilla_discovery_testkit::injected_environment_provider!();
+    async fn prepare(
+        &self,
+        _spec: &flotilla_resources::EnvironmentSpec,
+        _opts: &flotilla_environment::environment::PrepareOpts,
+    ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
+        Err("not used".to_string())
+    }
+
+    async fn provision(
+        &self,
+        _id: EnvironmentId,
+        _image: &flotilla_environment::environment::PreparedEnvironment,
+        _opts: flotilla_environment::environment::ProvisionOpts,
+    ) -> Result<EnvironmentHandle, flotilla_environment::environment::EnvironmentProvisionError> {
+        Err("not used".into())
+    }
+
+    async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
+        (self.during_listing)();
+        Ok(Vec::new())
+    }
+
+    async fn destroy(&self, _container_id: &str) -> Result<(), String> {
+        Err("not used".to_string())
+    }
+}
+
+// d13: the periodic pass read the live environments, then listed the containers. An environment
+// whose teardown began between the two had no container and was judged lost. Only a container
+// gone while its environment is still wanted is a loss.
+#[tokio::test]
+async fn teardown_begun_while_the_pass_lists_containers_is_not_a_loss() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_base = temp.path().join("config");
+    fs::create_dir_all(&config_base).expect("config directory");
+    fs::write(config_base.join("daemon.toml"), "machine_id = \"teardown-during-listing-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(config_base));
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+        flotilla_protocol::HostName::new("udder"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
+    let host_ref = daemon.local_host_id().expect("local host identity").to_string();
+    let engine = engine(&daemon);
+    let spec = docker_environment_spec(&host_ref, BTreeSet::new());
+    // Its vessel is still wanted: a container gone is a loss.
+    let wanted = engine.vessels.request("convoy-wanted", "work", &host_ref);
+    engine.environments.put_ready("env-wanted", &spec, Some(&wanted), "wanted-container", Default::default());
+    engine.vessels.ready(&wanted, "env-wanted");
+    // Its vessel ends while the pass lists: its teardown has begun.
+    let ending = engine.vessels.request("convoy-ending", "work", &host_ref);
+    engine.environments.put_ready("env-ending", &spec, Some(&ending), "ending-container", Default::default());
+    engine.vessels.ready(&ending, "env-ending");
+    // It is released while the pass lists.
+    engine.environments.put_ready("env-released", &spec, None, "released-container", Default::default());
+
+    let mut registry = ProviderRegistry::new();
+    register_host_adoption(&mut registry);
+    let during = Arc::clone(&engine);
+    registry.environment_providers.insert(
+        "docker",
+        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
+        Arc::new(ListingInterleaving {
+            during_listing: Box::new(move || {
+                during.vessels.step(&ending, flotilla_resources::vessel_records::VesselStep::Released);
+                during.environments.finish("env-released", flotilla_provisioning_testkit::Ending::Released);
+            }),
+        }),
+    );
+    let state = Arc::new(ControllerRuntimeState::new(
+        Arc::clone(&daemon),
+        config,
+        Arc::new(registry),
+        None,
+        host_ref,
+        "host-direct-test".to_string(),
+    ));
+
+    reconcile_provisioned_environments(&state, NAMESPACE).await.expect("reconcile the pass");
+
+    assert_eq!(
+        observed_backings(&state),
+        [BackingEvent {
+            name: "env-wanted".to_string(),
+            observed: Backing::Absent { reason: Some("Docker container wanted-container is not running".to_string()) },
+        }],
+        "only the environment still wanted is reported lost"
+    );
+}
+
 #[tokio::test]
 async fn environment_readoption_marks_missing_container_lost() {
     let temp = TempDir::new().expect("tempdir");

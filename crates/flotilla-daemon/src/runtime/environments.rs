@@ -13,7 +13,7 @@ use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provisioning::engine::controller::Backing;
 use flotilla_resources::environment_records::EnvironmentRecord;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::docker::{probe_provisioned_environment, verify_declared_agent_adapters};
 use super::state::{canonical_runtime_host_id, ControllerRuntimeState};
@@ -458,6 +458,15 @@ pub(super) async fn mark_unavailable_environment(
     disposition: BackingDisposition,
     message: &str,
 ) -> Result<(), String> {
+    // The pass judged from its live read, made before it listed or probed the backing. Read
+    // again now, after that evidence: an environment ended since, or whose vessel has ended so
+    // its release is due or running, is its release's to end, and the backing it took down is
+    // no loss. Its release starts only once its vessel has ended, so a vessel still live here
+    // means the backing was gone before any teardown.
+    if !still_wanted(state, env_id).await? {
+        debug!(environment = %env_id, cause = message, "backing gone while the environment is released; not judged");
+        return Ok(());
+    }
     let registered_container = state.daemon.environment_container_name(env_id);
     state.daemon.remove_provisioned_environment(env_id);
     state.provisioned_environments.lock().await.retain(|_, active| active.handle.id() != env_id);
@@ -496,6 +505,26 @@ pub(super) async fn mark_unavailable_environment(
     state.observe_environment_backing(env_id.as_str(), observed).await;
     warn!(environment = %env_id, %message, "provisioned environment backing is unavailable");
     Ok(())
+}
+
+/// Whether this home's environment `env_id` is live and held for no vessel, or for one still
+/// live: keyed reads of the environment and its vessel, as the Environment controller judges its
+/// holder.
+async fn still_wanted(state: &ControllerRuntimeState, env_id: &EnvironmentId) -> Result<bool, String> {
+    let reads = state.daemon.lifecycle_reads();
+    let name = env_id.as_str().to_owned();
+    tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+        let Some(environment) = reads.environments()?.get(&name, None)? else { return Ok(false) };
+        if environment.ended() {
+            return Ok(false);
+        }
+        match environment.vessel.as_deref() {
+            None => Ok(true),
+            Some(vessel) => Ok(reads.vessels()?.get(vessel, None)?.is_some_and(|vessel| !vessel.ended())),
+        }
+    }))
+    .await
+    .map_err(|error| format!("read environment {env_id} again: {error}"))?
 }
 
 // Allow the 60-second SSH/agent connect budget plus asset and credential setup.
