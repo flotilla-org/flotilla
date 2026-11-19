@@ -1340,7 +1340,8 @@ fn noted_turns<'a>(status: &'a flotilla_resources::ConvoyStatus, vessel: &'a str
 }
 
 /// The change requests each turn rule of a convoy fires on, as observed: a turn about a head none
-/// of them is at any longer was answered by a push (GitHub run GH2-1), and the turn a rule fires
+/// of them is at any longer was answered by a push (GitHub run GH2-1), one whose rule no longer
+/// asks at that head or whose change request ended was answered by the world (GS-1), and the turn a rule fires
 /// at their current state is the one a seat may owe that the home's notes no longer hold (GH2-2).
 #[derive(Default)]
 pub(super) struct TurnHeads(Vec<TurnSubject>);
@@ -1371,45 +1372,80 @@ impl TurnHeads {
         Self(subjects)
     }
 
-    /// Whether every change request rule `source` fires on is observed at a head other than the
-    /// one `revision` was delivered for: the seat pushed after the turn.
-    fn moved(&self, source: &str, revision: &str) -> bool {
-        let mut heads = self.0.iter().filter(|subject| subject.delivery.source == source).peekable();
-        heads.peek().is_some()
-            && heads.all(|subject| {
-                subject
-                    .observed
-                    .as_ref()
-                    .and_then(|record| record.status.as_ref()?.head_sha.value.as_deref())
-                    .is_some_and(|head| !super::turn_delivery::same_progress(revision, head))
+    /// Whether a turn rule `source` fired at `revision` is still owed at its change requests'
+    /// current observations, read at `now`: some change request it fires on is unobserved, or is
+    /// observed at the head the turn was about with the rule still asking to act there. A turn is
+    /// answered by a push past its head (GH2-1), by its rule no longer asking at the same head (an
+    /// approval, checks now passing, the conflict resolved: GitHub smoke GS-1) and by its change
+    /// request's merge or close. A rule on no change request is not judged here.
+    fn still_owed(&self, source: &str, revision: &str, now: DateTime<Utc>) -> bool {
+        let mut subjects = self.0.iter().filter(|subject| subject.delivery.source == source).peekable();
+        subjects.peek().is_none()
+            || subjects.any(|subject| match subject.standing(now) {
+                Standing::Unobserved => true,
+                Standing::Ended => false,
+                Standing::At { head, asks, .. } => asks && super::turn_delivery::same_progress(revision, &head),
             })
     }
 
     /// The turns rules targeting seat `vessel`/`role` fire at their change requests' current
     /// state that ask it to act, as rule source and subject revision: the turns it may owe now,
-    /// whatever the home has noted, its `owes` read at `now`. A merged settlement is not among them.
+    /// whatever the home has noted, read at `now`. A merged settlement is not among them.
     fn current<'a>(&'a self, vessel: &'a str, role: &'a str, now: DateTime<Utc>) -> impl Iterator<Item = (&'a str, String)> + 'a {
         self.0
             .iter()
             .filter(move |subject| subject.delivery.rule.to.vessel == vessel && subject.delivery.rule.to.role == role)
             .filter(|subject| !is_merged_settlement_probe(&subject.delivery.leaf))
-            .filter_map(move |subject| {
-                let record = subject.observed.as_ref()?;
-                let revision = super::turn_delivery::change_request_turn_revision(&subject.delivery.leaf, record.status.as_ref()?)?;
-                let observation =
-                    flotilla_resources::ChangeRequestLeafSubject { change_request: record, now, stale_after: std::time::Duration::MAX };
-                // As delivery reads its rule's `owes` as it fires: one that cannot answer asks.
-                super::turn_delivery::asks_to_act(&subject.delivery.rule, &subject.delivery.leaf.address, &observation)
-                    .unwrap_or(true)
-                    .then_some((subject.delivery.source.as_str(), revision))
+            .filter_map(move |subject| match subject.standing(now) {
+                Standing::At { asks: true, revision: Some(revision), .. } => Some((subject.delivery.source.as_str(), revision)),
+                _ => None,
             })
+    }
+}
+
+/// What a change request a turn rule fires on asks of the rule's seat, as observed.
+enum Standing {
+    /// Its state or head is unknown: a turn about it may still be owed.
+    Unobserved,
+    /// It merged or closed: it asks nothing more.
+    Ended,
+    /// It is open at `head`, where a turn of its rule fires at `revision` (unknown while a checks
+    /// leaf's checks are) and still asks the seat to act when `asks`.
+    At { head: String, revision: Option<String>, asks: bool },
+}
+
+impl TurnSubject {
+    /// What this change request asks of its rule's seat at its current observation, read at
+    /// `now`, as delivery reads its rule when it fires. A merged settlement's turn is about the
+    /// merge, so its subject's merge does not end it; it is judged by its head alone, as before.
+    fn standing(&self, now: DateTime<Utc>) -> Standing {
+        let Some(record) = self.observed.as_ref() else { return Standing::Unobserved };
+        let Some(status) = record.status.as_ref() else { return Standing::Unobserved };
+        let merged_settlement = is_merged_settlement_probe(&self.delivery.leaf);
+        if !merged_settlement
+            && matches!(
+                status.state.value,
+                Some(flotilla_resources::ObservedChangeRequestState::Merged | flotilla_resources::ObservedChangeRequestState::Closed)
+            )
+        {
+            return Standing::Ended;
+        }
+        let Some(head) = status.head_sha.value.clone() else { return Standing::Unobserved };
+        if merged_settlement {
+            return Standing::At { head, revision: None, asks: true };
+        }
+        let revision = super::turn_delivery::change_request_turn_revision(&self.delivery.leaf, status);
+        let observation = flotilla_resources::ChangeRequestLeafSubject { change_request: record, now, stale_after: std::time::Duration::MAX };
+        let asks = super::turn_delivery::asks_now(&self.delivery.rule, &self.delivery.leaf, &observation);
+        Standing::At { head, revision, asks }
     }
 }
 
 impl ReconcilerWake {
     /// The turns seat `vessel`/`role` of `convoy` owes and has not answered, accepted after
     /// `since` (its latest submission) when given. A turn is answered by a submission after it, a
-    /// push past the head it was about (`heads`) or guidance delivered to the seat after it (an
+    /// push past the head it was about, its rule no longer asking to act at that head or its change
+    /// request's merge or close (`heads`, GS-1), or guidance delivered to the seat after it (an
     /// operator's resume, N3-4), and one superseded before it was typed was never put to the seat,
     /// which owes the turn that superseded it instead (GitHub run GH2-1).
     ///
@@ -1428,11 +1464,12 @@ impl ReconcilerWake {
         heads: &TurnHeads,
     ) -> Result<Vec<OwedTurn>, String> {
         let Some(status) = convoy.status.as_ref() else { return Ok(Vec::new()) };
+        let now = self.subscriptions.inner.clock.now();
         let noted: Vec<_> = noted_turns(status, vessel, role)
             .filter(|turn| since.is_none_or(|since| turn.accepted_at > since))
-            .filter(|turn| !heads.moved(&turn.source, &turn.revision))
+            .filter(|turn| heads.still_owed(&turn.source, &turn.revision, now))
             .collect();
-        let current: Vec<_> = heads.current(vessel, role, self.subscriptions.inner.clock.now()).collect();
+        let current: Vec<_> = heads.current(vessel, role, now).collect();
         if noted.is_empty() && current.is_empty() {
             return Ok(noted);
         }

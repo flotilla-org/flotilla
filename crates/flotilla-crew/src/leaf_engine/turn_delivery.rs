@@ -654,6 +654,15 @@ pub(super) fn asks_to_act(rule: &TurnDeliveryRule, address: &LeafAddress, subjec
     Ok(evaluate_leaf(&template_leaf(owes, address.clone()), Some(subject), None)?.result != ThreeValue::False)
 }
 
+/// Whether rule `rule`, firing on `leaf`, asks its target to act at observation `subject`: its
+/// leaf still holds there and its turn there asks to act. One that no longer does (the review
+/// approved, the checks passed, the conflict resolved) asks nothing; an observation that cannot
+/// answer may ask, so it counts as asking.
+pub(super) fn asks_now(rule: &TurnDeliveryRule, leaf: &Leaf, subject: &dyn LeafSubject) -> bool {
+    let fires = evaluate_leaf(leaf, Some(subject), None).map_or(true, |evaluation| evaluation.result != ThreeValue::False);
+    fires && asks_to_act(rule, &leaf.address, subject).unwrap_or(true)
+}
+
 /// The subject revision a turn on change-request leaf `leaf` (not a merged settlement) fires at
 /// while the change request is observed as `cr`: its head, with the checks' state for a checks
 /// leaf. `None` while the head, or a checks leaf's checks, is unknown.

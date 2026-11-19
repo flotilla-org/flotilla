@@ -590,6 +590,46 @@ async fn a_turn_answered_before_a_restart_does_not_nudge_after_it() {
     assert_not_nudged(coder).await;
 }
 
+// GitHub smoke GS-1: a coder handed a request-changes review pushes its fix. The review still
+// stands at the new head, so the rule fires again there; the coder has nothing more to change and
+// does not submit again. The reviewer approves at that head: the rule no longer asks the coder to
+// act, so the world has answered the turn, and the idle coder is not nudged, nor after the merge.
+#[tokio::test]
+async fn a_review_turn_approved_at_its_head_does_not_nudge_the_idle_seat() {
+    use flotilla_resources::ObservedChangeRequestState::{Merged, Open};
+
+    let coder = coder().await;
+    submit_pr(&coder).await;
+    observe_review(&coder, Open, "head-1", true).await;
+    deliver_subject_turn(&coder, REVIEW_RULE, REVIEW_BRIEF, "head-1", true, "head-1").await;
+    observe_review(&coder, Open, "head-2", true).await;
+    deliver_subject_turn(&coder, REVIEW_RULE, REVIEW_BRIEF, "head-2", true, "head-2").await;
+    observe_review(&coder, Open, "head-2", false).await;
+    coder.clock.advance(chrono::Duration::minutes(3));
+    assert_not_nudged_again(&coder).await;
+
+    observe_review(&coder, Merged, "head-2", false).await;
+    coder.clock.advance(chrono::Duration::minutes(3));
+    assert_not_nudged(coder).await;
+}
+
+// GS-1: a merged PR owes no turn. A review turn still standing when the PR merges is not owed
+// after the merge, whether the home's notes hold it or it is rebuilt after a restart (GH2-2).
+#[tokio::test]
+async fn a_merged_pr_owes_no_turn() {
+    use flotilla_resources::ObservedChangeRequestState::{Merged, Open};
+
+    let coder = coder().await;
+    submit_pr(&coder).await;
+    observe_review(&coder, Open, "head-1", true).await;
+    deliver_subject_turn(&coder, REVIEW_RULE, REVIEW_BRIEF, "head-1", true, "head-1").await;
+    observe_review(&coder, Merged, "head-1", true).await;
+    assert_not_nudged_again(&coder).await;
+    restart(&coder);
+    coder.clock.advance(chrono::Duration::minutes(3));
+    assert_not_nudged(coder).await;
+}
+
 // GitHub run GH3-1: an operator resumed a coder that owed a failing-checks turn, telling it to
 // leave the PR as it was, and the judge nudged it 58 ms later from an idle that predated the
 // resume. A resume holds supervision for its grace. A turn delivered after the resume is owed as
@@ -620,7 +660,10 @@ async fn a_resumed_seat_that_owes_a_turn_is_not_nudged_inside_the_resume_grace()
     }
 
     // A turn after the resume asks the coder to act; it idles after it, past the resume's grace.
-    deliver_subject_turn(&coder, REVIEW_RULE, "Address the actionable review and push the fix.", "head-1", true, "head-1").await;
+    // The review stands at the head, as it does when its rule fires.
+    let open = flotilla_resources::ObservedChangeRequestState::Open;
+    observe_pr_as(&coder, open, "head-1", flotilla_resources::ObservedChecks::Fail, true).await;
+    deliver_subject_turn(&coder, REVIEW_RULE, REVIEW_BRIEF, "head-1", true, "head-1").await;
     let Coder { daemon, backend, probe, clock, launch, .. } = coder;
     let before = crew_messages(&daemon, "flotilla").await.len();
     clock.advance(chrono::Duration::minutes(3));
@@ -834,8 +877,25 @@ async fn assert_not_nudged(coder: Coder) {
     assert_eq!(after.len(), before, "no nudge: {:?}", after.iter().map(|message| &message.spec.body).collect::<Vec<_>>());
 }
 
-/// The observer reads the coder's PR now: open, mergeable, at `head`, with `checks`.
+/// The observer reads the coder's PR now: open, mergeable, at `head`, with `checks` and no review
+/// actionable at its head.
 async fn observe_pr(coder: &Coder, head: &str, checks: flotilla_resources::ObservedChecks) {
+    observe_pr_as(coder, flotilla_resources::ObservedChangeRequestState::Open, head, checks, false).await;
+}
+
+/// The observer reads the coder's PR now: in `state`, mergeable, at `head`, its checks passing,
+/// with a review actionable at its head when `actionable` (changes requested, not yet approved).
+async fn observe_review(coder: &Coder, state: flotilla_resources::ObservedChangeRequestState, head: &str, actionable: bool) {
+    observe_pr_as(coder, state, head, flotilla_resources::ObservedChecks::Pass, actionable).await;
+}
+
+async fn observe_pr_as(
+    coder: &Coder,
+    state: flotilla_resources::ObservedChangeRequestState,
+    head: &str,
+    checks: flotilla_resources::ObservedChecks,
+    actionable: bool,
+) {
     use flotilla_resources::{Clock, Observation};
 
     let records = coder.backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
@@ -865,10 +925,10 @@ async fn observe_pr(coder: &Coder, head: &str, checks: flotilla_resources::Obser
                 author: Default::default(),
                 review_decision: Default::default(),
                 review_requested_from_owner: Default::default(),
-                state: Observation::known(flotilla_resources::ObservedChangeRequestState::Open, now),
+                state: Observation::known(state, now),
                 head_sha: Observation::known(head.into(), now),
                 checks: Observation::known(checks, now),
-                review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, now) },
+                review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Observation::known(actionable, now) },
                 mergeable: Observation::known(flotilla_resources::ObservedMergeability::Mergeable, now),
             },
         )
@@ -987,6 +1047,7 @@ async fn a_seat_nudged_before_its_submission_is_not_nudged_after_it() {
 
 /// The review rule `coder` declares; turn delivery records its episodes under this source.
 const REVIEW_RULE: &str = "review-fix";
+const REVIEW_BRIEF: &str = "Address the actionable review and push the fix.";
 
 /// The checks rule `coder` declares, and its brief's first line, which a nudge about it names.
 const CHECKS_RULE: &str = "checks-settled";
