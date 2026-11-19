@@ -340,8 +340,7 @@ async fn an_idle_seat_given_a_turn_after_its_submission_is_nudged() {
     );
 
     clock.advance(chrono::Duration::seconds(1));
-    idle_coder(&daemon, &probe, &clock, &launch);
-    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    judge_idle_past_observer_grace(&daemon, &probe, &clock, &launch).await;
     let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
     let stalled = status.stalls.about(Some(("work", "coder"))).expect("the seat is stalled");
     assert_eq!(stalled.rung, StallRung::Nudge);
@@ -435,8 +434,7 @@ async fn a_checks_failed_turn_after_submission_nudges_the_idle_seat_naming_the_t
     let before: BTreeSet<String> = crew_messages(&daemon, "flotilla").await.into_iter().map(|message| message.metadata.name).collect();
 
     clock.advance(chrono::Duration::seconds(1));
-    idle_coder(&daemon, &probe, &clock, &launch);
-    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    judge_idle_past_observer_grace(&daemon, &probe, &clock, &launch).await;
     let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
     assert_eq!(status.stalls.about(Some(("work", "coder"))).expect("the seat is stalled").rung, StallRung::Nudge);
     let nudges: Vec<_> = crew_messages(&daemon, "flotilla")
@@ -671,6 +669,23 @@ fn idle_coder(
     super::support::agent_sessions(daemon)
         .observe(launch, Activity::Idle, "Stop".into(), super::support::engine_at(now))
         .expect("hook activity");
+}
+
+/// Judges the idle coder's seat once the observer's refresh grace for its PR has passed. The fixture
+/// has no forge for the PR, so a turn's demand for a current observation of it is never answered:
+/// the first judgement finds the row inside the grace the observer schedules on this clock and pins
+/// it, and the seat is judged after the clock moves past it.
+async fn judge_idle_past_observer_grace(
+    daemon: &Arc<InProcessDaemon>,
+    probe: &super::support::SessionStagingProbe,
+    clock: &flotilla_store_testkit::VirtualClock,
+    launch: &str,
+) {
+    idle_coder(daemon, probe, clock, launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement inside the grace");
+    clock.advance(chrono::Duration::minutes(2));
+    idle_coder(daemon, probe, clock, launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
 }
 
 /// The coder's inbox in launch `convoy` of project flotilla.
