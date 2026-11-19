@@ -42,6 +42,7 @@ use flotilla_resources::{
     Convoy, ConvoySpec, ConvoyStatus, ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance,
 };
 use flotilla_schema::reads;
+use tracing::{info_span, Instrument};
 
 use crate::held_listing::{ticks, ViewIndex};
 
@@ -286,7 +287,7 @@ impl ConvoyViews {
         let waiters = &self.held.waiters;
         waiters
             .wait(async {
-                let mut state = self.held.state.lock().await;
+                let mut state = self.held.state.lock().instrument(info_span!("convoy_views.lock_wait")).await;
                 waiters.serve(self.read_held(&mut state, read)).await
             })
             .await
@@ -331,7 +332,7 @@ impl ConvoyViews {
             tokio::spawn(reads::attributed(reads::caller(FOLLOWER), self.clone().follow(wakes)));
         }
         let held = state.as_mut().expect("filled above");
-        if let Err(error) = self.pass(held).await {
+        if let Err(error) = self.pass(held).instrument(info_span!("convoy_views.pass", by = "read")).await {
             tracing::warn!(%error, "convoy views: a change did not read; reading them all again");
             self.refill(held).await?;
         }
@@ -376,7 +377,7 @@ impl ConvoyViews {
     async fn follow(self, mut wakes: BoxStream<'static, ()>) {
         let mut ended = false;
         while !ended && wakes.next().await.is_some() {
-            let mut state = self.held.state.lock().await;
+            let mut state = self.held.state.lock().instrument(info_span!("convoy_views.lock_wait", by = "follower")).await;
             let Some(held) = state.as_mut() else { return };
             let waiters = &self.held.waiters;
             waiters.serve(self.follow_wakes(held, &mut wakes, &mut ended)).await;
@@ -388,7 +389,7 @@ impl ConvoyViews {
     /// Passes the views over one wake's changes and every wake waiting behind it.
     async fn follow_wakes(&self, held: &mut HeldViews, wakes: &mut BoxStream<'static, ()>, ended: &mut bool) {
         loop {
-            if let Err(error) = self.pass(held).await {
+            if let Err(error) = self.pass(held).instrument(info_span!("convoy_views.pass", by = "follower")).await {
                 // The views are read again in full; a failed read leaves them as they were.
                 tracing::warn!(%error, "convoy views: a change did not read; reading them all again");
                 if let Err(error) = self.refill(held).await {
@@ -441,6 +442,7 @@ impl ConvoyViews {
                     seen,
                 ))
             })
+            .instrument(info_span!("convoy_views.cursors"))
             .await?;
         let (passed, logged, through, rescanned) = {
             let mut following = following.lock().unwrap_or_else(PoisonError::into_inner);
@@ -474,7 +476,10 @@ impl ConvoyViews {
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
         }
-        self.recompose(held).await?;
+        if !held.owed.is_empty() || held.refill_owed {
+            let span = info_span!("convoy_views.recompose", launches = held.owed.len());
+            self.recompose(held).instrument(span).await?;
+        }
         // Every launch whose joins changed before `seen` is composed again.
         following.lock().unwrap_or_else(PoisonError::into_inner).cursors.composed(seen);
         Ok(())
@@ -521,6 +526,11 @@ impl ConvoyViews {
     /// leaves out is read by name: one that retired is held with how it ended until its watchers
     /// have read it, as a retired one held already is. Until it has, the whole views are owed.
     async fn refill(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
+        self.refill_all(held).instrument(info_span!("convoy_views.refill")).await
+    }
+
+    /// [`Self::refill`], unspanned.
+    async fn refill_all(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
         held.refill_owed = true;
         let unlisted: BTreeSet<_> =
             held.views.keys().chain(held.logged.iter()).filter(|key| !held.retiring.contains_key(*key)).cloned().collect();
@@ -653,6 +663,7 @@ impl ConvoyViews {
                 }));
                 Ok(views)
             })
+            .instrument(info_span!("convoy_views.stored"))
             .await?;
         let position = self.with_held(|held| held.position()).await?;
         Ok(views.into_iter().map(|view| HeldView { view, version: position }).collect())
