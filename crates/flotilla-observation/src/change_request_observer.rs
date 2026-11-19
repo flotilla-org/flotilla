@@ -14,9 +14,9 @@ use flotilla_resources::{
     checkout_records::{CheckoutChange, CheckoutHolder, Launches},
     convoy_subject_rows,
     lifecycle_reads::LifecycleReads,
-    merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestSpec, ChangeRequestStatus,
-    Clock, Convoy, ConvoyPhase, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks, ResourceError, ResourceObject,
-    ResourceProvenance, SystemClock,
+    merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestReviewObservation,
+    ChangeRequestSpec, ChangeRequestStatus, Clock, Convoy, ConvoyPhase, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState,
+    ObservedChecks, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
 };
 use flotilla_store::{
     load_metrics::{attributed, caller, carry},
@@ -1442,12 +1442,44 @@ fn spec_names(spec: &ChangeRequestSpec, subject: &ChangeRequestKey) -> bool {
     stored_spelling_names(subject.address(), &spec.service, &spec.scope, spec.number, &[])
 }
 
+/// Whether two statuses carry the same observed values. Every stored field is
+/// compared; only each `Observation`'s `observed_at` is left out, because it is
+/// the time of the read, not part of what was read: it differs on every poll,
+/// and freshness is judged from it separately (`stale_after` in `publish`).
+/// Both sides are destructured without `..`, so a field added to the stored
+/// status does not compile here until it is compared.
 fn observed_values_equal(left: &ChangeRequestStatus, right: &ChangeRequestStatus) -> bool {
-    left.state.value == right.state.value
-        && left.head_sha.value == right.head_sha.value
-        && left.checks.value == right.checks.value
-        && left.review.actionable_at_head.value == right.review.actionable_at_head.value
-        && left.mergeable.value == right.mergeable.value
+    let ChangeRequestStatus {
+        title,
+        author,
+        review_decision,
+        review_requested_from_owner,
+        state,
+        head_sha,
+        checks,
+        review: ChangeRequestReviewObservation { actionable_at_head },
+        mergeable,
+    } = left;
+    let ChangeRequestStatus {
+        title: right_title,
+        author: right_author,
+        review_decision: right_review_decision,
+        review_requested_from_owner: right_review_requested_from_owner,
+        state: right_state,
+        head_sha: right_head_sha,
+        checks: right_checks,
+        review: ChangeRequestReviewObservation { actionable_at_head: right_actionable_at_head },
+        mergeable: right_mergeable,
+    } = right;
+    title.value == right_title.value
+        && author.value == right_author.value
+        && review_decision.value == right_review_decision.value
+        && review_requested_from_owner.value == right_review_requested_from_owner.value
+        && state.value == right_state.value
+        && head_sha.value == right_head_sha.value
+        && checks.value == right_checks.value
+        && actionable_at_head.value == right_actionable_at_head.value
+        && mergeable.value == right_mergeable.value
 }
 
 #[cfg(test)]
@@ -2649,6 +2681,74 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), IDENTICAL_POLLS + 1);
         assert_eq!(after.metadata.resource_version, first.metadata.resource_version, "identical observed values must produce no writes");
         assert_eq!(after.status, first.status, "poll timestamps are not persisted unless an observed value changes");
+    }
+
+    // An approval at the same head changes only the review decision; the poll
+    // that reads it writes the record then, not once the record goes stale.
+    #[tokio::test(start_paused = true)]
+    async fn an_approval_at_the_same_head_is_written_on_the_poll_that_reads_it() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let observed_at = Utc::now();
+        let awaiting_review = ChangeRequestStatus {
+            title: Observation::known("Fix the thing".to_string(), observed_at),
+            author: Observation::known("someone".to_string(), observed_at),
+            review_decision: Observation::known(flotilla_resources::ObservedReviewDecision::Required, observed_at),
+            review_requested_from_owner: Observation::known(false, observed_at),
+            state: Observation::known(ObservedChangeRequestState::Open, observed_at),
+            head_sha: Observation::known("head".to_string(), observed_at),
+            checks: Observation::known(ObservedChecks::Pass, observed_at),
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, observed_at) },
+            mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
+        };
+        let source = Arc::new(MutableSource(Mutex::new(awaiting_review.clone()), AtomicUsize::new(0)));
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "authority".to_string(),
+            Arc::clone(&source) as Arc<dyn ChangeRequestObservationSource>,
+            ChangeRequestRefreshCadence::default(),
+        );
+        let subject = test_subject(4242);
+        refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.expect("demand");
+        wait_for_observation(&source, 1).await;
+        let records = backend.using::<ChangeRequest>("ops");
+        let first = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(record) = records.get(&subject.record_name()).await {
+                    if record.status.is_some() {
+                        return record;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("first observation written before deadline");
+
+        let approved_at = observed_at + chrono::Duration::seconds(90);
+        *source.0.lock().await = ChangeRequestStatus {
+            review_decision: Observation::known(flotilla_resources::ObservedReviewDecision::Approved, approved_at),
+            ..awaiting_review
+        };
+        tokio::time::advance(Duration::from_secs(90)).await;
+        wait_for_observation(&source, 2).await;
+
+        let approved = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let record = records.get(&subject.record_name()).await.expect("record");
+                if record.metadata.resource_version != first.metadata.resource_version {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the approving poll writes the record");
+        assert_eq!(source.1.load(Ordering::SeqCst), 2, "written by the second poll, not a later one");
+        assert_eq!(
+            approved.status.expect("status").review_decision.value,
+            Some(flotilla_resources::ObservedReviewDecision::Approved),
+            "the stored record carries the approval"
+        );
     }
 
     #[tokio::test(start_paused = true)]
