@@ -1,7 +1,7 @@
 use flotilla_resources::account_access::{AccountChange, AccountRecords};
 use flotilla_resources::checkout_path::checkout_path_component;
 use flotilla_resources::checkout_records::{CheckoutRecords, HOLDER_ENDED, HOLDER_NOT_OPEN};
-use flotilla_resources::convoy::engine::{launch_slug, EngineConvoyPath};
+use flotilla_resources::convoy::engine::EngineConvoyPath;
 use flotilla_resources::environment_records::{EnvironmentRecord, EnvironmentRecords};
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
 use flotilla_resources::vessel_planning::{Held, HeldKind, VesselPlan, VesselPlanner};
@@ -26,7 +26,7 @@ use flotilla_resources::{
     CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND,
 };
 use flotilla_resources::{
-    checkout_path::{checkout_name, checkout_placement_scope},
+    checkout_path::{checkout_name, checkout_placement_scope, vessel_launch_slug},
     clone_records::CloneRecords,
     realisation_settings,
 };
@@ -591,7 +591,7 @@ impl VesselPlanning {
             let Some(root) = placement_decision.as_ref().and_then(|decision| decision.provider_workspace_root.as_ref()) else {
                 return Ok(VesselPrepared::failed("cloud provider workspace root missing from frozen placement"));
             };
-            *clone_path = vessel_clone_path(root, &launch_slug(&obj.metadata.name));
+            *clone_path = vessel_clone_path(root, &vessel_launch_slug(&obj.metadata.name));
         }
         if let Some(decision) = placement_decision.as_ref() {
             strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
@@ -843,7 +843,7 @@ impl VesselPlanning {
                     checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(|_| strategy.host_ref())).as_deref(),
                 ),
                 PlacementStrategy::CloneInVessel { .. } => checkout_name(
-                    &launch_slug(&obj.metadata.name),
+                    &vessel_launch_slug(&obj.metadata.name),
                     &convoy_repository.workspace_slug,
                     multi_repository,
                     checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(|_| strategy.host_ref())).as_deref(),
@@ -1557,7 +1557,7 @@ impl SecondaryWatch for ConvoyVesselWake {
 /// becomes Docker container and volume names and host paths, so it takes the launch's
 /// path-safe slug: a standing role's launch is named in address form (`project:P/convoy:R#n`).
 fn environment_name(launch: &str) -> String {
-    format!("env-{}", launch_slug(launch))
+    format!("env-{}", vessel_launch_slug(launch))
 }
 
 fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &str, branch_slug: &str) -> String {

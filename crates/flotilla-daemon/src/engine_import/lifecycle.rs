@@ -164,7 +164,7 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
             });
             continue;
         }
-        import_checkouts(std::slice::from_ref(&record), &holder, &clone_launches, target, report);
+        import_checkouts(std::slice::from_ref(&record), &holder, &clone_launches, &carried.vessels, target, report);
     }
     let standing: Vec<_> = aliases.iter().filter(|((home, old), stable)| target.imports(home) && old != *stable).collect();
     if !standing.is_empty() {

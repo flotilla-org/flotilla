@@ -11,6 +11,21 @@ pub fn checkout_name(vessel_name: &str, workspace_slug: &str, multi_repository: 
     format!("checkout-{vessel_name}{repository_suffix}{placement_suffix}")
 }
 
+/// What a vessel launch's own resources are named after (a clone made in the vessel, its
+/// environment, its crew's sessions): the launch's path-safe slug, so the crew and the import
+/// name them alike.
+pub fn vessel_launch_slug(launch: &str) -> String {
+    crate::convoy::engine::launch_slug(launch)
+}
+
+/// Managed checkout `old`, which [`checkout_name`] named for `old_owner` (an old store's convoy or
+/// vessel), as named for `owner`, the launch that holds it on the engine: the rest of the name
+/// (repository and placement scope) is kept. `None` when `old` was not named for `old_owner`.
+pub fn checkout_renamed(old: &str, old_owner: &str, owner: &str) -> Option<String> {
+    let rest = old.strip_prefix("checkout-")?.strip_prefix(old_owner)?;
+    (rest.is_empty() || rest.starts_with('-')).then(|| format!("checkout-{owner}{rest}"))
+}
+
 /// The scope of `convoy`'s managed checkouts on `host_ref`: it hashes the convoy's creation
 /// timestamp's RFC 3339 form, so a convoy keeps its checkout names only while that stamp is
 /// served exactly.
