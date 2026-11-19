@@ -602,11 +602,16 @@ async fn a_resumed_seat_that_owes_a_turn_is_not_nudged_inside_the_resume_grace()
     {
         let Coder { daemon, backend, probe, .. } = &coder;
         let before = crew_messages(daemon, "flotilla").await.len();
-        daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement after the resume");
+        // The run's nudge came on the judge's second pass after the resume: the first had noted
+        // the idle seat, which then read Stalled.
+        for pass in ["first", "second"] {
+            daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement after the resume");
+            let after = crew_messages(daemon, "flotilla").await;
+            assert_eq!(after.len(), before, "no nudge on the {pass} pass: {:?}", after.iter().map(|message| &message.spec.body).collect::<Vec<_>>());
+        }
         let status = backend.clone().using::<ResourceConvoy>("flotilla").get(&probe.convoy).await.expect("convoy").status.expect("status");
-        assert!(status.stalls.about(Some(("work", "coder"))).is_none(), "{:?} {:?}", status.stalls, status.crew_work["work"]["coder"]);
-        let after = crew_messages(daemon, "flotilla").await;
-        assert_eq!(after.len(), before, "no nudge: {:?}", after.iter().map(|message| &message.spec.body).collect::<Vec<_>>());
+        let stalled = status.stalls.about(Some(("work", "coder")));
+        assert!(stalled.is_none_or(|stalled| stalled.rung != StallRung::Nudge && stalled.nudge_history.is_empty()), "{stalled:?}");
     }
 
     // A turn after the resume asks the coder to act; it idles after it, past the resume's grace.
