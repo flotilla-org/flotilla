@@ -128,8 +128,9 @@ pub struct CheckoutFacts {
 /// change-stream watermark while its inspections succeed, and `failing_since` once they fail. A
 /// gate that needs evidence newer than some moment asks for an inspection and reads its answer's
 /// receipt. Inspections run on events (a crew turn ending, a gate asking), never on a timer.
-/// Landed evidence latches: a later inspection that cannot judge `landed` keeps the held evidence
-/// (partial reports merge onto held state).
+/// A landing latches: a later inspection that cannot judge `landed` keeps the held landing and its
+/// evidence (partial reports merge onto held state); one judged without a change request latches
+/// at the HEAD it was judged at.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "CheckoutIntegration", code = "ki")]
 pub struct CheckoutIntegration {

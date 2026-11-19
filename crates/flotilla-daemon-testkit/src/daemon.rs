@@ -145,6 +145,9 @@ impl TestDaemon {
         /// `[dummy_fleet.terminal]`, such as `refusal_rate = 0.3`.
         #[builder(default)]
         terminal: &str,
+        /// `[dummy_fleet.vcs]`, such as `dirty_rate = 1.0`.
+        #[builder(default)]
+        vcs: &str,
         /// The rest of `daemon.toml`, such as `host_name`.
         #[builder(default)]
         settings: &str,
@@ -167,7 +170,7 @@ impl TestDaemon {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_dir = dir.path().join("config");
         std::fs::create_dir_all(&config_dir).expect("config dir");
-        std::fs::write(config_dir.join("daemon.toml"), daemon_toml(settings, agent, environment, change_request, terminal))
+        std::fs::write(config_dir.join("daemon.toml"), daemon_toml(settings, agent, environment, change_request, terminal, vcs))
             .expect("daemon.toml");
         let config = Arc::new(ConfigStore::with_base(config_dir.clone()));
         let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
@@ -228,7 +231,7 @@ fn place_import(import: &OldStoreImport, state_dir: &std::path::Path, machine_id
 
 /// `daemon.toml`: `settings`, with the harness's host name unless it names
 /// one, then the dummy fleet's sections.
-fn daemon_toml(settings: &str, agent: &str, environment: &str, change_request: &str, terminal: &str) -> String {
+fn daemon_toml(settings: &str, agent: &str, environment: &str, change_request: &str, terminal: &str, vcs: &str) -> String {
     let table = |section: &str, lines: &str| -> toml::Table { lines.parse().unwrap_or_else(|error| panic!("{section}: {error}")) };
     let mut document = table("settings", settings);
     let host = document.get("host_name").and_then(toml::Value::as_str).unwrap_or("dummy-load").to_string();
@@ -241,6 +244,7 @@ fn daemon_toml(settings: &str, agent: &str, environment: &str, change_request: &
     dummy_fleet.insert("environment".into(), table("environment", environment).into());
     dummy_fleet.insert("change_request".into(), table("change_request", change_request).into());
     dummy_fleet.insert("terminal".into(), table("terminal", terminal).into());
+    dummy_fleet.insert("vcs".into(), table("vcs", vcs).into());
     document.insert("dummy_fleet".into(), dummy_fleet.into());
     toml::to_string(&document).expect("daemon.toml")
 }

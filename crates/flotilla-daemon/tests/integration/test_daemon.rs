@@ -389,3 +389,44 @@ async fn a_table_over_an_engine_kind_opens_and_streams_a_later_change() {
         }
     }
 }
+
+// d11 finding 1: a convoy with no change request lands by "no commits beyond base", and its
+// checkout is dirty, so teardown holds its removal for a person. After a daemon restart the
+// release inspects it again before the convoy's association is known again, and that unknown
+// is not false: the checkout stays, held, until a person rules or it is clean. Finding 5: the
+// convoy table shows the held convoy needs a person, before and after the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_dirty_landed_checkout_stays_held_across_a_restart() {
+    let fleet = TestDaemon::builder().vcs("dirty_rate = 1.0").settings("host_name = \"restart-proof\"\n").start().await;
+    let name = fleet.dispatch(CrewMix::LongRunner, DUMMY_FULFILMENT_KIND).await;
+    fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
+    let held = "landed, but its removal is held";
+    let needs_you = |set: &ResultSet| {
+        set.rows.as_convoys().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row.resource.name == name
+                    && row.surface_state == flotilla_protocol::result_set::SurfaceState::NeedsYou
+                    && row.message.as_deref().is_some_and(|message| message.contains(held))
+            })
+        })
+    };
+    fleet.wait_query(QueryId::Convoys { scope: None }, needs_you).await;
+    let checkout = fleet.wait_row("the convoy's checkout landed and dirty", "checkout_integration", "", |row| {
+        row.get("landed") == Some(&serde_json::Value::Bool(true)) && row.get("clean") == Some(&serde_json::Value::Bool(false))
+    });
+    let launch = text(&checkout.await, "resource.name").to_owned();
+
+    let fleet = fleet.restart().await;
+    fleet.wait_query(QueryId::Convoys { scope: None }, needs_you).await;
+    // The restarted daemon's release runs at its start; give it several controller passes.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let rows = fleet.rows("checkout", "").await;
+        let row = rows.iter().find(|row| text(row, "resource.name") == launch).expect("the checkout's launch");
+        assert_eq!(text(row, "state"), "Realised", "the held checkout is not released without a ruling: {row:?}");
+        let integration = fleet.rows("checkout_integration", "").await;
+        let row = integration.iter().find(|row| text(row, "resource.name") == launch).expect("the checkout's integration");
+        assert_eq!(row.get("landed"), Some(&serde_json::Value::Bool(true)), "its landing stays judged: {row:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}

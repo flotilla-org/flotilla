@@ -250,10 +250,13 @@ impl Inspection {
         }
     }
 
-    /// This inspection merged onto `held`: a landing the held inspection had evidence for latches,
-    /// so an inspection that cannot judge `landed` keeps the held evidence.
+    /// This inspection merged onto `held`: a held landing latches, so an inspection that cannot
+    /// judge `landed` keeps it. Unknown is not false. A landing a merged change request evidences
+    /// latches whatever the HEAD; one judged without a change request (no commits beyond its base)
+    /// latches at the HEAD it was judged at, since a later commit is work that has not landed.
     pub fn latched(mut self, held: &Inspection) -> Self {
-        if self.landed.is_none() && held.landed == Some(true) && held.landed_evidence.is_some() {
+        let same_head = self.head_revision.is_some() && self.head_revision == held.head_revision;
+        if self.landed.is_none() && held.landed == Some(true) && (held.landed_evidence.is_some() || same_head) {
             self.landed = Some(true);
             self.landed_details = held.landed_details.clone();
             if self.landed_evidence.is_none() {
@@ -406,9 +409,20 @@ mod tests {
     fn a_judged_landing_replaces_held_evidence() {
         let judged = Inspection { landed: Some(false), ..Inspection::default() };
         assert_eq!(judged.clone().latched(&landed()), judged);
-        // Without evidence, a held landing does not latch.
-        let held = Inspection { landed_evidence: None, ..landed() };
-        assert_eq!(Inspection::default().latched(&held), Inspection::default());
+    }
+
+    // Behaviour (d11 finding 1): a landing judged without a change request (no commits beyond
+    // base) latches while the HEAD it was judged at stands, so an inspection that cannot judge
+    // `landed` (convoy association unavailable after a restart) does not unlatch it; a moved or
+    // unread HEAD does not keep it.
+    #[test]
+    fn a_landing_without_evidence_latches_at_its_head() {
+        let held = Inspection { landed_evidence: None, change_request: None, head_revision: Some("abc".into()), ..landed() };
+        let at = |head: Option<&str>| Inspection { clean: Some(false), head_revision: head.map(str::to_owned), ..Inspection::default() };
+        let latched = at(Some("abc")).latched(&held);
+        assert_eq!((latched.landed, latched.clean, latched.landed_details), (Some(true), Some(false), vec!["merged".to_owned()]));
+        assert_eq!(at(Some("def")).latched(&held), at(Some("def")), "a later commit has not landed");
+        assert_eq!(at(None).latched(&held), at(None), "an unread HEAD keeps nothing");
     }
 
     // Behaviour: a VCS inspection's conditions become judgements (unknown is no judgement), its

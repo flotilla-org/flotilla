@@ -650,15 +650,32 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
     }
 
     /// Inspects launch `name` afresh and records it; the integration its removal is decided from.
-    /// A failed inspection is recorded as failing and judges nothing.
+    /// A failed inspection is recorded as failing and judges nothing afresh: a landing held before
+    /// stays landed, so its removal is the one that refuses dirty work (unknown is not false), and
+    /// anything else is archived before removal.
     async fn inspected(&self, name: &str, request: &CheckoutRequest, inputs: &CheckoutInputs) -> Option<Inspection> {
-        match self.record_inspection(name, request, inputs, false).await {
-            Ok(integration) => integration,
-            Err(error) => {
-                warn!(checkout = name, %error, "a released checkout could not be inspected; it is archived before removal");
+        let error = match self.record_inspection(name, request, inputs, false).await {
+            Ok(integration) => return integration,
+            Err(error) => error,
+        };
+        let records = Arc::clone(&self.records);
+        let launch = name.to_owned();
+        let held = tokio::task::spawn_blocking(carry(move || records.get(&launch, None)))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|held| held)
+            .unwrap_or_else(|error| {
+                warn!(checkout = name, %error, "a released checkout's held inspection could not be read");
                 None
-            }
+            })
+            .and_then(|record| record.integration)
+            .map(|integration| integration.inspection)
+            .filter(|held| held.landed == Some(true));
+        match held {
+            Some(_) => warn!(checkout = name, %error, "a released checkout could not be inspected; its held landing stands"),
+            None => warn!(checkout = name, %error, "a released checkout could not be inspected; it is archived before removal"),
         }
+        held
     }
 
     /// Inspects launch `name` afresh, reading its branch's remote ref when `remote`, and records
