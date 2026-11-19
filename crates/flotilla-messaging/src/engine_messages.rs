@@ -118,6 +118,15 @@ pub trait EngineMessages: Send + Sync {
     /// The messages to `seats` (old crew addresses) still waiting for delivery that a supervisor
     /// sent and no fleet role did, local or replicated, in admission order.
     async fn queued_briefs(&self, namespace: &str, seats: &[String]) -> Result<Vec<SentMessage>, flotilla_resources::ResourceError>;
+    /// The newest message delivered to `seat` (an old crew address) that a supervisor sent and no
+    /// fleet role did, delivered after `after` when given, local or replicated: an operator's
+    /// resume or a supervisor's guidance.
+    async fn latest_guidance(
+        &self,
+        namespace: &str,
+        seat: &str,
+        after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Option<SeatMessage>, flotilla_resources::ResourceError>;
     /// What the stall judge reads of crew seats' inboxes, local or replicated: for each of
     /// `receivers` (old crew addresses), its open messages, the last one admitted among those
     /// settled and the one delivered last and not dropped since; then each `named` (receiver,

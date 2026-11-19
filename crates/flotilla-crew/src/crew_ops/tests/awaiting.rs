@@ -124,6 +124,15 @@ impl EngineMessages for RecordingMessages {
         });
         Ok(briefs.map(|(seat, name, intent, at)| sent(&seat, &name, &intent, at)).collect())
     }
+    async fn latest_guidance(
+        &self,
+        _namespace: &str,
+        _seat: &str,
+        _after: Option<DateTime<Utc>>,
+    ) -> Result<Option<flotilla_messaging::SeatMessage>, ResourceError> {
+        // Nothing admitted here is ever delivered.
+        Ok(None)
+    }
     async fn seat_standings(
         &self,
         _namespace: &str,

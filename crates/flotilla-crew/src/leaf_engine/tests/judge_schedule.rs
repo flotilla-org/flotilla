@@ -77,6 +77,15 @@ impl EngineMessages for CountedMessages {
         self.count("queued_briefs");
         self.inner.queued_briefs(namespace, seats).await
     }
+    async fn latest_guidance(
+        &self,
+        namespace: &str,
+        seat: &str,
+        after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Option<SeatMessage>, ResourceError> {
+        self.count("latest_guidance");
+        self.inner.latest_guidance(namespace, seat, after).await
+    }
     async fn seat_standings(
         &self,
         namespace: &str,

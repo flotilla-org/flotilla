@@ -1375,6 +1375,14 @@ impl flotilla_messaging::EngineMessages for Turns {
     ) -> Result<Vec<flotilla_messaging::SentMessage>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
+    async fn latest_guidance(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Option<flotilla_messaging::SeatMessage>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
     async fn seat_standings(
         &self,
         _: &str,

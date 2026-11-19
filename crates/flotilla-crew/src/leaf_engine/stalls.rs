@@ -1906,13 +1906,15 @@ impl ReconcilerWake {
                 .and_then(|session| self.agent_view(tick, session))
                 .filter(|agent| matches!(agent.live_activity(), Some(AgentActivity::Idle | AgentActivity::Interrupted)))
                 .and_then(|agent| agent.reading.activity_since);
-            // A crew that declared a stall has answered its resumed turn: a seat reads Working on
-            // the engine until its supervision opens a stall record, so the declaration says so.
+            // A crew that declared a stall has answered its resumed turn, which its declaration
+            // says. The seat's phase cannot: the stall the judge notes of an idle seat while the
+            // grace holds reads the seat Stalled too, and the grace held only on the pass that
+            // noted it (GitHub run GH3-1).
             let resume_grace = status
                 .crew_work
                 .get(vessel)
                 .and_then(|crew| crew.get(role))
-                .filter(|work| work.phase == CrewWorkPhase::Working && declared.is_none())
+                .filter(|work| matches!(work.phase, CrewWorkPhase::Working | CrewWorkPhase::Stalled) && declared.is_none())
                 .and_then(|work| work.resumed_at.zip(work.resume_brief_id.as_deref()))
                 .is_some_and(|(resumed_at, brief_id)| {
                     // A missing or recreated session must not suppress

@@ -1408,9 +1408,10 @@ impl TurnHeads {
 
 impl ReconcilerWake {
     /// The turns seat `vessel`/`role` of `convoy` owes and has not answered, accepted after
-    /// `since` (its latest submission) when given. A turn is answered by a submission after it or
-    /// a push past the head it was about (`heads`), and one superseded before it was typed was
-    /// never put to the seat, which owes the turn that superseded it instead (GitHub run GH2-1).
+    /// `since` (its latest submission) when given. A turn is answered by a submission after it, a
+    /// push past the head it was about (`heads`) or guidance delivered to the seat after it (an
+    /// operator's resume, N3-4), and one superseded before it was typed was never put to the seat,
+    /// which owes the turn that superseded it instead (GitHub run GH2-1).
     ///
     /// The home's notes hold the turns delivered since it started. A turn delivered before is
     /// found from what is durable (GH2-2): its rule's turn at its change request's current state
@@ -1480,7 +1481,16 @@ impl ReconcilerWake {
             let accepted_at = read.get(&message)?.created;
             since.is_none_or(|since| accepted_at > since).then_some(OwedTurn { source, accepted_at, revision, message })
         });
-        Ok(noted.into_iter().chain(found).filter(|turn| !superseded(&turn.message)).collect())
+        let owed: Vec<_> = noted.into_iter().chain(found).filter(|turn| !superseded(&turn.message)).collect();
+        // An operator's resume or a supervisor's guidance delivered to the seat answers the turns
+        // owed before it: the operator is the authority (GitHub run N3-4). Only one delivered
+        // since the oldest owed turn can answer any.
+        let Some(oldest) = owed.iter().map(|turn| turn.accepted_at).min() else { return Ok(owed) };
+        let guidance = primitives.latest_guidance(namespace, &receiver, Some(oldest)).await.map_err(|error| error.to_string())?;
+        Ok(match guidance {
+            Some(guidance) => owed.into_iter().filter(|turn| turn.accepted_at > guidance.created).collect(),
+            None => owed,
+        })
     }
 }
 

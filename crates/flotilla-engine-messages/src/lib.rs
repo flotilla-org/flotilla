@@ -1912,6 +1912,42 @@ impl MessagePrimitives {
         Ok(briefs)
     }
 
+    /// The newest message delivered to `seat` (an old crew address) that a supervisor sent and no
+    /// fleet role did, delivered after `after` when given: an operator's resume or a supervisor's
+    /// guidance. Read down the inbox's delivered index, newest first, to the first such message or
+    /// the first delivered at or before `after`.
+    pub async fn latest_guidance(
+        &self,
+        namespace: &str,
+        seat: &str,
+        after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Option<flotilla_messaging::SeatMessage>, ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        let inbox = match roles.inbox(seat) {
+            Ok(inbox) => inbox,
+            Err(error) => {
+                tracing::debug!(%seat, %error, "a seat with no inbox holds no message");
+                return Ok(None);
+            }
+        };
+        let mut found = None;
+        self.walk(&MessageSpec::delivered_by_inbox(&inbox), true, |home, message| {
+            if after.is_some_and(|after| view::delivered_at(&message).is_none_or(|delivered| delivered <= after)) {
+                return false;
+            }
+            let spec = message.spec();
+            if spec.relation == Relation::Supervisor && roles.role_of(&spec.sender).is_none() {
+                found = Some((home, message));
+                return false;
+            }
+            true
+        })
+        .map_err(ResourceError::other)?;
+        let Some(row) = found else { return Ok(None) };
+        let created = self.created_of(std::slice::from_ref(&row))?;
+        Ok(created.into_iter().next().and_then(|created| standing(seat.to_owned(), &row.1, created)))
+    }
+
     /// Each of `inboxes`' open messages, the last one admitted among those settled and the one
     /// delivered last and not dropped since; then each `named` message by its exact identity,
     /// each held with its home.
@@ -2058,6 +2094,14 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     }
     async fn queued_briefs(&self, namespace: &str, seats: &[String]) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
         MessagePrimitives::queued_briefs(self, namespace, seats).await
+    }
+    async fn latest_guidance(
+        &self,
+        namespace: &str,
+        seat: &str,
+        after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Option<flotilla_messaging::SeatMessage>, ResourceError> {
+        MessagePrimitives::latest_guidance(self, namespace, seat, after).await
     }
     async fn seat_standings(
         &self,
