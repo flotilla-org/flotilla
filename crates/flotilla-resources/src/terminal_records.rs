@@ -494,9 +494,11 @@ impl TerminalObservations {
         self.changed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Tells the subscribers, then counts the change: a subscriber that reads the count and then
+    /// drains its receiver has received every change counted.
     fn noted(&self, name: &str) {
-        self.changed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = self.changes.send(name.to_owned());
+        self.changed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// What is observed of launch `name`, if anything.

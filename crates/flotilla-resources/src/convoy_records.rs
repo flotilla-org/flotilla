@@ -733,10 +733,12 @@ impl ConvoyMemory {
         self.changed.load(Ordering::SeqCst)
     }
 
+    /// Tells the subscribers, then counts the change: a subscriber that reads the count and then
+    /// drains its receiver has received every change counted.
     fn noted(&self, name: &str) {
-        self.changed.fetch_add(1, Ordering::SeqCst);
         // No follower is no reason to fail: one may subscribe later.
         drop(self.changes.send(name.to_owned()));
+        self.changed.fetch_add(1, Ordering::SeqCst);
     }
 
     /// The notes on launch `name`; empty when none are held.
