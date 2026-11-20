@@ -961,11 +961,13 @@ pub enum ConvoyPhase {
     Landed,
     Failed,
     Abandoned,
+    /// Ended, where how it ended is not held here.
+    Ended,
 }
 
 impl ConvoyPhase {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Landed | Self::Failed | Self::Abandoned)
+        matches!(self, Self::Landed | Self::Failed | Self::Abandoned | Self::Ended)
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -977,6 +979,7 @@ impl ConvoyPhase {
             Self::Landed => "landed",
             Self::Failed => "failed",
             Self::Abandoned => "abandoned",
+            Self::Ended => "ended",
         }
     }
 }
@@ -1819,7 +1822,7 @@ mod serde_category_tests {
         categories!(AwarenessPhase, Some("kind"), Convoy => AwarenessPhase::Convoy(ConvoyPhase::Pending), Work => AwarenessPhase::Work(WorkPhase::Pending), Session => AwarenessPhase::Session(SessionPhase::Starting), Issue => AwarenessPhase::Issue(IssueState::Open));
         categories!(SessionPhase, None, Starting => SessionPhase::Starting, Running => SessionPhase::Running, Stopped => SessionPhase::Stopped, Failed => SessionPhase::Failed);
         categories!(StandingRoleHold, None, BackingUnverified => StandingRoleHold::BackingUnverified, RestartLimit => StandingRoleHold::RestartLimit);
-        categories!(ConvoyPhase, None, Pending => ConvoyPhase::Pending, Active => ConvoyPhase::Active, Interrupted => ConvoyPhase::Interrupted, Landing => ConvoyPhase::Landing, Landed => ConvoyPhase::Landed, Failed => ConvoyPhase::Failed, Abandoned => ConvoyPhase::Abandoned);
+        categories!(ConvoyPhase, None, Pending => ConvoyPhase::Pending, Active => ConvoyPhase::Active, Interrupted => ConvoyPhase::Interrupted, Landing => ConvoyPhase::Landing, Landed => ConvoyPhase::Landed, Failed => ConvoyPhase::Failed, Abandoned => ConvoyPhase::Abandoned, Ended => ConvoyPhase::Ended);
         categories!(WorkPhase, None, Pending => WorkPhase::Pending, Ready => WorkPhase::Ready, Launching => WorkPhase::Launching, Running => WorkPhase::Running, Stalled => WorkPhase::Stalled, Interrupted => WorkPhase::Interrupted, Complete => WorkPhase::Complete, Failed => WorkPhase::Failed, Cancelled => WorkPhase::Cancelled, Abandoned => WorkPhase::Abandoned);
         categories!(SurfaceState, Some("state"), Working => SurfaceState::Working, Available => SurfaceState::Available, StalledHandled => SurfaceState::StalledHandled { rung: HandledRung::Nudge }, NeedsYou => SurfaceState::NeedsYou);
         categories!(HandledRung, None, Nudge => HandledRung::Nudge, Supervisor => HandledRung::Supervisor, Bosun => HandledRung::Bosun, Governor => HandledRung::Governor);

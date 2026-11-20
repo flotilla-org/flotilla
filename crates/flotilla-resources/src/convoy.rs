@@ -1742,11 +1742,14 @@ pub enum ConvoyPhase {
     // ADR 0047: remove Cancelled alias one fleet roll after #2917.
     #[serde(alias = "Cancelled")]
     Abandoned,
+    /// Ended, where how it ended is not held here: a retired launch restored without its end's
+    /// log entry.
+    Ended,
 }
 
 impl ConvoyPhase {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Landed | Self::Failed | Self::Abandoned)
+        matches!(self, Self::Landed | Self::Failed | Self::Abandoned | Self::Ended)
     }
 }
 

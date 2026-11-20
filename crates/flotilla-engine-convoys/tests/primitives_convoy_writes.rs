@@ -406,7 +406,10 @@ async fn a_delete_retires_a_convoy_nothing_holds() {
     assert_eq!(fixture.convoys.get("c").expect("held").label(), ConvoyLabel::Retired);
     assert_eq!(records.at("home-a").expect("listing").records.len(), 0, "a deleted convoy is not listed");
     let ended = records.get(&launch, None).expect("read").expect("a retired convoy reads by name");
-    assert_eq!(ended.ended.map(|(end, _)| end), Some(ConvoyEnd::Abandoned { reason: "deleted".into() }));
+    assert_eq!(
+        ended.ended.and_then(|ending| ending.held().map(|(end, _)| end.clone())),
+        Some(ConvoyEnd::Abandoned { reason: "deleted".into() })
+    );
     fixture.engine.delete(&convoy, "alice").await.expect("deleting a retired convoy again");
 }
 

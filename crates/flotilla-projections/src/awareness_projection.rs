@@ -333,6 +333,8 @@ fn convoy_state(phase: Option<ConvoyPhase>, initializing: bool) -> AwarenessStat
         ConvoyPhase::Landing => AwarenessState::Active,
         ConvoyPhase::Failed => AwarenessState::Failed,
         ConvoyPhase::Abandoned => AwarenessState::Cancelled,
+        // Ended, how not held here: neither done nor failed is known.
+        ConvoyPhase::Ended => AwarenessState::Idle,
     }
 }
 

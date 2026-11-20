@@ -388,6 +388,7 @@ mod live_query_tests {
             ConvoyPhase::Landed,
             ConvoyPhase::Failed,
             ConvoyPhase::Abandoned,
+            ConvoyPhase::Ended,
         ] {
             let name = match phase {
                 ConvoyPhase::Pending => "pending",
@@ -397,6 +398,7 @@ mod live_query_tests {
                 ConvoyPhase::Landed => "landed",
                 ConvoyPhase::Failed => "failed",
                 ConvoyPhase::Abandoned => "abandoned",
+                ConvoyPhase::Ended => "ended",
             };
             let created = convoys
                 .create(

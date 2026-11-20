@@ -42,7 +42,9 @@ use futures::{stream::BoxStream, FutureExt, StreamExt};
 use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     convoy::view::VesselReading,
-    convoy_records::{ConvoyChange, ConvoyJoins, ConvoyListing, ConvoyNotes, ConvoyRecord, ConvoyRecords, UnreadableLaunch, WorkFacts},
+    convoy_records::{
+        ConvoyChange, ConvoyJoins, ConvoyListing, ConvoyNotes, ConvoyRecord, ConvoyRecords, Ending, UnreadableLaunch, WorkFacts,
+    },
     engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal, UnloggedRead, WriteError},
     held_joins::{JoinChange, JoinChanges, JoinsReader},
     lifecycle_reads::{ChangeCursor, LifecycleReads, Told},
@@ -952,7 +954,7 @@ fn view_of(namespace: &str, here: &str, record: &ConvoyRecord, notes: Option<&Co
     let provenance = if record.home == here {
         ResourceProvenance::Local
     } else {
-        let synced = record.ended.as_ref().map_or(record.admitted_at, |(_, at)| *at);
+        let synced = record.ended.as_ref().and_then(Ending::held).map_or(record.admitted_at, |(_, at)| at);
         ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: synced }
     };
     ReadResourceObject { object, provenance }
