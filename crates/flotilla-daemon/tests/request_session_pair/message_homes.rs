@@ -27,12 +27,9 @@ const NS: &str = "flotilla";
 /// The engine path at one daemon: its decided store homed at its node id.
 pub(super) async fn engine(daemon: &Arc<InProcessDaemon>) -> (Arc<Service>, Arc<MessagePrimitives>) {
     seed_fleet(&daemon.resource_backend()).await;
-    // The daemon's Message path, opened over its decided store as its runtime opens it.
-    let service = daemon.decided_store().expect("decided store");
-    let primitives = match daemon.message_primitives() {
-        Some(primitives) => primitives,
-        None => daemon.open_message_primitives().expect("message path"),
-    };
+    // The daemon's Message path, opened over its decided store with the daemon.
+    let service = daemon.decided_store();
+    let primitives = daemon.message_primitives();
     (service, primitives)
 }
 
@@ -151,12 +148,15 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         }
         _ => Some(message),
     });
-    let mesh = flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_filter(
-        vec![super::message_home_daemon("home-a").await, super::message_home_daemon("home-b").await],
-        drop_change_streams,
-    )
-    .await
-    .expect("two-home router");
+    let (home_a_daemon, home_b_daemon) = (super::message_home_daemon("home-a").await, super::message_home_daemon("home-b").await);
+    // A reads a record it misses at B, its home, served from B's store as B's record socket would
+    // serve it. Installed before the mesh's peer runtime, which would install A's own.
+    let reads = Arc::new(StoreReads { home: home_b_daemon.decided_store(), served: Default::default() });
+    home_a_daemon.message_primitives().install_home_reads(reads.clone()).expect("home reads");
+    let mesh =
+        flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_filter(vec![home_a_daemon, home_b_daemon], drop_change_streams)
+            .await
+            .expect("two-home router");
     let (a, b) = (&mesh.hosts[0], &mesh.hosts[1]);
     // Each daemon reads the engine's environments, as its runtime installs them.
     engine_environments(a);
@@ -214,8 +214,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     assert!(matches!(homed(&engine_b, &receiver, &request).await.expect("sent").1.state(), MessageState::Awaiting { .. }));
     // A's replica has not caught up: the reply's admission at A reads the
     // original at B, its home, marked remote with its age.
-    let reads = Arc::new(StoreReads { home: Arc::clone(&store_b), served: Default::default() });
-    engine_a.install_home_reads(reads.clone()).expect("home reads");
+    reads.served.lock().expect("served").clear();
     let reply = flotilla_resources::message_record_name("system:turn-rules", &receiver, "reply@1");
     let mut answer = flotilla_engine_messages_testkit::intent(&receiver, "system:turn-rules", MessageRelation::Peer, "reviewed");
     answer.in_reply_to = Some(request.clone());

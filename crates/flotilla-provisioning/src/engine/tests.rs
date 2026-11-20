@@ -478,7 +478,7 @@ fn every_old_phase_imports_and_rehearses() {
     ] {
         let mut obj = worktree(Some("convoy-a"));
         obj.status = Some(CheckoutStatus { phase, path: Some("/work/feature".into()), ..CheckoutStatus::default() });
-        let imported = super::import::import_checkout(&obj, HOME, &imported_convoy, &BTreeMap::new()).expect("imports").0;
+        let imported = super::import::import_checkout(&obj, HOME, &imported_convoy, &BTreeMap::new(), &BTreeMap::new()).expect("imports").0;
         if phase == CheckoutPhase::Gone {
             assert_eq!(
                 imported.resource.state(),
@@ -501,7 +501,7 @@ fn the_rehearsal_lists_records_with_no_mapping() {
     let mut report = ImportReport::default();
     let mut orphan = worktree(Some("convoy-gone"));
     orphan.metadata.name = "orphan-a".into();
-    report.record(&import_checkout(&orphan, HOME, &imported_convoy, &BTreeMap::new()).map(|(imported, _)| imported));
+    report.record(&import_checkout(&orphan, HOME, &imported_convoy, &BTreeMap::new(), &BTreeMap::new()).map(|(imported, _)| imported));
     let mut nameless = environment_object(true);
     nameless.status = Some(EnvironmentStatus { phase: EnvironmentPhase::Ready, ..Default::default() });
     report.record(&import_environment(&nameless, HOME, &Default::default(), &|_| Ok(HOME.to_owned())));

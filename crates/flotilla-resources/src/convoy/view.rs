@@ -32,6 +32,8 @@ pub enum Ended {
     Failed,
     /// Abandoned by an operator.
     Abandoned,
+    /// Retired, so ended; how it ended is not held here.
+    NotHeld,
 }
 
 /// What a work's Vessel says, by work name. A work with no entry has never had a Vessel.
@@ -109,6 +111,8 @@ pub fn derive(facts: &ConvoyFacts<'_>) -> ConvoyReading {
             .map(|(name, phase)| {
                 let phase = match (ended, phase) {
                     (_, phase) if phase.is_terminal() => phase,
+                    // How it ended is not held here: an unfinished work keeps what its Vessel says.
+                    (Ended::NotHeld, phase) => phase,
                     (Ended::Abandoned, _) => WorkPhase::Abandoned,
                     (Ended::Failed | Ended::Delivered, _) => WorkPhase::Cancelled,
                 };
@@ -220,6 +224,7 @@ fn convoy_phase(ended: Option<Ended>, work: &BTreeMap<String, WorkPhase>, (promi
         Some(Ended::Delivered) => return ConvoyPhase::Landed,
         Some(Ended::Failed) => return ConvoyPhase::Failed,
         Some(Ended::Abandoned) => return ConvoyPhase::Abandoned,
+        Some(Ended::NotHeld) => return ConvoyPhase::Ended,
         None => {}
     }
     if work.values().any(|phase| *phase == WorkPhase::Failed) {

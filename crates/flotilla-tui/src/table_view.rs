@@ -1216,7 +1216,7 @@ fn convoy_phase(row: &ConvoySummary) -> CellValue {
         Some(ConvoyPhase::Landed) => CellTone::Success,
         Some(ConvoyPhase::Landing) => CellTone::Plain,
         Some(ConvoyPhase::Failed) => CellTone::Error,
-        Some(ConvoyPhase::Abandoned) => CellTone::Muted,
+        Some(ConvoyPhase::Abandoned | ConvoyPhase::Ended) => CellTone::Muted,
     };
     let label = match (row.phase, row.disposition.as_deref()) {
         (Some(ConvoyPhase::Landed), Some(disposition)) => format!("landed · {disposition}"),

@@ -1,6 +1,6 @@
-//! AccessDelivery's reads and writes through the store's typed paths: one contract, run against
-//! the old store and against the engine's records installed behind `[primitives]`, so the access
-//! layer's writers and readers keep their behaviour on either.
+//! AccessDelivery's reads and writes through the store's typed paths, served by the engine's
+//! records, the daemon's only path for the kind. The access layer's writers and readers hold to
+//! one contract; it also runs against the plain in-memory store that tests stand in with.
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 

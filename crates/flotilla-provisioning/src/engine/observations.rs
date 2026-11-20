@@ -1,4 +1,4 @@
-//! ChangeRequest and Issue on the engine, behind `[primitives]`.
+//! ChangeRequest and Issue on the engine, their only path.
 //!
 //! [`EngineObservations`] is the [`KindRecords`] port of both kinds over the decided store. The
 //! source's observer writes its record at its own home, only when an observed value changes; every

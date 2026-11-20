@@ -1,7 +1,7 @@
-//! Repository's reads and writes through the store's typed paths (#3824 layer 3a): one contract,
-//! run against the old store and against the engine's records installed behind `[primitives]`,
-//! so Repository's writers (ensure, project ops, the reconciler's status) and readers keep their
-//! behaviour on either.
+//! Repository's reads and writes through the store's typed paths (#3824 layer 3a), served by the
+//! engine's records, the daemon's only path for the kind. Repository's writers (ensure, project
+//! ops, the reconciler's status) and readers hold to one contract; it also runs against the plain
+//! in-memory store that tests stand in with.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

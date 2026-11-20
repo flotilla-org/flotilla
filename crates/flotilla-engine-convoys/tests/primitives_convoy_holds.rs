@@ -20,6 +20,7 @@ use flotilla_engine_messages::{
 };
 use flotilla_engine_messages_testkit::{designate_fleet, intent, EngineMessagesHome};
 use flotilla_engine_store::{watch::EngineWatch, StoreLog};
+use flotilla_messaging::IntentExpectation;
 use flotilla_protocol::PrincipalRef;
 use flotilla_provisioning::{
     engine::{
@@ -43,8 +44,8 @@ use flotilla_resources::{
         admission::AdmissionDocument,
         engine::{launch_address, seat_address},
     },
-    convoy_records::ConvoyEnd,
     convoy_records::ConvoyRecords,
+    convoy_records::{ConvoyEnd, Ending},
     engine_records::KindRecords,
     standing_roles::{RunningValues, StandingRoles},
     vessel_resource_name,
@@ -460,7 +461,7 @@ fn an_ended_convoy_retires_once_its_holds_release() {
     // a listing leaves it out.
     let retired = records.get(&fixture.launch, None).expect("read").expect("a retired convoy reads by name");
     let abandoned_at = Timestamp(4_000_000).to_datetime().expect("a time");
-    assert_eq!(retired.ended, Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, abandoned_at)));
+    assert_eq!(retired.ended, Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, abandoned_at)));
     assert!(retired.retired);
     assert_eq!(records.at(HOME).expect("listing").records.len(), 0);
 }
@@ -595,9 +596,10 @@ async fn an_abandoned_convoys_submitted_pr_holds_it_until_the_pr_closes_or_merge
     }
 }
 
-// Behaviour (#3108 ruling 2): a convoy's end withdraws every message still pending to its own seats,
-// on its launch's authority, so they stop holding it; a message to anyone else stays pending. A
-// message to a seat admitted after the end is admitted, and the next sweep withdraws it.
+// Behaviour (#3108 ruling 2): a convoy's end withdraws every message still open to its own seats,
+// pending or handed and awaiting a reply the ended seat cannot give, on its launch's authority, so
+// they stop holding it; a message to anyone else stays pending. A message to a seat admitted after
+// the end is admitted, and the next sweep withdraws it.
 #[tokio::test]
 async fn a_convoys_end_withdraws_the_messages_pending_to_its_seats() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -618,14 +620,20 @@ async fn a_convoys_end_withdraws_the_messages_pending_to_its_seats() {
     let operator_inbox = primitives.inbox_for(NAMESPACE, "fleet/operator").await.expect("inbox");
     admit("m-seat", "fleet/operator".into(), seat.clone()).await;
     admit("m-operator", seat.clone(), "fleet/operator".into()).await;
+    let mut asks = intent("fleet/operator", &seat, MessageRelation::Supervisor, "answer me");
+    asks.expectation = IntentExpectation::Reply;
+    primitives.admit("m-handed", &asks).await.expect("admitted");
+    messages.deliver_turn(&seat, "m-handed", "session-coder").await;
+    assert!(matches!(state(fixture.seat(), "m-handed").await, MessageState::Awaiting { .. }));
     let mut open = OpenMessages::default();
     assert_eq!(sweep(primitives, &mut open).await, 0, "an open convoy's seat keeps its messages");
 
     fixture.abandon();
-    assert_eq!(sweep(primitives, &mut open).await, 1);
+    assert_eq!(sweep(primitives, &mut open).await, 2);
     let ended = launch_address(&project(), &fixture.launch).expect("launch address");
     let withdrawn = DropReason::Withdrawn { by: ended.clone(), authority: ended };
     assert!(matches!(state(fixture.seat(), "m-seat").await, MessageState::Dropped { reason, .. } if reason == withdrawn));
+    assert!(matches!(state(fixture.seat(), "m-handed").await, MessageState::Dropped { reason, .. } if reason == withdrawn));
     assert_eq!(state(operator_inbox, "m-operator").await, MessageState::Pending, "a message to a person is left");
     assert!(!fixture.holds().iter().any(|hold| hold.starts_with("message:")), "{:?}", fixture.holds());
 

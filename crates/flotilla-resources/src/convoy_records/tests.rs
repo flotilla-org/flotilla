@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_protocol::PrincipalRef;
 
-use super::{ConvoyEnd, ConvoyJoins, ConvoyNotes, ConvoyRecord, CrewNotes, SeatRecord, WorkFacts};
+use super::{ConvoyEnd, ConvoyJoins, ConvoyNotes, ConvoyRecord, CrewNotes, Ending, SeatRecord, WorkFacts};
 use crate::{
     convoy::{
         admission::AdmissionDocument,
@@ -195,12 +195,12 @@ fn a_launch_reads_its_verdicts_and_how_it_ended() {
     assert_eq!(status.work["work"].phase, WorkPhase::Failed);
     assert_eq!(status.phase, ConvoyPhase::Failed);
 
-    failed.ended = Some((ConvoyEnd::Failed { reason: "coder failed".into() }, at(200)));
+    failed.ended = Some(Ending::Held(ConvoyEnd::Failed { reason: "coder failed".into() }, at(200)));
     let status = failed.read_view("flotilla", ConvoyJoins { works: &ready(), working: &none, notes: None }).status.expect("status");
     assert_eq!((status.phase, status.message.as_deref(), status.finished_at), (ConvoyPhase::Failed, Some("coder failed"), Some(at(200))));
 
     let mut delivered = record(PromiseState::Kept);
-    delivered.ended = Some((ConvoyEnd::Delivered { disposition: "landed".into() }, at(300)));
+    delivered.ended = Some(Ending::Held(ConvoyEnd::Delivered { disposition: "landed".into() }, at(300)));
     let status = delivered.read_view("flotilla", ConvoyJoins { works: &ready(), working: &none, notes: None }).status.expect("status");
     assert_eq!((status.phase, status.disposition.as_deref(), status.finished_at), (ConvoyPhase::Landed, Some("landed"), Some(at(300))));
     assert_eq!(status.work["work"].phase, WorkPhase::Complete);
@@ -298,7 +298,7 @@ fn a_seat_the_end_overtook_reads_the_end() {
     let none = BTreeSet::new();
     // Delivered: the reviewer owed no promise and was never given its task.
     let mut delivered = record(PromiseState::Kept);
-    delivered.ended = Some((ConvoyEnd::Delivered { disposition: "merged".into() }, at(300)));
+    delivered.ended = Some(Ending::Held(ConvoyEnd::Delivered { disposition: "merged".into() }, at(300)));
     let status = delivered.read_view("flotilla", ConvoyJoins { works: &ready(), working: &none, notes: None }).status.expect("status");
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
     assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Ended);
@@ -306,7 +306,7 @@ fn a_seat_the_end_overtook_reads_the_end() {
 
     // Abandoned while the coder was working: it did not fail.
     let mut abandoned = record(PromiseState::Open);
-    abandoned.ended = Some((ConvoyEnd::Abandoned { reason: "operator stopped it".into() }, at(300)));
+    abandoned.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "operator stopped it".into() }, at(300)));
     let working = BTreeSet::from([seat("work", "coder")]);
     let status = abandoned.read_view("flotilla", ConvoyJoins { works: &ready(), working: &working, notes: None }).status.expect("status");
     assert_eq!(status.phase, ConvoyPhase::Abandoned);
@@ -319,7 +319,7 @@ fn a_seat_the_end_overtook_reads_the_end() {
         "work".into(),
         BTreeMap::from([("coder".into(), SeatRecord { failed: Some("it looped".into()), ..SeatRecord::default() })]),
     )]);
-    failed.ended = Some((ConvoyEnd::Failed { reason: "coder failed".into() }, at(200)));
+    failed.ended = Some(Ending::Held(ConvoyEnd::Failed { reason: "coder failed".into() }, at(200)));
     let status = failed.read_view("flotilla", ConvoyJoins { works: &ready(), working: &none, notes: None }).status.expect("status");
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Failed);
     assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("it looped"));

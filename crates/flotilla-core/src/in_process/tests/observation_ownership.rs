@@ -112,11 +112,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
                 if Arc::ptr_eq(source, target) {
                     continue;
                 }
-                flotilla_provisioning_testkit::replicate_home(
-                    &source.decided_store().unwrap(),
-                    source.node_id().as_str(),
-                    &target.decided_store().unwrap(),
-                );
+                flotilla_provisioning_testkit::replicate_home(&source.decided_store(), source.node_id().as_str(), &target.decided_store());
             }
         }
     }

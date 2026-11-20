@@ -356,18 +356,8 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
     };
     // The adapter's screen reading is the agent's activity, recorded on the AgentSession the
     // session's launch names; the pool's screen motion is not.
-    // The primitives share the daemon's decided store and home, where its Convoy path is.
-    let service = daemon.decided_store().unwrap();
-    let primitives = Arc::new(
-        flotilla_engine_messages::MessagePrimitives::open(
-            daemon.node_id().as_str(),
-            Arc::clone(&service),
-            daemon.resource_backend(),
-            Arc::new(flotilla_resources::SystemClock),
-        )
-        .unwrap(),
-    );
-    daemon.install_message_primitives(Arc::clone(&primitives)).unwrap();
+    let service = daemon.decided_store();
+    let primitives = daemon.message_primitives();
     let record = "codex-crew#1";
     let agent_activity =
         || primitives.sessions().get(record).and_then(|session| session.state().observation()).map(|observation| observation.activity);

@@ -278,7 +278,7 @@ pub fn convoy_badge(phase: Option<ConvoyPhase>, initializing: bool) -> Badge {
         ConvoyPhase::Landed => Badge { state: BadgeState::Done, attention: false },
         ConvoyPhase::Landing => Badge { state: BadgeState::Active, attention: false },
         ConvoyPhase::Failed => Badge { state: BadgeState::Failed, attention: true },
-        ConvoyPhase::Abandoned => Badge { state: BadgeState::Idle, attention: false },
+        ConvoyPhase::Abandoned | ConvoyPhase::Ended => Badge { state: BadgeState::Idle, attention: false },
     }
 }
 

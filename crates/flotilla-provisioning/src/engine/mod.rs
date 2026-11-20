@@ -1,5 +1,5 @@
-//! The engine's provisioning kinds, behind `[primitives]`: each kind's records, lifecycle
-//! homes, controller and actuator, and the import of old records into them (#3629).
+//! The engine's provisioning kinds, their only path: each kind's records, lifecycle homes,
+//! controller and actuator, and the import of old records into them (#3629).
 //!
 //! In progress, suspect and next attempt are judgements, never stored.
 
@@ -79,7 +79,7 @@ pub(crate) fn commit_mark(service: &flotilla_schema_sqlite::stream::Service, cod
     CommitMark::new(set, setter)
 }
 
-/// The provisioning kinds' engine homes at this home, behind `[primitives]`.
+/// The provisioning kinds' engine homes at this home.
 #[derive(Clone)]
 pub struct ProvisioningLifecycles {
     pub environments: Arc<dyn Lifecycles<EnvironmentKind>>,
@@ -158,8 +158,7 @@ impl<K: LifecycleKind> From<WriteError<Lifecycle<K>>> for EngineError {
     }
 }
 
-/// The engine's resources of one lifecycle kind at this home: the single writer behind
-/// `[primitives]`.
+/// The engine's resources of one lifecycle kind at this home: their single writer.
 pub trait Lifecycles<K: LifecycleKind>: Send + Sync {
     /// The home the resources are homed at, and that their references to this home's resources name.
     fn home(&self) -> &str;

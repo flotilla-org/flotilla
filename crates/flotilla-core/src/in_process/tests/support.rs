@@ -454,7 +454,7 @@ impl HostsAt<'_> {
     fn service(self) -> Arc<flotilla_schema_sqlite::stream::Service> {
         match self {
             Self::Store(backend) => Arc::clone(&backend.service),
-            Self::Daemon(daemon) => daemon.decided_store().expect("decided store"),
+            Self::Daemon(daemon) => daemon.decided_store(),
         }
     }
 
@@ -544,7 +544,7 @@ static TEST_ENGINES: std::sync::LazyLock<std::sync::Mutex<InstalledEngines>> = s
 /// and the same engine after, as a composed daemon has one. Its readers and watchers follow the
 /// store when a runtime is running, as the runtime's do.
 pub(in crate::in_process) fn test_engine(daemon: &InProcessDaemon) -> TestEngine {
-    let service = daemon.decided_store().expect("decided store");
+    let service = daemon.decided_store();
     let mut engines = TEST_ENGINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     engines.retain(|(store, _)| store.strong_count() > 0);
     if let Some((_, engine)) = engines.iter().find(|(store, _)| store.as_ptr() == Arc::as_ptr(&service)) {
@@ -763,7 +763,7 @@ pub(super) async fn stall_test_daemon_with_clock(clock: Arc<dyn flotilla_resourc
 /// The daemon's AgentSessions, where its harness hooks and screen reads record a crew's activity
 /// beside the TerminalSession's attention; stall judgement reads them (#3108).
 pub(super) fn agent_sessions(daemon: &InProcessDaemon) -> Arc<flotilla_engine_messages::Sessions> {
-    let service = daemon.decided_store().expect("decided store");
+    let service = daemon.decided_store();
     let primitives = flotilla_engine_messages::MessagePrimitives::open(
         daemon.node_id().as_str(),
         service,
@@ -912,15 +912,11 @@ impl IssueProvider for SuspendedBoardProvider {
 // #2842: realistic Project status and 400 serving convoys must not turn a
 // board read into per-issue forge calls or wait on an unfinished bulk fetch.
 
-/// `daemon`'s Message path over its decided store, installed as its runtime installs it: opened
-/// on first use, the same path after.
+/// `daemon`'s Message path over its decided store, opened with the daemon.
 pub(in crate::in_process) fn install_engine_messages(
     daemon: &crate::in_process::InProcessDaemon,
 ) -> Arc<flotilla_engine_messages::MessagePrimitives> {
-    match daemon.message_primitives() {
-        Some(primitives) => primitives,
-        None => daemon.open_message_primitives().expect("message path"),
-    }
+    daemon.message_primitives()
 }
 
 /// `daemon`'s Messages in `namespace` as the crew and the crew Message reads see them.

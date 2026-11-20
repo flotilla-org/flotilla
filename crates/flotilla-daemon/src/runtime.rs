@@ -175,8 +175,8 @@ impl DaemonRuntime {
         phase("set_provisioning_namespace", daemon.set_provisioning_namespace(options.namespace.clone())).await;
         let aggregator_projection_state = phase("aggregator_projection_state", daemon.aggregator_projection_state()).await;
         let daemon_config = config.load_daemon_config()?;
-        // ADR 0064 (#3108): Message and the provisioning lifecycles run on the decided store.
-        result_phase("open_message_primitives", open_message_primitives(&daemon)).await?;
+        // ADR 0064 (#3108): the provisioning lifecycles run on the decided store, beside the
+        // Message path the daemon opened over it.
         let (provisioning, lifecycle_followers) = open_provisioning_lifecycles(&daemon).await?;
         daemon.require_lifecycle_reads_installed()?;
         // The Convoy views read every launch once, here, before any request reads them.
@@ -857,7 +857,7 @@ fn spawn_controller_loops(
             let discovered = state.daemon.discovered_checkouts();
             let forge_default_branch_resolver = forge_default_branch_resolver.clone();
             // A repository's clones wake it as their launches change.
-            let decided = state.daemon.decided_store().ok();
+            let decided = state.daemon.decided_store();
             move |_: ResourceBackend, _: String| {
                 let forge_default_branch_resolver = forge_default_branch_resolver.clone();
                 let mut reconciler = RepositoryReconciler::new(discovered.clone(), lifecycle_reads.clone());
@@ -898,11 +898,10 @@ fn spawn_controller_loops(
                 secondaries.push(daemon.convoy_wake_watch());
                 secondaries.push(Box::new(flotilla_crew::convoy::EngineConvoyWake { engine: daemon.convoy_engine_path() }));
                 // A convoy's checkouts are the engine's: their changes wake the convoy holding them.
-                if let Ok(service) = daemon.decided_store() {
-                    secondaries.push(Box::new(flotilla_provisioning::engine::checkouts::CheckoutConvoyWake::new(Arc::clone(&service))));
-                    // A convoy reads its vessels' phases from the engine, so their records wake it.
-                    secondaries.push(Box::new(flotilla_provisioning::engine::vessel::VesselConvoyWake::new(service)));
-                }
+                let service = daemon.decided_store();
+                secondaries.push(Box::new(flotilla_provisioning::engine::checkouts::CheckoutConvoyWake::new(Arc::clone(&service))));
+                // A convoy reads its vessels' phases from the engine, so their records wake it.
+                secondaries.push(Box::new(flotilla_provisioning::engine::vessel::VesselConvoyWake::new(service)));
                 (
                     secondaries,
                     ConvoyReconciler::new(daemon.lifecycle_reads())
@@ -947,17 +946,16 @@ fn spawn_controller_loops(
         })));
     }
     controllers.extend(spawn_image_build_controller(&state, provisioning));
-    // Message delivery is the engine path's adapter (#3317, #3108); the runtime opens that path at
-    // startup, before any controller runs.
-    match state.daemon.message_primitives() {
-        Some(primitives) => {
-            let delivery =
-                self::primitives::MessageDelivery::new(Arc::clone(&state), primitives, namespace_string.clone(), runtime_health.clone());
-            let metrics = state.controller_metrics.for_kind("Message");
-            controllers.push(tokio::spawn(attributed(Arc::clone(&metrics.reads), delivery.run(metrics))));
-        }
-        None => tracing::warn!(namespace = %namespace_string, "the Message path is not open; nothing delivers messages"),
-    }
+    // Message delivery is the engine path's adapter (#3317, #3108), over the path the daemon
+    // opened with its decided store.
+    let delivery = self::primitives::MessageDelivery::new(
+        Arc::clone(&state),
+        state.daemon.message_primitives(),
+        namespace_string.clone(),
+        runtime_health.clone(),
+    );
+    let metrics = state.controller_metrics.for_kind("Message");
+    controllers.push(tokio::spawn(attributed(Arc::clone(&metrics.reads), delivery.run(metrics))));
     // #3907, #3929: bindings per convoy on its home, provisions per place.
     controllers.push(controller!(Convoy, "AccountBinding", {
         let daemon = Arc::clone(&state.daemon);
@@ -1008,7 +1006,7 @@ pub(crate) fn decided_diagrams() -> Result<std::collections::BTreeMap<String, St
 
 #[cfg(test)]
 mod decided_kinds_tests {
-    // Behaviour (#3629 layers 2 and 6, #3824 layer 1): behind `[primitives]` the decided store
+    // Behaviour (#3629 layers 2 and 6, #3824 layer 1): the decided store
     // holds the provisioning lifecycle kinds, the crew kinds and the account kinds beside Message
     // and AgentSession, and every kind with a machine has its diagram for the table views.
     #[test]
@@ -1040,27 +1038,14 @@ pub fn engine_opener(config: &ConfigStore) -> flotilla_core::in_process::EngineO
     )
 }
 
-/// Opens the Message path over the decided store composed with the daemon (#3317). Installed
-/// before peer tasks start, so every peer's log is followed from the first connection.
-pub(crate) async fn open_message_primitives(daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
-    result_phase("restore_message_primitives", async {
-        let daemon = Arc::clone(daemon);
-        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || daemon.open_message_primitives()))
-            .await
-            .map_err(|error| error.to_string())?
-    })
-    .await
-    .map(|_| ())
-}
-
 /// The archive shipper over the decided store (#3939), uploading to every configured fleet blob
-/// store. None without `[primitives]`, whose store it archives, or without a store to ship to.
+/// store. None without a store to ship to.
 fn archive_shipper(
     daemon: &Arc<InProcessDaemon>,
     stores: &[flotilla_config::BlobStoreConfig],
     health: &RuntimeHealth,
 ) -> Result<Option<(archive::ArchiveShipper, Arc<flotilla_schema_sqlite::stream::Service>)>, String> {
-    let Ok(decided) = daemon.decided_store() else { return Ok(None) };
+    let decided = daemon.decided_store();
     if stores.is_empty() {
         info!("no [[blob_stores]] configured: ended engine resources stay local");
         return Ok(None);
@@ -1097,13 +1082,7 @@ fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>, engine: &Pr
             }
         }
     });
-    let service = match state.daemon.decided_store() {
-        Ok(service) => service,
-        Err(error) => {
-            error!(%error, "the Environment controller has no decided store; environments will not launch");
-            return None;
-        }
-    };
+    let service = state.daemon.decided_store();
     let home = service.home().to_owned();
     let actuator = EnvironmentActuator::new(
         Arc::new(DockerControllerRuntime { state: Arc::clone(state) }),
@@ -1126,13 +1105,7 @@ fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>, engine: &Pr
 /// host's probe (`remotes`) to reach it again.
 fn spawn_clone_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{clone_actuator::CloneActuator, controller::Controller, reads::StoreReads};
-    let service = match state.daemon.decided_store() {
-        Ok(service) => service,
-        Err(error) => {
-            error!(%error, "the Clone controller has no decided store; clones will not launch");
-            return None;
-        }
-    };
+    let service = state.daemon.decided_store();
     let home = service.home().to_owned();
     let actuator = CloneActuator::new(
         Arc::new(RoutingCloneRuntime { state: Arc::clone(state) }),
@@ -1168,13 +1141,7 @@ fn spawn_image_build_controller(state: &Arc<ControllerRuntimeState>, engine: &Pr
         }
         return Vec::new();
     };
-    let service = match state.daemon.decided_store() {
-        Ok(service) => service,
-        Err(error) => {
-            error!(%error, "the ImageBuild controller has no decided store; image builds will not run");
-            return Vec::new();
-        }
-    };
+    let service = state.daemon.decided_store();
     let blobs: Arc<dyn crate::blob_store::BlobStore> = match state.blob_store.clone() {
         Some(blobs) => blobs,
         None => Arc::new(crate::blob_store::LocalBlobStore::new(state.config.state_dir().as_path())),
@@ -1226,13 +1193,7 @@ fn spawn_terminal_controller(
         reads::StoreReads,
         terminal_actuator::{TerminalActuator, TerminalProbe, TERMINAL_PROBE_EVERY},
     };
-    let service = match state.daemon.decided_store() {
-        Ok(service) => service,
-        Err(error) => {
-            error!(%error, "the TerminalSession controller has no decided store; terminal sessions will not launch");
-            return None;
-        }
-    };
+    let service = state.daemon.decided_store();
     let home = service.home().to_owned();
     let provider = Arc::new(TerminalControllerRuntime { state: Arc::clone(state) });
     let records = Arc::clone(&engine.terminal_records) as Arc<dyn flotilla_resources::terminal_records::TerminalRecords>;
@@ -1278,13 +1239,7 @@ fn spawn_checkout_controller(
 ) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{checkout_actuator::CheckoutActuator, controller::Controller, reads::StoreReads};
     let rechecks = state.checkout_recheck_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
-    let service = match state.daemon.decided_store() {
-        Ok(service) => service,
-        Err(error) => {
-            error!(%error, "the Checkout controller has no decided store; checkouts will not launch");
-            return None;
-        }
-    };
+    let service = state.daemon.decided_store();
     let home = service.home().to_owned();
     let routing = checkout_routing(state);
     let actuator = CheckoutActuator::new(
@@ -1308,17 +1263,13 @@ fn spawn_checkout_controller(
     let actuator = Arc::new(actuator.with_holds(Arc::new(holds)));
     // This host's checkout inspector answers gates' inspection requests through the same
     // actuator, so an inspection is recorded as the controller records it.
-    match state.daemon.message_primitives() {
-        Some(primitives) => {
-            let inspector = Arc::new(checkouts::CheckoutInspector { inspection: Arc::clone(&actuator) as _ });
-            let inspection = role_consumer::serve_role(Arc::clone(&primitives), inspector);
-            tasks.push(tokio::spawn(attributed(caller("checkout inspector"), inspection)));
-            // Branch validation asks this host's forge observer to look its branch up.
-            let observer = Arc::new(checkouts::ForgeObserver { daemon: Arc::clone(&state.daemon) });
-            tasks.push(tokio::spawn(attributed(caller("forge observer"), role_consumer::serve_role(primitives, observer))));
-        }
-        None => error!("the checkout inspector and forge observer have no Message path; requests to them here go unanswered"),
-    }
+    let primitives = state.daemon.message_primitives();
+    let inspector = Arc::new(checkouts::CheckoutInspector { inspection: Arc::clone(&actuator) as _ });
+    let inspection = role_consumer::serve_role(Arc::clone(&primitives), inspector);
+    tasks.push(tokio::spawn(attributed(caller("checkout inspector"), inspection)));
+    // Branch validation asks this host's forge observer to look its branch up.
+    let observer = Arc::new(checkouts::ForgeObserver { daemon: Arc::clone(&state.daemon) });
+    tasks.push(tokio::spawn(attributed(caller("forge observer"), role_consumer::serve_role(primitives, observer))));
     tasks.push(tokio::spawn(attributed(caller("checkout rechecks"), checkouts::recheck_on_discovered_refresh(Arc::clone(state)))));
     match Controller::start(Arc::clone(&engine.checkouts), actuator, state.daemon.clock_for_scenarios(), service) {
         Ok(controller) => Some(tokio::spawn(counted(state, "engine Checkout", async move {
@@ -1357,13 +1308,7 @@ fn spawn_vessel_controller(
 ) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{controller::Controller, vessel_actuator::VesselActuator};
     let rechecks = state.vessel_recheck_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
-    let service = match state.daemon.decided_store() {
-        Ok(service) => service,
-        Err(error) => {
-            error!(%error, "the Vessel controller has no decided store; vessels will not launch");
-            return None;
-        }
-    };
+    let service = state.daemon.decided_store();
     let backend = state.daemon.resource_backend();
     let planning = Arc::new(vessel_planning(state, &backend, &state.namespace));
     tasks.push(tokio::spawn(attributed(
@@ -1423,10 +1368,10 @@ async fn open_provisioning_lifecycles(
         vessel::{EngineVessels, PlacementLifecycles},
         LifecycleHome, ProvisioningLifecycles,
     };
-    let store = daemon.decided_store()?.store();
+    let store = daemon.decided_store().store();
     let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
     let opened = Arc::clone(&store);
-    let service = daemon.decided_store()?;
+    let service = daemon.decided_store();
     let lifecycles = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
         let store = opened;
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
@@ -1472,21 +1417,21 @@ async fn open_provisioning_lifecycles(
     .await
     .map_err(|error| error.to_string())??;
     // Every environment reader and requester goes through the engine's environments.
-    let environments = Arc::new(EngineEnvironments::over(Arc::clone(&lifecycles.environments), daemon.decided_store()?));
-    let environment_changes = environments.follow(daemon.decided_store()?)?;
+    let environments = Arc::new(EngineEnvironments::over(Arc::clone(&lifecycles.environments), daemon.decided_store()));
+    let environment_changes = environments.follow(daemon.decided_store())?;
     // Every clone reader and requester goes through the engine's clones.
-    let clones = Arc::new(EngineClones::over(Arc::clone(&lifecycles.clones) as _, daemon.decided_store()?));
-    let clone_changes = clones.follow(daemon.decided_store()?)?;
+    let clones = Arc::new(EngineClones::over(Arc::clone(&lifecycles.clones) as _, daemon.decided_store()));
+    let clone_changes = clones.follow(daemon.decided_store())?;
     // Every checkout reader and requester goes through the engine's checkouts.
-    let checkout_changes = lifecycles.checkout_records.follow(daemon.decided_store()?)?;
+    let checkout_changes = lifecycles.checkout_records.follow(daemon.decided_store())?;
     // Every terminal-session reader and requester goes through the engine's launches.
     let terminals = Arc::clone(&lifecycles.terminal_records);
-    let terminal_changes = terminals.follow(daemon.decided_store()?)?;
+    let terminal_changes = terminals.follow(daemon.decided_store())?;
     // Every vessel reader goes through the engine's launches; this home's are written only here.
-    let vessels = Arc::new(EngineVessels::over(Arc::clone(&lifecycles.vessels), daemon.decided_store()?));
-    let vessel_changes = vessels.follow(daemon.decided_store()?)?;
+    let vessels = Arc::new(EngineVessels::over(Arc::clone(&lifecycles.vessels), daemon.decided_store()));
+    let vessel_changes = vessels.follow(daemon.decided_store())?;
     // Capability cards follow a build's launches: a built image's verified tools are on them.
-    let image_build_changes = lifecycles.image_build_records.follow(daemon.decided_store()?)?;
+    let image_build_changes = lifecycles.image_build_records.follow(daemon.decided_store())?;
     daemon.install_lifecycle_reads(Arc::new(
         LifecycleReadPort::new(StoreReads::new(store), home)
             .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>)

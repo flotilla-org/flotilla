@@ -43,10 +43,6 @@ use serde_json::Value;
 #[cfg(unix)]
 const VALIDATION_INSPECTION_HOST: &str = "candidate-validation";
 
-/// The home the rehearsal gives the daemon's own records, which list without an origin root.
-#[cfg(unix)]
-const LOCAL_HOME: &str = "local";
-
 /// Candidate host configuration and optional probes for pre-roll validation.
 #[cfg(unix)]
 pub(crate) struct ValidationOptions {
@@ -78,9 +74,6 @@ const BUSY_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 /// (`crates/flotilla-daemon/src/server/request_dispatch.rs`), which has no shared constant.
 #[cfg(unix)]
 const STORE_BUSY_INTERACTIVE_MESSAGE: &str = "resource store busy: interactive request deadline exceeded";
-
-#[cfg(unix)]
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The daemon's resource socket. Every request validation makes goes through [`Daemon::send`],
 /// which waits out a busy store's refusal for up to `busy_retry`.
@@ -171,34 +164,6 @@ impl DaemonReply {
         let message = serde_json::from_slice::<StatusBody>(&self.body).ok()?.message;
         (message == STORE_BUSY_INTERACTIVE_MESSAGE || ResourceError::other(message.as_str()).is_store_busy()).then_some(message)
     }
-}
-
-/// The running daemon's own host id, as its host list names it; none when the daemon does not report one.
-#[cfg(unix)]
-async fn daemon_host_id(daemon: &Daemon, base: &str) -> Option<String> {
-    let command = flotilla_protocol::Command::builder().action(flotilla_protocol::CommandAction::QueryHostList {}).build();
-    let accepted: Value = daemon
-        .send(daemon.client.post(format!("{base}/v1/commands")).timeout(READ_TIMEOUT).json(&command))
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .ok()?;
-    let url = accepted.get("url")?.as_str()?;
-    let finished: Value = daemon
-        .send(daemon.client.get(format!("{base}{url}?wait=5")).timeout(READ_TIMEOUT))
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .ok()?;
-    let flotilla_protocol::CommandValue::HostList(hosts) = serde_json::from_value(finished.get("outcome")?.clone()).ok()? else {
-        return None;
-    };
-    let local = hosts.hosts.iter().find(|host| host.is_local)?;
-    Some(local.environment_id.as_ref()?.host_id()?.to_string())
 }
 
 // Candidate validation, including import enforcement, requires the Unix resource
@@ -295,7 +260,6 @@ async fn validate_daemon_with_preview(
     let mut retirement_inventory_failed = false;
     let has_templates = collections.iter().any(|(store, kind, _)| store == base && kind == "workflowtemplates");
     let mut charter_namespaces = std::collections::BTreeSet::new();
-    let mut import_rows = Vec::new();
     for (store_base, kind, namespaces) in collections {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
         let query = if replication.is_some_and(|class| class != ReplicationClass::None) { "?replicaSources=true" } else { "" };
@@ -349,16 +313,6 @@ async fn validate_daemon_with_preview(
                             failed = true;
                         }
                     }
-                }
-                if store_base == base {
-                    let home =
-                        item.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(Value::as_str).unwrap_or(LOCAL_HOME);
-                    import_rows.push(engine_import::Row {
-                        namespace: namespace.clone(),
-                        plural: kind.clone(),
-                        home: home.to_owned(),
-                        document: item.clone(),
-                    });
                 }
                 // A retired kind's rows are dropped by the import; this candidate has no decoder for them.
                 if engine_import::plan::is_retired(&kind) {
@@ -414,12 +368,9 @@ async fn validate_daemon_with_preview(
             }
         }
     }
-    // Rehearse before every roll, as this host's first start with `[primitives]` imports; the
-    // candidate host configuration controls enforcement.
-    let own_host = if import_rows.iter().any(|row| row.plural == "hosts") { daemon_host_id(&daemon, base).await } else { None };
-    let summary = engine_import::rehearse(&engine_import::Source::new(import_rows).with_own_host(own_host), LOCAL_HOME);
-    failed |= probes.require_import && summary.refused();
-    print_import(&summary);
+    // A running daemon imported its old store at its first start on the engine, and serves
+    // engine records since: there is nothing left to import, so nothing is rehearsed. Only a
+    // stopped store's first start imports ([`validate_store_with_options`]).
     let retirement_inventory =
         (!retirement_inventory_failed).then_some((retirement_templates, retirement_projects, retirement_designations));
     failed |= semantic_gates(retirement_inventory, &frozen_inventory, frozen_inventory_failed, probes, &mut report).await?;
@@ -1212,11 +1163,6 @@ mod tests {
         (stop, task)
     }
 
-    // Contract #3760: candidate config switches the gate, observed checkouts are
-    // exempt, rows of a retired kind are dropped (#4007), and every other refusal
-    // fails. Exhaust the finite on/off × store matrix, including empty stores,
-    // duplicate Messages and a missing designation.
-    // Named fleet-role Messages pass; an unnamed designation fails only when the candidate enables primitives.
     // Behaviour (cut-over B1): with the daemon stopped, the candidate validates the old store on
     // disk as its first start reads it, and leaves the file as it was. A store whose import would
     // refuse a record fails, naming it; a state directory with no store has nothing to import; one
@@ -1286,10 +1232,12 @@ mod tests {
         assert!(error.to_string().contains("validating an engine store on disk is not built"), "{error:#}");
     }
 
-    // The HTTP stand-in is the resource-socket process boundary; mapping and
-    // temporary-store restoration use the real rehearsal implementations.
+    // A running daemon already imported its store and serves engine records (a Message's
+    // receiver in address form, as at the r984 roll): validating it rehearses no import, so no
+    // record the old importer would refuse fails the gate. The HTTP stand-in is the
+    // resource-socket process boundary.
     #[tokio::test]
-    async fn candidate_import_gate_matrix() {
+    async fn a_running_daemon_is_not_refused_for_records_the_import_would_refuse() {
         rigging_tls::install_default_provider();
         for enabled in [false, true] {
             for case in [
@@ -1309,39 +1257,8 @@ mod tests {
                 let result = super::validate_daemon_with_options(&socket, Some(&[]), None, &probes).await;
                 let _ = stop.send(());
                 tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
-                assert_eq!(
-                    result.is_err(),
-                    enabled && !matches!(case, "empty" | "observed-checkout" | "retired-usage" | "named-designation"),
-                    "enabled={enabled}, case={case}: {result:?}"
-                );
+                assert!(result.is_ok(), "enabled={enabled}, case={case}: {result:?}");
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn rehearsal_reads_the_daemons_own_host_id() {
-        rigging_tls::install_default_provider();
-        let host = |name: &str, spec: flotilla_resources::HostSpec| {
-            serde_json::json!({
-                "apiVersion":"flotilla.work/v1", "kind":"Host",
-                "metadata":{"name":name,"namespace":"flotilla","resourceVersion":"1","creationTimestamp":"2026-10-19T00:00:00Z"},
-                "spec":spec,"status":{"daemon_generation":"g7"}
-            })
-        };
-        let ssh = flotilla_resources::HostSpec {
-            connection: flotilla_resources::HostConnection::SshHost { owning_daemon: "kiwi".into(), destination: "crew@b1".into() },
-            ..Default::default()
-        };
-        for (reported, refused) in [(Some("kiwi"), false), (None, true)] {
-            let socket_dir = TestSocketDir::new();
-            let socket = socket_dir.socket_path("own-host.sock");
-            let inventory = BTreeMap::from([("hosts".to_string(), vec![host("kiwi", Default::default()), host("b1", ssh.clone())])]);
-            let (stop, server) = serve_import_inventory(&socket, inventory, reported).await;
-            let probes = super::ValidationOptions { require_import: true, ..Default::default() };
-            let result = super::validate_daemon_with_options(&socket, Some(&[]), None, &probes).await;
-            let _ = stop.send(());
-            tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
-            assert_eq!(result.is_err(), refused, "reported={reported:?}: {result:?}");
         }
     }
 
@@ -1760,8 +1677,6 @@ mod tests {
             .expect("build in-process daemon server");
         // The ops inventory reads the engine's checkouts, as a composed daemon's does.
         flotilla_daemon_testkit::engine::engine(&server.daemon());
-        // Kind discovery reads every engine kind, Message among them, as a running daemon serves it.
-        server.daemon().open_message_primitives().expect("the engine Message path");
         let backend = server.daemon().resource_backend().clone();
         backend
             .using::<Project>("flotilla")

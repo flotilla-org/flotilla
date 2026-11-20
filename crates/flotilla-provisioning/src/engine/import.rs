@@ -62,6 +62,7 @@ use flotilla_state_machines::{
 };
 
 use flotilla_resources::{
+    checkout_path::{checkout_renamed, vessel_launch_slug},
     checkout_records::{launched, CheckoutHolder, Inspection},
     convoy::engine::ImportedLaunches,
     vessel_resource_name, CONVOY_LABEL,
@@ -675,11 +676,12 @@ pub type ImportedHolder = (flotilla_schema::Identity, u64);
 /// wrote, which `holders` names by the label's old convoy name. Its facts and its inspection come
 /// with it. A checkout whose convoy was not imported, having ended or stayed on the old store,
 /// is not imported: nothing would release it. `clones` names the launch each clone imported as,
-/// by its home and old name ([`import_clones`]).
+/// by its home and old name ([`import_clones`]), and `vessels` each vessel's ([`import_vessels`]).
 pub fn import_checkouts(
     records: &[(ResourceObject<OldCheckout>, String)],
     holders: &dyn Fn(&str) -> Option<ImportedHolder>,
     clones: &BTreeMap<(String, String), String>,
+    vessels: &VesselLaunches,
     target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) {
@@ -688,7 +690,7 @@ pub fn import_checkouts(
             continue;
         }
         let refuse = |reason: String| ImportRefusal { kind: CheckoutKind::NAME, record: checkout.metadata.name.clone(), reason };
-        let result = import_checkout(checkout, home, holders, clones).and_then(|(mut imported, holder)| {
+        let result = import_checkout(checkout, home, holders, clones, vessels).and_then(|(mut imported, holder)| {
             let mut change = imported.change();
             if let Some((identity, version)) = holder {
                 change.items.push(flotilla_schema::ChangeItem::new(identity, Some(version.to_string())));
@@ -710,12 +712,15 @@ pub fn import_checkouts(
 }
 
 /// Maps old Checkout `obj`, homed at `home`, onto its first launch, with the holder it is
-/// created under. The clone a worktree names is the launch it imported as, by `clones`.
+/// created under. The clone a worktree names is the launch it imported as, by `clones`. It takes
+/// the name its vessel asks for it by on the engine ([`engine_checkout_name`]), so a live crew's
+/// vessel finds the checkout it already has rather than requesting another of its branch.
 pub fn import_checkout(
     obj: &ResourceObject<OldCheckout>,
     home: &str,
     holders: &dyn Fn(&str) -> Option<ImportedHolder>,
     clones: &BTreeMap<(String, String), String>,
+    vessels: &VesselLaunches,
 ) -> Result<(ImportedResource<CheckoutKind>, Option<ImportedHolder>), ImportRefusal> {
     let refuse = |reason: String| ImportRefusal { kind: CheckoutKind::NAME, record: obj.metadata.name.clone(), reason };
     let holder = match obj.metadata.labels.get(CONVOY_LABEL) {
@@ -751,17 +756,42 @@ pub fn import_checkout(
         }
     }
     let holder_name = holder.as_ref().map(|(identity, _)| CheckoutHolder::Convoy(identity.name.clone()));
-    let request = checkouts::request_of(&obj.metadata.name, &spec, holder_name.as_ref(), home).map_err(refuse)?;
+    let name = engine_checkout_name(obj, holder.as_ref().map(|(identity, _)| identity.name.as_str()), vessels);
+    let request = checkouts::request_of(&name, &spec, holder_name.as_ref(), home).map_err(refuse)?;
     let since = Timestamp::from_datetime(&obj.metadata.creation_timestamp);
     Ok((
         ImportedResource {
             record: obj.metadata.name.clone(),
             home: home.to_owned(),
-            resource: Resource::stored(obj.metadata.name.clone(), request, State::new(state, since), Version(1)),
+            resource: Resource::stored(name, request, State::new(state, since), Version(1)),
             created: CreatedAt::from_datetime(&obj.metadata.creation_timestamp),
         },
         holder,
     ))
+}
+
+/// The name the engine's vessel reconciler asks for old checkout `obj` by. The old store named a
+/// convoy's worktree for the old convoy, and a clone made in a vessel for the old vessel; on the
+/// engine they are named for the convoy launch the checkout is held for (`convoy_launch`) and for
+/// the vessel launch (`vessels`), as a fresh launch's are. Kept under its old name, a live crew's
+/// vessel would not find it, and would request a second checkout of the same branch, which fails
+/// and ends the vessel and its convoy with it. An adopted checkout is asked for by the name its
+/// convoy recorded, and any other keeps its name.
+fn engine_checkout_name(obj: &ResourceObject<OldCheckout>, convoy_launch: Option<&str>, vessels: &VesselLaunches) -> String {
+    let old = &obj.metadata.name;
+    let renamed = match &obj.spec {
+        flotilla_resources::CheckoutSpec::Worktree(_) => {
+            obj.metadata.labels.get(CONVOY_LABEL).zip(convoy_launch).and_then(|(convoy, launch)| checkout_renamed(old, convoy, launch))
+        }
+        // The longest old vessel name it was named for: one vessel's name may begin another's.
+        flotilla_resources::CheckoutSpec::FreshClone(_) => vessels
+            .iter()
+            .filter_map(|((_, vessel), launch)| Some((vessel.len(), checkout_renamed(old, vessel, &vessel_launch_slug(launch))?)))
+            .max_by_key(|(length, _)| *length)
+            .map(|(_, name)| name),
+        flotilla_resources::CheckoutSpec::Observed(_) => None,
+    };
+    renamed.unwrap_or_else(|| old.clone())
 }
 
 /// Imports old TerminalSession `records` into `target`, each as its session's first launch. A
@@ -806,9 +836,19 @@ pub fn import_terminal_session(
 ) -> Result<ImportedResource<TerminalSessionKind>, ImportRefusal> {
     let refuse = |reason: String| ImportRefusal { kind: TerminalSessionKind::NAME, record: obj.metadata.name.clone(), reason };
     let mut request = terminals::request_of_old(obj, home).map_err(refuse)?;
-    if let Some(vessel) = request.holder.as_ref().and_then(|holder| holder.0.strip_prefix("vessel:")) {
-        request.holder = Some(Holder::vessel(&held_for_launch(vessel, home, vessels)));
+    let mut name = obj.metadata.name.clone();
+    if let Some(vessel) = request.holder.as_ref().and_then(|holder| holder.0.strip_prefix("vessel:")).map(str::to_owned) {
+        let launch = held_for_launch(&vessel, home, vessels);
+        // A crew's session is named for its vessel (`terminal-<vessel>-<role>`), and the vessel's
+        // seats ask for it by its launch's name: kept under the old vessel's name, a live crew's
+        // vessel would not find its running session and would start a second agent beside it.
+        // The launch keeps its cleat session, which is its realised identity.
+        if name == format!("terminal-{vessel}-{}", obj.spec.role) {
+            name = format!("terminal-{launch}-{}", obj.spec.role);
+        }
+        request.holder = Some(Holder::vessel(&launch));
     }
+    request.launch_of.clone_from(&name);
     let status = obj.status.as_ref();
     let state = match status.map(|status| status.phase).unwrap_or_default() {
         TerminalSessionPhase::Starting => LifecycleState::requested(),
@@ -826,7 +866,7 @@ pub fn import_terminal_session(
     Ok(ImportedResource {
         record: obj.metadata.name.clone(),
         home: home.to_owned(),
-        resource: Resource::stored(obj.metadata.name.clone(), request, State::new(state, since), Version(1)),
+        resource: Resource::stored(name, request, State::new(state, since), Version(1)),
         created: CreatedAt::from_datetime(&obj.metadata.creation_timestamp),
     })
 }

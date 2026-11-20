@@ -29,7 +29,7 @@ impl InProcessDaemon {
         }
         match action {
             CommandAction::CheckoutRecheck { .. } => {
-                let primitives = self.message_primitives().ok_or("a checkout is inspected on the engine path; enable [primitives]")?;
+                let primitives = self.message_primitives();
                 let namespace = self.provisioning_namespace().await;
                 primitives.inspect_checkout(&namespace, &home, launched(&launch)).await
             }

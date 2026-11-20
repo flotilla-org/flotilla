@@ -153,12 +153,10 @@ async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Op
     let daemon = message_home_daemon_with_floor(host_name, free_space_floor_gib).await;
     // Its Message path, over the designated fleet's roles, as the runtime composes it.
     message_homes::seed_fleet(&daemon.resource_backend()).await;
-    daemon.open_message_primitives().expect("message path");
     daemon
 }
 
-/// A daemon composed with its engine, whose Message path [`message_homes::engine`] opens once
-/// its mesh is up.
+/// A daemon composed with its engine.
 async fn message_home_daemon(host_name: &str) -> HomedDaemon {
     message_home_daemon_with_floor(host_name, None).await
 }
@@ -1741,11 +1739,7 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
     assert_eq!(home_artifacts.items.len(), 1);
     assert_eq!(home_artifacts.items[0].spec.producer, "coder");
     // The envelope reaches the crew's host as the home's log does.
-    flotilla_provisioning_testkit::replicate_home(
-        &follower.decided_store().expect("home decided store"),
-        follower.node_id().as_str(),
-        &leader.decided_store().expect("crew host decided store"),
-    );
+    flotilla_provisioning_testkit::replicate_home(&follower.decided_store(), follower.node_id().as_str(), &leader.decided_store());
     // The record the address names reaches the crew host by replication, which this read does
     // not otherwise wait for.
     eventually(Duration::from_secs(5), Duration::from_millis(10), "home artifact should replicate to the crew host", || async {
@@ -1913,7 +1907,7 @@ async fn artifact_environment_reference_contract() {
         .await;
         let convoy = convoy_launch.as_str();
         // A runtime composed this daemon: the launch is written at its home on its decided store.
-        let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&leader.decided_store().expect("decided store"));
+        let vessels = flotilla_provisioning_testkit::VesselsFixture::over_service(&leader.decided_store());
         let vessel = crew_vessel(&vessels, &leader, convoy, &follower);
         // A runtime composed this daemon: the launch is written at its home as its controller writes it.
         let terminals = runtime_terminals(&leader);
@@ -2418,7 +2412,7 @@ async fn definition_mutations_from_another_host_run_at_its_home() {
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
     let (leader, follower) = (&topology.leader, &topology.follower);
-    let decided = leader.decided_store().expect("leader decided store");
+    let decided = leader.decided_store();
     let spec: WorkflowTemplateSpec = serde_json::from_value(serde_json::json!({"vessels": []})).expect("template spec");
     let held_here = |name: &'static str| async move {
         !matches!(leader.resource_backend().using::<WorkflowTemplate>(namespace).get(name).await, Err(ResourceError::NotFound { .. }))
@@ -2430,11 +2424,7 @@ async fn definition_mutations_from_another_host_run_at_its_home() {
         .apply(&InputMeta::builder().name("homed-template".to_string()).build(), &spec)
         .await
         .expect("declare the template at its home");
-    flotilla_provisioning_testkit::replicate_home(
-        &follower.decided_store().expect("home decided store"),
-        follower.node_id().as_str(),
-        &decided,
-    );
+    flotilla_provisioning_testkit::replicate_home(&follower.decided_store(), follower.node_id().as_str(), &decided);
     let read = leader.resource_backend().including_replicas::<WorkflowTemplate>(namespace).get("homed-template").await.expect("replica");
     assert!(matches!(&read.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == follower.node_id()));
 
@@ -2762,7 +2752,7 @@ async fn hostless_convoy_command_explains_missing_home_route() {
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
     // Feta's launch, which no peer of this mesh reaches, last seen when it was admitted there.
-    let decided = topology.leader.decided_store().expect("decided store");
+    let decided = topology.leader.decided_store();
     let feta = flotilla_provisioning_testkit::other_home_for(&decided, "feta-root");
     let stranded = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
         feta.service(),
@@ -2967,7 +2957,7 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
     controller_task.abort();
     assert!(kiwi_requests.sync_once(Utc::now()).await.expect("kiwi vessel requests").requested.is_empty());
     // Kiwi follows feta's log, so feta's launch may already read here: only kiwi's own count.
-    let kiwi_home = topology.leader.decided_store().expect("kiwi home").home().to_owned();
+    let kiwi_home = topology.leader.decided_store().home().to_owned();
     let kiwi_launches = VesselRecords::every(engine(&topology.leader).vessels.vessels.as_ref()).expect("kiwi launches");
     assert!(kiwi_launches.iter().all(|launch| launch.home != kiwi_home), "kiwi launches nothing: {kiwi_launches:?}");
 }
@@ -3508,13 +3498,8 @@ async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, 
         }
         host_status.capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
     }
-    flotilla_provisioning_testkit::put_host_at_its_home(
-        &daemon.decided_store().expect("decided store"),
-        "remote-docker-host",
-        &host_spec,
-        Some(&host_status),
-    )
-    .await;
+    flotilla_provisioning_testkit::put_host_at_its_home(&daemon.decided_store(), "remote-docker-host", &host_spec, Some(&host_status))
+        .await;
     let mut events = daemon.subscribe();
     let command_id = daemon
         .execute(
@@ -3660,7 +3645,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         .expect("router topology");
     let (a, b) = if source_remote { (&topology.follower, &topology.leader) } else { (&topology.leader, &topology.follower) };
     let a_holds = if source_remote { &topology.follower_stream_holds } else { &topology.leader_stream_holds };
-    let b_home = b.decided_store().expect("governor home").home().to_owned();
+    let b_home = b.decided_store().home().to_owned();
     if unavailable {
         // The governor's launch travels B's log: until A installs it, A has no live governor.
         a_holds.hold(&b_home);
@@ -3886,8 +3871,8 @@ async fn seed_governor_subscription(a: &InProcessDaemon, b: &InProcessDaemon) {
         .await
         .expect("project subscriptions");
     // A's Project reaches B as A's log does.
-    let a_store = a.decided_store().expect("a's decided store");
-    flotilla_provisioning_testkit::replicate_home(&a_store, a_store.home(), &b.decided_store().expect("b's decided store"));
+    let a_store = a.decided_store();
+    flotilla_provisioning_testkit::replicate_home(&a_store, a_store.home(), &b.decided_store());
     let ensures = b_backend.using::<ConvoyEnsure>("flotilla");
     ensures
         .create(
@@ -4463,7 +4448,7 @@ async fn run_message_role_waiting_home_case(remote: bool, admitted: bool) {
     ] {
         if remote && name == "reply" {
             // The reply is routed by its original, which the caller reads once it follows the home's log.
-            let caller = topology.leader.message_primitives().expect("caller message path");
+            let caller = topology.leader.message_primitives();
             let inbox = caller.inbox_for("flotilla", "flotilla/governor").await.expect("the request's inbox");
             tokio::time::timeout(Duration::from_secs(5), async {
                 while caller.locate_in(&inbox, "request").expect("locate").is_none() {

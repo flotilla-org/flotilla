@@ -2,7 +2,24 @@
 //! (access, place), holding the home, each need's mechanism and digest, and the retry
 //! state of a delivery that failed. `convoy explain` reads it; launch honours its retry.
 
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    path::Path,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
+
+use flotilla_engine_convoys::holds::{crew_accesses, each};
+use flotilla_engine_store::{follow::Followed, watch::EngineWatch};
+use flotilla_provisioning::stored::environment::Environment;
+use flotilla_schema::Kind;
+use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
+use flotilla_state_machines::{
+    machines::convoy::{Convoy as EngineConvoy, ConvoyLabel},
+    Resource as EngineResource, StateValue,
+};
 
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 
@@ -12,7 +29,10 @@ use flotilla_resources::{
     AccessDelivery, AccessDeliverySpec, Convoy, InputMeta, ResourceError, ResourceObject, CONVOY_LABEL,
 };
 use flotilla_schema::Timestamp;
-use flotilla_store::controller::{ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, SecondaryWatch};
+use flotilla_store::{
+    controller::{ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
+    ResourceBackend,
+};
 use flotilla_vessel_delivery::{Access, Action, FetchBy, Liveness, Mechanism, Plan};
 
 use super::super::{account_access::AccountLaunch, state::ControllerRuntimeState};
@@ -189,12 +209,113 @@ fn bounded(error: &str) -> String {
 }
 
 /// Removes a record once its place or its convoy is recorded as ended; the home went with the
-/// place, and the access ended with the convoy.
+/// place, and the access ended with the convoy. A record is reconciled when it changes and when
+/// its place or its convoy ends ([`EndingWake`]).
 pub(in crate::runtime) fn status_controller(
     state: std::sync::Arc<ControllerRuntimeState>,
     namespace: String,
 ) -> (Vec<Box<dyn SecondaryWatch<Primary = AccessDelivery>>>, AccessStatusReconciler) {
-    (Vec::new(), AccessStatusReconciler { state, namespace, held: Default::default() })
+    let wake = EndingWake { service: state.daemon.decided_store() };
+    (vec![Box::new(wake)], AccessStatusReconciler { state, namespace, held: Default::default() })
+}
+
+/// What one pass over the decided log woke: the records whose place or convoy ended.
+#[derive(Default)]
+struct Woken {
+    records: BTreeSet<String>,
+    /// A home's state moved without entries: which of its resources ended is unknown.
+    rescanned: bool,
+}
+
+/// Wakes the records whose place's environment or whose convoy has ended, from the decided log:
+/// the records themselves do not change when either ends. Each is found through its index: a
+/// place's by `by_place`, a convoy's crew's by `by_access` with each of its crew's access keys.
+#[derive(Clone)]
+struct EndingWake {
+    service: Arc<Service>,
+}
+
+impl EndingWake {
+    fn woken(read: &mut Read<'_>, followed: Vec<Followed>) -> Result<Woken, StoreError> {
+        let environment = <EngineResource<Environment> as Kind>::CODE;
+        let convoy = <EngineResource<EngineConvoy> as Kind>::CODE;
+        let mut woken = Woken::default();
+        let mut wake = |read: &mut Read<'_>, id| {
+            if let Some((identity, _)) = read.identity(id)? {
+                woken.records.insert(identity.name);
+            }
+            Ok(())
+        };
+        for followed in followed {
+            let identity = match followed {
+                Followed::Changed(identity) => identity,
+                Followed::Rescan(_) => {
+                    woken.rescanned = true;
+                    continue;
+                }
+            };
+            let id = read.resolve(identity.kind, &identity.name, &identity.home)?;
+            if identity.kind == environment {
+                // One no longer held (deleted or expunged) has ended too.
+                let live = match id {
+                    Some(id) => read.load::<EngineResource<Environment>>(id)?.is_some_and(|loaded| loaded.value.state().live()),
+                    None => false,
+                };
+                if !live {
+                    each(read, &AccessDeliverySpec::by_place(&identity.name), &mut wake)?;
+                }
+            } else if identity.kind == convoy {
+                // One no longer held names no crew: its records wait for their places to end.
+                let Some(loaded) = id.map(|id| read.load::<EngineResource<EngineConvoy>>(id)).transpose()?.flatten() else {
+                    continue;
+                };
+                if loaded.value.state().label() != ConvoyLabel::Open {
+                    for access in crew_accesses(&loaded.value)? {
+                        each(read, &AccessDeliverySpec::by_access(&access), &mut wake)?;
+                    }
+                }
+            }
+        }
+        Ok(woken)
+    }
+}
+
+impl SecondaryWatch for EndingWake {
+    type Primary = AccessDelivery;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = AccessDelivery>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        sender: WorkQueueSender,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            let codes = [<EngineResource<Environment> as Kind>::CODE, <EngineResource<EngineConvoy> as Kind>::CODE];
+            let mut watch =
+                EngineWatch::start(Arc::clone(&self.service), codes).map_err(|error| ResourceError::other(error.to_string()))?;
+            loop {
+                let woken = match watch.next(Self::woken).await {
+                    Ok(woken) => woken,
+                    Err(error) => {
+                        tracing::warn!(%error, "the access delivery wake could not read the log; retrying at the next commit");
+                        continue;
+                    }
+                };
+                if woken.rescanned {
+                    sender.send_every();
+                }
+                for record in woken.records {
+                    if sender.send(record).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        })
+    }
 }
 
 pub(in crate::runtime) struct AccessStatusReconciler {

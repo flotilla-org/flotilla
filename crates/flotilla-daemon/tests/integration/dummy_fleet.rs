@@ -275,6 +275,69 @@ async fn a_stalled_crew_resumes_on_supervision_and_lands() {
     fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
 }
 
+// An access delivered to a convoy's crew is removed when the convoy ends, and one delivered into
+// an environment when that environment ends, though neither record changes then: the convoy it
+// held retires. Each record is applied while its convoy and place are live, so the reconcile its
+// creation wakes keeps it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn access_deliveries_go_when_their_convoy_or_place_ends_and_the_convoy_retires() {
+    use flotilla_resources::{access_delivery::access_key, AccessDelivery, AccessDeliverySpec, Environment};
+
+    let fleet = TestDaemon::builder().agent("stall_rate = 1.0").start().await;
+    let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    fleet.wait("a supervisable stall", stalled(&name)).await;
+    let launch_of = flotilla_resources::convoy::launch_of(&name).to_owned();
+    let environment = fleet
+        .wait("the crew's environment", |environment: &ResourceObject<Environment>| {
+            environment.metadata.name.starts_with(&format!("env-{launch_of}-"))
+        })
+        .await
+        .metadata
+        .name;
+    // `env-<convoy>-<work>-<n>`: the coder's work, whose crew the access is delivered to.
+    let work = environment
+        .strip_prefix(&format!("env-{launch_of}-"))
+        .and_then(|rest| rest.rsplit_once('-'))
+        .map(|(work, _)| work.to_owned())
+        .expect("the environment names its work");
+    let local = fleet.list::<Host>().await.into_iter().next().expect("local host").metadata.name;
+    let delivery = |access: String, place: String| AccessDeliverySpec {
+        access,
+        place,
+        harness: "claude-code".into(),
+        home: "/requesters/probe".into(),
+        needs: Default::default(),
+        retry: None,
+    };
+    // Its place is host-direct, which never ends: only the convoy's end removes it.
+    fleet
+        .apply::<AccessDelivery>(
+            "to-the-crew",
+            delivery(access_key("fleet", &name, &work, "coder"), flotilla_resources::host_direct_environment_name(&local)),
+        )
+        .await;
+    // It names no convoy: only its place's end removes it.
+    fleet.apply::<AccessDelivery>("into-the-environment", delivery("operator-probe".into(), environment.clone())).await;
+    // Their creations' reconciles run while the convoy and the place are live, and keep both.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for record in ["to-the-crew", "into-the-environment"] {
+        assert!(fleet.get::<AccessDelivery>(record).await.is_some(), "{record} is kept while its convoy and place are live");
+    }
+
+    let abandoned = fleet
+        .execute(CommandAction::ConvoyAbandon { namespace: Some(NAMESPACE.into()), name: name.clone(), reason: "end its accesses".into() })
+        .await;
+    assert!(!matches!(abandoned, CommandValue::Error { .. }), "{abandoned:?}");
+    fleet.wait("Abandoned", in_phase(&name, ConvoyPhase::Abandoned)).await;
+    fleet.wait_gone::<AccessDelivery>("to-the-crew").await;
+    fleet.wait_gone::<AccessDelivery>("into-the-environment").await;
+    fleet
+        .wait_reached("Retired", "convoy", "Retired", |row| {
+            row.get("resource.name").and_then(serde_json::Value::as_str) == Some(name.as_str())
+        })
+        .await;
+}
+
 // A dummy crew reaches the daemon as a real crew in its vessel does: its commands over the
 // environment socket its vessel forwards, as the crew its Hello claims, and Claude Code's hooks
 // over the hook route, so its attention is the hooks'. Its ledger is an artifact it put. A
@@ -733,6 +796,45 @@ async fn the_standing_governor_resumes_a_stalled_coder() {
     fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
     assert_eq!(fleet.counts().crews_stalled, 1, "only the coder stalled");
     assert_eq!(fleet.counts().command_errors, 0);
+}
+
+// Behaviour: a standing role's launches are named in address form (`project:P/convoy:R#n`),
+// and the environment each vessel requests is named from its launch. That name becomes a
+// Docker container name, a volume spec and host paths, so it must be a plain name component:
+// no `:` or `/`, which Docker refuses with "too many colons".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standing_roles_environment_takes_a_docker_safe_name() {
+    use flotilla_resources::Environment;
+
+    let fleet = TestDaemon::builder().start().await;
+    for catalog::CatalogDocument { kind, name, document } in
+        catalog::standing_governor_documents(&catalog_forge_url(&fleet).await).expect("governor documents")
+    {
+        let applied = fleet.execute(CommandAction::ResourceApply { namespace: NAMESPACE.into(), document }).await;
+        assert!(matches!(applied, CommandValue::ResourceObject(_)), "apply {kind} {name}: {applied:?}");
+    }
+    let governor = fleet
+        .wait("the standing governor's generation", |convoy: &ResourceObject<Convoy>| {
+            convoy.metadata.annotations.get(flotilla_resources::ENSURED_FROM_ANNOTATION).map(String::as_str) == Some(catalog::GOVERNOR_ROLE)
+        })
+        .await
+        .metadata
+        .name;
+    assert!(governor.contains(':') && governor.contains('/'), "a standing launch is named in address form: {governor}");
+    fleet.wait("the governor Active", in_phase(&governor, ConvoyPhase::Active)).await;
+    fleet
+        .wait("the governor's vessel's environment", |environment: &ResourceObject<Environment>| {
+            environment.metadata.name.contains("governor")
+        })
+        .await;
+    let environments: Vec<String> = fleet.list::<Environment>().await.into_iter().map(|environment| environment.metadata.name).collect();
+    // Docker's container name rule, which also keeps the name one path component.
+    for name in &environments {
+        let mut chars = name.chars();
+        let valid = chars.next().is_some_and(|first| first.is_ascii_alphanumeric())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+        assert!(valid, "environment {name} is not a Docker-safe name; environments: {environments:?}");
+    }
 }
 
 // A daemon restart restores its active convoy while the crew process survives.

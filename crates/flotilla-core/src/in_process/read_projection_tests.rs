@@ -489,9 +489,7 @@ mod tests {
             let fleet = FleetService::new(AggregatorProjectionState::new(), host_name.clone(), None);
             let convoy_engine = home.convoys.path();
             // Explanations read this home's Messages as the daemon's evidence does.
-            let receivers = super::super::projection_ports::MessageReceivers(Arc::new(std::sync::OnceLock::from(Arc::clone(
-                home.messages.primitives(),
-            ))));
+            let receivers = super::super::projection_ports::MessageReceivers(Arc::clone(home.messages.primitives()));
             Self {
                 receivers,
                 // The daemon's reads, which serve its convoys as well.

@@ -18,7 +18,7 @@ use flotilla_protocol::{LifecycleReading, PrincipalRef};
 use flotilla_resources::{
     convoy::admission::AdmissionDocument,
     convoy_records::{
-        ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes, UnreadableLaunch,
+        ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes, Ending, UnreadableLaunch,
     },
     engine_records::KindRecords,
     held_joins::HeldJoins,
@@ -739,7 +739,7 @@ async fn a_read_with_no_commit_since_the_last_pass_reads_no_store() {
     reads.convoys.passing.set(false);
 
     let mut ended = launch("fix-it#1", HERE);
-    ended.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    ended.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
     reads.convoys.commit(ended);
     let phase = views.get("fix-it#1").await.expect("read").status.expect("status").phase;
     assert_eq!(phase, ConvoyPhase::Abandoned, "the writer reads its commit back");
@@ -764,7 +764,7 @@ async fn reads_after_a_commit_wait_for_the_pass_in_progress_and_read_it() {
     reads.convoys.passing.set(true);
     let reaching = reads.convoys.passing.reaching.notified();
     let mut ended = launch("fix-it#1", HERE);
-    ended.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    ended.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
     reads.convoys.commit(ended);
     tokio::time::timeout(Duration::from_secs(5), reaching).await.expect("a pass reaches the gate");
 
@@ -825,7 +825,7 @@ async fn a_read_by_name_converts_only_that_launch() {
 #[tokio::test]
 async fn a_retired_launch_reads_by_name_with_its_ending() {
     let mut retired = launch("retired#1", HERE);
-    retired.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    retired.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
     retired.retired = true;
     let reads = Arc::new(Reads {
         joins: HeldJoins::default(),
@@ -853,7 +853,7 @@ async fn a_retired_launch_reads_by_name_with_its_ending() {
 #[tokio::test]
 async fn a_read_by_name_gives_an_unreadable_copy_beside_the_others() {
     let mut retired = launch("gone#1", HERE);
-    retired.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    retired.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
     retired.retired = true;
     let reads = Arc::new(Reads {
         joins: HeldJoins::default(),
@@ -898,7 +898,7 @@ async fn a_read_by_name_gives_an_unreadable_copy_beside_the_others() {
 #[tokio::test]
 async fn a_read_by_name_gives_a_held_and_a_retired_launch_of_the_name() {
     let mut retired = launch("shared#1", "home-b");
-    retired.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    retired.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
     retired.retired = true;
     let reads = Arc::new(Reads {
         joins: HeldJoins::default(),
@@ -940,7 +940,7 @@ fn installed(names: &[&str]) -> (Arc<Reads>, ConvoyViews, ResourceBackend) {
 /// `name` held here, abandoned as "stopped" and retired.
 fn retired(name: &str) -> ConvoyRecord {
     let mut record = launch(name, HERE);
-    record.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    record.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
     record.retired = true;
     record
 }
@@ -1035,7 +1035,7 @@ async fn a_launch_first_seen_retired_is_told_ended_once_then_leaves() {
 fn ensured(name: &str, home: &str, ensure: &str, ended: bool) -> ConvoyRecord {
     let mut record = launch(name, home);
     record.admission.provenance.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), ensure.into());
-    record.ended = ended.then(|| (ConvoyEnd::Delivered { disposition: "merged".into() }, at(200)));
+    record.ended = ended.then(|| Ending::Held(ConvoyEnd::Delivered { disposition: "merged".into() }, at(200)));
     record
 }
 
@@ -1097,7 +1097,7 @@ fn placed(name: &str, ended: bool) -> ConvoyRecord {
             })
             .build(),
     );
-    record.ended = ended.then(|| (ConvoyEnd::Delivered { disposition: "merged".into() }, at(200)));
+    record.ended = ended.then(|| Ending::Held(ConvoyEnd::Delivered { disposition: "merged".into() }, at(200)));
     record
 }
 

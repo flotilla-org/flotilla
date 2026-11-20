@@ -568,24 +568,20 @@ impl PeerRuntime {
             let mut decided_followers: HashMap<NodeId, (u64, tokio_util::task::AbortOnDropHandle<()>)> = HashMap::new();
             // The engine path's replica misses read at the home that holds the record.
             let decided_peers = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
-            if let (Some(primitives), Ok(service)) = (outbound_daemon.message_primitives(), outbound_daemon.decided_store()) {
-                let reads = super::change_stream::DecidedHomeReads {
-                    service,
-                    peers: Arc::clone(&decided_peers),
-                    clients: Default::default(),
-                    clock: outbound_daemon.clock_for_scenarios(),
-                };
-                if let Err(error) = primitives.install_home_reads(Arc::new(reads)) {
-                    debug!(%error, "engine home reads already installed");
-                }
+            let reads = super::change_stream::DecidedHomeReads {
+                service: outbound_daemon.decided_store(),
+                peers: Arc::clone(&decided_peers),
+                clients: Default::default(),
+                clock: outbound_daemon.clock_for_scenarios(),
+            };
+            if let Err(error) = outbound_daemon.message_primitives().install_home_reads(Arc::new(reads)) {
+                debug!(%error, "engine home reads already installed");
             }
             while let Some(event) = peer_connected_rx.recv().await {
                 match event {
                     PeerConnectionEvent::Connected(notice) => {
                         debug!(peer = %notice.peer, generation = notice.generation, "following peer change stream");
-                        if decided_followers.get(&notice.peer).is_none_or(|(generation, _)| *generation < notice.generation)
-                            && outbound_daemon.decided_store().is_ok()
-                        {
+                        if decided_followers.get(&notice.peer).is_none_or(|(generation, _)| *generation < notice.generation) {
                             let home = notice.peer.as_str().to_owned();
                             decided_peers.lock().expect("decided peers").insert(home.clone(), notice.resource_socket_path.clone());
                             let task = super::change_stream::follow(

@@ -1,7 +1,7 @@
-//! Project's reads and writes through the store's typed paths (#3824 layer 3b): one contract, run
-//! against the old store and against the engine's records installed behind `[primitives]`, so
-//! Project's writers (declarations, project operations' conditions, the dispatch reconciler's
-//! queue) and readers keep their behaviour on either.
+//! Project's reads and writes through the store's typed paths (#3824 layer 3b), served by the
+//! engine's records, the daemon's only path for the kind. Project's writers (declarations, project
+//! operations' conditions, the dispatch reconciler's queue) and readers hold to one contract; it
+//! also runs against the plain in-memory store that tests stand in with.
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 

@@ -153,10 +153,17 @@ pub fn forge() -> Value {
     )
 }
 
-/// A record of this store, created (at the time of the write) as the daemon creates it.
+/// A record of this store, created (at the time of the write) as the daemon creates it, with the
+/// document's labels and annotations.
 pub async fn own<R: Resource>(backend: &SqliteBackend, document: Value) -> Value {
     let kind = ResourceKind::of::<R>();
-    let meta = InputMeta::builder().name(document["metadata"]["name"].as_str().expect("name").to_owned()).build();
+    let labels = serde_json::from_value(document["metadata"]["labels"].clone()).unwrap_or_default();
+    let annotations = serde_json::from_value(document["metadata"]["annotations"].clone()).unwrap_or_default();
+    let meta = InputMeta::builder()
+        .name(document["metadata"]["name"].as_str().expect("name").to_owned())
+        .labels(labels)
+        .annotations(annotations)
+        .build();
     let created = backend.create_raw(kind, NS, &meta, &document["spec"]).await.expect("create");
     let created = if document["status"].is_null() {
         created

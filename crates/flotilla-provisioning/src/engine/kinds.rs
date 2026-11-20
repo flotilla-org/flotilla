@@ -1,4 +1,4 @@
-//! FulfilmentKind on the engine, behind `[primitives]`.
+//! FulfilmentKind on the engine, its only path.
 //!
 //! [`EngineKinds`] is the [`KindRecords`] port of FulfilmentKind over the decided store. This
 //! home writes its own kinds through the plain-kind port; every home's are read from a resident map

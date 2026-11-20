@@ -22,10 +22,9 @@
 //!   (runtime samples, configured limits, integration, degradations);
 //! - a judgement (in progress, suspect, lost, next attempt).
 //!
-//! Behind `[primitives]` the daemon opens its decided store with these kinds
-//! registered beside the engine's ([`register`], layer 2). The provisioning
-//! reconcilers write theirs through the engine (layer 3); nothing writes
-//! TerminalSession until the crew reconcilers move (layer 7).
+//! The daemon opens its decided store with these kinds registered beside the
+//! engine's ([`register`], layer 2), and the provisioning controllers write
+//! theirs through the engine.
 //!
 //! [`Lifecycle`]: flotilla_state_machines::machines::lifecycle::Lifecycle
 

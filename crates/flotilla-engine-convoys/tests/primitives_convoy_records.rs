@@ -1,7 +1,10 @@
 //! The engine's convoys as their readers take them (#3108): each launch, read from the decided
 //! store, under its old crews, with its verdicts, links, stalls and end.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use chrono::{TimeZone, Utc};
 use flotilla_engine_convoys::{
@@ -13,9 +16,9 @@ use flotilla_protocol::{PrincipalRef, Relationship};
 use flotilla_resources::{
     address::{stored_change_request_address, subject_for},
     convoy::{admission::AdmissionDocument, engine::seat_address},
-    convoy_records::{ConvoyEnd, ConvoyRecords, SeatRecord, SeatStall},
+    convoy_records::{ConvoyEnd, ConvoyJoins, ConvoyRecord, ConvoyRecords, Ending, SeatRecord, SeatStall},
     workflow_template::single_agent_workflow_spec,
-    SubjectDiscoverySource, WorkflowSnapshot,
+    ConvoyPhase, SubjectDiscoverySource, WorkflowSnapshot,
 };
 use flotilla_schema::{Address, Frozen, Kind, NewChange, Timestamp};
 use flotilla_schema_sqlite::{
@@ -200,7 +203,7 @@ fn a_launch_reads_its_seats_links_stalls_and_end() {
     assert_eq!(linked.subject, subject_for(&change).expect("subject"));
     assert_eq!(linked.relationship, Relationship::Produces);
     assert_eq!((linked.sources[0].source, linked.sources[0].at), (SubjectDiscoverySource::Claim, time(3)));
-    assert_eq!(record.ended, Some((ConvoyEnd::Failed { reason: "coder failed".into() }, time(5))));
+    assert_eq!(record.ended, Some(Ending::Held(ConvoyEnd::Failed { reason: "coder failed".into() }, time(5))));
     assert_eq!(records.at(HOME).expect("at home").records.len(), 1);
     assert_eq!(records.every().expect("every").records.len(), 1);
 }
@@ -313,7 +316,7 @@ fn a_replica_snapshotted_a_retired_launch_reads_its_end() {
     let records = EngineConvoyRecords::new(HOME, Arc::clone(&home_a), Arc::default(), OpenAwaiting::open(&home_a).expect("open records"));
     let record = records.get(&launch, Some("home-b")).expect("read").expect("the replica");
     assert!(record.retired);
-    assert_eq!(record.ended, Some((ConvoyEnd::Failed { reason: "coder failed".into() }, time(2))));
+    assert_eq!(record.ended, Some(Ending::Held(ConvoyEnd::Failed { reason: "coder failed".into() }, time(2))));
 
     let end = home_b
         .with_store(|store| store.read()?.changes_since("home-b", ended - 1, 1))
@@ -331,7 +334,7 @@ fn a_replica_snapshotted_a_retired_launch_reads_its_end() {
         .expect("apply");
     assert!(matches!(applied, Applied::Duplicate(_)), "{applied:?}");
     let record = records.get(&launch, Some("home-b")).expect("read").expect("the replica");
-    assert_eq!(record.ended, Some((ConvoyEnd::Failed { reason: "coder failed".into() }, time(2))));
+    assert_eq!(record.ended, Some(Ending::Held(ConvoyEnd::Failed { reason: "coder failed".into() }, time(2))));
 }
 
 // Behaviour (#3108): a replica holding a retired launch by snapshot resumes from its own
@@ -404,7 +407,39 @@ fn a_relay_holding_a_retired_launch_by_snapshot_snapshots_a_follower_behind_its_
         EngineConvoyRecords::new("home-c", Arc::clone(&home_c), Arc::default(), OpenAwaiting::open(&home_c).expect("open records"));
     let record = records.get(&launch, Some("home-b")).expect("read").expect("the replica");
     assert!(record.retired);
-    assert_eq!(record.ended, Some((ConvoyEnd::Failed { reason: "coder failed".into() }, time(2))));
+    assert_eq!(record.ended, Some(Ending::Held(ConvoyEnd::Failed { reason: "coder failed".into() }, time(2))));
+}
+
+// Behaviour (#3108): a replica restored from a snapshot that carries no end entry (one an earlier
+// generation served) holds a retired launch without the entry saying how it ended. Retired is
+// ended: the launch reads as ended, how not held here, in a read by name and in its old-shape
+// view, whose phase is terminal, so nothing counts it as live.
+#[test]
+fn a_retired_launch_whose_end_is_not_held_reads_as_ended() {
+    let (dir_b, dir_a) = (tempfile::tempdir().expect("tempdir"), tempfile::tempdir().expect("tempdir"));
+    let registry = flotilla_provisioning::stored::decided_registry().expect("registry");
+    // A home whose store declares nothing a Convoy snapshot carries.
+    let home_b = Arc::new(Service::open(&dir_b.path().join("decided.sqlite"), "home-b", registry).expect("store"));
+    let convoys = Convoys::open("home-b", &home_b).expect("open");
+    let launch = admitted(&convoys);
+    failed_and_retired(&convoys, &launch);
+
+    let home_a = service_at(&dir_a, HOME);
+    assert!(round(&home_b, "home-b", None, &home_a).snapshot);
+    let records = EngineConvoyRecords::new(HOME, Arc::clone(&home_a), Arc::default(), OpenAwaiting::open(&home_a).expect("open records"));
+    let record = records.get(&launch, Some("home-b")).expect("a retired launch reads").expect("the replica");
+    assert!(record.retired);
+    assert_eq!(record.ended, Some(Ending::NotHeld));
+    let named = records.named(&launch, Some("home-b")).expect("read by name");
+    assert_eq!((named.records.len(), named.unreadable.len()), (1, 0), "{named:?}");
+
+    assert!(record.is_terminal(&[]), "a retired launch is not live");
+    let view = record.read_view("flotilla", ConvoyJoins { works: &BTreeMap::new(), working: &BTreeSet::new(), notes: None });
+    let status = view.status.expect("an ended launch's view has a status");
+    assert_eq!(status.phase, ConvoyPhase::Ended);
+    assert!(status.phase.is_terminal());
+    assert_eq!((status.disposition, status.finished_at), (None, None), "how and when it ended are not held here");
+    assert_eq!(status.message.as_deref(), Some(ConvoyRecord::END_NOT_HELD));
 }
 
 // Behaviour: a crew that hands its work to a crew it fans out reads as handed back, under its old

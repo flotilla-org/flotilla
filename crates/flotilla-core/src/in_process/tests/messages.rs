@@ -78,7 +78,7 @@ async fn new_message_mutations_route_to_the_absent_receivers_home() {
             flotilla_engine_convoys_testkit::single_agent("coder"),
         )
         .await;
-    flotilla_provisioning_testkit::replicate_home(remote.service(), "receiver", &daemon.decided_store().expect("decided store"));
+    flotilla_provisioning_testkit::replicate_home(remote.service(), "receiver", &daemon.decided_store());
     let action = CommandAction::ResourceApply {
         namespace: "flotilla".into(),
         document: serde_json::json!({
@@ -173,7 +173,7 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         Some(daemon.node_id().clone())
     );
     // The reviewer is declared at another home and reaches this daemon through that home's log.
-    let decided = daemon.decided_store().expect("decided store");
+    let decided = daemon.decided_store();
     let remote = flotilla_provisioning_testkit::other_home_for(&decided, "remote-holder-home");
     let reviewer = flotilla_resources::ConvoyEnsureSpec::builder()
         .project_ref("flotilla".into())

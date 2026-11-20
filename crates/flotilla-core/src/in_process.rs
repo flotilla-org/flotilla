@@ -697,7 +697,8 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
         | flotilla_resources::ConvoyPhase::Interrupted
         | flotilla_resources::ConvoyPhase::Landing
         | flotilla_resources::ConvoyPhase::Landed
-        | flotilla_resources::ConvoyPhase::Abandoned => None,
+        | flotilla_resources::ConvoyPhase::Abandoned
+        | flotilla_resources::ConvoyPhase::Ended => None,
     }
 }
 
@@ -747,19 +748,18 @@ const ENVIRONMENT_ADOPTION_DEADLINE: std::time::Duration = std::time::Duration::
 
 pub struct InProcessDaemon {
     change_stream_rounds: change_stream::Rounds,
-    decided_store: std::sync::Mutex<Option<Arc<flotilla_schema_sqlite::stream::Service>>>,
+    decided_store: Arc<flotilla_schema_sqlite::stream::Service>,
     /// The decided store's holds as load metrics: each lock's wait and time held, as a read or a write.
     decided_store_metrics: Arc<flotilla_store::load_metrics::StoreLoadMetrics>,
     change_request_branches: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>>,
     /// The forge observations' records (ChangeRequest and Issue), whose changes wake the aggregator.
     observation_records: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::KindRecords<flotilla_resources::ChangeRequest>>>,
-    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4), installed with
-    /// the decided store's provisioning homes; none before, and none with the switch off.
+    /// The engine's provisioning readings (#3629 layer 4), installed with the decided store's
+    /// provisioning homes; none before.
     lifecycle_reads: Arc<flotilla_projections::ports::LateLifecycleReads>,
     /// The Convoy views composed over those readings, installed with them.
     convoy_views: std::sync::OnceLock<Arc<flotilla_store::ConvoyViews>>,
-    /// The account kinds' records (#3824 layer 1): the old store's, or the engine's once
-    /// installed behind `[primitives]`.
+    /// The account kinds' records (#3824 layer 1): the engine's.
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
     standing_roles: Arc<dyn flotilla_resources::standing_roles::StandingRoles>,
@@ -802,23 +802,20 @@ pub struct InProcessDaemon {
     convoy_ensure_reconciler: RwLock<Option<Arc<dyn ConvoyEnsureReconciler>>>,
     crew: Arc<CrewService>,
     leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics,
-    /// The `[primitives]` Message path, installed once at composition.
-    message_path: flotilla_engine_messages::MessagePath,
+    /// The engine's Message path over the decided store, opened at composition.
+    messages: Arc<flotilla_engine_messages::MessagePrimitives>,
     /// What this daemon has seen of its crews' progress beside their AgentSessions: in memory
     /// only, for its stall check and delivery confirmation (#3108).
     crew_progress: Arc<flotilla_resources::agent_activity::ProgressFacts>,
     /// The same path, as crew code reaches it: through its EngineMessages port.
     crew_message_path: flotilla_crew::ports::MessagePath,
-    /// The `[primitives]` Convoy path (#3587 layer 6), as crew code and the
-    /// convoy reconciler reach it.
+    /// The engine's Convoy path (#3587 layer 6), as crew code and the convoy reconciler reach it;
+    /// filled at composition.
     convoy_engine_path: flotilla_resources::convoy::engine::EngineConvoyPath,
     /// The engine Convoys behind that path, for readers of its records and its home's memory.
-    engine_convoys: std::sync::OnceLock<Arc<Convoys>>,
-    /// The engine's convoys as their readers read them, once the Convoy path is installed.
-    convoy_records: std::sync::OnceLock<Arc<EngineConvoyRecords>>,
-    /// The decided store's open AwaitingReply records, once the Convoy path is installed: one
-    /// set, which the convoys' readers and the Message path's writer share.
-    open_awaiting: std::sync::OnceLock<Arc<flotilla_engine_messages::awaiting::OpenAwaiting>>,
+    engine_convoys: Arc<Convoys>,
+    /// The engine's convoys as their readers read them.
+    convoy_records: Arc<EngineConvoyRecords>,
     message_receivers: projection_ports::MessageReceivers,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
     /// Unique identity for this daemon instance, generated at startup.
@@ -874,7 +871,7 @@ pub struct EngineIdentity {
     pub clock: Arc<dyn Clock>,
 }
 
-/// The decided store behind `[primitives]`, opened before anything reads a resource (#3108): the
+/// The decided store, opened before anything reads a resource (#3108): the
 /// store, the ports serving its kinds through the backend, and the forge observations' failures.
 pub struct ComposedEngine {
     pub service: Arc<flotilla_schema_sqlite::stream::Service>,
@@ -1151,6 +1148,28 @@ impl InProcessDaemon {
         resource_backend.serve_engine_in(DEFAULT_PROVISIONING_NAMESPACE);
         let identity = EngineIdentity { node_id: local_node_id.clone(), host_id: local_host_id.clone(), clock: Arc::clone(&clock) };
         let engine = engine(identity).await?;
+        if !engine.service.with_store(|store| Ok(store.kinds().iter().next().is_some())).map_err(|error| error.to_string())? {
+            return Err("decided store has no registered kinds".into());
+        }
+        // The engine's Convoy and Message paths over the decided store, at this daemon's home
+        // (#3317, #3587 layer 6). Blocking: restoring the Message path reads the store.
+        let (convoys, open_awaiting, messages) = {
+            let home = local_node_id.as_str().to_owned();
+            let service = Arc::clone(&engine.service);
+            let backend = resource_backend.clone();
+            let clock = Arc::clone(&clock);
+            tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+                let convoys = Arc::new(Convoys::open(&home, &service)?);
+                // The store's open AwaitingReply records, held once: the convoys' readers read
+                // their seats' stalls from them, and the Message path's writer keeps them.
+                let open = flotilla_engine_messages::awaiting::OpenAwaiting::open(&service)?;
+                let messages =
+                    Arc::new(flotilla_engine_messages::MessagePrimitives::open_over(&home, service, backend, clock, Arc::clone(&open))?);
+                Ok::<_, String>((convoys, open, messages))
+            }))
+            .await
+            .map_err(|error| format!("open the engine's Message path: {error}"))??
+        };
         for records in &engine.records {
             resource_backend.install_engine_records(Arc::clone(records));
         }
@@ -1393,7 +1412,6 @@ impl InProcessDaemon {
             Arc::new(ProviderIssueObservationSource { backend: resource_backend.clone(), query_port: Arc::clone(&issue_query_port) }),
             flotilla_observation::issue_observer::IssueRefreshCadence::default(),
         );
-        let message_path = flotilla_engine_messages::MessagePath::default();
         let crew_message_path = flotilla_crew::ports::MessagePath::default();
         let convoy_engine_path = flotilla_resources::convoy::engine::EngineConvoyPath::default();
         let change_request_observer = change_request_refresher.clone();
@@ -1444,6 +1462,20 @@ impl InProcessDaemon {
                 .local_environment_id(local_environment_id.clone())
                 .build(),
         );
+        // Every convoy reader reads the engine's launches, with this home's notes on them; its
+        // readers hear their changes from the store's log.
+        let convoy_records = Arc::new(EngineConvoyRecords::new(
+            local_node_id.as_str(),
+            Arc::clone(&engine.service),
+            Arc::clone(convoys.memory()),
+            Arc::clone(&open_awaiting),
+        ));
+        drop(convoy_records.follow()?);
+        // This home retires its ended convoys as their holds release.
+        drop(flotilla_engine_convoys::retire::follow(Arc::clone(&convoys), Arc::clone(&clock))?);
+        let convoy_engine: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> =
+            Arc::new(ConvoyEngine::new(Arc::clone(&convoys), resource_backend.clone(), Arc::clone(&clock)));
+        convoy_engine_path.set(convoy_engine).map_err(|_| "the Convoy path is already installed".to_owned())?;
         let daemon = Arc::new_cyclic(|self_weak| Self {
             dispatch_board_cache,
             repos: Arc::clone(&repos),
@@ -1501,21 +1533,20 @@ impl InProcessDaemon {
 
             crew: Arc::clone(&crew),
             leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics(leaf_subscriptions),
-            message_receivers: projection_ports::MessageReceivers(Arc::clone(&message_path)),
-            message_path,
+            message_receivers: projection_ports::MessageReceivers(Arc::clone(&messages)),
+            messages,
             crew_progress: Arc::new(flotilla_resources::agent_activity::ProgressFacts::new(clock.now())),
             crew_message_path,
             convoy_engine_path,
-            engine_convoys: std::sync::OnceLock::new(),
-            convoy_records: Default::default(),
-            open_awaiting: Default::default(),
+            engine_convoys: convoys,
+            convoy_records,
             brief_artifact_writer: Arc::clone(&brief_artifact_writer),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
             clock: Arc::clone(&clock),
             surfaces: Surfaces::default(),
-            decided_store: Default::default(),
+            decided_store: Arc::clone(&engine.service),
             decided_store_metrics: Default::default(),
             change_request_branches: Default::default(),
             observation_records: Default::default(),
@@ -1546,7 +1577,8 @@ impl InProcessDaemon {
             local_provider_statuses,
             local_placement_provider_statuses: RwLock::new(Vec::new()),
         });
-        daemon.install_decided_store(engine.service)?;
+        daemon.observe_decided_store()?;
+        daemon.install_message_path()?;
         engine.source_observers.install(Arc::new(flotilla_observation::forge_observation::DaemonSourceObservers::new(
             &daemon.resource_backend,
             Arc::clone(&daemon.provisioning_namespace),
@@ -2322,16 +2354,9 @@ impl InProcessDaemon {
         self.aggregator_projection_state.clone()
     }
 
-    /// Installs the registered ADR 0064 store during composition, before peer tasks start.
-    /// Kind migrations supply their registry without coupling this layer to machine kinds.
-    pub fn install_decided_store(&self, service: Arc<flotilla_schema_sqlite::stream::Service>) -> Result<(), String> {
-        if !service.with_store(|store| Ok(store.kinds().iter().next().is_some())).map_err(|error| error.to_string())? {
-            return Err("decided store has no registered kinds".into());
-        }
-        let mut slot = self.decided_store.lock().map_err(|_| "decided-store lock poisoned".to_owned())?;
-        if slot.is_some() {
-            return Err("decided store is already open".into());
-        }
+    /// Reports the decided store's serving health and lock holds, once, during composition.
+    fn observe_decided_store(&self) -> Result<(), String> {
+        let service = &self.decided_store;
         let fleet = Arc::clone(&self.fleet);
         let clock = Arc::clone(&self.clock);
         service.observe_serving(Arc::new(move |result| {
@@ -2355,30 +2380,19 @@ impl InProcessDaemon {
             wait.record(hold.wait);
             execution.record(hold.held);
         }))?;
-        *slot = Some(Arc::clone(&service));
-        drop(slot);
-        // Convoys are launches on this store, so the store brings this home's Convoy path.
-        self.install_convoy_path(self.node_id().as_str(), &service).map(drop)
+        Ok(())
     }
 
     /// Installs the engine's provisioning readings during composition (#3629 layer 4). Their
     /// AgentSessions are this daemon's own, read from its decided store with what it has seen
-    /// of its crews' progress (#3108), and so are its Convoys once the engine's Convoy path is
-    /// installed. Cached checkout providers then follow the checkout lifetimes they read.
+    /// of its crews' progress (#3108), and so are its Convoys, the engine's launches. Cached
+    /// checkout providers then follow the checkout lifetimes they read.
     pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_projections::ports::LifecycleReads>) -> Result<(), String> {
-        let reads: Arc<dyn flotilla_projections::ports::LifecycleReads> = match self.decided_store() {
-            Ok(service) => {
-                // Every convoy reader reads the engine's launches, so the readings bring the
-                // Convoy path with them; a Message path opened first installed it already.
-                let convoys = self.install_convoy_path(self.node_id().as_str(), &service)?;
-                Arc::new(projection_ports::DecidedReads {
-                    reads,
-                    agent_sessions: DecidedAgentSessions::new(service, Arc::clone(&self.clock), Arc::clone(&self.crew_progress)),
-                    convoys,
-                })
-            }
-            Err(_) => reads,
-        };
+        let reads: Arc<dyn flotilla_projections::ports::LifecycleReads> = Arc::new(projection_ports::DecidedReads {
+            reads,
+            agent_sessions: DecidedAgentSessions::new(self.decided_store(), Arc::clone(&self.clock), Arc::clone(&self.crew_progress)),
+            convoys: Arc::clone(&self.convoy_records),
+        });
         self.lifecycle_reads.install(Arc::clone(&reads))?;
         // A convoy's change request stays demanded until the checkouts it holds are released.
         self.change_request_observer.install_lifecycle_reads(Arc::clone(&reads))?;
@@ -2413,7 +2427,7 @@ impl InProcessDaemon {
         self.accounts.clone()
     }
 
-    /// Serves ChangeRequest and Issue from the engine's records behind `[primitives]`, and switches
+    /// Serves ChangeRequest and Issue from the engine's records, and switches
     /// the observers to write only what they observe. Records nothing demands after one lease are
     /// swept.
     pub fn install_observation_records(
@@ -2463,32 +2477,13 @@ impl InProcessDaemon {
         self.convoy_views.get().cloned().ok_or_else(|| "the Convoy views are not installed".to_owned())
     }
 
-    /// Opens the Message path over the decided store composed with this daemon and installs it
-    /// (#3317). Blocking: restoring the path reads the store.
-    pub fn open_message_primitives(&self) -> Result<Arc<flotilla_engine_messages::MessagePrimitives>, String> {
-        let service =
-            self.decided_store().map_err(|error| format!("[primitives] needs the decided store composed with the daemon: {error}"))?;
-        let open = self.open_awaiting.get().cloned().ok_or("the Convoy path is not installed with the decided store")?;
-        let primitives = Arc::new(flotilla_engine_messages::MessagePrimitives::open_over(
-            self.node_id().as_str(),
-            service,
-            self.resource_backend(),
-            self.clock_for_scenarios(),
-            open,
-        )?);
-        self.install_message_primitives(Arc::clone(&primitives))?;
-        Ok(primitives)
-    }
-
-    /// Installs the `[primitives]` Message path during composition (#3317),
-    /// after its decided store, with the Convoy path over the same store and
-    /// home (#3587 layer 6). Absent, every Message stays in the old store.
-    pub fn install_message_primitives(&self, primitives: Arc<flotilla_engine_messages::MessagePrimitives>) -> Result<(), String> {
-        self.install_convoy_path(primitives.home(), primitives.service())?;
+    /// Installs the Message path opened at composition (#3317) into its readers: the resource
+    /// backend's attentions and Message records, and the crew's port.
+    fn install_message_path(&self) -> Result<(), String> {
+        let primitives = Arc::clone(&self.messages);
         primitives.install_lifecycle_reads(self.lifecycle_reads())?;
         let (change_request, issue) = self.crew.message_observation_staleness();
         primitives.install_observation_staleness(change_request, issue)?;
-        self.message_path.set(Arc::clone(&primitives)).map_err(|_| "the Message path is already installed".to_owned())?;
         self.resource_backend.install_attentions(Arc::clone(&primitives) as Arc<dyn flotilla_resources::attentions::Attentions>);
         self.resource_backend
             .install_engine_records(Arc::new(MessageRecords::new(Arc::clone(&primitives), Arc::clone(&self.provisioning_namespace))));
@@ -2496,52 +2491,17 @@ impl InProcessDaemon {
         self.crew_message_path.set(engine).map_err(|_| "the crew's Message path is already installed".to_owned())
     }
 
-    /// Installs the Convoy path over decided store `service` at `home`, once: a second install at
-    /// the same home finds it in place, one at another home is refused. Returns its readers' records.
-    fn install_convoy_path(
-        &self,
-        home: &str,
-        service: &Arc<flotilla_schema_sqlite::stream::Service>,
-    ) -> Result<Arc<EngineConvoyRecords>, String> {
-        if let (Some(installed), Some(records)) = (self.engine_convoys.get(), self.convoy_records.get()) {
-            return if installed.home() == home {
-                Ok(Arc::clone(records))
-            } else {
-                Err(format!("the Convoy path is installed at home `{}`, not `{home}`", installed.home()))
-            };
-        }
-        let convoys = Arc::new(Convoys::open(home, service)?);
-        self.engine_convoys.set(Arc::clone(&convoys)).map_err(|_| "the Convoy path is already installed".to_owned())?;
-        // The store's open AwaitingReply records, held once: the convoys' readers read their
-        // seats' stalls from them, and the Message path's writer keeps them.
-        let open = flotilla_engine_messages::awaiting::OpenAwaiting::open(service)?;
-        self.open_awaiting.set(Arc::clone(&open)).map_err(|_| "the Convoy path is already installed".to_owned())?;
-        // Every convoy reader reads the engine's launches, with this home's notes on them; its
-        // readers hear their changes from the store's log, on the runtime composing this daemon.
-        let records = Arc::new(EngineConvoyRecords::new(home, Arc::clone(service), Arc::clone(convoys.memory()), open));
-        if tokio::runtime::Handle::try_current().is_ok() {
-            drop(records.follow()?);
-            // This home retires its ended convoys as their holds release.
-            drop(flotilla_engine_convoys::retire::follow(Arc::clone(&convoys), self.clock_for_scenarios())?);
-        }
-        self.convoy_records.set(Arc::clone(&records)).map_err(|_| "the Convoy path is already installed".to_owned())?;
-        let engine: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> =
-            Arc::new(ConvoyEngine::new(convoys, self.resource_backend(), self.clock_for_scenarios()));
-        self.convoy_engine_path.set(engine).map_err(|_| "the Convoy path is already installed".to_owned())?;
-        Ok(records)
-    }
-
-    /// The crew's `[primitives]` Message path: empty until the switch's primitives are installed.
+    /// The crew's Message path: the engine's, filled at composition.
     pub fn crew_message_path(&self) -> flotilla_crew::ports::MessagePath {
         Arc::clone(&self.crew_message_path)
     }
 
-    /// The engine Convoys: absent until the switch's primitives are installed.
-    pub fn engine_convoys(&self) -> Option<&Arc<Convoys>> {
-        self.engine_convoys.get()
+    /// The engine Convoys at this daemon's home.
+    pub fn engine_convoys(&self) -> &Arc<Convoys> {
+        &self.engine_convoys
     }
 
-    /// The `[primitives]` Convoy path: empty until the switch's primitives are installed.
+    /// The engine's Convoy path, filled at composition.
     pub fn convoy_engine_path(&self) -> flotilla_resources::convoy::engine::EngineConvoyPath {
         Arc::clone(&self.convoy_engine_path)
     }
@@ -2551,9 +2511,9 @@ impl InProcessDaemon {
         Arc::clone(&self.crew_progress)
     }
 
-    /// The `[primitives]` Message path, when the switch is on.
-    pub fn message_primitives(&self) -> Option<Arc<flotilla_engine_messages::MessagePrimitives>> {
-        self.message_path.get().cloned()
+    /// The engine's Message path over the decided store, opened at composition.
+    pub fn message_primitives(&self) -> Arc<flotilla_engine_messages::MessagePrimitives> {
+        Arc::clone(&self.messages)
     }
 
     /// Peer replication entry point; the router supplies the originating node from
@@ -2566,7 +2526,7 @@ impl InProcessDaemon {
         session: Option<String>,
     ) -> Result<CommandValue, String> {
         self.change_stream_rounds
-            .next(peer, home, self.decided_store()?, after, session, {
+            .next(peer, home, self.decided_store(), after, session, {
                 let clock = Arc::clone(&self.clock);
                 Arc::new(move || flotilla_schema::Timestamp::from_datetime(&clock.now()))
             })
@@ -2579,20 +2539,15 @@ impl InProcessDaemon {
         self.change_stream_rounds.peer(session).await
     }
 
-    /// Present only after the first kind migration installs its registered store.
     /// The decided store's load metrics: each write it commits, local or applied from another
     /// home, with how long it ran.
     pub fn decided_store_metrics(&self) -> Arc<flotilla_store::load_metrics::StoreLoadMetrics> {
         Arc::clone(&self.decided_store_metrics)
     }
 
-    pub fn decided_store(&self) -> Result<Arc<flotilla_schema_sqlite::stream::Service>, String> {
-        self.decided_store
-            .lock()
-            .map_err(|_| "decided-store lock poisoned".to_owned())?
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "decided store unavailable".to_owned())
+    /// The decided store composed with this daemon.
+    pub fn decided_store(&self) -> Arc<flotilla_schema_sqlite::stream::Service> {
+        Arc::clone(&self.decided_store)
     }
 
     pub fn resource_backend(&self) -> ResourceBackend {
@@ -3197,7 +3152,7 @@ impl InProcessDaemon {
         }
         let namespace = self.provisioning_namespace().await;
         let (repository, _) = self.repository_address_of(&namespace, repo_ref).await?;
-        let primitives = self.message_primitives().ok_or_else(|| "branch validation has no Message path".to_owned())?;
+        let primitives = self.message_primitives();
         primitives.observe_branch(&namespace, &repository, branch).await?;
         let (service, scope) = flotilla_resources::address::stored_service_scope(&repository)
             .ok_or_else(|| format!("{repository} names no forge repository"))?;
@@ -4030,6 +3985,7 @@ impl InProcessDaemon {
             flotilla_resources::ConvoyPhase::Landed => "landed",
             flotilla_resources::ConvoyPhase::Failed => "failed",
             flotilla_resources::ConvoyPhase::Abandoned => "abandoned",
+            flotilla_resources::ConvoyPhase::Ended => "ended",
         };
         let detail = convoy.status.as_ref().and_then(|status| status.message.as_deref());
         if stages.is_empty() {
@@ -5016,7 +4972,7 @@ impl InProcessDaemon {
     }
 
     async fn inspect_session_checkouts(&self, namespace: &str, session: &str) -> Result<(), String> {
-        let primitives = self.message_primitives().ok_or("the Message path is not installed")?;
+        let primitives = self.message_primitives();
         let session = self
             .resource_backend
             .using::<flotilla_resources::TerminalSession>(namespace)
@@ -5298,7 +5254,7 @@ impl InProcessDaemon {
     async fn message_origin(&self, namespace: &str, document: &serde_json::Value) -> Result<Option<NodeId>, String> {
         let Some(name) = document.pointer("/metadata/name").and_then(serde_json::Value::as_str) else { return Ok(None) };
         let intent = message_intent(document).map_err(|error| error.to_string())?;
-        let primitives = self.message_primitives().ok_or("no Message path is installed")?;
+        let primitives = self.message_primitives();
         if let Some(admitted) = primitives.admitted(&intent.inbox, name).map_err(|error| error.to_string())? {
             return Ok(Some(if admitted.home == primitives.home() { self.node_id.clone() } else { NodeId::new(admitted.home) }));
         }
@@ -5310,7 +5266,7 @@ impl InProcessDaemon {
         let intent = message_intent(document).map_err(|error| error.to_string())?;
         if intent.inbox.get(flotilla_address::Kind::Fleet).is_some() {
             let original_id = intent.in_reply_to.as_deref().ok_or("a fleet role's inbox takes only a correlated reply")?;
-            let primitives = self.message_primitives().ok_or("no Message path is installed")?;
+            let primitives = self.message_primitives();
             return off_frame(|| self.fleet_role_reply_origin(&primitives, namespace, &intent, original_id)).await.map(Some);
         }
         let inbox = &intent.inbox;
@@ -5724,7 +5680,7 @@ impl InProcessDaemon {
         let meta: InputMeta = serde_json::from_value(document.get("metadata").cloned().unwrap_or_default())
             .map_err(|error| ResourceError::decode(format!("message metadata: {error}")))?;
         let intent = message_intent(document)?;
-        let primitives = self.message_primitives().ok_or_else(|| ResourceError::other("no Message path is installed"))?;
+        let primitives = self.message_primitives();
         let admitted = primitives.admit(&meta.name, &intent).await?;
         // The admitted record (or the one that suppressed it) and the home holding it.
         Ok(flotilla_store::DynamicResourceObject {
@@ -6066,11 +6022,9 @@ impl InProcessDaemon {
             services.extend(convoy.spec.issues.iter().map(|issue| issue.reference.source.service.trim_end_matches('/').to_string()));
             explanation.warnings.extend(failures.into_iter().filter(|(service, _)| services.contains(service)).map(|(_, error)| error));
         }
-        if let Some(primitives) = self.message_primitives() {
-            match primitives.delivery_wait(&namespace).await {
-                Ok(wait) => explanation.warnings.extend(wait),
-                Err(error) => explanation.warnings.push(format!("message delivery readiness is unknown: {error}")),
-            }
+        match self.message_primitives().delivery_wait(&namespace).await {
+            Ok(wait) => explanation.warnings.extend(wait),
+            Err(error) => explanation.warnings.push(format!("message delivery readiness is unknown: {error}")),
         }
         match self.convoy_dispatch_scores(&namespace, &convoy).await {
             Ok(scores) => explanation.dispatch_scores = scores,
@@ -6603,7 +6557,7 @@ impl flotilla_crew::ports::CheckoutIntegrationInspector for CheckoutInspector {
     #[tracing::instrument(name = "checkout_landing_evidence", skip_all, fields(checkout = %checkout.name, home = %checkout.home))]
     async fn inspect_now(&self, namespace: &str, checkout: &flotilla_resources::checkout_records::CheckoutRecord) -> Result<(), String> {
         let daemon = self.0.upgrade().ok_or("checkout inspector daemon unavailable")?;
-        let primitives = daemon.message_primitives().ok_or("the Message path is not installed")?;
+        let primitives = daemon.message_primitives();
         primitives.inspect_checkout(namespace, &checkout.home, checkout.checkout_name()).await
     }
 }

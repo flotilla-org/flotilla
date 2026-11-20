@@ -3432,11 +3432,12 @@ fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
         ResourceConvoyPhase::Abandoned => ConvoyPhase::Abandoned,
         ResourceConvoyPhase::Landed => ConvoyPhase::Landed,
         ResourceConvoyPhase::Failed => ConvoyPhase::Failed,
+        ResourceConvoyPhase::Ended => ConvoyPhase::Ended,
     }
 }
 
 fn convoy_phase_is_terminal(phase: ResourceConvoyPhase) -> bool {
-    matches!(phase, ResourceConvoyPhase::Landed | ResourceConvoyPhase::Failed | ResourceConvoyPhase::Abandoned)
+    phase.is_terminal()
 }
 
 fn convoy_is_initializing(status: Option<&ConvoyStatus>) -> bool {

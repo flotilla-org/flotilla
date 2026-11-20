@@ -3,8 +3,8 @@ use super::*;
 /// Sends everything `source`'s decided store holds of its own home to `target`'s, as its log
 /// arrives at a peer.
 pub(super) fn replicate_decided_store(source: &InProcessDaemon, target: &InProcessDaemon) {
-    let from = source.decided_store().expect("source decided store");
-    let to = target.decided_store().expect("target decided store");
+    let from = source.decided_store();
+    let to = target.decided_store();
     flotilla_provisioning_testkit::replicate_home(&from, source.node_id().as_str(), &to);
 }
 
@@ -20,7 +20,7 @@ pub(super) async fn bridge_runtime_resource_stores(first: &InProcessDaemon, seco
 /// the home's log has passed the follower's cursor; the bridge runs every few milliseconds beside
 /// both daemons' controllers on the test's one runtime thread.
 async fn follow_engine_home(from: &InProcessDaemon, to: &InProcessDaemon) {
-    let (Ok(from), Ok(to)) = (from.decided_store(), to.decided_store()) else { return };
+    let (from, to) = (from.decided_store(), to.decided_store());
     tokio::task::spawn_blocking(move || {
         let home = from.home().to_owned();
         let after = to.last_sequence(&home).expect("the follower's cursor");
@@ -77,7 +77,7 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
     let kiwi_provisioning = engine_startup(&kiwi, NAMESPACE, &kiwi_profile).await.expect("register kiwi resources");
     let feta_provisioning = engine_startup(&feta, NAMESPACE, &feta_profile).await.expect("register feta resources");
     assert_eq!(
-        feta.decided_store().expect("feta decided store").last_sequence(kiwi.node_id().as_str()).expect("feta's cursor on kiwi"),
+        feta.decided_store().last_sequence(kiwi.node_id().as_str()).expect("feta's cursor on kiwi"),
         0,
         "the placement host must begin holding nothing of kiwi's"
     );

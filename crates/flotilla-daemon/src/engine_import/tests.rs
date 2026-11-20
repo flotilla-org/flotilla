@@ -611,8 +611,9 @@ fn an_imported_environment_and_terminal_session_keep_their_lease_after_the_first
     let imported = read.load::<EngineResource<Lifecycle<EnvironmentKind>>>(id).expect("load").expect("environment").value;
     assert_eq!(imported.spec().holder, held, "the environment is held for the launch");
 
+    // Named for the launch, as the vessel's seats ask for its crew's session.
     let (id, _) = *read
-        .integer_index_keys_before(&TerminalSessionKind::by_launch("terminal-live-work-coder"), HERE, i64::MAX, 1)
+        .integer_index_keys_before(&TerminalSessionKind::by_launch(&format!("terminal-{}-coder", launch.name())), HERE, i64::MAX, 1)
         .expect("launches")
         .first()
         .expect("the session's launch");
@@ -1654,6 +1655,80 @@ fn snapshots_only_an_ended_convoy_references_are_dropped() {
         assert_eq!((rows.imported, rows.dropped), (1, 1), "{kind}: {rows:?}");
         assert_eq!(rows.drops.get("a snapshot no live convoy references"), Some(&1), "{kind}: {rows:?}");
     }
+}
+
+// Behaviour (#3108, r983 cut-over): a live crew's managed checkouts import under the names its
+// vessel asks for them by on the engine: a convoy's worktree is named for the convoy launch it is
+// held for, a clone made in a vessel for the vessel launch, each keeping its repository and
+// placement suffix. Under the old store's names the vessel asked for a second checkout of the same
+// branch, which gave up, and the vessel and its convoy failed with it (feta and udder, r983).
+#[test]
+fn a_live_crews_checkouts_import_under_the_names_its_vessel_asks_for() {
+    use flotilla_provisioning::stored::checkout::CheckoutKind;
+    use flotilla_resources::{
+        checkout_path::{checkout_name, vessel_launch_slug},
+        CONVOY_LABEL,
+    };
+    use flotilla_state_machines::{
+        machines::{convoy::Convoy as EngineConvoy, lifecycle::Lifecycle, vessel::VesselKind},
+        Resource as Record,
+    };
+
+    const SCOPE: &str = "0123456789ab";
+    let held_for_demo = |name: &str, spec: Value| {
+        let mut checkout = document("Checkout", name, spec, json!({"phase": "Ready", "path": format!("/w/{name}")}));
+        checkout["metadata"]["labels"] = json!({ (CONVOY_LABEL): "demo" });
+        checkout
+    };
+    let worktree = checkout_name("demo", "repo", true, Some(SCOPE));
+    let in_vessel = checkout_name("demo-implement", "repo", false, Some(SCOPE));
+    let documents = vec![
+        live_convoy("demo"),
+        clone("clone-a"),
+        document(
+            "Vessel",
+            "demo-implement",
+            json!({"convoy_ref": "demo", "vessel_name": "implement", "fulfilment_kind_ref": "p"}),
+            json!({"phase": "Ready", "environment_ref": "env-b",
+                "placement_decision": {"policy_name": "p", "target_host": {"ref": HERE, "display_name": HERE}}}),
+        ),
+        held_for_demo(
+            &worktree,
+            json!({"kind": "worktree", "repo_ref": "repo", "env_ref": "env-a", "ref": "feature", "target_path": "/w/a", "clone_ref": "clone-a"}),
+        ),
+        held_for_demo(
+            &in_vessel,
+            json!({"kind": "fresh_clone", "repo_ref": "repo", "env_ref": "env-b", "ref": "feature", "target_path": "/w/b",
+                "url": "https://github.com/org/repo"}),
+        ),
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut target =
+        Import::create(&dir.path().join(ENGINE_STORE), HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&rows(documents), &mut target);
+    drop(target);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    assert_eq!(summary.kinds["Checkout"].imported, 2, "{summary:?}");
+
+    let mut store = engine(dir.path());
+    let mut read = store.read().expect("read");
+    macro_rules! names {
+        ($record:ty) => {{
+            let page = read.scan::<$record>(HERE, None, 8).expect("scan");
+            page.ids.into_iter().filter_map(|id| read.load::<$record>(id).expect("load")).map(|loaded| loaded.name).collect::<Vec<_>>()
+        }};
+    }
+    let [convoy] = names!(Record<EngineConvoy>).try_into().expect("one convoy launch");
+    let [vessel] = names!(Record<Lifecycle<VesselKind>>).try_into().expect("one vessel launch");
+    let mut checkouts: Vec<_> = names!(Record<Lifecycle<CheckoutKind>>)
+        .iter()
+        .map(|launch| flotilla_resources::checkout_records::launched(launch).to_owned())
+        .collect();
+    checkouts.sort();
+    let mut expected =
+        vec![checkout_name(&convoy, "repo", true, Some(SCOPE)), checkout_name(&vessel_launch_slug(&vessel), "repo", false, Some(SCOPE))];
+    expected.sort();
+    assert_eq!(checkouts, expected, "named for {convoy} and {vessel}, not {worktree} and {in_vessel}");
 }
 
 // Behaviour (#3108): a live convoy's labelled placement snapshot is labelled with the launch the

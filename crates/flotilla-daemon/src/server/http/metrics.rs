@@ -138,14 +138,12 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
         out.histogram("flotilla_store_queue_wait_seconds", &labels, wait);
         out.histogram("flotilla_store_execution_seconds", &labels, execution);
     }
-    if let Ok(service) = daemon.decided_store() {
-        let wal = service.wal();
-        let labels = ",store=\"decided\"";
-        out.number("flotilla_store_wal_frames", "gauge", labels, wal.frames);
-        out.number("flotilla_store_wal_uncheckpointed_frames", "gauge", labels, wal.uncheckpointed);
-        for (result, count) in [("complete", wal.complete), ("starved", wal.starved)] {
-            out.number("flotilla_store_wal_checkpoints_total", "counter", &format!("{labels},result=\"{result}\""), count);
-        }
+    let wal = daemon.decided_store().wal();
+    let labels = ",store=\"decided\"";
+    out.number("flotilla_store_wal_frames", "gauge", labels, wal.frames);
+    out.number("flotilla_store_wal_uncheckpointed_frames", "gauge", labels, wal.uncheckpointed);
+    for (result, count) in [("complete", wal.complete), ("starved", wal.starved)] {
+        out.number("flotilla_store_wal_checkpoints_total", "counter", &format!("{labels},result=\"{result}\""), count);
     }
     if let Some(controllers) = metrics.controllers.get() {
         // Kinds are registered by the compiled controller set, never resource IDs.
@@ -176,10 +174,9 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
     for (caller, reads) in callers() {
         out.reads(&caller, &reads);
     }
-    if let Some(convoys) = daemon.engine_convoys() {
-        out.number("flotilla_convoys_waiting_capacity", "gauge", "", convoys.memory().capacity_waits());
-        out.number("flotilla_convoys_unreadable", "gauge", "", convoys.memory().unreadable());
-    }
+    let convoys = daemon.engine_convoys().memory();
+    out.number("flotilla_convoys_waiting_capacity", "gauge", "", convoys.capacity_waits());
+    out.number("flotilla_convoys_unreadable", "gauge", "", convoys.unreadable());
     for ((project, workflow), histogram) in crate::dispatch_reconciler::DispatchMetrics::global().snapshot() {
         let labels = format!(",project=\"{}\",workflow=\"{}\"", escaped(&project), escaped(&workflow));
         out.histogram("flotilla_dispatch_time_from_ready_seconds", &labels, &histogram);

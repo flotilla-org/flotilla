@@ -369,6 +369,45 @@ mod tests {
         }
     }
 
+    // A definition every home stores a copy of (a project layer each home syncs) reads as one
+    // definition, not as a clash of its copies: admission refused the governor's placement with
+    // "image layer `wheelhouse` version `1.1.0` is defined twice".
+    #[tokio::test]
+    async fn layer_stored_by_two_homes_reads_once() {
+        use flotilla_resources::{ImageLayerResourceSpec, ImageLayerSource, ImageLayerSpec, ImageLayerTier, InputMeta};
+        let backend = flotilla_provisioning_testkit::EngineBackend::open("kiwi");
+        let layer = ImageLayerSpec::builder()
+            .name("wheelhouse".into())
+            .version("1.1.0".into())
+            .tier(ImageLayerTier::Project)
+            .source(ImageLayerSource::Project)
+            .project("wheelhouse".into())
+            .fragment("FROM ${BASE}\nRUN echo wheelhouse\n".into())
+            .provides(["project:wheelhouse".to_string()].into())
+            .probe("true".into())
+            .build();
+        let name = layer.resource_name();
+        let spec = ImageLayerResourceSpec::from(layer);
+        backend
+            .definitions::<ImageLayer>("flotilla")
+            .apply(&InputMeta::builder().name(name.clone()).build(), &spec)
+            .await
+            .expect("kiwi's copy");
+        let feta = backend.other_home("feta");
+        feta.definition::<ImageLayer>(&name, &spec).await;
+        backend.receive(&feta);
+
+        let layers = declared_image_layers(&backend, "flotilla").await.expect("layers");
+        assert_eq!(layers.iter().filter(|layer| layer.metadata.name == name).count(), 1, "one definition per name");
+        let catalogue = read_image_catalogue(&backend, "flotilla").await.expect("catalogue");
+        assert_eq!(catalogue.layers().iter().filter(|layer| layer.name == "wheelhouse").count(), 1);
+        let clashes = catalogue.effective("wheelhouse").check().err().unwrap_or_default();
+        assert!(
+            !clashes.iter().any(|error| matches!(error, flotilla_resources::ImageResolutionError::Clash { .. })),
+            "no clash: {clashes:?}"
+        );
+    }
+
     fn builder(arch: &str, slots: u32) -> Option<ImageBuildCapacity> {
         Some(ImageBuildCapacity::Builder {
             architecture: arch.into(),

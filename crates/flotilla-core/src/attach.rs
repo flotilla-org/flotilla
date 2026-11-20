@@ -926,6 +926,7 @@ fn attach_convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
         ResourceConvoyPhase::Abandoned => ConvoyPhase::Abandoned,
         ResourceConvoyPhase::Landed => ConvoyPhase::Landed,
         ResourceConvoyPhase::Failed => ConvoyPhase::Failed,
+        ResourceConvoyPhase::Ended => ConvoyPhase::Ended,
     }
 }
 
@@ -2108,7 +2109,7 @@ mod tests {
         assert!(second.expect("second lookup").is_none());
         // Another daemon's Host arrives from its own home.
         let spec = HostSpec { display_name: "new".into(), ..Default::default() };
-        flotilla_provisioning_testkit::put_host_at_its_home(&daemon.decided_store().expect("decided store"), "new-host", &spec, None).await;
+        flotilla_provisioning_testkit::put_host_at_its_home(&daemon.decided_store(), "new-host", &spec, None).await;
         assert!(reads.canonical_host(&backend, "flotilla", "new-host").await.expect("cached absence").is_none());
         let fresh = AttachReadContext::default();
         let host = fresh.canonical_host(&backend, "flotilla", "new-host").await.expect("fresh lookup").expect("new host visible");
@@ -2339,7 +2340,7 @@ mod tests {
                     flotilla_resources::MessageRelation::Peer,
                     "other",
                 );
-                daemon.message_primitives().expect("message path").admit(&format!("message-{n}"), &noise).await.expect("noise message");
+                daemon.message_primitives().admit(&format!("message-{n}"), &noise).await.expect("noise message");
             }
             // The views read every write before the measurement, so their catching up is not counted.
             daemon.convoy_views().expect("convoy views").open().await.expect("read the convoy views");
