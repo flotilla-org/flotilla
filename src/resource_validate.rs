@@ -16,8 +16,11 @@ use color_eyre::{eyre::eyre, Result};
 use flotilla_admission::repository_inspection::{inspect_project_ops_entries, OperationalEntryInventory, RepositoryInspector};
 #[cfg(unix)]
 use flotilla_charter::ops_entry::{parse_operational_entry, OperationalEntryFile};
+#[cfg(unix)]
 use flotilla_config::ConfigStore;
-use flotilla_core::in_process::{decided::ENGINE_STORE, DEFAULT_PROVISIONING_NAMESPACE};
+#[cfg(unix)]
+use flotilla_core::in_process::decided::ENGINE_STORE;
+use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 #[cfg(unix)]
 use flotilla_core::repository_inspection::GitRepositoryInspector;
 #[cfg(unix)]
