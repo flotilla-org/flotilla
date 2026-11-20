@@ -30,6 +30,7 @@ flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-terminal = { path = "../flotilla-terminal" }
+flotilla-transport = { path = "../flotilla-transport" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 async-trait.workspace = true
 bytes.workspace = true
@@ -45,7 +46,6 @@ uuid = { workspace = true, features = ["v4"] }
 [dev-dependencies]
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 flotilla-fake-forge = { path = "../flotilla-fake-forge" }
-flotilla-transport = { path = "../flotilla-transport" }
 hegeltest = "=0.48.1"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

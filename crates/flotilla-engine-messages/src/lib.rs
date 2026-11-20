@@ -1348,7 +1348,7 @@ impl MessagePrimitives {
             None => self.provenance(&found.home),
             Some(age_micros) => ResourceProvenance::Replica {
                 origin_root: flotilla_protocol::NodeId::new(found.home),
-                last_synced_at: chrono::Utc::now() - chrono::Duration::microseconds(age_micros),
+                last_synced_at: flotilla_resources::clock::now() - chrono::Duration::microseconds(age_micros),
             },
         };
         Ok(Some(ReadResourceObject { object, provenance }))

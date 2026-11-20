@@ -892,8 +892,11 @@ impl DaemonServer {
 /// Read a connection's first byte, which chooses HTTP or the framed protocol. A peer that
 /// sends nothing within [`CONNECTION_PREFACE_TIMEOUT`] is dropped.
 async fn read_preface(stream: &mut tokio::net::UnixStream) -> Option<u8> {
+    // Accepting the connection was traffic, as reading its first byte is.
+    flotilla_transport::traffic::moved();
+    let mut stream = flotilla_transport::traffic::Tracked::new(stream);
     let mut first_byte = [0_u8; 1];
-    match tokio::time::timeout(CONNECTION_PREFACE_TIMEOUT, tokio::io::AsyncReadExt::read_exact(stream, &mut first_byte)).await {
+    match tokio::time::timeout(CONNECTION_PREFACE_TIMEOUT, tokio::io::AsyncReadExt::read_exact(&mut stream, &mut first_byte)).await {
         Err(_) => {
             warn!(timeout_secs = CONNECTION_PREFACE_TIMEOUT.as_secs(), "connection timed out before sending a preface");
             None

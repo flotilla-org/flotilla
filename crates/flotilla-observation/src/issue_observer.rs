@@ -409,7 +409,7 @@ impl IssueRefresher {
             record.object.status.as_ref().map_or(record.object.metadata.creation_timestamp, |status| status.state.observed_at);
         let takeover_after =
             chrono::Duration::from_std(self.inner.cadence.stale_after.saturating_mul(2)).map_err(|error| error.to_string())?;
-        if Utc::now().signed_duration_since(observed_at) <= takeover_after {
+        if flotilla_resources::clock::now().signed_duration_since(observed_at) <= takeover_after {
             return Ok(false);
         }
         let local = self.inner.backend.using::<Issue>(&subject.namespace);
@@ -466,7 +466,8 @@ impl IssueRefresher {
         let stale_after = chrono::Duration::from_std(self.inner.cadence.stale_after).map_err(|error| error.to_string())?;
         if !heartbeat
             && current.status.as_ref().is_some_and(|current| {
-                observed_values_equal(current, &status) && Utc::now().signed_duration_since(current.state.observed_at) < stale_after
+                observed_values_equal(current, &status)
+                    && flotilla_resources::clock::now().signed_duration_since(current.state.observed_at) < stale_after
             })
         {
             return Ok(());

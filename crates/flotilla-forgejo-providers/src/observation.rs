@@ -38,7 +38,7 @@ pub(crate) fn check_response(
     if !status.is_success() {
         let detail = format!("Forgejo HTTP {}: {}", status, diagnostic_excerpt(body));
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_at = retry_deadline(headers, Utc::now());
+            let retry_at = retry_deadline(headers, flotilla_resources::clock::now());
             return Err(ObservationError::RateLimited { budget: service.to_string(), retry_at, detail });
         }
         return Err(ObservationError::Failed(detail));

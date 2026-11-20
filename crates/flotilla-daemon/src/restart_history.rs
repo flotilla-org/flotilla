@@ -43,7 +43,7 @@ pub(crate) struct DaemonLifecycle {
 
 impl DaemonLifecycle {
     pub(crate) fn begin(state_dir: &Path) -> Result<Self, String> {
-        Self::begin_at(state_dir, Utc::now())
+        Self::begin_at(state_dir, flotilla_resources::clock::now())
     }
 
     fn begin_at(state_dir: &Path, now: DateTime<Utc>) -> Result<Self, String> {

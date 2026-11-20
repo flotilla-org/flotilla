@@ -578,7 +578,7 @@ async fn observe(
     for revision in retired {
         observation.pending.remove(&revision);
     }
-    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+    let now = u64::try_from(flotilla_resources::clock::now().timestamp_millis()).unwrap_or_default();
     let revision = observation.revision.checked_add(1).ok_or("capabilities revision overflow")?.max(now);
     let body = observation.delivered.as_ref().map(|baseline| card_delta(baseline, card)).unwrap_or_else(|| card.to_string());
     let supersedes = observation.message.clone();

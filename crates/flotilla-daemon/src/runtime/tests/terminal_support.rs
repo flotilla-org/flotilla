@@ -191,7 +191,7 @@ impl TerminalPool for KeyedPool {
             return Ok(flotilla_terminal::TerminalSubmission::AlreadySubmitted { at_unix_ms });
         }
         self.inner.deliver(id, text).await?;
-        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).expect("after the epoch");
+        let now = u64::try_from(flotilla_resources::clock::now().timestamp_millis()).expect("after the epoch");
         self.accepted.lock().expect("keys").insert(key.into(), now);
         Ok(flotilla_terminal::TerminalSubmission::Submitted { keyed: true })
     }
@@ -232,7 +232,7 @@ pub(super) async fn refresh_message_test_attention(runtime: &TerminalControllerR
     let mut observation =
         runtime.observe_attention(name, (&holder).into()).await.expect("terminal observation").expect("observed attention");
     if let Some(attention) = &mut observation.attention {
-        attention.as_of = Utc::now();
+        attention.as_of = flotilla_resources::clock::now();
     }
     let adapter = launch.agent().map(|agent| agent.adapter.clone());
     terminals.observations().update(&launch.name, |held| {
@@ -339,7 +339,7 @@ impl CommandRunner for ControllerCleatRunner {
                     .recognizer_installed
                     .load(Ordering::SeqCst)
                     .then(|| serde_json::json!({"id":"codex","error":null,"observation":{"roles":[{"role":"composer","value":draft}]}}));
-                serde_json::json!({"last_controller_input_at": if quiet {0} else {Utc::now().timestamp_millis()}, "recognizer":recognizer})
+                serde_json::json!({"last_controller_input_at": if quiet {0} else {flotilla_resources::clock::now().timestamp_millis()}, "recognizer":recognizer})
                     .to_string()
             }
             "recognizer" => {

@@ -270,7 +270,7 @@ impl EngineTerminals {
     }
 
     fn now() -> Timestamp {
-        Timestamp::from_datetime(&Utc::now())
+        Timestamp::from_datetime(&flotilla_resources::clock::now())
     }
 
     fn records(

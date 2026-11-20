@@ -11,6 +11,8 @@ use tokio::{
 };
 
 use crate::memory::{memory_session_pair, Session};
+#[cfg(unix)]
+use crate::traffic::Tracked;
 
 type StreamReader = tokio::io::Lines<BufReader<tokio::io::Chain<Cursor<Vec<u8>>, Pin<Box<dyn AsyncRead + Send>>>>>;
 
@@ -50,6 +52,8 @@ impl MessageSession {
 
 #[cfg(unix)]
 pub async fn connect_unix_message_session(socket_path: &Path) -> Result<MessageSession, String> {
+    // A connection is traffic before its first byte: the listener's runtime wakes to accept it.
+    crate::traffic::moved();
     let stream = UnixStream::connect(socket_path).await.map_err(|e| format!("failed to connect to {}: {e}", socket_path.display()))?;
     Ok(unix_message_session(stream))
 }
@@ -62,7 +66,7 @@ pub fn unix_message_session(stream: UnixStream) -> MessageSession {
 #[cfg(unix)]
 pub fn unix_message_session_with_prefix(stream: UnixStream, prefix: Vec<u8>) -> MessageSession {
     let (read_half, write_half) = stream.into_split();
-    stream_message_session_with_prefix(read_half, write_half, prefix)
+    stream_message_session_with_prefix(Tracked::new(read_half), Tracked::new(write_half), prefix)
 }
 
 /// Construct a newline-delimited JSON session over independently owned streams.

@@ -131,7 +131,7 @@ impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
             &["pr", "view", &number, "--repo", repository, "--json", "state,headRefOid,statusCheckRollup,reviewDecision,mergeable",],
             Path::new("/"),
         )?;
-        parse_gh_observation(&output, Utc::now()).map_err(ObservationError::Failed)
+        parse_gh_observation(&output, flotilla_resources::clock::now()).map_err(ObservationError::Failed)
     }
 
     async fn observe_for_completion(&self, subject: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
@@ -143,7 +143,7 @@ impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
             &["pr", "view", &number, "--repo", repository, "--json", "state,isDraft,headRefOid,statusCheckRollup,reviewDecision,mergeable"],
             Path::new("/"),
         )?;
-        parse_gh_observation(&output, Utc::now()).map_err(ObservationError::Failed)
+        parse_gh_observation(&output, flotilla_resources::clock::now()).map_err(ObservationError::Failed)
     }
 }
 

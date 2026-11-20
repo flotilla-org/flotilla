@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use chrono::Utc;
 use flotilla_manifest::keys::KEY_CONVOY_NAME;
 use flotilla_protocol::{
     AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
@@ -50,7 +49,7 @@ struct Group {
 }
 
 pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSetState) {
-    let as_of = input.state.demand.as_ref().map_or_else(Utc::now, |metadata| metadata.as_of);
+    let as_of = input.state.demand.as_ref().map_or_else(flotilla_resources::clock::now, |metadata| metadata.as_of);
     let mut groups = BTreeMap::<String, Group>::new();
 
     if input.grouping == AwarenessGrouping::Project || input.scope.is_some() {
@@ -415,6 +414,7 @@ mod tests {
 
     use super::*;
     use crate::salience::{AttentionFact, RaisedFact};
+    use chrono::Utc;
 
     fn convoy(project_ref: &str, name: &str, phase: ConvoyPhase) -> ConvoyRow {
         ConvoyRow::builder()

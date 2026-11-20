@@ -260,7 +260,7 @@ impl EngineImageBuilds {
     }
 
     fn change(&self) -> PendingChange {
-        PendingChange::new(NewChange::new(DEMAND_WRITER, Timestamp::from_datetime(&chrono::Utc::now())))
+        PendingChange::new(NewChange::new(DEMAND_WRITER, Timestamp::from_datetime(&flotilla_resources::clock::now())))
     }
 
     fn held_demand(&self, name: &str) -> Result<Option<flotilla_engine_store::plain::Plain<ImageBuildDemand>>, String> {
@@ -355,7 +355,7 @@ impl ImageBuildRecords for EngineImageBuilds {
             return Err(format!("image build {} has not given up", held.name()));
         }
         self.lifecycles
-            .replace_launch(name, held.name(), held.spec().clone(), Timestamp::from_datetime(&chrono::Utc::now()))
+            .replace_launch(name, held.name(), held.spec().clone(), Timestamp::from_datetime(&flotilla_resources::clock::now()))
             .map_err(|error| format!("retry image build {name}: {error}"))
     }
 }
@@ -431,7 +431,7 @@ impl ImageBuildLauncher {
 }
 
 fn launch(lifecycles: &dyn Lifecycles<ImageBuildKind>, demanded: BTreeMap<String, ImageBuildDemand>) {
-    let at = Timestamp::from_datetime(&chrono::Utc::now());
+    let at = Timestamp::from_datetime(&flotilla_resources::clock::now());
     for (name, demand) in demanded {
         let launched = match lifecycles.newest_launch(&name) {
             None => lifecycles.request(&name, launch_of(&name, &demand), at).map(|created| created.name().to_owned()),

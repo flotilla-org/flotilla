@@ -282,7 +282,7 @@ fn infrastructure(reason: String) -> ProviderFailure {
         cause: Cause::new(CauseCategory::Transient, reason),
         retryable: true,
         // Time alone may cure it (a registry back, a credential minted): the kind's backoff decides when.
-        retry_at: Some(Timestamp::from_datetime(&chrono::Utc::now())),
+        retry_at: Some(Timestamp::from_datetime(&flotilla_resources::clock::now())),
     }
 }
 

@@ -1195,7 +1195,7 @@ impl ConvoyAdmission {
                 owner_references: Vec::new(),
                 finalizers: Vec::new(),
                 deletion_timestamp: None,
-                creation_timestamp: Utc::now(),
+                creation_timestamp: flotilla_resources::clock::now(),
                 merge: None,
             },
             spec: spec.clone(),
@@ -3907,7 +3907,7 @@ const CODEX_ADAPTER: &str = "codex";
 const ISSUE_SNAPSHOT_FRESHNESS: ChronoDuration = ChronoDuration::minutes(5);
 pub fn issue_snapshot_is_fresh(issue: &flotilla_protocol::Issue) -> bool {
     let Some(observed_at) = issue.observed_at else { return false };
-    let age = Utc::now().signed_duration_since(observed_at);
+    let age = flotilla_resources::clock::now().signed_duration_since(observed_at);
     (ChronoDuration::zero()..=ISSUE_SNAPSHOT_FRESHNESS).contains(&age)
 }
 
@@ -4480,7 +4480,7 @@ pub async fn validate_workflow_credentials_for_admission(
             placement.metadata.name
         ));
     };
-    status.apply_heartbeat_readiness(Utc::now());
+    status.apply_heartbeat_readiness(flotilla_resources::clock::now());
     if !status.ready && !allow_unready {
         return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
     }
@@ -4499,7 +4499,7 @@ pub async fn validate_workflow_credentials_for_admission(
     let expiry = status.credential_expiry().map_err(|error| {
         format!("placement `{}` host `{host_label}` has invalid credential expiry capability: {error}", placement.metadata.name)
     })?;
-    let now = Utc::now();
+    let now = flotilla_resources::clock::now();
     for credential in &required {
         if let Some(expired_at) = expiry.get(credential).and_then(|entry| entry.expired_at(now)) {
             return Err(format!(
@@ -4612,7 +4612,7 @@ pub async fn placement_agent_adapters(
         let mut status = host.status.ok_or_else(|| {
             format!("placement `{}` host `{host_label}` generation `{generation}` has no observed status", placement.metadata.name)
         })?;
-        status.apply_heartbeat_readiness(Utc::now());
+        status.apply_heartbeat_readiness(flotilla_resources::clock::now());
         if !status.ready && !allow_unready {
             return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
         }

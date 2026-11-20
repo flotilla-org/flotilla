@@ -70,7 +70,7 @@ impl StatusPatch<CloneStatus> for CloneStatusPatch {
                 status.message = Some(message.clone());
                 status.failed_at = None;
                 status.failure_policy = None;
-                status.retry = Some(ControllerRetry::retryable(status.retry.as_ref(), Utc::now(), CLONE_BACKOFF));
+                status.retry = Some(ControllerRetry::retryable(status.retry.as_ref(), crate::clock::now(), CLONE_BACKOFF));
             }
             Self::MarkReady { default_branch } => {
                 status.phase = ClonePhase::Ready;

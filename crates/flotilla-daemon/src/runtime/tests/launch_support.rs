@@ -42,7 +42,7 @@ pub(super) fn pending_binding(
 
 /// Bind a requester's Claude subscription to `credential` at this daemon, as admission does (#3907).
 pub(super) async fn bind_account(daemon: &InProcessDaemon, convoy: &str, role: &str, credential: &str, account: &str) {
-    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
+    let now = flotilla_schema::Timestamp::from_datetime(&flotilla_resources::clock::now());
     daemon.account_records().open(NAMESPACE, vec![pending_binding(convoy, role, credential, account, now)]).await.expect("account binding");
 }
 
@@ -64,7 +64,7 @@ pub(super) async fn bind_account_from_home(
         Arc::new(flotilla_resources::SystemClock),
     )
     .expect("other home accounts");
-    let opened_at = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + ahead));
+    let opened_at = flotilla_schema::Timestamp::from_datetime(&(flotilla_resources::clock::now() + ahead));
     accounts
         .open(NAMESPACE, vec![pending_binding(convoy, role, credential, "box-a@example.com", opened_at)])
         .await

@@ -707,7 +707,7 @@ impl ReadProjections<'_> {
             rows
         };
         rows.sort_by(|left, right| right.is_local.cmp(&left.is_local).then_with(|| left.host.cmp(&right.host)));
-        let dispatch_queue = Self::dispatch_queue(self.backend, namespace, None, Utc::now()).await?;
+        let dispatch_queue = Self::dispatch_queue(self.backend, namespace, None, flotilla_resources::clock::now()).await?;
         Ok(FleetHealthResponse { hosts: rows, dispatch_queue, forge_budgets: Vec::new() })
     }
 

@@ -71,7 +71,7 @@ impl DiscoveredCheckouts {
     /// Replaces `repository`'s discovered checkouts with `found`; an unchanged checkout keeps when it
     /// was discovered.
     pub fn replace(&self, repository: &RepositoryKey, found: Vec<DiscoveredCheckout>) {
-        let now = Utc::now();
+        let now = crate::clock::now();
         let changed = {
             let mut held = self.write();
             let mut changed = false;

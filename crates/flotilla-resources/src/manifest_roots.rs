@@ -158,7 +158,7 @@ pub fn source_status(mut status: ManifestRootStatus, revision: Option<String>, e
     status.source_error = error.map(str::to_string);
     if let Some(error) = error {
         if status.stalled.as_ref().is_none_or(|stall| stall.evidence != error) {
-            status.stalled = Some(root_stall(name, error.into(), Utc::now()));
+            status.stalled = Some(root_stall(name, error.into(), crate::clock::now()));
         }
     } else {
         status.applied_revision = revision;

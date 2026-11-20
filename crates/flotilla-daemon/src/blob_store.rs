@@ -354,7 +354,7 @@ impl S3BlobStore {
     fn signed_request(&self, method: reqwest::Method, key: &str, body: Option<&[u8]>) -> Result<reqwest::Request, String> {
         let url = self.object_url(key)?;
         let payload_hash = format!("{:x}", Sha256::digest(body.unwrap_or_default()));
-        let now = self.signing_time.unwrap_or_else(Utc::now);
+        let now = self.signing_time.unwrap_or_else(flotilla_resources::clock::now);
         let date = now.format("%Y%m%d").to_string();
         let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
         let host = match url.port() {

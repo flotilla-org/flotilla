@@ -638,7 +638,7 @@ fn remove_store(path: &Path) -> Result<(), String> {
 }
 
 fn write_report(state_dir: &Path, report: &Report) -> Result<PathBuf, String> {
-    let path = state_dir.join(format!("import-{}.json", chrono::Utc::now().format("%Y%m%dT%H%M%S%.6fZ")));
+    let path = state_dir.join(format!("import-{}.json", flotilla_resources::clock::now().format("%Y%m%dT%H%M%S%.6fZ")));
     let body = serde_json::to_vec_pretty(report).map_err(|error| error.to_string())?;
     let write = |path: &Path| {
         use std::io::Write;

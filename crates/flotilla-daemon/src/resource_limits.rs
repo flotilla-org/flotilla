@@ -20,7 +20,7 @@ pub(crate) fn raise_file_descriptor_limit() {
 
 pub(crate) fn file_descriptor_pressure_condition() -> Option<HostCondition> {
     let usage = current_file_descriptor_usage()?;
-    file_descriptor_pressure_condition_for(usage, Utc::now())
+    file_descriptor_pressure_condition_for(usage, flotilla_resources::clock::now())
 }
 
 fn file_descriptor_pressure_condition_for(usage: FileDescriptorUsage, observed_at: DateTime<Utc>) -> Option<HostCondition> {

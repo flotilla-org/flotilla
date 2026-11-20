@@ -25,6 +25,7 @@ use flotilla_agent::{ClaudeCodeHookTransport, CLAUDE_CODE_HOOK_TOKEN_ENV, CLAUDE
 use flotilla_client::SocketDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{commands::CommandValue, AgentHookTerminalRef, Command, CommandAction};
+use flotilla_transport::traffic::{self, Tracked};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -147,13 +148,15 @@ impl CrewHooks {
     }
 }
 
-async fn connect(socket: &Path) -> Result<tokio::net::UnixStream, String> {
-    tokio::net::UnixStream::connect(socket).await.map_err(|error| format!("connect {}: {error}", socket.display()))
+/// A connection to `socket`, its traffic counted as the runtime's work, as a crew's daemon
+/// connection's is.
+async fn connect(socket: &Path) -> Result<Tracked<tokio::net::UnixStream>, String> {
+    traffic::connect_unix(socket).await.map_err(|error| format!("connect {}: {error}", socket.display()))
 }
 
 /// POST one hook event to `<url>/<event>` over `stream`, a connection to the vessel's forward, as
 /// Claude Code's HTTP hook does, and require a success status.
-async fn post_hook(mut stream: tokio::net::UnixStream, hooks: &CrewHooks, event: &str, body: &[u8]) -> Result<(), String> {
+async fn post_hook(mut stream: Tracked<tokio::net::UnixStream>, hooks: &CrewHooks, event: &str, body: &[u8]) -> Result<(), String> {
     let (authority, path) = split_url(&hooks.url)?;
     let head = format!(
         "POST {}/{event} HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\n\

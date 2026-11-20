@@ -32,16 +32,48 @@ fn in_phase(convoy: &str, phase: ConvoyPhase) -> impl Fn(&ResourceObject<Convoy>
     move |found| found.metadata.name == convoy && found.status.as_ref().is_some_and(|status| status.phase == phase)
 }
 
+// A daemon's time is virtual: it moves only while nothing runs (#4385). A blocking-pool job,
+// such as the engine store's, is work the runtime cannot see run, and it counts as running: a
+// timer due while it works fires only once it has ended, at the time it was due.
+#[tokio::test(start_paused = true)]
+async fn a_timer_due_during_blocking_work_fires_only_once_the_work_ends() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let _daemon = TestDaemon::builder().start().await;
+    let ended = Arc::new(AtomicBool::new(false));
+    let started = tokio::time::Instant::now();
+    let timer = tokio::spawn({
+        let ended = Arc::clone(&ended);
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            (ended.load(Ordering::SeqCst), started.elapsed())
+        }
+    });
+    let work = tokio::task::spawn_blocking({
+        let ended = Arc::clone(&ended);
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            ended.store(true, Ordering::SeqCst);
+        }
+    });
+    work.await.expect("the blocking work");
+    let (after_the_work, at) = timer.await.expect("the timer");
+    assert!(after_the_work, "the timer fired while the blocking work ran");
+    assert!(at <= std::time::Duration::from_millis(2), "the timer fired {at:?} after it was set, not when it was due");
+}
+
 // A cloud sandbox the vendor deletes, or stops with no resume available, is
 // Lost: the daemon learns it only from what the vendor reports, and no stored
 // record is touched to make it so; the Lost status is written only as the
 // engine's answer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_cloud_sandbox_the_vendor_deletes_becomes_lost() {
     cloud_sandbox_becomes_lost(DummyVendor::vanish).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_cloud_sandbox_the_vendor_stops_becomes_lost() {
     cloud_sandbox_becomes_lost(DummyVendor::stop).await;
 }
@@ -65,7 +97,7 @@ async fn cloud_sandbox_becomes_lost(vendor: fn(&DummyVendor, &str) -> bool) {
 // the vendor deletes the crew's backing and the probe ends it Lost, attaching to the crew's
 // session is refused for that reason and its vessel row offers no attach. The dummy fleet's
 // containers offer no terminal route, so before the loss attach is refused for that instead.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_lost_environment_withdraws_its_sessions_attach() {
     let daemon = TestDaemon::builder().agent("turn_delay_ms = 60000").start().await;
     let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
@@ -105,14 +137,14 @@ async fn a_lost_environment_withdraws_its_sessions_attach() {
 // the new launch's session, so the governor's turns reach the new aide and the convoy lands. The
 // governor's handoffs in the gap are refused until the next launch replaces the lost one, so it
 // stalls, and the operator resumes it once the new aide runs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_relaunched_vessels_role_passes_to_its_new_session() {
     the_aides_role_passes_to_its_relaunch(false).await;
 }
 
 // As above, with the daemon restarting just after the loss, as b0's did: the restarted daemon
 // finds the backing gone at adoption and relaunches the vessel.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_vessel_lost_across_a_restart_passes_its_role_to_its_relaunch() {
     the_aides_role_passes_to_its_relaunch(true).await;
 }
@@ -159,10 +191,11 @@ async fn the_aides_role_passes_to_its_relaunch(restart: bool) {
 // A crew member's row shows its AgentSession as the decided store holds it (#3108), joined by
 // the TerminalSession's record name. The crew reports working, then idle once its work is
 // done, as a harness's hooks do; each is written after the view began following the store, so
-// the row reaching it shows the view woke on the store's commit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// the row reaching it shows the view woke on the store's commit. Its change request is not
+// merged while the scenario runs, so the convoy waits on it, idle, rather than landing at once.
+#[tokio::test(start_paused = true)]
 async fn a_crew_members_row_follows_its_agent_session() {
-    let daemon = TestDaemon::builder().start().await;
+    let daemon = TestDaemon::builder().change_request("merge_after_ms = 86400000").start().await;
     let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
     let reading = |set: &ResultSet| -> Option<AgentSessionReading> {
         let row = set.rows.as_convoys()?.iter().find(|row| row.resource.name == convoy)?;
@@ -183,7 +216,7 @@ async fn a_crew_members_row_follows_its_agent_session() {
 // this daemon reads the replica its decided store follows from that home's log, joined to the
 // replicated TerminalSession by home and record name. A stalled crew waits idle for guidance, so
 // its reading holds still while the peers connect.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_crew_members_row_shows_its_agent_session_at_another_home() {
     let (a, b) = tokio::join!(
         TestDaemon::builder().agent("stall_rate = 1.0").settings("host_name = \"agents-a\"\n").start(),
@@ -204,14 +237,13 @@ async fn a_crew_members_row_shows_its_agent_session_at_another_home() {
 // Once the peering drops, another home's crew reading goes stale here at the moment it stops
 // being current: HOME_HEARD_WITHIN after this daemon last heard from that home. Nothing else
 // happens then, so the row changing shows the reader's one deadline wake. The daemons' clock
-// follows tokio's paused time, so the clock and the deadline sleep move together.
+// is the runtime's virtual time, so the clock and the deadline sleep move together.
 #[tokio::test(start_paused = true)]
 async fn a_crew_members_row_goes_stale_at_its_deadline_once_its_home_is_unheard() {
-    use flotilla_resources::{agent_activity::HOME_HEARD_WITHIN, Clock as _};
-    let clock = std::sync::Arc::new(flotilla_store_testkit::PausedClock::start());
+    use flotilla_resources::{agent_activity::HOME_HEARD_WITHIN, clock::now};
     let (a, b) = tokio::join!(
-        TestDaemon::builder().clock(clock.clone()).agent("stall_rate = 1.0").settings("host_name = \"agents-a\"\n").start(),
-        TestDaemon::builder().clock(clock.clone()).agent("stall_rate = 1.0").settings("host_name = \"agents-b\"\n").start()
+        TestDaemon::builder().agent("stall_rate = 1.0").settings("host_name = \"agents-a\"\n").start(),
+        TestDaemon::builder().agent("stall_rate = 1.0").settings("host_name = \"agents-b\"\n").start()
     );
     let convoy = a.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
     let reading = |set: &ResultSet| -> Option<AgentSessionReading> {
@@ -225,12 +257,12 @@ async fn a_crew_members_row_goes_stale_at_its_deadline_once_its_home_is_unheard(
 
     drop(peering);
     // The last keepalive it heard came at most one held round before the drop.
-    let dropped = clock.now();
+    let dropped = now();
     let stale = b
         .wait_query(QueryId::Convoys { scope: None }, |set| reading(set).is_some_and(|reading| reading.stale))
         .within(std::time::Duration::from_secs(300))
         .await;
-    let stale_after = clock.now() - dropped;
+    let stale_after = now() - dropped;
     assert!(
         stale_after <= HOME_HEARD_WITHIN && stale_after > HOME_HEARD_WITHIN - chrono::Duration::seconds(15),
         "stale {stale_after} after the drop"
@@ -241,7 +273,7 @@ async fn a_crew_members_row_goes_stale_at_its_deadline_once_its_home_is_unheard(
 // A restarted daemon finds its running vessels again: the vendor's backings and
 // the crew's process survive, and the convoy lands with nothing provisioned or
 // launched twice.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_restarted_daemon_adopts_its_running_vessels() {
     let daemon = TestDaemon::builder().agent("turn_delay_ms = 5000").start().await;
     let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
@@ -262,12 +294,11 @@ async fn a_restarted_daemon_adopts_its_running_vessels() {
 // A convoy idle on a change request that is not changing is not stalled on its observer (run 5
 // R5-1): the observer's reads keep confirming the record though they write nothing, and the stall
 // judge counts those confirmations, before a restart and after it, when the record's last write
-// is older than the observer's staleness bound. The daemons' clock follows tokio's paused time.
+// is older than the observer's staleness bound.
 #[tokio::test(start_paused = true)]
 async fn a_convoy_idle_on_an_unchanged_change_request_is_not_stalled_across_a_restart() {
-    let clock = std::sync::Arc::new(flotilla_store_testkit::PausedClock::start());
     // The change request is never merged while the scenario runs.
-    let daemon = TestDaemon::builder().clock(clock.clone()).change_request("merge_after_ms = 86400000").start().await;
+    let daemon = TestDaemon::builder().change_request("merge_after_ms = 86400000").start().await;
     let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
     daemon
         .wait("its open change request", |found: &ResourceObject<ChangeRequest>| {
@@ -289,7 +320,8 @@ async fn a_convoy_idle_on_an_unchanged_change_request_is_not_stalled_across_a_re
     let daemon = daemon.restart().await;
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     assert_unstalled(&daemon, &convoy, "after the restart").await;
-    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+    // Most of half an hour more: on virtual time a wait this long costs only the daemon's passes.
+    tokio::time::sleep(std::time::Duration::from_secs(25 * 60)).await;
     assert_unstalled(&daemon, &convoy, "idle after the restart").await;
 }
 
@@ -303,7 +335,7 @@ async fn assert_unstalled(daemon: &TestDaemon, convoy: &str, when: &str) {
 
 // A vendor that refuses to provision fails the convoy before any crew launches;
 // once it accepts again, the next convoy lands.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_vendor_refusing_to_provision_fails_its_convoy() {
     let daemon = TestDaemon::builder().start().await;
     daemon.vendor().refuse_provisioning(true);
@@ -338,7 +370,7 @@ async fn watched_snapshot(
 // A client whose watch of an engine-served kind drops reconnects with its cursor: the resume names
 // the update and the delete made in the gap, without a snapshot, and a fresh watch converges on
 // the records as they are.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_resource_watch_reconnecting_after_a_gap_converges_on_the_records() {
     use flotilla_client::resource::ResourceWatchRequest;
     use flotilla_resources::{FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec};
@@ -401,7 +433,7 @@ async fn a_resource_watch_reconnecting_after_a_gap_converges_on_the_records() {
 
 // A table over an engine-served kind opens on its records, though the engine's listing carries no
 // position, and streams a record created after it opened.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_table_over_an_engine_kind_opens_and_streams_a_later_change() {
     use flotilla_protocol::table::Message;
     use flotilla_resources::{FulfilmentKind, Resource};
@@ -437,7 +469,7 @@ async fn a_table_over_an_engine_kind_opens_and_streams_a_later_change() {
 // release inspects it again before the convoy's association is known again, and that unknown
 // is not false: the checkout stays, held, until a person rules or it is clean. Finding 5: the
 // convoy table shows the held convoy needs a person, before and after the restart.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_held_dirty_landed_checkout_stays_held_across_a_restart() {
     let fleet = TestDaemon::builder().vcs("dirty_rate = 1.0").settings("host_name = \"restart-proof\"\n").start().await;
     let name = fleet.dispatch(CrewMix::LongRunner, DUMMY_FULFILMENT_KIND).await;
@@ -475,7 +507,7 @@ async fn a_held_dirty_landed_checkout_stays_held_across_a_restart() {
 
 // Fleet health counts a capped host's free vessel slots from the vessels the engine holds there:
 // `flotilla fleet check`, `fleet spread` and the plain `flotilla fleet` dashboard all ask it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fleet_health_counts_a_capped_hosts_free_slots_from_its_engine_vessels() {
     use flotilla_resources::{Host, HostSpec};
     let daemon = TestDaemon::builder().agent("turn_delay_ms = 60000").start().await;

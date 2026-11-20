@@ -155,6 +155,6 @@ impl EnvironmentFixture {
     }
 
     fn step(&self, name: &str, step: Step) {
-        self.lifecycles.step(name, &step, Timestamp::from_datetime(&chrono::Utc::now())).expect("environment step");
+        self.lifecycles.step(name, &step, Timestamp::from_datetime(&flotilla_resources::clock::now())).expect("environment step");
     }
 }

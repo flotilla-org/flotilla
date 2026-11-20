@@ -182,7 +182,7 @@ impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationS
             .find(|reference| issue_reference_address(reference, &forges).is_ok_and(|address| &address == subject.address()))
             .unwrap_or(fallback);
         let issue = self.query_port.fetch_issue_by_ref(&reference).await?;
-        let observed_at = chrono::Utc::now();
+        let observed_at = flotilla_resources::clock::now();
         Ok(flotilla_resources::IssueStatus {
             title: flotilla_resources::Observation::known(issue.title, observed_at),
             assignees: flotilla_resources::Observation::known(issue.assignees, observed_at),
@@ -441,7 +441,10 @@ impl ProviderChangeRequestObservationSource {
         let crew_logins = crew_logins.into_iter().map(|(number, logins)| (number, logins.into_iter().collect())).collect();
         let merge_check = self.query_port.merge_check(&repository.object.spec);
         let result = provider.observe_bound(&numbers, &crew_logins, Some(merge_check.as_ref())).await;
-        let delay = observation_cache_delay(observation_rate_limit_error(&result).and_then(ObservationError::retry_at), Utc::now());
+        let delay = observation_cache_delay(
+            observation_rate_limit_error(&result).and_then(ObservationError::retry_at),
+            flotilla_resources::clock::now(),
+        );
         let status = if let Some(error) = observation_rate_limit_error(&result) {
             observation_during_cooldown(&result, subject.number(), error)
         } else {

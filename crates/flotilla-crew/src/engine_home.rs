@@ -275,7 +275,7 @@ struct MessageClock {
 
 impl Clock for MessageClock {
     fn now(&self) -> DateTime<Utc> {
-        self.pinned.lock().expect("message clock").unwrap_or_else(Utc::now)
+        self.pinned.lock().expect("message clock").unwrap_or_else(flotilla_resources::clock::now)
     }
 }
 

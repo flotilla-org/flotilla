@@ -28,7 +28,7 @@ async fn follow_engine_home(from: &InProcessDaemon, to: &InProcessDaemon) {
             return;
         }
         let mut frames = Vec::new();
-        from.serve(Some(after), flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()), |frame| {
+        from.serve(Some(after), flotilla_schema::Timestamp::from_datetime(&flotilla_resources::clock::now()), |frame| {
             frames.push(frame.to_vec());
             Ok(())
         })

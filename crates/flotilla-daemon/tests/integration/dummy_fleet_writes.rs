@@ -165,7 +165,7 @@ async fn copied_store_daemon(token: &Path) -> (TestDaemon, Arc<Outbound>, Vec<Re
     (daemon, outbound, repositories)
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dummy_fleet_daemon_never_writes_to_the_forges_its_stores_name() {
     let dir = tempfile::tempdir().expect("tempdir");
     let token = dir.path().join("lab-token");

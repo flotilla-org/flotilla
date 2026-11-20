@@ -271,7 +271,7 @@ impl FleetService {
         host_registry: &HostRegistry,
         lifecycles: &dyn crate::ports::LifecycleReads,
     ) -> Result<Vec<FleetListRow>, String> {
-        let now = Utc::now();
+        let now = flotilla_resources::clock::now();
         let streams = self.change_streams(now);
 
         let session_list =

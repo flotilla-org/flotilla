@@ -26,7 +26,7 @@ fn age(now: DateTime<Utc>, at: Option<DateTime<Utc>>) -> &'static str {
 
 /// The last step: counts only, as tallies of [`KIND`].
 pub(super) fn first_start(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
-    let now = Utc::now();
+    let now = flotilla_resources::clock::now();
     // How the convoy `convoy` homed at `home` ended, when, and whether the import retired it.
     let ended = |home: &str, convoy: &str| {
         let key = (home.to_owned(), convoy.to_owned());

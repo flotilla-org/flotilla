@@ -279,7 +279,7 @@ impl InMemoryBackend {
         let resource_stream_count = stores.values().filter(|store| store.current_version() > 0).count() as u64;
         let mut diagnostics = ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, self.event_retention);
         let mut violations = self.ownership_violations.lock().await;
-        let cutoff = Utc::now() - chrono::Duration::hours(FIELD_OWNERSHIP_VIOLATION_TTL_HOURS);
+        let cutoff = flotilla_resources::clock::now() - chrono::Duration::hours(FIELD_OWNERSHIP_VIOLATION_TTL_HOURS);
         violations.retain(|violation| violation.observed_at >= cutoff);
         diagnostics.field_ownership_violations = violations.clone();
         diagnostics.replica_quarantines =
@@ -516,8 +516,10 @@ impl InMemoryBackend {
                 if previous.is_some_and(|(body, diagnostic)| body == encoded && diagnostic.error == error.to_string()) {
                     return false;
                 }
-                let quarantined_at =
-                    previous.filter(|(body, _)| body == encoded).map(|(_, diagnostic)| diagnostic.quarantined_at).unwrap_or_else(Utc::now);
+                let quarantined_at = previous
+                    .filter(|(body, _)| body == encoded)
+                    .map(|(_, diagnostic)| diagnostic.quarantined_at)
+                    .unwrap_or_else(flotilla_resources::clock::now);
                 let diagnostic = flotilla_resources::ResourceReplicaQuarantine {
                     origin_root: replica_key.0.clone(),
                     kind: replica_key.1 .2.clone(),
@@ -1070,7 +1072,7 @@ impl InMemoryBackend {
                     owner_references: meta.owner_references.clone(),
                     finalizers: meta.finalizers.clone(),
                     deletion_timestamp: meta.deletion_timestamp,
-                    creation_timestamp: Utc::now(),
+                    creation_timestamp: flotilla_resources::clock::now(),
                     merge,
                 },
                 spec: Self::clone_through_serde(spec)?,
@@ -1217,7 +1219,7 @@ impl InMemoryBackend {
             let version = store.allocate_version();
             object.metadata.resource_version = version.to_string();
             if !object.metadata.finalizers.is_empty() && object.metadata.deletion_timestamp.is_none() {
-                object.metadata.deletion_timestamp = Some(Utc::now());
+                object.metadata.deletion_timestamp = Some(flotilla_resources::clock::now());
                 let encoded = Self::encode_object(resource_kind, &object)?;
                 store.objects.insert(name.to_string(), encoded.clone());
                 store.push_event(

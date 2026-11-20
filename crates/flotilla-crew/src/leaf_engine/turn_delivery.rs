@@ -220,7 +220,7 @@ impl LeafSubscriptionTable {
         convoy: &str,
         failures: BTreeMap<String, DeliveryError>,
     ) -> Result<(), ResourceError> {
-        let patch = FailTurnDeliveries { failures, now: Utc::now(), changed: Default::default() };
+        let patch = FailTurnDeliveries { failures, now: flotilla_resources::clock::now(), changed: Default::default() };
         // Read here, not in the note, so a missing convoy stays NotFound and its batch is pruned.
         let current = convoys.get(convoy).await?;
         let written =
@@ -257,12 +257,9 @@ impl LeafSubscriptionTable {
         let convoys = self.inner.backend.clone().using::<Convoy>(&namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{convoy_name}` has no status"))?;
-        if status
-            .turn_deliveries
-            .get(source)
-            .and_then(|delivery| delivery.failure.as_ref())
-            .is_some_and(|failure| failure.kind == flotilla_resources::TurnDeliveryFailureKind::Permanent || Utc::now() < failure.retry_at)
-        {
+        if status.turn_deliveries.get(source).and_then(|delivery| delivery.failure.as_ref()).is_some_and(|failure| {
+            failure.kind == flotilla_resources::TurnDeliveryFailureKind::Permanent || flotilla_resources::clock::now() < failure.retry_at
+        }) {
             return Ok(());
         }
         // A stale firing after settlement has no work left to deliver.
@@ -386,7 +383,11 @@ impl LeafSubscriptionTable {
                 let owes = asks_to_act(
                     rule,
                     &leaf.address,
-                    &ChangeRequestLeafSubject { change_request: &record.object, now: Utc::now(), stale_after: std::time::Duration::MAX },
+                    &ChangeRequestLeafSubject {
+                        change_request: &record.object,
+                        now: flotilla_resources::clock::now(),
+                        stale_after: std::time::Duration::MAX,
+                    },
                 )?;
                 (revision.clone(), revision, evidence_at, brief, Some(subject), owes)
             }
@@ -436,7 +437,11 @@ impl LeafSubscriptionTable {
                 let owes = asks_to_act(
                     rule,
                     &leaf.address,
-                    &IssueLeafSubject { issue: &record.object, now: Utc::now(), stale_after: std::time::Duration::MAX },
+                    &IssueLeafSubject {
+                        issue: &record.object,
+                        now: flotilla_resources::clock::now(),
+                        stale_after: std::time::Duration::MAX,
+                    },
                 )?;
                 (
                     revision.clone(),
@@ -580,7 +585,7 @@ impl LeafSubscriptionTable {
             .delivery_condition(leaf_condition(leaf, Some(&convoy.spec.project_ref), &forges)?)
             .build();
         let run = status.turn_deliveries.get(source).map_or(0, |delivery| unprogressed_run(&delivery.episodes, &progress));
-        let now = Utc::now();
+        let now = flotilla_resources::clock::now();
         let patch = if run >= self.inner.episode_limit as usize {
             let reason = format!(
                 "turn delivery refused after {} consecutive episodes for condition source `{source}` at subject revision `{progress}`; a new subject revision or a resume clears this hold",
@@ -626,7 +631,7 @@ impl LeafSubscriptionTable {
                         new_turn: admission.new_turn,
                         rung: admission.rung,
                         message: admission.message,
-                        accepted_at: Utc::now(),
+                        accepted_at: flotilla_resources::clock::now(),
                     },
                     owes,
                 },

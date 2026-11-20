@@ -551,11 +551,11 @@ async fn drop_message(inbox: &flotilla_inbox::sqlite::SqliteInbox, message: &str
 /// receipt can also repeat a turn, which adapters ignore by message id.
 #[derive(Debug, Default)]
 pub struct TurnHolds {
-    until: BTreeMap<String, std::time::Instant>,
+    until: BTreeMap<String, tokio::time::Instant>,
 }
 
 impl TurnHolds {
-    pub fn hold(&mut self, messages: impl IntoIterator<Item = String>, until: std::time::Instant) {
+    pub fn hold(&mut self, messages: impl IntoIterator<Item = String>, until: tokio::time::Instant) {
         for message in messages {
             self.until.insert(message, until);
         }
@@ -570,7 +570,7 @@ impl TurnHolds {
     }
 
     /// Releases every hold that has run out by `now`, and names their messages.
-    pub fn expire(&mut self, now: std::time::Instant) -> Vec<String> {
+    pub fn expire(&mut self, now: tokio::time::Instant) -> Vec<String> {
         let mut expired = Vec::new();
         self.until.retain(|message, until| {
             let held = *until > now;
@@ -583,7 +583,7 @@ impl TurnHolds {
     }
 
     /// When the next hold runs out.
-    pub fn next_expiry(&self) -> Option<std::time::Instant> {
+    pub fn next_expiry(&self) -> Option<tokio::time::Instant> {
         self.until.values().min().copied()
     }
 }
@@ -656,7 +656,7 @@ mod tests {
     // confirmed turn releases it at once.
     #[test]
     fn unconfirmed_turns_are_held_until_the_hold_runs_out() {
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let mut holds = TurnHolds::default();
         holds.hold(["a".to_owned(), "b".to_owned()], start + std::time::Duration::from_secs(300));
         holds.expire(start + std::time::Duration::from_secs(299));

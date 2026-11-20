@@ -12,7 +12,6 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
 use flotilla_provisioning::engine::clone_actuator::{classify, CloneFailure, RemoteReachability};
 use flotilla_resources::{remote_condition_type, ConditionValue, HostCondition};
 use flotilla_vcs::vcs::Vcs;
@@ -44,7 +43,7 @@ impl RemoteProbe {
             .value(value)
             .reason(reason)
             .message(message)
-            .observed_at(Utc::now())
+            .observed_at(flotilla_resources::clock::now())
             // One unreachable remote leaves the host ready for everything else.
             .blocks_readiness(false)
             .blocks_forge_observation(false)

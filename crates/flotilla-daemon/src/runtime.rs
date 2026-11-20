@@ -23,7 +23,6 @@ mod terminal;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 pub(crate) use terminal::{DELIVERY_CONFIRMATION_POLL, DELIVERY_CONFIRMATION_STABLE_FOR};
 
-use chrono::Utc;
 use flotilla_admission::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
@@ -251,7 +250,7 @@ impl DaemonRuntime {
             // Each daemon start is a new generation.
             generation: Some(uuid::Uuid::new_v4().to_string()),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            started_at: Utc::now(),
+            started_at: flotilla_resources::clock::now(),
         };
         phase(
             "set_local_placement_capabilities",

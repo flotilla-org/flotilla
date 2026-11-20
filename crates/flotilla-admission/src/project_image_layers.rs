@@ -147,7 +147,7 @@ impl LayerRefreshState {
     fn refused(&mut self, namespace: &str, project: &str, source: Option<&CharterSource>, error: String) {
         let key = (namespace.to_string(), project.to_string());
         let previous = self.refusals.get(&key).filter(|previous| previous.source.as_ref() == source && previous.error == error);
-        let observed_at = previous.map_or_else(chrono::Utc::now, |previous| previous.observed_at);
+        let observed_at = previous.map_or_else(flotilla_resources::clock::now, |previous| previous.observed_at);
         let delay =
             previous.map_or(std::time::Duration::from_secs(60), |previous| (previous.delay * 2).min(std::time::Duration::from_secs(3600)));
         self.refusals.insert(

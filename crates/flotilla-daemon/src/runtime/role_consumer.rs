@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_address::Address;
 use flotilla_engine_messages::MessagePrimitives;
 use flotilla_inbox::{InboxBackend, Pending};
@@ -48,7 +47,7 @@ pub(super) async fn serve_role(primitives: Arc<MessagePrimitives>, requests: Arc
 async fn serve(primitives: &MessagePrimitives, requests: &dyn RoleRequests) -> Result<(), String> {
     let home = primitives.home().to_owned();
     let address = requests.inbox(&home)?;
-    let consumer = primitives.register_service(requests.role(), Timestamp::from_datetime(&Utc::now())).await?;
+    let consumer = primitives.register_service(requests.role(), Timestamp::from_datetime(&flotilla_resources::clock::now())).await?;
     let inbox = primitives.inbox();
     // Bound here as well as by the delivery pass: binding is an idempotent insert.
     inbox.bind(address.clone(), consumer.clone()).await.map_err(|error| error.to_string())?;

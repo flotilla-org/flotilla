@@ -186,7 +186,7 @@ async fn retain(
     // reference goes, or whose artifact's write failed.
     let mut leftovers = Some(tokio::time::Instant::now());
     loop {
-        let now = Utc::now();
+        let now = flotilla_resources::clock::now();
         due.extend(retention.expired(now));
         let mut failed = service.delete(&mut retention, due.iter().cloned()).await.err();
         if failed.is_none() {
@@ -205,7 +205,8 @@ async fn retain(
                 Err(error) => drop(failed.get_or_insert(error)),
             }
         }
-        let wake = |at: chrono::DateTime<Utc>| tokio::time::Instant::now() + (at - Utc::now()).to_std().unwrap_or_default();
+        let wake =
+            |at: chrono::DateTime<Utc>| tokio::time::Instant::now() + (at - flotilla_resources::clock::now()).to_std().unwrap_or_default();
         // A failure waits for its retry, not for what is already due; past its retries, for the
         // next change, or the next expiry or grace still ahead.
         let deadline = match failed {
@@ -217,14 +218,14 @@ async fn retain(
                 Some(wait) => Some(tokio::time::Instant::now() + wait),
                 None => {
                     let ahead = leftovers.filter(|at| *at > tokio::time::Instant::now());
-                    retention.next_deadline_after(Utc::now()).map(wake).into_iter().chain(ahead).min()
+                    retention.next_deadline_after(flotilla_resources::clock::now()).map(wake).into_iter().chain(ahead).min()
                 }
             },
         };
         tokio::select! {
             batch = changes.next() => {
                 let Some(events) = batch else { return "the artifact watch ended".into() };
-                let now = Utc::now();
+                let now = flotilla_resources::clock::now();
                 for event in events {
                     let event = match event {
                         Ok(event) => event,
@@ -234,7 +235,7 @@ async fn retain(
                 }
             }
             digest = unwritten.recv() => match digest {
-                Ok(digest) => retention.unwritten(&digest, Utc::now()),
+                Ok(digest) => retention.unwritten(&digest, flotilla_resources::clock::now()),
                 // Fell behind: the stores are looked at again.
                 Err(broadcast::error::RecvError::Lagged(_)) => leftovers = Some(tokio::time::Instant::now()),
                 Err(broadcast::error::RecvError::Closed) => return "the blob store closed".into(),
@@ -993,7 +994,7 @@ pub(super) fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, names
                     error!(%namespace, failures = pass_failures, "dispatch passes failed repeatedly; waiting for the next change");
                 }
                 let retry = (failed && pass_failures < DISPATCH_RETRY_LIMIT).then(|| DISPATCH_RETRY.delay(pass_failures));
-                let due = due.map(|due| due.signed_duration_since(Utc::now()).to_std().unwrap_or_default());
+                let due = due.map(|due| due.signed_duration_since(flotilla_resources::clock::now()).to_std().unwrap_or_default());
                 let wake = retry.into_iter().chain(due).min();
                 tokio::select! {
                     events = watches.next() => match events {

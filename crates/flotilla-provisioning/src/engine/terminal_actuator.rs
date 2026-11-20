@@ -30,7 +30,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_resources::{
     agent_activity::ProgressFacts,
     terminal_records::{TerminalLaunchFacts as FactsView, TerminalRecord, TerminalRecords, PROCESS_EXITED},
@@ -409,7 +408,7 @@ where
             return Ok(());
         }
         let delay = chrono::Duration::from_std(self.release_backoff.delay(failures)).unwrap_or_else(|_| chrono::Duration::days(1));
-        let retry_at = Timestamp::from_datetime(&(Utc::now() + delay));
+        let retry_at = Timestamp::from_datetime(&(flotilla_resources::clock::now() + delay));
         Err(ProviderFailure { retry_at: Some(retry_at), ..failed(errors) })
     }
 
@@ -552,7 +551,7 @@ where
             }
             Err(error) => warn!(launch = %record.name, %error, "daemon reach observation failed"),
         }
-        let now = Utc::now();
+        let now = flotilla_resources::clock::now();
         match self.provider.read_screen(record, session_id).await {
             Ok(Some(reading)) => {
                 if let (Some(progress), Some(digest)) = (&self.progress, reading.output_digest.as_deref()) {

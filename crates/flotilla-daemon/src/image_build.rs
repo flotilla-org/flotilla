@@ -6,7 +6,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_credentials::{BuildSecretError, CredentialStore};
 use flotilla_environment::environment::{image::SecretFile, RegistryAuth};
 use flotilla_provisioning::engine::image_build_actuator::ImageBuildMaterials;
@@ -94,7 +93,7 @@ impl ImageBuildMaterials for DaemonImageBuildMaterials {
     async fn keep_log(&self, build: &str, name: &str, log: &str) -> Result<String, String> {
         let name = name.to_owned();
         let digest = self.blobs.put_with_media_type(log.as_bytes(), "text/plain").await?;
-        let now = Utc::now();
+        let now = flotilla_resources::clock::now();
         let artifact = ArtifactSpec::builder()
             .convoy(String::new())
             .producer("image-build".into())

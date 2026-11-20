@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use chrono::Utc;
 use flotilla_protocol::NodeId;
 use futures::{stream::BoxStream, StreamExt};
 use serde::{de::IntoDeserializer, Deserialize};
@@ -1074,7 +1073,7 @@ async fn retain_authoritative_name_tombstone<T: Resource>(
     if write.created {
         backend
             .replica_writer::<T>(backend.local_root()?, namespace)
-            .apply(WatchEvent::DeletedByName(write.tombstone.clone()), Utc::now())
+            .apply(WatchEvent::DeletedByName(write.tombstone.clone()), flotilla_resources::clock::now())
             .await?;
     }
     Ok(write)
@@ -1106,7 +1105,10 @@ async fn collect_replica_typed<T: Resource>(
         )));
     }
     let value = read_object_value(&replica)?;
-    backend.replica_writer::<T>(origin_root.clone(), namespace).apply(WatchEvent::Deleted(replica.object), Utc::now()).await?;
+    backend
+        .replica_writer::<T>(origin_root.clone(), namespace)
+        .apply(WatchEvent::Deleted(replica.object), flotilla_resources::clock::now())
+        .await?;
     Ok(DynamicResourceObject {
         kind: T::API_PATHS.kind.to_string(),
         plural: T::API_PATHS.plural.to_string(),
@@ -1471,7 +1473,7 @@ fn apply_host_heartbeat_readiness<T: Resource>(value: &mut Value) -> Result<(), 
     }
     let mut status: HostStatus = serde_json::from_value(status_value.clone())
         .map_err(|error| ResourceError::decode(format!("decode Host status for heartbeat readiness: {error}")))?;
-    status.apply_heartbeat_readiness(chrono::Utc::now());
+    status.apply_heartbeat_readiness(flotilla_resources::clock::now());
     *status_value = serde_json::to_value(status)
         .map_err(|error| ResourceError::decode(format!("encode Host status for heartbeat readiness: {error}")))?;
     Ok(())

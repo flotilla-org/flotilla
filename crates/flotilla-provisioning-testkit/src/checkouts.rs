@@ -257,7 +257,7 @@ impl CheckoutFixture {
     }
 
     fn now() -> Timestamp {
-        Timestamp::from_datetime(&chrono::Utc::now())
+        Timestamp::from_datetime(&flotilla_resources::clock::now())
     }
 
     /// Requests checkout `name` with `spec`, held for `holder`, returning the launch that serves it.
@@ -320,6 +320,6 @@ impl CheckoutFixture {
     }
 
     fn step(&self, launch: &str, step: Step) {
-        self.lifecycles.step(launch, &step, Timestamp::from_datetime(&chrono::Utc::now())).expect("checkout step");
+        self.lifecycles.step(launch, &step, Timestamp::from_datetime(&flotilla_resources::clock::now())).expect("checkout step");
     }
 }

@@ -34,7 +34,7 @@ pub(super) async fn publish_change_request(
             .expect("read concurrently materialized CR observation"),
         Err(error) => panic!("create merged CR observation: {error}"),
     };
-    let observed_at = Utc::now();
+    let observed_at = flotilla_resources::clock::now();
     records
         .update_status(
             &record.metadata.name,

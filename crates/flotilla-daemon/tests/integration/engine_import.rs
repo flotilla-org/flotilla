@@ -678,7 +678,7 @@ fn unexplained_drops(report: &Value) -> Vec<String> {
 // Behaviour (#3108 rehearsal): a daemon started engine-only over an old store imports it at its
 // first start, accounts for every old row, and reads back through its tables exactly what the
 // report says it imported.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_daemon_started_over_an_old_store_reads_back_what_it_imported() {
     let dir = tempfile::tempdir().expect("tempdir");
     drop(populated(dir.path()).await);
@@ -751,7 +751,7 @@ async fn a_daemon_server_started_over_an_old_store_leaves_it_byte_identical() {
 // own launch, and finds the imported ones under those names. At r983 it found no checkout, asked
 // for a second of the same branch, which gave up, and the vessel and its convoy failed with it,
 // tearing the crew's environment and checkouts down (feta and udder).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_imported_live_crew_keeps_its_checkout_and_its_convoy() {
     use flotilla_resources::{
         checkout_path::{checkout_name, checkout_placement_scope},
@@ -875,7 +875,7 @@ async fn an_imported_live_crew_keeps_its_checkout_and_its_convoy() {
 // Rehearsal (#3108): the same over a copy of a real frozen-fleet store, named by
 // `FLOTILLA_IMPORT_REHEARSAL_STORE`. The copy stays where it is, and this prints counts by kind
 // and refusal reasons only.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[ignore = "needs a real old store copy in FLOTILLA_IMPORT_REHEARSAL_STORE"]
 async fn a_daemon_started_over_a_real_old_store_reads_back_what_it_imported() {
     let store = std::path::PathBuf::from(std::env::var_os("FLOTILLA_IMPORT_REHEARSAL_STORE").expect("FLOTILLA_IMPORT_REHEARSAL_STORE"));

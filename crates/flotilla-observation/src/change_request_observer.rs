@@ -1117,7 +1117,7 @@ impl ChangeRequestRefresher {
                     let ordinary_delay = if retained { RETAINED_REFRESH_INTERVAL } else { self.inner.cadence.checks_pending };
                     let delay = error
                         .retry_at()
-                        .and_then(|retry_at| retry_at.signed_duration_since(Utc::now()).to_std().ok())
+                        .and_then(|retry_at| retry_at.signed_duration_since(flotilla_resources::clock::now()).to_std().ok())
                         .filter(|delay| !delay.is_zero())
                         .unwrap_or(ordinary_delay);
                     if !self.wait_for_next(&subject, delay, ordinary_delay).await {
@@ -1546,7 +1546,7 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("node"));
         let hosts = backend.using::<Host>("ops");
         let host = hosts.create(&InputMeta::builder().name("node-host".into()).build(), &HostSpec::default()).await.expect("host");
-        let ready = HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() };
+        let ready = HostStatus { ready: true, heartbeat_at: Some(flotilla_resources::clock::now()), ..Default::default() };
         hosts.update_status("node-host", &host.metadata.resource_version, &ready).await.expect("heartbeat");
         let refresher = ChangeRequestRefresher::new(
             backend.clone(),
@@ -1565,7 +1565,7 @@ mod tests {
             submissions: vec![Submission {
                 reference: format!("cr/github.com/org/repo/{number}"),
                 metadata: BTreeMap::new(),
-                submitted_at: Some(Utc::now()),
+                submitted_at: Some(flotilla_resources::clock::now()),
                 verdict: None,
             }],
         };
@@ -1625,7 +1625,7 @@ mod tests {
                     is_main: false,
                 }),
                 holder: Some(CheckoutHolder::Convoy(convoy.into())),
-                requested_at: Utc::now(),
+                requested_at: flotilla_resources::clock::now(),
                 reading,
                 degraded: None,
                 integration: (),
@@ -1712,7 +1712,7 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("node"));
         let hosts = backend.using::<Host>("ops");
         let host = hosts.create(&InputMeta::builder().name("node-host".into()).build(), &HostSpec::default()).await.expect("host");
-        let ready = HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() };
+        let ready = HostStatus { ready: true, heartbeat_at: Some(flotilla_resources::clock::now()), ..Default::default() };
         hosts.update_status("node-host", &host.metadata.resource_version, &ready).await.expect("heartbeat");
         let refresher = ChangeRequestRefresher::new(
             backend.clone(),
@@ -1730,7 +1730,7 @@ mod tests {
             source: IssueSource { service: "github.com".into(), scope: "org/repo".into() },
             id: "42".into(),
         };
-        status.discover_subject(produced, Relationship::Produces, SubjectDiscoverySource::Claim, Utc::now());
+        status.discover_subject(produced, Relationship::Produces, SubjectDiscoverySource::Claim, flotilla_resources::clock::now());
         convoys.update_status("work", &convoy.metadata.resource_version, &status).await.expect("status");
         (refresher, convoys)
     }
@@ -1878,7 +1878,7 @@ mod tests {
             source: IssueSource { service: "github.com".into(), scope: "org/active".into() },
             id: "7".into(),
         };
-        status.discover_subject(produced, Relationship::Produces, SubjectDiscoverySource::Branch, Utc::now());
+        status.discover_subject(produced, Relationship::Produces, SubjectDiscoverySource::Branch, flotilla_resources::clock::now());
         convoys.update_status("active", &convoy.metadata.resource_version, &status).await.expect("produces");
         refresher.reconcile_convoy_demands("ops", &mut ConvoyDemands::default()).await.expect("reconcile");
         tokio::time::advance(BRANCH_PROBE_INTERVAL * 2).await;
@@ -1936,7 +1936,7 @@ mod tests {
             assert_eq!(refresher.observation_error(&subject).await, Some(replacement));
             *source.0.lock().await = Ok(parse_gh_observation(
                 r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[],"reviewDecision":"APPROVED","mergeable":"MERGEABLE"}"#,
-                Utc::now(),
+                flotilla_resources::clock::now(),
             )
             .expect("healthy observation"));
             refresher.refresh_once(&subject).await.expect("recovered observation");
@@ -1962,7 +1962,7 @@ mod tests {
     impl ChangeRequestObservationSource for CountingSource {
         async fn observe(&self, _subject: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            let observed_at = Utc::now();
+            let observed_at = flotilla_resources::clock::now();
             Ok(ChangeRequestStatus {
                 title: Default::default(),
                 author: Default::default(),
@@ -2032,7 +2032,7 @@ mod tests {
             Mutex::new(
                 parse_gh_observation(
                     r#"{"state":"MERGED","headRefOid":"head","statusCheckRollup":[],"mergeable":"MERGEABLE"}"#,
-                    Utc::now(),
+                    flotilla_resources::clock::now(),
                 )
                 .expect("merged"),
             ),
@@ -2058,8 +2058,11 @@ mod tests {
     #[async_trait]
     impl ChangeRequestObservationSource for GroupSource {
         async fn observe(&self, _: &ChangeRequestKey) -> Result<ChangeRequestStatus, ObservationError> {
-            Ok(parse_gh_observation(r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[],"mergeable":"MERGEABLE"}"#, Utc::now())
-                .expect("open"))
+            Ok(parse_gh_observation(
+                r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[],"mergeable":"MERGEABLE"}"#,
+                flotilla_resources::clock::now(),
+            )
+            .expect("open"))
         }
         async fn observe_group(
             &self,
@@ -2179,7 +2182,7 @@ mod tests {
                     .origin("kiwi".into())
                     .relationship(Relationship::Produces)
                     .role("coder".into())
-                    .last_seen(Utc::now())
+                    .last_seen(flotilla_resources::clock::now())
                     .build(),
             );
             records.update(&InputMeta::from(&record.metadata), &record.metadata.resource_version, &spec).await.expect("history");
@@ -2241,7 +2244,7 @@ mod tests {
                     linked.clone(),
                     Relationship::Produces,
                     flotilla_resources::SubjectDiscoverySource::Operator,
-                    Utc::now(),
+                    flotilla_resources::clock::now(),
                 );
                 convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("link");
             }
@@ -2255,7 +2258,7 @@ mod tests {
                         .origin("kiwi".into())
                         .relationship(Relationship::Produces)
                         .role("coder".into())
-                        .last_seen(Utc::now())
+                        .last_seen(flotilla_resources::clock::now())
                         .build(),
                 );
             }
@@ -2416,7 +2419,7 @@ mod tests {
                     .origin("kiwi".into())
                     .relationship(Relationship::Produces)
                     .role("coder".into())
-                    .last_seen(Utc::now())
+                    .last_seen(flotilla_resources::clock::now())
                     .build(),
             );
         }
@@ -2445,7 +2448,12 @@ mod tests {
                 .await
                 .unwrap();
             let mut status = ConvoyStatus::default();
-            status.discover_subject(link.clone(), Relationship::Produces, SubjectDiscoverySource::Operator, Utc::now());
+            status.discover_subject(
+                link.clone(),
+                Relationship::Produces,
+                SubjectDiscoverySource::Operator,
+                flotilla_resources::clock::now(),
+            );
             status.unlink_subject(&link);
             convoys.update_status(name, &convoy.metadata.resource_version, &status).await.unwrap();
             let refresher = ChangeRequestRefresher::new(
@@ -2493,7 +2501,7 @@ mod tests {
     async fn produced_request_survives_release_and_restart_until_terminal() {
         for terminal in [ObservedChangeRequestState::Merged, ObservedChangeRequestState::Closed] {
             let backend = ResourceBackend::new(InMemoryBackend::default());
-            let observed_at = Utc::now();
+            let observed_at = flotilla_resources::clock::now();
             let opened = parse_gh_observation(
                 r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[],"reviewDecision":"APPROVED","mergeable":"MERGEABLE"}"#,
                 observed_at,
@@ -2651,6 +2659,8 @@ mod tests {
         assert!(backend.local_namespaces::<ChangeRequest>().await.expect("local namespaces after GC").is_empty());
     }
 
+    // The polls all fall within the staleness bound: past it, a poll writes to keep the record
+    // fresh, as the observer's clock moves with the paused time.
     #[tokio::test(start_paused = true)]
     async fn identical_polls_do_not_write_status() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -2659,7 +2669,7 @@ mod tests {
             backend.clone(),
             "authority".to_string(),
             Arc::new(CountingSource(Arc::clone(&calls))),
-            ChangeRequestRefreshCadence::default(),
+            ChangeRequestRefreshCadence { stale_after: Duration::from_secs(3600), ..ChangeRequestRefreshCadence::default() },
         );
         let subject = ChangeRequestKey::new(
             "flotilla",
@@ -2688,7 +2698,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_approval_at_the_same_head_is_written_on_the_poll_that_reads_it() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let observed_at = Utc::now();
+        let observed_at = flotilla_resources::clock::now();
         let awaiting_review = ChangeRequestStatus {
             title: Observation::known("Fix the thing".to_string(), observed_at),
             author: Observation::known("someone".to_string(), observed_at),
@@ -2868,7 +2878,7 @@ mod tests {
             flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1699, &[]).expect("address"),
         )
         .expect("key");
-        refresher.demand(uuid::Uuid::new_v4(), subject.clone(), Some(Utc::now())).await.expect("freshness demand");
+        refresher.demand(uuid::Uuid::new_v4(), subject.clone(), Some(flotilla_resources::clock::now())).await.expect("freshness demand");
         wait_for_calls(&calls, 1).await;
         let records = backend.using::<ChangeRequest>("flotilla");
         let first = records.get(&subject.record_name()).await.expect("first observation");
@@ -2906,16 +2916,19 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // #3412: grace follows the observer's scheduled refresh plus its own
         // cadence; a new demand must replace the slow schedule with the fast one.
-        let now = Utc::now();
+        let now = flotilla_resources::clock::now();
         let deadline = refresher.refresh_grace_deadline(&subject, None, now).await;
         assert!(deadline >= now + chrono::Duration::seconds(179));
         assert!(deadline <= now + chrono::Duration::seconds(181));
 
         tokio::time::advance(Duration::from_secs(5)).await;
-        refresher.demand(uuid::Uuid::new_v4(), subject.clone(), Some(Utc::now())).await.expect("late freshness demand");
+        refresher
+            .demand(uuid::Uuid::new_v4(), subject.clone(), Some(flotilla_resources::clock::now()))
+            .await
+            .expect("late freshness demand");
         wait_for_calls(&calls, 2).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "freshness demand must preempt the remaining 85-second sleep");
-        let now = Utc::now();
+        let now = flotilla_resources::clock::now();
         let deadline = refresher.refresh_grace_deadline(&subject, Some(now), now).await;
         assert!(deadline >= now + chrono::Duration::seconds(19));
         assert!(deadline <= now + chrono::Duration::seconds(21));
@@ -2954,11 +2967,11 @@ mod tests {
             .observing_authority("remote".into())
             .build();
         let record = remote_records.create(&InputMeta::builder().name(subject.record_name()).build(), &spec).await.expect("remote record");
-        let observed = parse_gh_observation(r#"{"state":"OPEN"}"#, Utc::now()).expect("observation");
+        let observed = parse_gh_observation(r#"{"state":"OPEN"}"#, flotilla_resources::clock::now()).expect("observation");
         remote_records.update_status(&subject.record_name(), &record.metadata.resource_version, &observed).await.expect("observation");
         backend
             .replica_writer::<ChangeRequest>(NodeId::new("remote"), "ops")
-            .replace(&remote_records.list().await.expect("remote list"), Utc::now())
+            .replace(&remote_records.list().await.expect("remote list"), flotilla_resources::clock::now())
             .await
             .expect("replica");
         let produces = DeclaredSubject {
@@ -2998,17 +3011,18 @@ mod tests {
         projects.create(&InputMeta::builder().name("ops".into()).build(), &project).await.expect("remote project");
         backend
             .replica_writer::<flotilla_resources::Project>(NodeId::new("remote"), "ops")
-            .replace(&projects.list().await.expect("remote projects"), Utc::now())
+            .replace(&projects.list().await.expect("remote projects"), flotilla_resources::clock::now())
             .await
             .expect("project replica");
         // Only a host that has sent a heartbeat is a candidate observer (Q3): `remote` has.
         let hosts = remote.using::<flotilla_resources::Host>("ops");
         let host = hosts.create(&InputMeta::builder().name("remote-host".into()).build(), &Default::default()).await.expect("remote host");
-        let status = flotilla_resources::HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() };
+        let status =
+            flotilla_resources::HostStatus { ready: true, heartbeat_at: Some(flotilla_resources::clock::now()), ..Default::default() };
         hosts.update_status("remote-host", &host.metadata.resource_version, &status).await.expect("remote heartbeat");
         backend
             .replica_writer::<flotilla_resources::Host>(NodeId::new("remote"), "ops")
-            .replace(&hosts.list().await.expect("remote hosts"), Utc::now())
+            .replace(&hosts.list().await.expect("remote hosts"), flotilla_resources::clock::now())
             .await
             .expect("host replica");
         let unheld = ChangeRequestKey::new(
@@ -3081,7 +3095,7 @@ mod tests {
         )
         .expect("key");
         let demand = uuid::Uuid::new_v4();
-        refresher.demand(demand, subject.clone(), Some(Utc::now())).await.expect("demand");
+        refresher.demand(demand, subject.clone(), Some(flotilla_resources::clock::now())).await.expect("demand");
         tokio::time::timeout(Duration::from_secs(1), async {
             while failures.0.lock().expect("failures").is_empty() {
                 tokio::task::yield_now().await;
@@ -3108,7 +3122,7 @@ mod tests {
         )
         .expect("key");
         let demand = uuid::Uuid::new_v4();
-        refresher.demand(demand, subject.clone(), Some(Utc::now())).await.expect("demand");
+        refresher.demand(demand, subject.clone(), Some(flotilla_resources::clock::now())).await.expect("demand");
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {

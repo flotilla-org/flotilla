@@ -200,7 +200,7 @@ pub(super) async fn session_busy_after_delivery_grace(
     let mut positive_since = None;
     let deadline = tokio::time::Instant::now() + DELIVERY_CONFIRMATION_GRACE;
     loop {
-        let observation = observe_terminal_screen(pool, adapter, session_id, Utc::now())
+        let observation = observe_terminal_screen(pool, adapter, session_id, flotilla_resources::clock::now())
             .await?
             .ok_or_else(|| format!("terminal session {session_id} disappeared after message delivery"))?;
         // Pools without attention evidence retain legacy best-effort behavior,
@@ -714,7 +714,7 @@ impl TerminalControllerRuntime {
             }
         }
         let adapter = self.adapter_for_spec(spec).await?;
-        let now = Utc::now();
+        let now = flotilla_resources::clock::now();
         let Some((observation, agent)) = read_terminal_screen(&*pool, adapter.as_deref(), session_id, now).await? else { return Ok(None) };
         if let (Some(record), Some(activity)) = (spec.record, agent.and_then(screen_activity)) {
             self.observe_agent_screen(record, activity, now).await;
@@ -1116,7 +1116,7 @@ impl TerminalProvider for TerminalControllerRuntime {
             let backend = self.state.daemon.resource_backend();
             let vessel = vessel_name_of(&backend, context).await.ok_or_else(|| format!("vessel {} has no name", context.vessel_ref))?;
             let fact = Fact::SessionLeftRunning { convoy: context.convoy.clone(), vessel, session: launch.name.clone() };
-            self.state.daemon.attentions().raise(&context.namespace, &Attention::new(fact, reason, Utc::now())).await
+            self.state.daemon.attentions().raise(&context.namespace, &Attention::new(fact, reason, flotilla_resources::clock::now())).await
         };
         if let Err(error) = told.await {
             warn!(launch = %launch.name, %error, %reason, "a session left running could not be told to a person");

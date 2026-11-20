@@ -120,7 +120,7 @@ impl RuntimeHealth {
                 "{} controller exhausted its budget after {} consecutive failures; retrying after long backoff: {}",
                 exhausted.controller, exhausted.attempts, exhausted.error
             ))
-            .observed_at(Utc::now())
+            .observed_at(flotilla_resources::clock::now())
             // Only the aggregator schedules forge refresh; actuator-controller failure does not stop reads.
             .blocks_forge_observation(exhausted.controller == AGGREGATOR_CONTROLLER)
             .build();
@@ -142,7 +142,7 @@ impl RuntimeHealth {
                         .value(ConditionValue::False)
                         .reason("FleetDesignationUnavailable")
                         .message(message)
-                        .observed_at(Utc::now())
+                        .observed_at(flotilla_resources::clock::now())
                         .blocks_readiness(false)
                         .blocks_forge_observation(false)
                         .build(),
@@ -177,7 +177,7 @@ impl RuntimeHealth {
                     .value(ConditionValue::False)
                     .reason("RetentionFailing")
                     .message(message)
-                    .observed_at(Utc::now())
+                    .observed_at(flotilla_resources::clock::now())
                     .blocks_readiness(false)
                     .blocks_forge_observation(false)
                     .build();
@@ -195,7 +195,7 @@ impl RuntimeHealth {
             .value(ConditionValue::False)
             .reason("ReconciliationPassTimedOut")
             .message(format!("standing convoy ensure reconciliation exceeded its {timeout:?} pass timeout"))
-            .observed_at(Utc::now())
+            .observed_at(flotilla_resources::clock::now())
             // Admission scan backlog does not prevent existing forge reads.
             .blocks_forge_observation(false)
             .build();
@@ -212,7 +212,7 @@ impl RuntimeHealth {
         if let Some(state_dir) = self.restart_history_dir.clone() {
             let frequency =
                 flotilla_provider_runtime::probe::blocking("restart history", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
-                    crate::restart_history::recent_abnormal_restarts(state_dir.as_path(), Utc::now())
+                    crate::restart_history::recent_abnormal_restarts(state_dir.as_path(), flotilla_resources::clock::now())
                 })
                 .await;
             let condition = match frequency {
@@ -226,7 +226,7 @@ impl RuntimeHealth {
                             frequency.count,
                             frequency.window.as_secs() / 60
                         ))
-                        .observed_at(Utc::now())
+                        .observed_at(flotilla_resources::clock::now())
                         .blocks_readiness(false)
                         // Historical restarts do not disable a currently live forge reader.
                         .blocks_forge_observation(false)
@@ -239,7 +239,7 @@ impl RuntimeHealth {
                         .value(ConditionValue::False)
                         .reason("RestartHistoryUnavailable")
                         .message(error)
-                        .observed_at(Utc::now())
+                        .observed_at(flotilla_resources::clock::now())
                         // Restart-history diagnostics are independent of forge I/O.
                         .blocks_forge_observation(false)
                         .build(),
@@ -302,7 +302,7 @@ pub(super) fn assess_agent_adapter_capabilities(
             .value(ConditionValue::False)
             .reason("AgentAdaptersMissing")
             .message(format!("agent adapters from the last non-regressed daemon generation are missing: {}", missing.join(", ")))
-            .observed_at(Utc::now())
+            .observed_at(flotilla_resources::clock::now())
             // Missing agent adapters affect crew placement, not forge reads.
             .blocks_forge_observation(false)
             .build(),
@@ -370,7 +370,7 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
                 .value(ConditionValue::False)
                 .reason("ProbeFailed")
                 .message(error)
-                .observed_at(Utc::now())
+                .observed_at(flotilla_resources::clock::now())
                 // An admission free-space probe failure does not establish forge-read failure.
                 .blocks_forge_observation(false)
                 .build(),
@@ -587,7 +587,7 @@ pub(super) async fn resolve_daemon_forgejo_credential_condition(
             "daemon.toml [credentials.forgejo] keys {} do not resolve to declared Forge resources in namespaces {namespace_context}; check the Forge IDs or declare the missing Forges",
             unresolved.join(", ")
         ))
-        .observed_at(Utc::now())
+        .observed_at(flotilla_resources::clock::now())
         .blocks_readiness(false)
         // An unresolved mapping is source-specific; providers report their own credential errors.
         .blocks_forge_observation(false)

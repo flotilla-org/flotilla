@@ -2,7 +2,6 @@
 //! only actual crew work uses the selected credential and may spend model turns.
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
-use chrono::Utc;
 use flotilla_agent::adapter::Harness;
 use flotilla_environment::environment::EnvironmentProvider;
 use flotilla_provider_runtime::{execution_context::ObservationContext, CommandRunner, EnvVars};
@@ -138,7 +137,7 @@ pub(crate) async fn probe_kind(
     *model_probes = ModelProbeState::default();
     let mut facts = FulfilmentFacts {
         image: target.image.map(|image| image.to_string().into()),
-        observed_at: Utc::now(),
+        observed_at: flotilla_resources::clock::now(),
         free_vessel_slots: capacity_fact(pool_available),
         ..Default::default()
     };

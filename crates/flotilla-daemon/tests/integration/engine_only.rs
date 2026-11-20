@@ -24,7 +24,7 @@ fn names<'a>(column: &'a str, name: &'a str) -> impl Fn(&Row) -> bool + 'a {
 // coder's checkout and both crews' terminal sessions are realised; the crews take
 // turns and exchange messages; the coder's change request on the dummy forge keeps
 // its promise; the convoy is delivered, and everything held for it ends Gone.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn on_the_engine_alone_a_convoy_is_delivered_and_its_resources_end_gone() {
     let daemon = TestDaemon::builder().old_store(OldStoreMode::Unavailable).start().await;
     delivered_convoy(&daemon).await;
@@ -33,7 +33,7 @@ async fn on_the_engine_alone_a_convoy_is_delivered_and_its_resources_end_gone() 
 
 // The same convoy over a recording old store: lists, by stage, every access the
 // scenario still makes there, and where each first came from.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 #[ignore = "a census of the old store's remaining accesses, run by hand"]
 async fn census_of_old_store_accesses_on_the_way_to_delivery() {
     let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
@@ -47,7 +47,7 @@ async fn census_of_old_store_accesses_on_the_way_to_delivery() {
 // `flotilla apply` of an AccountProvision writes the engine's record, and the provision
 // controller wakes on that change alone: its place is no environment, so it removes it. The old
 // store is recorded rather than refused, because other controllers still reach it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn an_applied_account_provision_wakes_its_controller_on_the_engine() {
     use flotilla_resources::account_access::{ProvisionPlan, UpdateMode};
     let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
@@ -74,22 +74,16 @@ async fn an_applied_account_provision_wakes_its_controller_on_the_engine() {
 
 // The resource commands read a crew's clones and environments from the engine. The provisioning
 // reconcilers alone write them, so a delete is refused, naming the command that shows them.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn the_resource_commands_read_clones_and_environments_from_the_engine() {
     use flotilla_protocol::{CommandAction, CommandValue};
     use flotilla_resources::{Clone, Environment};
     let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
     daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
     daemon.stage("lifecycle");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let (clones, environments) = loop {
-        let (clones, environments) = (daemon.list::<Clone>().await, daemon.list::<Environment>().await);
-        if !clones.is_empty() && !environments.is_empty() {
-            break (clones, environments);
-        }
-        assert!(tokio::time::Instant::now() < deadline, "the crew's clone and environment are listed: {clones:?} {environments:?}");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
+    daemon.wait("the crew's clone", |_: &flotilla_resources::ResourceObject<Clone>| true).await;
+    daemon.wait("the crew's environment", |_: &flotilla_resources::ResourceObject<Environment>| true).await;
+    let (clones, environments) = (daemon.list::<Clone>().await, daemon.list::<Environment>().await);
     let clone = daemon.get::<Clone>(&clones[0].metadata.name).await.expect("the listed clone reads by name");
     assert_eq!(clone.spec, clones[0].spec);
     let environment = daemon.get::<Environment>(&environments[0].metadata.name).await.expect("the listed environment reads by name");
@@ -114,22 +108,15 @@ async fn the_resource_commands_read_clones_and_environments_from_the_engine() {
 // The resource commands read a crew's checkout from the engine's launches and refuse to write it,
 // naming where it is seen. Image builds have no resource view: every verb on them is refused,
 // naming `flotilla image check`. Neither kind reaches the old store.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn the_resource_commands_read_checkouts_from_the_engine_and_refuse_image_builds() {
     use flotilla_protocol::{CommandAction, CommandValue};
     use flotilla_resources::Checkout;
     let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
     daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
     daemon.stage("lifecycle");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let checkouts = loop {
-        let checkouts = daemon.list::<Checkout>().await;
-        if !checkouts.is_empty() {
-            break checkouts;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "the coder's checkout is listed");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
+    daemon.wait("the coder's checkout", |_: &flotilla_resources::ResourceObject<Checkout>| true).await;
+    let checkouts = daemon.list::<Checkout>().await;
     let checkout = daemon.get::<Checkout>(&checkouts[0].metadata.name).await.expect("the listed checkout reads by name");
     assert_eq!(checkout.spec, checkouts[0].spec);
     assert!(checkout.metadata.labels.contains_key(flotilla_resources::CONVOY_LABEL), "its convoy is labelled: {checkout:?}");
@@ -167,7 +154,7 @@ async fn the_resource_commands_read_checkouts_from_the_engine_and_refuse_image_b
 
 // No registered kind falls through to the old store by the generic resource verbs: each is served
 // by an engine port or refused there. A kind registered later without a port fails here.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn every_registered_kind_is_served_by_the_engine_or_refused() {
     use flotilla_protocol::CommandAction;
     let daemon = TestDaemon::builder().old_store(OldStoreMode::Unavailable).start().await;
@@ -202,7 +189,7 @@ async fn every_registered_kind_is_served_by_the_engine_or_refused() {
 
 // The engine serves its kinds in the daemon's namespace alone: the resource commands refuse a write
 // through any other, naming the namespace, and nothing is written.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn the_resource_commands_refuse_writes_through_another_namespace() {
     use flotilla_protocol::{CommandAction, CommandValue};
     use flotilla_resources::AccessDelivery;
@@ -242,22 +229,15 @@ async fn the_resource_commands_refuse_writes_through_another_namespace() {
 
 // The resource commands read a crew's messages from the engine. A message's state moves only
 // through its machine, so a delete is refused, naming the command that does change it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn the_resource_commands_read_messages_from_the_engine() {
     use flotilla_protocol::{CommandAction, CommandValue};
     use flotilla_resources::Message;
     let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
     daemon.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
     daemon.stage("messages");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let listed = loop {
-        let listed = daemon.list::<Message>().await;
-        if !listed.is_empty() {
-            break listed;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "no message listed for the dispatched crew");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
+    daemon.wait("a message for the dispatched crew", |_: &flotilla_resources::ResourceObject<Message>| true).await;
+    let listed = daemon.list::<Message>().await;
     let name = listed[0].metadata.name.clone();
     let got = daemon.get::<Message>(&name).await.expect("the listed message reads by name");
     assert_eq!(got.spec, listed[0].spec);
@@ -273,42 +253,23 @@ async fn the_resource_commands_read_messages_from_the_engine() {
 
 // A home's messages reach a peer by following its log: listed there through the resource
 // commands, with the old store's replication never consulted for them.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn messages_reach_a_peer_by_log_following() {
     let (a, b) = tokio::join!(
         TestDaemon::builder().settings("host_name = \"engine-a\"\n").old_store(OldStoreMode::Recording).start(),
         TestDaemon::builder().settings("host_name = \"engine-b\"\n").old_store(OldStoreMode::Recording).start()
     );
     a.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let sent = loop {
-        let sent = message_names(&a).await;
-        if !sent.is_empty() {
-            break sent;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "no message listed at its home");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
+    a.wait("a message at its home", |_: &flotilla_resources::ResourceObject<flotilla_resources::Message>| true).await;
+    let sent = message_names(&a).await;
     a.stage("peered");
     b.stage("peered");
     let _peering = TestDaemon::peer(&a, &b).await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let missing: Vec<_> = sent.difference(&message_names(&b).await).cloned().collect();
-        if missing.is_empty() {
-            break;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            let got = b
-                .execute(flotilla_protocol::CommandAction::QueryResourceGet {
-                    namespace: "flotilla".into(),
-                    kind: "Message".into(),
-                    name: missing[0].clone(),
-                })
-                .await;
-            panic!("messages not listed at the peer: {missing:?}; get: {got:?}");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for name in &sent {
+        b.wait("the message at the peer", |message: &flotilla_resources::ResourceObject<flotilla_resources::Message>| {
+            message.metadata.name == *name
+        })
+        .await;
     }
     // A host role's message (A's forge observer's) lists at both homes with its receiver as the
     // engine stores it: no convoy, vessel or project names a host role.
@@ -418,7 +379,7 @@ async fn delivered_convoy(daemon: &TestDaemon) {
 
 // The resource commands read vessels from the engine's launches and refuse to write them, naming
 // where a vessel is seen; neither reaches the old store.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn the_resource_commands_read_vessels_from_the_engine_and_refuse_writes() {
     use flotilla_protocol::{CommandAction, CommandValue};
     let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
@@ -446,7 +407,7 @@ async fn the_resource_commands_read_vessels_from_the_engine_and_refuse_writes() 
 
 // A home's vessel and terminal session launches reach a peer by following its log: listed there
 // through the resource commands, never through the old store.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn vessels_and_terminal_sessions_reach_a_peer_by_log_following() {
     use flotilla_resources::{TerminalSession, Vessel};
     let (a, b) = tokio::join!(
@@ -454,31 +415,18 @@ async fn vessels_and_terminal_sessions_reach_a_peer_by_log_following() {
         TestDaemon::builder().settings("host_name = \"engine-b\"\n").old_store(OldStoreMode::Recording).start()
     );
     a.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let (vessels, sessions) = loop {
-        let vessels = names_of(a.list::<Vessel>().await);
-        let sessions = names_of(a.list::<TerminalSession>().await);
-        if !vessels.is_empty() && !sessions.is_empty() {
-            break (vessels, sessions);
-        }
-        assert!(tokio::time::Instant::now() < deadline, "no vessel and session listed at their home");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
+    a.wait("a vessel at its home", |_: &flotilla_resources::ResourceObject<Vessel>| true).await;
+    a.wait("a terminal session at its home", |_: &flotilla_resources::ResourceObject<TerminalSession>| true).await;
+    let (vessels, sessions) = (names_of(a.list::<Vessel>().await), names_of(a.list::<TerminalSession>().await));
     a.stage("peered");
     b.stage("peered");
     let _peering = TestDaemon::peer(&a, &b).await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let missing_vessels: Vec<_> = vessels.difference(&names_of(b.list::<Vessel>().await)).cloned().collect();
-        let missing_sessions: Vec<_> = sessions.difference(&names_of(b.list::<TerminalSession>().await)).cloned().collect();
-        if missing_vessels.is_empty() && missing_sessions.is_empty() {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "not listed at the peer: vessels {missing_vessels:?}, sessions {missing_sessions:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for name in &vessels {
+        b.wait("the vessel at the peer", |vessel: &flotilla_resources::ResourceObject<Vessel>| vessel.metadata.name == *name).await;
+    }
+    for name in &sessions {
+        b.wait("the session at the peer", |session: &flotilla_resources::ResourceObject<TerminalSession>| session.metadata.name == *name)
+            .await;
     }
     for daemon in [&a, &b] {
         let report = daemon.old_store_report().expect("recorded");

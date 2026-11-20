@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
 use flotilla_protocol::{DaemonEvent, LeafAddress, LeafFire, WaitSubscriptionRequest};
 use flotilla_resources::{
     admit_leaf, evaluate_leaf, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Convoy, ConvoyLeafSubject, Forge,
@@ -70,7 +69,7 @@ impl LeafSubscriptionTable {
             watcher: LeafWatcher::WaitCaller { connection_id },
             maker: LeafMaker::Observed { refresher: "caller".into(), external_party: "unknown".into() },
             freshness_demand: request.freshness_demand,
-            created_at: Utc::now(),
+            created_at: flotilla_resources::clock::now(),
             episode_key: EpisodeKeyFields::default(),
         };
         self.inner.rows.lock().await.insert(id, row.clone());
@@ -217,7 +216,8 @@ impl LeafSubscriptionTable {
                     .filter(|deadline| Some(*deadline) != last_retry_deadline),
                 _ => None,
             };
-            let retry_delay = retry_at.map_or(Duration::from_secs(86400), |at| (at - Utc::now()).to_std().unwrap_or_default());
+            let retry_delay =
+                retry_at.map_or(Duration::from_secs(86400), |at| (at - flotilla_resources::clock::now()).to_std().unwrap_or_default());
             tokio::select! {
                 _ = tokio::time::sleep(retry_delay), if retry_at.is_some() => { last_retry_deadline = retry_at; }
                 result = changes.changed() => {
@@ -270,7 +270,7 @@ impl LeafSubscriptionTable {
         fire.subscription_id = subscription_id;
         self.inner.last_firings.lock().await.insert(
             (subscription_id, fire.leaf.clone()),
-            LeafFiringRecord { leaf: fire.leaf.clone(), value: fire.value.clone(), fired_at: Utc::now() },
+            LeafFiringRecord { leaf: fire.leaf.clone(), value: fire.value.clone(), fired_at: flotilla_resources::clock::now() },
         );
         let watcher = self.inner.rows.lock().await.get(&subscription_id).map(|row| row.watcher.clone());
         match watcher {
@@ -360,7 +360,7 @@ pub(super) fn evaluate_row(
             LeafAddress::ChangeRequest { .. } => {
                 let subject = name(leaf).and_then(|name| change_requests.get(name)).map(|change_request| ChangeRequestLeafSubject {
                     change_request,
-                    now: Utc::now(),
+                    now: flotilla_resources::clock::now(),
                     stale_after: staleness.change_request,
                 });
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
@@ -368,7 +368,7 @@ pub(super) fn evaluate_row(
             LeafAddress::Issue { .. } => {
                 let subject = name(leaf).and_then(|name| issues.get(name)).map(|issue| IssueLeafSubject {
                     issue,
-                    now: Utc::now(),
+                    now: flotilla_resources::clock::now(),
                     stale_after: staleness.issue,
                 });
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?

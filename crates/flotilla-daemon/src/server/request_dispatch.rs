@@ -634,7 +634,7 @@ async fn agent_hook(
             store.remove(&attachable_id);
             true
         } else if let Some(status) = event.event_type.to_status() {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            let now = u64::try_from(flotilla_resources::clock::now().timestamp()).unwrap_or_default();
             let existing = store.get(&attachable_id);
             // TODO(#393): persist event.cwd for CliAgentProvider correlation
             let entry = AgentEntry {

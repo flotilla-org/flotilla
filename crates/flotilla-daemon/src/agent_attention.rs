@@ -25,7 +25,7 @@ pub(crate) fn observe_hook_attention(
         .get(session_name, Some(terminals.home()))?
         .ok_or_else(|| format!("terminal session {session_name} has no launch here"))?;
     let adapter = launch.agent().map(|agent| agent.adapter.clone());
-    let attention = TerminalAttention { state, as_of: chrono::Utc::now(), source: TerminalAttentionSource::Hook };
+    let attention = TerminalAttention { state, as_of: flotilla_resources::clock::now(), source: TerminalAttentionSource::Hook };
     terminals.observations().update(&launch.name, |observation| {
         observation.codex_native_hooks |= native_codex;
         observation.observe_attention(attention, adapter.as_deref());
@@ -59,7 +59,7 @@ pub(crate) async fn record_agent_activity(
     }
     let sessions = Arc::clone(primitives.sessions());
     let cause = cause.to_owned();
-    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
+    let now = flotilla_schema::Timestamp::from_datetime(&flotilla_resources::clock::now());
     tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || sessions.observe(&launch.name, activity, cause, now)))
         .await
         .map_err(|error| error.to_string())??;

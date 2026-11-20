@@ -32,7 +32,7 @@
 //! imported and is not seeded with the dummy catalog.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -41,7 +41,7 @@ use std::{
 };
 
 use flotilla_client::{
-    resource::{ResourceClient, ResourceGetRequest, ResourceListRequest, ResourceWatchRequest},
+    resource::{ResourceClient, ResourceGetRequest, ResourceListRequest, ResourceWatch, ResourceWatchRequest},
     SocketDaemon,
 };
 use flotilla_config::{ConfigStore, DaemonConfig};
@@ -72,6 +72,8 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
+use flotilla_transport::traffic::Tracked;
+use futures::{FutureExt, StreamExt};
 use tokio::sync::{mpsc, watch, Notify};
 
 pub use super::old_store::OldStoreMode;
@@ -81,10 +83,11 @@ use super::old_store::{OldStore, OldStoreAccesses};
 pub const NAMESPACE: &str = "flotilla";
 /// Long runners' turns unless `.agent(..)` sets `long_runner_turns`.
 const LONG_RUNNER_TURNS: u32 = 2;
-const WAIT: Duration = Duration::from_secs(30);
-const SEED_WAIT: Duration = Duration::from_secs(60);
-const POLL: Duration = Duration::from_millis(100);
-const HARNESS_RESYNC: Duration = Duration::from_millis(200);
+/// How long a wait lasts before it fails, in virtual time: a scenario's real time is what its
+/// work takes, so the bound is generous, and a wait the system can never satisfy reaches it as
+/// soon as nothing nearer is due.
+const WAIT: Duration = Duration::from_secs(10 * 60);
+const HARNESS_RESYNC: Duration = Duration::from_secs(1);
 
 /// What a restart rebuilds the daemon from.
 struct Composition {
@@ -151,9 +154,8 @@ impl TestDaemon {
         /// The rest of `daemon.toml`, such as `host_name`.
         #[builder(default)]
         settings: &str,
-        clock: Option<Arc<dyn Clock>>,
         /// The controllers' resync interval; the harness's is short, so
-        /// scenarios observe seeded kinds and changes promptly.
+        /// scenarios observe seeded kinds and changes within a virtual second.
         #[builder(default = HARNESS_RESYNC)]
         resync: Duration,
         /// Install the GitHub and Forgejo providers behind these transports,
@@ -167,6 +169,7 @@ impl TestDaemon {
         /// An old store the first start imports; the daemon is then not seeded.
         import: Option<OldStoreImport>,
     ) -> Self {
+        assert_virtual_time();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_dir = dir.path().join("config");
         std::fs::create_dir_all(&config_dir).expect("config dir");
@@ -189,7 +192,8 @@ impl TestDaemon {
         };
         let composition = Composition {
             host: HostName::new(daemon_config.host_name.as_deref().expect("a host name")),
-            clock: clock.unwrap_or_else(|| Arc::new(SystemClock)),
+            // The wall clock as the runtime measures it: the test's virtual time.
+            clock: Arc::new(SystemClock),
             backend: ResourceBackend::from_arc(Arc::clone(&store)),
             old: ResourceBackend::from_arc(store),
             old_store,
@@ -210,6 +214,20 @@ impl TestDaemon {
         }
         started
     }
+}
+
+/// Fails unless the test runs on virtual time: tokio's paused time, on the one thread of a
+/// current-thread runtime, where the clock moves only when nothing can run. Paused time stands
+/// still across real work, which shows it.
+fn assert_virtual_time() {
+    let flavor = tokio::runtime::Handle::current().runtime_flavor();
+    let before = tokio::time::Instant::now();
+    std::thread::sleep(Duration::from_millis(1));
+    let paused = tokio::time::Instant::now() == before;
+    assert!(
+        flavor == tokio::runtime::RuntimeFlavor::CurrentThread && paused,
+        "a TestDaemon runs on virtual time: start its test with #[tokio::test(start_paused = true)]"
+    );
 }
 
 /// Puts `import`'s old store, with its write-ahead log, where the first start reads it in
@@ -249,14 +267,16 @@ fn daemon_toml(settings: &str, agent: &str, environment: &str, change_request: &
     toml::to_string(&document).expect("daemon.toml")
 }
 
-/// Short cadences, so scenarios observe seeded kinds and changes promptly.
+/// Cadences shorter than a host's, so scenarios observe seeded kinds and changes within a few
+/// virtual seconds. Each pass is real work, so a scenario's real time grows with its virtual time
+/// over the shortest of them.
 fn harness_options(resync: Duration) -> RuntimeOptions {
     RuntimeOptions {
         namespace: NAMESPACE.into(),
         heartbeat_interval: Duration::from_secs(5),
         controller_resync_interval: resync,
         // The dummy kinds are seeded after startup; observe them on the next pass.
-        fulfilment_probe_interval: Duration::from_millis(200),
+        fulfilment_probe_interval: Duration::from_secs(1),
         ..RuntimeOptions::default()
     }
 }
@@ -477,29 +497,72 @@ impl TestDaemon {
         items
     }
 
-    /// Wait until some `T` satisfies `done`, and return the first that does: of [`Self::every`],
-    /// so a Convoy that ended and retired is found. The wait fails with every `T`'s last state.
+    /// Wait until some `T` satisfies `done`, and return the first that does. It reads every `T`
+    /// ([`Self::every`], so a Convoy that ended and retired is found), then tries each state a
+    /// watch of them streams, and each one's last state again at every change the fleet records
+    /// (`done` may read [`Self::counts`]). It fails with every `T`'s last state.
     pub fn wait<'a, T: Resource>(&'a self, what: &'a str, done: impl Fn(&ResourceObject<T>) -> bool + 'a) -> Wait<'a, ResourceObject<T>> {
-        Wait::new(WAIT, async move |deadline| loop {
-            let mut items = self.every::<T>().await;
-            if let Some(found) = items.iter().position(&done) {
-                return items.swap_remove(found);
+        Wait::new(WAIT, async move |deadline| {
+            let mut recorded = self.fleet.changes();
+            let mut watch = watch_kind::<T>(&self.operator.resources).await;
+            // Each `T` by name, as last read: one that ended and retired keeps how it ended.
+            let mut last = BTreeMap::new();
+            for item in self.every::<T>().await {
+                last.insert(item.metadata.name.clone(), item);
             }
-            if tokio::time::Instant::now() > deadline {
-                panic!("no {} reached {what}; last states: {}; fleet: {:?}", T::API_PATHS.kind, shown(&items), self.counts());
+            loop {
+                if let Some(found) = last.iter().find_map(|(name, item)| done(item).then(|| name.clone())) {
+                    return last.remove(&found).expect("the found state");
+                }
+                let streamed = async {
+                    match watch.as_mut() {
+                        Some(watch) => watch.next().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    changed = recorded.changed() => if changed.is_err() {
+                        panic!("the fleet ended while waiting for a {} to reach {what}", T::API_PATHS.kind);
+                    },
+                    streamed = streamed => match streamed {
+                        Ok(Some(envelope)) => {
+                            for item in envelope.records.into_iter().filter_map(|record| record.object).map(decode::<T>) {
+                                // A state that passes is found, though a later one in the same
+                                // envelope moves on from it.
+                                if done(&item) {
+                                    return item;
+                                }
+                                last.insert(item.metadata.name.clone(), item);
+                            }
+                        }
+                        // An ended watch opens again, and every `T` is read anew.
+                        Ok(None) | Err(_) => {
+                            tokio::time::sleep(HARNESS_RESYNC).await;
+                            watch = watch_kind::<T>(&self.operator.resources).await;
+                            for item in self.every::<T>().await {
+                                last.insert(item.metadata.name.clone(), item);
+                            }
+                        }
+                    },
+                    () = tokio::time::sleep_until(deadline) => {
+                        let states: Vec<_> = last.values().collect();
+                        panic!("no {} reached {what}; last states: {}; fleet: {:?}", T::API_PATHS.kind, shown(&states), self.counts());
+                    }
+                }
             }
-            tokio::time::sleep(POLL).await;
         })
     }
 
     /// Wait until the `T` named `name` is gone.
     pub fn wait_gone<'a, T: Resource>(&'a self, name: &'a str) -> Wait<'a, ()> {
-        Wait::new(WAIT, async move |deadline| loop {
-            let Some(last) = self.get::<T>(name).await else { return };
-            if tokio::time::Instant::now() > deadline {
-                panic!("{} {name} was never removed; last state: {}", T::API_PATHS.kind, shown(&last));
+        Wait::new(WAIT, async move |deadline| {
+            let mut changes = self.changes().kind::<T>().await;
+            loop {
+                let Some(last) = self.get::<T>(name).await else { return };
+                if !changes.next(deadline).await {
+                    panic!("{} {name} was never removed; last state: {}", T::API_PATHS.kind, shown(&last));
+                }
             }
-            tokio::time::sleep(POLL).await;
         })
     }
 
@@ -509,16 +572,7 @@ impl TestDaemon {
     pub fn wait_query<'a>(&'a self, query: QueryId, done: impl Fn(&ResultSet) -> bool + 'a) -> Wait<'a, ResultSet> {
         Wait::new(WAIT, async move |deadline| {
             let mut events = self.operator.client.subscribe();
-            let cursors = [QueryCursor { query: query.clone(), since: None }];
-            let current = self.operator.client.subscribe_queries(uuid::Uuid::new_v4(), &cursors).await.expect("subscribe");
-            let mut last = None;
-            for event in current {
-                if let DaemonEvent::ResultSet(result) = event {
-                    if result.query() == query {
-                        last = Some(*result);
-                    }
-                }
-            }
+            let mut last = self.result_set(&query).await;
             loop {
                 if let Some(result) = last.take_if(|result| done(result)) {
                     return result;
@@ -527,24 +581,32 @@ impl TestDaemon {
                     Ok(next) => next,
                     Err(_) => panic!("no {query:?} result set satisfied the wait; last: {}", shown(&last)),
                 };
-                match next {
-                    Ok(DaemonEvent::ResultSet(result)) if result.query() == query => last = Some(*result),
-                    // A delta carries only what changed: read the whole set again, as a client
-                    // that resubscribes does.
-                    Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == query => {
-                        let current = self.operator.client.subscribe_queries(uuid::Uuid::new_v4(), &cursors).await.expect("subscribe");
-                        for event in current {
-                            if let DaemonEvent::ResultSet(result) = event {
-                                if result.query() == query {
-                                    last = Some(*result);
-                                }
-                            }
-                        }
+                // A delta carries only what changed, and a lag loses changes: read the whole set
+                // again, as a client that resubscribes does.
+                let reread = match next {
+                    Ok(DaemonEvent::ResultSet(result)) if result.query() == query => {
+                        last = Some(*result);
+                        false
                     }
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(DaemonEvent::ResultDelta(delta)) => delta.query() == query,
+                    Ok(_) => false,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("the daemon closed while waiting on {query:?}"),
+                };
+                if reread {
+                    last = self.result_set(&query).await.or(last);
                 }
             }
+        })
+    }
+
+    /// The client query `query`'s whole result set, subscribing to it as a client does.
+    async fn result_set(&self, query: &QueryId) -> Option<ResultSet> {
+        let cursors = [QueryCursor { query: query.clone(), since: None }];
+        let current = self.operator.client.subscribe_queries(uuid::Uuid::new_v4(), &cursors).await.expect("subscribe");
+        current.into_iter().rev().find_map(|event| match event {
+            DaemonEvent::ResultSet(result) if result.query() == *query => Some(*result),
+            _ => None,
         })
     }
 
@@ -591,7 +653,8 @@ impl TestDaemon {
     /// `/tables/{table}/rows?watch=true`.
     pub async fn watch_table(&self, table: &str) -> TableWatch {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let (mut client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+        let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+        let mut client = Tracked::new(client);
         let serving = tokio::spawn(flotilla_daemon::server::serve_local_http(server, Arc::clone(&self.daemon)));
         let request = format!(
             "GET /tables/{table}/rows?namespace={NAMESPACE}&limit=10000&watch=true HTTP/1.1\r\nHost: flotilla.local\r\nAccept: application/x-ndjson\r\n\r\n"
@@ -613,46 +676,57 @@ impl TestDaemon {
     }
 
     /// Wait until some row of `table` satisfying `condition` also satisfies
-    /// `done`, and return it. The wait fails with the table's last rows.
+    /// `done`, and return it. It reads again at each change the table's watch streams and each
+    /// change the fleet records, and fails with the table's last rows.
     pub fn wait_row<'a>(&'a self, what: &'a str, table: &'a str, condition: &'a str, done: impl Fn(&Row) -> bool + 'a) -> Wait<'a, Row> {
-        Wait::new(WAIT, async move |deadline| loop {
-            let mut rows = self.rows(table, condition).await;
-            if let Some(found) = rows.iter().position(&done) {
-                return rows.swap_remove(found);
+        Wait::new(WAIT, async move |deadline| {
+            let mut changes = self.changes().table(table).await;
+            loop {
+                let mut rows = self.rows(table, condition).await;
+                if let Some(found) = rows.iter().position(&done) {
+                    return rows.swap_remove(found);
+                }
+                if !changes.next(deadline).await {
+                    panic!("no {table} row reached {what}; last rows where {condition:?}: {}; fleet: {:?}", shown(&rows), self.counts());
+                }
             }
-            if tokio::time::Instant::now() > deadline {
-                panic!("no {table} row reached {what}; last rows where {condition:?}: {}; fleet: {:?}", shown(&rows), self.counts());
-            }
-            tokio::time::sleep(POLL).await;
         })
     }
 
     /// Wait until some row of engine table `table` satisfying `held` has reached
     /// `state`, read from the kind's log rather than its current rows: the fleet
     /// can move a record past a state between two reads. Returns the row as it
-    /// now is. The wait fails with the held rows and the log's last entries.
+    /// now is. It reads again at each change the table's watch streams, as each entry its log
+    /// gains changes its rows, and fails with the held rows and the log's last entries.
     pub fn wait_reached<'a>(&'a self, what: &'a str, table: &'a str, state: &'a str, held: impl Fn(&Row) -> bool + 'a) -> Wait<'a, Row> {
         let name = |row: &Row| row.get("resource.name").or_else(|| row.get("name")).and_then(serde_json::Value::as_str).map(str::to_owned);
-        Wait::new(WAIT, async move |deadline| loop {
-            let mut rows: Vec<Row> = self.rows(table, "").await.into_iter().filter(&held).collect();
-            let log = self.rows(&format!("{table}.log"), "").await;
-            let reached = |row: &Row| {
-                log.iter().any(|entry| name(entry) == name(row) && entry.get("to").and_then(serde_json::Value::as_str) == Some(state))
-            };
-            if let Some(found) = rows.iter().position(reached) {
-                return rows.swap_remove(found);
+        Wait::new(WAIT, async move |deadline| {
+            let mut changes = self.changes().table(table).await;
+            loop {
+                let mut rows: Vec<Row> = self.rows(table, "").await.into_iter().filter(&held).collect();
+                let log = self.rows(&format!("{table}.log"), "").await;
+                let reached = |row: &Row| {
+                    log.iter().any(|entry| name(entry) == name(row) && entry.get("to").and_then(serde_json::Value::as_str) == Some(state))
+                };
+                if let Some(found) = rows.iter().position(reached) {
+                    return rows.swap_remove(found);
+                }
+                if !changes.next(deadline).await {
+                    let last = &log[log.len().saturating_sub(20)..];
+                    panic!(
+                        "no {table} row reached {what}; held rows: {}; last log entries: {}; fleet: {:?}",
+                        shown(&rows),
+                        shown(last),
+                        self.counts()
+                    );
+                }
             }
-            if tokio::time::Instant::now() > deadline {
-                let last = &log[log.len().saturating_sub(20)..];
-                panic!(
-                    "no {table} row reached {what}; held rows: {}; last log entries: {}; fleet: {:?}",
-                    shown(&rows),
-                    shown(last),
-                    self.counts()
-                );
-            }
-            tokio::time::sleep(POLL).await;
         })
+    }
+
+    /// What wakes a wait: the changes the fleet records, and those of what the wait reads.
+    fn changes(&self) -> ChangesBuilder<'_> {
+        ChangesBuilder { daemon: self }
     }
 
     /// The report of the import the first start made, when it made one.
@@ -754,14 +828,14 @@ impl TestDaemon {
         let resolved = |repository: &ResourceObject<Repository>| {
             repository.metadata.name == key && repository.status.as_ref().is_some_and(|status| status.default_branch.is_some())
         };
-        self.wait("a resolved default branch", resolved).within(SEED_WAIT).await;
+        self.wait("a resolved default branch", resolved).await;
         // Admission places a literal image only once its host has probed the image's harnesses.
         let probed = |host: &ResourceObject<Host>| {
             host.status.as_ref().is_some_and(|status| {
                 status.fulfilment_facts.get(DUMMY_FULFILMENT_KIND).is_some_and(|facts| facts.harnesses.contains_key(DUMMY_AGENT_ADAPTER))
             })
         };
-        self.wait("the dummy kind's harness", probed).within(SEED_WAIT).await;
+        self.wait("the dummy kind's harness", probed).await;
     }
 }
 
@@ -772,7 +846,7 @@ pub struct Peering {
 
 /// A table watch over the daemon's local HTTP surface; dropping it disconnects.
 pub struct TableWatch {
-    body: tokio::io::BufReader<tokio::net::UnixStream>,
+    body: tokio::io::BufReader<Tracked<tokio::net::UnixStream>>,
     chunked: bool,
     /// Bytes read past the last whole message.
     buffer: Vec<u8>,
@@ -788,30 +862,113 @@ impl Drop for TableWatch {
 impl TableWatch {
     /// The next message, within the usual wait.
     pub async fn next(&mut self) -> TableMessage {
+        let next = tokio::time::timeout(WAIT, self.read()).await.expect("a table message in time");
+        next.expect("the table watch ended")
+    }
+
+    /// The next message; none once the watch ends.
+    async fn read(&mut self) -> Option<TableMessage> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt};
         loop {
             if let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<u8> = self.buffer.drain(..=end).collect();
                 if line.len() > 1 {
-                    return serde_json::from_slice(&line).unwrap_or_else(|error| panic!("table message: {error}"));
+                    return Some(serde_json::from_slice(&line).unwrap_or_else(|error| panic!("table message: {error}")));
                 }
                 continue;
             }
             let mut data = Vec::new();
             if self.chunked {
                 let mut size = String::new();
-                tokio::time::timeout(WAIT, self.body.read_line(&mut size)).await.expect("a table message in time").expect("chunk size");
+                if self.body.read_line(&mut size).await.ok()? == 0 {
+                    return None;
+                }
                 let size = usize::from_str_radix(size.split(';').next().unwrap_or_default().trim(), 16).expect("chunk size");
-                assert_ne!(size, 0, "the table watch ended");
+                if size == 0 {
+                    return None;
+                }
                 data.resize(size + 2, 0);
-                self.body.read_exact(&mut data).await.expect("chunk");
+                self.body.read_exact(&mut data).await.ok()?;
                 data.truncate(size);
-            } else {
-                let read = tokio::time::timeout(WAIT, self.body.read_until(b'\n', &mut data)).await.expect("a table message in time");
-                assert_ne!(read.expect("read table message"), 0, "the table watch ended");
+            } else if self.body.read_until(b'\n', &mut data).await.ok()? == 0 {
+                return None;
             }
             self.buffer.extend(data);
         }
+    }
+}
+
+/// Opens what wakes a wait: each change the fleet records, and, once opened, each change to what
+/// the wait reads, as the daemon publishes it.
+struct ChangesBuilder<'a> {
+    daemon: &'a TestDaemon,
+}
+
+impl<'a> ChangesBuilder<'a> {
+    /// And each change to a `T`, as `flotilla watch` streams them.
+    async fn kind<T: Resource>(self) -> Changes<'a> {
+        let resources = self.daemon.operator.resources.clone();
+        let watched = watch_kind::<T>(&resources).await;
+        let wakes = futures::stream::unfold((resources, watched), |(resources, mut watched)| async move {
+            loop {
+                let Some(watch) = watched.as_mut() else {
+                    // An ended watch opens again after a resync's wait, and its opening reads anew
+                    // what changed between.
+                    tokio::time::sleep(HARNESS_RESYNC).await;
+                    watched = Some(watch_kind::<T>(&resources).await?);
+                    return Some(((), (resources, watched)));
+                };
+                match watch.next().await {
+                    Ok(Some(_)) => return Some(((), (resources, watched))),
+                    Ok(None) | Err(_) => watched = None,
+                }
+            }
+        });
+        self.with(wakes.boxed())
+    }
+
+    /// And each change to the rows of `table`, as its watch streams them.
+    async fn table(self, table: &str) -> Changes<'a> {
+        let watch = self.daemon.watch_table(table).await;
+        let wakes = futures::stream::unfold(watch, |mut watch| async move { watch.read().await.map(|_| ((), watch)) });
+        self.with(wakes.boxed())
+    }
+
+    fn with(self, read: futures::stream::BoxStream<'a, ()>) -> Changes<'a> {
+        Changes { fleet: self.daemon.fleet.changes(), read }
+    }
+}
+
+/// A watch of every `T`, as `flotilla watch` opens one; none when the daemon refuses it.
+async fn watch_kind<T: Resource>(resources: &ResourceClient) -> Option<ResourceWatch> {
+    let request = ResourceWatchRequest::builder().kind(T::API_PATHS.kind.into()).namespace(NAMESPACE.into()).include_replicas(true).build();
+    resources.watch(request).await.ok()
+}
+
+/// The changes a wait wakes at.
+struct Changes<'a> {
+    fleet: watch::Receiver<u64>,
+    read: futures::stream::BoxStream<'a, ()>,
+}
+
+impl Changes<'_> {
+    /// Waits for the next change, taking every other already made with it. False when the
+    /// virtual `deadline` comes first.
+    async fn next(&mut self, deadline: tokio::time::Instant) -> bool {
+        let Self { fleet, read } = self;
+        let recorded = async {
+            if fleet.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            () = recorded => {}
+            Some(()) = read.next() => {}
+            () = tokio::time::sleep_until(deadline) => return false,
+        }
+        while let Some(Some(())) = read.next().now_or_never() {}
+        fleet.mark_unchanged();
+        true
     }
 }
 
@@ -840,8 +997,8 @@ impl<'a, T: 'a> Wait<'a, T> {
         Self { run: Box::new(move |deadline| Box::pin(run(deadline))), within }
     }
 
-    /// Waits up to `within` instead: for a scenario whose deadline lies beyond the usual wait,
-    /// under paused time.
+    /// Waits up to `within` of virtual time instead: for a scenario whose deadline lies beyond
+    /// the usual wait.
     pub fn within(mut self, within: Duration) -> Self {
         self.within = within;
         self
@@ -988,7 +1145,8 @@ async fn local_get(daemon: &Arc<InProcessDaemon>, target: &str) -> (u16, Vec<u8>
 /// [`local_get`], accepting `accept`.
 async fn local_get_as(daemon: &Arc<InProcessDaemon>, target: &str, accept: &str) -> (u16, Vec<u8>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let (mut client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+    let (client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+    let mut client = Tracked::new(client);
     let serving = tokio::spawn(flotilla_daemon::server::serve_local_http(server, Arc::clone(daemon)));
     let request = format!("GET {target} HTTP/1.1\r\nHost: flotilla.local\r\nAccept: {accept}\r\nConnection: close\r\n\r\n");
     client.write_all(request.as_bytes()).await.expect("send request");
