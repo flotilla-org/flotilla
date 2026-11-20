@@ -8,6 +8,11 @@ setup="$repo_root/ci/fleet-candidates/setup-linux-toolchain.sh"
 toolchain="$repo_root/ci/fleet-candidates/cleat-toolchain.sh"
 
 bash -n "$builder" "$setup" "$toolchain"
+bash -n "$repo_root/ci/fleet-candidates/zig-package-mirror.sh" "$repo_root/ci/fleet-candidates/mirror-zig-packages.sh"
+# Both platform jobs read Zig packages from the lab mirror with the run's token.
+# shellcheck disable=SC2016
+test "$(grep -Fc 'FLEET_ZIG_PACKAGE_MIRROR_TOKEN: ${{ forgejo.token }}' "$workflow")" -eq 2
+grep -Fq 'export ZIG_PACKAGE_MIRROR="$zig_package_mirror"' "$builder"
 "$repo_root/ci/toolchain/test-pin.sh"
 if grep -Fq '0.16.0' "$builder"; then
   echo 'candidate builder must derive the Zig version from the Cleat toolchain pin' >&2

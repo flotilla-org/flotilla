@@ -612,7 +612,8 @@ before saving. Candidate commands use only the native debug and release profiles
 adding custom profiles or explicit cross targets requires extending pruning and
 its tests. Cargo metadata supplies workspace membership and Cargo owns the
 artifact names; registry/git dependencies and toolchains remain cached. Failed
-or cancelled runs never save a partial cache. Darwin currently has no cache.
+or cancelled runs never save a partial cache. Darwin currently has no cache;
+both jobs read Zig packages from the [Zig package mirror](#zig-package-mirror).
 
 Host-side evidence: `python3 -m unittest discover -s ci/fleet-candidates -p
 test_dependency_cache.py` varies each lock/pin independently, preserves the key
@@ -631,6 +632,44 @@ optional prefix restore, pruning and one save; repeat those dependency inputs to
 confirm the new exact hit skips save. Compare save duration and archive size to
 the old source-keyed cache. These action-service observations require lab runs;
 the host tests do not claim to verify remote cache-hit reporting.
+
+### Zig package mirror
+
+Ghostty's Zig packages come from several third-party hosts (GitHub archives,
+codeberg.org, deps.files.ghostty.org). The Darwin job has no cache and fetched
+all of them on every run, so one slow host failed a release. Both jobs now read
+them from the lab mirror, the Forgejo generic package `lab/zig-packages`: one
+version per package hash declared in a `build.zig.zon`, holding the archive
+under its upstream file name. `build-candidate.sh` points Cleat's
+`tools/prepare-ghostty-vt.sh` at it through `ZIG_PACKAGE_MIRROR`, with the
+run's own Forgejo token (`FLEET_ZIG_PACKAGE_MIRROR_TOKEN: ${{ forgejo.token }}`)
+in a header file that exists only while Cleat fetches.
+
+Cleat tries the mirror first for each package it is missing. A package the
+mirror lacks (HTTP 404) is fetched upstream with a `warning: the Zig package
+mirror has no ...` line; any other mirror failure (unreachable, 401/403, 5xx)
+stops the build. Whatever the source, `zig fetch` re-hashes each archive and
+it must equal the declared hash. A Cleat that predates the mirror is refused.
+`FLEET_ZIG_PACKAGE_MIRROR=` (set and empty) builds from upstream only.
+
+Populate the mirror once for each new Cleat or Ghostty pin, on a lab machine
+(feta) with network to the upstream hosts:
+
+```sh
+ci/fleet-candidates/mirror-zig-packages.sh <cleat-sha> ~/.config/lab-forgejo-robert-package-token
+```
+
+The token needs `write:package` on `lab`. The script runs Cleat's prepare
+script with an empty Zig cache and `--fetch-only`, so every package for the
+pin is fetched and verified, then uploads those the mirror does not hold yet.
+Rerunning it is harmless.
+
+If an upstream host is down while populating, a Zig 0.16 package cache that
+already holds the package keeps it as `p/<hash>.tar.gz`. Uploading that file
+is sound only after `zig fetch <file>` (run in a directory with a
+`build.zig`) prints the declared hash: upload it as
+`lab/zig-packages/<hash>/<upstream archive name>`. Cleat dbdee9d's
+translate-c archive (codeberg) was mirrored that way on 2026-11-20.
 
 ### Guest platform catalog
 

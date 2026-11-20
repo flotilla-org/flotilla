@@ -2,6 +2,7 @@
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/cleat-toolchain.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/zig-package-mirror.sh"
 
 fetch_exact() {
   local repository="$1"
@@ -112,6 +113,14 @@ main() {
 flotilla_sha="$(require_sha FLEET_FLOTILLA_SHA "${FLEET_FLOTILLA_SHA:-}")"
 mattpocock_skills_sha="$(require_sha FLEET_MATTPOCOCK_SKILLS_SHA "${FLEET_MATTPOCOCK_SKILLS_SHA:-}")"
 rjw_skills_sha="$(require_sha FLEET_RJW_SKILLS_SHA "${FLEET_RJW_SKILLS_SHA:-}")"
+# Unset selects the lab mirror; an explicit empty value fetches from upstream.
+zig_package_mirror="${FLEET_ZIG_PACKAGE_MIRROR-$FLEET_ZIG_PACKAGE_MIRROR_URL}"
+zig_package_mirror_token="${FLEET_ZIG_PACKAGE_MIRROR_TOKEN:-}"
+unset FLEET_ZIG_PACKAGE_MIRROR_TOKEN
+if [[ -n "$zig_package_mirror" && -z "$zig_package_mirror_token" ]]; then
+  echo 'FLEET_ZIG_PACKAGE_MIRROR_TOKEN must hold a token that reads the Zig package mirror (or set FLEET_ZIG_PACKAGE_MIRROR= to fetch from upstream)' >&2
+  exit 1
+fi
 
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)
@@ -257,7 +266,21 @@ done < <(python3 "$(dirname "${BASH_SOURCE[0]}")/generation_validation.py" sibli
 
 (
   cd "$cleat_root"
+  # Zig packages come from the lab mirror (see "Zig package mirror" in the
+  # README); the token stays in a header file for the fetch only.
+  scratch="$(mktemp -d)"
+  trap 'rm -rf "$scratch"' EXIT
+  if [[ -n "$zig_package_mirror" ]]; then
+    grep -q 'ZIG_PACKAGE_MIRROR' tools/prepare-ghostty-vt.sh \
+      || { printf 'cleat %s predates the Zig package mirror; dispatch a cleat that has it, or set FLEET_ZIG_PACKAGE_MIRROR= to fetch from upstream\n' "$cleat_sha" >&2; exit 1; }
+    write_zig_package_mirror_header "$zig_package_mirror_token" "$scratch/mirror.header"
+    export ZIG_PACKAGE_MIRROR="$zig_package_mirror" ZIG_PACKAGE_MIRROR_AUTH_HEADER_FILE="$scratch/mirror.header"
+  else
+    echo 'warning: FLEET_ZIG_PACKAGE_MIRROR is empty; Zig packages come from their upstream hosts' >&2
+  fi
   ./tools/prepare-ghostty-vt.sh
+  rm -f "$scratch/mirror.header"
+  unset ZIG_PACKAGE_MIRROR ZIG_PACKAGE_MIRROR_AUTH_HEADER_FILE
   cargo build -p cleat --locked --features ghostty-vt --release
 )
 
