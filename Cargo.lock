@@ -3937,7 +3937,6 @@ dependencies = [
  "futures",
  "hegeltest",
  "rstest",
- "rusqlite",
  "serde",
  "serde_json",
  "serde_yml",
