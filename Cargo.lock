@@ -2906,6 +2906,7 @@ dependencies = [
  "flotilla-engine-messages",
  "flotilla-engine-messages-testkit",
  "flotilla-engine-store",
+ "flotilla-messaging",
  "flotilla-protocol",
  "flotilla-provisioning",
  "flotilla-resources",
