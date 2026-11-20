@@ -50,7 +50,7 @@ pub struct SweepReport {
     pub answered: usize,
     pub outcomes: usize,
     pub withdrawn: usize,
-    /// Pending messages withdrawn by the end of the convoy whose seat they were sent to.
+    /// Open messages withdrawn by the end of the convoy whose seat they were sent to.
     pub convoy_ended: usize,
     pub expired: usize,
     pub undeliverable: usize,
@@ -434,9 +434,11 @@ impl MessagePrimitives {
                     }
                 }
             }
-            // Its seat's convoy ended: the end withdraws what that seat was never handed, on the
-            // ended launch's authority, at the message's own home (#3108).
-            if state == MessageState::Pending {
+            // Its seat's convoy ended: the end withdraws what that seat was never handed, and what it
+            // was handed and never answered, since an ended seat answers nothing; on the ended
+            // launch's authority, at the message's own home (#3108). A reply that did come settled
+            // it above.
+            if matches!(state, MessageState::Pending | MessageState::Awaiting { .. }) {
                 if let Some(convoy) = self.ended_seat(&spec.inbox)? {
                     self.world().update(|world| world.authority.put(&Ref::new(convoy.as_str()), true));
                     if drop_message(inbox, &name, DropReason::Withdrawn { by: convoy.clone(), authority: convoy }).await {
