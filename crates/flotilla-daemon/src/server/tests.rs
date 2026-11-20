@@ -808,7 +808,7 @@ async fn daemon_server_keeps_resources_across_restart_without_an_old_store() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(tmp.path().join("config"));
     let socket_path = tmp.path().join("flotilla.sock");
-    let old_store = config.state_dir().as_path().join(crate::engine_import::OLD_STORE);
+    let old_store = config.state_dir().as_path().join("resources.sqlite");
 
     let server = DaemonServer::new(Vec::new(), Arc::clone(&config), fake_discovery(false), socket_path.clone(), StdDuration::from_secs(30))
         .await

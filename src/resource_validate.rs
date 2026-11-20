@@ -24,7 +24,7 @@ use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 #[cfg(unix)]
 use flotilla_core::repository_inspection::GitRepositoryInspector;
 #[cfg(unix)]
-use flotilla_daemon::{engine_import, stopped_store::StoppedStore};
+use flotilla_daemon::stopped_store::StoppedStore;
 #[cfg(unix)]
 use flotilla_environment::environment::{command_provider, EnvironmentInput};
 #[cfg(unix)]
@@ -316,10 +316,6 @@ async fn validate_daemon_with_preview(
                             failed = true;
                         }
                     }
-                }
-                // A retired kind's rows are dropped by the import; this candidate has no decoder for them.
-                if engine_import::plan::is_retired(&kind) {
-                    continue;
                 }
                 if let Err(error) = validate_stored_record(item) {
                     eprintln!("{label}/{name}: {error}");

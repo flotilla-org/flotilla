@@ -122,7 +122,6 @@ async fn a_reviewed_coder_lands_after_its_reviewer_answers() {
     assert_eq!(pr.id, "template/pr");
     assert_eq!(pr.state, flotilla_resources::promises::PromiseState::Kept);
     assert!(status.crew_work.values().flat_map(|crew| crew.values()).all(|work| work.phase == CrewWorkPhase::Done));
-    assert_no_old_messages(&fleet).await;
 }
 
 // Behaviour: a crew keeps its own role's promises through a handoff (#3574 decision 3). A
@@ -189,7 +188,6 @@ async fn a_long_runner_exchanges_its_turns_before_landing() {
     let (_, snapshot) = deliver(&fleet, CrewMix::LongRunner).await;
     assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
     assert_eq!(snapshot.turns_received, u64::from(2 * LONG_RUNNER_TURNS), "every task and reply is a delivered turn: {snapshot:?}");
-    assert_no_old_messages(&fleet).await;
 }
 
 // A long runner's governor and aide sit in separate vessels: `crew list` shows the governor the
@@ -449,7 +447,6 @@ async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
         landed.status.expect("status").crew_work["governor"]["governor"].completion_authority,
         flotilla_resources::WorkCompletionAuthority::Promises
     );
-    assert_no_old_messages(&fleet).await;
 }
 
 // The supervisor is eagerly launched with no claim, waits for a delivered
@@ -461,12 +458,6 @@ async fn an_eager_supervisor_waits_for_work_and_lands_after_answering() {
     assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
     assert_eq!(snapshot.turns_received, 2, "the task and answer are delivered: {snapshot:?}");
     assert_eq!(snapshot.crews_stalled, 0, "{snapshot:?}");
-}
-
-/// On the engine path every Message is the engine's; the old store holds none.
-async fn assert_no_old_messages(fleet: &TestDaemon) {
-    let old = fleet.old_store_list::<flotilla_resources::Message>().await;
-    assert!(old.is_empty(), "the old store holds Messages: {old:?}");
 }
 
 // Behaviour: with no FleetDesignation the controllers keep running and explain names the missing
@@ -554,7 +545,6 @@ async fn operator_turn_scenario(noted: bool) {
     assert!(!matches!(sent, CommandValue::Error { .. }), "{sent:?}");
     fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
     assert_eq!(fleet.counts().turns_received, turns + 1, "the operator's turn reached the crew");
-    assert_no_old_messages(&fleet).await;
 }
 
 // A standing Ensure binds an admitted convoy. Abandoning that convoy must let
