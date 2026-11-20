@@ -106,10 +106,22 @@ impl<T: Resource> DefinitionResolver<T> {
         Some(self.read_all(&*records).await)
     }
 
+    /// The engine reads `query` selects; `None` unless the kind is served by the engine. A merged
+    /// read yields one definition per name, every home's copy merged as the old store merged them,
+    /// and the built-ins once.
+    pub(crate) async fn engine_query(&self, query: &crate::StoreQuery) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
+        let home = self.records()?.home();
+        let reads = self.engine_reads_for(query).await?;
+        Some(reads.and_then(|reads| select_reads(reads, query)).and_then(|reads| match query.merged_definitions {
+            true => merge_reads(reads, &NodeId::new(home)),
+            false => Ok(reads),
+        }))
+    }
+
     /// [`Self::engine_reads`] for `query`: a query for one receiver's open messages, or one whose
     /// rows its index keys cover, reads them through the port's index when it keeps one, and every
     /// other reads them all.
-    pub(crate) async fn engine_reads_for(&self, query: &crate::StoreQuery) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
+    async fn engine_reads_for(&self, query: &crate::StoreQuery) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
         let records = self.records()?;
         if !self.holds_engine_records() {
             return Some(self.reads(&records.home(), Vec::new(), None));
@@ -1036,7 +1048,7 @@ fn definition_is_visible<T: Resource>(object: &ResourceObject<T>) -> bool {
 
 /// The engine reads `query` selects (#3824 layer 2b-ii): this home's alone unless the query takes
 /// replicas, and the built-ins only for a merged read.
-pub(crate) fn select_reads<T: Resource>(
+fn select_reads<T: Resource>(
     reads: Vec<ReadResourceObject<T>>,
     query: &crate::StoreQuery,
 ) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
@@ -1058,6 +1070,15 @@ pub(crate) fn select_reads<T: Resource>(
         .into_iter()
         .filter(|read| selected.contains(&read.object.metadata.name) && messages.contains(&read.object.metadata.name))
         .collect())
+}
+
+/// Every home's copy of each stored definition in `reads` merged into one, as a local read; the
+/// built-ins, which no home stores, as they are.
+fn merge_reads<T: Resource>(reads: Vec<ReadResourceObject<T>>, local_root: &NodeId) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+    let (builtins, stored): (Vec<_>, Vec<_>) =
+        reads.into_iter().partition(|read| flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, &read.object.metadata.name));
+    let merged = merge_cached_definitions(stored, local_root)?;
+    Ok(merged.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).chain(builtins).collect())
 }
 
 /// The index keys `record` is held under, as a reader's [`IndexCover`] names them.
