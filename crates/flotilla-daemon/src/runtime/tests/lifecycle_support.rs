@@ -291,16 +291,11 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         .find(|launch| launch.work() == "implement" && !launch.ended())
         .expect("the work's launch")
         .name;
-    let sqlite_path = config.state_dir().as_path().join("resources.sqlite");
     let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut previous_idle_sample = None;
     loop {
         let workspace = workspaces.get(&launch).await.expect("steady workspace should remain");
-        let sample = (
-            workspace.metadata.resource_version,
-            workspace.status.expect("steady workspace status").ready_at,
-            sqlite_path.exists().then(|| sqlite_max_event_rowid(&sqlite_path)),
-        );
+        let sample = (workspace.metadata.resource_version, workspace.status.expect("steady workspace status").ready_at);
         if previous_idle_sample.as_ref() == Some(&sample) {
             break;
         }

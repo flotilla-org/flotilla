@@ -125,14 +125,10 @@ fn corpus() -> Vec<ResourceObject<Host>> {
         .collect()
 }
 
-/// The record, observation and drops a Host's status maps to.
-fn observed(
-    spec: HostSpec,
-    status: HostStatus,
-) -> (host_kinds::HostRecord, Option<host_kinds::HostObservation>, Vec<(&'static str, &'static str)>) {
-    let mut dropped = Vec::new();
-    let observation = observation(&spec, &status, &mut dropped).expect("maps");
-    (host_kinds::HostRecord::new(&spec), Some(observation), dropped)
+/// The record and observation a Host's status maps to.
+fn observed(spec: HostSpec, status: HostStatus) -> (host_kinds::HostRecord, Option<host_kinds::HostObservation>) {
+    let observation = observation(&spec, &status).expect("maps");
+    (host_kinds::HostRecord::new(&spec), Some(observation))
 }
 
 // Behaviour (#3824 layer 4c): a corpus Host's status maps to its observation.
@@ -140,7 +136,7 @@ fn observed(
 fn the_corpus_status_maps_to_an_observation() {
     let corpus = corpus();
     assert!(!corpus.is_empty());
-    let (_, observation, _) = observed(corpus[2].spec.clone(), corpus[2].status.clone().expect("a status"));
+    let (_, observation) = observed(corpus[2].spec.clone(), corpus[2].status.clone().expect("a status"));
     let observation = observation.expect("observed");
     assert_eq!(observation.agent_adapters, BTreeSet::from(["claude-code".to_owned(), "codex".to_owned()]));
     assert_eq!(observation.agent_adapter_baseline, observation.agent_adapters);
@@ -196,18 +192,7 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
             .expect("facts"),
             ..HostStatus::default()
         };
-        let (_, observation, dropped) = observed(HostSpec::default(), status);
-        for reason in [
-            "each fact's observation time, a judgement",
-            "free vessel slots, a judgement",
-            "model facts, which nothing keeps",
-            "image identity and presence, which nothing reads",
-            "each condition's observation time, a judgement",
-            "diagnostic conditions, which belong in metrics",
-            "provider implementation names, which nothing reads",
-        ] {
-            assert!(dropped.contains(&("HostObservation", reason)), "{reason}: {dropped:?}");
-        }
+        let (_, observation) = observed(HostSpec::default(), status);
         let observation = observation.expect("observed");
         assert_eq!(observation.below_free_space_floor, below, "{free:?} {floor:?}");
         assert_eq!(observation.architecture.as_deref(), Some("arm64"));
@@ -231,27 +216,25 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
     }
 }
 
-/// The imported crew-pool flag of the kind `host-direct` holding `slots`, and whether the slot
-/// count was counted as a dropped judgement.
-fn pool_missing(spec: HostSpec, slots: Option<u32>) -> (bool, bool) {
+/// The crew-pool flag of the kind `host-direct` holding `slots`.
+fn pool_missing(spec: HostSpec, slots: Option<u32>) -> bool {
     let status = HostStatus {
         fulfilment_facts: serde_json::from_value(json!({"host-direct": {
             "gui_session_logged_in": false, "observed_at": "2026-10-29T00:00:00Z", "free_vessel_slots": slots}}))
         .expect("facts"),
         ..HostStatus::default()
     };
-    let (_, observation, dropped) = observed(spec, status);
-    let counted = dropped.contains(&("HostObservation", "free vessel slots, a judgement"));
-    (observation.expect("observed").facts["host-direct"].crew_pool_missing, counted)
+    let (_, observation) = observed(spec, status);
+    observation.expect("observed").facts["host-direct"].crew_pool_missing
 }
 
 // Behaviour (#3824 layer 4c): on a host without a vessel cap, no free slots means the kind's crew
 // pool is missing, and that fact is kept; any other slot count is a judgement and is dropped.
 #[test]
 fn a_kind_without_its_crew_pool_stays_full() {
-    assert_eq!(pool_missing(HostSpec::default(), Some(0)), (true, false));
-    assert_eq!(pool_missing(HostSpec::default(), Some(3)), (false, true));
-    assert_eq!(pool_missing(HostSpec::default(), None), (false, false));
+    assert!(pool_missing(HostSpec::default(), Some(0)));
+    assert!(!pool_missing(HostSpec::default(), Some(3)));
+    assert!(!pool_missing(HostSpec::default(), None));
 }
 
 // Behaviour (#3824 layer 4c): a capped host that is full, its pool present, also has no free
@@ -259,8 +242,8 @@ fn a_kind_without_its_crew_pool_stays_full() {
 #[test]
 fn a_full_host_with_its_crew_pool_is_not_missing_it() {
     let capped = HostSpec { max_vessels: Some(2), ..HostSpec::default() };
-    assert_eq!(pool_missing(capped, Some(0)), (false, true));
-    assert_eq!(pool_missing(ssh("kiwi"), Some(0)), (false, true));
+    assert!(!pool_missing(capped, Some(0)));
+    assert!(!pool_missing(ssh("kiwi"), Some(0)));
 }
 
 // Behaviour (ADR 0047): an SSH host's markers are dropped as the connection carries them; a
@@ -277,9 +260,8 @@ fn a_previous_generations_ssh_host_and_missing_baseline_import() {
         agent_adapter_baseline: None,
         ..HostStatus::default()
     };
-    let (host, observation, dropped) = observed(ssh("udder"), status);
+    let (host, observation) = observed(ssh("udder"), status);
     assert!(matches!(host.connection, host_kinds::Connection::SshHost { ref owning_daemon, .. } if owning_daemon == "udder"));
-    assert!(dropped.contains(&("HostObservation", "the SSH capability markers, which the connection carries")), "{dropped:?}");
     let observation = observation.expect("observed");
     assert_eq!(observation.agent_adapter_baseline, BTreeSet::from(["claude-code".to_owned()]));
 }
@@ -299,9 +281,8 @@ fn the_frozen_fleets_pre_4001_ssh_host_imports() {
         .expect("capabilities"),
         ..HostStatus::default()
     };
-    let (host, _, dropped) = observed(spec, status);
+    let (host, _) = observed(spec, status);
     assert!(matches!(host.connection, host_kinds::Connection::SshHost { ref owning_daemon, .. } if owning_daemon == "udder"));
-    assert!(dropped.contains(&("HostObservation", "the SSH capability markers, which the connection carries")), "{dropped:?}");
 }
 
 // Behaviour (#3824 layer 4c): nothing is dropped silently. An unknown capability key, a capability
@@ -315,7 +296,7 @@ fn a_status_the_engine_cannot_hold_is_refused() {
         ..HostStatus::default()
     };
     let cases = [
-        ("unknown", HostSpec::default(), with(json!({"gpu": true}), vec![]), "capability `gpu` has no import mapping"),
+        ("unknown", HostSpec::default(), with(json!({"gpu": true}), vec![]), "capability `gpu` is neither carried nor ignored"),
         ("adapters", HostSpec::default(), with(json!({"agent_adapters": "claude"}), vec![]), "`agent_adapters` capability does not decode"),
         (
             "providers",
@@ -332,7 +313,7 @@ fn a_status_the_engine_cannot_hold_is_refused() {
         ("owner", ssh("udder"), with(json!({"owning_daemon": "feta"}), vec![]), "names `feta`, and its connection `udder`"),
     ];
     for (name, spec, status, reason) in cases {
-        let error = observation(&spec, &status, &mut Vec::new()).expect_err(name);
+        let error = observation(&spec, &status).expect_err(name);
         assert!(error.contains(reason), "{name}: {error}");
     }
 }

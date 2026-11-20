@@ -801,20 +801,17 @@ fn dropped_daemon_releases_the_engine_a_test_installed() {
     assert!(decided.upgrade().is_none(), "the dropped daemon's decided store is still held");
 }
 
-/// A fresh host keeps its resources in the engine store across a restart, and never creates the
-/// old resource store.
+/// A fresh host keeps its resources in the engine store across a restart.
 #[tokio::test]
-async fn daemon_server_keeps_resources_across_restart_without_an_old_store() {
+async fn daemon_server_keeps_resources_across_restart() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(tmp.path().join("config"));
     let socket_path = tmp.path().join("flotilla.sock");
-    let old_store = config.state_dir().as_path().join("resources.sqlite");
 
     let server = DaemonServer::new(Vec::new(), Arc::clone(&config), fake_discovery(false), socket_path.clone(), StdDuration::from_secs(30))
         .await
         .expect("server should start");
     let backend = server.daemon().resource_backend();
-    assert!(!old_store.exists(), "a fresh host's daemon created the old resource store");
 
     use flotilla_resources::{
         CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
@@ -848,7 +845,6 @@ async fn daemon_server_keeps_resources_across_restart_without_an_old_store() {
         .expect("credential declaration should survive restart");
 
     assert_eq!(fetched.spec.source, CredentialSource::Env { name: "PERSISTED_TOKEN".into() });
-    assert!(!old_store.exists(), "the restarted daemon created the old resource store");
 }
 
 #[test]

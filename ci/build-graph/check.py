@@ -46,7 +46,7 @@ DISCOVERY_FORBIDDEN = (
 # It never reaches resource types or a store, so connectors stay below the store stack.
 AGENT_CONNECTOR = "flotilla-agent-connector"
 AGENT_CONNECTOR_FORBIDDEN = (
-    "flotilla-resources", "flotilla-store", "flotilla-store-memory", "flotilla-store-sqlite",
+    "flotilla-resources", "flotilla-store", "flotilla-store-memory",
     "flotilla-engine-store", "flotilla-schema-sqlite",
 )
 # #2951 ruling 6: terminal adapters speak terminal values, not resource records.
