@@ -159,7 +159,6 @@ use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, Execut
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_projections::fleet::FleetService;
 use flotilla_projections::host_registry::HostCounts;
-use flotilla_projections::host_registry::HostQueryDetails;
 use flotilla_provider_runtime::host_environment::{HostEnvironment, HostSupply};
 use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 use flotilla_provider_runtime::ChannelLabel;
@@ -2747,24 +2746,11 @@ impl InProcessDaemon {
     }
 
     async fn refresh_resource_host_summaries_with_backend(&self, backend: &ResourceBackend) -> Result<(), String> {
-        use flotilla_protocol::qualified_path::HostId;
-
         // Serialize list-and-project passes so a slower old read cannot replace a
         // newer description published by the watch or a concurrent query.
         let _projection = self.host_registry.description_projection.lock().await;
         let namespace = self.provisioning_namespace().await;
         let statuses = self.read_projections().with_backend(backend).host_statuses(&namespace).await?;
-        let details = statuses
-            .iter()
-            .map(|(name, status)| {
-                (
-                    EnvironmentId::host(HostId::new(name)),
-                    HostQueryDetails::builder()
-                        .maybe_visible_environments(status.description.as_ref().map(|description| description.environments.clone()))
-                        .build(),
-                )
-            })
-            .collect();
         let mut summaries: HashMap<EnvironmentId, HostSummary> = statuses
             .into_values()
             .filter_map(|status| status.host_summary())
@@ -2777,7 +2763,7 @@ impl InProcessDaemon {
             summaries.insert(local.environment_id.clone(), local);
         }
         self.host_registry
-            .sync_resource_summaries(summaries, details, &|event| {
+            .sync_resource_summaries(summaries, &|event| {
                 self.event_sink.emit(event);
             })
             .await;

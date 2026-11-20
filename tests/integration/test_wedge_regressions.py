@@ -280,10 +280,12 @@ def test_02_transport_death_re_resolves_forwarded_socket(topology):
     ).stdout.strip() == remote_pid
     # Each successful kill/reconnect advances the generation, so repetitions
     # get distinct markers and must observe a new write, never an old replica.
+    # The marker is a WorkflowTemplate: a Host is homed at its own daemon, so
+    # node-b may not write one under another name.
     marker_name = f"transport-recovery-{initial_generation}"
     document = "\n".join([
         "apiVersion: flotilla.work/v1",
-        "kind: Host",
+        "kind: WorkflowTemplate",
         "metadata:",
         f"  name: {marker_name}",
         "  namespace: flotilla",
@@ -304,7 +306,7 @@ def test_02_transport_death_re_resolves_forwarded_socket(topology):
         within_attempt_budget()
         listed = flotilla_json(
             "node-a",
-            "resource list hosts --include-replicas",
+            "resource list workflowtemplates --include-replicas",
         )
         return any(
             item["metadata"]["name"] == marker_name

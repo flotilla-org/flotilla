@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use flotilla_protocol::{
-    DaemonEvent, EnvironmentId, EnvironmentInfo, HostIdentity, HostListEntry, HostListResponse, HostName, HostProvidersResponse,
-    HostSnapshot, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey, SystemInfo, ToolInventory,
-    TopologyResponse, TopologyRoute,
+    DaemonEvent, EnvironmentId, HostIdentity, HostListEntry, HostListResponse, HostName, HostProvidersResponse, HostSnapshot,
+    HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey, SystemInfo, ToolInventory, TopologyResponse,
+    TopologyRoute,
 };
 use tokio::sync::RwLock;
 
@@ -19,12 +19,6 @@ struct HostState {
     summary: Option<HostSummary>,
     seq: u64,
     removed: bool,
-}
-
-/// Resource-derived query details which are not part of HostSnapshot's shape.
-#[derive(Debug, Clone, Default, bon::Builder)]
-pub struct HostQueryDetails {
-    pub visible_environments: Option<Vec<EnvironmentInfo>>,
 }
 
 /// Plane-A peer state supplied by the host; projections only join it to read models.
@@ -48,7 +42,6 @@ pub struct HostRegistry {
     peers: std::sync::Arc<dyn PeerOverlay>,
     pub description_projection: tokio::sync::Mutex<()>,
     resource_environments: RwLock<HashSet<EnvironmentId>>,
-    query_details: RwLock<HashMap<EnvironmentId, HostQueryDetails>>,
     local_node: NodeInfo,
     hosts: RwLock<HashMap<EnvironmentId, HostState>>,
     node_environments: RwLock<HashMap<NodeId, EnvironmentId>>,
@@ -74,7 +67,6 @@ impl HostRegistry {
             peers,
             description_projection: tokio::sync::Mutex::new(()),
             resource_environments: RwLock::new(HashSet::new()),
-            query_details: RwLock::new(HashMap::new()),
             local_node,
             hosts: RwLock::new(hosts),
             node_environments: RwLock::new(node_environments),
@@ -187,19 +179,13 @@ impl HostRegistry {
         }
         let summary = state.summary.clone();
 
-        let mut response = build_host_status(
+        Ok(build_host_status(
             self.peers.as_ref(),
             environment_id,
             state,
             summary,
             HostStatusContext { local_node: &self.local_node, configured: &configured, node_connectivity: &node_connectivity, counts },
-        );
-        if let Some(details) = self.query_details.read().await.get(environment_id) {
-            if let Some(environments) = &details.visible_environments {
-                response.visible_environments = environments.clone();
-            }
-        }
-        Ok(response)
+        ))
     }
 
     pub async fn get_host_providers(
@@ -216,14 +202,7 @@ impl HostRegistry {
         }
         let summary = state.summary.clone().ok_or_else(|| format!("no summary available for host: {environment_id}"))?;
 
-        let mut response =
-            build_host_providers(self.peers.as_ref(), environment_id, state, &self.local_node, &configured, &node_connectivity, summary);
-        if let Some(environments) =
-            self.query_details.read().await.get(environment_id).and_then(|details| details.visible_environments.as_ref())
-        {
-            response.visible_environments = environments.clone();
-        }
-        Ok(response)
+        Ok(build_host_providers(self.peers.as_ref(), environment_id, state, &self.local_node, &configured, &node_connectivity, summary))
     }
 
     pub async fn get_topology(&self) -> TopologyResponse {
@@ -393,10 +372,6 @@ impl HostRegistry {
         self.sync_host_membership(counts, emit).await;
     }
 
-    pub async fn has_resource_description(&self, environment_id: &EnvironmentId) -> bool {
-        self.query_details.read().await.get(environment_id).is_some_and(|details| details.visible_environments.is_some())
-    }
-
     async fn remove_host_presentation(&self, environment_id: &EnvironmentId, emit: &impl Fn(DaemonEvent)) {
         let mut environments = self.node_environments.write().await;
         let mut hosts = self.hosts.write().await;
@@ -453,13 +428,7 @@ impl HostRegistry {
         }
     }
 
-    pub async fn sync_resource_summaries(
-        &self,
-        summaries: HashMap<EnvironmentId, HostSummary>,
-        details: HashMap<EnvironmentId, HostQueryDetails>,
-        emit: &impl Fn(DaemonEvent),
-    ) {
-        *self.query_details.write().await = details;
+    pub async fn sync_resource_summaries(&self, summaries: HashMap<EnvironmentId, HostSummary>, emit: &impl Fn(DaemonEvent)) {
         let mut projected = self.resource_environments.write().await;
         let removed = projected.difference(&summaries.keys().cloned().collect()).cloned().collect::<Vec<_>>();
         *projected = summaries.keys().cloned().collect();

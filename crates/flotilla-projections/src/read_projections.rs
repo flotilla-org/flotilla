@@ -846,7 +846,9 @@ impl ReadProjections<'_> {
         local_summary: &HostSummary,
     ) -> Result<HostStatusResponse, String> {
         let mut response = self.host_registry.get_host_status(environment_id, counts).await?;
-        if environment_id == &local_summary.environment_id && !self.host_registry.has_resource_description(environment_id).await {
+        // The engine's Host record keeps only the architecture of a description, so the stored
+        // environments are always empty; the answering daemon reads its own live.
+        if environment_id == &local_summary.environment_id {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
         response.change_stream = if &response.node.node_id == self.node_id {
@@ -864,7 +866,9 @@ impl ReadProjections<'_> {
         local_summary: &HostSummary,
     ) -> Result<HostProvidersResponse, String> {
         let mut response = self.host_registry.get_host_providers(environment_id, counts).await?;
-        if environment_id == &local_summary.environment_id && !self.host_registry.has_resource_description(environment_id).await {
+        // The engine's Host record keeps only the architecture of a description, so the stored
+        // environments are always empty; the answering daemon reads its own live.
+        if environment_id == &local_summary.environment_id {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
         Ok(response)

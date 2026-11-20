@@ -5690,6 +5690,29 @@ display_name = "Build Box"
 }
 
 #[tokio::test]
+async fn local_host_status_lists_live_environments_once_its_heartbeat_is_stored() {
+    let (_temp, _repo, daemon, _identity) = daemon_for_fake_repo().await;
+    let local = daemon.local_host_summary().await;
+    let local_host_id = daemon.local_host_id().expect("local host id");
+    // The engine's Host record keeps a description's architecture alone, so what the heartbeat
+    // stores holds no environments.
+    let mut stored = local.clone();
+    stored.system.arch = Some("amd64".into());
+    stored.environments.clear();
+    let status = HostStatus { description: Some(stored), ready: true, ..HostStatus::default() };
+    publish_other_host(&daemon, local_host_id.as_str(), &status).await;
+
+    let response = daemon.get_host_status_internal(&local.environment_id).await.expect("host status");
+    assert!(
+        response.visible_environments.iter().any(|environment| environment.environment_id() == &local.environment_id),
+        "the answering daemon's own environment is visible: {:?}",
+        response.visible_environments
+    );
+    let providers = daemon.get_host_providers_internal(&local.environment_id).await.expect("host providers");
+    assert_eq!(response.visible_environments, providers.visible_environments);
+}
+
+#[tokio::test]
 async fn broken_static_ssh_environment_does_not_break_local_startup() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
