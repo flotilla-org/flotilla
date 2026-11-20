@@ -149,20 +149,6 @@ pub(crate) fn addresses(convoy: &Resource<Convoy>) -> Result<(Address, Vec<Addre
     Ok((convoy_address, seats))
 }
 
-/// The messages homed at `home` pending to any of `seats`.
-pub(crate) fn pending_to(read: &mut Read<'_>, seats: &[Address], home: &str) -> Result<Vec<ResourceId>, StoreError> {
-    let mut pending = Vec::new();
-    for seat in seats {
-        each(read, &MessageSpec::by_inbox(seat, &MessageLabel::Pending), |read, id| {
-            if read.identity(id)?.is_some_and(|(identity, _)| identity.home == home) {
-                pending.push(id);
-            }
-            Ok(())
-        })?;
-    }
-    Ok(pending)
-}
-
 fn first<Q>(read: &mut Read<'_>, query: &IndexQuery<Q>, holds: &mut BTreeSet<String>, label: &str) -> Result<(), StoreError> {
     let page = read.page(query, None, 1)?;
     if let Some(id) = page.ids.first() {

@@ -22,13 +22,13 @@ use flotilla_engine_store::{
     StoreLog,
 };
 use flotilla_resources::account_access::{
-    binding_name, requester_address, requester_parts, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords,
-    BindingRecord, BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite,
-    ACCOUNT_BINDING_LABEL, ACCOUNT_CREDENTIAL_LABEL,
+    binding_name, requester_parts, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords, BindingRecord,
+    BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite, ACCOUNT_BINDING_LABEL,
+    ACCOUNT_CREDENTIAL_LABEL,
 };
 use flotilla_resources::engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, WriteError as RecordWriteError};
-use flotilla_resources::{address::AddressKind, convoy::engine::ImportedLaunches, CONVOY_LABEL};
-use flotilla_schema::{CreatedAt, Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
+use flotilla_resources::CONVOY_LABEL;
+use flotilla_schema::{Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
 use futures::stream::BoxStream;
@@ -39,9 +39,7 @@ use super::reads::created_at;
 use super::resume::{followed_since, logged_since};
 use super::watch::CommitsSeen;
 use super::watch::EngineWatch;
-use crate::stored::account::{
-    self as stored, AccountBinding, BindingEdge, BindingSpec, BindingState, Close, ObserveEpoch, ProvisionSpec, Regrant, Revoke,
-};
+use crate::stored::account::{AccountBinding, BindingEdge, BindingSpec, BindingState, Close, ObserveEpoch, ProvisionSpec, Regrant, Revoke};
 
 /// The writer recorded on this home's account writes.
 const WRITER: &str = "account-records";
@@ -617,160 +615,6 @@ fn rescanned(read: &mut Read<'_>, home: &str) -> Result<Vec<AccountChange>, Stor
 /// The requester binding name ([`binding_name`]) an engine binding was opened for.
 pub fn requester_name(binding: &BindingSpec) -> Option<String> {
     requester_parts(&binding.requester).map(|(convoy, role)| binding_name(&convoy, &role, &binding.requirement))
-}
-
-/// `spec` with its requester's convoy named by the launch it imports as (#3108), in `namespace`.
-fn at_launch(mut spec: BindingSpec, namespace: &str, convoys: &ImportedLaunches) -> Result<BindingSpec, String> {
-    let (convoy, role) =
-        requester_parts(&spec.requester).ok_or_else(|| format!("requester `{}` names no convoy and role", spec.requester))?;
-    let launch = convoys.name(namespace, &convoy).ok_or_else(|| {
-        let reason = convoys.missing(namespace, &convoy).map(|reason| reason.to_string()).unwrap_or_default();
-        // The requester's address first: the project it names is the tombstone's (#3108).
-        format!("its requester `{}` {reason} (`{convoy}`)", spec.requester)
-    })?;
-    spec.requester = requester_address(spec.requester.get(AddressKind::Project), &launch, &role)?;
-    Ok(spec)
-}
-
-/// The engine name an old binding at `home` imports as, unless another of `taken` holds it.
-fn imported_binding_name(spec: &BindingSpec, home: &str, taken: &mut BTreeSet<(String, String)>) -> Result<String, String> {
-    let requester = requester_name(spec).ok_or_else(|| format!("requester `{}` names no convoy and role", spec.requester))?;
-    let name = engine_binding_name(&requester, spec.opened_at);
-    if !taken.insert((home.to_owned(), name.clone())) {
-        return Err(format!("another binding of its requester opened at the same time already imports as `{name}`"));
-    }
-    Ok(name)
-}
-
-/// [`import_accounts`] into a temporary store of their own.
-pub fn rehearse_accounts(
-    bindings: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountBinding>, String)],
-    provisions: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountProvision>, String)],
-    convoys: &ImportedLaunches,
-    report: &mut super::import::ImportReport,
-) {
-    use super::import::ImportRefusal;
-    let mut kinds = flotilla_schema::KindRegistry::new();
-    let rehearsal = stored::register(&mut kinds)
-        .map_err(|error| format!("registry: {error:?}"))
-        .and_then(|()| flotilla_engine_store::Rehearsal::open(kinds));
-    match rehearsal {
-        Ok(mut rehearsal) => import_accounts(bindings, provisions, convoys, &mut rehearsal, report),
-        Err(reason) => {
-            let refuse = |kind, record: &str| ImportRefusal { kind, record: record.to_owned(), reason: reason.clone() };
-            report.refused.extend(bindings.iter().map(|(binding, _)| refuse("AccountBinding", &binding.metadata.name)));
-            report.refused.extend(provisions.iter().map(|(provision, _)| refuse("AccountProvision", &provision.metadata.name)));
-        }
-    }
-}
-
-/// Maps the old store's bindings and provisions (each with its home) onto the engine and writes
-/// them into `target`, bindings first, so each provision's reference finds its binding (ADR 0047:
-/// the previous generation's records decode). A binding takes its engine name from its requester
-/// and opening; a provision is re-pointed at that name. Counted by kind and state; refusals are
-/// named. Every home's bindings name the bindings provisions point at, but only the records of a
-/// home `target` imports are written: another home's are left to that home.
-pub fn import_accounts(
-    bindings: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountBinding>, String)],
-    provisions: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountProvision>, String)],
-    convoys: &ImportedLaunches,
-    target: &mut impl flotilla_engine_store::ImportTarget,
-    report: &mut super::import::ImportReport,
-) {
-    use super::import::ImportRefusal;
-    use flotilla_state_machines::Version;
-    let change = |old: &flotilla_resources::ObjectMeta| {
-        NewChange::new(flotilla_engine_store::IMPORT_WRITER, Timestamp::from_datetime(&old.creation_timestamp))
-            .created_at(CreatedAt::from_datetime(&old.creation_timestamp))
-    };
-    let mut renamed = BTreeMap::new();
-    let mut taken = BTreeSet::new();
-    for (old, home) in bindings {
-        let refuse = |reason: String| ImportRefusal { kind: "AccountBinding", record: old.metadata.name.clone(), reason };
-        // An r879 binding's home-key label (#3953) is dropped (ADR 0047).
-        let spec = binding_spec(&old.spec);
-        let named = at_launch(spec, &old.metadata.namespace, convoys)
-            .and_then(|spec| imported_binding_name(&spec, home, &mut taken).map(|name| (name, spec)));
-        let imported = target.imports(home);
-        let (name, spec) = match named {
-            Ok(named) if !imported => {
-                renamed.insert((home.clone(), old.metadata.name.clone()), (home.clone(), named.0));
-                continue;
-            }
-            Ok(named) => named,
-            Err(reason) => {
-                if imported {
-                    report.refused.push(refuse(reason));
-                }
-                continue;
-            }
-        };
-        let state = binding_state(&old.spec.state.value);
-        let label = match state {
-            BindingState::Open => "open",
-            BindingState::Closed { .. } => "closed",
-            BindingState::Revoked { .. } => "revoked",
-        };
-        let resource = Resource::<AccountBinding>::stored(name.clone(), spec, State::new(state, old.spec.state.since), Version(1));
-        // The store stamps every epoch row with the create's version.
-        let written = target.write_with(home, &name, &change(&old.metadata), 1, |version| {
-            let mut spec = resource.spec().clone();
-            spec.epochs.restamp(version);
-            resource.clone().with_spec(spec)
-        });
-        match written {
-            Ok(_) => {
-                report.import_row("AccountBinding", label);
-                renamed.insert((home.clone(), old.metadata.name.clone()), (home.clone(), name));
-            }
-            Err(reason) => report.refused.push(refuse(reason)),
-        }
-    }
-    for (old, home) in provisions {
-        if !target.imports(home) {
-            continue;
-        }
-        let refuse = |reason: String| ImportRefusal { kind: "AccountProvision", record: old.metadata.name.clone(), reason };
-        // A daemon's own records list without an origin root; a provision names its binding's
-        // home by node id, so a binding listed as this daemon's is found by name alone.
-        let named = renamed.get(&(old.spec.binding.home.clone(), old.spec.binding.name.clone())).or_else(|| {
-            let mut local = renamed
-                .iter()
-                .filter(|((held_home, held), _)| *held == old.spec.binding.name && target.imports(held_home))
-                .map(|(_, renamed)| renamed);
-            local.next().filter(|_| local.next().is_none())
-        });
-        let Some((binding_home, binding)) = named else {
-            report
-                .refused
-                .push(refuse(format!("names binding `{}` at `{}`, which is not imported", old.spec.binding.name, old.spec.binding.home)));
-            continue;
-        };
-        let mut spec = provision_spec(&old.spec);
-        spec.binding = Ref::new(binding.clone(), binding_home.clone());
-        let label = if spec.delivered.is_some() { "delivered" } else { "recorded" };
-        // Another home's binding arrives by replication; the reference creates its identity.
-        let restored = if target.imports(&spec.binding.home) {
-            target.holds::<Resource<AccountBinding>>(&spec.binding.name, &spec.binding.home)
-        } else {
-            Ok(true)
-        };
-        match restored {
-            Ok(true) => {}
-            Ok(false) => {
-                report.refused.push(refuse(format!("its binding `{}` at `{}` is not restored", spec.binding.name, spec.binding.home)));
-                continue;
-            }
-            Err(reason) => {
-                report.refused.push(refuse(reason));
-                continue;
-            }
-        }
-        match target.write(home, &old.metadata.name, &change(&old.metadata), &spec) {
-            Ok(()) => report.import_row("AccountProvision", label),
-            Err(reason) => report.refused.push(refuse(reason)),
-        }
-    }
 }
 
 impl std::fmt::Debug for EngineAccounts {

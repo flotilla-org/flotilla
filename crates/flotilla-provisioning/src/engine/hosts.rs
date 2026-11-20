@@ -41,7 +41,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
 use serde_json::{json, Value};
 
-use super::host_import;
+use super::host_observation;
 use super::reads::created_at;
 use super::resume::followed_since;
 use super::watch::CommitsSeen;
@@ -161,7 +161,7 @@ fn resolve<'a>(records: &'a Records, home: &str, name: &str) -> Option<(&'a str,
 /// The observation `status` maps to, with each condition whose value and flags stand kept as
 /// `held` has it.
 pub fn observed(spec: &HostSpec, status: &HostStatus, held: Option<&HostObservation>) -> Result<HostObservation, String> {
-    let mut observation = host_import::observation(spec, status, &mut Vec::new())?;
+    let mut observation = host_observation::observation(spec, status, &mut Vec::new())?;
     if let Some(held) = held {
         for (condition_type, condition) in &mut observation.conditions {
             if let Some(kept) = held.conditions.get(condition_type).filter(|kept| stands(kept, condition)) {

@@ -7,7 +7,6 @@ pub mod convert;
 pub mod host_identity;
 pub mod in_process;
 pub mod model;
-pub mod primitives;
 pub(crate) mod repo_state;
 pub mod repository_inspection;
 pub mod resolve;
