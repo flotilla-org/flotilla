@@ -1,6 +1,5 @@
 mod schema_support;
 
-
 use flotilla_provisioning::stored::repository::{self as stored};
 use flotilla_schema::render_view;
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};

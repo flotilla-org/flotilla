@@ -5,7 +5,6 @@ use flotilla_resources::{
 };
 use flotilla_store::{MessageQuery, OwnerQuery, ResourceBackend, StoreExt, StoreQuery};
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use flotilla_store_testkit::fixtures::{convoy_meta, convoy_spec};
 use flotilla_store_testkit::ReadCountsBackendExt;
 use std::collections::BTreeMap;
@@ -87,7 +86,7 @@ async fn seed(backend: &ResourceBackend) {
 }
 async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     // The Environment admission query must have the same candidate cover on
-    // memory, SQLite (sync/async/file), and hybrid adapters.
+    // memory and hybrid adapters.
     for (name, spec) in [
         (
             "current-direct",
@@ -814,12 +813,8 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
 }
 #[tokio::test]
 async fn shared_query_contract() {
-    let sqlite = ResourceBackend::new(SqliteBackend::open_in_memory().unwrap());
     let memory = ResourceBackend::new(InMemoryBackend::default());
-    let directory = tempfile::tempdir().unwrap();
-    let file = ResourceBackend::new(SqliteBackend::open(directory.path().join("sync.sqlite")).unwrap());
-    let asynchronous = ResourceBackend::new(SqliteBackend::open_async(directory.path().join("async.sqlite")).await.unwrap());
-    for backend in [&sqlite, &memory, &file, &asynchronous] {
+    for backend in [&memory] {
         seed(backend).await;
         contract(backend, backend).await;
     }

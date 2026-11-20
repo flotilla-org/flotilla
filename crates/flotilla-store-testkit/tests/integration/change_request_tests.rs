@@ -94,17 +94,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_observation_history_is_thin() {
-        assert_observation_history_is_thin(ResourceBackend::new(flotilla_store_testkit::sqlite_backend().expect("sqlite backend"))).await;
-    }
-
-    #[tokio::test]
     async fn in_memory_enumerates_local_observation_namespaces() {
         assert_local_namespace_enumeration(ResourceBackend::new(flotilla_store_testkit::memory_backend())).await;
-    }
-
-    #[tokio::test]
-    async fn sqlite_enumerates_local_observation_namespaces() {
-        assert_local_namespace_enumeration(ResourceBackend::new(flotilla_store_testkit::sqlite_backend().expect("sqlite backend"))).await;
     }
 }

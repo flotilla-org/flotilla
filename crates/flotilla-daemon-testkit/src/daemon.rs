@@ -262,7 +262,9 @@ async fn compose(
         hook_endpoint: Some(hooks),
         ..harness_options(composition.resync)
     };
-    let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.unwrap_or_else(|error| panic!("runtime: {error:?}"));
+    let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options)
+        .await
+        .unwrap_or_else(|error| panic!("runtime: {error:?}"));
     front_door.install_blob_store(Arc::clone(&runtime.blob_store)).expect("install the blob store");
     (daemon, runtime, shutdown)
 }

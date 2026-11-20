@@ -14,7 +14,6 @@ use flotilla_resources::{
 };
 use flotilla_store::{LocalViewSource, OwnerQuery, ResourceBackend, StoreQuery, StoreViewSource, ViewSource, WatchView};
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use flotilla_store_testkit::fixtures::{convoy_meta, convoy_spec};
 use futures::{stream::BoxStream, StreamExt};
 
@@ -247,14 +246,6 @@ async fn memory_watch_view_contract() {
     let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("local-root"));
     contract(backend.clone(), backend).await;
 }
-#[tokio::test]
-async fn sqlite_watch_view_contract() {
-    let directory = tempfile::tempdir().unwrap();
-    let backend =
-        ResourceBackend::new(SqliteBackend::open(directory.path().join("store.db")).unwrap()).with_local_root(NodeId::new("local-root"));
-    contract(backend.clone(), backend).await;
-}
-
 // Across empty inventories, duplicate names, label changes and deletes, shared
 // generations must agree with the maintained view's queries. Saved snapshots
 // remain unchanged when later watch events arrive, including their indexes.

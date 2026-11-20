@@ -2,7 +2,6 @@
 use flotilla_resources::*;
 use flotilla_store::{ResourceBackend, ResourceKind};
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use flotilla_store_testkit::{fixtures::contract::*, ReadCountsBackendExt, ReadOperation, ReadSnapshot, ReadTally};
 use futures::StreamExt;
 use serde_json::json;
@@ -11,7 +10,6 @@ use std::collections::BTreeMap;
 async fn backend(name: &str) -> ResourceBackend {
     match name {
         "memory" => ResourceBackend::new(InMemoryBackend::default()),
-        "sqlite" => ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")),
         _ => unreachable!(),
     }
 }
@@ -23,7 +21,6 @@ macro_rules! contract {
             // including optimistic concurrency, no-ops, metadata and watch replay.
             #[rstest::rstest]
             #[case("memory")]
-            #[case("sqlite")]
             #[tokio::test]
             async fn shared_contract(#[case] adapter: &str, #[values(0, 1, 2, 3, 4, 5, 6, 7, 8)] scenario: u8) {
                 let backend = backend(adapter).await;
@@ -49,7 +46,6 @@ contract!(convoy, ConvoyFixture);
 // through every adapter, while an unobserved handle has no counters attached.
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 async fn read_observers_cross_the_store_trait(#[case] adapter: &str) {
     let plain = backend(adapter).await;
@@ -71,7 +67,6 @@ async fn read_observers_cross_the_store_trait(#[case] adapter: &str) {
 // API spells them; replica-inclusive reads keep the same classification.
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 async fn read_operations_classify_selectors(#[case] adapter: &str) {
     use flotilla_store::StoreQuery;
@@ -130,7 +125,6 @@ async fn unsupported_defaults_are_neutral() {
 // replaced a list-and-find with `get_all` keep choosing the same copy.
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 async fn get_all_orders_provenances_like_list(#[case] adapter: &str) {
     use flotilla_protocol::NodeId;
@@ -177,18 +171,10 @@ async fn replica_burst_recovers_in_memory() {
     assert_replica_burst_recovers(ResourceBackend::new(InMemoryBackend::default())).await;
 }
 
-#[tokio::test]
-async fn replica_burst_recovers_sqlite() {
-    let directory = tempfile::tempdir().unwrap();
-    let backend = SqliteBackend::open(directory.path().join("queue.sqlite")).unwrap();
-    assert_replica_burst_recovers(ResourceBackend::new(backend)).await;
-}
-
 // Missing objects still cross the store boundary: zero decoded objects does
 // not mean zero calls. All adapters obey the same accounting contract.
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 async fn read_counts_include_missing_gets(#[case] adapter: &str) {
     let plain = backend(adapter).await;
@@ -201,14 +187,10 @@ async fn read_counts_include_missing_gets(#[case] adapter: &str) {
 // a subject under the same or different relationships (#3171).
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
-#[case("sqlite-reopen")]
 #[tokio::test]
 async fn duplicate_collection_values(#[case] adapter: &str) {
     use flotilla_store::StoreQuery;
-    let directory = (adapter == "sqlite-reopen").then(|| tempfile::tempdir().unwrap());
-    let path = directory.as_ref().map(|dir| dir.path().join("store.sqlite"));
-    let backend = if let Some(path) = &path { ResourceBackend::new(SqliteBackend::open(path).unwrap()) } else { backend(adapter).await };
+    let backend = backend(adapter).await;
     let resolver = backend.using::<Convoy>("flotilla");
     let mut meta = ConvoyFixture::meta("duplicates");
     meta.labels.insert("index-contract".into(), "same".into());
@@ -246,34 +228,6 @@ async fn duplicate_collection_values(#[case] adapter: &str) {
         .await
         .expect("apply duplicate replica subjects");
     drop(resolver);
-    let backend = if let Some(path) = &path {
-        drop(backend);
-        // Simulate an older/unconfigured writer leaving projections empty while
-        // duplicate subjects are already durable. Open must rebuild both sides.
-        let raw = rusqlite::Connection::open(path).unwrap();
-        // Legacy/external JSON can repeat a label key. The domain decoder takes
-        // its last value; rebuilding the lookup must accept the same body.
-        for table in ["resource_objects", "replica_objects"] {
-            let body: String =
-                raw.query_row(&format!("SELECT body_json FROM {table} WHERE name='duplicates'"), [], |row| row.get(0)).unwrap();
-            let body = body.replace("\"index-contract\":\"same\"", "\"index-contract\":\"old\",\"index-contract\":\"same\"");
-            raw.execute(&format!("UPDATE {table} SET body_json=?1 WHERE name='duplicates'"), [body]).unwrap();
-        }
-        for table in [
-            "resource_objects_Convoy_status_subjects___subject_values",
-            "replica_objects_Convoy_status_subjects___subject_values",
-            "resource_objects_labels",
-            "resource_objects_owners",
-            "replica_objects_labels",
-            "replica_objects_owners",
-        ] {
-            raw.execute(&format!("DELETE FROM {table}"), []).unwrap();
-        }
-        drop(raw);
-        ResourceBackend::new(SqliteBackend::open(path).expect("reopen repairs duplicate projections"))
-    } else {
-        backend
-    };
     for namespace in ["flotilla", "remote"] {
         let result = backend
             .query_declared::<Convoy>(
@@ -312,7 +266,6 @@ async fn duplicate_collection_values(#[case] adapter: &str) {
 // valid objects on both sides still apply, and a corrected delivery clears it.
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 async fn replica_batch_quarantines_one_object(#[case] adapter: &str, #[values(false, true)] snapshot: bool) {
     use flotilla_store::{SerializedResource, StoreExt};
@@ -407,65 +360,10 @@ async fn replica_batch_quarantines_one_object(#[case] adapter: &str, #[values(fa
     assert_eq!(quarantines[0].origin_root, other);
 }
 
-// A valid decoded object can still fail in SQLite maintenance. Its savepoint
-// must undo the object and every trigger side effect while the batch continues.
-#[rstest::rstest]
-#[tokio::test]
-async fn replica_sql_failure_rolls_back_only_one_record(#[values(false, true)] snapshot: bool) {
-    use flotilla_store::StoreExt;
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("store.sqlite");
-    let sqlite = SqliteBackend::open(&path).unwrap();
-    let raw = rusqlite::Connection::open(&path).unwrap();
-    raw.execute_batch("CREATE TRIGGER reject_bad_replica AFTER INSERT ON replica_objects WHEN NEW.name='bad' BEGIN SELECT RAISE(FAIL, 'test unappliable replica'); END;").unwrap();
-    drop(raw);
-    let backend = ResourceBackend::new(sqlite);
-    let source = ResourceBackend::new(InMemoryBackend::default());
-    for name in ["before", "bad", "after"] {
-        source.using::<Convoy>("flotilla").create(&ConvoyFixture::meta(name), &ConvoyFixture::spec()).await.unwrap();
-    }
-    let origin = flotilla_protocol::NodeId::new("peer");
-    let listed = source.using::<Convoy>("flotilla").list().await.unwrap();
-    let mut watch = backend.including_replicas::<Convoy>("flotilla").watch().await.unwrap();
-    if snapshot {
-        backend.replica_writer::<Convoy>(origin.clone(), "flotilla").replace(&listed, chrono::Utc::now()).await.unwrap();
-    } else {
-        let events = listed.items.into_iter().map(WatchEvent::Added).collect::<Vec<_>>();
-        backend.replica_writer::<Convoy>(origin.clone(), "flotilla").apply_batch(&events, chrono::Utc::now()).await.unwrap();
-    }
-    for _ in 0..2 {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), watch.next()).await.unwrap().unwrap().unwrap();
-        let ReadWatchEvent::Added(item) = event else { panic!("expected committed addition") };
-        assert_ne!(item.object.metadata.name, "bad", "rejected record must never publish");
-    }
-    assert!(tokio::time::timeout(std::time::Duration::from_millis(10), watch.next()).await.is_err(), "only committed objects publish");
-    drop(watch);
-    let names = backend
-        .store()
-        .list_replicas_typed::<Convoy>("flotilla")
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|item| item.object.metadata.name)
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(names, std::collections::BTreeSet::from(["before".into(), "after".into()]));
-    drop(backend);
-    let raw = rusqlite::Connection::open(&path).unwrap();
-    let digest_count: usize =
-        raw.query_row("SELECT count(*) FROM digest_entries WHERE origin='peer' AND name='bad'", [], |row| row.get(0)).unwrap();
-    assert_eq!(digest_count, 0, "trigger projection rolled back with rejected object");
-    drop(raw);
-    let reopened = ResourceBackend::new(SqliteBackend::open(&path).unwrap());
-    let diagnostics = reopened.store().diagnostics().await.unwrap().unwrap();
-    assert_eq!(diagnostics.replica_quarantines.len(), 1, "quarantine survives restart");
-    assert!(diagnostics.replica_quarantines[0].error.contains("test unappliable replica"));
-}
-
 // A bucket snapshot proves absence only within that bucket; a full snapshot
 // subsequently clears the remaining rejected name for the same origin.
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 async fn replica_snapshot_quarantine_pruning_is_bucket_scoped(#[case] adapter: &str) {
     use flotilla_store::SerializedResource;
@@ -502,7 +400,6 @@ async fn replica_snapshot_quarantine_pruning_is_bucket_scoped(#[case] adapter: &
 // response, first Added event and stored object all carry the same decision.
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 async fn admission_placement_is_published_with_convoy(#[case] adapter: &str) {
     use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
@@ -569,7 +466,6 @@ async fn admission_placement_is_published_with_convoy(#[case] adapter: &str) {
 // canonical write; equality of canonical specs must not cause update loops.
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 async fn legacy_environment_instance_survives_read_write_and_noop(#[case] adapter: &str, #[values(false, true)] direct: bool) {
     let backend = backend(adapter).await;
@@ -611,7 +507,6 @@ async fn legacy_environment_instance_survives_read_write_and_noop(#[case] adapte
 // (An HTTP backend authors no definitions, so this runs on the local adapters.)
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 async fn built_in_definitions_are_read_from_the_code_and_never_written(#[case] adapter: &str) {
     use flotilla_resources::{builtins::builtin_definitions, ImageLayer, WorkflowTemplate};

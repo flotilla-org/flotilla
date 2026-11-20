@@ -18,10 +18,7 @@ use flotilla_provisioning::{
         host::{self as host_kinds, Class, Readiness, Value},
     },
 };
-use flotilla_resources::{
-    ConditionValue, Host, HostCondition, HostConnection, HostSpec, HostStatus, ObjectMeta,
-    ResourceObject,
-};
+use flotilla_resources::{ConditionValue, Host, HostCondition, HostConnection, HostSpec, HostStatus, ObjectMeta, ResourceObject};
 use flotilla_schema::{render_view, KindCode, Timestamp};
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
 use schema_support::{check, plan};

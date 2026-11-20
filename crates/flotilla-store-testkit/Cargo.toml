@@ -10,7 +10,6 @@ default = []
 skip-no-sandbox-tests = []
 
 [dependencies]
-flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-protocol = { path = "../flotilla-protocol" }

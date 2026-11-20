@@ -7,10 +7,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use flotilla_resources::{
-    Clone as OldClone, ClonePhase, CloneSpec, CloneStatus,
-    ObjectMeta, RepositoryKey, ResourceObject,
-};
+use flotilla_resources::{Clone as OldClone, ClonePhase, CloneSpec, CloneStatus, ObjectMeta, RepositoryKey, ResourceObject};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleState},
     Home,

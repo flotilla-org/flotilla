@@ -52,7 +52,8 @@ fn remedy(error: &flotilla_schema_sqlite::StoreError) -> String {
     ) {
         return String::new();
     }
-    "; do not delete it: deleting it throws away every write since the roll; keep it, back it up, and install a generation that opens it".into()
+    "; do not delete it: deleting it throws away every write since the roll; keep it, back it up, and install a generation that opens it"
+        .into()
 }
 
 /// Opens the decided store at `state_dir`, homed at this daemon's node id, and the ports serving

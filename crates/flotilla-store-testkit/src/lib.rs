@@ -20,9 +20,6 @@ pub use standing_roles::MemoryStandingRoles;
 pub fn memory_backend() -> flotilla_store::ResourceBackend {
     flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())
 }
-pub fn sqlite_backend() -> Result<flotilla_store::ResourceBackend, flotilla_resources::ResourceError> {
-    Ok(flotilla_store::ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open_in_memory()?))
-}
 
 /// The record name the observer writes for a stored `(service, scope, number)`
 /// change request spelling that needs no Forge directory.

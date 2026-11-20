@@ -4,9 +4,7 @@
 
 use std::{collections::BTreeMap, fmt::Debug, sync::Arc};
 
-use flotilla_engine_store::{
-    plain::{register_plain, PendingChange, Plain, PlainError, PlainLog},
-};
+use flotilla_engine_store::plain::{register_plain, PendingChange, Plain, PlainError, PlainLog};
 use flotilla_schema::{Kind, KindRegistry, NewChange, Stored, Timestamp};
 use flotilla_schema_sqlite::{Store, StoreHandle};
 use hegel::{generators as gs, TestCase};

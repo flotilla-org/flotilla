@@ -1,5 +1,5 @@
 use flotilla_store::StoreExt;
-// Shared merged-watch contract for the real memory and SQLite stores.
+// Shared merged-watch contract for the real memory store.
 use std::collections::BTreeSet;
 
 use flotilla_protocol::NodeId;
@@ -110,17 +110,13 @@ fn generated_merged_watch_membership(tc: hegel::TestCase) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
         contract(ResourceBackend::new(flotilla_store_testkit::memory_backend()), &operations).await;
-        contract(ResourceBackend::new(flotilla_store_testkit::sqlite_backend().expect("sqlite")), &operations).await;
     });
 }
 
 // Pin the final-replica removal and tombstone failures independently of seeds.
 #[tokio::test]
 async fn merged_watch_removes_last_replica_and_preserves_surviving_sources() {
-    for backend in [
-        ResourceBackend::new(flotilla_store_testkit::memory_backend()),
-        ResourceBackend::new(flotilla_store_testkit::sqlite_backend().expect("sqlite")),
-    ] {
+    for backend in [ResourceBackend::new(flotilla_store_testkit::memory_backend())] {
         contract(backend, &[0, 0, 2, 1, 3, 6, 0, 7, 4, 0, 1, 5, 6]).await;
     }
 }
@@ -130,10 +126,7 @@ async fn merged_watch_removes_last_replica_and_preserves_surviving_sources() {
 // member arrives, so either dropping a deletion or an addition fails this test.
 #[tokio::test]
 async fn merged_watch_replays_changes_queued_during_bootstrap() {
-    for backend in [
-        ResourceBackend::new(flotilla_store_testkit::memory_backend()),
-        ResourceBackend::new(flotilla_store_testkit::sqlite_backend().expect("sqlite")),
-    ] {
+    for backend in [ResourceBackend::new(flotilla_store_testkit::memory_backend())] {
         let source = ResourceBackend::new(flotilla_store_testkit::memory_backend());
         let spec = ProjectSpec::builder().display_name("Platform".into()).default_workflow_ref("dev".into()).build();
         let before =

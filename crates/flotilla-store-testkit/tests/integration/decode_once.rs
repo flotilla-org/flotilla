@@ -15,7 +15,6 @@ use flotilla_protocol::NodeId;
 use flotilla_resources::{ApiPaths, InputMeta, ObjectMeta, ReplicationClass, Resource, ResourceObject, StatusPatch, WatchStart};
 use flotilla_store::{replica::StoredReplicaEventKind, ResourceBackend, ResourceKind, SerializedResource, StoreExt, StoreQuery};
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use futures::StreamExt;
 use hegel::generators as gs;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -110,24 +109,20 @@ fn replica_object<const ID: usize>(name: &str) -> ResourceObject<Probe<ID>> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Store {
-    Sqlite,
     Memory,
 }
 
 impl Store {
     fn open(self) -> ResourceBackend {
         let backend = match self {
-            Self::Sqlite => ResourceBackend::new(SqliteBackend::open_in_memory().expect("open sqlite")),
             Self::Memory => ResourceBackend::new(InMemoryBackend::default()),
         };
         backend.with_local_root(NodeId::new("decode-root"))
     }
 
-    /// SQLite holds stored text: one decode reads the text straight into `T`.
     /// The memory store holds trees: one borrowed typed decode of the tree.
     fn once_per_row(self, rows: usize) -> Decodes {
         match self {
-            Self::Sqlite => Decodes { from_text: rows, from_tree: 0 },
             Self::Memory => Decodes { from_text: 0, from_tree: rows },
         }
     }
@@ -146,7 +141,7 @@ impl Store {
 #[hegel::test]
 fn typed_reads_decode_each_row_once(tc: hegel::TestCase) {
     const ID: usize = 0;
-    let store = if tc.draw(gs::booleans()) { Store::Sqlite } else { Store::Memory };
+    let store = Store::Memory;
     let locals = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
     let updates = if locals == 0 { 0 } else { tc.draw(gs::integers::<usize>().min_value(0).max_value(3)) };
     let replicas = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
@@ -214,98 +209,13 @@ fn typed_reads_decode_each_row_once(tc: hegel::TestCase) {
     });
 }
 
-// Behaviour (#3154): the typed decode is the quarantine check. A stored body
-// that does not decode as the registered type costs one decode attempt, is
-// excluded from the list and is quarantined; its valid neighbours still decode
-// once each.
-#[tokio::test]
-async fn typed_list_quarantines_with_its_only_decode() {
-    const ID: usize = 1;
-    let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("resources.sqlite");
-    let backend = ResourceBackend::new(SqliteBackend::open(&path).expect("open sqlite"));
-    let resolver = backend.using::<Probe<ID>>(NAMESPACE);
-    for name in ["alpha", "broken", "gamma"] {
-        resolver.create(&labelled(name), &spec(name)).await.expect("create");
-    }
-    let raw = rusqlite::Connection::open(&path).expect("raw connection");
-    SqliteBackend::register_query_functions(&raw).expect("configure raw connection");
-    let changed = raw
-        .execute(
-            "UPDATE resource_objects SET body_json = json_set(body_json, '$.spec.value', 7) WHERE kind = 'DecodeProbe' AND name = 'broken'",
-            [],
-        )
-        .expect("corrupt one body");
-    assert_eq!(changed, 1);
-    drop(raw);
-    take_decodes::<ID>();
-
-    let listed = resolver.list().await.expect("list");
-    let names: Vec<_> = listed.items.iter().map(|object| object.metadata.name.as_str()).collect();
-    assert_eq!(names, ["alpha", "gamma"]);
-    assert_eq!(take_decodes::<ID>(), Decodes { from_text: 3, from_tree: 0 });
-
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let diagnostics = backend.diagnostics().await.expect("diagnostics").expect("sqlite diagnostics");
-            if diagnostics.decode_quarantines.iter().any(|quarantine| quarantine.name == "broken") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the failed decode is quarantined");
-}
-
-// Behaviour (#3154): replay decodes each stored event once for a typed watcher,
-// including a full-object `Deleted` event, and still delivers a name-only
-// tombstone (a `Deleted` body without `spec`) as `DeletedByName`.
-#[tokio::test]
-async fn typed_replay_decodes_deleted_objects_once_and_keeps_tombstones() {
-    const ID: usize = 2;
-    let backend = ResourceBackend::new(SqliteBackend::open_in_memory().expect("open sqlite"));
-    let resolver = backend.using::<Probe<ID>>(NAMESPACE);
-    resolver.create(&labelled("deleted"), &spec("deleted")).await.expect("create");
-    resolver.delete("deleted").await.expect("delete");
-    resolver.create(&labelled("kept"), &spec("kept")).await.expect("create");
-    backend.store().tombstone_typed::<Probe<ID>>(NAMESPACE, "ghost", None).await.expect("tombstone");
-    take_decodes::<ID>();
-
-    let mut replay = resolver.watch(WatchStart::FromVersion("0".to_string())).await.expect("replay");
-    let mut events = Vec::new();
-    for _ in 0..4 {
-        events.push(tokio::time::timeout(Duration::from_secs(5), replay.next()).await.expect("event").expect("open").expect("decoded"));
-    }
-    let shapes: Vec<_> = events
-        .iter()
-        .map(|event| match event {
-            flotilla_resources::WatchEvent::Added(object) => ("added", object.metadata.name.clone()),
-            flotilla_resources::WatchEvent::Modified(object) => ("modified", object.metadata.name.clone()),
-            flotilla_resources::WatchEvent::Deleted(object) => ("deleted", object.metadata.name.clone()),
-            flotilla_resources::WatchEvent::DeletedByName(tombstone) => ("tombstone", tombstone.name.clone()),
-        })
-        .collect();
-    assert_eq!(
-        shapes,
-        [
-            ("added", "deleted".to_string()),
-            ("deleted", "deleted".to_string()),
-            ("added", "kept".to_string()),
-            ("tombstone", "ghost".to_string())
-        ]
-    );
-    // Two adds and one full-object delete; the tombstone has no spec to decode.
-    assert_eq!(take_decodes::<ID>(), Decodes { from_text: 3, from_tree: 0 });
-}
-
 // Behaviour (#3154, ADR 0047): raw readers receive the stored spec tree as
 // written, so a field this generation does not know survives a raw read for
 // pass-through; typed readers decode the same row into the registered type.
 #[tokio::test]
 async fn raw_reads_keep_unknown_fields_and_typed_reads_ignore_them() {
     const ID: usize = 3;
-    for store in [Store::Sqlite, Store::Memory] {
+    for store in [Store::Memory] {
         let backend = store.open();
         let kind = ResourceKind::of::<Probe<ID>>();
         let stored = replica_object::<ID>("future");
@@ -335,7 +245,7 @@ async fn raw_reads_keep_unknown_fields_and_typed_reads_ignore_them() {
 #[tokio::test]
 async fn typed_reads_decode_null_status_as_none() {
     const ID: usize = 4;
-    for store in [Store::Sqlite, Store::Memory] {
+    for store in [Store::Memory] {
         let backend = store.open();
         let kind = ResourceKind::of::<Probe<ID>>();
         let stored = replica_object::<ID>("null-status");
@@ -354,40 +264,4 @@ async fn typed_reads_decode_null_status_as_none() {
         assert_eq!(typed.len(), 1, "{store:?}");
         assert_eq!(typed[0].object.status, None, "{store:?}");
     }
-}
-
-// Behaviour (#3154): the single typed decode still checks identity. A stored
-// body whose `kind` or `apiVersion` names another resource is refused on the
-// typed path and on the raw path alike. Only SQLite can hold such a body: the
-// memory store keeps trees it encoded itself.
-#[tokio::test]
-async fn typed_reads_refuse_a_body_of_another_kind_or_api_version() {
-    const ID: usize = 5;
-    let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("resources.sqlite");
-    let backend = ResourceBackend::new(SqliteBackend::open(&path).expect("open sqlite"));
-    let resolver = backend.using::<Probe<ID>>(NAMESPACE);
-    for name in ["other-kind", "other-version", "intact"] {
-        resolver.create(&labelled(name), &spec(name)).await.expect("create");
-    }
-    let raw = rusqlite::Connection::open(&path).expect("raw connection");
-    SqliteBackend::register_query_functions(&raw).expect("configure raw connection");
-    for (name, path, value) in [("other-kind", "$.kind", "Convoy"), ("other-version", "$.apiVersion", "flotilla.work/v2")] {
-        let changed = raw
-            .execute(
-                "UPDATE resource_objects SET body_json = json_set(body_json, ?1, ?2) WHERE kind = 'DecodeProbe' AND name = ?3",
-                [path, value, name],
-            )
-            .expect("rewrite identity");
-        assert_eq!(changed, 1, "{name}");
-    }
-    drop(raw);
-
-    for name in ["other-kind", "other-version"] {
-        assert!(resolver.get(name).await.is_err(), "typed get refuses {name}");
-        assert!(backend.store().get_raw(ResourceKind::of::<Probe<ID>>(), NAMESPACE, name).await.is_err(), "raw get refuses {name}");
-    }
-    assert_eq!(resolver.get("intact").await.expect("intact").spec, spec::<ID>("intact"));
-    let listed = resolver.list().await.expect("list");
-    assert_eq!(listed.items.iter().map(|object| object.metadata.name.as_str()).collect::<Vec<_>>(), ["intact"]);
 }

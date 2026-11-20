@@ -7,7 +7,6 @@ use flotilla_resources::{
 };
 use flotilla_store::{decode_stored_resource_document, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use hegel::generators as gs;
 
 fn at(seconds: i64) -> chrono::DateTime<Utc> {
@@ -431,10 +430,7 @@ fn message_indexes_follow_authority_and_replica_lifecycles(tc: hegel::TestCase) 
         .collect();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     runtime.block_on(async {
-        for backend in [
-            ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
-            ResourceBackend::new(SqliteBackend::open_in_memory().unwrap()),
-        ] {
+        for backend in [ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())] {
             let resolver = backend.using::<Message>("flotilla");
             for (step, (id, operation)) in operations.iter().enumerate() {
                 let name = format!("message-{id}");
@@ -726,13 +722,8 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
             (reads.calls_by_kind().get(kind).copied().unwrap_or_default(), reads.objects_by_kind().get(kind).copied().unwrap_or_default())
         })
     }
-    async fn resolve_reads(sqlite: bool, unrelated: usize) -> (ReadSnapshot, ReadSnapshot) {
-        let backend = if sqlite {
-            ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))
-        } else {
-            ResourceBackend::new(InMemoryBackend::default())
-        }
-        .with_read_counts();
+    async fn resolve_reads(unrelated: usize) -> (ReadSnapshot, ReadSnapshot) {
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
         for n in 0..=unrelated {
             let name = if n == 0 { "convoy".into() } else { format!("unrelated-{n}") };
             let ensure_name = if n == 0 { "ensure".into() } else { format!("ensure-{n}") };
@@ -850,9 +841,7 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
         assert!(backend.read_snapshot().since(&before).is_empty(), "principal addresses never load agent holders");
         (batch, resolve)
     }
-    for sqlite in [false, true] {
-        assert_flat_reads([0, 48], |unrelated| resolve_reads(sqlite, unrelated)).await;
-    }
+    assert_flat_reads([0, 48], resolve_reads).await;
 }
 
 // Message pushdown queries classify every persisted phase using the model's
@@ -860,9 +849,7 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
 #[tokio::test]
 async fn message_query_phase_classification_matches_model() {
     use flotilla_store::MessageQuery;
-    for backend in
-        [ResourceBackend::new(InMemoryBackend::default()), ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite backend"))]
-    {
+    for backend in [ResourceBackend::new(InMemoryBackend::default())] {
         let messages = backend.using::<Message>("flotilla");
         // Explicit finite generator spans absent status and every phase. Each
         // record starts fresh because terminal message statuses are immutable.

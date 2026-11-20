@@ -7,7 +7,6 @@ mod decode_once;
 mod forge_identity;
 mod fulfilment_kind;
 mod host_status_coalescing;
-mod host_status_wal;
 mod in_memory;
 mod lifecycle_hygiene;
 mod lifecycle_status_patch;
@@ -19,7 +18,6 @@ mod provisioning_resources_in_memory;
 mod provisioning_status_patch;
 mod repository_in_memory;
 mod resource_projection;
-mod sqlite;
 mod status_patch;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;

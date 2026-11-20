@@ -29,7 +29,6 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 flotilla-store-memory = { path = "../flotilla-store-memory" }
-flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 tokio = { workspace = true, features = ["test-util"] }

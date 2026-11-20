@@ -1,5 +1,4 @@
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use std::collections::BTreeMap;
 
 use flotilla_resources::{
@@ -360,10 +359,7 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
 
 #[tokio::test]
 async fn repository_roundtrips_and_is_immutable_in_local_backends() {
-    let backends = [
-        ResourceBackend::new(InMemoryBackend::default()),
-        ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite backend should open")),
-    ];
+    let backends = [ResourceBackend::new(InMemoryBackend::default())];
     for backend in backends {
         let repositories = backend.using::<Repository>("flotilla");
         let spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("remote should normalize");

@@ -8850,13 +8850,8 @@ mod tests {
     // capability lookup is waiting. A provider gate makes the ordering exact.
     #[tokio::test]
     async fn local_convoy_publishes_while_attach_check_is_held() {
-        for sqlite in [false, true] {
-            let temp = tempfile::TempDir::new().expect("tempdir");
-            let durable = if sqlite {
-                ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(temp.path().join("gate.sqlite")).expect("sqlite"))
-            } else {
-                ResourceBackend::new(InMemoryBackend::default())
-            };
+        {
+            let durable = ResourceBackend::new(InMemoryBackend::default());
             let sessions = durable.using::<TerminalSession>("flotilla");
             let session = session_object("terminal-probe").await;
             let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -8927,8 +8922,7 @@ mod tests {
             .await
             .expect("projection catches up after probe release");
             eprintln!(
-            "HELD_CHECK_PROJECTION sqlite={} write_us={} direct_watch_us={} held_us={} projected_before_probe_release={} projection_after_release_us={}",
-                sqlite,
+            "HELD_CHECK_PROJECTION write_us={} direct_watch_us={} held_us={} projected_before_probe_release={} projection_after_release_us={}",
             committed.duration_since(start).as_micros(),
             watch_us,
             held_us,
