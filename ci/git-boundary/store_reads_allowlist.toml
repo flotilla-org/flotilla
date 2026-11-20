@@ -25,11 +25,6 @@ function = "refresh_convoys"
 reason = "List-then-watch subscription: the Convoy list runs only while no watch is established, then events are applied incrementally."
 
 [[allow]]
-path = "crates/flotilla-store/src/registry.rs"
-function = "quarantine_undecodable_stored_objects"
-reason = "Startup decode quarantine of a durable store: one list per registered kind, which is the purpose of the sweep."
-
-[[allow]]
 path = "crates/flotilla-store/src/view.rs"
 function = "recover_view"
 reason = "Watch-view protocol: retry the snapshot/watch handoff with backoff after a watch expires."
