@@ -28,6 +28,9 @@ PLATFORMS = validation.PLATFORMS
 SHA_PATTERN = validation.SHA_PATTERN
 DIGEST_PATTERN = validation.DIGEST_PATTERN
 MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
+# The member-size checks below bound the payload; this bounds the inflated tar
+# itself (payload plus headers and padding) before it is parsed.
+MAX_TAR_BYTES = MAX_ARCHIVE_BYTES + 64 * 1024 * 1024
 
 
 def read_token(path):
@@ -152,11 +155,22 @@ def safe_member_path(path, root):
     return relative
 
 
-def inspect_inner_archive(archive_bytes, platform, sources):
-    bundle_name = f"fleet-candidate-{platform}"
-    manifest_path = f"{bundle_name}/manifest.json"
+def inflate_archive(archive_bytes, platform):
+    """The raw tar inside one candidate archive, inflated exactly once."""
     try:
-        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+        return validation.gunzip_bounded(archive_bytes, MAX_TAR_BYTES)
+    except validation.ValidationError as error:
+        raise PromotionError(f"{platform} candidate archive is invalid: {error}") from error
+
+
+def inspect_inner_archive(archive_bytes, platform, sources):
+    return inspect_inner_tar(inflate_archive(archive_bytes, platform), platform, sources)
+
+
+def inspect_inner_tar(tar_bytes, platform, sources):
+    bundle_name = f"fleet-candidate-{platform}"
+    try:
+        with tarfile.open(fileobj=validation.BufferFile(tar_bytes), mode="r:") as archive:
             try:
                 members = validation.checked_archive_members(archive, bundle_name)
             except validation.ValidationError as error:
@@ -303,11 +317,14 @@ def read_candidate(artifact_bytes, platform, sources):
     for field, expected_value in expected_metadata.items():
         if metadata.get(field) != expected_value:
             raise PromotionError(f"{platform} candidate metadata has unexpected {field}")
-    protocol_version = inspect_inner_archive(archive_bytes, platform, sources)
+    tar_bytes = inflate_archive(archive_bytes, platform)
+    protocol_version = inspect_inner_tar(tar_bytes, platform, sources)
     return {
         "platform": platform,
         "archive_name": archive_name,
         "archive": archive_bytes,
+        # The verified tar, kept so repackaging does not inflate it again.
+        "tar": tar_bytes,
         "checksum_name": f"{archive_name}.sha256",
         "checksum": checksum_bytes,
         "metadata_name": f"{archive_name}.json",
@@ -355,8 +372,27 @@ def fetch_candidates(api_root, run_id, sources, token):
     return candidates
 
 
+class _ViewReader:
+    """A file-like reader over a memoryview, so tarfile copies no whole payload."""
+
+    def __init__(self, view):
+        self.view = view
+        self.position = 0
+
+    def read(self, size=-1):
+        end = len(self.view) if size is None or size < 0 else min(len(self.view), self.position + size)
+        chunk = bytes(self.view[self.position:end])
+        self.position = end
+        return chunk
+
+
 def repackage_guest_tools(candidates, sources, cohort):
-    """Copy this run's verified Linux payload before the Darwin signing boundary."""
+    """Copy this run's verified Linux payload before the Darwin signing boundary.
+
+    Payloads are memoryviews into each verified tar rather than copies: the
+    raclette guest has 4 GiB and no swap, and both platforms' tars are live at
+    once. Each tar is released as soon as its platform has been written.
+    """
     roots = {}
     directory_aliases = {}
     manifests = {}
@@ -364,22 +400,33 @@ def repackage_guest_tools(candidates, sources, cohort):
     for candidate in candidates:
         platform = candidate['platform']
         root = f'fleet-candidate-{platform}'
-        with tarfile.open(fileobj=io.BytesIO(candidate['archive']), mode='r:gz') as archive:
+        tar_bytes = candidate.pop('tar', None)
+        if tar_bytes is None:
+            tar_bytes = inflate_archive(candidate['archive'], platform)
+        view = memoryview(tar_bytes)
+        with tarfile.open(fileobj=validation.BufferFile(tar_bytes), mode='r:') as archive:
             members = validation.checked_archive_members(archive, root)
             contents = {}
             directory_aliases[platform] = [(member.name, member.bundle_directory_target) for member in members if getattr(member, "bundle_directory_target", None)]
             for member in members:
                 if member.isfile():
                     path = str(Path(member.name).relative_to(root))
-                    contents[path] = archive.extractfile(member).read()
+                    if member.issparse():
+                        contents[path] = archive.extractfile(member).read()
+                    else:
+                        contents[path] = view[member.offset_data:member.offset_data + member.size]
                     modes[(platform, path)] = member.mode
+        del view, tar_bytes, archive, members
         candidate.setdefault('native_candidate_sha256', hashlib.sha256(candidate['archive']).hexdigest())
-        manifest = json.loads(contents.pop('manifest.json'))
+        manifest = json.loads(bytes(contents.pop('manifest.json')))
         if manifest.get('guest_tools_cohort') != str(cohort):
             raise PromotionError(f'{platform}: candidate guest cohort differs from the verified Actions run')
         manifests[platform] = manifest
         roots[platform] = contents
     linux = roots['linux-x86_64-gnu2.36']
+    for path in [path for path in linux if path.startswith(validation.GUEST_PREFIX + '/')]:
+        # The guest payload outlives the Linux tar and is parsed as bytes.
+        linux[path] = bytes(linux[path])
     try:
         catalog = validation.validate_guest_tools(linux, sources, str(cohort), required=True)
     except ValueError as error:
@@ -410,7 +457,8 @@ def repackage_guest_tools(candidates, sources, cohort):
                              for path, content in sorted(contents.items())]
         contents['manifest.json'] = (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode()
         output = io.BytesIO()
-        with gzip.GzipFile(fileobj=output, mode='wb', mtime=0) as compressed, tarfile.open(fileobj=compressed, mode='w') as archive:
+        with gzip.GzipFile(fileobj=output, mode='wb', mtime=0, compresslevel=validation.ARCHIVE_GZIP_LEVEL) as compressed, \
+                tarfile.open(fileobj=compressed, mode='w') as archive:
             import posixpath
             for name, target in directory_aliases[platform]:
                 member = tarfile.TarInfo(name)
@@ -421,7 +469,11 @@ def repackage_guest_tools(candidates, sources, cohort):
                 member = tarfile.TarInfo(f'fleet-candidate-{platform}/{path}')
                 member.size = len(content)
                 member.mode = modes.get((platform, path), modes.get(('linux-x86_64-gnu2.36', path), 0o644))
-                archive.addfile(member, io.BytesIO(content))
+                archive.addfile(member, _ViewReader(memoryview(content)))
+        # Release this platform's tar before inflating the written archive.
+        del contents, content, roots[platform]
+        if platform == 'linux-x86_64-gnu2.36':
+            linux = native = None
         candidate['archive'] = output.getvalue()
         candidate['sha256'] = hashlib.sha256(candidate['archive']).hexdigest()
         candidate['size_bytes'] = len(candidate['archive'])
@@ -515,6 +567,15 @@ def build_generation_manifest(run, sources, candidates, generation):
     }
 
 
+def record_generation(path, generation):
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(generation + "\n")
+        temporary.replace(path)
+    except OSError as error:
+        raise PromotionError(f"promoted {generation} but cannot record it in {path}: {error}") from error
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Promote an exact Forgejo fleet-candidate run")
     parser.add_argument("run_id", type=int)
@@ -522,6 +583,10 @@ def parse_args():
     parser.add_argument("--read-token-file", required=True)
     parser.add_argument("--package-token-file", required=True)
     parser.add_argument("--package-username", required=True)
+    parser.add_argument(
+        "--record-generation-file",
+        help="after publishing, write the promoted generation's name here (read by the finalize chain)",
+    )
     return parser.parse_args()
 
 
@@ -559,6 +624,8 @@ def main():
                 authorization,
             )
     put_immutable(f"{package_root}/generation.json", generation_bytes, authorization)
+    if args.record_generation_file:
+        record_generation(Path(args.record_generation_file), generation)
     print(f"promoted {generation}")
 
 

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -84,6 +85,32 @@ def get_bytes(url, auth):
         raise FinalizationError(f"Forgejo GET {url} returned {error.code}") from error
     except (OSError, ValueError, urllib.error.URLError) as error:
         raise FinalizationError(f"Forgejo GET failed for {url}: {error}") from error
+
+
+def await_signature(url, auth, timeout, poll=5, clock=time.monotonic, sleep=time.sleep):
+    """Wait for the signer's completion marker, which it uploads last.
+
+    Only "not there yet" (404) waits; any other answer fails at once. A signing
+    failure never publishes the marker, so it surfaces here as the timeout.
+    """
+    deadline = clock() + timeout
+    while True:
+        request = urllib.request.Request(url, headers={"Authorization": auth})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                response.read(64 * 1024)
+                return
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise FinalizationError(f"signature probe {url} returned {error.code}") from error
+        except (OSError, urllib.error.URLError) as error:
+            raise FinalizationError(f"signature probe failed for {url}: {error}") from error
+        if clock() >= deadline:
+            raise FinalizationError(
+                f"no completed Darwin signature after {timeout} s at {url}; "
+                "see the signer's status on comte (~/.local/state/lab-darwin-sign/)"
+            )
+        sleep(poll)
 
 
 def put_immutable(url, content, auth):
@@ -539,7 +566,18 @@ def completed_generation(source_match, package_metadata, source_generation):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Verify and finalize one centrally signed Darwin generation")
-    parser.add_argument("source_generation")
+    parser.add_argument("source_generation", nargs="?")
+    parser.add_argument(
+        "--generation-file",
+        help="read the source generation from this file (written by lab-fleet-promote --record-generation-file)",
+    )
+    parser.add_argument(
+        "--await-signature",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help="wait up to SECONDS for the signer's completion marker before finalizing",
+    )
     parser.add_argument("--server-url", required=True)
     parser.add_argument("--read-token-file", required=True)
     parser.add_argument("--package-token-file", required=True)
@@ -548,7 +586,16 @@ def parse_args():
     parser.add_argument("--expected-identity", required=True)
     parser.add_argument("--expected-team-id", required=True)
     parser.add_argument("--expected-entitlements-file", required=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (args.source_generation is None) == (args.generation_file is None):
+        parser.error("give exactly one of source_generation or --generation-file")
+    if args.await_signature < 0:
+        parser.error("--await-signature must not be negative")
+    if args.generation_file is not None:
+        args.source_generation = read_file(args.generation_file, "generation file").decode(errors="replace").strip()
+    if not GENERATION_PATTERN.fullmatch(args.source_generation):
+        raise FinalizationError("source generation has an invalid format")
+    return args
 
 
 def main():
@@ -568,6 +615,8 @@ def main():
         f"{server}/api/v1/packages/{SIGNED_OWNER}/generic/{SIGNED_PACKAGE}/"
         f"{urllib.parse.quote(args.source_generation, safe='')}"
     )
+    if args.await_signature:
+        await_signature(f"{signed_root}/signed-generation.json", read_auth, args.await_signature)
     source_bytes = get_bytes(f"{source_root}/generation.json", read_auth)
     source_document = parse_json(source_bytes, "source generation")
     source_match, sources, protocol, linux, darwin = validate_source_generation(
