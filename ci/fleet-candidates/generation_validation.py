@@ -6,6 +6,7 @@ import contextlib
 import copy
 import datetime
 import hashlib
+import io
 import json
 import os
 import plistlib
@@ -19,6 +20,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import zlib
 from pathlib import Path, PurePosixPath
 from xml.parsers.expat import ExpatError
 
@@ -443,6 +445,77 @@ def produce_guest_tools(root, sources, cohort, layers):
 
 class ValidationError(ValueError):
     pass
+
+
+# Release archives are written at gzip level 6: level 9 costs about three times
+# the CPU for about 3% smaller output on these bundles.
+ARCHIVE_GZIP_LEVEL = 6
+
+
+def gunzip_bounded(data, limit, chunk=64 * 1024 * 1024):
+    """Inflate a whole gzip stream in one pass, refusing output beyond `limit`.
+
+    tarfile over an "r:gz" stream inflates again from the start on every
+    backwards seek, so callers that read members out of order decompress once
+    here and read the tar through BufferFile. The result is a bytearray grown a
+    chunk at a time, so the whole tar is never held twice. Concatenated members
+    and trailing zero padding are accepted, as gzip.GzipFile accepts them;
+    anything else after the stream, or a stream that ends early, is refused.
+    """
+    output = bytearray()
+    pending = data
+    members = 0
+    while pending:
+        inflater = zlib.decompressobj(wbits=31)
+        while True:
+            try:
+                piece = inflater.decompress(pending, min(chunk, limit + 1 - len(output)))
+            except zlib.error as error:
+                raise ValidationError(f"invalid gzip stream: {error}") from error
+            output += piece
+            if len(output) > limit:
+                raise ValidationError("gzip stream expands beyond the size limit")
+            pending = inflater.unconsumed_tail
+            if inflater.eof or not (pending or piece):
+                break
+        if not inflater.eof:
+            raise ValidationError("gzip stream is truncated")
+        members += 1
+        pending = inflater.unused_data.lstrip(b"\0")
+    if not members:
+        raise ValidationError("gzip stream is empty")
+    return output
+
+
+class BufferFile(io.RawIOBase):
+    """A seekable read-only file over a buffer, without copying it as BytesIO does."""
+
+    def __init__(self, buffer):
+        super().__init__()
+        self._view = memoryview(buffer)
+        self._position = 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def readinto(self, target):
+        count = min(len(target), max(0, len(self._view) - self._position))
+        target[:count] = self._view[self._position:self._position + count]
+        self._position += count
+        return count
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        base = {io.SEEK_SET: 0, io.SEEK_CUR: self._position, io.SEEK_END: len(self._view)}[whence]
+        if base + offset < 0:
+            raise ValueError("negative seek position")
+        self._position = base + offset
+        return self._position
+
+    def tell(self):
+        return self._position
 
 
 def require_sources(value):

@@ -59,6 +59,26 @@ before trusting candidate executables. Sync the installer and validator together
 keep the existing validator rollback rule: validate old releases without requiring
 payloads introduced by newer generations.
 
+### Release chain hooks
+
+The promoter, signer and finalizer each inflate an archive once and write
+gzip level 6 (`ARCHIVE_GZIP_LEVEL` in `generation_validation.py`). The digests
+recorded for a repackaged or signed archive are of the bytes written; the
+promoter inflates its output once more and inspects it before publishing.
+
+Two options let the hosts chain promote, sign and finalize without an operator
+(the units and the Comte follower live in project-map):
+
+- `lab-fleet-promote --record-generation-file PATH` writes the promoted
+  generation's name to PATH after `generation.json` is uploaded.
+- `lab-fleet-finalize-darwin --generation-file PATH` reads the source generation
+  from that file instead of the positional argument, and
+  `--await-signature SECONDS` waits up to SECONDS for the signer's
+  `signed-generation.json` (404 waits; any other answer fails at once; the
+  timeout fails naming the signer's status on Comte).
+
+Both are optional; the manual invocations are unchanged.
+
 ### Rolling out archive-link support (#3190)
 
 Before building/promoting a candidate that preserves terminfo aliases, sync in

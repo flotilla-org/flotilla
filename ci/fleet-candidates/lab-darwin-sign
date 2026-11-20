@@ -31,6 +31,8 @@ OWNER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
 SHA_PATTERN = validation.SHA_PATTERN
 DIGEST_PATTERN = validation.DIGEST_PATTERN
 MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
+# Bounds the inflated tar (payload plus headers) before it is parsed.
+MAX_TAR_BYTES = MAX_ARCHIVE_BYTES + 64 * 1024 * 1024
 INPUT_PACKAGE = "flotilla-fleet"
 OUTPUT_PACKAGE = "flotilla-fleet-darwin-signed"
 INPUT_OWNER = "lab"
@@ -305,8 +307,14 @@ def allowed_payload(path):
 
 
 def extract_verified_candidate(archive_bytes, stage, generation, sources, protocol):
+    # Inflate once: members are read in manifest order, not archive order, and
+    # every backwards seek on an "r:gz" stream inflates again from the start.
     try:
-        archive = tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz")
+        tar_bytes = validation.gunzip_bounded(archive_bytes, MAX_TAR_BYTES)
+    except validation.ValidationError as error:
+        raise SigningError(f"Darwin candidate is not a valid tar.gz archive: {error}") from error
+    try:
+        archive = tarfile.open(fileobj=validation.BufferFile(tar_bytes), mode="r:")
     except tarfile.TarError as error:
         raise SigningError("Darwin candidate is not a valid tar.gz archive") from error
     with archive:
@@ -582,7 +590,7 @@ def build_archive(stage):
             member.mtime = 0
             archive.addfile(member, io.BytesIO(content))
     output = io.BytesIO()
-    with gzip.GzipFile(filename="", fileobj=output, mode="wb", mtime=0) as compressed:
+    with gzip.GzipFile(filename="", fileobj=output, mode="wb", mtime=0, compresslevel=validation.ARCHIVE_GZIP_LEVEL) as compressed:
         compressed.write(tar_output.getvalue())
     return output.getvalue()
 
