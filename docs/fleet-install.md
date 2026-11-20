@@ -139,18 +139,17 @@ the live-store validation, the candidate validates the stores on disk with
 `flotilla --config-dir … --state-dir … resource validate --from-store`. This
 check:
 
-- decodes every record of `resources.sqlite`, own and replicated;
-- rehearses the engine import over exactly the rows the first start reads, at
-  the daemon's real node id;
-- runs the workflow-retirement preview, the frozen-reference check and the
-  skill catalog;
-- inspects every registered Project's operational entries in this host's
-  observation roots.
+- opens a copy of the engine store (`decided.sqlite`) with a daemon composed as
+  the candidate composes one, with none of its controllers, and reads it
+  through the resource API `--from-daemon` reads, so the checks are the same:
+  every record decoded, the workflow-retirement preview, the frozen-reference
+  check over the environments the store holds, the skill catalog, every
+  registered Project's operational entries in this host's observation roots,
+  and the bound charter inputs of manifest roots.
 
-Only an engine daemon serves bound charter inputs, so that one live check
-cannot run offline; the validator names any manifest roots it skipped. A state
-directory that already holds `decided.sqlite` is refused, because validating an
-engine store on disk is not built.
+The store on disk is only copied. A state directory with no `decided.sqlite`
+has nothing to check; one holding only the old `resources.sqlite` is refused,
+since the first start no longer imports it.
 
 After validation, `--offline` switches `current` and `previous`, writes the
 unit or launch agent and the Darwin `tcc` copies, records the roll, and does

@@ -602,8 +602,8 @@ pub enum ResourceSubCommand {
         /// Validate the running daemon's stored records using this binary's schema
         #[arg(long, group = "stored")]
         from_daemon: bool,
-        /// Validate a stopped daemon's stores on disk, in --state-dir, using this binary's schema:
-        /// the records and the engine import its first start would read
+        /// Validate a stopped daemon's engine store on disk, in --state-dir, using this binary's
+        /// schema: the same checks as --from-daemon, over a copy of the store
         #[arg(long, group = "stored", conflicts_with = "host")]
         from_store: bool,
         /// Resolve every CrewDefaults role and Project against this candidate skill catalog
