@@ -947,7 +947,6 @@ async fn acted_on_each_turn_once(fleet: &TestDaemon, name: &str) {
     assert_eq!(kept.len(), 1, "one change-request promise: {kept:?}");
 }
 
-/// Wall time moved forward by however much a test skips, so retry backoff passes at once.
 // Behaviour (#3824 layer 8b): a standing convoy whose
 // generation fails three times is held, and the hold is an attention from the standing
 // role in its project's operator inbox. The person sees it in `message inbox`;

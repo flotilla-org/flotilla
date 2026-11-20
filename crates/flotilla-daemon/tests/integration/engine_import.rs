@@ -847,7 +847,6 @@ async fn an_imported_live_crew_keeps_its_checkout_and_its_convoy() {
         .wait::<Vessel>("the vessel holding its imported checkout and session", |held| {
             held.status.as_ref().is_some_and(|status| status.terminal_session_refs == [session.clone()] && !status.checkout_refs.is_empty())
         })
-        .within(Duration::from_secs(30))
         .await;
     // A few of the controllers' passes: nothing ends, and nothing is asked for beside what it had.
     tokio::time::sleep(Duration::from_secs(3)).await;

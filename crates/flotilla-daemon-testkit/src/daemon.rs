@@ -502,7 +502,7 @@ impl TestDaemon {
     /// watch of them streams, and each one's last state again at every change the fleet records
     /// (`done` may read [`Self::counts`]). It fails with every `T`'s last state.
     pub fn wait<'a, T: Resource>(&'a self, what: &'a str, done: impl Fn(&ResourceObject<T>) -> bool + 'a) -> Wait<'a, ResourceObject<T>> {
-        Wait::new(WAIT, async move |deadline| {
+        Wait::new(async move |deadline| {
             let mut recorded = self.fleet.changes();
             let mut watch = watch_kind::<T>(&self.operator.resources).await;
             // Each `T` by name, as last read: one that ended and retired keeps how it ended.
@@ -537,7 +537,6 @@ impl TestDaemon {
                         }
                         // An ended watch opens again, and every `T` is read anew.
                         Ok(None) | Err(_) => {
-                            tokio::time::sleep(HARNESS_RESYNC).await;
                             watch = watch_kind::<T>(&self.operator.resources).await;
                             for item in self.every::<T>().await {
                                 last.insert(item.metadata.name.clone(), item);
@@ -555,7 +554,7 @@ impl TestDaemon {
 
     /// Wait until the `T` named `name` is gone.
     pub fn wait_gone<'a, T: Resource>(&'a self, name: &'a str) -> Wait<'a, ()> {
-        Wait::new(WAIT, async move |deadline| {
+        Wait::new(async move |deadline| {
             let mut changes = self.changes().kind::<T>().await;
             loop {
                 let Some(last) = self.get::<T>(name).await else { return };
@@ -570,7 +569,7 @@ impl TestDaemon {
     /// `done`, subscribing to it as a client does. The wait fails with the
     /// last result set.
     pub fn wait_query<'a>(&'a self, query: QueryId, done: impl Fn(&ResultSet) -> bool + 'a) -> Wait<'a, ResultSet> {
-        Wait::new(WAIT, async move |deadline| {
+        Wait::new(async move |deadline| {
             let mut events = self.operator.client.subscribe();
             let mut last = self.result_set(&query).await;
             loop {
@@ -679,7 +678,7 @@ impl TestDaemon {
     /// `done`, and return it. It reads again at each change the table's watch streams and each
     /// change the fleet records, and fails with the table's last rows.
     pub fn wait_row<'a>(&'a self, what: &'a str, table: &'a str, condition: &'a str, done: impl Fn(&Row) -> bool + 'a) -> Wait<'a, Row> {
-        Wait::new(WAIT, async move |deadline| {
+        Wait::new(async move |deadline| {
             let mut changes = self.changes().table(table).await;
             loop {
                 let mut rows = self.rows(table, condition).await;
@@ -700,7 +699,7 @@ impl TestDaemon {
     /// gains changes its rows, and fails with the held rows and the log's last entries.
     pub fn wait_reached<'a>(&'a self, what: &'a str, table: &'a str, state: &'a str, held: impl Fn(&Row) -> bool + 'a) -> Wait<'a, Row> {
         let name = |row: &Row| row.get("resource.name").or_else(|| row.get("name")).and_then(serde_json::Value::as_str).map(str::to_owned);
-        Wait::new(WAIT, async move |deadline| {
+        Wait::new(async move |deadline| {
             let mut changes = self.changes().table(table).await;
             loop {
                 let mut rows: Vec<Row> = self.rows(table, "").await.into_iter().filter(&held).collect();
@@ -912,9 +911,7 @@ impl<'a> ChangesBuilder<'a> {
         let wakes = futures::stream::unfold((resources, watched), |(resources, mut watched)| async move {
             loop {
                 let Some(watch) = watched.as_mut() else {
-                    // An ended watch opens again after a resync's wait, and its opening reads anew
-                    // what changed between.
-                    tokio::time::sleep(HARNESS_RESYNC).await;
+                    // An ended watch opens again, and its opening reads anew what changed between.
                     watched = Some(watch_kind::<T>(&resources).await?);
                     return Some(((), (resources, watched)));
                 };
@@ -989,19 +986,11 @@ type WaitFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> +
 
 pub struct Wait<'a, T> {
     run: Box<dyn FnOnce(tokio::time::Instant) -> WaitFuture<'a, T> + 'a>,
-    within: Duration,
 }
 
 impl<'a, T: 'a> Wait<'a, T> {
-    fn new(within: Duration, run: impl AsyncFnOnce(tokio::time::Instant) -> T + 'a) -> Self {
-        Self { run: Box::new(move |deadline| Box::pin(run(deadline))), within }
-    }
-
-    /// Waits up to `within` of virtual time instead: for a scenario whose deadline lies beyond
-    /// the usual wait.
-    pub fn within(mut self, within: Duration) -> Self {
-        self.within = within;
-        self
+    fn new(run: impl AsyncFnOnce(tokio::time::Instant) -> T + 'a) -> Self {
+        Self { run: Box::new(move |deadline| Box::pin(run(deadline))) }
     }
 }
 
@@ -1010,7 +999,7 @@ impl<'a, T: 'a> std::future::IntoFuture for Wait<'a, T> {
     type IntoFuture = WaitFuture<'a, T>;
 
     fn into_future(self) -> Self::IntoFuture {
-        (self.run)(tokio::time::Instant::now() + self.within)
+        (self.run)(tokio::time::Instant::now() + WAIT)
     }
 }
 

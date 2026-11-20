@@ -169,7 +169,6 @@ async fn the_aides_role_passes_to_its_relaunch(restart: bool) {
                 && found.status.as_ref().is_some_and(|status| status.stalled.is_some() || status.phase == ConvoyPhase::Landed)
                 && daemon.counts().sessions_launched == 3
         })
-        .within(std::time::Duration::from_secs(120))
         .await;
     if waiting.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed) {
         return;
@@ -258,10 +257,7 @@ async fn a_crew_members_row_goes_stale_at_its_deadline_once_its_home_is_unheard(
     drop(peering);
     // The last keepalive it heard came at most one held round before the drop.
     let dropped = now();
-    let stale = b
-        .wait_query(QueryId::Convoys { scope: None }, |set| reading(set).is_some_and(|reading| reading.stale))
-        .within(std::time::Duration::from_secs(300))
-        .await;
+    let stale = b.wait_query(QueryId::Convoys { scope: None }, |set| reading(set).is_some_and(|reading| reading.stale)).await;
     let stale_after = now() - dropped;
     assert!(
         stale_after <= HOME_HEARD_WITHIN && stale_after > HOME_HEARD_WITHIN - chrono::Duration::seconds(15),

@@ -4,12 +4,6 @@ use chrono::{DateTime, Utc};
 /// deterministic under test.
 pub trait Clock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
-
-    /// Signals each time the clock moves other than by elapsing, so a wait for a deadline measured
-    /// on it measures again. `None` for a clock that only elapses.
-    fn jumps(&self) -> Option<tokio::sync::watch::Receiver<()>> {
-        None
-    }
 }
 
 /// The wall clock, as the async runtime measures time: [`now`].

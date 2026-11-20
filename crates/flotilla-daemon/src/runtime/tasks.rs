@@ -1129,7 +1129,6 @@ pub(super) fn spawn_convoy_ensure_reconciler_task(
         };
         let mut dependency_events = dependencies().await;
         let clock = state.daemon.clock_for_scenarios();
-        let mut jumps = clock.jumps();
         let mut failures = 0_u32;
         let mut watch_failures = 0_u32;
         loop {
@@ -1165,43 +1164,34 @@ pub(super) fn spawn_convoy_ensure_reconciler_task(
                 None
             });
             let mut restart_watches = dependency_events.is_empty();
-            loop {
-                // Measured on the daemon's clock, again whenever that clock jumps.
-                let due_wait = due.map(|due| (due - clock.now()).to_std().unwrap_or_default());
-                tokio::select! {
-                    _ = tokio::time::sleep_until(retry.unwrap_or_else(tokio::time::Instant::now)), if retry.is_some() => {}
-                    _ = tokio::time::sleep(due_wait.unwrap_or_default()), if due_wait.is_some() => {}
-                    jumped = async { jumps.as_mut().expect("guarded").changed().await }, if jumps.is_some() && due.is_some() => {
-                        if jumped.is_err() {
-                            jumps = None;
-                        }
-                        continue;
+            // Measured on the daemon's clock.
+            let due_wait = due.map(|due| (due - clock.now()).to_std().unwrap_or_default());
+            tokio::select! {
+                _ = tokio::time::sleep_until(retry.unwrap_or_else(tokio::time::Instant::now)), if retry.is_some() => {}
+                _ = tokio::time::sleep(due_wait.unwrap_or_default()), if due_wait.is_some() => {}
+                event = dependency_events.next(), if !dependency_events.is_empty() => {
+                    if let Some(Err(error)) = event {
+                        warn!(%error, "standing convoy admission dependency watch failed");
+                        restart_watches = true;
                     }
-                    event = dependency_events.next(), if !dependency_events.is_empty() => {
-                        if let Some(Err(error)) = event {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    while let Some(Some(event)) = dependency_events.next().now_or_never() {
+                        if let Err(error) = event {
                             warn!(%error, "standing convoy admission dependency watch failed");
                             restart_watches = true;
                         }
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        while let Some(Some(event)) = dependency_events.next().now_or_never() {
-                            if let Err(error) = event {
-                                warn!(%error, "standing convoy admission dependency watch failed");
-                                restart_watches = true;
-                            }
-                        }
-                        // A change revives a pass that gave up.
-                        if failures >= CONVOY_ENSURE_RETRY_LIMIT {
-                            failures = 0;
-                        }
                     }
-                    else => {
-                        // Every dependency stream ended: re-arm them, paced.
-                        watch_failures = watch_failures.saturating_add(1);
-                        tokio::time::sleep(CONVOY_ENSURE_RETRY.delay(watch_failures)).await;
-                        restart_watches = true;
+                    // A change revives a pass that gave up.
+                    if failures >= CONVOY_ENSURE_RETRY_LIMIT {
+                        failures = 0;
                     }
                 }
-                break;
+                else => {
+                    // Every dependency stream ended: re-arm them, paced.
+                    watch_failures = watch_failures.saturating_add(1);
+                    tokio::time::sleep(CONVOY_ENSURE_RETRY.delay(watch_failures)).await;
+                    restart_watches = true;
+                }
             }
             if restart_watches {
                 // Reconciliation is level-triggered; re-arm dependencies
