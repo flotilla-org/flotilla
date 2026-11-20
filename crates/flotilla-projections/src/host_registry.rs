@@ -393,10 +393,6 @@ impl HostRegistry {
         self.sync_host_membership(counts, emit).await;
     }
 
-    pub async fn has_resource_description(&self, environment_id: &EnvironmentId) -> bool {
-        self.query_details.read().await.get(environment_id).is_some_and(|details| details.visible_environments.is_some())
-    }
-
     async fn remove_host_presentation(&self, environment_id: &EnvironmentId, emit: &impl Fn(DaemonEvent)) {
         let mut environments = self.node_environments.write().await;
         let mut hosts = self.hosts.write().await;
