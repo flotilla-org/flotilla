@@ -43,6 +43,26 @@ pub enum ConvoyEnd {
     Abandoned { reason: String },
 }
 
+/// That a launch ended, and how and when where this store holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ending {
+    /// How and when it ended: from its state, or from its end edge's log entry once it retired.
+    Held(ConvoyEnd, DateTime<Utc>),
+    /// It retired, so it ended; the log entry saying how and when is not held here (a replica
+    /// restored from a snapshot taken after the end).
+    NotHeld,
+}
+
+impl Ending {
+    /// How and when it ended, where held here.
+    pub fn held(&self) -> Option<(&ConvoyEnd, DateTime<Utc>)> {
+        match self {
+            Self::Held(end, at) => Some((end, *at)),
+            Self::NotHeld => None,
+        }
+    }
+}
+
 /// One seat as the launch records it, by its old crew `(work, role)`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SeatRecord {
@@ -83,10 +103,10 @@ pub struct ConvoyRecord {
     pub admission: AdmissionDocument,
     /// When it was admitted: its creation's log time.
     pub admitted_at: DateTime<Utc>,
-    /// How and when it ended; none while it is open.
-    pub ended: Option<(ConvoyEnd, DateTime<Utc>)>,
+    /// That it ended, and how and when where held here; none while it is open.
+    pub ended: Option<Ending>,
     /// It retired: nothing holds it any more, and how it ended is read from its end edge's log
-    /// entry.
+    /// entry, where this store holds it.
     pub retired: bool,
     /// Its seats by work, then role.
     pub seats: BTreeMap<String, BTreeMap<String, SeatRecord>>,
@@ -365,12 +385,21 @@ impl ConvoyRecord {
         view::derive(&ConvoyFacts { ended: self.end(), snapshot, vessels: &vessels, crew: &crew }).phase.is_terminal()
     }
 
+    /// A view's message for a launch that ended where how it ended is not held here.
+    pub const END_NOT_HELD: &'static str = "retired; the log entry of how it ended is not held here";
+
     fn end(&self) -> Option<Ended> {
-        self.ended.as_ref().map(|(end, _)| match end {
-            ConvoyEnd::Delivered { .. } => Ended::Delivered,
-            ConvoyEnd::Failed { .. } => Ended::Failed,
-            ConvoyEnd::Abandoned { .. } => Ended::Abandoned,
+        self.ended.as_ref().map(|ending| match ending {
+            Ending::Held(ConvoyEnd::Delivered { .. }, _) => Ended::Delivered,
+            Ending::Held(ConvoyEnd::Failed { .. }, _) => Ended::Failed,
+            Ending::Held(ConvoyEnd::Abandoned { .. }, _) => Ended::Abandoned,
+            Ending::NotHeld => Ended::NotHeld,
         })
+    }
+
+    /// How and when it ended, where held here.
+    fn held_end(&self) -> Option<(&ConvoyEnd, DateTime<Utc>)> {
+        self.ended.as_ref().and_then(Ending::held)
     }
 
     /// Each seat's reading. A seat is stalled while a stall is raised about it: replicated as its
@@ -427,7 +456,7 @@ impl ConvoyRecord {
         let vessels: BTreeMap<String, VesselReading> = joins.works.iter().map(|(work, facts)| (work.clone(), facts.reading)).collect();
         let derived = view::derive(&ConvoyFacts { ended: self.end(), snapshot, vessels: &vessels, crew: &readings });
         let notes = joins.notes.cloned().unwrap_or_default();
-        let finished_at = self.ended.as_ref().map(|(_, at)| *at);
+        let finished_at = self.held_end().map(|(_, at)| at);
 
         let work = derived
             .work
@@ -467,7 +496,7 @@ impl ConvoyRecord {
                         // ended; a stalled seat gives the report its crew made, as this home noted it
                         // or as its stall record carries it.
                         let message = match phase {
-                            CrewWorkPhase::Ended => self.ended.as_ref().map(|(end, _)| match end {
+                            CrewWorkPhase::Ended => self.held_end().map(|(end, _)| match end {
                                 ConvoyEnd::Delivered { disposition } => disposition.clone(),
                                 ConvoyEnd::Failed { reason } | ConvoyEnd::Abandoned { reason } => reason.clone(),
                             }),
@@ -500,9 +529,10 @@ impl ConvoyRecord {
             })
             .collect();
 
-        let (disposition, message) = match self.ended.as_ref().map(|(end, _)| end) {
-            Some(ConvoyEnd::Delivered { disposition }) => (Some(disposition.clone()), None),
-            Some(ConvoyEnd::Failed { reason } | ConvoyEnd::Abandoned { reason }) => (None, Some(reason.clone())),
+        let (disposition, message) = match &self.ended {
+            Some(Ending::Held(ConvoyEnd::Delivered { disposition }, _)) => (Some(disposition.clone()), None),
+            Some(Ending::Held(ConvoyEnd::Failed { reason } | ConvoyEnd::Abandoned { reason }, _)) => (None, Some(reason.clone())),
+            Some(Ending::NotHeld) => (None, Some(Self::END_NOT_HELD.to_owned())),
             None => (None, None),
         };
         let status = ConvoyStatus {

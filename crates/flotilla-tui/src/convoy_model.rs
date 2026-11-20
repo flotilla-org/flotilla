@@ -57,6 +57,8 @@ pub enum ConvoyPhase {
     Landed,
     Failed,
     Abandoned,
+    /// Ended, how not held here.
+    Ended,
 }
 
 impl From<wire::ConvoyPhase> for ConvoyPhase {
@@ -69,13 +71,14 @@ impl From<wire::ConvoyPhase> for ConvoyPhase {
             wire::ConvoyPhase::Landed => Self::Landed,
             wire::ConvoyPhase::Failed => Self::Failed,
             wire::ConvoyPhase::Abandoned => Self::Abandoned,
+            wire::ConvoyPhase::Ended => Self::Ended,
         }
     }
 }
 
 impl ConvoyPhase {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Landed | Self::Failed | Self::Abandoned)
+        matches!(self, Self::Landed | Self::Failed | Self::Abandoned | Self::Ended)
     }
 
     pub fn label(self) -> &'static str {
@@ -87,6 +90,7 @@ impl ConvoyPhase {
             Self::Landed => "landed",
             Self::Failed => "failed",
             Self::Abandoned => "abandoned",
+            Self::Ended => "ended",
         }
     }
 }

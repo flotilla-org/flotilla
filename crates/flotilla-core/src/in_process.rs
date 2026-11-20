@@ -697,7 +697,8 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
         | flotilla_resources::ConvoyPhase::Interrupted
         | flotilla_resources::ConvoyPhase::Landing
         | flotilla_resources::ConvoyPhase::Landed
-        | flotilla_resources::ConvoyPhase::Abandoned => None,
+        | flotilla_resources::ConvoyPhase::Abandoned
+        | flotilla_resources::ConvoyPhase::Ended => None,
     }
 }
 
@@ -3984,6 +3985,7 @@ impl InProcessDaemon {
             flotilla_resources::ConvoyPhase::Landed => "landed",
             flotilla_resources::ConvoyPhase::Failed => "failed",
             flotilla_resources::ConvoyPhase::Abandoned => "abandoned",
+            flotilla_resources::ConvoyPhase::Ended => "ended",
         };
         let detail = convoy.status.as_ref().and_then(|status| status.message.as_deref());
         if stages.is_empty() {

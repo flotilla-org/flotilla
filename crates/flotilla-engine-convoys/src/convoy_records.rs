@@ -18,8 +18,8 @@ use flotilla_resources::{
     address::subject_for,
     convoy::{admission::AdmissionDocument, engine::seat_address},
     convoy_records::{
-        several_projects, ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords, LaunchHolds, SeatRecord,
-        UnreadableLaunch,
+        several_projects, ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords, Ending, LaunchHolds,
+        SeatRecord, UnreadableLaunch,
     },
     lifecycle_reads::{ChangeCursor, CursorSince},
     promises::SubmissionVerdict,
@@ -485,14 +485,16 @@ fn entry(
     retired: Retired,
 ) -> Result<Option<Result<ConvoyRecord, UnreadableLaunch>>, StoreError> {
     let Loaded { id, home, version, value: convoy, .. } = loaded;
+    let held = |end: ConvoyEnd, at: Timestamp| Some(Ending::Held(end, time(at)));
     let ended = match convoy.state() {
         ConvoyState::Open { .. } => None,
-        ConvoyState::Delivered { disposition, .. } => Some((ConvoyEnd::Delivered { disposition: disposition.clone() }, convoy.since())),
-        ConvoyState::Abandoned { cause, reason, .. } => Some((end_of(*cause, reason.clone()), convoy.since())),
+        ConvoyState::Delivered { disposition, .. } => held(ConvoyEnd::Delivered { disposition: disposition.clone() }, convoy.since()),
+        ConvoyState::Abandoned { cause, reason, .. } => held(end_of(*cause, reason.clone()), convoy.since()),
         ConvoyState::Retired if retired == Retired::Skip => return Ok(None),
-        ConvoyState::Retired => end_entry(read, id, &home)?,
-    }
-    .map(|(end, at)| (end, time(at)));
+        // Retired is ended. A replica restored from a snapshot taken after the end may not hold
+        // the entry saying how: it reads as ended, how not held here.
+        ConvoyState::Retired => Some(end_entry(read, id, &home)?.map_or(Ending::NotHeld, |(end, at)| Ending::Held(end, time(at)))),
+    };
     let is_retired = matches!(convoy.state(), ConvoyState::Retired);
     let home = home.as_str();
     let spec = convoy.spec();
@@ -508,10 +510,6 @@ fn entry(
         created_at: admitted_at,
         reason,
     };
-    if is_retired && ended.is_none() {
-        // A replica restored from a snapshot taken after the end does not hold its entry.
-        return Ok(Some(Err(unreadable(format!("convoy {} retired, and the log entry of its end is not held here", convoy.name())))));
-    }
     let admission = match AdmissionDocument::decode(convoy.name(), spec.admission.value().bytes()) {
         Ok(admission) => admission,
         Err(error) => return Ok(Some(Err(unreadable(format!("convoy {}'s admission: {error}", convoy.name()))))),
