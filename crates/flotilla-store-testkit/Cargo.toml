@@ -11,7 +11,6 @@ skip-no-sandbox-tests = []
 
 [dependencies]
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
-flotilla-store-http = { path = "../flotilla-store-http" }
 flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-protocol = { path = "../flotilla-protocol" }
@@ -30,15 +29,10 @@ flotilla-resources = { path = "../flotilla-resources" }
 workspace = true
 
 [dev-dependencies]
-url = "2"
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 tracing.workspace = true
 rusqlite = { version = "0.37", features = ["bundled", "functions"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
-flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
 serde_yml = "0.0.12"
-rigging-tls = { workspace = true }
-reqwest = { workspace = true, features = ["json", "stream"] }
 hegeltest = "=0.48.1"
 rstest.workspace = true
 tempfile = "3"

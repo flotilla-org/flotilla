@@ -145,7 +145,7 @@ impl IssueRefresher {
         self.inner.cadence.stale_after
     }
 
-    /// The engine's observation records, which composition installs behind `[primitives]`.
+    /// The engine's observation records, which composition installs.
     pub fn engine(&self) -> &EngineObservers {
         &self.inner.engine
     }

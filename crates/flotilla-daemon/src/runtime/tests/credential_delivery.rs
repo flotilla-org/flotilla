@@ -1375,7 +1375,7 @@ async fn a_convoy_change_refreshes_no_card() {
         source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
         id: "1".into(),
     };
-    let path = cards.daemon.convoy_engine_path().get().cloned().expect("the Convoy path");
+    let path = cards.daemon.convoy_engine_path();
     path.link(&convoy, &subject, flotilla_resources::SubjectDiscoverySource::Operator, "operator").await.expect("link a subject");
     let linked = cards.daemon.resource_backend().using::<Convoy>(NAMESPACE).get(&cards.convoys[0]).await.expect("convoy");
     assert_ne!(linked.metadata.resource_version, convoy.metadata.resource_version, "the convoy changed");

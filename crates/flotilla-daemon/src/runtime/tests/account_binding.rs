@@ -53,7 +53,7 @@ async fn queued_by_grants(daemon: &InProcessDaemon, queued: &mut UnboundedReceiv
 /// Ends convoy launch `convoy` at `daemon`'s home, as an operator's abandon ends it.
 async fn end_convoy(daemon: &InProcessDaemon, convoy: &str) {
     let view = daemon.resource_backend().using::<Convoy>(NAMESPACE).get(convoy).await.expect("convoy");
-    let engine = daemon.convoy_engine_path().get().cloned().expect("the Convoy path");
+    let engine = daemon.convoy_engine_path();
     engine.abandon(&view, "operator", "ended").await.expect("convoy ended");
 }
 

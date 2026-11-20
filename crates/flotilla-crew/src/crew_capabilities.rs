@@ -15,7 +15,7 @@ use flotilla_resources::terminal_records::{newest_launches, TerminalRecord};
 use flotilla_resources::vessel_records::VesselRecord;
 use flotilla_resources::{
     message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, MessageRelation,
-    ResourceError, ResourceObject, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
+    ResourceObject, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
 };
 use flotilla_store::{load_metrics::carry, ResourceBackend};
 use sha2::{Digest, Sha256};
@@ -357,8 +357,7 @@ pub fn card_delta(previous: &str, current: &str) -> String {
 
 /// Ephemeral baselines preserve stored resource shapes. Pending snapshots survive
 /// annotation CAS retries; delivery evidence advances the agent's delta baseline.
-/// It publishes through the Message path installed at startup.
-#[derive(Default)]
+/// It publishes through the engine's Messages.
 pub struct CapabilityCardTracker(
     Mutex<BTreeMap<(String, String), SessionCardObservation>>,
     crate::ports::MessagePath,
@@ -441,7 +440,7 @@ impl<V: PartialEq> ReadIndex<V> {
 }
 
 impl CapabilityCardTracker {
-    /// A tracker publishing through `path` (the composition root's slot).
+    /// A tracker publishing through `path`.
     pub fn with_message_path(path: crate::ports::MessagePath) -> Self {
         Self(Mutex::default(), path, std::sync::Mutex::default(), std::sync::Mutex::default())
     }
@@ -474,8 +473,8 @@ impl CapabilityCardTracker {
         self.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(namespace.to_owned()).or_default().insert(session.to_owned());
     }
 
-    fn primitives(&self) -> Result<Arc<dyn flotilla_messaging::EngineMessages>, ResourceError> {
-        crate::ports::installed_messages(&self.1)
+    fn primitives(&self) -> Arc<dyn flotilla_messaging::EngineMessages> {
+        Arc::clone(&self.1)
     }
 
     async fn observation(&self, namespace: &str, session: &str) -> SessionCardObservation {
@@ -553,12 +552,7 @@ async fn observe(
     let mut retired = Vec::new();
     let pending = observation.pending.clone();
     let named: Vec<_> = pending.values().map(|(name, _)| (receiver.clone(), name.clone())).collect();
-    let sent = tracker
-        .primitives()
-        .map_err(|error| error.to_string())?
-        .sent_messages(namespace, &named)
-        .await
-        .map_err(|error| error.to_string())?;
+    let sent = tracker.primitives().sent_messages(namespace, &named).await.map_err(|error| error.to_string())?;
     for (revision, (name, snapshot)) in &pending {
         let Some(message) = sent.iter().find(|message| message.standing.name == *name) else {
             // An audit record can be reaped before the next capability change.
@@ -610,7 +604,7 @@ async fn publish_card_revision(
     tracker: &CapabilityCardTracker,
 ) -> Result<(String, String), String> {
     let inbox = flotilla_resources::convoy::engine::role_inbox(receiver)?;
-    let primitives = tracker.primitives().map_err(|error| error.to_string())?;
+    let primitives = tracker.primitives();
     let sender = primitives.fleet_role(namespace, "capabilities").await.map_err(|error| error.to_string())?;
     let name = message_record_name(inbox.as_str(), sender.as_str(), &format!("{}:capabilities@{revision}", session.metadata.name));
     let supersedes = match supersedes {

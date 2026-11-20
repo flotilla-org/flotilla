@@ -1,4 +1,4 @@
-//! The cut-over import: the first start with `[primitives]` on and no engine store fills the
+//! The cut-over import: the first start with no engine store fills the
 //! engine store from the old one.
 //!
 //! [`first_start`] reads `resources.sqlite` read-only, imports into `decided.sqlite.importing`
@@ -666,7 +666,7 @@ fn log_summary(summary: &Summary, report: &Path) {
     tracing::info!(report = %report.display(), refused = summary.refusals.len(), "engine import report written");
 }
 
-/// The cut-over import at a daemon's start with `[primitives]` on, homed at `home` and describing
+/// The cut-over import at a daemon's start, homed at `home` and describing
 /// `own_host`: when
 /// `state_dir` holds an old store and no engine store, imports the old store into a new engine
 /// store, writes the report, and puts the engine store in place only if nothing was refused. A
@@ -682,7 +682,7 @@ pub fn first_start(state_dir: &Path, home: &str, own_host: Option<&str>) -> Resu
     }
     let importing = state_dir.join(IMPORTING);
     remove_store(&importing)?;
-    tracing::info!(source = %old.display(), target = %importing.display(), home, "engine import: first start with [primitives]");
+    tracing::info!(source = %old.display(), target = %importing.display(), home, "engine import: first start with no engine store");
     let source = Source::read(&old, home)?.with_own_host(own_host.map(str::to_owned));
     let registry = crate::runtime::decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
     let (summary, last_sequence) = {

@@ -32,21 +32,21 @@ RESOURCE_EXEMPTIONS = frozenset({
 # higher orchestration through ports. Register each new capability here.
 CAPABILITY_CRATES = frozenset({"flotilla-executor", "flotilla-projections", "flotilla-admission", "flotilla-provisioning", "flotilla-crew"})
 CAPABILITY_FORBIDDEN = (
-    "flotilla-core", "flotilla-daemon", "flotilla-controllers",
+    "flotilla-core", "flotilla-daemon",
     "flotilla-credentials",
 )
 # #3524: discovery owns EnvironmentManager and the Environments and EnvironmentLifecycle
 # ports. Capability crates and hosts consume them; discovery never reaches back.
 DISCOVERY = "flotilla-discovery"
 DISCOVERY_FORBIDDEN = (
-    "flotilla-core", "flotilla-credentials", "flotilla-controllers", "flotilla-daemon",
+    "flotilla-core", "flotilla-credentials", "flotilla-daemon",
     "flotilla-store", "flotilla-observation", *sorted(CAPABILITY_CRATES),
 )
 # #2951 ruling 2, #3545: the harness connector contract holds traits and value types only.
 # It never reaches resource types or a store, so connectors stay below the store stack.
 AGENT_CONNECTOR = "flotilla-agent-connector"
 AGENT_CONNECTOR_FORBIDDEN = (
-    "flotilla-resources", "flotilla-store", "flotilla-store-memory", "flotilla-store-sqlite", "flotilla-store-http",
+    "flotilla-resources", "flotilla-store", "flotilla-store-memory", "flotilla-store-sqlite",
     "flotilla-engine-store", "flotilla-schema-sqlite",
 )
 # #2951 ruling 6: terminal adapters speak terminal values, not resource records.
@@ -61,13 +61,13 @@ SCHEMA_CRATES = ("flotilla-schema-derive", "flotilla-schema", "flotilla-schema-s
 SCHEMA_ALLOWED = ("flotilla-address", "flotilla-cbor", "rigging-condition")
 # ADR 0064, #3320 ruling 3: the state-machine engine is backend-free. In production it
 # reaches only flotilla-schema (its code enums, records, timestamps and edge events) and
-# what flotilla-schema may reach, and no production crate depends on it until the stack
-# that adds the composition-root switch names its dependents here.
+# what flotilla-schema may reach, and no production crate depends on it unless it is named
+# among its dependents here.
 STATE_MACHINES = "flotilla-state-machines"
 STATE_MACHINES_ALLOWED = ("flotilla-schema", "flotilla-schema-derive", *SCHEMA_ALLOWED)
 STATE_MACHINE_DEPENDENTS = frozenset({
     "flotilla-engine-store", "flotilla-inbox", "flotilla-inbox-testkit", "flotilla-quint-testkit",
-    # #3317: the composition root and its Message path, behind `[primitives]`.
+    # #3317: the composition root and its Message path.
     "flotilla-core", "flotilla-daemon", "flotilla-engine-messages",
     # Dev-only: tests drive the real engine Message path.
     "flotilla-engine-messages-testkit",
@@ -80,7 +80,7 @@ STATE_MACHINE_DEPENDENTS = frozenset({
     # #3108: Convoy on the engine, below the composition root so crew and testkits can seed launches.
     "flotilla-engine-convoys",
 })
-# #3317: the Message switch composes the engine inbox; only these use it directly.
+# #3317: the Message engine composes the engine inbox; only these use it directly.
 INBOX_DEPENDENTS = frozenset({"flotilla-daemon", "flotilla-engine-messages"})
 # #3108: the engine Message path sits beside the capabilities, below the composition root;
 # crew takes it only as a dev-dependency for its tests.
@@ -189,7 +189,7 @@ def violations(metadata):
         errors.append("flotilla-client: must not depend on flotilla-core, directly or transitively")
     for component in ("flotilla-config", "flotilla-provider-runtime", "flotilla-discovery-api", "flotilla-vcs", "flotilla-environment", "flotilla-terminal", "flotilla-cloud-agent", "flotilla-ai-utility", "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-change-request", "flotilla-issue-tracker", "flotilla-agent", "flotilla-dummy-fleet", "flotilla-charter"):
         for target in ("flotilla-core", "flotilla-credentials",
-                       "flotilla-controllers", "flotilla-daemon", "flotilla-store", "flotilla-observation", *sorted(CAPABILITY_CRATES)):
+                       "flotilla-daemon", "flotilla-store", "flotilla-observation", *sorted(CAPABILITY_CRATES)):
             if component in packages and target in packages and reaches(component, target):
                 errors.append(f"{component}: must not depend on {target}, directly or transitively")
     for target in AGENT_CONNECTOR_FORBIDDEN:
@@ -266,13 +266,13 @@ def violations(metadata):
                               "flotilla-build-features anchors)")
         for name in sorted(packages):
             if name != STATE_MACHINES and STATE_MACHINES in production[name] and name not in STATE_MACHINE_DEPENDENTS:
-                errors.append(f"{name}: production dependency on {STATE_MACHINES} before the composition-root switch")
-    # #3316/#3317: the contract backend is composed only behind the Message
-    # switch, by the composition crates. Testkits are dev-only callers.
+                errors.append(f"{name}: production dependency on {STATE_MACHINES} outside its named dependents")
+    # #3316/#3317: the contract backend is composed only by the Message engine's
+    # composition crates. Testkits are dev-only callers.
     if "flotilla-inbox" in packages:
         for name in sorted(packages):
             if name not in INBOX_DEPENDENTS and not is_testkit(name) and "flotilla-inbox" in production[name]:
-                errors.append(f"{name}: production dependency on flotilla-inbox outside the Message switch's composition")
+                errors.append(f"{name}: production dependency on flotilla-inbox outside the Message engine's composition")
     for name, package in sorted(packages.items()):
         # A dev-only testkit may depend on the library it tests, closing a
         # Cargo dev cycle without introducing an upward production edge.

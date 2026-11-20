@@ -1,24 +1,21 @@
-//! The `[primitives]` switch's Convoy path, as old-store code reaches it
+//! The engine's Convoys, as the code that still speaks the old shape reaches them
 //! (#3587 layer 6).
 //!
-//! With the switch on, the engine Convoy decides (owner ruling, 2026-10-22,
-//! layer 6 question 1): crew verbs and observers write the engine through
-//! [`EngineConvoys`] and return its refusals. Readers see a convoy through
-//! [`viewed_read`] (layer 8): the engine's promises in the old shape, read keyed
-//! at the convoy's home, when the engine holds it, else the stored status's.
-//! One set of views serves the switch on or off, and no old status is
+//! The engine Convoy decides (owner ruling, 2026-10-22, layer 6 question 1): crew verbs and
+//! observers write the engine through [`EngineConvoys`] and return its refusals. Readers see a
+//! convoy through [`viewed_read`] (layer 8): the engine's promises in the old shape, read keyed
+//! at the convoy's home, when the engine holds it, else the stored status's. No old status is
 //! written for the engine's promises.
 //!
 //! The port speaks the old shape: a crew is `(vessel, role)` and a promise is
 //! its old id, so callers keep their validation and the implementation owns
 //! the mapping onto seats and labels. A convoy the engine does not hold (one
-//! admitted before the switch, until the layer 9 import) stays on the old
+//! admitted before the engine took over, until the cut-over import) stays on the old
 //! path: [`EngineConvoys::holds`] is the one question callers ask first.
-//! Absent ([`EngineConvoyPath`] unset), nothing changes.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -174,12 +171,11 @@ pub fn note<P: crate::StatusPatch<super::ConvoyStatus> + ?Sized>(
     convoy: &ResourceObject<Convoy>,
     patch: &P,
 ) -> Result<ResourceObject<Convoy>, String> {
-    let engine = path.get().ok_or(NO_ENGINE)?;
-    if !engine.holds(convoy) {
+    if !path.holds(convoy) {
         return Err(format!("convoy `{}` is not held at this home; its notes are its home's", convoy.metadata.name));
     }
     let mut status = convoy.status.clone().unwrap_or_default();
-    let (notes, _) = engine.memory().update(&convoy.metadata.name, |notes| {
+    let (notes, _) = path.memory().update(&convoy.metadata.name, |notes| {
         notes.apply(&status, patch);
         notes.clone()
     });
@@ -191,31 +187,26 @@ pub fn note<P: crate::StatusPatch<super::ConvoyStatus> + ?Sized>(
 
 /// Sets this home's notes on convoy `name` to those `status` holds: a view read before a write
 /// that failed to finish, put back, or one a writer changed whole.
-pub fn set_notes(path: &EngineConvoyPath, name: &str, status: &super::ConvoyStatus) -> Result<(), String> {
-    let engine = path.get().ok_or(NO_ENGINE)?;
-    engine.memory().update(name, |notes| notes.read_from(status));
-    Ok(())
+pub fn set_notes(path: &EngineConvoyPath, name: &str, status: &super::ConvoyStatus) {
+    path.memory().update(name, |notes| notes.read_from(status));
 }
 
 /// The old status's promises: by vessel, then role.
 pub type OldPromises = BTreeMap<String, BTreeMap<String, Vec<super::promises::Promise>>>;
 
-/// The composition root's slot for [`EngineConvoys`]: set once, at startup.
-pub type EngineConvoyPath = Arc<OnceLock<Arc<dyn EngineConvoys>>>;
+/// The engine's Convoys, which every convoy reader and writer goes through.
+pub type EngineConvoyPath = Arc<dyn EngineConvoys>;
 
-/// The refusal of a convoy read or write on a path not yet installed.
-pub const NO_ENGINE: &str = "convoys are not served without the engine";
-
-/// The engine path for `convoy`, when the switch is on and the engine holds it.
+/// The engine's Convoys for `convoy`, when the engine holds it.
 pub fn deciding<'a>(path: &'a EngineConvoyPath, convoy: &ResourceObject<Convoy>) -> Option<&'a Arc<dyn EngineConvoys>> {
-    path.get().filter(|engine| engine.holds(convoy))
+    Some(path).filter(|engine| engine.holds(convoy))
 }
 
 /// A convoy as its readers see it (#3587 layer 8), read at its home (a
 /// replica's origin home): with the engine's promises in place of the stored
-/// ones when the engine holds it, else as stored. A failed read, or one before
-/// the path is installed, is an error, never the stored record: an engine-held
-/// convoy's stored promises were handed over, and would read as none.
+/// ones when the engine holds it, else as stored. A failed read is an error,
+/// never the stored record: an engine-held convoy's stored promises were
+/// handed over, and would read as none.
 pub fn viewed_read(path: &EngineConvoyPath, read: &ReadResourceObject<Convoy>) -> Result<ResourceObject<Convoy>, String> {
     viewed(path, read, false)
 }
@@ -231,8 +222,7 @@ fn viewed(path: &EngineConvoyPath, read: &ReadResourceObject<Convoy>, recorded: 
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str()),
         _ => None,
     };
-    let engine = path.get().ok_or(NO_ENGINE)?;
-    let held = if recorded { engine.recorded_promises(&read.object, home)? } else { engine.promises(&read.object, home)? };
+    let held = if recorded { path.recorded_promises(&read.object, home)? } else { path.promises(&read.object, home)? };
     Ok(match held {
         Some(promises) => with_promises(&read.object, promises),
         None => read.object.clone(),
@@ -800,17 +790,12 @@ mod tests {
 
     // Behaviour (#3587 layer 8): readers see the engine's promises in place of the stored ones when
     // the engine holds the convoy, asked at the convoy's own home; for a convoy the engine does not
-    // hold, they see the record as stored. Before the path is installed, a read is refused.
+    // hold, they see the record as stored.
     #[test]
     fn readers_see_the_engines_promises_only_where_it_holds_the_convoy() {
         let local = |name: &str| ReadResourceObject { object: convoy(name), provenance: ResourceProvenance::Local };
-        let uninstalled = EngineConvoyPath::default();
-        assert_eq!(viewed_read(&uninstalled, &local("c")).expect_err("uninstalled: refused"), NO_ENGINE);
-
         let engine = Arc::new(Holding { asked: Mutex::new(Vec::new()), memory: Default::default() });
-        let on = EngineConvoyPath::default();
-        let shared: Arc<dyn EngineConvoys> = engine.clone();
-        assert!(on.set(shared).is_ok());
+        let on: EngineConvoyPath = engine.clone();
         assert_eq!(viewed_read(&on, &local("c")).expect("read").status.expect("status").promises, kept());
         assert!(viewed_read(&on, &local("unheld")).expect("read").status.expect("status").promises.is_empty(), "not held: as stored");
 

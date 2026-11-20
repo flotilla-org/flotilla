@@ -177,6 +177,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         Arc::clone(&crate::engine(&placement_daemon).vessels.lifecycles),
         placement_daemon.lifecycle_reads(),
         placement_daemon.decided_store(),
+        placement_daemon.convoy_engine_path(),
     );
     let terminals = &crate::engine(&placement_daemon).terminals;
     let requested = || terminals.terminals.of_vessel(&held).expect("vessel sessions").pop();

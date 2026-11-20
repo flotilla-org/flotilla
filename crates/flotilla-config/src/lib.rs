@@ -397,9 +397,6 @@ pub struct DaemonConfig {
     /// Opt-in dummy providers for load testing (#3206); absent in real fleets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dummy_fleet: Option<dummy_fleet::DummyFleetConfig>,
-    // The retired `[primitives]` switch (ADR 0064 cut-over, #3108): every daemon runs on the engine,
-    // and a `daemon.toml` that still carries the section loads, its section ignored as an unknown
-    // key. The fleet's configs drop it with the roll; nothing to remove here after that.
     /// The optional loopback HTTP listener (ADR 0065); absent means none.
     #[serde(default)]
     pub http: HttpListenerConfig,

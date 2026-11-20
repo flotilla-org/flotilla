@@ -1,4 +1,4 @@
-//! The engine-first Convoy writer behind `[primitives]` (#3587 layer 6).
+//! The engine-first Convoy writer (#3587 layer 6).
 //!
 //! [`ConvoyEngine`] implements the old-shaped port
 //! ([`flotilla_resources::convoy::engine::EngineConvoys`]) over this home's

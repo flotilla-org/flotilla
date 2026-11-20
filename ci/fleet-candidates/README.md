@@ -422,17 +422,15 @@ default `flotilla` namespace when reading an older daemon, which did not expose
 namespace discovery.
 
 The candidate also rehearses lifecycle and Message imports into temporary engine
-stores. When the candidate host's `daemon.toml` contains `[primitives]`, every
-rehearsal refusal fails validation except an observed Checkout: it has no engine
-request and deliberately never imports. The exemption list matches the kind and
-complete refusal reason; new refusal classes fail closed. With the switch absent,
-rehearsals only report. A missing FleetDesignation is reported once per namespace
-with Messages, rather than once per Message. Vessel imports follow the Q6 lease
-mapping; their refusals are not exempt. `--host` changes the inventory source,
-while the enforcing switch still comes from the candidate's local config directory.
+stores. Every rehearsal refusal fails validation except an observed Checkout: it
+has no engine request and deliberately never imports. The exemption list matches
+the kind and complete refusal reason; new refusal classes fail closed. A missing
+FleetDesignation is reported once per namespace with Messages, rather than once
+per Message. Vessel imports follow the Q6 lease mapping; their refusals are not
+exempt. `--host` changes the inventory source.
 When at least one Message decodes, its rehearsal also refuses any undecodable
 supporting Forge, Convoy, Artifact, Repository or TerminalSession, even if that
-Message does not reference it. These refusals fail the enabled gate; a shared
+Message does not reference it. These refusals fail the gate; a shared
 record may also appear in the lifecycle report. Without a decoded Message, the
 Message rehearsal skips those dependencies; general stored-record validation
 still checks their decodability.

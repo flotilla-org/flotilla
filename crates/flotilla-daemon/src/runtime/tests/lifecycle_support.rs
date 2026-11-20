@@ -542,7 +542,7 @@ async fn release_after_change_request(
 
     record_successful_empty_branch_scan(daemon, convoy_name).await;
     let engine_path = daemon.convoy_engine_path();
-    let engine = engine_path.get().expect("the engine's convoys");
+    let engine = &engine_path;
     let current = convoys.get(convoy_name).await.expect("convoy");
     engine.verdict(&current, "template/decision-ledger", true, "operator", "ledger seen").await.expect("ledger kept");
     // The coder submits its PR, as `crew promise submit` does.

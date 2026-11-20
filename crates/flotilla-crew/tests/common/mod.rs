@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{collections::BTreeMap, future::Future, time::Duration};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
@@ -407,4 +407,28 @@ pub fn cr_name(service: &str, scope: &str, number: u64) -> String {
         &flotilla_resources::address::stored_change_request_address(service, scope, number, &[]).expect("change request address"),
     )
     .expect("record name")
+}
+
+/// The engine's Messages at a home of its own, for a reader that reads no message. The home lives
+/// as long as the process.
+pub fn detached_messages() -> flotilla_crew::ports::MessagePath {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let home: &'static flotilla_engine_messages_testkit::EngineMessagesHome =
+        Box::leak(Box::new(flotilla_engine_messages_testkit::EngineMessagesHome::open("detached", "flotilla", &backend)));
+    home.messages()
+}
+
+/// The engine's Convoys at a home of its own, for a reader that reads no convoy. The home lives
+/// as long as the process.
+pub fn detached_convoys() -> flotilla_resources::convoy::engine::EngineConvoyPath {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let home: &'static flotilla_engine_convoys_testkit::EngineConvoysHome =
+        Box::leak(Box::new(flotilla_engine_convoys_testkit::EngineConvoysHome::open(
+            "detached",
+            "flotilla",
+            &backend,
+            Arc::new(flotilla_resources::SystemClock),
+            Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        )));
+    home.path()
 }

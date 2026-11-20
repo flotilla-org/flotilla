@@ -1,4 +1,4 @@
-//! The engine-first Convoy write path behind `[primitives]` (#3587 layer 6):
+//! The engine-first Convoy write path (#3587 layer 6):
 //! admission, crew verbs, observers, verdicts, handoff and delivery write the
 //! engine, its refusals come back to the caller, and every engine write is
 //! copied one way into the old status.
@@ -710,8 +710,7 @@ async fn invalid_standing_identity_refuses_admission_and_reads_without_legacy_fa
     assert!(admit(&fixture, &old).await.is_err());
     assert!(fixture.engine.promises(&old, None).is_err());
     assert!(fixture.convoys.get("invalid-standing").is_none());
-    let path: flotilla_resources::convoy::engine::EngineConvoyPath = Default::default();
-    assert!(path.set(Arc::new(fixture.engine)).is_ok());
+    let path: flotilla_resources::convoy::engine::EngineConvoyPath = Arc::new(fixture.engine);
     let read = flotilla_resources::ReadResourceObject { object: old, provenance: flotilla_resources::ResourceProvenance::Local };
     let Err(error) = flotilla_resources::convoy::engine::viewed_read(&path, &read) else { panic!("public read must return the error") };
     assert!(error.contains("no recorded ensure role"), "{error}");

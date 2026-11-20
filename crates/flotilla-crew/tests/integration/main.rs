@@ -1,10 +1,11 @@
 // Keep integration coverage in one executable to avoid linking the crate graph per module.
 // Tests share a process: isolate state and keep process-wide mutations in separate targets.
-// Controllers' fixtures stay with the crew and provisioning tests that also use them.
-#[path = "../../../flotilla-controllers/tests/common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 mod convoy_engine_path;
+mod convoy_reconcile;
 mod environment_vessels;
+mod liveness_contract;
 mod message_reads;
 mod placement_tiebreak_capacity_wait;
 mod read_costs;

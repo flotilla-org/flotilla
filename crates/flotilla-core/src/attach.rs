@@ -111,7 +111,7 @@ pub(super) struct AttachResolver<'a> {
     pub(super) local_environment_id: &'a EnvironmentId,
     pub(super) host_name: &'a HostName,
     pub(super) namespace: &'a std::sync::RwLock<String>,
-    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
+    /// The engine's provisioning readings (#3629 layer 4).
     pub(super) lifecycle_reads: &'a dyn flotilla_projections::ports::LifecycleReads,
     /// Sessions on SSH hosts attach through their vessel's agent (#3792).
     pub(super) ssh_host_vessels: Option<Arc<dyn super::SshHostVesselAccess>>,

@@ -41,7 +41,7 @@ pub const ARCHIVE_WRITER: &str = "system:archive";
 
 /// The bundle format this generation writes. A later generation adds fields with serde defaults
 /// and keeps decoding this one (ADR 0047). Format 2 carries the entries' changes (#4024); format 1
-/// was written only behind `[primitives]`, before any production store archived, so none exists.
+/// was written only before any production store archived, so none exists.
 pub const BUNDLE_FORMAT: u32 = 2;
 
 /// The media type of an uploaded bundle.

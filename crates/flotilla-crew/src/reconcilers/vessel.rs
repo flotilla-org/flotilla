@@ -1450,18 +1450,14 @@ impl ConvoyVesselWake {
                 }
             })
             .boxed();
-        // The engine path is installed before any controller starts; empty, the switch is off.
-        let engine = match self.engine.get() {
-            Some(engine) => futures::stream::unfold(engine.changes(), |mut changes| async move {
-                match changes.recv().await {
-                    Ok(name) => Some((ConvoyWoken::Convoy(name), changes)),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((ConvoyWoken::Every, changes)),
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-                }
-            })
-            .boxed(),
-            None => futures::stream::pending().boxed(),
-        };
+        let engine = futures::stream::unfold(self.engine.changes(), |mut changes| async move {
+            match changes.recv().await {
+                Ok(name) => Some((ConvoyWoken::Convoy(name), changes)),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((ConvoyWoken::Every, changes)),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+            }
+        })
+        .boxed();
         Ok(futures::stream::select_all([convoys, artifacts, accounts, engine]).boxed())
     }
 

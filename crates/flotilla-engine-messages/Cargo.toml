@@ -3,7 +3,7 @@ name = "flotilla-engine-messages"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
-description = "Message on the engine behind the [primitives] switch: admission, the inbox, consumer records, attentions and the old-shape views (#3317)"
+description = "Message on the engine: admission, the inbox, consumer records, attentions and the old-shape views (#3317)"
 
 [dependencies]
 flotilla-address = { path = "../flotilla-address" }

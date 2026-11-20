@@ -531,7 +531,7 @@ async fn a_convoy_rows_address_acts_on_that_rows_convoy() {
     let (_dir, daemon) = super::super::tests::empty_daemon().await;
     let namespace = daemon.provisioning_namespace().await;
     let backend = daemon.resource_backend();
-    let engine = Arc::clone(daemon.convoy_engine_path().get().expect("the engine Convoy path"));
+    let engine = daemon.convoy_engine_path();
     let mut retired = None;
     for (record, role, landed) in [("lander", "coder", false), ("convoy-1", "lander", true), ("convoy-2", "lander", false)] {
         let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), role.to_owned()), (PROJECT_LABEL.to_owned(), "flotilla".to_owned())]);

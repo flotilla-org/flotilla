@@ -1,4 +1,4 @@
-//! Message on the engine behind the `[primitives]` switch (#3317).
+//! Message on the engine (#3317).
 //!
 //! [`MessagePrimitives`] is the new path's composition at one home: the
 //! decided store, the engine inbox over it ([`SqliteInbox`]), the minimal
@@ -2702,10 +2702,6 @@ fn delivered_to(state: &MessageState, receiver: &Receiver) -> bool {
 fn held(version: u64) -> bool {
     version > 0
 }
-
-/// The composition root's slot for the new path: set once, at startup,
-/// when `[primitives]` is on; empty otherwise, and nothing changes.
-pub type MessagePath = Arc<std::sync::OnceLock<Arc<MessagePrimitives>>>;
 
 #[cfg(test)]
 mod tests {

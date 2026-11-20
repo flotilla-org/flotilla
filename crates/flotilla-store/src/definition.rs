@@ -57,7 +57,7 @@ impl<T: Resource> DefinitionResolver<T> {
         Self { backend, namespace, _marker: PhantomData }
     }
 
-    /// The engine's records of this kind, installed behind `[primitives]` (#3824 layer 2b-ii).
+    /// The engine's records of this kind, installed (#3824 layer 2b-ii).
     fn records(&self) -> Option<Arc<dyn KindRecords<T>>> {
         self.backend.engine_records::<T>()
     }

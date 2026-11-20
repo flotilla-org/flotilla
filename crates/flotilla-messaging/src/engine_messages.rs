@@ -72,11 +72,10 @@ pub struct AdmittedMessage {
     pub superseded_by: Option<String>,
 }
 
-/// The `[primitives]` switch's Message path, as crew code reads and admits
-/// Messages (#3317). Crew code never reaches the engine: it sees engine
-/// messages in the old shape through this port, which the composition root
-/// implements over the decided store. Absent, every read and admission is
-/// the old store's, unchanged.
+/// The engine's Messages, as crew code reads and admits them (#3317). Crew
+/// code never reaches the engine: it sees engine messages in the old shape
+/// through this port, which the composition root implements over the decided
+/// store.
 #[async_trait]
 pub trait EngineMessages: Send + Sync {
     /// Whether `inbox` holds the message `record`, local or replicated, read by its exact identity

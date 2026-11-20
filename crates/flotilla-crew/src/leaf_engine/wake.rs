@@ -268,7 +268,7 @@ impl ReconcilerWake {
         sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        let primitives = self.subscriptions.message_primitives();
         let seats = flotilla_resources::convoy_crew_seats(convoy);
         let named = flotilla_resources::convoy_seat_turns(convoy);
         let messages = primitives.seat_standings(namespace, &seats, &named).await.map_err(|error| error.to_string())?;
@@ -342,7 +342,7 @@ impl ReconcilerWake {
         let mut checkout_changes = self.subscriptions.inner.lifecycle_reads.checkouts().ok().map(|checkouts| checkouts.changes());
         // A convoy's promises are its engine record's: no old record is written for their edges,
         // so its rows follow the engine's changes too (#3108).
-        let mut engine_changes = self.subscriptions.inner.convoy_engine.get().map(|engine| engine.changes());
+        let mut engine_changes = Some(self.subscriptions.inner.convoy_engine.changes());
         let mut convoy_objects = views.local_convoys().await?.as_ref().clone();
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
         // What the stall judge reads besides the rows' inputs: every convoy, a supervisor's
@@ -353,8 +353,7 @@ impl ReconcilerWake {
         let mut project_watch = views.projects.subscribe();
         let mut defaults_watch = views.defaults.subscribe();
         let mut fleet_watch = views.fleet.subscribe();
-        let mut inbox_changes =
-            self.subscriptions.message_primitives().and_then(|messages| messages.inbox_changes()).map_err(|error| error.to_string())?;
+        let mut inbox_changes = self.subscriptions.message_primitives().inbox_changes().map_err(|error| error.to_string())?;
         let mut agent_changes = self.subscriptions.inner.lifecycle_reads.agent_sessions().ok().and_then(|reads| reads.changes().ok());
         let clock = Arc::clone(&self.subscriptions.inner.clock);
         let mut jumps = clock.jumps();
@@ -598,7 +597,7 @@ impl ReconcilerWake {
     /// This home's `convoy` with its promises as its log records them: a keyed read of one
     /// convoy, made only for a seat that has submitted every open promise.
     async fn recorded_promises(&self, convoy: &ResourceObject<Convoy>) -> Result<OldPromises, String> {
-        let engine = self.subscriptions.inner.convoy_engine.get().cloned().ok_or(flotilla_resources::convoy::engine::NO_ENGINE)?;
+        let engine = Arc::clone(&self.subscriptions.inner.convoy_engine);
         let convoy = convoy.clone();
         let name = convoy.metadata.name.clone();
         tokio::task::spawn_blocking(carry(move || engine.recorded_promises(&convoy, None)))
@@ -1474,7 +1473,7 @@ impl ReconcilerWake {
         if noted.is_empty() && current.is_empty() {
             return Ok(noted);
         }
-        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        let primitives = self.subscriptions.message_primitives();
         // The current turns' names: a turn is sent from the fleet's turn-rules role to the seat.
         // A fleet with no such role admitted none.
         let project = &convoy.spec.project_ref;

@@ -1,4 +1,4 @@
-//! AwaitingReply on the engine behind `[primitives]` (#3587 layer 7): the
+//! AwaitingReply on the engine (#3587 layer 7): the
 //! sender's record of a Reply or Outcome send, answered by the reply in the
 //! sender's own inbox, expired past its deadline, withdrawn by the sender,
 //! and read by subject and sender through the store's indexes.

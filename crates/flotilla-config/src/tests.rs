@@ -831,15 +831,6 @@ async fn config_loaders_share_read_parse_warning_and_cache_policy() {
     }
 }
 
-// Behaviour (#3108 cut-over): the retired `[primitives]` switch no longer exists, and a
-// `daemon.toml` written while it did still loads.
-#[test]
-fn a_daemon_toml_with_the_retired_primitives_switch_still_loads() {
-    let config: DaemonConfig = toml::from_str("[primitives]\n[dummy_fleet]\n").unwrap();
-    assert!(config.dummy_fleet.is_some());
-    assert!(toml::from_str::<DaemonConfig>("[primitives]\n").is_ok());
-}
-
 // Unknown [http] keys must fail through the file-loading API and name the key.
 // No [http] field has been retired; the existing default/listen tests cover N→N+1.
 #[hegel::test]

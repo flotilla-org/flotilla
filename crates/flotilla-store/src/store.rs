@@ -260,9 +260,6 @@ pub trait Store: std::fmt::Debug + Send + Sync {
     fn blocking_request_encoding(&self) -> bool {
         false
     }
-    fn durable_local(&self) -> bool {
-        false
-    }
     fn hierarchy_admission(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
         None
     }

@@ -5,7 +5,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -333,7 +333,7 @@ async fn an_abandoned_convoys_merged_pr_is_the_observers_verdict() {
 }
 
 fn reconciler(backend: &ResourceBackend, engine: Arc<Recording>) -> ConvoyReconciler {
-    reconciler_reading(backend, engine, flotilla_provisioning_testkit::CheckoutFixture::default().reads)
+    reconciler_reading(backend, engine, flotilla_provisioning_testkit::EngineFixture::default().reads())
 }
 
 /// [`reconciler`], reading the engine's lifecycle readings through `reads`.
@@ -342,10 +342,18 @@ fn reconciler_reading(
     engine: Arc<Recording>,
     reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
 ) -> ConvoyReconciler {
-    let path: EngineConvoyPath = Arc::new(OnceLock::new());
-    let engine: Arc<dyn EngineConvoys> = engine;
-    assert!(path.set(engine).is_ok());
-    ConvoyReconciler::new(reads).with_artifacts(backend.including_replicas::<Artifact>(NAMESPACE)).with_engine(path)
+    reconciler_messaging(backend, engine, reads, crate::common::detached_messages())
+}
+
+/// [`reconciler_reading`], reading the engine's messages through `messages`.
+fn reconciler_messaging(
+    backend: &ResourceBackend,
+    engine: Arc<Recording>,
+    reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+    messages: flotilla_crew::ports::MessagePath,
+) -> ConvoyReconciler {
+    let path: EngineConvoyPath = engine;
+    ConvoyReconciler::new(reads, path, messages).with_artifacts(backend.including_replicas::<Artifact>(NAMESPACE))
 }
 
 // Behaviour: the observed ledger is the engine's Submit by an observer, and the controller writes
@@ -539,9 +547,7 @@ async fn a_change_wakes_only_the_convoys_noted_as_waiting() {
     engine.memory.update("waits-for-capacity", |notes| notes.stalls.set(stall));
     engine.memory.update("holds-delivery", |notes| notes.delivery_held_until = Some(chrono::Utc::now()));
     engine.memory.update("neither", |notes| notes.branch_subject_scan_error = Some("noted".into()));
-    let path: EngineConvoyPath = Arc::new(OnceLock::new());
-    let shared: Arc<dyn EngineConvoys> = engine;
-    assert!(path.set(shared).is_ok());
+    let path: EngineConvoyPath = engine;
 
     let hosts = backend.clone().using::<Host>(NAMESPACE);
     let mut host = hosts
@@ -786,12 +792,8 @@ async fn a_message_commit_wakes_the_convoys_holding_delivery_without_listing_mes
     let engine = Arc::new(Recording { holds: true, ..Default::default() });
     engine.memory.update("holds-delivery", |notes| notes.delivery_held_until = Some(chrono::Utc::now()));
     engine.memory.update("neither", |notes| notes.branch_subject_scan_error = Some("noted".into()));
-    let path: EngineConvoyPath = Arc::new(OnceLock::new());
-    let shared: Arc<dyn EngineConvoys> = engine;
-    assert!(path.set(shared).is_ok());
-    let messages: MessagePath = Arc::new(OnceLock::new());
-    let installed: Arc<dyn EngineMessages> = Arc::clone(&primitives) as Arc<dyn EngineMessages>;
-    assert!(messages.set(installed).is_ok());
+    let path: EngineConvoyPath = engine;
+    let messages: MessagePath = Arc::clone(&primitives) as Arc<dyn EngineMessages>;
     let admit = |n: usize| {
         let primitives = Arc::clone(&primitives);
         async move {
@@ -872,9 +874,7 @@ async fn engine_changes_wake_the_convoy_reconciler() {
     let (feed, _) = tokio::sync::broadcast::channel(16);
     let engine = Arc::new(Recording { holds: true, ..Default::default() });
     *engine.changes.lock().expect("changes") = Some(feed.clone());
-    let path: EngineConvoyPath = Arc::new(OnceLock::new());
-    let shared: Arc<dyn EngineConvoys> = engine;
-    assert!(path.set(shared).is_ok());
+    let path: EngineConvoyPath = engine;
     let (sender, mut queue) = WorkQueueSender::channel();
     let on: Box<dyn SecondaryWatch<Primary = Convoy>> = Box::new(EngineConvoyWake { engine: path });
     let watch = tokio::spawn(on.spawn(backend, "flotilla".into(), sender));
@@ -927,10 +927,7 @@ fn submit_pr(convoy: &mut ResourceObject<Convoy>, number: u64) {
 
 /// An engine path holding `engine`, for a wake beside the reconciler that reads through it.
 fn engine_path(engine: &Arc<Recording>) -> EngineConvoyPath {
-    let path: EngineConvoyPath = Arc::new(OnceLock::new());
-    let shared: Arc<dyn EngineConvoys> = Arc::clone(engine) as Arc<dyn EngineConvoys>;
-    assert!(path.set(shared).is_ok());
-    path
+    Arc::clone(engine) as EngineConvoyPath
 }
 
 /// The names queued within 100 ms of the first, which comes within 5 s.
@@ -1513,12 +1510,10 @@ async fn an_undelivered_turn_holds_delivery() {
         if !live {
             fixture.release(&launch);
         }
-        let messages: flotilla_crew::ports::MessagePath = Arc::new(OnceLock::new());
         let held_until = awaiting.then(|| chrono::Utc::now() + chrono::Duration::minutes(5));
-        let turns: Arc<dyn flotilla_messaging::EngineMessages> = Arc::new(Turns { held_until });
-        assert!(messages.set(turns).is_ok());
+        let messages: flotilla_crew::ports::MessagePath = Arc::new(Turns { held_until });
         let engine = Arc::new(Recording { holds: true, ..Default::default() });
-        let reconciler = reconciler_reading(&backend, Arc::clone(&engine), fixture.reads.clone()).with_messages(messages);
+        let reconciler = reconciler_messaging(&backend, Arc::clone(&engine), fixture.reads.clone(), messages);
         let prepared = reconciler.prepare(&convoy).await.expect("prepare");
         let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
         let delivered = *engine.deliveries.lock().expect("deliveries") == 1;

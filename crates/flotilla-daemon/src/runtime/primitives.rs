@@ -1,5 +1,5 @@
-//! The engine path's delivery adapter (#3317), behind the `[primitives]`
-//! switch: the consumer that takes crew turns from role inboxes.
+//! The engine path's delivery adapter (#3317): the consumer that takes crew
+//! turns from role inboxes.
 //!
 //! Each pass reads today's role routing through the bindings port
 //! (`MessageReceiverSnapshot`), keeps one minimal AgentSession per live crew

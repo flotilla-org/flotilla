@@ -43,11 +43,6 @@ pub const OWNING_DAEMON_CAPABILITY: &str = "owning_daemon";
 /// Codex crews take a copy of (#4037). Absent reads as none.
 pub const CODEX_CENTRAL_LOGIN_CAPABILITY: &str = "codex_central_login";
 pub const HEARTBEAT_READY_TTL_SECS: i64 = 60;
-/// A heartbeat that observes nothing new apart from timestamps still commits
-/// once the stored `heartbeat_at` is this old. Readers then see `heartbeat_at`
-/// advance within `HEARTBEAT_REFRESH_SECS` plus one heartbeat interval, which
-/// stays inside [`HEARTBEAT_READY_TTL_SECS`] for any interval under 40 s.
-pub const HEARTBEAT_REFRESH_SECS: i64 = HEARTBEAT_READY_TTL_SECS / 3;
 pub const SLEEP_INHIBITION_CONDITION_TYPE: &str = "SleepInhibition";
 /// The prefix of a host's condition on whether it reaches a remote Git host:
 /// `Remote/<remote host>`. A clone's transport failure records it False at once, and the host's
@@ -719,26 +714,10 @@ pub struct SshVesselSlots {
 
 impl StatusPatch<HostStatus> for HostStatusPatch {
     /// Host status is a latest-value observation. Commit only what changes an
-    /// observation; fold timestamp-only refreshes into the heartbeat, which
-    /// still commits often enough to keep `heartbeat_at` fresh.
+    /// observation: a timestamp-only refresh writes nothing, since a Host's
+    /// `heartbeat_at` is derived from when its home was last heard.
     fn requires_write(&self, before: &HostStatus, after: &HostStatus) -> bool {
-        if !before.same_observations_as(after) {
-            return true;
-        }
-        match self {
-            Self::Heartbeat { heartbeat_at, .. } => before.heartbeat_at.is_none_or(|previous| {
-                // A clock regression must not leave a future heartbeat looking fresh.
-                *heartbeat_at < previous
-                    || heartbeat_at.signed_duration_since(previous) >= chrono::Duration::seconds(HEARTBEAT_REFRESH_SECS)
-            }),
-            // The owning daemon's last successful probe stands in for an SSH host's heartbeat.
-            Self::SshHost { heartbeat_at: Some(heartbeat_at), .. } => before.heartbeat_at.is_none_or(|previous| {
-                *heartbeat_at < previous
-                    || heartbeat_at.signed_duration_since(previous) >= chrono::Duration::seconds(HEARTBEAT_REFRESH_SECS)
-            }),
-            Self::SshHost { heartbeat_at: None, .. } => before.heartbeat_at.is_some(),
-            Self::FulfilmentFacts { .. } | Self::SleepInhibition { .. } | Self::ImageInventory { .. } => false,
-        }
+        !before.same_observations_as(after)
     }
 
     fn apply(&self, status: &mut HostStatus) {

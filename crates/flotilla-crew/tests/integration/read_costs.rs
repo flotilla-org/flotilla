@@ -3,7 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -96,7 +96,7 @@ async fn launches_read_by_a_pass(others: usize) -> (u64, KeyedGets) {
         launches.push(launch);
     }
     let passed = backend.clone().using::<Convoy>(NAMESPACE).get(&launches[0]).await.expect("the convoy's view");
-    let reconciler = ConvoyReconciler::new(Arc::clone(convoys.reads())).with_engine(convoys.path());
+    let reconciler = ConvoyReconciler::new(Arc::clone(convoys.reads()), convoys.path(), crate::common::detached_messages());
 
     let vessels = &engine.vessels.vessels;
     convoys.settled().await;
@@ -157,7 +157,7 @@ async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
     }
 
     let accounts: Arc<dyn AccountRecords> = Arc::new(OldStoreAccounts::new(backend.clone()));
-    let wake = ConvoyVesselWake::new(&backend, NAMESPACE, Arc::clone(convoys.reads()), Arc::new(OnceLock::new()), accounts);
+    let wake = ConvoyVesselWake::new(&backend, NAMESPACE, Arc::clone(convoys.reads()), convoys.path(), accounts);
     let (sender, mut queued) = WorkQueueSender::channel();
     let waking = tokio::spawn(Box::new(wake).spawn(backend.clone(), NAMESPACE.to_owned(), sender));
 
@@ -366,7 +366,7 @@ async fn read_by_cards(others: usize, scope: impl FnOnce(&[String]) -> CardScope
     }
     // The convoy views are filled once, at their first read, as a running daemon's already are.
     backend.clone().using::<Convoy>(NAMESPACE).list().await.expect("the convoy views");
-    let tracker = CapabilityCardTracker::default();
+    let tracker = CapabilityCardTracker::with_message_path(crate::common::detached_messages());
     let accounts = OldStoreAccounts::new(backend.clone());
     let scope = scope(&launches);
 
@@ -463,7 +463,7 @@ async fn read_by_open_launches(others: usize) -> (usize, u64, KeyedGets) {
     assert_eq!(views.open().await.expect("first read").len(), others + 1, "the first read lists every open launch");
 
     let before = (convoys.convoy_listings(), convoys.keyed_gets());
-    convoys.path().get().expect("the Convoy path").abandon(&launches[0], "operator", "ended").await.expect("end the first launch");
+    convoys.path().abandon(&launches[0], "operator", "ended").await.expect("end the first launch");
     let ended = &launches[0].metadata.name;
     let admitted = admit(others + 1).await.metadata.name;
     quiet(&mut sent).await;
@@ -805,7 +805,7 @@ async fn ended_launches_leave_the_held_joins() {
     assert_eq!((held.vessels, held.terminals), (10, 10), "every launch is held: {held:?}");
 
     let (ended, live) = crewed.launches.split_at(5);
-    let engine = crewed.convoys.path().get().cloned().expect("the Convoy path");
+    let engine = crewed.convoys.path();
     for (launch, vessel, session) in ended {
         let view = convoys.get(launch).await.expect("the convoy");
         engine.abandon(&view, "operator", "ended").await.expect("end the convoy");
@@ -831,7 +831,7 @@ async fn ended_launches_leave_the_held_joins() {
     // Composed again as its notes change, an ended convoy's works show what they did.
     let mut status = convoys.get(&ended[0].0).await.expect("an ended convoy").status.expect("its status");
     status.branch_subject_scan_error = Some("noted after the end".into());
-    set_notes(&crewed.convoys.path(), &ended[0].0, &status).expect("note the convoy");
+    set_notes(&crewed.convoys.path(), &ended[0].0, &status);
     let again = convoys.get(&ended[0].0).await.expect("an ended convoy").status.expect("its status");
     assert_eq!(again.branch_subject_scan_error.as_deref(), Some("noted after the end"), "the view is composed again");
     assert_eq!(again.work, composed, "its works show what they did");
@@ -882,7 +882,7 @@ async fn held_before_and_after_ending(convoys: usize, watched: bool) -> (HeldWor
     };
     let running = held().await;
 
-    let engine = crewed.convoys.path().get().cloned().expect("the Convoy path");
+    let engine = crewed.convoys.path();
     for (n, (launch, vessel, session)) in crewed.launches.iter().enumerate() {
         let view = views.0.get(launch).await.expect("the convoy");
         engine.abandon(&view, "operator", "ended").await.expect("end the convoy");

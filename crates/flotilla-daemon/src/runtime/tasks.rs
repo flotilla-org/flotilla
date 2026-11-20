@@ -793,7 +793,7 @@ pub fn spawn_pending_supervisor_turn_task(daemon: Arc<InProcessDaemon>, namespac
             let convoys = backend.including_replicas::<Convoy>(&namespace).watch().await?;
             let sessions = backend.including_replicas::<TerminalSession>(&namespace).watch().await?;
             // The Message path's commits, which list no message to hear one.
-            let messages = message_path.get().ok_or_else(|| ResourceError::other("the Message path is not installed"))?.changes()?.map(Ok);
+            let messages = message_path.changes()?.map(Ok);
             Ok((
                 futures::stream::select(convoys.map(|event| event.map(|_| ())), messages.map(|event| event.map(|_| ()))).boxed(),
                 sessions.map(|event| event.map(|_| ())).boxed(),

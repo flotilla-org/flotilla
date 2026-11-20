@@ -573,6 +573,7 @@ async fn lost_vessel_resume_explains_rehydration() {
         .brief_artifact_writer(crew.brief_artifact_writer.clone())
         .checkout_vcs(crew.checkout_vcs.clone())
         .local_environment_id(crew.local_environment_id.clone())
+        .capability_cards(crate::crew_capabilities::CapabilityCardTracker::with_message_path(held.engine.message_path()))
         .message_path(held.engine.message_path())
         .convoy_engine(held.engine.path())
         .build();
@@ -740,7 +741,7 @@ impl TurnDeliveryActuator for Delivery {
         // boundary; escalation must not overwrite it when committing ownership.
         if self.conflict {
             let source = convoys.get(&self.launch).await.expect("source authority");
-            let engine = self.path.get().expect("the Convoy path");
+            let engine = &self.path;
             engine.fail_seat(&source, "work", "coder", "operator", "concurrent ruling").await.expect("concurrent ruling");
         }
         if self.resume_coder {

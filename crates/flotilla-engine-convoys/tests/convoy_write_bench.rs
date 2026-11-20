@@ -1,4 +1,4 @@
-//! The `[primitives]` Convoy write path under load (#3587 layer 6): ignored by default.
+//! The engine Convoy write path under load (#3587 layer 6): ignored by default.
 //!
 //! ```text
 //! FLOTILLA_CONVOY_BENCH_N=1000 cargo test -p flotilla-core --release --locked --test convoy_write_bench -- --ignored --nocapture
@@ -6,7 +6,7 @@
 //!
 //! `FLOTILLA_CONVOY_BENCH_N` old convoys (default 10,000) in an in-memory old store, one in ten
 //! freshly bootstrapped and admitted on the engine at this home over a temp-file decided store
-//! (WAL, as the daemon opens it); the rest stay old-only, as the replicas and pre-switch convoys a
+//! (WAL, as the daemon opens it); the rest stay old-only, as the replicas and pre-engine convoys a
 //! home holds. Each engine convoy has two crews, a deliverer `coder` with `template/pr` and a
 //! `reviewer` with nothing.
 //!

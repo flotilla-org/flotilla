@@ -17,9 +17,10 @@
 //! and plan are the registered implementation's own text.
 //!
 //! These are the serde shapes of the old-store kinds [`AccountBinding`] and [`AccountProvision`]
-//! that production runs with `[primitives]` off (owner ruling 1 on #3910); they go with the
-//! switch. The engine stores the reviewed tables through `flotilla_provisioning::stored::account`
-//! (#3824 layer 1); the parts both shapes share derive `Stored` here.
+//! that the old-store fixture in the store-testkit still holds (owner ruling 1 on #3910); they go
+//! with it. Production serves them from the engine, which stores the reviewed tables through
+//! `flotilla_provisioning::stored::account` (#3824 layer 1); the parts both shapes share derive
+//! `Stored` here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -394,10 +395,10 @@ pub enum ProvisionWrite {
     Superseded,
 }
 
-/// The account kinds' read and write port (#3824 layer 1). With `[primitives]` off it is the old
-/// store's records; with it on, the engine's: the binding home's AccountBinding machine and the
-/// place's AccountProvision plain records, read from the decided store. Callers never see how
-/// either names its records beyond the names it returns.
+/// The account kinds' read and write port (#3824 layer 1): the engine's binding home's
+/// AccountBinding machine and the place's AccountProvision plain records, read from the decided
+/// store. (The store-testkit's old-store fixture implements it over the old store's records, for
+/// tests.) Callers never see how either names its records beyond the names it returns.
 #[async_trait::async_trait]
 pub trait AccountRecords: Send + Sync {
     /// The requester's current binding for `access`: its open one, or else its latest ended one.

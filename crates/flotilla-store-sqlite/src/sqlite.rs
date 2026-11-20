@@ -3471,9 +3471,6 @@ impl Store for SqliteBackend {
     fn blocking_request_encoding(&self) -> bool {
         true
     }
-    fn durable_local(&self) -> bool {
-        true
-    }
     fn with_local_root(&self, root: NodeId) -> std::sync::Arc<dyn Store> {
         std::sync::Arc::new(self.clone().with_local_root(root))
     }

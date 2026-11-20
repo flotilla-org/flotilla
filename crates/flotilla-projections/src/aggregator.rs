@@ -243,9 +243,9 @@ pub struct Aggregator {
     #[builder(skip)]
     engine_checkout_home: Option<String>,
     bootstrapping: bool,
-    /// The `[primitives]` Convoy path (#3587 layer 8), and the namespace its
+    /// The engine's Convoys (#3587 layer 8), and the namespace their
     /// changed convoys are named in.
-    convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
+    convoy_engine: Option<flotilla_resources::convoy::engine::EngineConvoyPath>,
     engine_namespace: String,
     #[builder(skip)]
     projection_delivery: ConvoyProjectionDelivery,
@@ -260,7 +260,7 @@ pub struct Aggregator {
     emitted_queries: HashSet<QueryId>,
     #[builder(skip)]
     attach_resolver: Option<Arc<dyn AttachCapabilityResolver>>,
-    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
+    /// The engine's provisioning readings (#3629 layer 4).
     #[builder(skip = Arc::new(crate::ports::NoLifecycleReads))]
     lifecycle_reads: Arc<dyn crate::ports::LifecycleReads>,
     #[builder(skip)]
@@ -392,7 +392,7 @@ impl Aggregator {
             held_launches: HeldLaunches::default(),
             engine_checkout_home: None,
             bootstrapping: false,
-            convoy_engine: Default::default(),
+            convoy_engine: None,
             engine_namespace: String::new(),
             projection_delivery: ConvoyProjectionDelivery::Immediate,
             projection_full: false,
@@ -457,7 +457,7 @@ impl Aggregator {
 
     /// Rows read a convoy's promises from the engine when it holds the convoy.
     pub fn with_convoy_engine(mut self, engine: flotilla_resources::convoy::engine::EngineConvoyPath, namespace: &str) -> Self {
-        self.convoy_engine = engine;
+        self.convoy_engine = Some(engine);
         self.engine_namespace = namespace.to_owned();
         self
     }
@@ -633,7 +633,7 @@ impl Aggregator {
 
         // An engine edge writes no old record: follow the engine's changes to
         // re-project the convoy's row (#3587 layer 8).
-        let mut engine_changes = self.convoy_engine.get().map(|engine| engine.changes());
+        let mut engine_changes = self.convoy_engine.as_ref().map(|engine| engine.changes());
         // Environments are the engine's: their changes come from its log (#3108).
         let mut environment_changes = self.lifecycle_reads.environments().ok().map(|environments| environments.changes());
         // So are clones: a checkout's readiness reads its clone launch.
@@ -2794,7 +2794,7 @@ impl Aggregator {
                     && session.object.metadata.labels.get(VESSEL_LABEL).is_some_and(|value| value == vessel)
                     && self.read_host(&session.provenance).as_ref() == Some(vessel_host)
                     && self.attachable_sessions.contains(&session_key(session))
-                    // Last: behind `[primitives]` it is an engine read.
+                    // Last: it is an engine read.
                     && self.session_running(session)
             })
             .min_by_key(|session| &session.object.metadata.name)
@@ -2828,7 +2828,10 @@ impl Aggregator {
         if unreadable_reason(&read.object).is_some() {
             return Ok(read.object.clone());
         }
-        flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, read)
+        match &self.convoy_engine {
+            Some(engine) => flotilla_resources::convoy::engine::viewed_read(engine, read),
+            None => Ok(read.object.clone()),
+        }
     }
 
     fn summarize(&self, resource: &ResourceRef, convoy: &ResourceObject<Convoy>) -> ConvoyRow {

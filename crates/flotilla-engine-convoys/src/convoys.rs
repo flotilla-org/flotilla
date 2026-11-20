@@ -1,4 +1,4 @@
-//! Convoy on the engine behind the `[primitives]` switch (#3587 layer 6).
+//! Convoy on the engine (#3587 layer 6).
 //!
 //! [`Convoys`] is this home's Convoy writer: one engine [`Home`] over the
 //! decided store's log, restored from the store on open, and the world

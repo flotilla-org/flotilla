@@ -419,7 +419,7 @@ impl StandingConvoyBackingInspector for RecordlessBacking {
 
 /// The engine's Convoy path at `daemon`'s home.
 fn convoy_engine(daemon: &InProcessDaemon) -> Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> {
-    Arc::clone(daemon.convoy_engine_path().get().expect("the engine Convoy path"))
+    daemon.convoy_engine_path()
 }
 
 /// Admits convoy `name` at `daemon`'s home as admission would, its one agent seat owing the

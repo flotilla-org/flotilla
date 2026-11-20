@@ -27,7 +27,7 @@ macro_rules! dispatch_backend {
     };
 }
 
-/// The engine ports installed behind `[primitives]`, by the resource kinds they serve, and the
+/// The engine ports installed, by the resource kinds they serve, and the
 /// namespace their records are served in: shared by every handle cloned or derived from one
 /// backend (#3824 layers 2b-ii and 3).
 type EngineSlot = std::sync::Arc<std::sync::RwLock<EngineSlots>>;
@@ -218,7 +218,7 @@ impl ResourceBackend {
         engines.feeds.get(R::API_PATHS.kind)?.upgrade()?.downcast::<crate::engine_feed::EngineFeed<R>>().ok()
     }
 
-    /// Installs the engine's attentions behind `[primitives]`. A daemon runtime restarted over the
+    /// Installs the engine's attentions. A daemon runtime restarted over the
     /// same backend installs its reopened engine in place of the last.
     pub fn install_attentions(&self, attentions: std::sync::Arc<dyn flotilla_resources::attentions::Attentions>) {
         *self.attentions.0.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attentions);

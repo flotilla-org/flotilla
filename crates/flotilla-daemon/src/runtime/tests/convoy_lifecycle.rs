@@ -112,7 +112,7 @@ async fn standing_ensure_dependency_changes_emit_wakes() {
                     .await;
                 watch.next().await.expect("watch should remain open").expect("convoy admit event");
                 let view = home.convoy(&launch).await;
-                home.convoys.path().get().expect("the Convoy path").abandon(&view, "operator", "abandoned").await.expect("end the launch");
+                home.convoys.path().abandon(&view, "operator", "abandoned").await.expect("end the launch");
             }
             "ConvoyEnsure" => {
                 backend
@@ -549,7 +549,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     // Its branch's change request is linked and its work done: it lands once evidence settles it.
     let convoys = authority_daemon.resource_backend().using::<Convoy>(NAMESPACE);
     let engine_path = authority_daemon.convoy_engine_path();
-    let engine = engine_path.get().expect("the authority's engine convoys");
+    let engine = &engine_path;
     let admitted = convoys.get(&convoy_name).await.expect("admitted convoy");
 
     engine
@@ -643,10 +643,12 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
 
     // B's checkout and its CR observations, decided records homed at B, reach A as B's log does.
     flotilla_provisioning_testkit::replicate_home(&checkout_home.service, "checkout-root", &decided);
-    let reconciler = ConvoyReconciler::new(authority_daemon.lifecycle_reads()).with_engine(Arc::clone(&engine_path)).with_change_requests(
-        authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
-        authority_daemon.change_request_stale_after(),
-    );
+    let reconciler =
+        ConvoyReconciler::new(authority_daemon.lifecycle_reads(), Arc::clone(&engine_path), authority_daemon.crew_message_path())
+            .with_change_requests(
+                authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
+                authority_daemon.change_request_stale_after(),
+            );
     // Fresh replicated evidence settles it: the reconciler observes the branch's change request,
     // one edge a pass as the controller runs it, then delivers the launch.
     let mut current = convoys.get(&convoy_name).await.expect("get Landing convoy");

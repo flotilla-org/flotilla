@@ -13,7 +13,7 @@
 use chrono::{DateTime, Utc};
 use flotilla_protocol::Subject;
 use flotilla_resources::address::record_name;
-use flotilla_resources::convoy::engine::{deciding, note, Actor, EngineConvoyPath, EngineConvoys, NO_ENGINE};
+use flotilla_resources::convoy::engine::{deciding, note, Actor, EngineConvoyPath, EngineConvoys};
 use flotilla_resources::convoy::reconcile::*;
 use flotilla_resources::*;
 use flotilla_store::{
@@ -43,9 +43,9 @@ pub struct ConvoyReconciler {
     landing_evidence_stale_after: std::time::Duration,
     clock: Arc<dyn Clock>,
     prepared_snapshot_gc: Option<PreparedSnapshotGarbageCollector>,
-    /// The engine's convoys; empty until startup installs them.
+    /// The engine's convoys.
     engine: EngineConvoyPath,
-    /// The `[primitives]` switch's Message path; empty while it is off.
+    /// The engine's Messages.
     messages: crate::ports::MessagePath,
     lifecycle_reads: Arc<dyn lifecycle_reads::LifecycleReads>,
 }
@@ -57,8 +57,13 @@ pub struct ConvoyPass {
 }
 
 impl ConvoyReconciler {
-    /// Reads the engine's lifecycle readings of vessels, sessions and checkouts through `lifecycle_reads`.
-    pub fn new(lifecycle_reads: Arc<dyn lifecycle_reads::LifecycleReads>) -> Self {
+    /// Reads the engine's lifecycle readings of vessels, sessions and checkouts through
+    /// `lifecycle_reads`, and decides on the engine's `engine` convoys and `messages`.
+    pub fn new(
+        lifecycle_reads: Arc<dyn lifecycle_reads::LifecycleReads>,
+        engine: EngineConvoyPath,
+        messages: crate::ports::MessagePath,
+    ) -> Self {
         Self {
             vessels: None,
             artifacts: None,
@@ -70,22 +75,10 @@ impl ConvoyReconciler {
             landing_evidence_stale_after: std::time::Duration::from_secs(30),
             clock: Arc::new(SystemClock),
             prepared_snapshot_gc: None,
-            engine: EngineConvoyPath::default(),
-            messages: crate::ports::MessagePath::default(),
+            engine,
+            messages,
             lifecycle_reads,
         }
-    }
-
-    /// The engine's convoys, installed at startup.
-    pub fn with_engine(mut self, engine: EngineConvoyPath) -> Self {
-        self.engine = engine;
-        self
-    }
-
-    /// The `[primitives]` switch's Message path, set at startup when it is on.
-    pub fn with_messages(mut self, messages: crate::ports::MessagePath) -> Self {
-        self.messages = messages;
-        self
     }
 
     pub fn with_artifacts(mut self, artifacts: ReplicaReadResolver<Artifact>) -> Self {
@@ -186,7 +179,7 @@ impl ConvoyReconciler {
         vessel: &str,
         role: &str,
     ) -> Result<Option<DateTime<Utc>>, ResourceError> {
-        let Some(messages) = self.messages.get() else { return Ok(None) };
+        let messages = &self.messages;
         // The seat's sessions here, read by the launches of its work: a session runs while its
         // newest launch is ready.
         let reads = Arc::clone(&self.lifecycle_reads);
@@ -627,7 +620,7 @@ impl<W: Resource> WakeOn<W> {
                     })
                 })
                 .boxed(),
-            WakeOn::MessageCommits(path) => crate::ports::installed_messages(path)?.changes()?.map(|()| Ok(None)).boxed(),
+            WakeOn::MessageCommits(path) => path.changes()?.map(|()| Ok(None)).boxed(),
         })
     }
 }
@@ -652,7 +645,7 @@ impl<W: Resource> SecondaryWatch for NoteWake<W> {
         sender: flotilla_store::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let Some(engine) = self.engine.get().cloned() else { return Err(ResourceError::other(NO_ENGINE)) };
+            let engine = Arc::clone(&self.engine);
             let mut watch = self.changes.watch().await?;
             loop {
                 match futures::StreamExt::next(&mut watch).await {
@@ -706,7 +699,7 @@ impl<W: Resource> SecondaryWatch for CapacityWake<W> {
         sender: flotilla_store::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let Some(engine) = self.engine.get().cloned() else { return Err(ResourceError::other(NO_ENGINE)) };
+            let engine = Arc::clone(&self.engine);
             let memory = engine.memory();
             let host = Host::API_PATHS.kind;
             // As EvidenceWake: a convoy noted before the watch opened takes one more pass.
@@ -768,7 +761,7 @@ impl<W: Resource> SecondaryWatch for EvidenceWake<W> {
         sender: flotilla_store::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let Some(engine) = self.engine.get().cloned() else { return Err(ResourceError::other(NO_ENGINE)) };
+            let engine = Arc::clone(&self.engine);
             // The watch hears changes from when it opens. A pass notes its names before it reads,
             // so a convoy noted by now may have read before the watch opened and missed a change
             // in between: it takes one more pass. Every later pass notes after the watch opened.
@@ -826,10 +819,7 @@ impl SecondaryWatch for EngineConvoyWake {
         sender: flotilla_store::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            // The daemon installs the engine path while it is composed, before any controller (and
-            // so this watch) is spawned.
-            let Some(engine) = self.engine.get() else { return Err(ResourceError::other(NO_ENGINE)) };
-            let mut changes = engine.changes();
+            let mut changes = self.engine.changes();
             loop {
                 match changes.recv().await {
                     Ok(name) => {

@@ -106,7 +106,7 @@ async fn produce(requester: &InProcessDaemon, name: &str) -> String {
         },
     };
     let path = requester.convoy_engine_path();
-    let engine = path.get().expect("the Convoy path");
+    let engine = path;
     engine
         .promise(&convoy, "work", "coder", &submit, flotilla_resources::convoy::engine::Actor::Crew)
         .await
@@ -271,9 +271,12 @@ async fn remote_change_request_scenario(late_watcher: bool) {
     owner_observer.refresh_demanded_owned().await.unwrap();
     // The producer's convoy reconciler observes the merged record and keeps the promise on the
     // engine, one edge a pass.
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(requester.lifecycle_reads())
-        .with_engine(requester.convoy_engine_path())
-        .with_change_requests(requester.resource_backend().including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180));
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(
+        requester.lifecycle_reads(),
+        requester.convoy_engine_path(),
+        requester.crew_message_path(),
+    )
+    .with_change_requests(requester.resource_backend().including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180));
     eventually(Duration::from_secs(5), Duration::from_millis(10), "merged observation keeps promise", || async {
         use flotilla_store::controller::Reconciler;
         let current = convoys.get(&producer).await.expect("producer");
@@ -293,7 +296,7 @@ async fn remote_change_request_scenario(late_watcher: bool) {
         let (convoys, path) = (convoys.clone(), requester.convoy_engine_path());
         async move {
             let convoy = convoys.get(&launch).await.expect("consumer");
-            path.get().expect("the Convoy path").abandon(&convoy, "operator", "consumer removed").await.expect("end the consumer");
+            path.abandon(&convoy, "operator", "consumer removed").await.expect("end the consumer");
         }
     };
     end(producer.clone()).await;

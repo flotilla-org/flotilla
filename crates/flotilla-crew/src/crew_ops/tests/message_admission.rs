@@ -149,7 +149,7 @@ async fn read_by_follow_ups(count: usize) -> (u64, u64) {
             .pending_follow_up(ResourceRef::new("flotilla.work/v1", "Message", "flotilla", &name))
             .build();
         status.crew_work.entry("work".into()).or_default().insert("coder".into(), coder);
-        flotilla_resources::convoy::engine::set_notes(&held.engine.path(), &launch, &status).expect("queue the follow-up");
+        flotilla_resources::convoy::engine::set_notes(&held.engine.path(), &launch, &status);
         followed.push((launch, name));
     }
     let (reconciled, reads) = flotilla_store::load_metrics::measure(crew.reconcile_pending_supervisor_turns_once("flotilla")).await;

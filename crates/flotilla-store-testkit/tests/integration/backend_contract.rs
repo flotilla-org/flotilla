@@ -1,145 +1,17 @@
-//! All adapters run the same existing CRUD/list/watch scenarios. HTTP uses a
-//! stand-in for the resource HTTP process, enforcing paths and Kubernetes bodies.
-use axum::{
-    body::{Body, Bytes},
-    extract::{Path, RawQuery, State},
-    http::{Method, StatusCode},
-    response::{IntoResponse, Response},
-    routing::any,
-    Router,
-};
+//! All adapters run the same existing CRUD/list/watch scenarios.
 use flotilla_resources::*;
 use flotilla_store::{ResourceBackend, ResourceKind};
-use flotilla_store_http::HttpBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 use flotilla_store_testkit::{fixtures::contract::*, ReadCountsBackendExt, ReadOperation, ReadSnapshot, ReadTally};
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::BTreeMap;
 
-struct HttpFixture {
-    backend: ResourceBackend,
-    task: tokio::task::JoinHandle<()>,
-}
-impl Drop for HttpFixture {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-impl HttpFixture {
-    async fn new() -> Self {
-        let authority = ResourceBackend::new(InMemoryBackend::default());
-        let app = Router::new()
-            .route("/apis/{group}/{version}/namespaces/{namespace}/{plural}", any(request))
-            .route("/apis/{group}/{version}/namespaces/{namespace}/{plural}/{name}", any(request))
-            .route("/apis/{group}/{version}/namespaces/{namespace}/{plural}/{name}/{subresource}", any(request))
-            .with_state(authority);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind HTTP fixture");
-        let url = format!("http://{}", listener.local_addr().expect("fixture address"));
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve fixture");
-        });
-        Self { backend: ResourceBackend::new(HttpBackend::new(rigging_tls::client(), url)), task }
-    }
-}
-async fn request(
-    State(backend): State<ResourceBackend>,
-    Path(path): Path<BTreeMap<String, String>>,
-    RawQuery(query): RawQuery,
-    method: Method,
-    bytes: Bytes,
-) -> Response {
-    let query: BTreeMap<String, String> =
-        url::form_urlencoded::parse(query.as_deref().unwrap_or_default().as_bytes()).into_owned().collect();
-    let kind = match path["plural"].as_str() {
-        "convoys" => ResourceKind::of::<Convoy>(),
-        "environments" => ResourceKind::of::<Environment>(),
-        other => panic!("unexpected fixture resource {other}"),
-    };
-    assert_eq!(path["group"], kind.paths.group);
-    assert_eq!(path["version"], kind.paths.version);
-    let namespace = &path["namespace"];
-    let name = path.get("name");
-    if method == Method::GET && query.get("watch").is_some_and(|v| v == "true") {
-        let start = query.get("resourceVersion").map(|v| WatchStart::FromVersion(v.clone())).unwrap_or(WatchStart::Now);
-        let stream = match backend.store().watch_raw(kind, namespace, start).await {
-            Ok(stream) => stream,
-            Err(error) => return error_response(error),
-        };
-        let body = stream.map(move |event| {
-                let value = match event?.decode_raw(kind)? {
-                    WatchEvent::Added(o) => json!({"type":"ADDED","object":kind.encode_object(&o)?}),
-                    WatchEvent::Modified(o) => json!({"type":"MODIFIED","object":kind.encode_object(&o)?}),
-                    WatchEvent::Deleted(o) => json!({"type":"DELETED","object":kind.encode_object(&o)?}),
-                    WatchEvent::DeletedByName(t) => json!({"type":"DELETED","object":{"apiVersion":api_version(kind.paths),"kind":kind.paths.kind,"metadata":{"name":t.name,"namespace":t.namespace,"resourceVersion":t.resource_version,"annotations":t.annotations}}}),
-                };
-                Ok::<_,ResourceError>(format!("{value}\n"))
-            });
-        return Body::from_stream(body).into_response();
-    }
-    let result: Result<Value, ResourceError> = async {
-        let store = backend.store();
-        if method == Method::GET {
-            return match name {
-                Some(name) => kind.encode_object(&store.get_raw(kind, namespace, name).await?),
-                None => {
-                    let list = store.list_raw(kind, namespace).await?;
-                    Ok(json!({"apiVersion":api_version(kind.paths),"kind":format!("{}List",kind.paths.kind),"metadata":{"resourceVersion":list.resource_version,"generation":list.generation},"items":list.items.iter().map(|o|kind.encode_object(o)).collect::<Result<Vec<_>,_>>()?}))
-                }
-            };
-        }
-        if method == Method::DELETE {
-            store.delete_raw(kind, namespace, name.expect("delete name")).await?;
-            return Ok(json!({}));
-        }
-        let body: Value = serde_json::from_slice(&bytes).expect("Kubernetes request JSON");
-        assert_eq!(body["apiVersion"], api_version(kind.paths));
-        assert_eq!(body["kind"], kind.paths.kind);
-        let mut metadata = body["metadata"].clone();
-        // K8s input metadata carries the deletion fence in camelCase.
-        if let Some(timestamp) = metadata.as_object_mut().expect("metadata object").remove("deletionTimestamp") {
-            metadata["deletion_timestamp"] = timestamp;
-        }
-        let meta: InputMeta = serde_json::from_value(metadata).expect("request metadata");
-        let version = body["metadata"]["resourceVersion"].as_str();
-        let object = if method == Method::POST {
-            assert!(name.is_none());
-            assert!(version.is_none());
-            store.create_raw(kind, namespace, &meta, &body["spec"]).await?
-        } else {
-            assert_eq!(method, Method::PUT);
-            assert_eq!(name.map(String::as_str), Some(meta.name.as_str()));
-            if path.get("subresource").is_some_and(|s| s == "status") {
-                store.update_status_raw(kind, namespace, &meta.name, version.expect("status version"), &body["status"]).await?
-            } else {
-                store.update_raw(kind, namespace, &meta, version.expect("update version"), &body["spec"]).await?
-            }
-        };
-        kind.encode_object(&object)
-    }.await;
-    match result {
-        Ok(value) => axum::Json(value).into_response(),
-        Err(error) => error_response(error),
-    }
-}
-fn error_response(error: ResourceError) -> Response {
-    let status = match error {
-        ResourceError::NotFound { .. } => StatusCode::NOT_FOUND,
-        ResourceError::Conflict { .. } => StatusCode::CONFLICT,
-        ResourceError::WatchExpired { .. } => StatusCode::GONE,
-        _ => StatusCode::UNPROCESSABLE_ENTITY,
-    };
-    (status, axum::Json(json!({"message":error.to_string()}))).into_response()
-}
-async fn backend(name: &str) -> (ResourceBackend, Option<HttpFixture>) {
+async fn backend(name: &str) -> ResourceBackend {
     match name {
-        "memory" => (ResourceBackend::new(InMemoryBackend::default()), None),
-        "sqlite" => (ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")), None),
-        "http" => {
-            let fixture = HttpFixture::new().await;
-            (fixture.backend.clone(), Some(fixture))
-        }
+        "memory" => ResourceBackend::new(InMemoryBackend::default()),
+        "sqlite" => ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")),
         _ => unreachable!(),
     }
 }
@@ -152,13 +24,9 @@ macro_rules! contract {
             #[rstest::rstest]
             #[case("memory")]
             #[case("sqlite")]
-            #[case("http")]
             #[tokio::test]
             async fn shared_contract(#[case] adapter: &str, #[values(0, 1, 2, 3, 4, 5, 6, 7, 8)] scenario: u8) {
-                if cfg!(feature = "skip-no-sandbox-tests") && adapter == "http" {
-                    return;
-                }
-                let (backend, _server) = backend(adapter).await;
+                let backend = backend(adapter).await;
                 match scenario {
                     0 => assert_create_get_list_roundtrip_with_backend::<$fixture>(backend).await,
                     1 => assert_stale_resource_version_conflicts_with_backend::<$fixture>(backend).await,
@@ -182,13 +50,9 @@ contract!(convoy, ConvoyFixture);
 #[rstest::rstest]
 #[case("memory")]
 #[case("sqlite")]
-#[case("http")]
 #[tokio::test]
 async fn read_observers_cross_the_store_trait(#[case] adapter: &str) {
-    if cfg!(feature = "skip-no-sandbox-tests") && adapter == "http" {
-        return;
-    }
-    let (plain, _server) = backend(adapter).await;
+    let plain = backend(adapter).await;
     let observed = plain.clone().with_read_counts();
     let resolver = observed.using::<Convoy>("flotilla");
     resolver.create(&ConvoyFixture::meta("counted"), &ConvoyFixture::spec()).await.expect("create");
@@ -204,15 +68,14 @@ async fn read_observers_cross_the_store_trait(#[case] adapter: &str) {
 }
 
 // Selector-bounded reads are queries and unselective ones are lists, whichever
-// API spells them; replica-inclusive reads keep the same classification. (The
-// HTTP stand-in serves only the resource API, so this runs on local adapters.)
+// API spells them; replica-inclusive reads keep the same classification.
 #[rstest::rstest]
 #[case("memory")]
 #[case("sqlite")]
 #[tokio::test]
 async fn read_operations_classify_selectors(#[case] adapter: &str) {
     use flotilla_store::StoreQuery;
-    let (plain, _server) = backend(adapter).await;
+    let plain = backend(adapter).await;
     let resolver = plain.using::<Convoy>("flotilla");
     for name in ["first", "second"] {
         let meta = InputMeta::builder().name(name.into()).labels(BTreeMap::from([("pick".to_string(), name.to_string())])).build();
@@ -255,17 +118,11 @@ async fn read_operations_classify_selectors(#[case] adapter: &str) {
     }
 }
 
-// Default refusal messages describe the port; the HTTP adapter preserves its
-// legacy public errors for operations it cannot author locally.
+// Default refusal messages describe the port.
 #[tokio::test]
-async fn unsupported_defaults_are_neutral_and_http_refusals_are_unchanged() {
+async fn unsupported_defaults_are_neutral() {
     let memory = ResourceBackend::new(InMemoryBackend::default());
     assert_eq!(memory.store().unsupported_operation("replicas"), ResourceError::invalid("this store does not support replicas"));
-    let http = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), "http://127.0.0.1:1"));
-    assert!(matches!(http.store().list_replicas_raw(ResourceKind::of::<Convoy>(), "flotilla").await,
-        Err(ResourceError::Invalid { message }) if message == "HTTP backends cannot hold replicas"));
-    assert!(matches!(http.local_namespaces::<Convoy>().await,
-        Err(ResourceError::Invalid { message }) if message == "HTTP backends cannot enumerate local resource namespaces"));
 }
 
 // A named read sees the same provenances, in the same order, as the matching
@@ -278,7 +135,7 @@ async fn unsupported_defaults_are_neutral_and_http_refusals_are_unchanged() {
 async fn get_all_orders_provenances_like_list(#[case] adapter: &str) {
     use flotilla_protocol::NodeId;
     use flotilla_store::StoreExt;
-    let (plain, _server) = backend(adapter).await;
+    let plain = backend(adapter).await;
     let backend = plain.with_local_root(NodeId::new("self"));
     backend.using::<Convoy>("flotilla").create(&ConvoyFixture::meta("alpha"), &ConvoyFixture::spec()).await.expect("local");
     // Insert origins out of order so the read cannot rely on insertion order.
@@ -332,10 +189,9 @@ async fn replica_burst_recovers_sqlite() {
 #[rstest::rstest]
 #[case("memory")]
 #[case("sqlite")]
-#[case("http")]
 #[tokio::test]
 async fn read_counts_include_missing_gets(#[case] adapter: &str) {
-    let (plain, _server) = backend(adapter).await;
+    let plain = backend(adapter).await;
     let counted = plain.with_read_counts();
     assert!(matches!(counted.using::<Convoy>("flotilla").get("absent").await, Err(ResourceError::NotFound { .. })));
     assert_eq!(counted.read_snapshot().tally("Convoy", ReadOperation::Get), ReadTally { calls: 1, objects: 0 });
@@ -352,8 +208,7 @@ async fn duplicate_collection_values(#[case] adapter: &str) {
     use flotilla_store::StoreQuery;
     let directory = (adapter == "sqlite-reopen").then(|| tempfile::tempdir().unwrap());
     let path = directory.as_ref().map(|dir| dir.path().join("store.sqlite"));
-    let (backend, _server) =
-        if let Some(path) = &path { (ResourceBackend::new(SqliteBackend::open(path).unwrap()), None) } else { backend(adapter).await };
+    let backend = if let Some(path) = &path { ResourceBackend::new(SqliteBackend::open(path).unwrap()) } else { backend(adapter).await };
     let resolver = backend.using::<Convoy>("flotilla");
     let mut meta = ConvoyFixture::meta("duplicates");
     meta.labels.insert("index-contract".into(), "same".into());
@@ -461,7 +316,7 @@ async fn duplicate_collection_values(#[case] adapter: &str) {
 #[tokio::test]
 async fn replica_batch_quarantines_one_object(#[case] adapter: &str, #[values(false, true)] snapshot: bool) {
     use flotilla_store::{SerializedResource, StoreExt};
-    let (backend, _server) = backend(adapter).await;
+    let backend = backend(adapter).await;
     let source = ResourceBackend::new(InMemoryBackend::default());
     let mut objects = Vec::new();
     for name in ["before", "bad", "after"] {
@@ -614,7 +469,7 @@ async fn replica_sql_failure_rolls_back_only_one_record(#[values(false, true)] s
 #[tokio::test]
 async fn replica_snapshot_quarantine_pruning_is_bucket_scoped(#[case] adapter: &str) {
     use flotilla_store::SerializedResource;
-    let (backend, _server) = backend(adapter).await;
+    let backend = backend(adapter).await;
     let source = ResourceBackend::new(InMemoryBackend::default());
     let first = "bad";
     let second = (0..256)
@@ -648,12 +503,11 @@ async fn replica_snapshot_quarantine_pruning_is_bucket_scoped(#[case] adapter: &
 #[rstest::rstest]
 #[case("memory")]
 #[case("sqlite")]
-#[case("http")]
 #[tokio::test]
 async fn admission_placement_is_published_with_convoy(#[case] adapter: &str) {
     use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
     use flotilla_resources::convoy::ADMISSION_PLACEMENT_ANNOTATION;
-    let (backend, _fixture) = backend(adapter).await;
+    let backend = backend(adapter).await;
     let convoys = backend.using::<Convoy>("flotilla");
     let decision = PlacementDecision {
         provider_instance: None,
@@ -716,13 +570,9 @@ async fn admission_placement_is_published_with_convoy(#[case] adapter: &str) {
 #[rstest::rstest]
 #[case("memory")]
 #[case("sqlite")]
-#[case("http")]
 #[tokio::test]
 async fn legacy_environment_instance_survives_read_write_and_noop(#[case] adapter: &str, #[values(false, true)] direct: bool) {
-    if cfg!(feature = "skip-no-sandbox-tests") && adapter == "http" {
-        return;
-    }
-    let (backend, _server) = backend(adapter).await;
+    let backend = backend(adapter).await;
     let meta = InputMeta::builder()
         .name("legacy-environment".into())
         .labels(BTreeMap::from([("flotilla.work/environment-provider-instance".into(), "custom-instance".into())]))
@@ -765,7 +615,7 @@ async fn legacy_environment_instance_survives_read_write_and_noop(#[case] adapte
 #[tokio::test]
 async fn built_in_definitions_are_read_from_the_code_and_never_written(#[case] adapter: &str) {
     use flotilla_resources::{builtins::builtin_definitions, ImageLayer, WorkflowTemplate};
-    let (backend, _server) = backend(adapter).await;
+    let backend = backend(adapter).await;
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let builtin_names =
         |kind: &str| builtin_definitions(kind).expect("built-ins load").iter().map(|builtin| builtin.name.clone()).collect::<Vec<_>>();

@@ -37,7 +37,7 @@ async fn a_watched_listing_reads_a_convoy_end_its_watch_has_not_told() {
     assert_eq!(listed().await, std::slice::from_ref(&vessel), "a lost launch is listed while its convoy is live");
 
     let ended = backend.using::<Convoy>(NAMESPACE).get(&launch).await.expect("convoy");
-    convoys.path().get().expect("the Convoy path").abandon(&ended, "operator", "abandoned").await.expect("abandon");
+    convoys.path().abandon(&ended, "operator", "abandoned").await.expect("abandon");
     assert!(listed().await.is_empty(), "the convoy's end is read from the log at the listing");
 }
 

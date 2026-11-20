@@ -379,7 +379,7 @@ async fn a_seat_that_resubmits_after_a_review_fix_is_not_nudged() {
     let Coder { daemon, backend, probe, clock, launch, .. } = coder;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let convoy = convoys.get(&probe.convoy).await.expect("convoy");
-    let recorded = daemon.convoy_engine_path().get().expect("engine").recorded_promises(&convoy, None).expect("recorded read");
+    let recorded = daemon.convoy_engine_path().recorded_promises(&convoy, None).expect("recorded read");
     let resubmitted = recorded.expect("held")["work"]["coder"].iter().find(|promise| promise.id == pr.id).expect("the PR promise").clone();
     assert_eq!(resubmitted.submissions.len(), 2, "the fix is a second submission");
     assert!(resubmitted.submissions.iter().all(|submission| submission.submitted_at.is_some()), "{resubmitted:?}");
@@ -510,7 +510,7 @@ async fn a_resubmission_after_a_turn_answers_it_with_the_head_unchanged() {
     deliver_review_fix(&coder).await;
     resubmit_pr(&coder, &pr).await;
     let convoy = coder.backend.clone().using::<ResourceConvoy>("flotilla").get(&coder.probe.convoy).await.expect("convoy");
-    let recorded = coder.daemon.convoy_engine_path().get().expect("engine").recorded_promises(&convoy, None).expect("recorded read");
+    let recorded = coder.daemon.convoy_engine_path().recorded_promises(&convoy, None).expect("recorded read");
     let resubmitted = recorded.expect("held")["work"]["coder"].iter().find(|promise| promise.id == pr.id).expect("the PR promise").clone();
     assert_eq!(resubmitted.submissions.len(), 2, "the resubmission is recorded: {resubmitted:?}");
     assert_not_nudged(coder).await;
@@ -824,8 +824,8 @@ async fn assert_not_nudged_again(coder: &Coder) {
 /// What a restart loses: the home's in-memory notes on the coder's convoy, turn delivery's
 /// episodes among them.
 fn restart(coder: &Coder) {
-    coder.daemon.convoy_engine_path().get().expect("engine").memory().update(&coder.probe.convoy, |notes| *notes = Default::default());
-    let convoy = coder.daemon.convoy_engine_path().get().expect("engine").memory().get(&coder.probe.convoy);
+    coder.daemon.convoy_engine_path().memory().update(&coder.probe.convoy, |notes| *notes = Default::default());
+    let convoy = coder.daemon.convoy_engine_path().memory().get(&coder.probe.convoy);
     assert!(convoy.turn_deliveries.is_empty());
 }
 

@@ -66,9 +66,7 @@ impl EngineHome {
 
     /// The Message path, as the crew and its leaf subscriptions take it.
     pub fn message_path(&self) -> crate::ports::MessagePath {
-        let path = crate::ports::MessagePath::default();
-        let _ = path.set(self.messages.messages());
-        path
+        self.messages.messages()
     }
 
     /// Records the message `record` sent to `receiver` as a turn `session` confirmed at `at`, as
@@ -140,7 +138,7 @@ impl EngineHome {
     pub async fn admit_reserved(&self, launch: &str, spec: ConvoySpec, status: ConvoyStatus) {
         let convoy = flotilla_engine_convoys_testkit::convoy(&self.namespace, launch, spec, status.clone());
         self.engine().admit_reserved(&convoy).await.expect("admit the launch");
-        set_notes(&self.path(), launch, &status).expect("note the launch's status");
+        set_notes(&self.path(), launch, &status);
     }
 
     /// Launch `launch` as its view reads, through `backend`.
@@ -257,13 +255,13 @@ impl EngineHome {
         let convoy = self.view(backend, launch).await;
         let mut status = convoy.status.unwrap_or_default();
         change(&mut status);
-        set_notes(&self.path(), launch, &status).expect("note the launch");
+        set_notes(&self.path(), launch, &status);
         self.view(backend, launch).await
     }
 
     /// The Convoy path's engine.
     pub fn engine(&self) -> Arc<dyn EngineConvoys> {
-        self.path().get().cloned().expect("the Convoy path is installed")
+        self.path()
     }
 }
 

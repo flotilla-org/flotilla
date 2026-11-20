@@ -2114,9 +2114,8 @@ pub enum ConvoyStatusPatch {
         vessel: String,
         role: String,
         at: DateTime<Utc>,
-        /// With `[primitives]` on, the engine decided the crew's promises are
-        /// settled and the stored status holds none to check again (#3587
-        /// layer 8); otherwise apply rechecks the stored promises.
+        /// When the engine decided the crew's promises are settled, the stored status holds none
+        /// to check again (#3587 layer 8); otherwise apply rechecks the stored promises.
         engine: bool,
     },
     MarkCrewCompleted {

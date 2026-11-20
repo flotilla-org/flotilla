@@ -66,12 +66,6 @@ Desk and crew vessel builds keep Cargo incrementals enabled. CI builds set `CARG
 
 Only when `CODEX_SANDBOX` is set, use `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped. Everywhere else, use the default `TMPDIR`. Either way, pass the affected packages (`-p <pkg>`) instead of `--workspace` for the local gate. Unix-socket tests use the shared harness's SUN_LEN-safe directory directly beneath `/tmp`, independent of `TMPDIR`; do not change this command to work around socket-path length errors.
 
-Controller-backed in-process daemon coverage lives in `flotilla-controllers`' registered integration binary:
-
-```bash
-cargo test -p flotilla-controllers --locked --test integration in_process_daemon::
-```
-
 Shared helpers live in dev-only `flotilla-*-testkit` crates; production crates have no `test-support` or `replay` features.
 Tokio `test-util` is selected only by dev-dependencies. Package-local test commands need no helper flags.
 Core and daemon unit tests compile shared adapter sources only under `cfg(test)` to retain the unit-test library's trait identity;
@@ -81,7 +75,7 @@ rejects production testkit dependencies and production `test-util`, and runs in 
 adding dependencies. The build-graph check resolves the full Cargo graph to enforce the boundary on external Rigging crates; its first run may fetch the locked Git sources. Optional TLS providers and sandbox skips remain opt-in.
 Workspace tests require Python 3.9+ and Cargo on PATH (`python` on Windows, `python3` elsewhere) for this guard.
 
-`flotilla-store-testkit`, `flotilla-crew` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.
+`flotilla-store-testkit` and `flotilla-crew` collect their integration tests in `tests/integration/main.rs`.
 The store-testkit `watch_allocations` and `decode_cost` targets and the daemon `daemon_allocations` target stay separate because they install process-wide counting allocators.
 `flotilla-daemon` uses that target for general integration tests and `tests/request_session_pair/main.rs` for routing scenarios.
 Run `cargo test -p <package> --locked --test integration` for the integration target, and
@@ -185,7 +179,6 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-messaging` | Resource-backed inbox admission, delivery through the agent-connector `TransportRouter`, conditions and receiver/role routing, and the `EngineMessages` port onto the engine's Message path |
 | `flotilla-store` | Object-safe `Store`, typed resolvers, replica/watch machinery, store queries, generic request snapshots and merged definition-catalog reads, and the generic controller runtime || `flotilla-store-memory` | In-memory storage and observed replicas; no native persistence dependencies |
 | `flotilla-store-sqlite` | SQLite persistence, schema, transactions and decode quarantine |
-| `flotilla-store-http` | Kubernetes-isomorphic HTTP storage client |
 | `flotilla-store-testkit` | Shared backend contracts, fixtures and per-request read counters |
 | `flotilla-schema-derive` | `Stored` generates codecs, descriptors and edge handles; `Describe` generates descriptions only; `Verb` generates a native verb's declaration into `flotilla_verbs`. Shape attributes (`child`, `flatten`, `intern`, `code`) are separate from storage policies (#3320, ADR 0067) |
 | `flotilla-schema` | Backend-neutral `TableSet` descriptions and `Describe` traits for stored kinds and query rows, declared indexes, logical rows codec, the append-only `Records` type, the `EdgeEvent` edge event and inline CBOR documents, typed edge handles and the `Edge` builder, typed index queries (`IndexQuery`), log entries (`Event`, with named field-level `Effect`s) and write origins, timestamps, the kind-code registry and the schema review view (`render_view`); re-exports the derive |
@@ -199,7 +192,6 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `rigging-ssh` (external) | OpenSSH argument builders and the forwarded-socket waiter for the peer transport, from the locked Rigging commit |
 | `rigging-replay-testkit` (external, dev-only) | Replay sessions, recording, masks, mock runners and HTTP stand-ins |
 | `flotilla-replay-testkit` | GitHub replay channel over `rigging-replay-testkit` scheduling, masks and test helpers |
-| `flotilla-controllers` | Cross-capability reconciler tests and the `provisioned_mount` helper, pending retirement |
 | `flotilla-commands` | Resource-oriented command preparation and execution |
 | `flotilla-transport` | Framed message sessions over Unix sockets or in-memory channels for daemon client and peer connections |
 | `flotilla` (root) | Thin `src/main.rs` entry point |

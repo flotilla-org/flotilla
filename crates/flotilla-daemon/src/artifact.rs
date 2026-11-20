@@ -406,7 +406,7 @@ mod tests {
         home_blobs.sync_once().await.expect("sync to fleet store");
         // The launch ends; its brief outlives it.
         let ended = home.convoy(convoy).await;
-        home.convoys.path().get().expect("the Convoy path").abandon(&ended, "operator", "abandoned").await.expect("end the launch");
+        home.convoys.path().abandon(&ended, "operator", "abandoned").await.expect("end the launch");
         assert!(backend.using::<Artifact>(namespace).get(&artifact.metadata.name).await.is_ok());
         let fetched = remote_blobs.get(&BlobDigest::parse(&digest).expect("valid digest")).await.expect("fetch on remote host");
         assert_eq!(fetched.as_deref(), Some(body.as_slice()));
