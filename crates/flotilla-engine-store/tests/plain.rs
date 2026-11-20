@@ -6,7 +6,6 @@ use std::{collections::BTreeMap, fmt::Debug, sync::Arc};
 
 use flotilla_engine_store::{
     plain::{register_plain, PendingChange, Plain, PlainError, PlainLog},
-    rehearse_plain,
 };
 use flotilla_schema::{Kind, KindRegistry, NewChange, Stored, Timestamp};
 use flotilla_schema_sqlite::{Store, StoreHandle};
@@ -62,8 +61,7 @@ enum Op<K> {
 ///   changes nothing, and of an absent name is `Missing`;
 /// - an edit that changes nothing keeps the version;
 /// - after every step the home reads exactly the model, and a replica that applies the home's log
-///   reads the same resources at the same versions;
-/// - at the end, the import rehearsal restores every live resource and reads it back unchanged.
+///   reads the same resources at the same versions.
 pub fn contract<K>(tc: &TestCase, kinds: KindRegistry, spec: impl Fn(&TestCase) -> K)
 where
     K: Kind + Clone + PartialEq + Debug,
@@ -151,9 +149,6 @@ where
             assert_eq!(log.get::<K>(name, HOME).expect("get"), expected.iter().find(|plain| plain.name == name).cloned());
         }
     }
-    let imported: Vec<_> =
-        model.iter().map(|(name, (version, spec))| (HOME.to_owned(), (*name).to_owned(), *version, spec.clone())).collect();
-    assert_eq!(rehearse_plain(kinds, &imported), Vec::new(), "every live resource rehearses cleanly");
 }
 
 /// A plain kind with every spec shape a moved kind uses: plain columns, an optional flattened

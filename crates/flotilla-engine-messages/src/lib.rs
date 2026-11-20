@@ -36,7 +36,7 @@ use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_engine_store::StoreLog;
 use flotilla_inbox::{sqlite::SqliteInbox, ConsumerLog, ConsumerPort, InboxBackend, Observations, ReceiptScope, Supervision};
 use flotilla_messaging::MessageResolution;
-use flotilla_resources::convoy::engine::{convoy_reference_address, NoLaunch};
+use flotilla_resources::convoy::engine::convoy_reference_address;
 use flotilla_resources::{
     address::{artifact_address, record_name as address_record_name, repository_address},
     Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, Project, ReadResourceObject, Repository,
@@ -2510,10 +2510,9 @@ impl OldStoreRecords {
         }
     }
 
-    /// [`Self::convoy_project`], or a refusal naming the convoy as one this host does not hold, in
-    /// the form the import reads to make a tombstone of it.
+    /// [`Self::convoy_project`], or a refusal naming the convoy as one this host does not hold.
     fn held_convoy_project(&self, name: &str) -> Result<String, String> {
-        self.convoy_project(name).ok_or_else(|| format!("`convoy:{name}` {} (`{name}`)", NoLaunch::NotHeld.class()))
+        self.convoy_project(name).ok_or_else(|| format!("`convoy:{name}` names a convoy not in this host's replica (`{name}`)"))
     }
 
     fn convoy_address(&self, name: &str) -> Result<Address, String> {
