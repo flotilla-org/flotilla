@@ -21,7 +21,6 @@ mod repository_in_memory;
 mod resource_projection;
 mod sqlite;
 mod status_patch;
-mod stored_corpus;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;
 mod workflow_template_in_memory;

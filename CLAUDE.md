@@ -12,10 +12,10 @@ A system for improving multi-agent developer workflows. Consists of a daemon mes
   - manifests in project-map and ops repositories;
   - daemon config.
 
-  Write only the new shape. For a rename add a serde `alias`, for a new field a `default`, and for a retired field a deserialize-only record type that accepts and drops it (see `VesselRequirement`'s `stance`); for a retired kind, an entry in `RETIRED_RESOURCE_KINDS` that decodes its rows as retired and dropped (ADR 0047 §4). Comment each shim with when it can be removed (one roll later). There is still no migration framework.
+  Write only the new shape. For a rename add a serde `alias`, for a new field a `default`, and for a retired field a deserialize-only record type that accepts and drops it (see `VesselRequirement`'s `stance`). Comment each shim with when it can be removed (one roll later). There is still no migration framework.
 - **Out-of-repo manifests**: stay compatible, or ship the project-map/ops manifest update in the same roll.
   Operational entries in ops repositories follow the same N→N+1 rule: retired fields are accepted and dropped for one generation, while genuinely unknown fields remain errors. The candidate pre-roll validation must parse registered projects' operational entries as well as decode stored records; a refusal fails the gate.
-- **Enforcement**: `cargo test` decodes a golden corpus of real stored records (#2169). If it fails, fix the decoder with an alias, default, or record type. **Never regenerate the corpus to make a PR pass**; it is refreshed only after a fleet roll. Before each roll, the candidate decodes every host's live store (#2167).
+- **Enforcement**: before each roll, the candidate decodes every host's engine store (`flotilla resource validate --from-store`, or `--from-daemon` on a running host). The golden corpus of old-store records is gone with the old store; a corpus of engine-store records taken after the next roll is tracked in a follow-up issue. **Never regenerate a corpus to make a PR pass.**
 
 ### Plane-A freeze (transition in progress)
 
@@ -51,7 +51,6 @@ Before pushing, run the local gate:
 - `cargo fmt --check` (whole workspace).
 - Clippy and tests for the **affected packages only**: each workspace package whose files the change touches (`crates/<name>/`, plus the root `flotilla` package for `src/`), as `cargo clippy -p <pkg>... --all-targets --locked -- -D warnings` and `cargo test -p <pkg>... --locked`.
 - The build-graph check and the Git check, with their tests, when the change touches Cargo manifests, dependencies or Git-invoking code.
-- The stored-record corpus decode (`cargo test -p flotilla-store-testkit --locked --test integration stored_corpus`) when the change touches a resource kind's serialized shape.
 - A change that maps to no package (`ci/`, workspace `Cargo.toml`, `rust-toolchain.toml`) runs the check that owns that file: the build-graph or Git check and their tests, or `cargo check --workspace --locked` for a toolchain or workspace-manifest change.
 - A change to a widely used package (protocol, resources, store, core) still runs only its own tests locally; CI covers its dependents.
 
