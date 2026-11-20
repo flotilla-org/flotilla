@@ -14,7 +14,7 @@ use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     pinned_workflow_ref, Convoy, ConvoyPhase, CredentialSpec, CredentialSpecSpec, Environment, InputDefinition, K8sResourceObject,
-    Resource, ResourceObject, SkillCatalogEntry, Vessel, WorkflowTemplateSpec, IMAGE_DIGESTS_CAPABILITY,
+    Resource, ResourceObject, SkillCatalogEntry, Vessel, WorkflowTemplateSpec, CONVOY_UNREADABLE_ANNOTATION, IMAGE_DIGESTS_CAPABILITY,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -193,6 +193,19 @@ fn namespace(document: &Value) -> &str {
     document["metadata"]["namespace"].as_str().unwrap_or("<missing namespace>")
 }
 
+/// A retired convoy as an r985 daemon serves it when it does not hold the entry of its end: no
+/// status, and an unreadable annotation saying it retired. It has ended. From r987 the daemon
+/// serves it with the terminal phase `Ended`; remove this once no r985 daemon is left to validate
+/// against (one roll after r987).
+fn retired_unreadable(convoy: &ResourceObject<Convoy>) -> bool {
+    convoy.status.is_none()
+        && convoy
+            .metadata
+            .annotations
+            .get(CONVOY_UNREADABLE_ANNOTATION)
+            .is_some_and(|reason| reason.contains(" retired, and the log entry of its end is not held here"))
+}
+
 fn name(document: &Value) -> &str {
     document["metadata"]["name"].as_str().unwrap_or("<unnamed>")
 }
@@ -201,7 +214,7 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
     let mut report = Report { inventory_complete: true, ..Report::default() };
     for document in inventory.iter().filter(|document| document["kind"] == "Convoy") {
         let convoy = decode::<Convoy>(document).map_err(|error| eyre!("Convoy/{}/{}: {error:#}", namespace(document), name(document)))?;
-        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) || retired_unreadable(&convoy) {
             continue;
         }
         report.live_convoys += 1;
@@ -555,6 +568,23 @@ mod tests {
         assert_eq!(bad.skills.unsatisfied, 1);
         assert_eq!(bad.failures.len(), 1);
         assert!(bad.failures[0].contains("Convoy/fleet/governor") && bad.failures[0].contains(&"1".repeat(40)));
+    }
+
+    // An r985 daemon serves a retired convoy whose end entry it does not hold with no status and
+    // an unreadable annotation saying it retired: it has ended, so it is not checked as live (the
+    // r986 roll was refused on udder for one). A convoy unreadable for another reason still is.
+    #[tokio::test]
+    async fn a_retired_convoy_served_unreadable_is_not_live() {
+        let (_, mut inventory) = frozen_store().await;
+        let supply = Supply { revision: "2".repeat(40), image_available: false };
+        inventory[0]["status"] = Value::Null;
+        inventory[0]["metadata"]["annotations"][CONVOY_UNREADABLE_ANNOTATION] =
+            Value::String("convoy project:katzensteg/convoy:governor#18 retired, and the log entry of its end is not held here".into());
+        let report = check(&inventory, &BTreeSet::new(), &supply).await.expect("check");
+        assert_eq!(report.live_convoys, 0, "{:?}", report.failures);
+        inventory[0]["metadata"]["annotations"][CONVOY_UNREADABLE_ANNOTATION] =
+            Value::String("convoy governor's admission: undecodable".into());
+        assert_eq!(check(&inventory, &BTreeSet::new(), &supply).await.expect("check").live_convoys, 1);
     }
 
     // An explicit reason-bearing marker waives the frozen-reference gate only;
