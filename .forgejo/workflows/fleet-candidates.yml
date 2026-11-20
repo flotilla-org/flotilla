@@ -88,6 +88,9 @@ jobs:
         env:
           # Read-only access to private pinned skill sources; no project write scope.
           GH_TOKEN: ${{ secrets.SKILL_SOURCES_READ_TOKEN }}
+          # The run's own token reads the lab Zig package mirror (lab/zig-packages);
+          # build-candidate.sh hands it only to Cleat's package fetch.
+          FLEET_ZIG_PACKAGE_MIRROR_TOKEN: ${{ forgejo.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -179,6 +182,9 @@ jobs:
         env:
           # Read-only access to private pinned skill sources; no project write scope.
           GH_TOKEN: ${{ secrets.SKILL_SOURCES_READ_TOKEN }}
+          # The run's own token reads the lab Zig package mirror (lab/zig-packages);
+          # build-candidate.sh hands it only to Cleat's package fetch.
+          FLEET_ZIG_PACKAGE_MIRROR_TOKEN: ${{ forgejo.token }}
         shell: /bin/bash -e {0}
         run: orchestration/ci/fleet-candidates/build-candidate.sh
 
