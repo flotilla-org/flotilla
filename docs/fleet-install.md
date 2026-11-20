@@ -148,8 +148,7 @@ check:
   and the bound charter inputs of manifest roots.
 
 The store on disk is only copied. A state directory with no `decided.sqlite`
-has nothing to check; one holding only the old `resources.sqlite` is refused,
-since the first start no longer imports it.
+has nothing to check.
 
 After validation, `--offline` switches `current` and `previous`, writes the
 unit or launch agent and the Darwin `tcc` copies, records the roll, and does

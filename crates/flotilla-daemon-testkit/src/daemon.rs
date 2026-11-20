@@ -348,14 +348,7 @@ impl TestDaemon {
     pub fn serve_socket(&self, socket: &std::path::Path) -> MainSocket {
         let listener = tokio::net::UnixListener::bind(socket).unwrap_or_else(|error| panic!("bind {}: {error}", socket.display()));
         let daemon = Arc::clone(&self.daemon);
-        MainSocket(
-            socket.to_path_buf(),
-            tokio::spawn(async move {
-                while let Ok((stream, _)) = listener.accept().await {
-                    tokio::spawn(flotilla_daemon::server::serve_local_http(stream, Arc::clone(&daemon)));
-                }
-            }),
-        )
+        MainSocket(socket.to_path_buf(), tokio::spawn(flotilla_daemon::stopped_store::serve_resource_socket(listener, daemon)))
     }
 
     /// The directory that holds the daemon's configuration and its state, as `--config-dir` and
@@ -796,11 +789,6 @@ pub struct StoppedDaemon {
 }
 
 impl StoppedDaemon {
-    /// The directory that holds the stopped daemon's configuration and its store.
-    pub fn config_dir(&self) -> std::path::PathBuf {
-        self.dir.path().join("config")
-    }
-
     /// Start the daemon again over the same store, as a process restart does.
     pub async fn start(self) -> TestDaemon {
         let Self { fleet, composition, dispatched, dir, node } = self;

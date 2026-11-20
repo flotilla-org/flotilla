@@ -527,7 +527,7 @@ async fn local_ops_inventory(roots: &[PathBuf]) -> (GitRepositoryInspector, BTre
 /// preview, the frozen-reference check over the environments the store holds, the skill catalog,
 /// every registered Project's operational entries and the bound charter inputs of manifest roots.
 ///
-/// A state directory with no store has nothing to check, and one with only an old store is refused.
+/// A state directory with no store has nothing to check.
 #[cfg(unix)]
 pub(crate) async fn validate_store_with_options(
     config: &ConfigStore,
@@ -839,7 +839,7 @@ mod tests {
     // HTTP audit (#1512): inventory/resource validation speaks the owned daemon
     // API over a local Unix socket. The socket integration tests below exercise
     // its actual server; no external-service stand-in or recorded replay applies.
-    use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+    use std::{path::Path, sync::Arc, time::Duration};
 
     use flotilla_config::ConfigStore;
     use flotilla_daemon::server::DaemonServer;
@@ -853,186 +853,6 @@ mod tests {
         collect_files, inspect_validation_roots, ops_inventory_endpoint_absent, parse_documents, validate_daemon, validate_grant_documents,
         validate_path, validate_project_ops, VALIDATION_INSPECTION_HOST,
     };
-
-    fn import_gate_inventory(case: &str) -> BTreeMap<String, Vec<Value>> {
-        let document = |kind, name, spec, status| {
-            serde_json::json!({
-                "apiVersion":"flotilla.work/v1", "kind":kind,
-                "metadata":{"name":name,"namespace":"flotilla","resourceVersion":"1","creationTimestamp":"2026-10-19T00:00:00Z"},
-                "spec":spec,"status":status
-            })
-        };
-        let checkout = document(
-            "Checkout",
-            "observed",
-            serde_json::json!({
-                "kind":"observed","ref":"main","path":"/repo","repo_ref":"repo","host_ref":"host","is_main":true
-            }),
-            serde_json::json!({"phase":"Ready"}),
-        );
-        let terminal = document(
-            "TerminalSession",
-            "missing-identity",
-            serde_json::json!({
-                "env_ref":"env","role":"tool","source":{"kind":"tool","command":"true"},"cwd":"/repo","pool":"cleat"
-            }),
-            serde_json::json!({"phase":"Running"}),
-        );
-        let mut message = document(
-            "Message",
-            "message",
-            serde_json::json!({
-                "sender":"principal:alice","receiver":"flotilla/demo/work/coder","relation":"system","body":"hello"
-            }),
-            serde_json::json!({"phase":"accepted","since":"2026-10-19T00:00:00Z","acceptedSequence":1}),
-        );
-        let mut designation =
-            document("FleetDesignation", "fleet", serde_json::json!({"fleet":"lab", "project":"project-map"}), Value::Null);
-        if matches!(case, "named-designation" | "unnamed-designation") {
-            message["spec"]["sender"] = serde_json::json!("system:nudge");
-            message["spec"]["receiver"] = serde_json::json!("system:turn-rules");
-        }
-        if case == "unnamed-designation" {
-            designation["spec"].as_object_mut().expect("designation spec").remove("fleet");
-        }
-        // Usage is retired (#3943); a previous-generation daemon still lists its rows (#4007).
-        let usage = document(
-            "Usage",
-            "usage-b31c",
-            serde_json::json!({"provider":"codex","account":"crew@example.com"}),
-            serde_json::json!({"windows":[{"name":"weekly","used_percent":41.0}],"observed_at":"2026-10-17T00:00:00Z"}),
-        );
-        BTreeMap::from([
-            ("checkouts".into(), if case == "observed-checkout" { vec![checkout] } else { vec![] }),
-            ("usages".into(), if case == "retired-usage" { vec![usage.clone(), usage] } else { vec![] }),
-            ("terminalsessions".into(), if case == "missing-identity" { vec![terminal] } else { vec![] }),
-            (
-                "messages".into(),
-                if matches!(case, "named-designation" | "unnamed-designation") {
-                    vec![message]
-                } else if matches!(case, "message-refusal" | "missing-designation") {
-                    vec![message.clone(), message]
-                } else {
-                    vec![]
-                },
-            ),
-            (
-                "fleetdesignations".into(),
-                if matches!(case, "message-refusal" | "named-designation" | "unnamed-designation") { vec![designation] } else { vec![] },
-            ),
-        ])
-    }
-
-    // Stand-in for the resource HTTP process boundary. The inventory determines
-    // the expected requests; shutdown verifies all collections were fetched.
-    async fn serve_import_inventory(
-        socket: &std::path::Path,
-        inventory: BTreeMap<String, Vec<Value>>,
-        host_id: Option<&str>,
-    ) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
-        use tokio::{
-            io::{AsyncReadExt, AsyncWriteExt},
-            net::UnixListener,
-        };
-        let listener = UnixListener::bind(socket).unwrap();
-        let (stop, mut stopped) = tokio::sync::oneshot::channel();
-        let kinds: Vec<_> = inventory.keys().cloned().collect();
-        let namespaces: BTreeMap<_, _> = kinds.iter().map(|kind| (kind.clone(), vec!["flotilla"])).collect();
-        let mut responses =
-            BTreeMap::from([("/apis/flotilla.work/v1".to_string(), serde_json::json!({"kinds":kinds,"namespaces":namespaces}))]);
-        for (kind, items) in inventory {
-            responses.insert(format!("/apis/flotilla.work/v1/namespaces/flotilla/{kind}"), serde_json::json!({"items":items}));
-        }
-        let merged_hosts = responses.get("/apis/flotilla.work/v1/namespaces/flotilla/hosts").cloned();
-        let host_list = host_id.map(|host_id| {
-            let entry = flotilla_protocol::HostListEntry {
-                environment_id: Some(flotilla_protocol::EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(host_id))),
-                host_name: flotilla_protocol::HostName::new("local"),
-                node: None,
-                is_local: true,
-                configured: false,
-                connection_status: flotilla_protocol::PeerConnectionState::Disconnected,
-                reconnect: None,
-                has_summary: true,
-                repo_count: 0,
-            };
-            let outcome = flotilla_protocol::CommandValue::HostList(Box::new(flotilla_protocol::HostListResponse { hosts: vec![entry] }));
-            serde_json::json!({"state":"finished","outcome":outcome})
-        });
-        let task = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = tokio::select! {
-                    _ = &mut stopped => {
-                        assert!(responses.is_empty(), "unfetched collections: {:?}", responses.keys());
-                        return;
-                    }
-                    connection = listener.accept() => connection.unwrap(),
-                };
-                let mut request = Vec::new();
-                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let mut buffer = [0; 4096];
-                    let count = stream.read(&mut buffer).await.unwrap();
-                    assert!(count > 0);
-                    request.extend_from_slice(&buffer[..count]);
-                }
-                let request = String::from_utf8(request).unwrap();
-                let path = request.split_whitespace().nth(1).unwrap().split('?').next().unwrap();
-                let (status, body) = match (request.starts_with("POST "), path, &host_list) {
-                    (true, "/v1/commands", Some(_)) => ("202 Accepted", serde_json::json!({"url":"/v1/commands/host-list"})),
-                    (false, "/v1/commands/host-list", Some(host_list)) => ("200 OK", host_list.clone()),
-                    (_, path, _) if path.starts_with("/v1/commands") => ("404 Not Found", Value::Null),
-                    _ => {
-                        assert!(request.starts_with("GET "));
-                        let target = request.split_whitespace().nth(1).unwrap();
-                        if let Some(merged) = merged_hosts.as_ref().filter(|_| target.ends_with("/hosts?includeReplicas=true")) {
-                            ("200 OK", merged.clone())
-                        } else {
-                            ("200 OK", responses.remove(path).unwrap_or_else(|| panic!("unexpected or duplicate request {path}")))
-                        }
-                    }
-                };
-                let body = body.to_string();
-                stream
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-            }
-        });
-        (stop, task)
-    }
-
-    // A running daemon already imported its store and serves engine records (a Message's
-    // receiver in address form, as at the r984 roll): validating it rehearses no import, so no
-    // record the old importer would refuse fails the gate. The HTTP stand-in is the
-    // resource-socket process boundary.
-    #[tokio::test]
-    async fn a_running_daemon_is_not_refused_for_records_the_import_would_refuse() {
-        rigging_tls::install_default_provider();
-        for case in [
-            "empty",
-            "observed-checkout",
-            "retired-usage",
-            "missing-identity",
-            "message-refusal",
-            "missing-designation",
-            "named-designation",
-            "unnamed-designation",
-        ] {
-            let socket_dir = TestSocketDir::new();
-            let socket = socket_dir.socket_path("import-gate.sock");
-            let (stop, server) = serve_import_inventory(&socket, import_gate_inventory(case), None).await;
-            let result = super::validate_daemon_with_options(&socket, Some(&[]), None, &super::ValidationOptions::default()).await;
-            let _ = stop.send(());
-            tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
-            assert!(result.is_ok(), "case={case}: {result:?}");
-        }
-    }
 
     // Owner ruling #2491: the actual offline manifest command catches the
     // mixed case across files, including a listed empty map, before admission.
@@ -2257,7 +2077,7 @@ mod busy_daemon_retry {
         validate(&dir, "--from-daemon").await.expect("the running daemon's healthy store validates");
         drop(serving);
         let stopped = daemon.stop().await;
-        validate(&stopped.config_dir(), "--from-store").await.expect("the stopped healthy store validates");
+        validate(&dir, "--from-store").await.expect("the stopped healthy store validates");
 
         // A crew-skill default naming a skill the candidate's catalog does not hold.
         let daemon = stopped.start().await;
@@ -2266,8 +2086,8 @@ mod busy_daemon_retry {
         let serving = daemon.serve_socket(&socket);
         let running = validate(&dir, "--from-daemon").await.expect_err("the running daemon's broken record is refused");
         drop(serving);
-        let stopped = daemon.stop().await;
-        let offline = validate(&stopped.config_dir(), "--from-store").await.expect_err("the stopped broken record is refused");
+        let _stopped = daemon.stop().await;
+        let offline = validate(&dir, "--from-store").await.expect_err("the stopped broken record is refused");
         for error in [format!("{running:#}"), format!("{offline:#}")] {
             assert!(error.contains("missing-skill"), "{error}");
         }

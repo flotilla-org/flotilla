@@ -21,13 +21,13 @@ use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::HostName;
 use tokio::{net::UnixListener, task::JoinHandle};
 
-use crate::{engine_import::OLD_STORE, peer::HostPeerOverlay, server::serve_local_http};
+use crate::{peer::HostPeerOverlay, server::serve_local_http};
 
 /// A copy of a stopped host's engine store, opened by a daemon that serves its resource API on
 /// [`StoppedStore::socket`] until this is dropped.
 pub struct StoppedStore {
     socket: PathBuf,
-    daemon: Arc<InProcessDaemon>,
+    _daemon: Arc<InProcessDaemon>,
     serving: JoinHandle<()>,
     followers: Vec<JoinHandle<()>>,
     // Removes the copy when dropped, after the daemon that has it open.
@@ -37,21 +37,12 @@ pub struct StoppedStore {
 impl StoppedStore {
     /// Opens the engine store in `config`'s state directory, with `observation_roots` as the
     /// daemon's start would track them. `None` when the state directory holds no store, so the
-    /// first start begins empty. A state directory holding only the old store is refused: no host
-    /// holds one now, and nothing imports it.
+    /// first start begins empty.
     pub async fn open(config: &ConfigStore, observation_roots: Vec<PathBuf>) -> Result<Option<Self>, String> {
         let state_dir = config.state_dir().as_path();
         let engine = state_dir.join(decided::ENGINE_STORE);
         if !engine.exists() {
-            let old = state_dir.join(OLD_STORE);
-            return match old.exists() {
-                true => Err(format!(
-                    "{} is an old store and {} is absent: the first start no longer imports it",
-                    old.display(),
-                    engine.display()
-                )),
-                false => Ok(None),
-            };
+            return Ok(None);
         }
         let copy =
             tempfile::Builder::new().prefix("flotilla-validate-").tempdir().map_err(|error| format!("create the store copy: {error}"))?;
@@ -98,18 +89,13 @@ impl StoppedStore {
 
         let socket = copy.path().join("resources.sock");
         let listener = UnixListener::bind(&socket).map_err(|error| format!("bind {}: {error}", socket.display()))?;
-        let serving = tokio::spawn(accept(listener, Arc::clone(&daemon)));
-        Ok(Some(Self { socket, daemon, serving, followers, _copy: copy }))
+        let serving = tokio::spawn(serve_resource_socket(listener, Arc::clone(&daemon)));
+        Ok(Some(Self { socket, _daemon: daemon, serving, followers, _copy: copy }))
     }
 
     /// The socket the copy's resource API is served on.
     pub fn socket(&self) -> &Path {
         &self.socket
-    }
-
-    /// The daemon that has the copy open.
-    pub fn daemon(&self) -> &Arc<InProcessDaemon> {
-        &self.daemon
     }
 }
 
@@ -122,7 +108,9 @@ impl Drop for StoppedStore {
     }
 }
 
-async fn accept(listener: UnixListener, daemon: Arc<InProcessDaemon>) {
+/// Serves `daemon`'s resource API to every connection `listener` accepts, as the main socket
+/// serves the operator's process.
+pub async fn serve_resource_socket(listener: UnixListener, daemon: Arc<InProcessDaemon>) {
     while let Ok((stream, _)) = listener.accept().await {
         tokio::spawn(serve_local_http(stream, Arc::clone(&daemon)));
     }
