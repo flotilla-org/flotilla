@@ -54,7 +54,7 @@ pub fn run(
 ) -> BoxFuture<'_, Result<(), ResourceError>> {
     Box::pin(async move {
         let durable = context.durable;
-        let aggregator = Aggregator::with_events(state, context.host_name, context.event_sink, context.events)
+        let aggregator = Aggregator::with_events(state, context.host_name, context.event_sink, context.events, context.convoy_engine)
             .with_attach_resolver_arc(context.attach)
             .with_lifecycle_reads(context.lifecycles)
             .with_discovered_checkouts(context.discovered, namespace)
@@ -63,7 +63,7 @@ pub fn run(
             .with_change_request_resolver_arc(context.change_requests)
             .with_issue_resolver_arc(context.issues)
             .with_issue_polling_health(issue_polling)
-            .with_convoy_engine(context.convoy_engine, namespace)
+            .with_engine_namespace(namespace)
             .with_attentions(durable.attentions(), namespace)
             .with_clock(context.clock);
         aggregator

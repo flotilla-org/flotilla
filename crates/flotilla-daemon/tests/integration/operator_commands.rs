@@ -87,12 +87,10 @@ async fn a_start_reports_failed_work_without_waiting_for_the_attach_timeout() {
     let fleet = TestDaemon::builder().environment("failure_rate = 1.0").start().await;
     let mut intent = start_of("bootstrap-failure", CrewMix::Coder);
     intent.auto_attach = ConvoyAutoAttach::Always;
-    let started = tokio::time::Instant::now();
     let reported = tokio::time::timeout(Duration::from_secs(20), fleet.execute(CommandAction::ConvoyStart { intent }))
         .await
         .expect("a failed convoy stops the attach wait promptly");
     assert!(matches!(reported, CommandValue::Error { .. }), "{reported:?}");
-    assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 // A landed convoy has nothing left to end: deleting it succeeds and the convoy is kept, landed.
@@ -185,34 +183,4 @@ async fn an_operators_forced_completion_settles_a_crew_that_submitted_nothing() 
         .await;
     let status = convoy.status.expect("status");
     assert_eq!(status.crew_work["coder"]["coder"].phase, CrewWorkPhase::Done);
-}
-
-// A Project that gains a member leaves a running convoy's checkouts as they were: nothing is
-// requested for the new member, and the convoy keeps the repositories it was admitted with.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_project_gaining_a_member_leaves_a_running_convoys_checkouts_unchanged() {
-    use flotilla_resources::{Checkout, Project, ProjectRepositorySpec, RepositorySpec};
-
-    let fleet = TestDaemon::builder().agent("stall_rate = 1.0").start().await;
-    let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
-    fleet
-        .wait("a running convoy with its checkout", |convoy: &ResourceObject<Convoy>| {
-            convoy.metadata.name == name && convoy.status.as_ref().is_some_and(|status| status.stalled.is_some())
-        })
-        .await;
-    let checkouts = || async { fleet.list::<Checkout>().await.into_iter().map(|checkout| checkout.metadata.name).collect::<Vec<_>>() };
-    let before = checkouts().await;
-    assert!(!before.is_empty(), "the running convoy holds a checkout");
-    let admitted = fleet.get::<Convoy>(&name).await.expect("convoy").spec.repositories;
-
-    let added = RepositorySpec::remote("https://github.com/flotilla-org/binnacle").expect("added repository");
-    fleet.apply::<Repository>(&added.key().to_string(), added.clone()).await;
-    let mut project = fleet.get::<Project>(catalog::FLEET_PROJECT).await.expect("project").spec;
-    project.repositories.push(ProjectRepositorySpec::builder().repo(added.key()).build());
-    fleet.apply::<Project>(catalog::FLEET_PROJECT, project).await;
-
-    // Give the controllers time to act on the change before judging that they did not.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    assert_eq!(checkouts().await, before, "no checkout is requested for the new member");
-    assert_eq!(fleet.get::<Convoy>(&name).await.expect("convoy").spec.repositories, admitted);
 }

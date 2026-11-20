@@ -806,8 +806,6 @@ pub struct InProcessDaemon {
     /// What this daemon has seen of its crews' progress beside their AgentSessions: in memory
     /// only, for its stall check and delivery confirmation (#3108).
     crew_progress: Arc<flotilla_resources::agent_activity::ProgressFacts>,
-    /// The same path, as crew code reaches it: through its EngineMessages port.
-    crew_message_path: flotilla_crew::ports::MessagePath,
     /// The engine's Convoys (#3587 layer 6), as crew code and the convoy reconciler reach them.
     convoy_engine_path: flotilla_resources::convoy::engine::EngineConvoyPath,
     /// The engine Convoys behind that path, for readers of its records and its home's memory.
@@ -1531,7 +1529,6 @@ impl InProcessDaemon {
             message_receivers: projection_ports::MessageReceivers(Arc::clone(&messages)),
             messages,
             crew_progress: Arc::new(flotilla_resources::agent_activity::ProgressFacts::new(clock.now())),
-            crew_message_path,
             convoy_engine_path,
             engine_convoys: convoys,
             convoy_records,
@@ -2473,7 +2470,7 @@ impl InProcessDaemon {
     }
 
     /// Installs the Message path opened at composition (#3317) into its readers: the resource
-    /// backend's attentions and Message records, and the crew's port.
+    /// backend's attentions and Message records.
     fn install_message_path(&self) -> Result<(), String> {
         let primitives = Arc::clone(&self.messages);
         primitives.install_lifecycle_reads(self.lifecycle_reads())?;
@@ -2486,7 +2483,7 @@ impl InProcessDaemon {
 
     /// The crew's Messages: the engine's.
     pub fn crew_message_path(&self) -> flotilla_crew::ports::MessagePath {
-        Arc::clone(&self.crew_message_path)
+        Arc::clone(&self.messages) as _
     }
 
     /// The engine Convoys at this daemon's home.
