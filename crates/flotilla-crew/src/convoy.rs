@@ -20,7 +20,7 @@ use flotilla_store::{
     controller::{LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
     load_metrics::carry,
     occupancy::host_occupancy,
-    DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, ResourceBackend, TypedResolver,
+    PreparedSnapshotGarbageCollector, ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,7 +35,7 @@ pub struct ConvoyReconciler {
     vessels: Option<ReplicaReadResolver<Vessel>>,
     artifacts: Option<ReplicaReadResolver<Artifact>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
-    forges: Option<DefinitionResolver<Forge>>,
+    forges: Option<Arc<dyn flotilla_resources::forge_records::ForgeRecords>>,
     hosts: Option<ReplicaReadResolver<Host>>,
     /// The store and namespace whose live convoys and vessels count a host's vessels against its cap.
     occupancy: Option<(ResourceBackend, String)>,
@@ -109,7 +109,7 @@ impl ConvoyReconciler {
         self
     }
 
-    pub fn with_forges(mut self, forges: DefinitionResolver<Forge>) -> Self {
+    pub fn with_forges(mut self, forges: Arc<dyn flotilla_resources::forge_records::ForgeRecords>) -> Self {
         self.forges = Some(forges);
         self
     }
@@ -447,7 +447,7 @@ impl ConvoyReconciler {
         if self.change_requests.is_none() {
             return Ok(());
         }
-        let forges = self.forge_specs().await?;
+        let forges = self.forge_specs(obj).await?;
         let names: BTreeSet<String> =
             flotilla_resources::convoy::promises::ended_submissions(status, &forges).iter().filter_map(record_name).collect();
         engine.memory().note_evidence(&obj.metadata.name, ChangeRequest::API_PATHS.kind, names.clone());
@@ -473,12 +473,18 @@ impl ConvoyReconciler {
         Ok(())
     }
 
-    /// The declared forges' specs, or none without a Forge reader.
-    async fn forge_specs(&self) -> Result<Vec<flotilla_resources::ForgeSpec>, ResourceError> {
-        Ok(match &self.forges {
-            Some(forges) => forges.list().await?.into_iter().map(|forge| forge.spec).collect(),
-            None => Vec::new(),
-        })
+    /// The specs of the forges `convoy`'s addresses resolve through, each read by key, or none
+    /// without a Forge reader.
+    async fn forge_specs(&self, convoy: &ResourceObject<Convoy>) -> Result<Vec<flotilla_resources::ForgeSpec>, ResourceError> {
+        match &self.forges {
+            Some(forges) => flotilla_resources::forge_records::forges_named_by(
+                forges.as_ref(),
+                flotilla_resources::forge_records::convoy_forge_spellings(convoy),
+            )
+            .await
+            .map_err(ResourceError::other),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The change requests `names` names, each by its record name: every home's copy of it,
@@ -904,7 +910,7 @@ impl Reconciler for ConvoyReconciler {
         }
 
         let checkouts = self.held_checkouts(obj).await?;
-        let forges = self.forge_specs().await?;
+        let forges = self.forge_specs(obj).await?;
         let is_landing = status.phase == ConvoyPhase::Landing;
         // A checkout's inspection names the change request its branch is associated with; what
         // that request came to is the forge observation's.

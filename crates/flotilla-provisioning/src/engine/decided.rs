@@ -32,6 +32,9 @@ pub struct DecidedPorts {
     /// Which sources this home observes, which the observation records consult before a write.
     pub source_observers: Arc<LateSourceObservers>,
     pub accounts: Arc<dyn AccountRecords>,
+    /// The Forge and Repository ports, keyed and indexed reads with no listing.
+    pub forges: Arc<dyn flotilla_resources::forge_records::ForgeRecords>,
+    pub repositories: Arc<dyn flotilla_resources::repository_records::RepositoryRecords>,
     pub manifest_roots: Arc<dyn ManifestRoots>,
     /// Each standing role's running values, written by the home that admits it.
     pub standing_roles: Arc<dyn StandingRoles>,
@@ -47,13 +50,15 @@ pub fn open_ports(service: &Arc<Service>, own_host: &str, clock: Arc<dyn Clock>)
     // ChangeRequest and Issue: written by their source's observer, read at every home.
     let source_observers = Arc::new(LateSourceObservers::default());
     let observations = Arc::new(EngineObservations::open(Arc::clone(service), clock())?.observed_by(source_observers.clone()));
+    let definitions = Arc::new(EngineDefinitions::open(Arc::clone(service), clock())?);
+    let repositories = Arc::new(EngineRepositories::open(Arc::clone(service), clock())?);
     let records: Vec<Arc<dyn EnginePort>> = vec![
         Arc::clone(&accounts) as Arc<dyn EnginePort>,
         Arc::clone(&manifest_roots) as Arc<dyn EnginePort>,
         // #3824 layer 2b-ii: the definition kinds.
-        Arc::new(EngineDefinitions::open(Arc::clone(service), clock())?),
+        Arc::clone(&definitions) as Arc<dyn EnginePort>,
         // #3824 layer 3a and 3b: Repository, and Project with its operations' record.
-        Arc::new(EngineRepositories::open(Arc::clone(service), clock())?),
+        Arc::clone(&repositories) as Arc<dyn EnginePort>,
         Arc::new(EngineProjects::open(Arc::clone(service), clock())?),
         Arc::new(EngineArtifacts::open(Arc::clone(service), clock())?),
         Arc::new(EngineAccessDeliveries::open(Arc::clone(service), clock())?),
@@ -69,6 +74,8 @@ pub fn open_ports(service: &Arc<Service>, own_host: &str, clock: Arc<dyn Clock>)
         observations,
         source_observers,
         accounts,
+        forges: definitions,
+        repositories,
         manifest_roots,
         standing_roles: Arc::new(EngineStandingRoles::open(Arc::clone(service), clock())),
     })

@@ -1,22 +1,19 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, sync::Arc};
 
 use crate::engine::{checkouts::CheckoutRepositoryWake, clones::CloneRepositoryWake};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::checkout_records::latest_launches;
-use flotilla_resources::repository::{forge_service_url_key, FORGE_SERVICE_URL_FIELD};
 use flotilla_resources::{
     discovered_checkouts::DiscoveredCheckouts, lifecycle_reads::LifecycleReads, resolve_default_branch, CheckoutSpec, CredentialConsumer,
-    CredentialSpec, DefaultBranchObservation, DefaultBranchProvenance, Forge, ForgeIdentity, ForgeSpec, LifecycleAuthority, ReadWatchEvent,
+    CredentialSpec, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, ForgeSpec, LifecycleAuthority, ReadWatchEvent,
     Repository, RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch, ResourceError, ResourceObject,
 };
+use flotilla_resources::{forge_records::ForgeRecords, repository_records::RepositoryRecords};
 use flotilla_schema::reads::carry;
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
-    ResourceBackend, StoreQuery,
+    ResourceBackend,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast::error::RecvError;
@@ -50,10 +47,12 @@ impl RepositoryReconciler {
     pub fn secondary_watches(
         discovered: DiscoveredCheckouts,
         service: Arc<flotilla_schema_sqlite::stream::Service>,
+        forges: Arc<dyn ForgeRecords>,
+        repositories: Arc<dyn RepositoryRecords>,
     ) -> Vec<Box<dyn SecondaryWatch<Primary = Repository>>> {
         vec![
             Box::new(DiscoveredRepositoryWake(discovered)),
-            Box::new(ForgeIdentityRepositoryWake),
+            Box::new(ForgeIdentityRepositoryWake { forges, repositories }),
             Box::new(CheckoutRepositoryWake::new(Arc::clone(&service))),
             Box::new(CloneRepositoryWake::new(service)),
         ]
@@ -121,20 +120,19 @@ impl SecondaryWatch for DiscoveredRepositoryWake {
 /// Wakes the Repositories on a forge when the forge, or a Forgejo credential on it, changes: a
 /// repository's forge lookup runs as the daemon's identity there, which those declare.
 #[derive(Clone)]
-struct ForgeIdentityRepositoryWake;
+struct ForgeIdentityRepositoryWake {
+    forges: Arc<dyn ForgeRecords>,
+    repositories: Arc<dyn RepositoryRecords>,
+}
 
 impl ForgeIdentityRepositoryWake {
     /// The URL of the forge `event` changes the daemon's identity on, if any.
-    async fn forge_url(backend: &ResourceBackend, namespace: &str, event: ForgeIdentityEvent) -> Result<Option<String>, ResourceError> {
+    async fn forge_url(&self, event: ForgeIdentityEvent) -> Result<Option<String>, ResourceError> {
         match event {
             ForgeIdentityEvent::Forge(spec) => Ok(Some(spec.https_url)),
+            // An undeclared forge has no repositories to wake; its declaration wakes them.
             ForgeIdentityEvent::Credential(CredentialConsumer::Forgejo { forge_ref, .. }) => {
-                match backend.including_replicas::<Forge>(namespace).get(&forge_ref).await {
-                    Ok(forge) => Ok(Some(forge.object.spec.https_url)),
-                    // An undeclared forge has no repositories to wake; its declaration wakes them.
-                    Err(ResourceError::NotFound { .. }) => Ok(None),
-                    Err(error) => Err(error),
-                }
+                Ok(self.forges.forge(&forge_ref).await.map_err(ResourceError::other)?.map(|forge| forge.https_url))
             }
             // Other consumers are no forge's daemon identity.
             ForgeIdentityEvent::Credential(_) => Ok(None),
@@ -161,20 +159,11 @@ impl SecondaryWatch for ForgeIdentityRepositoryWake {
         namespace: String,
         sender: WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
-        // A deletion by name carries no spec, so no forge to resolve, and wakes nothing. These
-        // watches start now over the engine's Forge and CredentialSpec records, which hand every
-        // deletion over with the record deleted; a deletion by name comes only from resuming a
-        // watch at an earlier position, which these never do.
+        // A withdrawn forge arrives with the declaration it had, so it wakes the repositories it
+        // served. A credential's deletion by name carries no spec, so no forge, and wakes nothing;
+        // it comes only from resuming a watch at an earlier position, which this never does.
         Box::pin(async move {
-            let forges = backend.including_replicas::<Forge>(&namespace).watch().await?.filter_map(|event| {
-                futures::future::ready(match event {
-                    Ok(ReadWatchEvent::Added(forge) | ReadWatchEvent::Modified(forge) | ReadWatchEvent::Deleted(forge)) => {
-                        Some(Ok(ForgeIdentityEvent::Forge(forge.object.spec)))
-                    }
-                    Ok(ReadWatchEvent::DeletedByName { .. }) => None,
-                    Err(error) => Some(Err(error)),
-                })
-            });
+            let forges = self.forges.changes().await.map_err(ResourceError::other)?.map(|spec| Ok(ForgeIdentityEvent::Forge(spec)));
             let credentials = backend.including_replicas::<CredentialSpec>(&namespace).watch().await?.filter_map(|event| {
                 futures::future::ready(match event {
                     Ok(ReadWatchEvent::Added(spec) | ReadWatchEvent::Modified(spec) | ReadWatchEvent::Deleted(spec)) => {
@@ -186,22 +175,11 @@ impl SecondaryWatch for ForgeIdentityRepositoryWake {
             });
             let mut events = std::pin::pin!(futures::stream::select(forges, credentials));
             while let Some(event) = events.next().await {
-                let Some(url) = Self::forge_url(&backend, &namespace, event?).await? else { continue };
+                let Some(url) = self.forge_url(event?).await? else { continue };
                 // The Repositories on that forge, through the index of their forge's service URL;
                 // every home's copy, since each names the one Repository this controller reconciles.
-                let query = StoreQuery {
-                    fields: BTreeMap::from([(FORGE_SERVICE_URL_FIELD.to_owned(), forge_service_url_key(&url).to_owned())]),
-                    include_replicas: true,
-                    ..StoreQuery::default()
-                };
-                let on_forge: BTreeSet<String> = backend
-                    .using::<Repository>(&namespace)
-                    .query_declared(&query)
-                    .await?
-                    .items
-                    .into_iter()
-                    .map(|repository| repository.object.metadata.name)
-                    .collect();
+                let on_forge: BTreeSet<String> =
+                    self.repositories.on_forge(&url).await.map_err(ResourceError::other)?.into_iter().map(|record| record.name).collect();
                 for name in on_forge {
                     if sender.send(name).await.is_err() {
                         return Ok(());

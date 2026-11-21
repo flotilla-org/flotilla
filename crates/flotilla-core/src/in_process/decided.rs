@@ -82,6 +82,8 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
         change_request_branches,
         source_observers,
         accounts,
+        forges,
+        repositories,
         manifest_roots,
         standing_roles,
     } = open_ports(&service, &own_host, identity.clock)?;
@@ -93,6 +95,8 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
         change_request_branches,
         source_observers,
         accounts,
+        forges,
+        repositories,
         manifest_roots,
         standing_roles,
     })

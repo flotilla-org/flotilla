@@ -582,6 +582,57 @@ impl<R: Defined> KindRecords<R> for EngineDefinitions {
     }
 }
 
+impl EngineDefinitions {
+    /// The forges as several homes' declarations resolve, by name.
+    fn forges_resolved(&self) -> Result<BTreeMap<String, flotilla_resources::ForgeSpec>, String> {
+        let resident = self.refresh()?;
+        let held = &resident.records.forges;
+        let mut names: Vec<&String> = held.keys().map(|(name, _)| name).collect();
+        names.dedup();
+        Ok(names.into_iter().filter_map(|name| resolve(held, &self.home, name).map(|record| (name.clone(), record.spec))).collect())
+    }
+}
+
+/// The forge port, over the resident map: a forge is read by its name, or through the index of the
+/// hosts it claims (`spec.remote_hosts.*`, the Forge kind's declared field).
+#[async_trait::async_trait]
+impl flotilla_resources::forge_records::ForgeRecords for EngineDefinitions {
+    async fn forge(&self, name: &str) -> Result<Option<flotilla_resources::ForgeSpec>, String> {
+        let resident = self.refresh()?;
+        Ok(resolve(&resident.records.forges, &self.home, name).map(|record| record.spec))
+    }
+
+    async fn at_host(&self, host: &str) -> Result<Vec<flotilla_resources::ForgeSpec>, String> {
+        let host = host.to_ascii_lowercase();
+        Ok(self
+            .forges_resolved()?
+            .into_values()
+            .filter(|spec| Forge::indexed_values(spec, "spec.remote_hosts.*").is_some_and(|hosts| hosts.contains(&host)))
+            .collect())
+    }
+
+    async fn changes(&self) -> Result<BoxStream<'_, flotilla_resources::ForgeSpec>, String> {
+        use futures::StreamExt;
+        let ticks = self.changes.subscribe().map_err(|error| error.to_string())?;
+        let known = self.forges_resolved()?;
+        Ok(futures::stream::unfold((ticks, known), move |(mut ticks, mut known)| async move {
+            loop {
+                ticks.next().await?;
+                let Ok(now) = self.forges_resolved() else { continue };
+                let mut changed: Vec<flotilla_resources::ForgeSpec> =
+                    now.iter().filter(|(name, spec)| known.get(*name) != Some(spec)).map(|(_, spec)| spec.clone()).collect();
+                changed.extend(known.iter().filter(|(name, _)| !now.contains_key(*name)).map(|(_, spec)| spec.clone()));
+                known = now;
+                if !changed.is_empty() {
+                    return Some((futures::stream::iter(changed), (ticks, known)));
+                }
+            }
+        })
+        .flatten()
+        .boxed())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

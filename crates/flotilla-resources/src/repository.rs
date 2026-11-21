@@ -574,6 +574,31 @@ pub fn repository_display_labels<'a>(
         .collect()
 }
 
+/// The repositories among `others` that can change the workspace slug [`repository_workspace_slugs`]
+/// gives `seed`: those sharing a normalized leaf or catalog slug with it, and those sharing one
+/// with such a repository in turn. Slug allocation over `seed` and these alone gives `seed` the
+/// slug it gets over every repository.
+pub fn workspace_slug_component<'a>(
+    seed: &RepositorySpec,
+    others: impl IntoIterator<Item = &'a RepositorySpec>,
+) -> Vec<&'a RepositorySpec> {
+    let slugs = |spec: &RepositorySpec| [normalize_workspace_slug(&spec.leaf_slug()), normalize_workspace_slug(&spec.catalog_slug())];
+    let mut names: BTreeSet<String> = slugs(seed).into_iter().collect();
+    let mut remaining: Vec<(&RepositorySpec, [String; 2])> = others.into_iter().map(|spec| (spec, slugs(spec))).collect();
+    let mut component = Vec::new();
+    loop {
+        let (joined, rest): (Vec<_>, Vec<_>) = remaining.into_iter().partition(|(_, own)| own.iter().any(|slug| names.contains(slug)));
+        remaining = rest;
+        if joined.is_empty() {
+            return component;
+        }
+        for (spec, own) in joined {
+            names.extend(own);
+            component.push(spec);
+        }
+    }
+}
+
 /// Short, path-safe repository names, qualified only when names collide.
 ///
 /// Repository keys remain opaque identity and must not leak into paths as the
@@ -927,5 +952,27 @@ mod prefixed_service_tests {
         assert_eq!(decoded, spec);
         assert_eq!(decoded.forge().expect("forge").repository, "team/repo");
         assert!(decoded.with_remotes([format!("https://lab.example{prefix}/other/repo")]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod slug_component_tests {
+    use super::{repository_workspace_slugs, workspace_slug_component, RepositorySpec};
+
+    fn spec(url: &str) -> RepositorySpec {
+        RepositorySpec::remote(url).expect("remote")
+    }
+
+    // Behaviour: repositories whose leaf slugs differ as written but collide once normalized are
+    // each other's slug peers, so neither is allocated the other's directory.
+    #[test]
+    fn leaf_slugs_that_collide_only_once_normalized_are_peers() {
+        let (a, b, unrelated) =
+            (spec("https://example.com/x/foo.bar.git"), spec("https://example.com/y/foo_bar.git"), spec("https://example.com/z/other.git"));
+        let peers = workspace_slug_component(&a, [&b, &unrelated]);
+        assert_eq!(peers, vec![&b]);
+        let (ka, kb) = (a.key(), b.key());
+        let slugs = repository_workspace_slugs([(&ka, &a), (&kb, &b)]);
+        assert_ne!(slugs[&ka], slugs[&kb]);
     }
 }

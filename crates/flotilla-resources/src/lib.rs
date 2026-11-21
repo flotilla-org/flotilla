@@ -69,6 +69,7 @@ pub mod error;
 pub mod field_ownership;
 mod fleet_designation;
 mod forge;
+pub mod forge_records;
 mod fulfilment_kind;
 pub mod held_joins;
 #[doc(hidden)]
@@ -95,6 +96,7 @@ pub mod realisation_settings;
 mod replica;
 #[doc(hidden)]
 pub mod repository;
+pub mod repository_records;
 #[doc(hidden)]
 pub mod resource;
 #[doc(hidden)]

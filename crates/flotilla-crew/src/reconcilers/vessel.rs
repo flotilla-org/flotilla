@@ -76,6 +76,8 @@ pub struct VesselPlanning {
     accounts: Arc<dyn AccountRecords>,
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
+    /// Keyed and indexed reads of the repositories: no pass lists the kind.
+    repository_records: Arc<dyn flotilla_resources::repository_records::RepositoryRecords>,
     kinds: TypedResolver<FulfilmentKind>,
     artifacts: ReplicaReadResolver<Artifact>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
@@ -101,6 +103,7 @@ impl VesselPlanning {
             accounts,
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
+            repository_records: Arc::new(flotilla_store::BackendRepositories::new(backend.clone(), namespace)),
             kinds: backend.clone().using::<FulfilmentKind>(namespace),
             artifacts: backend.including_replicas::<Artifact>(namespace),
             federated_convoys: None,
@@ -111,6 +114,22 @@ impl VesselPlanning {
             worktree_metadata: None,
             brief_templates: CrewBriefTemplateResolver::default(),
         }
+    }
+
+    /// Reads repositories through `records`, the engine's port, in place of the backend's.
+    pub fn with_repository_records(mut self, records: Arc<dyn flotilla_resources::repository_records::RepositoryRecords>) -> Self {
+        self.repository_records = records;
+        self
+    }
+
+    /// The repositories other than `repository_key` that could share `spec`'s workspace slug, each
+    /// read from the engine's records.
+    async fn slug_peers(
+        &self,
+        spec: &RepositorySpec,
+    ) -> Result<BTreeMap<flotilla_resources::RepositoryKey, RepositorySpec>, ResourceError> {
+        let peers = self.repository_records.workspace_slug_peers(spec).await.map_err(ResourceError::other)?;
+        Ok(peers.into_iter().map(|record| (record.spec.key(), record.spec)).collect())
     }
 
     /// Why an agent crew must not start yet: its account binding is no longer open.
@@ -755,9 +774,6 @@ impl VesselPlanning {
         let mut contained_branches = BTreeSet::new();
         let mut waiting_for_checkouts = Vec::new();
         let mut fork_stance = false;
-        // Slug allocation needs the repository catalog only when a shared clone
-        // is missing; read it at most once per prepare, not once per repository.
-        let repository_catalog = tokio::sync::OnceCell::new();
         for convoy_repository in convoy_repositories {
             let repository_spec = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
                 Ok(repository) => repository.spec,
@@ -806,12 +822,10 @@ impl VesselPlanning {
                         existing.spec.path
                     }
                     None => {
-                        let repository_catalog = repository_catalog.get_or_try_init(|| self.repositories.list()).await?;
-                        let keyed_repositories = repository_catalog
-                            .items
+                        let peers = self.slug_peers(&repository_spec).await?;
+                        let keyed_repositories = peers
                             .iter()
-                            .filter(|candidate| candidate.spec.key() != repository_key)
-                            .map(|candidate| (candidate.spec.key(), &candidate.spec))
+                            .map(|(key, spec)| (key.clone(), spec))
                             .chain(std::iter::once((repository_key.clone(), &repository_spec)))
                             .collect::<Vec<_>>();
                         let clone_directory_slug = repository_workspace_slugs(keyed_repositories.iter().map(|(key, spec)| (key, *spec)))
