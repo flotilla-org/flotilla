@@ -1,7 +1,7 @@
 //! ADR 0051: replicated observations are the sole subject fact source.
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_address::Forge as AddressForge;
+use flotilla_address::{Forge as AddressForge, Kind as AddressKind};
 use flotilla_protocol::{IssueSource, Relationship, Subject, SubjectKind};
 use flotilla_resources::{
     address, ForgeKind, ForgeSpec, Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability,
@@ -29,8 +29,6 @@ use crate::keys::{
     KEY_SUBJECT_PRODUCES, KEY_SUBJECT_REFERENCES, KEY_SUBJECT_REPOSITORY_ALIAS, KEY_SUBJECT_SCOPE, KEY_SUBJECT_SERVICE,
     KEY_SUBJECT_SUPERSEDES, KEY_SUBJECT_WORKS_ON, SEGMENT_PROJECT,
 };
-
-const BUILTIN_GITHUB_SERVICE: &str = "github.com";
 
 /// The entity a convoy subject names, through the one stored-spelling →
 /// address resolver, which also reads the encoded host and URL spellings.
@@ -230,7 +228,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     }
     // Like declared forges, publish the default even without visible subjects.
     // Presentation-only: never declare a resource or re-key repositories.
-    if super::subject_forge(&observations.forges, BUILTIN_GITHUB_SERVICE).is_none() {
+    if !observations.forges.iter().any(|forge| forge.spec.forge_id == flotilla_address::GITHUB_FORGE_ID) {
         project_forge(catalog, &AddressForge::github(), ForgeKind::Github, "https://github.com");
     }
 
@@ -282,24 +280,27 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     for repo in &observations.references.repositories {
         aliases.entry(&repo.source).or_insert(repo.alias.as_str());
     }
-    // The forge a subject's presentation links to is the declared Forge that
-    // covers its service, else the built-in GitHub; the subject's own id
-    // comes from the stored-spelling resolver.
-    let services: BTreeSet<_> = links.keys().map(|subject| subject.source.service.as_str()).collect();
-    let forges: BTreeMap<_, _> = services
-        .into_iter()
-        .filter_map(|service| {
-            let declared = super::subject_forge(&observations.forges, service)
-                .and_then(|forge| AddressForge::new(forge.spec.forge_id.clone(), forge.spec.kind.into()).ok());
-            match declared.or_else(|| (service == BUILTIN_GITHUB_SERVICE).then(AddressForge::github)) {
-                Some(forge) => Some((service, entity::forge(&forge))),
-                None => {
-                    catalog.uncovered_services.insert(service.to_owned());
-                    None
-                }
+    // A subject's forge link is the forge its own address resolved to, so the
+    // two cannot disagree; a service the resolver cannot place is uncovered.
+    let mut forges: BTreeMap<&str, EntityRef> = BTreeMap::new();
+    for subject in links.keys() {
+        let service = subject.source.service.as_str();
+        if forges.contains_key(service) {
+            continue;
+        }
+        let forge = address::subject_address(subject, &forge_specs)
+            .ok()
+            .and_then(|address| address.get(AddressKind::Forge).map(str::to_owned))
+            .and_then(|id| AddressForge::new(id, ForgeKind::Github.into()).ok());
+        match forge {
+            Some(forge) => {
+                forges.insert(service, entity::forge(&forge));
             }
-        })
-        .collect();
+            None => {
+                catalog.uncovered_services.insert(service.to_owned());
+            }
+        }
+    }
     let identity_facts = |subject: &Subject| {
         let label = subject.short(&observations.references);
         let kind = match subject.kind {

@@ -2481,7 +2481,6 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
         }
         project_catalog(&input, &mint())
     };
-    let implicit = build(&observations);
     let declaration = match mode {
         Coverage::Absent => None,
         Coverage::Unrelated => Some(("lab", "https://lab.example", "lab.example", ForgeKind::Github)),
@@ -2508,20 +2507,13 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
     }
     let catalog = build(&observations);
     let patches = catalog.reassert_patches();
-    let expected_id = if matches!(mode, Coverage::Absent | Coverage::Unrelated) { "forge:github" } else { "forge:declared" };
+    // A github.com subject resolves to the built-in forge whichever Forge claims the host.
+    let expected_id = "forge:github";
     let forge = EntityRef::new("forge", expected_id);
     let facts = find_entity(&patches, &forge);
-    assert_eq!(text(facts, "flotilla.forge.kind"), if matches!(mode, Coverage::HostAlias) { "forgejo" } else { "github" }, "{mode:?}");
-    assert_eq!(
-        text(facts, "flotilla.forge.web_url"),
-        if matches!(mode, Coverage::HostAlias) { "https://declared.example" } else { "https://github.com" },
-        "{mode:?}"
-    );
-    assert_eq!(
-        text(facts, "flotilla.forge.change_request_url_template"),
-        if matches!(mode, Coverage::HostAlias) { "{web_url}/{scope}/pulls/{number}" } else { "{web_url}/{scope}/pull/{number}" },
-        "{mode:?}"
-    );
+    assert_eq!(text(facts, "flotilla.forge.kind"), "github", "{mode:?}");
+    assert_eq!(text(facts, "flotilla.forge.web_url"), "https://github.com", "{mode:?}");
+    assert_eq!(text(facts, "flotilla.forge.change_request_url_template"), "{web_url}/{scope}/pull/{number}", "{mode:?}");
     assert_eq!(text(facts, "flotilla.forge.issue_url_template"), "{web_url}/{scope}/issues/{number}", "{mode:?}");
     for subject in &subjects {
         let target = match subject.kind {
@@ -2547,9 +2539,7 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
         );
     }
     if matches!(mode, Coverage::InstallationUrl | Coverage::HostAlias) {
-        assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(entity::forge(&forge_named("github.com")))));
-        let diff = catalog.diff_patches(&implicit);
-        assert!(find_entity(&diff, &entity::forge(&forge_named("github.com"))).unset.contains(&"flotilla.forge.kind".into()));
+        find_entity(&patches, &EntityRef::new("forge", "forge:declared"));
     }
     // Projection never creates a Forge resource for the fallback.
     let stored = runtime.block_on(backend.using::<Forge>("dev").list()).expect("stored forges");
