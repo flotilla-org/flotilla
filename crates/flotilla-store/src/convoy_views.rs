@@ -36,20 +36,14 @@ use std::{
     },
 };
 
-use chrono::DateTime;
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 
-use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
-    convoy::view::VesselReading,
-    convoy_records::{
-        ConvoyChange, ConvoyJoins, ConvoyListing, ConvoyNotes, ConvoyRecord, ConvoyRecords, Ending, UnreadableLaunch, WorkFacts,
-    },
+    convoy_compose::{join, unreadable_view, view_of},
+    convoy_records::{ConvoyChange, ConvoyListing, ConvoyRecord, ConvoyRecords, WorkFacts},
     engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal, UnloggedRead, WriteError},
     held_joins::{JoinChange, JoinChanges, JoinsReader},
     lifecycle_reads::{ChangeCursor, LifecycleReads, Told},
-    terminal_records::{newest_launches, TerminalRecord},
-    vessel_records::{interrupted_message, VesselRecord},
     Convoy, ConvoySpec, ConvoyStatus, ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance,
 };
 use flotilla_schema::reads;
@@ -849,26 +843,9 @@ impl ConvoyViews {
         let (name, home, namespace) = (name.to_owned(), home.map(str::to_owned), self.namespace.clone());
         let views = self
             .blocking(move |reads| {
-                let convoys = reads.convoys()?;
-                let here = convoys.home().to_owned();
-                let ConvoyListing { mut records, mut unreadable } = convoys.named(&name, home.as_deref())?;
-                records.retain(|record| !held.contains(&record.home));
-                unreadable.retain(|launch| !held.contains(&launch.home));
-                let mut views: Vec<_> = unreadable.iter().map(|launch| unreadable_view(&namespace, &here, launch)).collect();
-                if records.is_empty() {
-                    return Ok(views);
-                }
-                let (vessels, terminals) = (reads.vessels()?, reads.terminals()?);
-                let launches = vessels.of_convoy(&name)?;
-                let mut sessions = BTreeMap::new();
-                for launch in &launches {
-                    sessions.insert(launch.name.clone(), terminals.of_vessel(&launch.name)?);
-                }
-                views.extend(records.iter().map(|record| {
-                    let notes = (record.home == here).then(|| convoys.memory().get(&record.name));
-                    let joined = join(record, notes.as_ref(), launches.clone(), |vessel| sessions.get(vessel).cloned().unwrap_or_default());
-                    view_of(&namespace, &here, record, notes.as_ref(), &joined)
-                }));
+                let here = reads.convoys()?.home().to_owned();
+                let mut views = flotilla_resources::convoy_compose::compose_named(reads, &namespace, &name, home.as_deref())?;
+                views.retain(|view| !held.contains(&view_home(view, &here)));
                 Ok(views)
             })
             .instrument(info_span!("convoy_views.stored"))
@@ -959,27 +936,12 @@ impl std::fmt::Debug for ConvoyViews {
 /// `held`, held at `home`, as the engine port hands it out. Each is counted as a Convoy converted
 /// to the port's shape.
 /// `record` as a read view at home `here`, joined as `joined` with its home's `notes`.
-fn view_of(namespace: &str, here: &str, record: &ConvoyRecord, notes: Option<&ConvoyNotes>, joined: &Joined) -> ReadResourceObject<Convoy> {
-    let working = record.working(&joined.live, notes);
-    let object = record.read_view(namespace, ConvoyJoins { works: &joined.works, working: &working, notes });
-    let provenance = if record.home == here {
-        ResourceProvenance::Local
-    } else {
-        let synced = record.ended.as_ref().and_then(Ending::held).map_or(record.admitted_at, |(_, at)| at);
-        ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: synced }
-    };
-    ReadResourceObject { object, provenance }
-}
-
-/// Launch `launch`, which cannot be read, as its read view at home `here`, with why; when another
-/// home's last changed is not known.
-fn unreadable_view(namespace: &str, here: &str, launch: &UnreadableLaunch) -> ReadResourceObject<Convoy> {
-    let provenance = if launch.home == here {
-        ResourceProvenance::Local
-    } else {
-        ResourceProvenance::Replica { origin_root: NodeId::new(launch.home.clone()), last_synced_at: DateTime::UNIX_EPOCH }
-    };
-    ReadResourceObject { object: launch.read_view(namespace), provenance }
+/// The home holding the launch `view` shows, read at home `here`.
+fn view_home(view: &ReadResourceObject<Convoy>, here: &str) -> String {
+    match &view.provenance {
+        ResourceProvenance::Local => here.to_owned(),
+        ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
+    }
 }
 
 fn view_record(held: HeldView, home: String) -> Record<Convoy> {
@@ -1061,10 +1023,7 @@ impl KindRecords<Convoy> for ConvoyViews {
         let stored = self.stored(name, None, held).await.map_err(|error| error.to_string())?;
         let here = self.home();
         copies.extend(stored.into_iter().map(|view| {
-            let home = match &view.view.provenance {
-                ResourceProvenance::Local => here.clone(),
-                ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
-            };
+            let home = view_home(&view.view, &here);
             view_record(view, home)
         }));
         Ok(copies)
@@ -1359,52 +1318,4 @@ impl HeldViews {
             self.remove(key);
         }
     }
-}
-
-/// What one launch is joined with.
-#[derive(Default)]
-struct Joined {
-    /// Each work's newest Vessel launch, by work. A work with none has never had one.
-    works: BTreeMap<String, WorkFacts>,
-    /// The seats `(work, role)` whose newest session launch is realised.
-    live: BTreeSet<(String, String)>,
-}
-
-/// What `record` is joined with: its convoy's Vessel `launches` and each launch's sessions from
-/// `sessions_of`, its home's `notes` telling which crew agents are wanted running.
-fn join(
-    record: &ConvoyRecord,
-    notes: Option<&ConvoyNotes>,
-    launches: Vec<VesselRecord>,
-    sessions_of: impl Fn(&str) -> Vec<TerminalRecord>,
-) -> Joined {
-    let mut joined = Joined::default();
-    for requirement in &record.admission.workflow_snapshot.vessels {
-        // A work replaced at another home has a launch at each: the newest requested serves it.
-        let Some(vessel) = launches
-            .iter()
-            .filter(|vessel| vessel.convoy_home == record.home && vessel.work() == requirement.name)
-            .max_by_key(|vessel| (vessel.requested_at, vessel.launch_number()))
-        else {
-            continue;
-        };
-        let sessions = sessions_of(&vessel.name);
-        for session in newest_launches(sessions.iter().cloned()).into_values() {
-            if matches!(session.reading, LifecycleReading::Ready { .. }) {
-                joined.live.insert((requirement.name.clone(), session.role));
-            }
-        }
-        let interrupted = vessel.interrupted_roles(requirement, &sessions, |index| {
-            requirement.crew.get(index).is_some_and(|member| record.wanted_running(&requirement.name, &member.role, notes))
-        });
-        let facts = WorkFacts {
-            reading: VesselReading::At(vessel.phase_with(&interrupted)),
-            ready_at: vessel.environment().is_some().then_some(vessel.since),
-            started_at: Some(vessel.requested_at),
-            finished_at: None,
-            message: interrupted_message(&interrupted).or_else(|| vessel.reading.reason()),
-        };
-        joined.works.insert(requirement.name.clone(), facts);
-    }
-    joined
 }

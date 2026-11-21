@@ -26,6 +26,7 @@ mod clone;
 mod controller_retry;
 #[doc(hidden)]
 pub mod convoy;
+pub mod convoy_compose;
 mod convoy_ensure;
 pub mod convoy_records;
 mod credential;
