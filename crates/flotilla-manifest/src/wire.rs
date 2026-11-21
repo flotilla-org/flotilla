@@ -11,7 +11,7 @@
 //! | Key | Semantics |
 //! | --- | --- |
 //! | `source` | Producer provenance (`flotilla` here; other producers use their own stable name). |
-//! | `flotilla.session` | Canonical `<host>/<namespace>/<session>` pane-to-catalog join identity. |
+//! | `flotilla.session` | Canonical `<host>/<session>` pane-to-catalog join identity. |
 //! | `flotilla.vessel` | Vessel name bound to a pane. |
 //! | `flotilla.convoy` | Canonical `<namespace>/<convoy>@<origin>` resource identity on panes and path segments. |
 //! | `flotilla.namespace` | Resource namespace bound to a pane. |

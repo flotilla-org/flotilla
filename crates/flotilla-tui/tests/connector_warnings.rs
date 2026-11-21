@@ -3,8 +3,8 @@ use flotilla_cli::pm_connect::ConnectorState;
 use flotilla_manifest::recipe::FlotillaRecipes;
 use flotilla_protocol::{
     result_set::{ConvoySubjectRow, ResultSet, Rows},
-    ConvoyPhase, ConvoyRow, DaemonEvent, IssueSource, NodeId, Relationship, ResourceCursor, ResourceReadEnvelope, ResourceReadRecord,
-    ResourceRecordProvenance, ResourceRecordType, ResourceRef, Subject, SubjectKind,
+    ConvoyPhase, ConvoyRow, DaemonEvent, HostName, IssueSource, NodeId, Relationship, ResourceCursor, ResourceReadEnvelope,
+    ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef, Subject, SubjectKind,
 };
 use flotilla_resources::{Forge, ForgeKind, ForgeSpec, InputMeta};
 use flotilla_store::ResourceBackend;
@@ -16,7 +16,8 @@ use tracing::instrument::WithSubscriber;
 #[tokio::test]
 async fn connector_rebuilds_warn_only_on_gap_transitions() {
     let convoy = ConvoyRow::builder()
-        .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "work"))
+        .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "work").on_host(HostName::new("kiwi")))
+        .home(HostName::new("kiwi"))
         .name("work")
         .workflow_ref("dev")
         .project_ref("dev")

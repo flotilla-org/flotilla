@@ -411,15 +411,16 @@ impl FleetService {
             .map(|convoy| {
                 (
                     (convoy.resource.namespace.clone(), convoy.resource.name.clone()),
-                    (convoy.subjects.clone(), convoy.landing_reason.clone()),
+                    (convoy.subjects.clone(), convoy.landing_reason.clone(), convoy.home.clone()),
                 )
             })
             .collect::<HashMap<_, _>>();
         for row in &mut rows {
             if let Some(convoy_ref) = &row.convoy_ref {
-                if let Some((subjects, reason)) = context_by_convoy.get(&(row.namespace.clone(), convoy_ref.clone())) {
+                if let Some((subjects, reason, home)) = context_by_convoy.get(&(row.namespace.clone(), convoy_ref.clone())) {
                     row.subjects = subjects.clone();
                     row.landing_reason = reason.clone();
+                    row.convoy_home = Some(home.clone());
                 }
             }
         }
@@ -653,6 +654,7 @@ mod tests {
         let remote = HostName::new("remote");
         let convoy = ConvoyRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy").on_host(remote.clone()))
+            .home(remote.clone())
             .name("convoy".to_string())
             .workflow_ref("workflow".to_string())
             .project_ref("flotilla".to_string())
@@ -673,6 +675,7 @@ mod tests {
     fn an_unreadable_crewless_convoy_reads_as_unreadable_not_pending() {
         let convoy = ConvoyRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy"))
+            .home(flotilla_protocol::HostName::new("local"))
             .name("convoy".to_string())
             .workflow_ref("workflow".to_string())
             .project_ref("flotilla".to_string())

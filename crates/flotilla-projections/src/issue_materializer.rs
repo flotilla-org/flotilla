@@ -1807,6 +1807,7 @@ mod tests {
             convoys.local_rows.insert(
                 resource.clone(),
                 ConvoyRow::builder()
+                    .home(flotilla_protocol::HostName::new("local"))
                     .resource(resource.clone())
                     .name("batch")
                     .workflow_ref("workflow")

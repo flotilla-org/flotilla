@@ -24,6 +24,7 @@ use flotilla_daemon::{
 pub async fn apply_convoy_replica_feed(daemon: &InProcessDaemon, namespace: &str, name: &str, home: HostName) {
     let resource = ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, namespace, name).on_host(home.clone());
     let row = ConvoyRow::builder()
+        .home(home.clone())
         .resource(resource)
         .name(name)
         .workflow_ref("scratch")

@@ -29,9 +29,15 @@ pub fn parse_pane_id(value: &str) -> Option<u32> {
     text.parse().ok()
 }
 
+/// A pane stamp is best effort: a name the address grammar refuses leaves that
+/// fact out and is logged, and the attach goes on.
+fn stamped(entity: Result<entity::EntityRef, entity::Error>, name: &str) -> Option<entity::EntityRef> {
+    entity.map_err(|error| tracing::warn!(%name, %error, "the pane is not stamped with an identity the address grammar refuses")).ok()
+}
+
 /// The Pane-target patch `flotilla attach` publishes at the binding moment.
 ///
-/// `flotilla.session` = `<host>/<namespace>/<session>` is the canonical join
+/// `flotilla.session` = `<host>/<session>` is the canonical join
 /// key; the rest are denormalized binding facts for resilience and direct
 /// grouping rules. Everything is stamped without TTL.
 pub fn pane_stamp(pane: PaneTarget, attach_ref: &str, binding: Option<&AttachBinding>) -> MetadataPatch {
@@ -44,26 +50,28 @@ pub fn pane_stamp(pane: PaneTarget, attach_ref: &str, binding: Option<&AttachBin
     if let Some(binding) = binding {
         fact(KEY_HOST, binding.host.to_string());
         fact(KEY_NAMESPACE, binding.namespace.clone());
-        let entity = match (&binding.convoy, &binding.vessel, &binding.session) {
-            (Some(convoy), Some(vessel), _) => Some(entity::vessel(&binding.namespace, convoy, vessel, binding.host.as_str())),
-            (Some(convoy), None, _) => Some(entity::convoy(&binding.namespace, convoy, binding.host.as_str())),
-            (None, _, Some(session)) => Some(entity::session(&format!("{}/{}/{session}", binding.host, binding.namespace))),
-            (None, _, None) => None,
-        };
+        // A convoy and its vessels are addressed under the host holding the
+        // convoy's record, not the host that owns the attach target. Without
+        // that home there is no convoy identity to stamp.
+        let convoy = binding.convoy.as_ref().zip(binding.convoy_home.as_ref());
+        let convoy_entity = convoy.and_then(|(convoy, home)| stamped(entity::convoy(home.as_str(), convoy), convoy));
+        let vessel_entity = convoy
+            .zip(binding.vessel.as_ref())
+            .and_then(|((convoy, home), vessel)| stamped(entity::vessel(home.as_str(), convoy, vessel), vessel));
+        let session_ref = binding.session.as_ref().map(|session| entity::session(binding.host.as_str(), session));
+        let entity = vessel_entity.clone().or_else(|| convoy_entity.clone()).or_else(|| session_ref.clone());
         if let Some(entity) = entity {
             fact(KEY_ENTITY_KIND, entity.kind.clone());
             fact(KEY_ENTITY_ID, entity.id);
         }
-        if let Some(session) = &binding.session {
-            fact(KEY_SESSION, format!("{}/{}/{session}", binding.host, binding.namespace));
+        if let Some(session) = session_ref {
+            fact(KEY_SESSION, session.id);
         }
-        if let Some(convoy) = &binding.convoy {
-            fact(KEY_CONVOY, entity::convoy(&binding.namespace, convoy, binding.host.as_str()).id);
+        if let Some(convoy) = convoy_entity {
+            fact(KEY_CONVOY, convoy.id);
         }
-        if let Some(vessel) = &binding.vessel {
-            if let Some(convoy) = &binding.convoy {
-                fact(KEY_VESSEL, entity::vessel(&binding.namespace, convoy, vessel, binding.host.as_str()).id);
-            }
+        if let Some(vessel) = vessel_entity {
+            fact(KEY_VESSEL, vessel.id);
         }
         if let Some(role) = &binding.role {
             fact(KEY_CREW_ROLE, role.clone());
@@ -93,6 +101,7 @@ mod tests {
             .namespace("dev")
             .session("terminal-impl-coder")
             .convoy("manifest-extraction")
+            .convoy_home(HostName::new("feta"))
             .vessel("implement")
             .role("coder")
             .build();
@@ -100,15 +109,42 @@ mod tests {
 
         assert_eq!(patch.target, MetadataTarget::Pane(PaneTarget::Terminal(42)));
         assert_eq!(patch.source_id, SOURCE_ATTACH);
-        assert_eq!(patch.set[KEY_SESSION].value, MetadataValue::text("feta/dev/terminal-impl-coder"));
-        assert_eq!(patch.set[KEY_CONVOY].value, MetadataValue::text("dev/manifest-extraction@feta"));
-        assert_eq!(patch.set[KEY_VESSEL].value, MetadataValue::text("dev/manifest-extraction/implement@feta"));
+        assert_eq!(patch.set[KEY_SESSION].value, MetadataValue::text("feta/terminal-impl-coder"));
+        assert_eq!(patch.set[KEY_CONVOY].value, MetadataValue::text("host:feta/convoy:manifest-extraction"));
+        assert_eq!(patch.set[KEY_VESSEL].value, MetadataValue::text("host:feta/convoy:manifest-extraction/vessel:implement"));
         assert_eq!(patch.set[KEY_ENTITY_KIND].value, MetadataValue::text("vessel"));
-        assert_eq!(patch.set[KEY_ENTITY_ID].value, MetadataValue::text("dev/manifest-extraction/implement@feta"));
+        assert_eq!(patch.set[KEY_ENTITY_ID].value, MetadataValue::text("host:feta/convoy:manifest-extraction/vessel:implement"));
         assert_eq!(patch.set[KEY_CREW_ROLE].value, MetadataValue::text("coder"));
         assert_eq!(patch.set[KEY_ATTACH_REF].value, MetadataValue::text("implement/coder"));
         assert_eq!(patch.set[KEY_SOURCE].value, MetadataValue::text(SOURCE_FLOTILLA));
         assert!(patch.set.values().all(|update| update.ttl_ms.is_none()), "pane stamps carry no TTL");
+    }
+
+    #[test]
+    fn a_convoy_is_stamped_under_its_record_home_not_the_attach_host() {
+        let binding = AttachBinding::builder()
+            .host(HostName::new("kiwi"))
+            .namespace("dev")
+            .session("terminal-impl-coder")
+            .convoy("fix#9")
+            .convoy_home(HostName::new("feta"))
+            .vessel("implement")
+            .build();
+        let patch = pane_stamp(PaneTarget::Terminal(7), "implement/coder", Some(&binding));
+
+        assert_eq!(patch.set[KEY_CONVOY].value, MetadataValue::text("host:feta/convoy:fix%239"));
+        assert_eq!(patch.set[KEY_VESSEL].value, MetadataValue::text("host:feta/convoy:fix%239/vessel:implement"));
+        assert_eq!(patch.set[KEY_SESSION].value, MetadataValue::text("kiwi/terminal-impl-coder"));
+    }
+
+    #[test]
+    fn a_convoy_with_no_known_home_has_no_identity() {
+        let binding =
+            AttachBinding::builder().host(HostName::new("kiwi")).namespace("dev").session("terminal-impl-coder").convoy("fix#9").build();
+        let patch = pane_stamp(PaneTarget::Terminal(7), "implement/coder", Some(&binding));
+
+        assert!(!patch.set.contains_key(KEY_CONVOY) && !patch.set.contains_key(KEY_VESSEL));
+        assert_eq!(patch.set[KEY_ENTITY_KIND].value, MetadataValue::text("session"));
     }
 
     #[test]

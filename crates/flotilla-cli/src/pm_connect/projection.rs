@@ -9,7 +9,7 @@ use flotilla_manifest::{
 };
 use flotilla_protocol::{
     result_set::{AwarenessEntry, AwarenessNode, Timestamp},
-    IssueSource, ResourceRef, Subject, SubjectKind, ViewAddress,
+    IssueSource, ResourceRef, Subject, SubjectKind,
 };
 
 use super::{resources::RecordKey, ConnectorState};
@@ -219,14 +219,14 @@ impl Projection {
             let header = (header, next.entries.len());
             if self.headers.get(&next.id) != Some(&header) {
                 self.headers.insert(next.id.clone(), header);
-                self.change(Node::Header(next.id.clone()), Some(address_links(&next.id)));
+                self.change(Node::Header(next.id.clone()), Some(node_links(next)));
             }
             for entry in &next.entries {
                 if !parent_changed && prior_entries.get(&entry.id).copied() == Some(entry) {
                     continue;
                 }
                 self.entries.insert((next.id.clone(), entry.id.clone()), entry.clone());
-                let mut links = address_links(&entry.id);
+                let mut links = entry_links(entry);
                 links.push(Dependency::Entry(entry.id.clone()));
                 links.extend(entry.issue_refs.iter().map(|reference| {
                     Dependency::Subject(Subject { kind: SubjectKind::Issue, source: reference.source.clone(), id: reference.id.clone() })
@@ -381,10 +381,20 @@ impl Projection {
     }
 }
 
-pub(super) fn address_links(address: &str) -> Vec<Dependency> {
-    match address.parse::<ViewAddress>() {
-        Ok(ViewAddress::Convoy { namespace, name }) => vec![Dependency::Convoy(namespace, name)],
-        Ok(ViewAddress::Vessel { namespace, convoy, .. }) => vec![Dependency::Convoy(namespace, convoy)],
+/// The convoy a convoy-grouped awareness node's typed ref names.
+pub(super) fn node_links(node: &AwarenessNode) -> Vec<Dependency> {
+    match node.refs.first() {
+        Some(reference) if node.kind == flotilla_protocol::AwarenessKind::Convoy && reference.kind == "Convoy" => {
+            vec![Dependency::Convoy(reference.namespace.clone(), reference.name.clone())]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The convoy an awareness entry's typed ref names. The entry id is an opaque key.
+pub(super) fn entry_links(entry: &flotilla_protocol::AwarenessEntry) -> Vec<Dependency> {
+    match entry.refs.first() {
+        Some(reference) if reference.kind == "Convoy" => vec![Dependency::Convoy(reference.namespace.clone(), reference.name.clone())],
         _ => Vec::new(),
     }
 }

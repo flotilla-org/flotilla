@@ -2572,12 +2572,12 @@ mod tests {
                 &FlotillaRecipes::new("flotilla"),
             );
             let patches = catalog.reassert_patches();
-            let cr = entity::change_request("github.com", "org/repo", "42");
+            let cr = cr_entity("github.com", "org/repo", "42");
             let patch = patches.iter().find(|patch| patch.target == MetadataTarget::Entity(cr.clone())).expect("orphan");
             assert_eq!(patch.set["flotilla.orphaned"].value, MetadataValue::Bool(true));
             assert_eq!(
                 patch.set["flotilla.subject_of.produces"].value,
-                MetadataValue::EntityRefs(vec![entity::convoy("ops", "producer", "kiwi")])
+                MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "producer").expect("valid address")])
             );
             // A restart loses all in-memory demand/tasks but retains the store.
             for (_, refresh) in refresher.inner.active.lock().await.drain() {
@@ -3137,5 +3137,16 @@ mod tests {
 
         refresher.release(demand).await;
         assert_eq!(refresher.observation_error(&subject).await, None);
+    }
+
+    fn cr_entity(service: &str, scope: impl AsRef<str>, number: impl AsRef<str>) -> flotilla_manifest::entity::EntityRef {
+        let address = flotilla_resources::address::stored_change_request_address(
+            service,
+            scope.as_ref(),
+            number.as_ref().parse().expect("number"),
+            &[],
+        )
+        .expect("a resolvable service");
+        flotilla_manifest::entity::change_request(&address)
     }
 }

@@ -1517,6 +1517,11 @@ pub struct AttachBinding {
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy: Option<String>,
+    /// The host holding the convoy's record, which `convoy` and `vessel` are
+    /// addressed under; not the host that owns the attach target. Absent when
+    /// the record's home is unknown, so no convoy identity is stamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convoy_home: Option<crate::HostName>,
     /// The convoy phase observed when the attach plan was resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy_phase: Option<crate::ConvoyPhase>,

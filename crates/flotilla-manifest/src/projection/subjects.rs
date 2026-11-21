@@ -1,9 +1,11 @@
 //! ADR 0051: replicated observations are the sole subject fact source.
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_protocol::{IssueRef, IssueSource, Relationship, Subject, SubjectKind};
+use flotilla_address::{Forge as AddressForge, Kind as AddressKind};
+use flotilla_protocol::{IssueSource, Relationship, Subject, SubjectKind};
 use flotilla_resources::{
-    ForgeKind, Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision,
+    address, ForgeKind, ForgeSpec, Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability,
+    ObservedReviewDecision,
 };
 
 use super::{
@@ -28,17 +30,17 @@ use crate::keys::{
     KEY_SUBJECT_SUPERSEDES, KEY_SUBJECT_WORKS_ON, SEGMENT_PROJECT,
 };
 
-const BUILTIN_GITHUB_SERVICE: &str = "github.com";
-
-fn subject_entity(subject: &Subject) -> EntityRef {
-    match subject.kind {
-        SubjectKind::Issue => entity::issue(&IssueRef { source: subject.source.clone(), id: subject.id.clone() }),
-        SubjectKind::ChangeRequest => entity::change_request(&subject.source.service, &subject.source.scope, &subject.id),
-    }
+/// The entity a convoy subject names, through the one stored-spelling →
+/// address resolver, which also reads the encoded host and URL spellings.
+fn subject_entity(forges: &[ForgeSpec], subject: &Subject) -> Option<EntityRef> {
+    let address = address::subject_address(subject, forges).ok()?;
+    Some(match subject.kind {
+        SubjectKind::Issue => entity::issue(&address),
+        SubjectKind::ChangeRequest => entity::change_request(&address),
+    })
 }
 
-fn assert_subject(catalog: &mut Catalog, subject: &Subject, facts: Vec<(&'static str, MetadataValue)>) {
-    let target = subject_entity(subject);
+fn assert_subject(catalog: &mut Catalog, target: EntityRef, facts: Vec<(&'static str, MetadataValue)>) {
     // Subject links own this fact, including absence when ambiguous; an
     // awareness entry must not leave an inherited project behind.
     if let Some(prior) = catalog.facts.get_mut(&MetadataTarget::Entity(target.clone())) {
@@ -122,10 +124,9 @@ fn observe<T: PresentationValue>(
 pub(super) fn project_role_attempts(catalog: &mut Catalog, role: &StandingRoleRow, convoys: &[ConvoyRow]) {
     let attempts = standing_attempts(role, convoys);
     let current = attempts.iter().rev().find(|convoy| convoy.is_live()).copied();
-    let convoy_ref =
-        |convoy: &ConvoyRow| entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
+    let convoy_ref = |convoy: &ConvoyRow| super::convoy_entity(convoy);
     let mut facts = vec![
-        (KEY_ROLE_ATTEMPTS, MetadataValue::EntityRefs(attempts.iter().map(|convoy| convoy_ref(convoy)).collect())),
+        (KEY_ROLE_ATTEMPTS, MetadataValue::EntityRefs(attempts.iter().filter_map(|convoy| convoy_ref(convoy)).collect())),
         (KEY_ROLE_DESIRED_STATE, MetadataValue::text("running")),
         (
             KEY_ROLE_STATE,
@@ -145,27 +146,27 @@ pub(super) fn project_role_attempts(catalog: &mut Catalog, role: &StandingRoleRo
         facts.push((KEY_ROLE_NEXT_ATTEMPT, MetadataValue::text(next.to_rfc3339())));
     }
     if let Some(convoy) = current {
-        facts.push((KEY_ROLE_CURRENT_ATTEMPT, MetadataValue::EntityRefs(vec![convoy_ref(convoy)])));
+        facts.push((KEY_ROLE_CURRENT_ATTEMPT, MetadataValue::EntityRefs(convoy_ref(convoy).into_iter().collect())));
         let sessions = convoy
             .vessels
             .iter()
-            .filter_map(|vessel| {
-                vessel.materialize.as_ref().map(|name| entity::session(&format!("{}/{}/{}", vessel.host, convoy.resource.namespace, name)))
-            })
+            .filter_map(|vessel| vessel.materialize.as_ref().map(|name| entity::session(vessel.host.as_str(), name)))
             .collect::<BTreeSet<_>>();
         facts.push((KEY_ROLE_CREW_SESSIONS, MetadataValue::EntityRefs(sessions.into_iter().collect())));
     }
-    catalog.assert_entity(role_entity(role), facts, None);
+    if let Some(role_entity) = role_entity(role) {
+        catalog.assert_entity(role_entity, facts, None);
+    }
 }
 
 /// The declared and built-in forges share the PM connector contract.
-fn project_forge(catalog: &mut Catalog, id: &str, kind: ForgeKind, web_url: &str) {
+fn project_forge(catalog: &mut Catalog, forge: &AddressForge, kind: ForgeKind, web_url: &str) {
     let (kind, path) = match kind {
         ForgeKind::Github => ("github", "pull"),
         ForgeKind::Forgejo => ("forgejo", "pulls"),
     };
     catalog.assert_entity(
-        entity::forge(id),
+        entity::forge(forge),
         vec![
             (KEY_FORGE_KIND, MetadataValue::text(kind)),
             (KEY_FORGE_WEB_URL, MetadataValue::text(web_url.trim_end_matches('/'))),
@@ -178,13 +179,14 @@ fn project_forge(catalog: &mut Catalog, id: &str, kind: ForgeKind, web_url: &str
 
 pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, observations: &SubjectCatalogInput) {
     project_inbox(catalog, input, observations);
+    let forge_specs: Vec<ForgeSpec> = observations.forges.iter().map(|forge| forge.spec.clone()).collect();
     let mut links: BTreeMap<Subject, BTreeMap<Relationship, BTreeSet<EntityRef>>> = BTreeMap::new();
     let mut projects = BTreeMap::new();
     let mut landed = BTreeSet::new();
     let mut convoy_edges = BTreeMap::new();
     for convoy in input.convoys {
-        let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
-        if let Some((project, _)) = super::project_fact(Some(&convoy.project_ref), "fleet") {
+        let Some(convoy_entity) = super::convoy_entity(convoy) else { continue };
+        if let Some((project, _)) = super::project_fact(Some(&convoy.project_ref)) {
             projects.insert(convoy_entity.clone(), project.id);
         }
         // A future finished_at from clock skew remains in the window until
@@ -201,11 +203,13 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
             if !visible {
                 continue;
             }
-            forward.entry(entry.relationship).or_default().insert(subject_entity(&entry.subject));
+            if let Some(subject_entity) = subject_entity(&forge_specs, &entry.subject) {
+                forward.entry(entry.relationship).or_default().insert(subject_entity);
+            }
             links.entry(entry.subject.clone()).or_default().entry(entry.relationship).or_default().insert(convoy_entity.clone());
         }
         if !forward.is_empty() && !catalog.facts.contains_key(&MetadataTarget::Entity(convoy_entity.clone())) {
-            catalog.assert_entity(convoy_entity.clone(), super::convoy_identity_facts(convoy), None);
+            catalog.assert_entity(convoy_entity.clone(), super::convoy_identity_facts(convoy, &convoy_entity), None);
         }
         let facts: Vec<_> = forward
             .into_iter()
@@ -218,23 +222,25 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     }
 
     for record in &observations.forges {
-        project_forge(catalog, &record.spec.forge_id, record.spec.kind, &record.spec.https_url);
+        if let Ok(forge) = AddressForge::new(record.spec.forge_id.clone(), record.spec.kind.into()) {
+            project_forge(catalog, &forge, record.spec.kind, &record.spec.https_url);
+        }
     }
     // Like declared forges, publish the default even without visible subjects.
     // Presentation-only: never declare a resource or re-key repositories.
-    if super::subject_forge(&observations.forges, BUILTIN_GITHUB_SERVICE).is_none() {
-        project_forge(catalog, BUILTIN_GITHUB_SERVICE, ForgeKind::Github, "https://github.com");
+    if !observations.forges.iter().any(|forge| forge.spec.forge_id == flotilla_address::GITHUB_FORGE_ID) {
+        project_forge(catalog, &AddressForge::github(), ForgeKind::Github, "https://github.com");
     }
 
     for role in input.standing_roles {
-        let role_ref = role_entity(role);
-        projects.insert(role_ref.clone(), entity::project(&role.resource.namespace, super::role_project(role), "fleet").id);
+        let (Some(role_ref), Some(project)) = (role_entity(role), super::project_entity(super::role_project(role))) else { continue };
+        projects.insert(role_ref.clone(), project.id);
         let attempts = standing_attempts(role, input.convoys);
         let current = attempts.iter().rev().find(|convoy| convoy.is_live()).copied();
         let mut facts = Vec::new();
         if let Some(convoy) = current {
-            let target = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
-            if let Some(forward) = convoy_edges.get(&target) {
+            let target = super::convoy_entity(convoy);
+            if let Some(forward) = target.as_ref().and_then(|target| convoy_edges.get(target)) {
                 facts.extend(forward.clone());
             }
             for entry in &convoy.subjects {
@@ -245,11 +251,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     }
 
     let selected = flotilla_resources::select_change_requests(&observations.change_requests);
-    let present_convoys: BTreeSet<_> = input
-        .convoys
-        .iter()
-        .map(|convoy| entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource)))
-        .collect();
+    let present_convoys: BTreeSet<_> = input.convoys.iter().filter_map(super::convoy_entity).collect();
     let mut orphaned = BTreeSet::new();
     for (subject, record) in &selected {
         if !flotilla_resources::retain_change_request(record)
@@ -259,16 +261,19 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         {
             continue;
         }
+        let history_convoy = |history: &flotilla_resources::ChangeRequestSubjectHistory| {
+            super::refused(entity::convoy(&history.origin, &history.convoy), &history.convoy)
+        };
         let departed_producer = record.spec.subject_of.iter().any(|history| {
             history.relationship == Relationship::Produces
-                && !present_convoys.contains(&entity::convoy(&history.namespace, &history.convoy, &history.origin))
+                && history_convoy(history).is_some_and(|convoy| !present_convoys.contains(&convoy))
         });
         if departed_producer {
             orphaned.insert(subject.clone());
         }
         if orphaned.contains(subject) {
             for history in &record.spec.subject_of {
-                let convoy = entity::convoy(&history.namespace, &history.convoy, &history.origin);
+                let Some(convoy) = history_convoy(history) else { continue };
                 links.entry(subject.clone()).or_default().entry(history.relationship).or_default().insert(convoy);
             }
         }
@@ -279,20 +284,35 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     for repo in &observations.references.repositories {
         aliases.entry(&repo.source).or_insert(repo.alias.as_str());
     }
-    let services: BTreeSet<_> = links.keys().map(|subject| subject.source.service.as_str()).collect();
-    let forges: BTreeMap<_, _> = services
-        .into_iter()
-        .filter_map(|service| {
-            if let Some(forge) = super::subject_forge(&observations.forges, service) {
-                Some((service, entity::forge(&forge.spec.forge_id)))
-            } else if service == BUILTIN_GITHUB_SERVICE {
-                Some((service, entity::forge(BUILTIN_GITHUB_SERVICE)))
-            } else {
-                catalog.uncovered_services.insert(service.to_owned());
-                None
+    // A subject's forge link is the forge its own address resolved to, so the
+    // two cannot disagree; a service the resolver cannot place is uncovered.
+    let mut forges: BTreeMap<&str, EntityRef> = BTreeMap::new();
+    for subject in links.keys() {
+        let service = subject.source.service.as_str();
+        if forges.contains_key(service) {
+            continue;
+        }
+        let forge = address::subject_address(subject, &forge_specs)
+            .ok()
+            .and_then(|address| address.get(AddressKind::Forge).map(str::to_owned))
+            .and_then(|id| {
+                // The forge's own kind: a declared forge's, else the built-in GitHub.
+                let kind = match forge_specs.iter().find(|spec| spec.forge_id == id) {
+                    Some(spec) => spec.kind,
+                    None if id == flotilla_address::GITHUB_FORGE_ID => ForgeKind::Github,
+                    None => return None,
+                };
+                AddressForge::new(id, kind.into()).ok()
+            });
+        match forge {
+            Some(forge) => {
+                forges.insert(service, entity::forge(&forge));
             }
-        })
-        .collect();
+            None => {
+                catalog.uncovered_services.insert(service.to_owned());
+            }
+        }
+    }
     let identity_facts = |subject: &Subject| {
         let label = subject.short(&observations.references);
         let kind = match subject.kind {
@@ -330,12 +350,13 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         if !links.contains_key(subject) {
             continue;
         }
+        let Some(target) = subject_entity(&forge_specs, subject) else { continue };
         let mut facts = identity_facts(subject);
         facts.extend(change_request_facts(status, landed.contains(subject)));
         if orphaned.contains(subject) {
             facts.push((KEY_SUBJECT_ORPHANED, MetadataValue::Bool(true)));
         }
-        assert_subject(catalog, subject, facts);
+        assert_subject(catalog, target, facts);
     }
     for record in &observations.issues {
         let subject = Subject {
@@ -346,6 +367,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         if !links.contains_key(&subject) {
             continue;
         }
+        let Some(target) = subject_entity(&forge_specs, &subject) else { continue };
         let mut facts = identity_facts(&subject);
         if let Some(status) = &record.status {
             observe(&mut facts, KEY_ISSUE_TITLE, KEY_ISSUE_TITLE_OBSERVED_AT, &status.title);
@@ -354,7 +376,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
             observe(&mut facts, KEY_ISSUE_ASSIGNEES, KEY_ISSUE_ASSIGNEES_OBSERVED_AT, &status.assignees);
             observe(&mut facts, KEY_ISSUE_UPDATED_AT, KEY_ISSUE_UPDATED_AT_OBSERVED_AT, &status.updated_at);
         }
-        assert_subject(catalog, &subject, facts);
+        assert_subject(catalog, target, facts);
     }
 }
 
@@ -397,11 +419,11 @@ fn project_inbox(catalog: &mut Catalog, input: &CatalogInput<'_>, records: &Subj
     for row in input.convoys {
         let namespace = &row.resource.namespace;
         let name = &row.resource.name;
-        let target = entity::convoy(namespace, name, &entity::resource_origin(&row.resource));
+        let Some(target) = super::convoy_entity(row) else { continue };
         // Inbox facts may introduce a convoy absent from awareness. Seed its
         // canonical identity before other projections test whether it exists.
         if !catalog.facts.contains_key(&MetadataTarget::Entity(target.clone())) {
-            catalog.assert_entity(target.clone(), super::convoy_identity_facts(row), None);
+            catalog.assert_entity(target.clone(), super::convoy_identity_facts(row, &target), None);
         }
         let resource = records.convoys.iter().find(|record| record.metadata.namespace == *namespace && record.metadata.name == *name);
         let holds: Vec<_> = resource
@@ -459,5 +481,33 @@ fn project_inbox(catalog: &mut Catalog, input: &CatalogInput<'_>, records: &Subj
         facts.push((KEY_CONVOY_PENDING_MESSAGES, MetadataValue::StringList(pending.into_values().collect())));
         facts.push((KEY_CONVOY_STUCK_MESSAGES, MetadataValue::StringList(stuck.into_values().collect())));
         catalog.assert_entity(target, facts, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use flotilla_protocol::IssueSource;
+    use flotilla_resources::{ForgeKind, ForgeSpec};
+
+    use super::*;
+
+    // A declared issue subject on a Forge installed under a path is stored with
+    // its location encoded in the service; it must still name the Forge.
+    #[test]
+    fn an_encoded_installation_spelling_resolves_to_its_forge() {
+        let forge = ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(ForgeKind::Forgejo)
+            .hosts(["git.example.com".into()].into_iter().collect())
+            .https_url("https://git.example.com/forgejo".into())
+            .git_ssh_host("git.example.com".into())
+            .build();
+        let subject = Subject {
+            kind: SubjectKind::Issue,
+            source: IssueSource { service: "git.example.com%2fforgejo".into(), scope: "team/cleat".into() },
+            id: "7".into(),
+        };
+        assert_eq!(subject_entity(&[forge], &subject).expect("resolves").id, "forge:lab/repo:team%2Fcleat/issue:7");
+        assert_eq!(subject_entity(&[], &subject), None, "no declared Forge, no address");
     }
 }

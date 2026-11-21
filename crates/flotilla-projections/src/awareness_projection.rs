@@ -419,6 +419,7 @@ mod tests {
     fn convoy(project_ref: &str, name: &str, phase: ConvoyPhase) -> ConvoyRow {
         ConvoyRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", name))
+            .home(flotilla_protocol::HostName::new("local"))
             .name(name.to_string())
             .workflow_ref("implement")
             .phase(phase)
