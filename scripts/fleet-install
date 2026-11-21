@@ -11,6 +11,7 @@ readonly FLEET_TOKEN_FILE="${FLEET_INSTALL_TOKEN_FILE:-$HOME/.config/flotilla/fl
 readonly SYSTEMD_USER_DIR="${FLEET_INSTALL_SYSTEMD_USER_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
 readonly LAUNCH_AGENT_DIR="${FLEET_INSTALL_LAUNCH_AGENT_DIR:-$HOME/Library/LaunchAgents}"
 readonly LAUNCH_AGENT_LABEL="work.flotilla.flotillad"
+readonly TENDER_LAUNCH_AGENT_LABEL="work.flotilla.tender"
 readonly DAEMON_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flotilla"
 readonly DAEMON_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/flotilla"
 readonly DAEMON_INSTALL_MARKER="$DAEMON_CONFIG_DIR/run/install-in-progress"
@@ -48,6 +49,7 @@ INSTALL_LOCK_HELD=0
 DAEMON_INSTALL_MARKER_HELD=0
 DAEMON_INSTALL_WINDOW_OPEN=0
 DAEMON_SERVICE_DISABLED=0
+TENDER_SERVICE_DISABLED=0
 DARWIN_RECOVERY_GENERATION=""
 CONFIRMATION_PID=""
 CONFIRMATION_LOG=""
@@ -354,7 +356,7 @@ verify_darwin_signatures() {
   identity="$(manifest_value "$generation_manifest" central_signing.signing.identity)"
   requirement="=designated => anchor apple generic and certificate leaf[subject.OU] = \"$TRUSTED_APPLE_TEAM_ID\""
   codesign="$(codesign_program)"
-  local targets=("$release"/lib/*.dylib "$release"/bin/flotilla "$release"/bin/flotillad "$release"/bin/drydock-host "$release"/bin/cleat)
+  local targets=("$release"/lib/*.dylib "$release"/bin/flotilla "$release"/bin/flotillad "$release"/bin/drydock-host "$release"/bin/tender "$release"/bin/cleat)
   local siblings sibling
   siblings="$(python3 "$GENERATION_VALIDATOR" sibling-commands -- "$release")" || die "cannot list the release's siblings"
   for sibling in $siblings; do
@@ -433,7 +435,8 @@ ensure_launchers_and_path() {
   for name in flotilla-vessel drydock-agent; do
     [[ ! -x "$FLEET_ROOT/current/bin/$name" ]] || write_launcher "$name"
   done
-  for name in flotilla flotillad cleat; do
+  # The incoming generation is not current yet, so the launcher cannot wait for its `bin/tender`.
+  for name in flotilla flotillad cleat tender; do
     write_launcher "$name"
   done
 
@@ -494,6 +497,43 @@ UNIT
   mv -f "$temporary" "$unit"
 }
 
+# Tender runs as its own user service beside flotillad, as the same account. Its state
+# (identity key, authority store, trusted.toml) lives in Tender's own directories, which
+# the installer never touches, so the instance keeps its identity across rolls.
+write_tender_systemd_unit() {
+  [[ "$PLATFORM" == linux-* ]] || return 0
+  local unit="$SYSTEMD_USER_DIR/tender.service"
+  local temporary tender_path fleet_bin_path
+  tender_path="$(systemd_path "$FLEET_ROOT/current/bin/tender")"
+  fleet_bin_path="$(systemd_path "$FLEET_BIN_DIR")"
+  mkdir -p "$SYSTEMD_USER_DIR"
+  temporary="$(mktemp "$SYSTEMD_USER_DIR/.tender.service.fleet-install.XXXXXX")"
+  cat >"$temporary" <<UNIT
+# managed by fleet-install
+[Unit]
+Description=Tender daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart="$tender_path" serve
+Environment="PATH=$fleet_bin_path:/usr/local/bin:/usr/bin:/bin"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+  chmod 0644 "$temporary"
+  mv -f "$temporary" "$unit"
+}
+
+# True when the selected generation ships Tender: one built before it did has no `bin/tender`.
+generation_ships_tender() {
+  [[ -x "$CURRENT_LINK/bin/tender" ]]
+}
+
 systemd_path() {
   python3 "$GENERATION_VALIDATOR" systemd-path -- "$1" "$HOME"
 }
@@ -506,7 +546,14 @@ prepare_linux_daemon_service() {
     && [[ "$(systemctl --user is-enabled flotillad.service 2>/dev/null || true)" == disabled ]]; then
     DAEMON_SERVICE_DISABLED=1
   fi
+  # Read before the unit is written: a unit just created is not enabled yet, and would read as
+  # disabled by the operator.
+  if [[ -f "$SYSTEMD_USER_DIR/tender.service" ]] \
+    && [[ "$(systemctl --user is-enabled tender.service 2>/dev/null || true)" == disabled ]]; then
+    TENDER_SERVICE_DISABLED=1
+  fi
   write_systemd_user_unit
+  write_tender_systemd_unit
   # Re-enabling linger can be denied by polkit outside a login session even
   # when linger is already on; only attempt the transition that is needed.
   local user
@@ -520,15 +567,24 @@ prepare_linux_daemon_service() {
   if ((!DAEMON_SERVICE_DISABLED)); then
     systemctl --user enable flotillad.service
   fi
+  if ((!TENDER_SERVICE_DISABLED)); then
+    systemctl --user enable tender.service
+  fi
 }
 
 restart_linux_daemon_service() {
   [[ "$PLATFORM" == linux-* ]] || return 0
+  command -v systemctl >/dev/null || die 'cannot restart flotillad.service: systemctl is not available'
+  # Tender is restarted with the generation, withdrawing its API publications: its epoch
+  # changes and publishers publish again. It has its own disabled flag, so flotillad's dev
+  # mode does not keep it from restarting. A generation without it leaves the service alone.
+  if ((!TENDER_SERVICE_DISABLED)) && generation_ships_tender; then
+    systemctl --user restart tender.service
+  fi
   if ((DAEMON_SERVICE_DISABLED)); then
     printf 'fleet-install: preserving flotillad dev mode; systemd user unit remains disabled\n'
     return 0
   fi
-  command -v systemctl >/dev/null || die 'cannot restart flotillad.service: systemctl is not available'
   systemctl --user restart flotillad.service
 }
 
@@ -546,6 +602,19 @@ write_launchd_agent() {
   temporary="$(mktemp "$LAUNCH_AGENT_DIR/.$LAUNCH_AGENT_LABEL.plist.fleet-install.XXXXXX")"
   python3 "$GENERATION_VALIDATOR" launchd-agent -- "$temporary" "$LAUNCH_AGENT_LABEL" "$daemon_path" "$daemon_path_value" "$skills_path" "$codex_home_path" \
     "$DAEMON_CONFIG_DIR" "$DAEMON_STATE_DIR" "$DAEMON_SOCKET" "$stderr_path" "$stdout_path"
+  chmod 0644 "$temporary"
+  mv -f "$temporary" "$plist"
+}
+
+write_tender_launchd_agent() {
+  [[ "$PLATFORM" == darwin-* ]] || return 0
+  local plist="$LAUNCH_AGENT_DIR/$TENDER_LAUNCH_AGENT_LABEL.plist"
+  local temporary
+  mkdir -p "$LAUNCH_AGENT_DIR" "$LAUNCH_LOG_DIR"
+  temporary="$(mktemp "$LAUNCH_AGENT_DIR/.$TENDER_LAUNCH_AGENT_LABEL.plist.fleet-install.XXXXXX")"
+  python3 "$GENERATION_VALIDATOR" launchd-tender-agent -- "$temporary" "$TENDER_LAUNCH_AGENT_LABEL" "$DARWIN_TCC_ROOT/bin/tender" \
+    "$FLEET_BIN_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$LAUNCH_LOG_DIR/tender.stderr.log" "$LAUNCH_LOG_DIR/tender.stdout.log"
   chmod 0644 "$temporary"
   mv -f "$temporary" "$plist"
 }
@@ -587,6 +656,9 @@ read_darwin_service_disabled() {
     || die "cannot determine whether $LAUNCH_AGENT_LABEL is disabled"
   if grep -Fq "\"$LAUNCH_AGENT_LABEL\" => true" <<<"$disabled_services"; then
     DAEMON_SERVICE_DISABLED=1
+  fi
+  if grep -Fq "\"$TENDER_LAUNCH_AGENT_LABEL\" => true" <<<"$disabled_services"; then
+    TENDER_SERVICE_DISABLED=1
   fi
 }
 
@@ -641,6 +713,8 @@ prepare_darwin_daemon_service() {
   fi
   launchctl bootout "$domain/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
   write_launchd_agent
+  launchctl bootout "$domain/$TENDER_LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+  write_tender_launchd_agent
 }
 
 # Copy, never symlink: TCC resolves symlinks to the generation's changing path.
@@ -657,6 +731,9 @@ restart_darwin_daemon_service() {
   [[ "$PLATFORM" == darwin-* ]] || return 0
   refresh_darwin_tcc_payload || return 1
   if ((DAEMON_SERVICE_DISABLED)); then
+    # Tender has its own disabled flag; flotillad's dev mode only keeps flotillad down.
+    command -v launchctl >/dev/null || die "cannot restart $TENDER_LAUNCH_AGENT_LABEL: launchctl is not available"
+    restart_darwin_tender_service
     printf 'fleet-install: preserving flotillad dev mode; launchd agent remains disabled\n'
     return 0
   fi
@@ -670,8 +747,47 @@ restart_darwin_daemon_service() {
     launchctl bootstrap "$domain" "$plist" || return 1
   fi
   launchctl kickstart -k "$target" || return 1
+  restart_darwin_tender_service
   # Successful restarts also disarm recovery on exact-generation reinstalls.
   DARWIN_RECOVERY_GENERATION=""
+}
+
+# A failed Tender start never takes flotillad's generation down with it: the health check
+# below reports it.
+restart_darwin_tender_service() {
+  ((!TENDER_SERVICE_DISABLED)) || return 0
+  [[ -x "$DARWIN_TCC_ROOT/bin/tender" ]] || return 0
+  local domain="gui/$(id -u)"
+  local target="$domain/$TENDER_LAUNCH_AGENT_LABEL"
+  local plist="$LAUNCH_AGENT_DIR/$TENDER_LAUNCH_AGENT_LABEL.plist"
+  launchctl enable "$target" || return 0
+  if ! launchctl print "$target" >/dev/null 2>&1; then
+    launchctl bootstrap "$domain" "$plist" || return 0
+  fi
+  launchctl kickstart -k "$target" || return 0
+}
+
+# `tender identity` answering is Tender's health: the daemon is up and its control API serves.
+# Tender is not rolled back with flotillad; an unhealthy one is reported and fixed forward.
+confirm_tender_health() {
+  local tender="$CURRENT_LINK/bin/tender"
+  [[ "$PLATFORM" != darwin-* ]] || tender="$DARWIN_TCC_ROOT/bin/tender"
+  ((!TENDER_SERVICE_DISABLED)) || { printf 'fleet-install: tender health confirmation skipped while its service is disabled\n'; return 0; }
+  [[ -x "$tender" ]] || return 0
+  local deadline=$((SECONDS + ${TENDER_CONFIRM_TIMEOUT_SECONDS:-30}))
+  while true; do
+    if "$tender" identity >/dev/null 2>"$FLEET_ROOT/.tender-health.stderr" 9>&-; then
+      rm -f -- "$FLEET_ROOT/.tender-health.stderr"
+      printf 'fleet-install: tender answers identity\n'
+      return 0
+    fi
+    if ((SECONDS >= deadline)); then
+      cat "$FLEET_ROOT/.tender-health.stderr" >&2
+      rm -f -- "$FLEET_ROOT/.tender-health.stderr"
+      return 1
+    fi
+    sleep 1
+  done
 }
 
 probe_daemon_health() {
@@ -1038,11 +1154,18 @@ activate_staged_generation() {
     await_confirmation_watchdog "$generation" "$rollback_generation" || unhealthy=$?
     ((unhealthy)) || prune_after_confirmation
   fi
+  local tender_unhealthy=0
+  if ((!unhealthy)); then
+    confirm_tender_health || tender_unhealthy=1
+  fi
   if [[ "$replaced" != "$generation" ]] && ! record_roll "$generation" "$replaced" "${FLEET_INSTALL_ROLLBACK_REASON:-}"; then
     printf 'fleet-install: could not record the roll in %s\n' "$ROLL_LOG" >&2
   fi
   if ((unhealthy)); then
     die "UNHEALTHY: generation $generation is installed and current but failed health confirmation; nothing was rolled back (--no-rollback); the cleat drain did not run; inspect the daemon's log and fix forward: install a fixed generation with --no-rollback, or rerun fleet-install --no-rollback $generation once its daemon is healthy, to confirm it and drain cleat"
+  fi
+  if ((tender_unhealthy)); then
+    die "UNHEALTHY: generation $generation is installed and flotillad is healthy, but \`tender identity\` does not answer; nothing was rolled back; inspect tender.service (or $TENDER_LAUNCH_AGENT_LABEL) and its log"
   fi
   # Always use the incoming generation: the previous CLI may not have this
   # post-install step. Cleat alias turnover is outside the health rollback.

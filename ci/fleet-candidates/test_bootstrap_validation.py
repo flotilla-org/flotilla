@@ -58,10 +58,36 @@ class BootstrapValidationTests(unittest.TestCase):
         with self.assertRaises(validation.ValidationError):
             validation.validate_produced_payload(self.root)
         host.chmod(0o755)
+        with self.assertRaisesRegex(validation.ValidationError, "missing executable bin/tender"):
+            validation.validate_produced_payload(self.root)
+        self.write_tender()
         with self.assertRaisesRegex(validation.ValidationError, "missing executable bin/drydock-host-typescript"):
             validation.validate_produced_payload(self.root)
         self.write_typescript_host()
         validation.validate_produced_payload(self.root)
+
+    def test_tender_is_required_at_production_and_optional_at_consumption(self):
+        self.assertNotIn("bin/tender", validation.REQUIRED_PAYLOAD)
+        for platform in validation.PLATFORMS:
+            self.assertTrue(validation.allowed_payload("bin/tender", platform))
+        host = self.root / "bin" / "drydock-host"
+        host.parent.mkdir()
+        host.write_bytes(b"host")
+        host.chmod(0o755)
+        self.write_typescript_host()
+        with self.assertRaisesRegex(validation.ValidationError, "missing executable bin/tender"):
+            validation.validate_produced_payload(self.root)
+        self.write_tender(mode=0o644)
+        with self.assertRaisesRegex(validation.ValidationError, "missing executable bin/tender"):
+            validation.validate_produced_payload(self.root)
+        self.write_tender()
+        validation.validate_produced_payload(self.root)
+
+    def write_tender(self, mode=0o755):
+        tender = self.root / "bin" / "tender"
+        tender.parent.mkdir(exist_ok=True)
+        tender.write_bytes(b"tender")
+        tender.chmod(mode)
 
     # Siblings (#4249) are read from `flotilla`'s allowlist, shipped exactly at production, accepted
     # on every platform at consumption, and never confused with the Linux vessel CLI.
@@ -86,6 +112,7 @@ class BootstrapValidationTests(unittest.TestCase):
         host.parent.mkdir()
         host.write_bytes(b"host")
         host.chmod(0o755)
+        self.write_tender()
         self.write_typescript_host()
         with self.assertRaisesRegex(validation.ValidationError, "missing executable bin/flotilla-table"):
             validation.validate_produced_payload(self.root, ["table"])
