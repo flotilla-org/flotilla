@@ -1,12 +1,13 @@
-//! Convoys read from the engine's launches in the old Convoy shape (#3108): each launch joined
-//! with its works' Vessel launches and their sessions, its home's notes at that home only, and
-//! every write refused.
+//! Convoys read from the engine's launches in the old Convoy shape (#3108, #4412 C): each launch
+//! composed on each read from its record, its works' Vessel launches and their sessions, and its
+//! home's notes at that home only; every write refused. A get, a listing and a watch of the same
+//! records give the same version, and what changed since a position is named from the log.
 
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -20,9 +21,9 @@ use flotilla_resources::{
     convoy_records::{
         ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes, Ending, UnreadableLaunch,
     },
-    engine_records::KindRecords,
+    engine_records::{KindRecords, Since},
     held_joins::HeldJoins,
-    lifecycle_reads::{ChangeCursor, CursorSince, LifecycleReads, ProvisioningKind, Told},
+    lifecycle_reads::{ChangeCursor, CursorSince, LifecycleReads, ProvisioningKind},
     promises::{Promise, PromiseKind, PromiseSource, PromiseState},
     terminal_records::{
         TerminalChange, TerminalLaunchRequest, TerminalLaunchSource, TerminalObservations, TerminalRecord, TerminalRecords, TerminalRenewal,
@@ -32,9 +33,8 @@ use flotilla_resources::{
     Convoy, ConvoyAttention, ConvoyPhase, CrewWorkPhase, ReadWatchEvent, WorkPhase, WorkflowSnapshot,
 };
 use flotilla_store::{
-    live_convoys_query,
     load_metrics::{measure, ReadCounts},
-    ConvoyViews, EnginePort, ResourceBackend, StoreQuery,
+    ConvoyViews, EnginePort, ResourceBackend,
 };
 use flotilla_store_memory::InMemoryBackend;
 
@@ -110,6 +110,14 @@ fn launch(name: &str, home: &str) -> ConvoyRecord {
     }
 }
 
+/// `name` held here, abandoned as "stopped", and retired when `retired`.
+fn abandoned(name: &str, home: &str, retired: bool) -> ConvoyRecord {
+    let mut record = launch(name, home);
+    record.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    record.retired = retired;
+    record
+}
+
 fn session(vessel: &str, role: &str, reading: LifecycleReading) -> TerminalRecord {
     TerminalRecord {
         name: format!("terminal-{vessel}-{role}#1"),
@@ -129,137 +137,97 @@ fn session(vessel: &str, role: &str, reading: LifecycleReading) -> TerminalRecor
     }
 }
 
-/// A cursor over records that never change once read.
-struct Unchanging;
+/// The launch of `convoy`'s work `work`, held here, in `reading`.
+fn vessel(convoy: &str, work: &str, reading: LifecycleReading) -> VesselRecord {
+    let launch_of = flotilla_resources::vessel_resource_name(flotilla_resources::convoy::launch_of(convoy), work);
+    VesselRecord {
+        name: format!("{launch_of}#1"),
+        home: HERE.into(),
+        convoy: convoy.into(),
+        convoy_home: HERE.into(),
+        launch_of,
+        host: "host-a".into(),
+        requested_at: at(110),
+        since: at(115),
+        reading,
+    }
+}
 
-impl<C> ChangeCursor<C> for Unchanging {
+fn ready_vessel(convoy: &str, work: &str) -> VesselRecord {
+    vessel(convoy, work, LifecycleReading::Ready { identity: "env".into() })
+}
+
+/// What a write touched, by kind: one log for the three kinds, as a home's log holds them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Written {
+    Convoy,
+    Vessel,
+    Terminal,
+}
+
+/// One home's log of writes: each entry's sequence is its place, from 1.
+#[derive(Clone, Default)]
+struct Log(Arc<Mutex<Vec<(Written, String, String)>>>);
+
+impl Log {
+    fn write(&self, kind: Written, name: &str, home: &str) {
+        self.0.lock().expect("log").push((kind, name.into(), home.into()));
+    }
+
+    fn head(&self) -> u64 {
+        self.0.lock().expect("log").len() as u64
+    }
+}
+
+/// A cursor over one kind's entries in the log, which reads what was written since a position
+/// and is never passed.
+struct LogCursor {
+    log: Log,
+    kind: Written,
+}
+
+impl<C> ChangeCursor<C> for LogCursor {
     fn pass(&mut self) -> Result<Vec<C>, String> {
         Ok(Vec::new())
     }
 
     fn position(&self) -> u64 {
-        0
+        self.log.head()
     }
 
     fn read_through(&self) -> BTreeMap<String, u64> {
-        BTreeMap::new()
+        BTreeMap::from([(HERE.to_owned(), self.log.head())])
     }
 
-    fn since(&self, _: &BTreeMap<String, u64>) -> Result<CursorSince, String> {
-        Ok(CursorSince::Changed { written: Vec::new(), through: BTreeMap::new() })
-    }
-
-    /// No commit ever changes its records.
-    fn told(&self) -> Option<Told> {
-        Some(Told::new(Arc::default(), Arc::new(())))
-    }
-}
-
-/// A gate a blocking read waits at while it is closed, telling `reaching` that it waits.
-#[derive(Default)]
-struct Gate {
-    closed: Mutex<bool>,
-    opened: Condvar,
-    reaching: tokio::sync::Notify,
-}
-
-impl Gate {
-    fn set(&self, closed: bool) {
-        *self.closed.lock().expect("gate") = closed;
-        self.opened.notify_all();
-    }
-
-    fn pass(&self) {
-        let closed = self.closed.lock().expect("gate");
-        if *closed {
-            self.reaching.notify_one();
-        }
-        drop(self.opened.wait_while(closed, |closed| *closed).expect("gate"));
-    }
-}
-
-/// A cursor that passes the changes a test writes into it, each once, each moving it on, after
-/// its gate; while failing is set, its next pass fails instead and clears it.
-struct Written {
-    changes: Arc<Mutex<Vec<ConvoyChange>>>,
-    passed: u64,
-    gate: Arc<Gate>,
-    failing: Arc<AtomicBool>,
-    /// The commits counted, where it counts them.
-    told: Option<Told>,
-}
-
-impl ChangeCursor<ConvoyChange> for Written {
-    fn pass(&mut self) -> Result<Vec<ConvoyChange>, String> {
-        self.gate.pass();
-        if self.failing.swap(false, Ordering::SeqCst) {
-            return Err("the log did not read".into());
-        }
-        let changes = std::mem::take(&mut *self.changes.lock().expect("written changes"));
-        self.passed += changes.len() as u64;
-        Ok(changes)
-    }
-
-    fn position(&self) -> u64 {
-        self.passed
-    }
-
-    fn read_through(&self) -> BTreeMap<String, u64> {
-        BTreeMap::new()
-    }
-
-    fn since(&self, _: &BTreeMap<String, u64>) -> Result<CursorSince, String> {
-        Ok(CursorSince::Expired("the written changes hold no log".into()))
-    }
-
-    fn told(&self) -> Option<Told> {
-        self.told.clone()
+    fn since(&self, at: &BTreeMap<String, u64>) -> Result<CursorSince, String> {
+        let from = at.get(HERE).copied().unwrap_or(0) as usize;
+        let log = self.log.0.lock().expect("log");
+        let written =
+            log.iter().skip(from).filter(|(kind, ..)| *kind == self.kind).map(|(_, name, home)| (name.clone(), home.clone())).collect();
+        Ok(CursorSince::Changed { written, through: BTreeMap::from([(HERE.to_owned(), log.len() as u64)]) })
     }
 }
 
 struct Convoys {
     records: Mutex<Vec<ConvoyRecord>>,
     memory: ConvoyMemory,
-    /// How many times a launch's record was read.
+    log: Log,
+    /// How many times a launch's record was read, by name or in a listing.
     read: AtomicUsize,
-    /// How many times every launch was listed.
-    listed: AtomicUsize,
-    /// The changes the cursor passes next; no follower is told of them, so only a read finds them.
-    written: Arc<Mutex<Vec<ConvoyChange>>>,
-    /// Where the cursor waits as it passes.
-    passing: Arc<Gate>,
-    /// The cursor's next pass fails.
-    failing: Arc<AtomicBool>,
-    /// While closed, a launch's record read waits, after it tells `reading`.
-    gate: (Mutex<bool>, Condvar),
-    reading: tokio::sync::Notify,
     /// Launches held that cannot be read, which a listing leaves out as it does retired ones.
     unreadable: Mutex<Vec<UnreadableLaunch>>,
-    /// What tells the follower a record changed, as a commit does.
     told: tokio::sync::broadcast::Sender<ConvoyChange>,
-    /// Whether the cursor counts the commits [`Convoys::commit`] makes, as the log's does; a test
-    /// that writes into the cursor alone leaves it off, and every read then passes.
-    counts: AtomicBool,
-    /// The commits [`Convoys::commit`] made.
-    commits: Arc<AtomicU64>,
 }
 
 impl Convoys {
-    fn new(records: Vec<ConvoyRecord>) -> Self {
+    fn new(records: Vec<ConvoyRecord>, log: Log) -> Self {
         Self {
-            unreadable: Mutex::default(),
             records: Mutex::new(records),
             memory: ConvoyMemory::default(),
+            log,
             read: AtomicUsize::new(0),
-            listed: AtomicUsize::new(0),
-            written: Arc::default(),
-            passing: Arc::default(),
-            failing: Arc::default(),
-            gate: (Mutex::new(false), Condvar::new()),
-            reading: tokio::sync::Notify::new(),
+            unreadable: Mutex::default(),
             told: tokio::sync::broadcast::channel(16).0,
-            counts: AtomicBool::new(false),
-            commits: Arc::default(),
         }
     }
 
@@ -267,22 +235,16 @@ impl Convoys {
         self.records.lock().expect("records").clone()
     }
 
-    /// Writes `record` in place of its launch's, and tells the cursor and the follower, as a
-    /// committed edge does.
+    /// Writes `record` in place of its launch's, logs it and tells the followers, as a committed
+    /// edge does.
     fn commit(&self, record: ConvoyRecord) {
         let change = ConvoyChange::Changed { name: record.name.clone(), home: record.home.clone() };
         let mut records = self.records.lock().expect("records");
         records.retain(|held| (&held.name, &held.home) != (&record.name, &record.home));
+        self.log.write(Written::Convoy, &record.name, &record.home);
         records.push(record);
         drop(records);
-        self.written.lock().expect("written").push(change.clone());
-        self.commits.fetch_add(1, Ordering::SeqCst);
         let _ = self.told.send(change);
-    }
-
-    fn set_gate(&self, closed: bool) {
-        *self.gate.0.lock().expect("gate") = closed;
-        self.gate.1.notify_all();
     }
 }
 
@@ -296,16 +258,17 @@ impl ConvoyRecords for Convoys {
     }
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
         self.read.fetch_add(1, Ordering::SeqCst);
-        self.reading.notify_one();
-        let closed = self.gate.0.lock().expect("gate");
-        drop(self.gate.1.wait_while(closed, |closed| *closed).expect("gate"));
         let home = home.unwrap_or(HERE);
         Ok(self.records().into_iter().find(|record| record.name == name && record.home == home))
     }
     fn named(&self, name: &str, home: Option<&str>) -> Result<ConvoyListing, String> {
         let records = match home {
             Some(home) => self.get(name, Some(home))?.into_iter().collect(),
-            None => self.records().into_iter().filter(|record| record.name == name).collect(),
+            None => {
+                let records: Vec<_> = self.records().into_iter().filter(|record| record.name == name).collect();
+                self.read.fetch_add(records.len(), Ordering::SeqCst);
+                records
+            }
         };
         let unreadable = self.unreadable.lock().expect("unreadable").clone();
         let unreadable =
@@ -323,12 +286,7 @@ impl ConvoyRecords for Convoys {
         let held = |record: &ConvoyRecord| {
             record.role() == role && !record.project.is_empty() && project.is_none_or(|project| record.project == project)
         };
-        let held: Vec<_> = self.records().into_iter().filter(held).collect();
-        let projects: std::collections::BTreeSet<_> = held.iter().map(|record| record.project.clone()).collect();
-        if projects.len() > 1 {
-            return Err(flotilla_resources::convoy_records::several_projects(role, projects));
-        }
-        Ok(held.into_iter().max_by_key(|record| record.admitted_at))
+        Ok(self.records().into_iter().filter(held).max_by_key(|record| record.admitted_at))
     }
     // A listing leaves retired launches out, as the engine's does.
     fn at(&self, home: &str) -> Result<ConvoyListing, String> {
@@ -338,7 +296,6 @@ impl ConvoyRecords for Convoys {
     fn every(&self) -> Result<ConvoyListing, String> {
         let records: Vec<_> = self.records().into_iter().filter(|record| !record.retired).collect();
         self.read.fetch_add(records.len(), Ordering::SeqCst);
-        self.listed.fetch_add(1, Ordering::SeqCst);
         Ok(ConvoyListing { records, unreadable: Vec::new() })
     }
     fn memory(&self) -> &ConvoyMemory {
@@ -348,19 +305,40 @@ impl ConvoyRecords for Convoys {
         self.told.subscribe()
     }
     fn cursor(&self) -> Option<Box<dyn ChangeCursor<ConvoyChange>>> {
-        Some(Box::new(Written {
-            changes: Arc::clone(&self.written),
-            passed: 0,
-            gate: Arc::clone(&self.passing),
-            failing: Arc::clone(&self.failing),
-            told: self.counts.load(Ordering::SeqCst).then(|| Told::new(Arc::clone(&self.commits), Arc::new(()))),
-        }))
+        Some(Box::new(LogCursor { log: self.log.clone(), kind: Written::Convoy }))
     }
 }
 
 struct Terminals {
-    records: Vec<TerminalRecord>,
+    records: Mutex<Vec<TerminalRecord>>,
     observations: TerminalObservations,
+    log: Log,
+    told: tokio::sync::broadcast::Sender<TerminalChange>,
+}
+
+impl Terminals {
+    fn new(records: Vec<TerminalRecord>, log: Log) -> Self {
+        Self {
+            records: Mutex::new(records),
+            observations: TerminalObservations::default(),
+            log,
+            told: tokio::sync::broadcast::channel(16).0,
+        }
+    }
+
+    fn records(&self) -> Vec<TerminalRecord> {
+        self.records.lock().expect("terminals").clone()
+    }
+
+    fn commit(&self, record: TerminalRecord) {
+        let change = TerminalChange::Changed { name: record.name.clone(), home: record.home.clone() };
+        let mut records = self.records.lock().expect("terminals");
+        records.retain(|held| (&held.name, &held.home) != (&record.name, &record.home));
+        self.log.write(Written::Terminal, &record.name, &record.home);
+        records.push(record);
+        drop(records);
+        let _ = self.told.send(change);
+    }
 }
 
 impl TerminalRecords for Terminals {
@@ -371,20 +349,21 @@ impl TerminalRecords for Terminals {
     fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
         Vec::new()
     }
-    fn get(&self, name: &str, _home: Option<&str>) -> Result<Option<TerminalRecord>, String> {
-        Ok(self.records.iter().find(|record| record.name == name).cloned())
+    fn get(&self, name: &str, home: Option<&str>) -> Result<Option<TerminalRecord>, String> {
+        let home = home.unwrap_or(HERE);
+        Ok(self.records().into_iter().find(|record| record.name == name && record.home == home))
     }
     fn at(&self, home: &str) -> Result<Vec<TerminalRecord>, String> {
-        Ok(self.records.iter().filter(|record| record.home == home).cloned().collect())
+        Ok(self.records().into_iter().filter(|record| record.home == home).collect())
     }
     fn live(&self) -> Result<Vec<TerminalRecord>, String> {
-        Ok(self.records.iter().filter(|record| record.home == HERE && !record.ended()).cloned().collect())
+        Ok(self.records().into_iter().filter(|record| record.home == HERE && !record.ended()).collect())
     }
     fn every(&self) -> Result<Vec<TerminalRecord>, String> {
-        Ok(self.records.clone())
+        Ok(self.records())
     }
     fn of_vessel(&self, vessel: &str) -> Result<Vec<TerminalRecord>, String> {
-        Ok(self.records.iter().filter(|record| record.vessel.as_deref() == Some(vessel)).cloned().collect())
+        Ok(self.records().into_iter().filter(|record| record.vessel.as_deref() == Some(vessel)).collect())
     }
     fn of_environment(&self, _environment: &str, _home: &str) -> Result<Vec<TerminalRecord>, String> {
         Ok(Vec::new())
@@ -398,13 +377,30 @@ impl TerminalRecords for Terminals {
     fn observations(&self) -> &TerminalObservations {
         &self.observations
     }
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<TerminalChange> {
+        self.told.subscribe()
+    }
     fn cursor(&self) -> Option<Box<dyn ChangeCursor<TerminalChange>>> {
-        Some(Box::new(Unchanging))
+        Some(Box::new(LogCursor { log: self.log.clone(), kind: Written::Terminal }))
     }
 }
 
 struct Vessels {
-    records: Vec<VesselRecord>,
+    records: Mutex<Vec<VesselRecord>>,
+    log: Log,
+}
+
+impl Vessels {
+    fn records(&self) -> Vec<VesselRecord> {
+        self.records.lock().expect("vessels").clone()
+    }
+
+    fn commit(&self, record: VesselRecord) {
+        let mut records = self.records.lock().expect("vessels");
+        records.retain(|held| (&held.name, &held.home) != (&record.name, &record.home));
+        self.log.write(Written::Vessel, &record.name, &record.home);
+        records.push(record);
+    }
 }
 
 impl VesselRecords for Vessels {
@@ -417,24 +413,23 @@ impl VesselRecords for Vessels {
     }
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<VesselRecord>, String> {
         let home = home.unwrap_or(HERE);
-        Ok(self.records.iter().find(|record| record.name == name && record.home == home).cloned())
+        Ok(self.records().into_iter().find(|record| record.name == name && record.home == home))
     }
     fn launches(&self, convoy: &str, convoy_home: &str, launch_of: &str, home: Option<&str>) -> Result<Vec<VesselRecord>, String> {
         let home = home.unwrap_or(HERE);
         Ok(self
-            .records
-            .iter()
+            .records()
+            .into_iter()
             .filter(|record| {
                 record.convoy == convoy && record.convoy_home == convoy_home && record.launch_of == launch_of && record.home == home
             })
-            .cloned()
             .collect())
     }
     fn at(&self, home: &str) -> Result<Vec<VesselRecord>, String> {
-        Ok(self.records.iter().filter(|record| record.home == home).cloned().collect())
+        Ok(self.records().into_iter().filter(|record| record.home == home).collect())
     }
     fn every(&self) -> Result<Vec<VesselRecord>, String> {
-        Ok(self.records.clone())
+        Ok(self.records())
     }
     fn request(&self, _request: &VesselLaunchRequest) -> Result<String, String> {
         Err("not requested here".into())
@@ -443,23 +438,7 @@ impl VesselRecords for Vessels {
         Err("not stepped here".into())
     }
     fn cursor(&self) -> Option<Box<dyn ChangeCursor<VesselChange>>> {
-        Some(Box::new(Unchanging))
-    }
-}
-
-/// The ready launch of `convoy`'s work `work`, held here.
-fn ready_vessel(convoy: &str, work: &str) -> VesselRecord {
-    let launch_of = flotilla_resources::vessel_resource_name(flotilla_resources::convoy::launch_of(convoy), work);
-    VesselRecord {
-        name: format!("{launch_of}#1"),
-        home: HERE.into(),
-        convoy: convoy.into(),
-        convoy_home: HERE.into(),
-        launch_of,
-        host: "host-a".into(),
-        requested_at: at(110),
-        since: at(115),
-        reading: LifecycleReading::Ready { identity: "env".into() },
+        Some(Box::new(LogCursor { log: self.log.clone(), kind: Written::Vessel }))
     }
 }
 
@@ -468,6 +447,18 @@ struct Reads {
     vessels: Vessels,
     terminals: Terminals,
     joins: HeldJoins,
+}
+
+impl Reads {
+    fn new(convoys: Vec<ConvoyRecord>, vessels: Vec<VesselRecord>, terminals: Vec<TerminalRecord>) -> Arc<Self> {
+        let log = Log::default();
+        Arc::new(Self {
+            convoys: Convoys::new(convoys, log.clone()),
+            vessels: Vessels { records: Mutex::new(vessels), log: log.clone() },
+            terminals: Terminals::new(terminals, log),
+            joins: HeldJoins::default(),
+        })
+    }
 }
 
 impl LifecycleReads for Reads {
@@ -491,121 +482,19 @@ impl LifecycleReads for Reads {
     }
 }
 
-// Behaviour: a launch reads as a Convoy named by its launch, its work Running on its ready
-// Vessel launch, its eager seat working on its live session and its latent one once its home delivered
-// its task. Its home's notes show at that home; another home's launch reads without them. The
-// views are held: a read reads no record, and a change reads again only the launch it touches.
-#[tokio::test]
-async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
-    let vessel = ready_vessel("fix-it#1", "work");
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(vec![launch("fix-it#1", HERE), launch("other#1", "home-b")]),
-        terminals: Terminals {
-            records: vec![
-                session(&vessel.name, "coder", LifecycleReading::Ready { identity: "s1".into() }),
-                session(&vessel.name, "reviewer", LifecycleReading::Ready { identity: "s2".into() }),
-            ],
-            observations: TerminalObservations::default(),
-        },
-        vessels: Vessels { records: vec![vessel.clone()] },
-    });
-    let views = ConvoyViews::new("flotilla", reads.clone());
-
-    let convoy = views.get("fix-it#1").await.expect("read");
-    let status = convoy.status.expect("status");
-    assert_eq!(status.phase, ConvoyPhase::Active);
-    assert_eq!(status.work["work"].phase, WorkPhase::Running);
-    assert_eq!((status.work["work"].started_at, status.work["work"].ready_at), (Some(at(110)), Some(at(115))));
-    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
-    assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Pending, "a latent seat waits for its task");
-
-    // Reads are of the views held: reading again reads no record.
-    let read = reads.convoys.read.load(Ordering::SeqCst);
-    views.get("fix-it#1").await.expect("read again");
-    assert_eq!(reads.convoys.read.load(Ordering::SeqCst), read, "a read recomposes nothing");
-
-    // A change recomposes the launch it touches, then ticks the watchers.
-    let mut ticks = KindRecords::changes(&views).await.expect("follow");
-    let (_, changed) = reads.convoys.memory.update("fix-it#1", |notes: &mut ConvoyNotes| {
-        notes.attention = Some(ConvoyAttention { source: "turn".into(), reason: "queued".into(), raised_at: at(120) });
-        notes.crew.entry("work".into()).or_default().insert("reviewer".into(), CrewNotes { task_assigned: true, ..CrewNotes::default() });
-    });
-    assert!(changed);
-    tokio::time::timeout(Duration::from_secs(5), ticks.next()).await.expect("ticked").expect("following");
-    assert_eq!(reads.convoys.read.load(Ordering::SeqCst), read + 1, "only the changed launch is read again");
-    let status = views.get("fix-it#1").await.expect("read").status.expect("status");
-    assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Working);
-    assert_eq!(status.attention.map(|attention| attention.reason).as_deref(), Some("queued"));
-
-    reads.convoys.memory.update("other#1", |notes: &mut ConvoyNotes| {
-        notes.attention = Some(ConvoyAttention { source: "turn".into(), reason: "not here".into(), raised_at: at(120) });
-    });
-    tokio::time::timeout(Duration::from_secs(5), ticks.next()).await.expect("ticked").expect("following");
-    let other = views.find("other#1", Some("home-b")).await.expect("read").expect("held");
-    assert!(other.object.status.expect("status").attention.is_none(), "another home's launch reads without this home's notes");
-    assert_eq!(views.sources().await.expect("sources").len(), 2);
-    assert_eq!(views.here().await.expect("here").len(), 1);
-}
-
-// Behaviour: the views write nothing; a convoy is admitted, edged and ended on the engine.
-#[tokio::test]
-async fn the_views_refuse_writes() {
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(vec![launch("fix-it#1", HERE)]),
-        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
-        vessels: Vessels { records: Vec::new() },
-    });
-    let views = ConvoyViews::new("flotilla", reads);
-    let none = BTreeMap::new();
-    let held = KindRecords::get(&views, "fix-it#1").await.expect("get").expect("held");
-    assert!(views.apply("fix-it#1", None, &none, &none, &held.spec).await.is_err());
-    assert!(views.set_status("fix-it#1", held.version, &held.status.expect("status")).await.is_err());
-    assert!(KindRecords::delete(&views, "fix-it#1").await.is_err());
-    assert_eq!(KindRecords::list(&views).await.expect("list").len(), 1);
-}
-
-// Behaviour: a read dropped while it composes a changed launch again leaves that launch owed. The
-// cursor has passed the change and will not name it again, so the next read composes it.
-#[tokio::test]
-async fn a_dropped_read_leaves_its_changes_for_the_next() {
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(vec![launch("fix-it#1", HERE)]),
-        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
-        vessels: Vessels { records: Vec::new() },
-    });
-    let views = ConvoyViews::new("flotilla", reads.clone());
-    views.get("fix-it#1").await.expect("held");
-
-    // The launch's record goes and the cursor names it; a read starts composing it and waits.
-    reads.convoys.set_gate(true);
-    reads.convoys.records.lock().expect("records").clear();
-    reads.convoys.written.lock().expect("written").push(ConvoyChange::Changed { name: "fix-it#1".into(), home: HERE.into() });
-    let reading = reads.convoys.reading.notified();
-    let dropped = tokio::spawn({
-        let views = views.clone();
-        async move { views.get("fix-it#1").await.map(drop) }
-    });
-    reading.await;
-    dropped.abort();
-    assert!(dropped.await.expect_err("dropped").is_cancelled());
-    reads.convoys.set_gate(false);
-
-    assert!(views.get("fix-it#1").await.is_err(), "the next read composes the launch the dropped one owed");
-}
-
 /// Views over launches `names`, held here, joined with nothing.
 fn views_of(names: &[&str]) -> (Arc<Reads>, ConvoyViews) {
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(names.iter().map(|name| launch(name, HERE)).collect()),
-        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
-        vessels: Vessels { records: Vec::new() },
-    });
+    let reads = Reads::new(names.iter().map(|name| launch(name, HERE)).collect(), Vec::new(), Vec::new());
     let views = ConvoyViews::new("flotilla", reads.clone());
     (reads, views)
+}
+
+/// `reads` served as a backend's Convoy kind.
+fn installed(reads: &Arc<Reads>) -> ResourceBackend {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.serve_engine_in("flotilla");
+    Arc::new(ConvoyViews::new("flotilla", reads.clone())).install(&backend);
+    backend
 }
 
 /// Each launch's version as the engine port lists it, by name.
@@ -617,187 +506,139 @@ fn attention(notes: &mut ConvoyNotes) {
     notes.attention = Some(ConvoyAttention { source: "turn".into(), reason: "queued".into(), raised_at: at(120) });
 }
 
-// Behaviour (#3108): a note on one launch moves that launch's version alone. Another launch read
-// again in the same pass, as a write to a record it joins makes it, shows the same and keeps its
-// version: this home's notes are no part of a version they do not change.
+// Behaviour: a launch reads as a Convoy named by its launch, its work Running on its ready Vessel
+// launch, its eager seat working on its live session and its latent one once its home delivered
+// its task. Its home's notes show at that home; another home's launch reads without them.
 #[tokio::test]
-async fn a_note_on_one_launch_moves_only_its_version() {
+async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
+    let vessel = ready_vessel("fix-it#1", "work");
+    let reads = Reads::new(
+        vec![launch("fix-it#1", HERE), launch("other#1", "home-b")],
+        vec![vessel.clone()],
+        vec![
+            session(&vessel.name, "coder", LifecycleReading::Ready { identity: "s1".into() }),
+            session(&vessel.name, "reviewer", LifecycleReading::Ready { identity: "s2".into() }),
+        ],
+    );
+    let views = ConvoyViews::new("flotilla", reads.clone());
+
+    let convoy = KindRecords::get(&views, "fix-it#1").await.expect("read").expect("held");
+    let status = convoy.status.expect("status");
+    assert_eq!(status.phase, ConvoyPhase::Active);
+    assert_eq!(status.work["work"].phase, WorkPhase::Running);
+    assert_eq!((status.work["work"].started_at, status.work["work"].ready_at), (Some(at(110)), Some(at(115))));
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Pending, "a latent seat waits for its task");
+
+    let mut ticks = KindRecords::changes(&views).await.expect("follow");
+    let (_, changed) = reads.convoys.memory.update("fix-it#1", |notes: &mut ConvoyNotes| {
+        attention(notes);
+        notes.crew.entry("work".into()).or_default().insert("reviewer".into(), CrewNotes { task_assigned: true, ..CrewNotes::default() });
+    });
+    assert!(changed);
+    tokio::time::timeout(Duration::from_secs(5), ticks.next()).await.expect("ticked").expect("following");
+    let status = KindRecords::get(&views, "fix-it#1").await.expect("read").expect("held").status.expect("status");
+    assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.attention.map(|attention| attention.reason).as_deref(), Some("queued"));
+
+    reads.convoys.memory.update("other#1", attention);
+    let other = KindRecords::copies(&views, "other#1").await.expect("read");
+    assert_eq!(other.iter().map(|copy| copy.home.as_str()).collect::<Vec<_>>(), ["home-b"]);
+    assert!(other[0].status.as_ref().expect("status").attention.is_none(), "another home's launch reads without this home's notes");
+    assert_eq!(KindRecords::sources(&views).await.expect("sources").len(), 2);
+}
+
+// Behaviour: the views write nothing; a convoy is admitted, edged and ended on the engine.
+#[tokio::test]
+async fn the_views_refuse_writes() {
+    let (_, views) = views_of(&["fix-it#1"]);
+    let none = BTreeMap::new();
+    let held = KindRecords::get(&views, "fix-it#1").await.expect("get").expect("held");
+    assert!(views.apply("fix-it#1", None, &none, &none, &held.spec).await.is_err());
+    assert!(views.set_status("fix-it#1", held.version, &held.status.expect("status")).await.is_err());
+    assert!(KindRecords::delete(&views, "fix-it#1").await.is_err());
+    assert_eq!(KindRecords::list(&views).await.expect("list").len(), 1);
+}
+
+// Behaviour (#4412 C): a launch's version is what its view shows. A note on one launch moves that
+// launch's version alone; a launch whose record is written again showing the same keeps it.
+#[tokio::test]
+async fn a_version_moves_only_with_what_its_launch_shows() {
     let (reads, views) = views_of(&["fix-it#1", "other#1"]);
     let before = versions(&views).await;
 
-    reads.convoys.written.lock().expect("written").push(ConvoyChange::Changed { name: "other#1".into(), home: HERE.into() });
+    reads.convoys.commit(launch("other#1", HERE));
     assert!(reads.convoys.memory.update("fix-it#1", attention).1);
     let after = versions(&views).await;
     assert_ne!(after["fix-it#1"], before["fix-it#1"], "the noted launch changed");
-    assert_eq!(after["other#1"], before["other#1"], "a launch read again that shows the same keeps its version");
+    assert_eq!(after["other#1"], before["other#1"], "a launch written again that shows the same keeps its version");
 }
 
-// Behaviour (#3108): a launch that changes and changes back is told at three versions: a watcher
-// that read the first sees the last as a change, as it is one.
-#[tokio::test]
-async fn a_change_and_its_undoing_are_each_told_at_their_own_version() {
-    let (reads, views) = views_of(&["fix-it#1"]);
-    let first = versions(&views).await["fix-it#1"];
-    assert!(reads.convoys.memory.update("fix-it#1", attention).1);
-    let noted = versions(&views).await["fix-it#1"];
-    assert!(reads.convoys.memory.update("fix-it#1", |notes: &mut ConvoyNotes| *notes = ConvoyNotes::default()).1);
-    let undone = versions(&views).await["fix-it#1"];
-    assert!(first < noted && noted < undone, "versions {first}, {noted}, {undone} each move on");
+// Behaviour (#4412 C): a get, a listing and a watch of the same records agree on a launch's
+// version, as a reader comparing a get against what it watched relies on.
+#[tokio::test(start_paused = true)]
+async fn a_get_a_listing_and_a_watch_agree_on_a_version() {
+    let vessel = ready_vessel("fix-it#1", "work");
+    let reads = Reads::new(
+        vec![launch("fix-it#1", HERE)],
+        vec![vessel.clone()],
+        vec![session(&vessel.name, "coder", LifecycleReading::Ready { identity: "s1".into() })],
+    );
+    let backend = installed(&reads);
+    let convoys = backend.including_replicas::<Convoy>("flotilla");
+    let got = convoys.get("fix-it#1").await.expect("get").object.metadata.resource_version;
+    let listed = convoys.list().await.expect("list").items.remove(0).object.metadata.resource_version;
+    assert_eq!(got, listed);
+    let mut watch = convoys.watch().await.expect("watch");
+
+    // A session ending changes what the launch shows: the watch, a get and a listing read the same
+    // new version.
+    reads.terminals.commit(session(&vessel.name, "coder", LifecycleReading::Released));
+    let next = match tokio::time::timeout(Duration::from_secs(5), watch.next()).await.expect("event").expect("watching").expect("event") {
+        ReadWatchEvent::Modified(read) => read.object.metadata.resource_version,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_ne!(next, got);
+    assert_eq!(convoys.list().await.expect("list").items.remove(0).object.metadata.resource_version, next);
+    assert_eq!(convoys.get("fix-it#1").await.expect("get").object.metadata.resource_version, next);
 }
 
-// Behaviour (#3108): a launch read again at each of several passes, its record named by the log
-// each time but showing the same, keeps the version it was first told at while the log moves on.
+// Behaviour (#4412 C): what changed since a position names the launches whose records were
+// written, and those whose Vessel launches or sessions were, each joined back to its launch by
+// key, and those whose notes this home changed; a position taken after them names none.
 #[tokio::test]
-async fn an_unchanged_launch_keeps_its_version_across_passes() {
-    let (reads, views) = views_of(&["fix-it#1"]);
-    let first = versions(&views).await["fix-it#1"];
-    for _ in 0..3 {
-        reads.convoys.written.lock().expect("written").push(ConvoyChange::Changed { name: "fix-it#1".into(), home: HERE.into() });
-        assert_eq!(versions(&views).await["fix-it#1"], first);
-    }
-}
-
-// Behaviour: a read dropped while the cursors pass keeps the cursors and what they passed. The
-// next read composes the change the dropped one's pass named, and later reads go on following the
-// cursors instead of listing every launch on each read (load_driver_smoke's driver dropped reads).
-#[tokio::test]
-async fn a_read_dropped_while_the_cursors_pass_keeps_them() {
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(vec![launch("fix-it#1", HERE), launch("other#1", HERE)]),
-        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
-        vessels: Vessels { records: Vec::new() },
-    });
+async fn changes_since_a_position_name_each_launch_a_write_touched() {
+    let fixed = ready_vessel("fix-it#1", "work");
+    let reads = Reads::new(
+        vec![launch("fix-it#1", HERE), launch("other#1", HERE), launch("noted#1", HERE), launch("quiet#1", HERE)],
+        vec![fixed.clone(), ready_vessel("other#1", "work")],
+        vec![session(&fixed.name, "coder", LifecycleReading::Ready { identity: "s1".into() })],
+    );
     let views = ConvoyViews::new("flotilla", reads.clone());
-    views.get("fix-it#1").await.expect("held");
-    let listed = reads.convoys.listed.load(Ordering::SeqCst);
+    let named = |since: Since| match since {
+        Since::Changed { names, through } => (names.into_iter().collect::<Vec<_>>(), through),
+        Since::Expired(reason) => panic!("expired: {reason}"),
+    };
 
-    // The launch's record goes and the cursor names it; a read starts passing the cursors and waits.
-    reads.convoys.passing.set(true);
-    reads.convoys.records.lock().expect("records").retain(|record| record.name != "fix-it#1");
-    reads.convoys.written.lock().expect("written").push(ConvoyChange::Changed { name: "fix-it#1".into(), home: HERE.into() });
-    let reaching = reads.convoys.passing.reaching.notified();
-    let dropped = tokio::spawn({
-        let views = views.clone();
-        async move { views.get("other#1").await.map(drop) }
-    });
-    reaching.await;
-    dropped.abort();
-    assert!(dropped.await.expect_err("dropped").is_cancelled());
-    reads.convoys.passing.set(false);
+    let position = views.position().await.expect("position");
+    reads.terminals.commit(session(&fixed.name, "coder", LifecycleReading::Released));
+    reads.vessels.commit(vessel("other#1", "work", LifecycleReading::Released));
+    reads.convoys.memory.update("noted#1", attention);
+    let (names, through) = named(views.changed_since(&position).await.expect("since"));
+    assert_eq!(names, ["fix-it#1", "noted#1", "other#1"], "the session's launch, the Vessel's launch and the noted launch");
 
-    assert!(views.get("fix-it#1").await.is_err(), "the next read composes the change the dropped pass named");
-    views.get("other#1").await.expect("read");
-    views.get("other#1").await.expect("read again");
-    assert_eq!(reads.convoys.listed.load(Ordering::SeqCst), listed, "no read lists every launch again");
+    let (names, _) = named(views.changed_since(&through).await.expect("since"));
+    assert!(names.is_empty(), "nothing written after: {names:?}");
 }
 
-// Behaviour: a pass that fails is read again in full once, since what it passed is not known, and
-// keeps the cursors: later reads take changes from them instead of listing every launch again.
-#[tokio::test]
-async fn a_failed_pass_keeps_the_cursors() {
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(vec![launch("fix-it#1", HERE), launch("other#1", HERE)]),
-        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
-        vessels: Vessels { records: Vec::new() },
-    });
-    let views = ConvoyViews::new("flotilla", reads.clone());
-    views.get("fix-it#1").await.expect("held");
-    let listed = reads.convoys.listed.load(Ordering::SeqCst);
-
-    // The launch's record goes and the next pass fails: the read lists every launch instead.
-    reads.convoys.failing.store(true, Ordering::SeqCst);
-    reads.convoys.records.lock().expect("records").retain(|record| record.name != "fix-it#1");
-    assert!(views.get("fix-it#1").await.is_err(), "the failed pass's read lists the launch gone");
-    assert_eq!(reads.convoys.listed.load(Ordering::SeqCst), listed + 1, "the failed pass's read lists every launch");
-
-    // The other launch's record goes and only the cursor names it.
-    reads.convoys.records.lock().expect("records").clear();
-    reads.convoys.written.lock().expect("written").push(ConvoyChange::Changed { name: "other#1".into(), home: HERE.into() });
-    assert!(views.get("other#1").await.is_err(), "the next read takes the change from the cursor");
-    assert!(views.get("other#1").await.is_err(), "read again");
-    assert_eq!(reads.convoys.listed.load(Ordering::SeqCst), listed + 1, "no later read lists every launch again");
-}
-
-// Behaviour (d14): a read made while no commit has landed since the views last passed reads the
-// views as held: it reads no store, the log included, so it waits on no pass. A writer still reads
-// its commit back at its next read, and a note at the next read after it.
-#[tokio::test]
-async fn a_read_with_no_commit_since_the_last_pass_reads_no_store() {
-    let (reads, views) = views_of(&["fix-it#1", "other#1"]);
-    reads.convoys.counts.store(true, Ordering::SeqCst);
-    views.get("fix-it#1").await.expect("held");
-    views.get("fix-it#1").await.expect("held, every count told");
-
-    // With the cursor's gate closed, a read that passed would wait at it.
-    reads.convoys.passing.set(true);
-    let read = reads.convoys.read.load(Ordering::SeqCst);
-    let other = tokio::time::timeout(Duration::from_secs(5), views.get("other#1")).await.expect("read without passing");
-    other.expect("held");
-    assert_eq!(reads.convoys.read.load(Ordering::SeqCst), read, "a read with nothing committed reads no record");
-    reads.convoys.passing.set(false);
-
-    let mut ended = launch("fix-it#1", HERE);
-    ended.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
-    reads.convoys.commit(ended);
-    let phase = views.get("fix-it#1").await.expect("read").status.expect("status").phase;
-    assert_eq!(phase, ConvoyPhase::Abandoned, "the writer reads its commit back");
-
-    assert!(reads.convoys.memory.update("other#1", attention).1);
-    let noted = views.get("other#1").await.expect("read").status.expect("status").attention;
-    assert!(noted.is_some(), "a note is read at the next read");
-}
-
-// Behaviour (d15): reads made after a commit, while a pass over it is in progress, wait for that
-// pass and each reads the commit back, without reading the views' records again themselves. A
-// read the commit's count does not cover, made before it, reads the views as last published.
-#[tokio::test]
-async fn reads_after_a_commit_wait_for_the_pass_in_progress_and_read_it() {
-    let (reads, views) = views_of(&["fix-it#1", "other#1"]);
-    reads.convoys.counts.store(true, Ordering::SeqCst);
-    views.get("fix-it#1").await.expect("held, every count told");
-    let before = views.get("other#1").await.expect("held").status.expect("status").phase;
-    assert_eq!(before, ConvoyPhase::Active);
-
-    // The follower wakes for the commit and passes, and waits at the cursor's gate.
-    reads.convoys.passing.set(true);
-    let reaching = reads.convoys.passing.reaching.notified();
-    let mut ended = launch("fix-it#1", HERE);
-    ended.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
-    reads.convoys.commit(ended);
-    tokio::time::timeout(Duration::from_secs(5), reaching).await.expect("a pass reaches the gate");
-
-    let waiting: Vec<_> = (0..16)
-        .map(|_| {
-            let views = views.clone();
-            tokio::spawn(async move { views.get("fix-it#1").await.map(|convoy| convoy.status.map(|status| status.phase)) })
-        })
-        .collect();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(waiting.iter().all(|read| !read.is_finished()), "a read after the commit waits for the pass over it");
-    let read = reads.convoys.read.load(Ordering::SeqCst);
-    reads.convoys.passing.set(false);
-    for waited in waiting {
-        let phase = tokio::time::timeout(Duration::from_secs(5), waited).await.expect("served").expect("joined").expect("read");
-        assert_eq!(phase, Some(ConvoyPhase::Abandoned), "each waiting read reads the commit back");
-    }
-    assert_eq!(reads.convoys.read.load(Ordering::SeqCst), read + 1, "one pass composed the launch for every waiting read");
-}
-
-/// The views converted by a read of one launch by name, with `others` unrelated launches held:
+/// The launches converted by a read of one launch by name, with `others` unrelated launches held:
 /// its copies, then another home's launch read where this home holds none.
 async fn converted_by_one_read(others: usize) -> (u64, u64) {
     let mut launches: Vec<_> = (0..others).map(|n| launch(&format!("other-{n}#1"), HERE)).collect();
     launches.extend([launch("wanted#1", HERE), launch("wanted#1", "home-b"), launch("remote#1", "home-b")]);
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(launches),
-        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
-        vessels: Vessels { records: Vec::new() },
-    });
+    let reads = Reads::new(launches, Vec::new(), Vec::new());
     let views = ConvoyViews::new("flotilla", reads);
-    assert_eq!(views.sources().await.expect("fill").len(), others + 3);
+    assert_eq!(views.sources().await.expect("listing").len(), others + 3);
 
     let converted = |reads: &ReadCounts| reads.get("Convoy").map_or(0, |counts| counts.converted);
     let (copies, reads) = measure(views.copies("wanted#1")).await;
@@ -820,22 +661,12 @@ async fn a_read_by_name_converts_only_that_launch() {
     assert_eq!(large, small, "the cost does not grow with the launches held");
 }
 
-// Behaviour (#3108 retirement): a retired launch, which the views never hold, still reads by name
-// through the generic Convoy reads with how it ended, and a listing leaves it out.
+// Behaviour (#3108 retirement): a retired launch still reads by name through the generic Convoy
+// reads with how it ended, and a listing leaves it out.
 #[tokio::test]
 async fn a_retired_launch_reads_by_name_with_its_ending() {
-    let mut retired = launch("retired#1", HERE);
-    retired.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
-    retired.retired = true;
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(vec![retired, launch("open#1", HERE)]),
-        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
-        vessels: Vessels { records: Vec::new() },
-    });
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.serve_engine_in("flotilla");
-    Arc::new(ConvoyViews::new("flotilla", reads)).install(&backend);
+    let reads = Reads::new(vec![abandoned("retired#1", HERE, true), launch("open#1", HERE)], Vec::new(), Vec::new());
+    let backend = installed(&reads);
     let convoys = backend.using::<Convoy>("flotilla");
 
     let names: Vec<_> = convoys.list().await.expect("list").items.into_iter().map(|convoy| convoy.metadata.name).collect();
@@ -848,19 +679,11 @@ async fn a_retired_launch_reads_by_name_with_its_ending() {
     assert_eq!(copies.len(), 1, "every copy of the name reads it too");
 }
 
-// Behaviour (#3108): a read of every copy of a name the views do not hold fails nothing because one
-// copy cannot be read: that copy reads as unreadable, with why, beside the others.
+// Behaviour (#3108): a read of every copy of a name fails nothing because one copy cannot be read:
+// that copy reads as unreadable, with why, beside the others.
 #[tokio::test]
 async fn a_read_by_name_gives_an_unreadable_copy_beside_the_others() {
-    let mut retired = launch("gone#1", HERE);
-    retired.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
-    retired.retired = true;
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(vec![retired, launch("open#1", HERE)]),
-        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
-        vessels: Vessels { records: Vec::new() },
-    });
+    let reads = Reads::new(vec![abandoned("gone#1", HERE, true), launch("open#1", HERE)], Vec::new(), Vec::new());
     reads.convoys.unreadable.lock().expect("unreadable").push(UnreadableLaunch {
         name: "gone#1".into(),
         home: "home-b".into(),
@@ -872,9 +695,7 @@ async fn a_read_by_name_gives_an_unreadable_copy_beside_the_others() {
         created_at: at(100),
         reason: "its end is not held here".into(),
     });
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.serve_engine_in("flotilla");
-    Arc::new(ConvoyViews::new("flotilla", reads)).install(&backend);
+    let backend = installed(&reads);
 
     let copies = backend.including_replicas::<Convoy>("flotilla").get_all("gone#1").await.expect("no copy fails the read").items;
     let read: BTreeMap<_, _> = copies
@@ -892,23 +713,12 @@ async fn a_read_by_name_gives_an_unreadable_copy_beside_the_others() {
     );
 }
 
-// Behaviour (#3108): a read by name shows every home's launch of the name, retired or held: a
-// launch the views hold at one home, and a retired one of the same name at another, which they
-// do not, read side by side.
+// Behaviour (#3108): a read by name shows every home's launch of the name, retired or not: a live
+// launch at one home and a retired one of the same name at another read side by side.
 #[tokio::test]
-async fn a_read_by_name_gives_a_held_and_a_retired_launch_of_the_name() {
-    let mut retired = launch("shared#1", "home-b");
-    retired.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
-    retired.retired = true;
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(vec![launch("shared#1", HERE), retired]),
-        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
-        vessels: Vessels { records: Vec::new() },
-    });
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.serve_engine_in("flotilla");
-    Arc::new(ConvoyViews::new("flotilla", reads)).install(&backend);
+async fn a_read_by_name_gives_a_live_and_a_retired_launch_of_the_name() {
+    let reads = Reads::new(vec![launch("shared#1", HERE), abandoned("shared#1", "home-b", true)], Vec::new(), Vec::new());
+    let backend = installed(&reads);
     let convoys = backend.including_replicas::<Convoy>("flotilla");
     assert_eq!(convoys.list().await.expect("list").items.len(), 1, "the listing holds the open launch alone");
 
@@ -923,26 +733,8 @@ async fn a_read_by_name_gives_a_held_and_a_retired_launch_of_the_name() {
     assert_eq!(
         read,
         BTreeMap::from([(true, Some(ConvoyPhase::Active)), (false, Some(ConvoyPhase::Abandoned))]),
-        "this home's held launch, and home-b's retired one with its ending"
+        "this home's live launch, and home-b's retired one with its ending"
     );
-}
-
-/// Views over launches `names`, held here and joined with nothing, installed as a backend's
-/// Convoy kind.
-fn installed(names: &[&str]) -> (Arc<Reads>, ConvoyViews, ResourceBackend) {
-    let (reads, views) = views_of(names);
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.serve_engine_in("flotilla");
-    Arc::new(views.clone()).install(&backend);
-    (reads, views, backend)
-}
-
-/// `name` held here, abandoned as "stopped" and retired.
-fn retired(name: &str) -> ConvoyRecord {
-    let mut record = launch(name, HERE);
-    record.ended = Some(Ending::Held(ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
-    record.retired = true;
-    record
 }
 
 /// The next event a watcher reads: its launch, and its phase and message, or `None` where it left.
@@ -961,186 +753,25 @@ async fn next_event<E: std::fmt::Debug>(
     }
 }
 
-/// What a watcher reads of launch `name` until it leaves, the other launches' events skipped.
-async fn read_until_gone<E: std::fmt::Debug>(
-    watch: &mut (impl futures::Stream<Item = Result<ReadWatchEvent<Convoy>, E>> + Unpin),
-    name: &str,
-) -> Vec<(ConvoyPhase, Option<String>)> {
-    let mut seen = Vec::new();
-    loop {
-        match next_event(watch).await {
-            (launch, Some(read)) if launch == name => seen.push(read),
-            (launch, None) if launch == name => return seen,
-            _ => {}
-        }
-    }
-}
-
-/// Changes launch `other`'s view and reads to its event: what a watcher reads of any launch on the
-/// way.
-async fn read_through_a_change_of<E: std::fmt::Debug>(
-    reads: &Reads,
-    watch: &mut (impl futures::Stream<Item = Result<ReadWatchEvent<Convoy>, E>> + Unpin),
-    other: &str,
-) -> Vec<String> {
-    assert!(reads.convoys.memory.update(other, attention).1);
-    let mut on_the_way = Vec::new();
-    loop {
-        match next_event(watch).await {
-            (launch, _) if launch == other => return on_the_way,
-            (launch, _) => on_the_way.push(launch),
-        }
-    }
-}
-
-// Behaviour (#3108 retirement): a held launch that ends and retires is read by its watcher with how
-// it ended exactly once and then leaves, on the watcher's next read, not at a later sweep. The
-// views hold nothing of it after, and a read by name still gives its ending.
+// Behaviour (#3108 retirement): a launch that ends and then retires is read by its watcher with
+// how it ended, then leaves; a listing holds nothing of it after, and a read by name still gives
+// its ending.
 #[tokio::test(start_paused = true)]
-async fn a_retired_launch_is_told_ended_once_then_leaves_the_views() {
-    let (reads, views, backend) = installed(&["open#1"]);
-    let mut watch = backend.including_replicas::<Convoy>("flotilla").watch().await.expect("watch");
-    let alone = views.held().await.expect("held");
+async fn a_launch_that_ends_then_retires_is_told_ended_then_leaves() {
+    let reads = Reads::new(vec![launch("open#1", HERE)], Vec::new(), Vec::new());
+    let backend = installed(&reads);
+    let convoys = backend.including_replicas::<Convoy>("flotilla");
+    let mut watch = convoys.watch().await.expect("watch");
 
     reads.convoys.commit(launch("fix-it#1", HERE));
-    while next_event(&mut watch).await.0 != "fix-it#1" {}
-    assert!(views.held().await.expect("held") > alone, "the live launch is held");
+    assert_eq!(next_event(&mut watch).await, ("fix-it#1".to_owned(), Some((ConvoyPhase::Active, None))));
+    reads.convoys.commit(abandoned("fix-it#1", HERE, false));
+    assert_eq!(next_event(&mut watch).await, ("fix-it#1".to_owned(), Some((ConvoyPhase::Abandoned, Some("stopped".to_owned())))));
+    reads.convoys.commit(abandoned("fix-it#1", HERE, true));
+    assert_eq!(next_event(&mut watch).await, ("fix-it#1".to_owned(), None), "it leaves once retired");
 
-    reads.convoys.commit(retired("fix-it#1"));
-    let seen = read_until_gone(&mut watch, "fix-it#1").await;
-    assert_eq!(seen, [(ConvoyPhase::Abandoned, Some("stopped".to_owned()))], "the watcher read its ending once, then it left");
-    assert!(read_through_a_change_of(&reads, &mut watch, "open#1").await.is_empty(), "nothing more is told of it");
-    assert_eq!(views.held().await.expect("held"), alone, "the views hold nothing of the retired launch");
-    assert!(views.sources().await.expect("sources").iter().all(|read| read.object.metadata.name != "fix-it#1"));
+    let names: Vec<_> = convoys.list().await.expect("list").items.into_iter().map(|read| read.object.metadata.name).collect();
+    assert_eq!(names, ["open#1"]);
     let read = backend.using::<Convoy>("flotilla").get("fix-it#1").await.expect("read by name");
     assert_eq!(read.status.expect("status").phase, ConvoyPhase::Abandoned);
-}
-
-// Behaviour (#3108 retirement): a launch the views first see retired, born ended or ended and
-// retired between two passes, is read by its watcher with how it ended exactly once and then
-// leaves; the views hold nothing of it after.
-#[tokio::test(start_paused = true)]
-async fn a_launch_first_seen_retired_is_told_ended_once_then_leaves() {
-    let (reads, views, backend) = installed(&["open#1"]);
-    let mut watch = backend.including_replicas::<Convoy>("flotilla").watch().await.expect("watch");
-    let alone = views.held().await.expect("held");
-
-    reads.convoys.commit(retired("born#1"));
-    let seen = read_until_gone(&mut watch, "born#1").await;
-    assert_eq!(seen, [(ConvoyPhase::Abandoned, Some("stopped".to_owned()))], "the watcher read its ending once, then it left");
-    assert!(read_through_a_change_of(&reads, &mut watch, "open#1").await.is_empty(), "nothing more is told of it");
-    assert_eq!(views.held().await.expect("held"), alone, "the views hold nothing of the retired launch");
-}
-
-/// `name` held at `home`, ensured from `ensure`, and ended when `ended`.
-fn ensured(name: &str, home: &str, ensure: &str, ended: bool) -> ConvoyRecord {
-    let mut record = launch(name, home);
-    record.admission.provenance.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), ensure.into());
-    record.ended = ended.then(|| Ending::Held(ConvoyEnd::Delivered { disposition: "merged".into() }, at(200)));
-    record
-}
-
-/// The launches a standing role's queries select, and the views each converted, with `others`
-/// unrelated launches held: its live generations here and at every home, and its generations here.
-async fn ensured_queries(others: usize) -> Vec<(usize, u64)> {
-    let mut launches: Vec<_> = (0..others).map(|n| ensured(&format!("other-{n}#1"), HERE, "other", n % 2 == 0)).collect();
-    launches.extend([
-        ensured("wanted#1", HERE, "wanted", true),
-        ensured("wanted#2", HERE, "wanted", false),
-        ensured("wanted-b#1", "home-b", "wanted", false),
-    ]);
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(launches),
-        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
-        vessels: Vessels { records: Vec::new() },
-    });
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.serve_engine_in("flotilla");
-    Arc::new(ConvoyViews::new("flotilla", reads)).install(&backend);
-    backend.using::<Convoy>("flotilla").list().await.expect("the views fill");
-
-    let field = format!("metadata.annotations.\"{}\"", flotilla_resources::ENSURED_FROM_ANNOTATION);
-    let live = |everywhere: bool| StoreQuery {
-        fields: BTreeMap::from([(field.clone(), "wanted".to_owned())]),
-        include_replicas: everywhere,
-        ..live_convoys_query()
-    };
-    let generations = StoreQuery { fields: BTreeMap::from([(field.clone(), "wanted".to_owned())]), ..StoreQuery::default() };
-    let mut selected = Vec::new();
-    for query in [live(false), live(true), generations] {
-        let (rows, reads) = measure(backend.query_declared::<Convoy>("flotilla", &query)).await;
-        let converted = reads.get("Convoy").map_or(0, |counts| counts.converted);
-        selected.push((rows.expect("query").items.len(), converted));
-    }
-    selected
-}
-
-// Behaviour (#3108): a query selecting convoys by an annotation, as a standing role's passes read
-// its generations, converts only the launches it may select, however many other launches are held.
-#[tokio::test]
-async fn a_selecting_query_converts_only_the_launches_it_selects() {
-    let small = ensured_queries(10).await;
-    let large = ensured_queries(400).await;
-    assert_eq!(small, [(1, 1), (2, 2), (2, 2)], "live here, live everywhere, generations here: each converts only the launches it returns");
-    assert_eq!(large, small, "the cost does not grow with the launches held");
-}
-
-/// `name` held here, placed on host `b1`, and ended when `ended`.
-fn placed(name: &str, ended: bool) -> ConvoyRecord {
-    let mut record = launch(name, HERE);
-    record.admission.placement_decision = Some(
-        flotilla_protocol::PlacementDecision::builder()
-            .kind("host-direct-b1".to_owned())
-            .target_host(flotilla_protocol::PlacementTargetHost {
-                reference: flotilla_protocol::CanonicalHostId::resolved("b1"),
-                display_name: "b1".into(),
-            })
-            .build(),
-    );
-    record.ended = ended.then(|| Ending::Held(ConvoyEnd::Delivered { disposition: "merged".into() }, at(200)));
-    record
-}
-
-/// Host `b1`'s occupancy and the launches it converted, with `others` ended launches held besides
-/// a live launch admitted there and an ended launch whose vessel there still tears down.
-async fn occupancy_with(others: usize) -> (flotilla_resources::HostOccupancy, u64) {
-    let mut launches: Vec<_> = (0..others).map(|n| placed(&format!("old-{n}#1"), true)).collect();
-    launches.extend([placed("live#1", false), placed("tearing#1", true)]);
-    let reads = Arc::new(Reads {
-        joins: HeldJoins::default(),
-        convoys: Convoys::new(launches),
-        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
-        vessels: Vessels { records: Vec::new() },
-    });
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.serve_engine_in("flotilla");
-    Arc::new(ConvoyViews::new("flotilla", reads)).install(&backend);
-    backend.using::<Convoy>("flotilla").list().await.expect("the views fill");
-    // The vessel holds no decision of its own: its ended convoy's places it.
-    let spec = flotilla_resources::VesselSpec {
-        convoy_ref: "tearing#1".into(),
-        vessel_name: "work".into(),
-        fulfilment_kind_ref: "host-direct-b1".into(),
-        adopted_checkout_refs: BTreeMap::new(),
-    };
-    backend
-        .using::<flotilla_resources::Vessel>("flotilla")
-        .create(&flotilla_resources::InputMeta::builder().name("tearing-work".to_owned()).build(), &spec)
-        .await
-        .expect("the vessel is written");
-
-    let (occupancy, reads) = measure(flotilla_store::occupancy::host_occupancy(&backend, "flotilla", "b1")).await;
-    (occupancy.expect("occupancy"), reads.get("Convoy").map_or(0, |counts| counts.converted))
-}
-
-// Behaviour (#3108): a host's occupancy counts the vessels live convoys admitted there and those
-// an ended convoy still holds, converting only those launches, however many ended launches are held.
-#[tokio::test]
-async fn a_hosts_occupancy_converts_only_live_and_vessel_holding_launches() {
-    let (small, converted) = occupancy_with(2).await;
-    assert_eq!((small.placed, small.admitted.clone()), (1, vec![("live#1".to_owned(), 1)]), "the torn-down vessel and the live admission");
-    let (large, converted_large) = occupancy_with(200).await;
-    assert_eq!(large, small);
-    assert_eq!((converted, converted_large), (2, 2), "the live launch and the vessel's ended one, at both sizes");
 }

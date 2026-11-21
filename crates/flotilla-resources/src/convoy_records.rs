@@ -893,3 +893,64 @@ impl ConvoyMemory {
 
 #[cfg(test)]
 mod tests;
+
+/// This home's launches that have not ended, held between reads (#4412 C): the first read lists
+/// this home's launches once, and each later read gets by key only the launches the log wrote
+/// since the read before. A launch that cannot be read counts as open, since nothing says it
+/// ended. A port without a log, or a log that no longer holds what was written since, is listed
+/// again.
+#[derive(Default)]
+pub struct OpenLaunches {
+    held: Option<HeldOpen>,
+}
+
+struct HeldOpen {
+    open: BTreeSet<String>,
+    cursor: Box<dyn crate::lifecycle_reads::ChangeCursor<ConvoyChange>>,
+    through: BTreeMap<String, u64>,
+}
+
+impl OpenLaunches {
+    /// The launches at `convoys`' home that have not ended, as of this read.
+    pub fn read(&mut self, convoys: &dyn ConvoyRecords) -> Result<BTreeSet<String>, String> {
+        let here = convoys.home().to_owned();
+        if let Some(held) = &mut self.held {
+            match held.cursor.since(&held.through)? {
+                crate::lifecycle_reads::CursorSince::Changed { written, through } => {
+                    let names: BTreeSet<String> = written.into_iter().filter(|(_, home)| *home == here).map(|(name, _)| name).collect();
+                    for name in names {
+                        if open(&convoys.named(&name, Some(&here))?) {
+                            held.open.insert(name);
+                        } else {
+                            held.open.remove(&name);
+                        }
+                    }
+                    held.through = through;
+                    return Ok(held.open.clone());
+                }
+                crate::lifecycle_reads::CursorSince::Expired(_) => self.held = None,
+            }
+        }
+        // The position is taken before the listing: a write between the two is read again next
+        // time, which changes nothing.
+        let cursor = convoys.cursor();
+        let through = cursor.as_ref().map(|cursor| cursor.read_through());
+        let listing = convoys.at(&here)?;
+        let open: BTreeSet<String> = listing
+            .records
+            .into_iter()
+            .filter(|record| record.ended.is_none())
+            .map(|record| record.name)
+            .chain(listing.unreadable.into_iter().map(|launch| launch.name))
+            .collect();
+        if let (Some(cursor), Some(through)) = (cursor, through) {
+            self.held = Some(HeldOpen { open: open.clone(), cursor, through });
+        }
+        Ok(open)
+    }
+}
+
+/// Whether a launch read by name has not ended: held, not ended and not retired, or unreadable.
+fn open(listing: &ConvoyListing) -> bool {
+    !listing.unreadable.is_empty() || listing.records.iter().any(|record| record.ended.is_none() && !record.retired)
+}

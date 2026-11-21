@@ -381,16 +381,13 @@ async fn push_generation(
 struct CredentialConvoysWatch {
     accounts: Arc<dyn AccountRecords>,
     daemon: Arc<InProcessDaemon>,
+    /// This home's open launches, held between grant events and moved by what the log wrote.
+    open: Arc<std::sync::Mutex<flotilla_resources::convoy_records::OpenLaunches>>,
 }
 
 impl CredentialConvoysWatch {
     /// `credentials: None` (a grant deleted by name) reaches every convoy with a binding here.
-    async fn enqueue(
-        &self,
-        namespace: &str,
-        sender: &WorkQueueSender,
-        credentials: Option<Vec<String>>,
-    ) -> Result<(), ResourceError> {
+    async fn enqueue(&self, namespace: &str, sender: &WorkQueueSender, credentials: Option<Vec<String>>) -> Result<(), ResourceError> {
         let (mut convoys, bound) =
             self.accounts.bound_convoys(namespace, credentials.as_deref().unwrap_or_default()).await.map_err(ResourceError::other)?;
         if credentials.is_none() {
@@ -405,15 +402,12 @@ impl CredentialConvoysWatch {
 }
 
 impl CredentialConvoysWatch {
-    /// This home's launches that have not ended, from their records; one that cannot be read
-    /// counts, since nothing says it ended.
-    async fn open_launches(&self) -> Result<Vec<String>, ResourceError> {
-        let reads = self.daemon.lifecycle_reads();
+    /// This home's launches that have not ended; one that cannot be read counts, since nothing
+    /// says it ended.
+    async fn open_launches(&self) -> Result<std::collections::BTreeSet<String>, ResourceError> {
+        let (reads, open) = (self.daemon.lifecycle_reads(), Arc::clone(&self.open));
         tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
-            let convoys = reads.convoys()?;
-            let listing = convoys.at(convoys.home())?;
-            let open = listing.records.into_iter().filter(|record| record.ended.is_none()).map(|record| record.name);
-            Ok::<_, String>(open.chain(listing.unreadable.into_iter().map(|launch| launch.name)).collect())
+            open.lock().unwrap_or_else(std::sync::PoisonError::into_inner).read(reads.convoys()?)
         }))
         .await
         .map_err(|error| ResourceError::other(error.to_string()))?
@@ -506,7 +500,7 @@ pub(super) fn binding_controller(
     (
         vec![
             Box::new(AccountConvoysWatch { accounts: Arc::clone(&accounts) }),
-            Box::new(CredentialConvoysWatch { accounts, daemon: Arc::clone(&daemon) }),
+            Box::new(CredentialConvoysWatch { accounts, daemon: Arc::clone(&daemon), open: Arc::default() }),
         ],
         AccountBindingReconciler { daemon, namespace },
     )

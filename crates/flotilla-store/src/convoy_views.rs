@@ -104,11 +104,8 @@ impl ConvoyViews {
                         heads: BTreeMap::new(),
                     };
                     // Each cursor starts at the log's end: the heads are where all three stand.
-                    cursors.heads = least([
-                        cursors.convoys.read_through(),
-                        cursors.vessels.read_through(),
-                        cursors.terminals.read_through(),
-                    ]);
+                    cursors.heads =
+                        least([cursors.convoys.read_through(), cursors.vessels.read_through(), cursors.terminals.read_through()]);
                     Some(cursors)
                 })();
                 opened.map(Mutex::new)
@@ -216,12 +213,16 @@ impl LogCursors {
     }
 }
 
-/// Each home's least sequence among `throughs`; a home one of them does not name is left out, so
-/// a read from it starts that home's log afresh.
+/// Each home's least sequence among the `throughs` that name it. The three cursors read each
+/// home's one log, so a cursor that names no sequence of a home has read nothing of its kind
+/// there; leaving the home out would read its log from the start, which a home caught up from a
+/// snapshot no longer holds.
 fn least(throughs: impl IntoIterator<Item = BTreeMap<String, u64>>) -> BTreeMap<String, u64> {
-    let mut throughs = throughs.into_iter();
-    let Some(first) = throughs.next() else { return BTreeMap::new() };
-    throughs.fold(first, |held, read| held.into_iter().filter_map(|(home, seq)| Some((home.clone(), seq.min(*read.get(&home)?)))).collect())
+    let mut least = BTreeMap::<String, u64>::new();
+    for (home, seq) in throughs.into_iter().flatten() {
+        least.entry(home).and_modify(|held| *held = (*held).min(seq)).or_insert(seq);
+    }
+    least
 }
 
 impl std::fmt::Debug for ConvoyViews {

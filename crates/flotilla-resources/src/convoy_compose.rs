@@ -77,7 +77,11 @@ pub fn compose_listing(reads: &dyn LifecycleReads, namespace: &str, listing: Con
         composed.extend(records.into_iter().map(|record| {
             let notes = (record.home == here).then(|| convoys.memory().get(&record.name));
             let joined = join(record, notes.as_ref(), &launches, |vessel| sessions.get(vessel).cloned().unwrap_or_default());
-            Composed { home: record.home.clone(), view: view_of(namespace, &here, record, notes.as_ref(), &joined), retired: record.retired }
+            Composed {
+                home: record.home.clone(),
+                view: view_of(namespace, &here, record, notes.as_ref(), &joined),
+                retired: record.retired,
+            }
         }));
     }
     Ok(composed)
@@ -94,7 +98,12 @@ struct Joined {
 
 /// What `record` is joined with: its convoy's Vessel `launches` and each launch's sessions from
 /// `sessions_of`, its home's `notes` telling which crew agents are wanted running.
-fn join(record: &ConvoyRecord, notes: Option<&ConvoyNotes>, launches: &[VesselRecord], sessions_of: impl Fn(&str) -> Vec<TerminalRecord>) -> Joined {
+fn join(
+    record: &ConvoyRecord,
+    notes: Option<&ConvoyNotes>,
+    launches: &[VesselRecord],
+    sessions_of: impl Fn(&str) -> Vec<TerminalRecord>,
+) -> Joined {
     let mut joined = Joined::default();
     for requirement in &record.admission.workflow_snapshot.vessels {
         // A work replaced at another home has a launch at each: the newest requested serves it.
