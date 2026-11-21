@@ -640,7 +640,7 @@ impl<'a> AttachResolver<'a> {
         let command = "${SHELL:-/bin/sh}";
         pool.preflight_attach(seat).await?;
         pool.ensure_session(&session_name, command, &cwd, &Vec::new(), &[]).await?;
-        let args = pool.attach_args_for_mode(&session_name, command, &cwd, &Vec::new(), seat)?;
+        let args = pool.attach_args_for_mode(&session_name, Some(command), &cwd, &Vec::new(), seat)?;
         Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(args)]))
     }
 
@@ -1493,13 +1493,19 @@ mod tests {
 
     // Attach scenarios need a daemon and providers, independent of standing-convoy admission.
     async fn attach_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir) {
+        attach_fixture_with(fake_discovery(false)).await
+    }
+
+    async fn attach_fixture_with(
+        discovery: flotilla_discovery::DiscoveryRuntime,
+    ) -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"attach-test\"\n").expect("daemon config");
         let backend = flotilla_store_memory::engine_home_backend();
         let daemon = InProcessDaemon::new_with_resource_backend(
             Vec::new(),
             Arc::new(ConfigStore::with_base(temp.path())),
-            fake_discovery(false),
+            discovery,
             HostName::new("local"),
             backend.clone(),
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
@@ -2241,6 +2247,71 @@ mod tests {
             .await
             .expect_err("an explicit host must constrain role-address resolution");
         assert_eq!(wrong_host, "no attach target matching 'governor@andamento' on host 'udder'");
+    }
+
+    // An agent launch's command is recorded only in the daemon's memory, so a restarted daemon
+    // has none for the sessions already running. A pool that attaches to a named session needs
+    // none, so those sessions stay attachable (r995 refused every one of them).
+    #[tokio::test]
+    async fn a_running_agent_session_with_no_recorded_launch_command_attaches() {
+        use flotilla_resources::terminal_records::{TerminalLaunchRequest, TerminalLaunchSource};
+        // A pool that attaches to a named session, as cleat does; core tests have no cleat binary.
+        let pool = Arc::new(flotilla_discovery_testkit::FakeTerminalPool::new());
+        pool.add_sessions(vec![flotilla_terminal::TerminalSession {
+            session_name: "session-coder-session".to_string(),
+            status: flotilla_protocol::TerminalStatus::Running,
+            command: None,
+            working_directory: None,
+            screen_activity: None,
+        }])
+        .await;
+        let (daemon, backend, _temp) = attach_fixture_with(flotilla_discovery_testkit::fake_discovery_with_provider_set(
+            flotilla_discovery_testkit::FakeDiscoveryProviders::new().with_terminal_pool(pool),
+        ))
+        .await;
+        let convoy = create_identity_convoy(&daemon, "convoy-restarted", "coder", "flotilla").await;
+        let host = daemon.local_host_id().expect("local host identity").to_string();
+        backend
+            .using::<ResourceHost>("flotilla")
+            .create(
+                &test_meta(&host),
+                &HostSpec { display_name: "standing-test".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
+            .await
+            .expect("local host resource");
+        let _messages = install_engine_messages(&daemon);
+        let engine = test_engine(&daemon);
+        let environment = create_test_environment(&engine.environments, "coder-env", &host);
+        let vessel = ensure_vessel(&engine, &convoy, "work");
+        let launch = engine.terminals.request(&TerminalLaunchRequest {
+            session: "coder-session".to_string(),
+            environment,
+            vessel: Some(vessel),
+            role: "coder".to_string(),
+            pool: "fake-terminals".to_string(),
+            cwd: "/repo".to_string(),
+            env: Default::default(),
+            source: TerminalLaunchSource::Agent {
+                capability: "code".to_string(),
+                adapter: None,
+                model: None,
+                brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
+                    path: "brief.md".to_string(),
+                    content: "brief".to_string(),
+                    copies: vec![],
+                },
+            },
+        });
+        // Ready with no launch command observed, as after a restart.
+        engine.terminals.ready(&launch, "session-coder-session", &Default::default());
+
+        let resolved = daemon
+            .attach_resolver()
+            .resolve_attach("coder-session", None, false, AttachMode::Default, None)
+            .await
+            .expect("a running agent session attaches without a recorded launch command");
+        assert_eq!(resolved.binding.and_then(|binding| binding.session), Some("coder-session".to_string()));
     }
 
     #[tokio::test]

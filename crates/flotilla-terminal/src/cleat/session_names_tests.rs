@@ -131,7 +131,7 @@ async fn a_launch_named_session_goes_through_every_operation_under_cleats_name_r
     assert_eq!(pool.capture_screen(LAUNCH_SESSION).await.expect("capture").as_deref(), Some("screen"));
 
     let attach = pool
-        .attach_args_for_mode(LAUNCH_SESSION, "claude", &ExecutionEnvironmentPath::new("/repo"), &Vec::new(), AttachMode::Take)
+        .attach_args_for_mode(LAUNCH_SESSION, Some("claude"), &ExecutionEnvironmentPath::new("/repo"), &Vec::new(), AttachMode::Take)
         .expect("attach args");
     let flat = flotilla_protocol::arg::flatten(&attach, 0);
     let attached = flat.rsplit(' ').next().expect("attach names its session");

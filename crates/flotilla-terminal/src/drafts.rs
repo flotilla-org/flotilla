@@ -151,7 +151,7 @@ mod tests {
         ) -> Result<(), String> {
             Ok(())
         }
-        fn attach_args(&self, _: &str, _: &str, _: &ExecutionEnvironmentPath, _: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
+        fn attach_args(&self, _: &str, _: Option<&str>, _: &ExecutionEnvironmentPath, _: &TerminalEnvVars) -> Result<Vec<Arg>, String> {
             Ok(Vec::new())
         }
         async fn kill_session(&self, _: &str) -> Result<(), String> {

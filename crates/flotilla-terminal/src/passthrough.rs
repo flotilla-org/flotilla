@@ -26,7 +26,7 @@ impl TerminalPool for PassthroughTerminalPool {
     fn attach_args(
         &self,
         _session_name: &str,
-        command: &str,
+        command: Option<&str>,
         _cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String> {
@@ -38,6 +38,9 @@ impl TerminalPool for PassthroughTerminalPool {
                 args.push(Arg::EnvAssignment { key: k.clone(), value: v.clone() });
             }
         }
+        // Passthrough has no persistent session: attaching runs the launch command, so it needs it.
+        let command =
+            command.ok_or("the passthrough pool attaches by running the session's launch command, which this daemon has not recorded")?;
         args.push(Arg::Literal(command.into()));
         Ok(args)
     }
@@ -96,14 +99,14 @@ mod tests {
         let pool = PassthroughTerminalPool;
         for key in ["", "FOO-BAR", "A=B", "9KEY", "A;cmd"] {
             let env = vec![(key.to_string(), "value".to_string())];
-            assert!(pool.attach_args("s", "bash", &ExecutionEnvironmentPath::new("/tmp"), &env).is_err());
+            assert!(pool.attach_args("s", Some("bash"), &ExecutionEnvironmentPath::new("/tmp"), &env).is_err());
         }
     }
 
     #[test]
     fn attach_args_simple_command() {
         let pool = PassthroughTerminalPool;
-        let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/tmp"), &vec![]).expect("attach_args");
+        let args = pool.attach_args("my-session", Some("bash"), &ExecutionEnvironmentPath::new("/tmp"), &vec![]).expect("attach_args");
 
         assert_eq!(args, vec![Arg::Literal("bash".into())]);
     }
@@ -111,7 +114,7 @@ mod tests {
     #[test]
     fn attach_args_flatten_simple_command() {
         let pool = PassthroughTerminalPool;
-        let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/tmp"), &vec![]).expect("attach_args");
+        let args = pool.attach_args("my-session", Some("bash"), &ExecutionEnvironmentPath::new("/tmp"), &vec![]).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
         assert_eq!(flat, "bash");
@@ -121,7 +124,7 @@ mod tests {
     fn attach_args_with_env_vars() {
         let pool = PassthroughTerminalPool;
         let env = vec![("FOO".to_string(), "bar".to_string())];
-        let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/tmp"), &env).expect("attach_args");
+        let args = pool.attach_args("my-session", Some("bash"), &ExecutionEnvironmentPath::new("/tmp"), &env).expect("attach_args");
 
         assert_eq!(
             args,
@@ -133,7 +136,7 @@ mod tests {
     fn attach_args_flatten_with_env_vars() {
         let pool = PassthroughTerminalPool;
         let env = vec![("FOO".to_string(), "bar".to_string())];
-        let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/tmp"), &env).expect("attach_args");
+        let args = pool.attach_args("my-session", Some("bash"), &ExecutionEnvironmentPath::new("/tmp"), &env).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
         assert_eq!(flat, "env FOO='bar' bash");
@@ -144,7 +147,7 @@ mod tests {
         // Regression: flatten(attach_args()) should produce the same string as attach_command()
         let pool = PassthroughTerminalPool;
         let env = vec![("FOO".to_string(), "bar".to_string())];
-        let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/tmp"), &env).expect("attach_args");
+        let args = pool.attach_args("my-session", Some("bash"), &ExecutionEnvironmentPath::new("/tmp"), &env).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
         // The old attach_command produced: "env FOO='bar' bash"
@@ -155,7 +158,7 @@ mod tests {
     fn attach_args_env_value_with_single_quote() {
         let pool = PassthroughTerminalPool;
         let env = vec![("KEY".to_string(), "it's".to_string())];
-        let args = pool.attach_args("s", "cmd", &ExecutionEnvironmentPath::new("/tmp"), &env).expect("attach_args");
+        let args = pool.attach_args("s", Some("cmd"), &ExecutionEnvironmentPath::new("/tmp"), &env).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
         assert_eq!(flat, "env KEY='it'\\''s' cmd");

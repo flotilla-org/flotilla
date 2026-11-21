@@ -1035,7 +1035,7 @@ impl TerminalPool for FakeTerminalPool {
     fn attach_args(
         &self,
         session_name: &str,
-        _command: &str,
+        _command: Option<&str>,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &flotilla_terminal::TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
@@ -1052,7 +1052,7 @@ impl TerminalPool for FakeTerminalPool {
     fn attach_args_for_mode(
         &self,
         session_name: &str,
-        _command: &str,
+        _command: Option<&str>,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &flotilla_terminal::TerminalEnvVars,
         mode: flotilla_protocol::commands::AttachMode,

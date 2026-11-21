@@ -516,7 +516,7 @@ impl TerminalPool for CleatTerminalPool {
     fn attach_args(
         &self,
         session_name: &str,
-        _command: &str,
+        _command: Option<&str>,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String> {
@@ -548,7 +548,7 @@ impl TerminalPool for CleatTerminalPool {
     fn attach_args_for_mode(
         &self,
         session_name: &str,
-        _command: &str,
+        _command: Option<&str>,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &TerminalEnvVars,
         mode: AttachMode,
@@ -1397,7 +1397,7 @@ mod tests {
     #[test]
     fn attach_args_with_command_no_env() {
         let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
-        let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
+        let args = pool.attach_args("my-session", Some("bash"), &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
 
         assert_eq!(
             args,
@@ -1413,7 +1413,7 @@ mod tests {
     #[test]
     fn attach_args_flatten_with_command_no_env() {
         let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
-        let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
+        let args = pool.attach_args("my-session", Some("bash"), &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
         assert_eq!(flat, "cleat attach --no-create my-session");
@@ -1423,10 +1423,10 @@ mod tests {
     fn human_take_attach_adds_take_while_watch_omits_it() {
         let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let take = pool
-            .attach_args_for_mode("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::PreferTake)
+            .attach_args_for_mode("my-session", Some("bash"), &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::PreferTake)
             .expect("take attach args");
         let watch = pool
-            .attach_args_for_mode("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::Default)
+            .attach_args_for_mode("my-session", Some("bash"), &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::Default)
             .expect("watch attach args");
 
         assert_eq!(flotilla_protocol::arg::flatten(&take, 0), "cleat attach --no-create --take my-session");
@@ -1474,7 +1474,7 @@ mod tests {
     #[test]
     fn attach_args_empty_command_no_env() {
         let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
-        let args = pool.attach_args("sess-1", "", &ExecutionEnvironmentPath::new("/home/dev"), &vec![]).expect("attach_args");
+        let args = pool.attach_args("sess-1", Some(""), &ExecutionEnvironmentPath::new("/home/dev"), &vec![]).expect("attach_args");
 
         // Same structure regardless of command
         assert_eq!(
@@ -1492,7 +1492,7 @@ mod tests {
     fn attach_args_with_env_vars() {
         let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let env = vec![("FOO".to_string(), "bar".to_string()), ("BAZ".to_string(), "qu'x".to_string())];
-        let args = pool.attach_args("sess", "cmd", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
+        let args = pool.attach_args("sess", Some("cmd"), &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
 
         // Env vars are baked in at ensure_session/launch time — not in attach_args
         assert_eq!(
@@ -1510,7 +1510,7 @@ mod tests {
     fn attach_args_with_env_vars_empty_command() {
         let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let env = vec![("KEY".to_string(), "val".to_string())];
-        let args = pool.attach_args("sess", "", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
+        let args = pool.attach_args("sess", Some(""), &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
 
         assert_eq!(
             args,
@@ -1527,7 +1527,7 @@ mod tests {
     fn attach_args_flatten_roundtrip_env_vars() {
         let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let env = vec![("FOO".to_string(), "bar".to_string())];
-        let args = pool.attach_args("sess", "bash", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
+        let args = pool.attach_args("sess", Some("bash"), &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
         // No --cmd, no NestedCommand

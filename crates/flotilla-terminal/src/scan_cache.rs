@@ -83,7 +83,7 @@ impl TerminalPool for SharedTerminalPool {
     fn attach_args(
         &self,
         session_name: &str,
-        command: &str,
+        command: Option<&str>,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
@@ -97,7 +97,7 @@ impl TerminalPool for SharedTerminalPool {
     fn attach_args_for_mode(
         &self,
         session_name: &str,
-        command: &str,
+        command: Option<&str>,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
         mode: AttachMode,

@@ -583,7 +583,7 @@ impl TerminalPool for MockTerminalPool {
     fn attach_args(
         &self,
         session_name: &str,
-        _cmd: &str,
+        _cmd: Option<&str>,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
