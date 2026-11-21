@@ -9,7 +9,7 @@ use flotilla_manifest::keys::KEY_CONVOY_NAME;
 use flotilla_protocol::{
     AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
     AwarenessNode, AwarenessPhase, AwarenessState, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryScope, ResourceRef,
-    ResultSetState, Salience, WorkPhase, UNKNOWN_REPOSITORY_LABEL,
+    ResultSetState, Salience, ViewAddress, WorkPhase, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{api_version, Project, Resource};
 
@@ -67,7 +67,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
         group.refs.push(convoy.resource.clone());
         group.add_entry(enrich_salience(
             AwarenessEntry::builder()
-                .id(format!("convoy/{}/{}", convoy.resource.namespace, convoy.resource.name))
+                .id(convoy_address(convoy))
                 .kind(AwarenessKind::Convoy)
                 .label(convoy.name.clone())
                 .state(convoy_state(convoy.phase, convoy.initializing))
@@ -84,7 +84,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             refs.extend(vessel.vessel_resource.clone());
             group.add_entry(enrich_salience(
                 AwarenessEntry::builder()
-                    .id(format!("vessel/{}/{}/{}", convoy.resource.namespace, convoy.resource.name, vessel.name))
+                    .id(vessel_address(convoy, &vessel.name))
                     .kind(AwarenessKind::Vessel)
                     .label(vessel.name.clone())
                     .state(work_state(vessel.phase))
@@ -292,6 +292,17 @@ fn group_key_for_scope(scope: &QueryScope) -> GroupKey {
     GroupKey::scoped(scope.clone())
 }
 
+/// Entry and group ids are view addresses so consumers can parse them back;
+/// engine launch names carry `#` and `/`, which `Display` percent-encodes.
+fn convoy_address(convoy: &ConvoyRow) -> String {
+    ViewAddress::Convoy { namespace: convoy.resource.namespace.clone(), name: convoy.resource.name.clone() }.to_string()
+}
+
+fn vessel_address(convoy: &ConvoyRow, vessel: &str) -> String {
+    ViewAddress::Vessel { namespace: convoy.resource.namespace.clone(), convoy: convoy.resource.name.clone(), vessel: vessel.to_owned() }
+        .to_string()
+}
+
 fn group_kind_for_query(scope: Option<&QueryScope>, grouping: AwarenessGrouping) -> AwarenessKind {
     if scope.is_some() {
         return AwarenessKind::Project;
@@ -305,9 +316,7 @@ fn group_kind_for_query(scope: Option<&QueryScope>, grouping: AwarenessGrouping)
 fn group_key_for_convoy(grouping: AwarenessGrouping, convoy: &ConvoyRow) -> GroupKey {
     match grouping {
         AwarenessGrouping::Project => project_ref_key(&convoy.resource.namespace, &convoy.project_ref),
-        AwarenessGrouping::Convoy => {
-            GroupKey::new(format!("convoy/{}/{}", convoy.resource.namespace, convoy.resource.name), convoy.name.clone())
-        }
+        AwarenessGrouping::Convoy => GroupKey::new(convoy_address(convoy), convoy.name.clone()),
     }
 }
 

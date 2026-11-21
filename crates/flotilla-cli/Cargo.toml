@@ -46,6 +46,7 @@ libc = { workspace = true }
 hegeltest.workspace = true
 flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store = { path = "../flotilla-store" }
+flotilla-projections = { path = "../flotilla-projections" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3.22", features = ["json"] }

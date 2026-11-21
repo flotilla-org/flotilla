@@ -2109,6 +2109,7 @@ dependencies = [
  "flotilla-discovery-testkit",
  "flotilla-manifest",
  "flotilla-paths",
+ "flotilla-projections",
  "flotilla-protocol",
  "flotilla-resources",
  "flotilla-store",

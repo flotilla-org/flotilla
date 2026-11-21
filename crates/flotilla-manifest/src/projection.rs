@@ -689,10 +689,10 @@ fn awareness_parent_facts(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Vec<(&
             ]
         }
         AwarenessKind::Convoy => {
-            let value = node.id.strip_prefix("convoy/").unwrap_or(&node.id);
-            let Some((namespace, name)) = value.split_once('/') else {
+            let Some((namespace, name)) = convoy_id_parts(&node.id) else {
                 return vec![];
             };
+            let (namespace, name) = (namespace.as_str(), name.as_str());
             let origin = find_convoy(convoys, namespace, name)
                 .map(|row| entity::resource_origin(&row.resource))
                 .unwrap_or_else(|| "fleet".to_owned());
@@ -720,8 +720,8 @@ fn awareness_node_entity(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Option<
             Some((entity, facts))
         }
         AwarenessKind::Convoy => {
-            let value = node.id.strip_prefix("convoy/").unwrap_or(&node.id);
-            let (namespace, name) = value.split_once('/')?;
+            let (namespace, name) = convoy_id_parts(&node.id)?;
+            let (namespace, name) = (namespace.as_str(), name.as_str());
             let row = find_convoy(convoys, namespace, name);
             let origin = row.map(|row| entity::resource_origin(&row.resource)).unwrap_or_else(|| "fleet".to_owned());
             let entity = entity::convoy(namespace, name, &origin);
@@ -802,8 +802,8 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
     let mut label = entry.label.clone();
     let (entity, facts) = match entry.kind {
         AwarenessKind::Convoy => {
-            let value = entry.id.strip_prefix("convoy/").unwrap_or(&entry.id);
-            let (namespace, name) = value.split_once('/')?;
+            let (namespace, name) = convoy_id_parts(&entry.id)?;
+            let (namespace, name) = (namespace.as_str(), name.as_str());
             let row = find_convoy(convoys, namespace, name);
             let origin = row.map(|row| entity::resource_origin(&row.resource)).unwrap_or_else(|| "fleet".to_owned());
             let entity = entity::convoy(namespace, name, &origin);
@@ -821,9 +821,8 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
             (entity, facts)
         }
         AwarenessKind::Vessel => {
-            let value = entry.id.strip_prefix("vessel/").unwrap_or(&entry.id);
-            let mut parts = value.split('/');
-            let (namespace, convoy_name, vessel_name) = (parts.next()?, parts.next()?, parts.next()?);
+            let (namespace, convoy_name, vessel_name) = vessel_id_parts(&entry.id)?;
+            let (namespace, convoy_name, vessel_name) = (namespace.as_str(), convoy_name.as_str(), vessel_name.as_str());
             let row = find_convoy(convoys, namespace, convoy_name);
             let origin = row.map(|row| entity::resource_origin(&row.resource)).unwrap_or_else(|| "fleet".to_owned());
             let convoy = entity::convoy(namespace, convoy_name, &origin);
@@ -901,6 +900,30 @@ fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &
             vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host))
         }
         _ => None,
+    }
+}
+
+/// Awareness convoy ids are `ViewAddress` strings. Ids written before that
+/// (`convoy/<ns>/<name>` raw) are read for one generation.
+fn convoy_id_parts(id: &str) -> Option<(String, String)> {
+    match id.parse() {
+        Ok(ViewAddress::Convoy { namespace, name }) => Some((namespace, name)),
+        Ok(_) => None,
+        Err(_) => {
+            let (namespace, name) = id.strip_prefix("convoy/").unwrap_or(id).split_once('/')?;
+            Some((namespace.to_owned(), name.to_owned()))
+        }
+    }
+}
+
+fn vessel_id_parts(id: &str) -> Option<(String, String, String)> {
+    match id.parse() {
+        Ok(ViewAddress::Vessel { namespace, convoy, vessel }) => Some((namespace, convoy, vessel)),
+        Ok(_) => None,
+        Err(_) => {
+            let mut parts = id.strip_prefix("vessel/").unwrap_or(id).split('/');
+            Some((parts.next()?.to_owned(), parts.next()?.to_owned(), parts.next()?.to_owned()))
+        }
     }
 }
 

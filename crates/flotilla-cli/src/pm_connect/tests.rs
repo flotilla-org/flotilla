@@ -2357,3 +2357,73 @@ async fn failed_watch_setup_preserves_unfinished_namespaces() {
     assert_eq!(state.pending_namespaces, expected);
     tasks.shutdown().await;
 }
+
+fn attach_vessel(convoy: &ResourceRef, name: &str) -> flotilla_protocol::result_set::VesselRow {
+    use flotilla_protocol::result_set::{Readiness, ReadinessState, VesselRow, WorkPhase};
+    VesselRow::builder()
+        .readiness(Readiness { state: ReadinessState::Ready, blockers: Vec::new() })
+        .resource(convoy.subresource(format!("vessels/{name}")))
+        .name(name)
+        .phase(WorkPhase::Running)
+        .host(HostName::new("feta"))
+        .materialize(format!("terminal-{name}"))
+        .build()
+}
+
+fn engine_convoy(name: &str, ensured_from: Option<&str>) -> ConvoyRow {
+    use flotilla_protocol::result_set::ConvoyPhase;
+    let resource = ResourceRef::new("flotilla.work/v1", "Convoy", "dev", name).on_host(HostName::new("kiwi"));
+    ConvoyRow::builder()
+        .vessels(vec![attach_vessel(&resource, "work")])
+        .resource(resource)
+        .name(name)
+        .workflow_ref("standing")
+        .project_ref("platform")
+        .maybe_address_role(ensured_from.map(|_| "governor".to_owned()))
+        .maybe_ensured_from(ensured_from.map(str::to_owned))
+        .generation(3)
+        .phase(ConvoyPhase::Active)
+        .build()
+}
+
+// Engine launch names carry `#` and standing ones also `/`; the awareness ids
+// the connector joins on must still resolve to convoy rows.
+#[test]
+fn engine_era_launch_names_keep_attach_facts() {
+    use flotilla_projections::awareness_projection::{project_awareness, AwarenessInput};
+    use flotilla_protocol::{AwarenessGrouping, AwarenessLimit};
+
+    let standing = "project:x/convoy:governor#3";
+    let plain = "fix#8";
+    let convoys = vec![engine_convoy(standing, Some("ensure-governor")), engine_convoy(plain, None)];
+    let (nodes, _) = project_awareness(AwarenessInput {
+        grouping: AwarenessGrouping::Project,
+        limit: AwarenessLimit::default(),
+        projects: vec![flotilla_protocol::QueryScope::new("dev", "platform")],
+        convoys: convoys.clone(),
+        ..Default::default()
+    });
+
+    let mut state = ConnectorState::default();
+    state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::Convoys { scope: None, rows: convoys },
+        state: Default::default(),
+    })));
+    state.apply_event(&awareness_set(1, nodes));
+    let patches = state.rebuild(&mint());
+
+    for name in [standing, plain] {
+        let convoy = patches
+            .iter()
+            .find(|patch| patch.target == MetadataTarget::Entity(entity::convoy("dev", name, "kiwi")))
+            .unwrap_or_else(|| panic!("convoy {name} not projected at its row origin"));
+        assert!(convoy.set.contains_key("action.primary.recipe"), "{name} convoy has no attach recipe");
+        let vessel_entity = entity::vessel("dev", name, "work", "feta");
+        let vessel = patches
+            .iter()
+            .find(|patch| patch.target == MetadataTarget::Entity(vessel_entity.clone()))
+            .unwrap_or_else(|| panic!("vessel of {name} not projected at @feta"));
+        assert!(vessel.set.contains_key("action.primary.recipe"), "{name} vessel has no attach recipe");
+    }
+}
