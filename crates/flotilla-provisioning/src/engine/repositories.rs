@@ -287,17 +287,16 @@ impl flotilla_resources::repository_records::RepositoryRecords for EngineReposit
         self.indexed(flotilla_resources::repository::FORGE_SERVICE_URL_FIELD, forge_service_url_key(service_url)).await
     }
 
-    async fn with_catalog_target(&self, target: &str) -> Result<Vec<Record<Repository>>, String> {
-        let found = self.indexed("spec.catalog_targets.*", target).await?;
-        // Each name as several homes' copies resolve.
-        let mut names: Vec<String> = found.into_iter().map(|record| record.name).collect();
-        names.sort();
-        names.dedup();
-        let mut resolved = Vec::new();
-        for name in names {
-            resolved.extend(KindRecords::<Repository>::get(self, &name).await?);
-        }
-        Ok(resolved)
+    async fn workspace_slug_peers(&self, spec: &RepositorySpec) -> Result<Vec<Record<Repository>>, String> {
+        let all = KindRecords::<Repository>::list(self).await?;
+        let own = spec.key();
+        let candidates: Vec<&Record<Repository>> = all.iter().filter(|record| record.spec.key() != own).collect();
+        let names: std::collections::BTreeSet<String> =
+            flotilla_resources::repository::workspace_slug_component(spec, candidates.iter().map(|record| &record.spec))
+                .into_iter()
+                .map(|peer| peer.key().to_string())
+                .collect();
+        Ok(all.into_iter().filter(|record| names.contains(&record.spec.key().to_string())).collect())
     }
 
     async fn changes(&self) -> Result<BoxStream<'_, ()>, String> {

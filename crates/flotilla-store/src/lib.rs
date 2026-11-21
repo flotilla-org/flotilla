@@ -7,7 +7,7 @@ use flotilla_resources::{error, host, labels, resource, retention};
 
 mod attentions;
 mod backend_ports;
-pub use backend_ports::{BackendForges, BackendRepositories};
+pub use backend_ports::BackendRepositories;
 mod backend;
 pub use backend::*;
 pub mod controller;

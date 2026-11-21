@@ -123,21 +123,21 @@ impl VesselPlanning {
     }
 
     /// The repositories other than `repository_key` that could share `spec`'s workspace slug, each
-    /// read through the catalog-target index.
+    /// read from the engine's records.
     async fn slug_peers(
         &self,
         repository_key: &flotilla_resources::RepositoryKey,
         spec: &RepositorySpec,
     ) -> Result<BTreeMap<flotilla_resources::RepositoryKey, RepositorySpec>, ResourceError> {
-        let mut peers = BTreeMap::new();
-        for target in flotilla_resources::repository::workspace_slug_targets(spec) {
-            for record in self.repository_records.with_catalog_target(&target).await.map_err(ResourceError::other)? {
-                let key = record.spec.key();
-                if &key != repository_key {
-                    peers.insert(key, record.spec);
-                }
-            }
-        }
+        let peers = self
+            .repository_records
+            .workspace_slug_peers(spec)
+            .await
+            .map_err(ResourceError::other)?
+            .into_iter()
+            .filter(|record| &record.spec.key() != repository_key)
+            .map(|record| (record.spec.key(), record.spec))
+            .collect();
         Ok(peers)
     }
 
@@ -783,8 +783,6 @@ impl VesselPlanning {
         let mut contained_branches = BTreeSet::new();
         let mut waiting_for_checkouts = Vec::new();
         let mut fork_stance = false;
-        // Slug allocation needs the repository catalog only when a shared clone
-        // is missing; read it at most once per prepare, not once per repository.
         for convoy_repository in convoy_repositories {
             let repository_spec = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
                 Ok(repository) => repository.spec,

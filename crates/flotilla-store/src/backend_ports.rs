@@ -2,71 +2,17 @@
 //! its backend: the readers that take the ports run unchanged over a bare backend's records.
 //! Each read is the same keyed or indexed read the engine's port makes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_resources::{
     engine_records::Record,
-    forge_records::ForgeRecords,
     repository::{forge_service_url_key, FORGE_SERVICE_URL_FIELD},
     repository_records::RepositoryRecords,
-    Forge, ForgeSpec, Repository, ResourceError, ResourceObject,
+    Repository, RepositorySpec, ResourceError, ResourceObject,
 };
 use futures::stream::BoxStream;
 
 use crate::{ResourceBackend, StoreQuery};
-
-/// The Forge port over `backend`'s definitions in `namespace`.
-pub struct BackendForges {
-    backend: ResourceBackend,
-    namespace: String,
-}
-
-impl BackendForges {
-    pub fn new(backend: ResourceBackend, namespace: &str) -> Self {
-        Self { backend, namespace: namespace.to_owned() }
-    }
-}
-
-#[async_trait::async_trait]
-impl ForgeRecords for BackendForges {
-    async fn forge(&self, name: &str) -> Result<Option<ForgeSpec>, String> {
-        match self.backend.definitions::<Forge>(&self.namespace).get(name).await {
-            Ok(forge) => Ok(Some(forge.spec)),
-            Err(ResourceError::NotFound { .. }) => Ok(None),
-            Err(error) => Err(error.to_string()),
-        }
-    }
-
-    async fn at_host(&self, host: &str) -> Result<Vec<ForgeSpec>, String> {
-        let query = StoreQuery {
-            fields: BTreeMap::from([("spec.remote_hosts.*".to_owned(), host.to_ascii_lowercase())]),
-            include_replicas: true,
-            ..Default::default()
-        };
-        let read = self.backend.query_declared::<Forge>(&self.namespace, &query).await.map_err(|error| error.to_string())?;
-        let mut forges: BTreeMap<String, ForgeSpec> = BTreeMap::new();
-        for forge in read.items {
-            forges.entry(forge.object.metadata.name).or_insert(forge.object.spec);
-        }
-        Ok(forges.into_values().collect())
-    }
-
-    async fn changes(&self) -> Result<BoxStream<'_, ForgeSpec>, String> {
-        use flotilla_resources::ReadWatchEvent;
-        use futures::StreamExt;
-        let events = self.backend.including_replicas::<Forge>(&self.namespace).watch().await.map_err(|error| error.to_string())?;
-        Ok(events
-            .filter_map(|event| {
-                futures::future::ready(match event {
-                    Ok(ReadWatchEvent::Added(forge) | ReadWatchEvent::Modified(forge) | ReadWatchEvent::Deleted(forge)) => {
-                        Some(forge.object.spec)
-                    }
-                    _ => None,
-                })
-            })
-            .boxed())
-    }
-}
 
 /// The Repository port over `backend`'s repositories in `namespace`.
 pub struct BackendRepositories {
@@ -114,8 +60,16 @@ impl RepositoryRecords for BackendRepositories {
         self.indexed(FORGE_SERVICE_URL_FIELD, forge_service_url_key(service_url)).await
     }
 
-    async fn with_catalog_target(&self, target: &str) -> Result<Vec<Record<Repository>>, String> {
-        self.indexed("spec.catalog_targets.*", target).await
+    async fn workspace_slug_peers(&self, spec: &RepositorySpec) -> Result<Vec<Record<Repository>>, String> {
+        let all = self.backend.using::<Repository>(&self.namespace).list().await.map_err(|error| error.to_string())?;
+        let own = spec.key();
+        let others: Vec<_> = all.items.into_iter().filter(|object| object.spec.key() != own).collect();
+        let names: BTreeSet<String> =
+            flotilla_resources::repository::workspace_slug_component(spec, others.iter().map(|object| &object.spec))
+                .into_iter()
+                .map(|peer| peer.key().to_string())
+                .collect();
+        Ok(others.into_iter().filter(|object| names.contains(&object.spec.key().to_string())).map(Self::record).collect())
     }
 
     async fn changes(&self) -> Result<BoxStream<'_, ()>, String> {

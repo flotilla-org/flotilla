@@ -6,7 +6,7 @@
 
 use futures::stream::BoxStream;
 
-use crate::{engine_records::Record, Repository};
+use crate::{engine_records::Record, Repository, RepositorySpec};
 
 /// The Repository port. A key several homes hold reads as this home's record, else the
 /// lexically first home's.
@@ -17,9 +17,11 @@ pub trait RepositoryRecords: Send + Sync {
     /// Every home's copy of every repository on the forge whose service URL is `service_url`
     /// ([`crate::repository::FORGE_SERVICE_URL_FIELD`]), through the index of it.
     async fn on_forge(&self, service_url: &str) -> Result<Vec<Record<Repository>>, String>;
-    /// The repositories one of whose catalog targets is `target` (`spec.catalog_targets.*`: a leaf
-    /// or catalog slug, or an `owner/name`), as several homes' resolve, through the index of it.
-    async fn with_catalog_target(&self, target: &str) -> Result<Vec<Record<Repository>>, String>;
+    /// The repositories, other than `spec`'s own, that can change the workspace slug it is
+    /// allocated ([`crate::repository::workspace_slug_component`]), as several homes' resolve.
+    /// Slugs collide once normalized and the indexes hold them as written, so the engine answers
+    /// from its resident records.
+    async fn workspace_slug_peers(&self, spec: &RepositorySpec) -> Result<Vec<Record<Repository>>, String>;
     /// Ticks as repositories change, from now on.
     async fn changes(&self) -> Result<BoxStream<'_, ()>, String>;
 }
