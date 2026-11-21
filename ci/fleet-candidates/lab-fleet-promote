@@ -87,8 +87,13 @@ def validate_run(run, run_id):
         raise PromotionError(f"run {run_id} is not successful: {run.get('status', 'unknown')}")
     if run.get("workflow_id") != "fleet-candidates.yml":
         raise PromotionError(f"run {run_id} did not execute fleet-candidates.yml")
-    if run.get("prettyref") != "main" or run.get("trigger_event") != "workflow_dispatch":
-        raise PromotionError(f"run {run_id} is not a manual main-branch candidate run")
+    # Any branch's run may be promoted: starting the promotion is the approval, and the
+    # workflow commit is recorded in the generation. Hosts still refuse an incoming
+    # flotilla that does not descend from live unless `fleet-install --rollback --reason`.
+    if run.get("trigger_event") != "workflow_dispatch":
+        raise PromotionError(f"run {run_id} is not a manual candidate run")
+    if not run.get("prettyref"):
+        raise PromotionError(f"run {run_id} names no workflow ref")
     commit_sha = run.get("commit_sha", "")
     if not SHA_PATTERN.fullmatch(commit_sha):
         raise PromotionError(f"run {run_id} has an invalid workflow commit")
@@ -96,8 +101,8 @@ def validate_run(run, run_id):
         payload = json.loads(run["event_payload"])
     except (KeyError, TypeError, json.JSONDecodeError) as error:
         raise PromotionError(f"run {run_id} has an invalid workflow-dispatch payload") from error
-    if payload.get("ref") != "refs/heads/main":
-        raise PromotionError(f"run {run_id} payload did not select refs/heads/main")
+    if payload.get("ref") != f"refs/heads/{run['prettyref']}":
+        raise PromotionError(f"run {run_id} payload ref {payload.get('ref')!r} does not match its run ref {run['prettyref']!r}")
     inputs = payload.get("inputs", {})
     sources = {name: inputs.get(f"{name.replace(chr(45), chr(95))}_sha", "").lower() for name in ("flotilla", "cleat", "mattpocock-skills", "rjw-skills")}
     for name, source_sha in sources.items():
@@ -114,7 +119,7 @@ def validate_jobs(tasks_response, run):
         if task.get("run_number") == run["index_in_repo"]
         and task.get("workflow_id") == "fleet-candidates.yml"
         and task.get("head_sha") == run["commit_sha"]
-        and task.get("head_branch") == "main"
+        and task.get("head_branch") == run["prettyref"]
     ]
     for expected_name in EXPECTED_JOBS:
         if not any(task.get("name") == expected_name and task.get("status") == "success" for task in matching):
@@ -545,6 +550,7 @@ def build_generation_manifest(run, sources, candidates, generation):
             "api_run_id": run["id"],
             "run_number": run["index_in_repo"],
             "workflow": run["workflow_id"],
+            "workflow_ref": run["prettyref"],
             "workflow_commit": run["commit_sha"],
             "completed_at": run["stopped"],
         },

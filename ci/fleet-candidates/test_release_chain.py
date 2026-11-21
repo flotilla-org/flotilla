@@ -3,6 +3,7 @@ import gzip
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import tarfile
 import tempfile
@@ -79,6 +80,39 @@ class PromoteTests(unittest.TestCase):
             promote.record_generation(path, GENERATION)
             self.assertEqual(path.read_text(), GENERATION + "\n")
             self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ["988"])
+
+    @staticmethod
+    def run_on(ref, payload_ref=None):
+        inputs = {f"{name}_sha": "a" * 40 for name in ("flotilla", "cleat", "mattpocock_skills", "rjw_skills")}
+        payload = {"ref": payload_ref or f"refs/heads/{ref}", "inputs": inputs}
+        return {
+            "id": 991, "status": "success", "workflow_id": "fleet-candidates.yml", "prettyref": ref,
+            "trigger_event": "workflow_dispatch", "commit_sha": "b" * 40, "index_in_repo": 861,
+            "event_payload": json.dumps(payload),
+        }
+
+    @staticmethod
+    def jobs_on(promote, branch):
+        return {"workflow_runs": [
+            {"run_number": 861, "workflow_id": "fleet-candidates.yml", "head_sha": "b" * 40, "head_branch": branch,
+             "name": name, "status": "success"} for name in promote.EXPECTED_JOBS]}
+
+    def test_a_run_on_any_branch_is_promotable(self):
+        promote = load("lab-fleet-promote")
+        for ref in ("main", "zig-package-mirror"):
+            run = self.run_on(ref)
+            self.assertEqual(promote.validate_run(run, 991)["flotilla"], "a" * 40)
+            promote.validate_jobs(self.jobs_on(promote, ref), run)
+
+    def test_a_payload_ref_that_disagrees_with_the_run_is_refused(self):
+        promote = load("lab-fleet-promote")
+        with self.assertRaisesRegex(promote.PromotionError, "does not match its run ref"):
+            promote.validate_run(self.run_on("zig-package-mirror", payload_ref="refs/heads/main"), 991)
+
+    def test_jobs_from_another_branch_do_not_count(self):
+        promote = load("lab-fleet-promote")
+        with self.assertRaisesRegex(promote.PromotionError, "missing successful job"):
+            promote.validate_jobs(self.jobs_on(promote, "main"), self.run_on("zig-package-mirror"))
 
 
 class SignerTests(unittest.TestCase):
