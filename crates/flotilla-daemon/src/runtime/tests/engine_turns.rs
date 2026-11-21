@@ -390,7 +390,14 @@ async fn typing_pass_reads(idle: usize) -> flotilla_store::load_metrics::ReadCou
     let mut delivery = crew.delivery();
     passes(&mut delivery, 10).await;
     crew.send("one-turn", "system:turn-rules", MessageRelation::System, "Continue the work.").await;
-    let (pass, reads) = flotilla_store::load_metrics::measure(delivery.pass()).await;
+    // The pass types the turn in a task of its own, which may still be running when the pass
+    // returns: the measure ends once the pool has been handed the turn.
+    let (pass, reads) = flotilla_store::load_metrics::measure(async {
+        let pass = delivery.pass().await;
+        pool.submission_attempted.notified().await;
+        pass
+    })
+    .await;
     pass.expect("delivery pass");
     assert_eq!(pool.inputs.lock().expect("typed inputs").len(), 1, "the pass types the turn");
     reads
