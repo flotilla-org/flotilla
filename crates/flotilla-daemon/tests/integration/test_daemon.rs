@@ -583,7 +583,7 @@ async fn a_landed_convoy_held_by_a_clean_checkout_with_unjudged_landing_tells_a_
         .rows("vessel", "")
         .await
         .into_iter()
-        .filter(|row| text(row, "resource.name").starts_with(&prefix) && text(row, "state") == "Realised");
+        .filter(|row| text(row, "resource.name").starts_with(prefix) && text(row, "state") == "Realised");
     assert_eq!(live.count(), 0, "its vessel is freed");
 }
 
