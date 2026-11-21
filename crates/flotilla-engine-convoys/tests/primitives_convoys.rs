@@ -21,6 +21,7 @@ fn address(text: &str) -> Address {
 
 fn request() -> ConvoyRequest {
     ConvoyRequest {
+        role: String::new(),
         launch_of: "c".into(),
         workflow_ref: "w".into(),
         admission: flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new()))

@@ -176,6 +176,7 @@ impl CheckoutFixture {
             replacements: 0,
         };
         let request = ConvoyRequest {
+            role: String::new(),
             launch_of: name.into(),
             workflow_ref: "w".into(),
             admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(empty_admission())).expect("freeze"),

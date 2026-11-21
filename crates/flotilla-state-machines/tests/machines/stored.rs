@@ -78,6 +78,7 @@ fn promise() -> AdmittedPromise {
 /// A convoy whose seat `coder` owns promise 0 and a lifetime duty.
 fn convoy_request() -> ConvoyRequest {
     ConvoyRequest {
+        role: String::new(),
         launch_of: "c".into(),
         workflow_ref: "w".into(),
         admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
@@ -428,6 +429,7 @@ fn convoy_and_awaiting_reply_round_trip() {
     let spec = ConvoySpec {
         launch_of: "c".into(),
         launch: 1,
+        role: Some("coder".into()),
         workflow_ref: "w".into(),
         admission: Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new())).expect("freeze"),
         project: project(),

@@ -95,6 +95,7 @@ impl ConvoyViews {
                 Source::Named(name) => convoys.named(name, None)?,
                 Source::OpenIn(project) => convoys.open_in(project)?,
                 Source::Launches(project, of) => convoys.launches_of(of, project)?,
+                Source::OpenRole(project, role) => convoys.open_of_role(project, role)?,
             });
         }
         // A launch two sources name is composed once.
@@ -119,23 +120,19 @@ impl ConvoyViews {
 
     /// The log's cursors, opened on first use; none where no log is held.
     fn log(&self) -> Option<&Mutex<LogCursors>> {
-        self.log
-            .get_or_init(|| {
-                let opened = (|| {
-                    let mut cursors = LogCursors {
-                        convoys: self.convoys().ok()?.cursor()?,
-                        vessels: self.reads.vessels().ok()?.cursor()?,
-                        terminals: self.reads.terminals().ok()?.cursor()?,
-                        heads: BTreeMap::new(),
-                    };
-                    // Each cursor starts at the log's end: the heads are where all three stand.
-                    cursors.heads =
-                        least([cursors.convoys.read_through(), cursors.vessels.read_through(), cursors.terminals.read_through()]);
-                    Some(cursors)
-                })();
-                opened.map(Mutex::new)
-            })
-            .as_ref()
+        self.log.get_or_init(|| self.open_cursors().map(Mutex::new)).as_ref()
+    }
+
+    /// Cursors over the log, each starting at the log's end: the heads are where all three stand.
+    fn open_cursors(&self) -> Option<LogCursors> {
+        let mut cursors = LogCursors {
+            convoys: self.convoys().ok()?.cursor()?,
+            vessels: self.reads.vessels().ok()?.cursor()?,
+            terminals: self.reads.terminals().ok()?.cursor()?,
+            heads: BTreeMap::new(),
+        };
+        cursors.heads = least([cursors.convoys.read_through(), cursors.vessels.read_through(), cursors.terminals.read_through()]);
+        Some(cursors)
     }
 
     /// Where a read now starts from: the log read through each home's sequence, and the notes
@@ -148,12 +145,13 @@ impl ConvoyViews {
         let heads = log.heads.clone();
         let homes = match log.written_since(&heads)? {
             Ok((_, through)) => through,
-            Err(_) => {
-                // The heads have left the log: read from its start, which names nothing kept.
-                match log.written_since(&BTreeMap::new())? {
-                    Ok((_, through)) => through,
-                    Err(reason) => return Err(reason),
-                }
+            Err(reason) => {
+                // The heads have left the log, as a home caught up from a snapshot since they
+                // were read leaves it: the position starts again where the log ends now. Its
+                // start is no position, since such a home's log no longer holds it.
+                let Some(reopened) = self.open_cursors() else { return Err(reason) };
+                *log = reopened;
+                log.heads.clone()
             }
         };
         log.advance(&homes);
@@ -260,6 +258,8 @@ enum Source {
     /// Every home's launch of a name in a project that has not retired, through the `by_launch`
     /// index.
     Launches(String, String),
+    /// Every home's open launch of a role in a project, through the `open_by_role` index.
+    OpenRole(String, String),
 }
 
 /// What one part of a cover selects, as the launches it may select are read.
@@ -285,6 +285,10 @@ enum Part {
     LaunchOf(String),
     /// The launches of a name in a project.
     Launches(String, String),
+    /// Every launch of the role, in a project another part names, ended or not.
+    Role(String),
+    /// The open launches of a role in a project.
+    OpenRole(String, String),
 }
 
 /// The index keys of the project and launch-of labels, as the store's query index names them.
@@ -306,7 +310,8 @@ fn sources_of(cover: &IndexCover) -> Option<BTreeSet<Source>> {
                 Part::Named(name) => Some(Source::Named(name)),
                 Part::OpenIn(project) => Some(Source::OpenIn(project)),
                 Part::Launches(project, of) => Some(Source::Launches(project, of)),
-                Part::Project(_) | Part::LaunchOf(_) => None,
+                Part::OpenRole(project, role) => Some(Source::OpenRole(project, role)),
+                Part::Project(_) | Part::LaunchOf(_) | Part::Role(_) => None,
             })
             .collect(),
         Term::Live | Term::Unknown => None,
@@ -321,6 +326,7 @@ fn term(cover: &IndexCover) -> Term {
                 "field:spec.project_ref" => Some(Some(Part::Project(value.clone()))),
                 key if key == PROJECT_KEY.as_str() => Some(Some(Part::Project(value.clone()))),
                 key if key == LAUNCH_OF_KEY.as_str() => Some(Some(Part::LaunchOf(value.clone()))),
+                "field:spec.role" => Some(Some(Part::Role(value.clone()))),
                 "field:status.phase" if LIVE_PHASES.contains(&value.as_str()) => Some(None),
                 "missing:status.phase" => Some(None),
                 _ => None,
@@ -356,8 +362,16 @@ fn term(cover: &IndexCover) -> Term {
                 Part::LaunchOf(of) => Some(of),
                 _ => None,
             });
-            if let (Some(project), Some(of)) = (project, launch_of) {
-                return Term::Sources(vec![Part::Launches(project, of)]);
+            let role = single(|part| match part {
+                Part::Role(role) => Some(role),
+                _ => None,
+            });
+            if let (Some(project), Some(of)) = (&project, launch_of) {
+                return Term::Sources(vec![Part::Launches(project.clone(), of)]);
+            }
+            // One project and one role, open launches alone: the role index reads them.
+            if let (Some(project), Some(role), true) = (project, role, live) {
+                return Term::Sources(vec![Part::OpenRole(project, role)]);
             }
             // Any part's sources hold every launch all parts select; with a part keeping the open
             // launches alone, a project's are its open ones. A part naming launches drives first.
@@ -368,7 +382,9 @@ fn term(cover: &IndexCover) -> Term {
                     _ => None,
                 })
                 .collect();
-            drivers.sort_by_key(|parts| parts.iter().filter(|part| matches!(part, Part::Project(_) | Part::LaunchOf(_))).count());
+            drivers.sort_by_key(|parts| {
+                parts.iter().filter(|part| matches!(part, Part::Project(_) | Part::LaunchOf(_) | Part::Role(_))).count()
+            });
             match drivers.into_iter().next() {
                 Some(parts) if live => Term::Sources(parts.into_iter().map(open).collect()),
                 Some(parts) => Term::Sources(parts),

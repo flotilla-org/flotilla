@@ -124,6 +124,7 @@ fn request(n: usize) -> ConvoyRequest {
         owner: seat("coder"),
     };
     ConvoyRequest {
+        role: String::new(),
         launch_of: format!("c{n}"),
         workflow_ref: "w".into(),
         admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),

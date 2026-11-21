@@ -354,6 +354,7 @@ pub fn request(convoy: &ResourceObject<OldConvoy>) -> Result<ConvoyRequest, Stri
     let (workflow_ref, admission) = admission(convoy)?;
     Ok(ConvoyRequest {
         launch_of: engine_name(convoy)?,
+        role: convoy.spec.role.clone(),
         workflow_ref,
         admission,
         project: project(convoy)?,

@@ -272,6 +272,11 @@ impl ConvoyRecords for CountedConvoys {
         self.records.launches_of(of, project)
     }
 
+    fn open_of_role(&self, project: &str, role: &str) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.open_of_role(project, role)
+    }
+
     fn open_in(&self, project: &str) -> Result<ConvoyListing, String> {
         Meter::count(&self.meter.convoys);
         self.records.open_in(project)

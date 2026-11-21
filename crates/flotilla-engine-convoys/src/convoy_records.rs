@@ -55,6 +55,9 @@ pub struct EngineConvoyRecords {
     /// Every home's open AwaitingReply records, which say which seats are stalled.
     stalls: Arc<OpenAwaiting>,
     changes: tokio::sync::broadcast::Sender<ConvoyChange>,
+    /// Whether the store held an open launch without a stored role when first asked: one admitted
+    /// before the role was stored (ADR 0047 N->N+1). Remove with the `Option` on the spec's role.
+    unstored_roles: Arc<std::sync::OnceLock<bool>>,
 }
 
 /// The kinds a launch's changes are read from: its own record and the stall records about its
@@ -67,7 +70,14 @@ impl EngineConvoyRecords {
     /// The port at `home` over `service`, with the home's notes in `memory`, which its writers
     /// share, and the store's open AwaitingReply records in `stalls`.
     pub fn new(home: &str, service: Arc<Service>, memory: Arc<ConvoyMemory>, stalls: Arc<OpenAwaiting>) -> Self {
-        Self { home: home.to_owned(), service, memory, stalls, changes: tokio::sync::broadcast::channel(CHANGES).0 }
+        Self {
+            home: home.to_owned(),
+            service,
+            memory,
+            stalls,
+            changes: tokio::sync::broadcast::channel(CHANGES).0,
+            unstored_roles: Arc::default(),
+        }
     }
 
     /// Follows the convoys' records and the stall records about their seats in the store's log,
@@ -86,6 +96,33 @@ impl EngineConvoyRecords {
         }))
     }
 
+    /// Whether the store holds an open launch without a stored role, read once by loading every
+    /// launch at every home (ADR 0047 N->N+1; remove with the `Option` on the spec's role).
+    fn unstored_roles(&self, read: &mut Read<'_>) -> Result<bool, StoreError> {
+        if let Some(unstored) = self.unstored_roles.get() {
+            return Ok(*unstored);
+        }
+        for home in self.service.homes() {
+            let mut after = None;
+            loop {
+                let page = read.scan::<Resource<Convoy>>(&home, after, PAGE)?;
+                for id in page.ids {
+                    if read
+                        .load::<Resource<Convoy>>(id)?
+                        .is_some_and(|loaded| loaded.value.label() == ConvoyLabel::Open && loaded.value.spec().role.is_none())
+                    {
+                        return Ok(*self.unstored_roles.get_or_init(|| true));
+                    }
+                }
+                after = page.next;
+                if after.is_none() {
+                    break;
+                }
+            }
+        }
+        Ok(*self.unstored_roles.get_or_init(|| false))
+    }
+
     fn read<T>(&self, what: &str, read: impl FnOnce(&mut Read<'_>) -> Result<T, StoreError>) -> Result<T, String> {
         self.service.with_store(|store| read(&mut store.read()?)).map_err(|error| format!("engine convoys {what}: {error}"))
     }
@@ -94,12 +131,22 @@ impl EngineConvoyRecords {
     /// neither hides the others nor reads as absent.
     /// Every home's launches `query` selects through its index, retired ones left out.
     fn paged(read: &mut Read<'_>, stalls: &OpenAwaiting, query: &IndexQuery<ConvoySpec>) -> Result<ConvoyListing, StoreError> {
+        Self::paged_where(read, stalls, query, |_| true)
+    }
+
+    /// The launches `query` pages through that `keep` keeps.
+    fn paged_where(
+        read: &mut Read<'_>,
+        stalls: &OpenAwaiting,
+        query: &IndexQuery<ConvoySpec>,
+        keep: impl Fn(&Resource<Convoy>) -> bool,
+    ) -> Result<ConvoyListing, StoreError> {
         let mut listing = ConvoyListing::default();
         let mut after = None;
         loop {
             let page = read.page(query, after.as_ref(), PAGE)?;
             for id in page.ids {
-                if let Some(loaded) = read.load::<Resource<Convoy>>(id)? {
+                if let Some(loaded) = read.load::<Resource<Convoy>>(id)?.filter(|loaded| keep(&loaded.value)) {
                     match entry(read, stalls, loaded, Retired::Skip)? {
                         Some(Ok(record)) => listing.records.push(record),
                         Some(Err(unreadable)) => listing.unreadable.push(unreadable),
@@ -195,6 +242,25 @@ impl ConvoyRecords for EngineConvoyRecords {
         let address = Address::project(project).map_err(|error| format!("project `{project}`: {error}"))?;
         self.read(&format!("launches of {of} in {project}"), |read| {
             Self::paged(read, &self.stalls, &ConvoySpec::by_launch(&address, &of.to_owned()))
+        })
+    }
+
+    fn open_of_role(&self, project: &str, role: &str) -> Result<ConvoyListing, String> {
+        let address = Address::project(project).map_err(|error| format!("project `{project}`: {error}"))?;
+        self.read(&format!("open {role} launches in {project}"), |read| {
+            let mut listing = Self::paged(read, &self.stalls, &ConvoySpec::open_by_role(&address, &role.to_owned()))?;
+            // ADR 0047 N->N+1: a launch admitted before its role was stored has none in the index.
+            // While the store held one at the first ask, the project's open launches without one
+            // are read and judged by the role their admission names. A launch written since
+            // always stores its role. Remove with the `Option` on the spec's role.
+            if !self.unstored_roles(read)? {
+                return Ok(listing);
+            }
+            let unstored =
+                Self::paged_where(read, &self.stalls, &ConvoySpec::open_by_project(&address), |convoy| convoy.spec().role.is_none())?;
+            listing.records.extend(unstored.records.into_iter().filter(|record| record.role() == role));
+            listing.unreadable.extend(unstored.unreadable);
+            Ok(listing)
         })
     }
 

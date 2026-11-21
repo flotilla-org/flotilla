@@ -275,6 +275,8 @@ pub enum LinkSource {
 /// One subject link, such as a change request: an unlink marks the row, and a
 /// relink appends another.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
+// The convoys linked to a subject: admission's continuation guard reads them by key.
+#[store(index(name = "by_subject", eq(subject)))]
 pub struct SubjectLink {
     pub subject: Address,
     pub source: LinkSource,
@@ -357,6 +359,8 @@ impl<'de> Deserialize<'de> for AdmissionBytes {
     code = "cv",
     state = ConvoyState,
     index(name = "open_by_project", eq(project), when(state in [Open])),
+    // A project's open convoys of a role: admission's identity guard reads them by key.
+    index(name = "open_by_role", eq(project, role), when(state in [Open])),
     // A name's launches in launch order: the newest is the last.
     index(name = "by_launch", eq(project, launch_of), order(launch))
 )]
@@ -366,6 +370,12 @@ pub struct ConvoySpec {
     pub launch_of: String,
     /// The home sequence the launch's create took; 0 until its log numbers it.
     pub launch: u64,
+    /// The role admission froze, interned (domain `rl`). None only on a launch admitted before
+    /// the role was stored (ADR 0047 N->N+1): remove the `Option` and the shims reading the role
+    /// from the admission document once no open convoy lacks one.
+    #[store(intern = "rl")]
+    #[serde(default)]
+    pub role: Option<String>,
     /// The workflow template admission resolved.
     #[store(intern = "wf")]
     pub workflow_ref: String,
@@ -498,6 +508,10 @@ pub struct AdmittedPromise {
 pub struct ConvoyRequest {
     /// The name the convoy is a launch of; its log numbers the launch.
     pub launch_of: String,
+    /// The role admission froze. Defaulted for a request a previous generation stored in a
+    /// Message (ADR 0047 N->N+1; remove the default one roll later).
+    #[serde(default)]
+    pub role: String,
     /// The workflow template the caller resolved.
     pub workflow_ref: String,
     /// The caller's admission document, stored as given.
@@ -1229,6 +1243,7 @@ impl Machine for Convoy {
         let mut spec = ConvoySpec {
             launch_of: request.launch_of,
             launch: 0,
+            role: Some(request.role),
             workflow_ref: request.workflow_ref,
             admission: request.admission,
             project: request.project,

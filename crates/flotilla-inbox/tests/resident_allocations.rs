@@ -152,6 +152,7 @@ fn calibrate() {
                 use flotilla_state_machines::machines::convoy::*;
                 let owner = SeatName::new("coder", "");
                 flotilla_schema::Frozen::new(MessageBody::Request(RequestBody::Convoy(Box::new(ConvoyRequest {
+                    role: String::new(),
                     launch_of: "c".into(),
                     workflow_ref: "w".into(),
                     admission: flotilla_schema::Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),

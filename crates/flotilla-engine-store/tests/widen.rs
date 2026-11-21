@@ -233,6 +233,7 @@ fn a_table_missing_a_defaulted_column_and_a_code_is_widened() {
         replacements: 0,
     };
     let request = ConvoyRequest {
+        role: String::new(),
         launch_of: "c".into(),
         workflow_ref: "w".into(),
         admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
@@ -290,6 +291,7 @@ fn a_store_holding_convoy_quotas_opens_and_drops_them() {
         replacements: 0,
     };
     let request = ConvoyRequest {
+        role: String::new(),
         launch_of: "c".into(),
         workflow_ref: "w".into(),
         admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),

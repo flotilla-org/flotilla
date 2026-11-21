@@ -324,6 +324,24 @@ async fn a_convoy_idle_on_an_unchanged_change_request_is_not_stalled_across_a_re
     assert_unstalled(&daemon, &convoy, "idle after the restart").await;
 }
 
+// After a restart over the same store the controller's start pass reads the open convoy again and
+// notes the change request its PR names, so that request's merge, the next change after the
+// restart, wakes the convoy and it lands.
+#[tokio::test(start_paused = true)]
+async fn after_a_restart_a_later_merge_wakes_the_convoy() {
+    let daemon = TestDaemon::builder().change_request("merge_after_ms = 120000").start().await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    daemon
+        .wait("its open change request", |found: &ResourceObject<ChangeRequest>| {
+            found.status.as_ref().is_some_and(|status| status.state.value == Some(ObservedChangeRequestState::Open))
+        })
+        .await;
+    let daemon = daemon.restart().await;
+    assert_unstalled(&daemon, &convoy, "after the restart, before the merge").await;
+    daemon.wait("Landed", in_phase(&convoy, ConvoyPhase::Landed)).await;
+    assert_eq!(daemon.counts().sessions_launched, 1, "the coder was adopted, not relaunched: {:?}", daemon.counts());
+}
+
 /// `convoy` is still Active and has no stall, `when`.
 async fn assert_unstalled(daemon: &TestDaemon, convoy: &str, when: &str) {
     let found = daemon.get::<Convoy>(convoy).await.expect("the convoy");

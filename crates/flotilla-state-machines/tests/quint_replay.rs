@@ -698,6 +698,7 @@ fn convoy_request(id: i64, parts: &Value) -> ConvoyRequest {
         .collect();
     seats.sort_by_key(|seat| seat.parent.is_some());
     ConvoyRequest {
+        role: String::new(),
         launch_of: id.to_string(),
         workflow_ref: "w".into(),
         admission: flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new()))

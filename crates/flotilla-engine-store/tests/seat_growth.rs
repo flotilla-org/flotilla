@@ -38,6 +38,7 @@ fn retired_seats_keep_their_names_and_replicas_follow_seat_edges() {
         .create(
             name,
             ConvoyRequest {
+                role: String::new(),
                 launch_of: name.into(),
                 workflow_ref: "w".into(),
                 admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),

@@ -84,6 +84,7 @@ fn document() -> AdmissionDocument {
 fn request() -> ConvoyRequest {
     let bytes = document().encode().expect("encode");
     ConvoyRequest {
+        role: String::new(),
         launch_of: "fix-it".into(),
         workflow_ref: "single".into(),
         admission: Frozen::new(AdmissionBytes::new(bytes)).expect("freeze"),
@@ -221,6 +222,7 @@ fn an_undecodable_launch_is_listed_as_unreadable_beside_the_others() {
     convoys.create_reserved(&reserved, request(), Timestamp(1_000_000)).expect("admitted");
     let readable = convoys.get("fix-it").expect("launch").name().to_owned();
     let broken = ConvoyRequest {
+        role: String::new(),
         launch_of: "broken".into(),
         admission: Frozen::new(AdmissionBytes::new(vec![0xff, 0x00])).expect("freeze"),
         ..request()

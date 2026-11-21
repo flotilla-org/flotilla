@@ -130,6 +130,7 @@ fn request(document: AdmissionDocument) -> ConvoyRequest {
     let ledger = (PromiseId(0), promise("template/coder/decision-ledger".into(), "decision-ledger"));
     let prs = PRS.map(|id| (PromiseId(id), promise(format!("pr-{id}"), "pr")));
     ConvoyRequest {
+        role: String::new(),
         launch_of: "fix-it".into(),
         workflow_ref: "single".into(),
         admission: Frozen::new(AdmissionBytes::new(document.encode().expect("encode"))).expect("freeze"),

@@ -694,6 +694,14 @@ pub trait ConvoyRecords: Send + Sync {
         listing.unreadable.retain(|launch| launch.project == project);
         Ok(listing)
     }
+    /// Every home's open launches of `role` in `project`, read through the kind's `open_by_role`
+    /// index; an unreadable launch in `project` is listed whatever its role. The default filters
+    /// [`ConvoyRecords::open_in`].
+    fn open_of_role(&self, project: &str, role: &str) -> Result<ConvoyListing, String> {
+        let mut listing = self.open_in(project)?;
+        listing.records.retain(|record| record.role() == role);
+        Ok(listing)
+    }
     /// The launches whose records change, as they are written or replicated here, from now on.
     fn changes(&self) -> tokio::sync::broadcast::Receiver<ConvoyChange> {
         tokio::sync::broadcast::channel(1).1
