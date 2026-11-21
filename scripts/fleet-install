@@ -546,12 +546,14 @@ prepare_linux_daemon_service() {
     && [[ "$(systemctl --user is-enabled flotillad.service 2>/dev/null || true)" == disabled ]]; then
     DAEMON_SERVICE_DISABLED=1
   fi
-  write_systemd_user_unit
-  write_tender_systemd_unit
+  # Read before the unit is written: a unit just created is not enabled yet, and would read as
+  # disabled by the operator.
   if [[ -f "$SYSTEMD_USER_DIR/tender.service" ]] \
     && [[ "$(systemctl --user is-enabled tender.service 2>/dev/null || true)" == disabled ]]; then
     TENDER_SERVICE_DISABLED=1
   fi
+  write_systemd_user_unit
+  write_tender_systemd_unit
   # Re-enabling linger can be denied by polkit outside a login session even
   # when linger is already on; only attempt the transition that is needed.
   local user
@@ -741,7 +743,7 @@ restart_darwin_daemon_service() {
     launchctl bootstrap "$domain" "$plist" || return 1
   fi
   launchctl kickstart -k "$target" || return 1
-  restart_darwin_tender_service || return 1
+  restart_darwin_tender_service
   # Successful restarts also disarm recovery on exact-generation reinstalls.
   DARWIN_RECOVERY_GENERATION=""
 }

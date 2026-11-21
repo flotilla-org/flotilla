@@ -364,6 +364,16 @@ if [[ "$*" == '--user is-active --quiet flotillad.service' ]]; then
   [[ "${DAEMON_RUNNING:-0}" == 1 ]]
   exit
 fi
+# A unit that is present but was never enabled reports `disabled`, as systemd does.
+[[ "$*" != '--user enable tender.service' ]] || touch "$HOME/.tender-enabled"
+if [[ "$*" == '--user is-enabled tender.service' ]]; then
+  if [[ "${TENDER_UNIT_DISABLED:-false}" == true || ! -f "$HOME/.tender-enabled" ]]; then
+    printf 'disabled\n'
+    exit 1
+  fi
+  printf 'enabled\n'
+  exit
+fi
 if [[ "$*" == '--user is-enabled flotillad.service' ]]; then
   if [[ "${SYSTEMD_UNIT_DISABLED:-false}" == true ]]; then
     printf 'disabled\n'
