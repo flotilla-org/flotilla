@@ -90,7 +90,6 @@ pub fn observation(spec: &HostSpec, status: &HostStatus) -> Result<HostObservati
     // Without a vessel cap only a missing pool gives no free slots; under a cap a full host does too,
     // so there the first probe says whether the pool is missing.
     let pool_missing = |facts: &FulfilmentFacts| spec.max_vessels.is_none() && facts.free_vessel_slots == Some(0);
-    for _facts in status.fulfilment_facts.values() {}
     Ok(HostObservation {
         daemon_generation: status.daemon_generation.clone(),
         protocol_fingerprint: status.protocol_fingerprint.clone(),

@@ -254,8 +254,7 @@ fn build_peer_manager(
 }
 
 /// The resource API's backend, the engine's home: the engine holds every registered kind, so
-/// its store holds nothing and is not durable. The old `resources.sqlite` is never opened here;
-/// only the first start's import reads it, read-only.
+/// its store holds nothing and is not durable.
 fn build_embedded_resource_backend() -> ResourceBackend {
     flotilla_store_memory::engine_home_backend()
 }
