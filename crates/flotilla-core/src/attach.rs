@@ -2442,8 +2442,6 @@ mod tests {
                 );
                 daemon.message_primitives().admit(&format!("message-{n}"), &noise).await.expect("noise message");
             }
-            // The views read every write before the measurement, so their catching up is not counted.
-            daemon.convoy_views().expect("convoy views").open().await.expect("read the convoy views");
             // Only this request's reads are counted: daemon tasks reading the same store are not.
             let resolver = daemon.attach_resolver();
             let (resolved, reads) = measure(resolver.resolve_attach(reference, None, false, AttachMode::Default, None)).await;

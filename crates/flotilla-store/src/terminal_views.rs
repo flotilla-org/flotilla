@@ -333,7 +333,7 @@ impl Cursors {
             return Ok(None);
         }
         Ok(Some(Self {
-            reader: JoinsReader::register(Arc::clone(&reads), false)?,
+            reader: JoinsReader::register(Arc::clone(&reads))?,
             joins_seen: 0,
             joins_position: 0,
             environments: reads.environments().ok().and_then(|environments| environments.cursor()),

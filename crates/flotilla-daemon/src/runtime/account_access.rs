@@ -41,7 +41,7 @@ use flotilla_resources::{
 use flotilla_schema::{Ref, Timestamp};
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
-    ConvoyViews, ResourceBackend,
+    ResourceBackend,
 };
 use futures::StreamExt;
 
@@ -389,7 +389,6 @@ impl CredentialConvoysWatch {
         &self,
         namespace: &str,
         sender: &WorkQueueSender,
-        views: &ConvoyViews,
         credentials: Option<Vec<String>>,
     ) -> Result<(), ResourceError> {
         let (mut convoys, bound) =
@@ -397,11 +396,28 @@ impl CredentialConvoysWatch {
         if credentials.is_none() {
             convoys.extend(bound.iter().cloned());
         }
-        convoys.extend(views.open().await?.into_iter().filter(|convoy| !bound.contains(convoy)));
+        convoys.extend(self.open_launches().await?.into_iter().filter(|convoy| !bound.contains(convoy)));
         for convoy in convoys {
             sender.send(convoy).await.map_err(|_| ResourceError::other("controller queue closed while forwarding a credential event"))?;
         }
         Ok(())
+    }
+}
+
+impl CredentialConvoysWatch {
+    /// This home's launches that have not ended, from their records; one that cannot be read
+    /// counts, since nothing says it ended.
+    async fn open_launches(&self) -> Result<Vec<String>, ResourceError> {
+        let reads = self.daemon.lifecycle_reads();
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+            let convoys = reads.convoys()?;
+            let listing = convoys.at(convoys.home())?;
+            let open = listing.records.into_iter().filter(|record| record.ended.is_none()).map(|record| record.name);
+            Ok::<_, String>(open.chain(listing.unreadable.into_iter().map(|launch| launch.name)).collect())
+        }))
+        .await
+        .map_err(|error| ResourceError::other(error.to_string()))?
+        .map_err(ResourceError::other)
     }
 }
 
@@ -419,7 +435,6 @@ impl SecondaryWatch for CredentialConvoysWatch {
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
-            let views = self.daemon.convoy_views().map_err(ResourceError::other)?;
             let grants = backend.including_replicas::<CredentialGrant>(&namespace).watch().await?.map(|event| {
                 event.map(|event| match event {
                     ReadWatchEvent::Added(grant) | ReadWatchEvent::Modified(grant) | ReadWatchEvent::Deleted(grant) => {
@@ -438,7 +453,7 @@ impl SecondaryWatch for CredentialConvoysWatch {
             });
             let mut events = futures::stream::select(grants, specs);
             while let Some(credentials) = events.next().await {
-                self.enqueue(&namespace, &sender, &views, credentials?).await?;
+                self.enqueue(&namespace, &sender, credentials?).await?;
             }
             Ok(())
         })

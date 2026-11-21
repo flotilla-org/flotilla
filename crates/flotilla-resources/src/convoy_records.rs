@@ -688,8 +688,9 @@ pub trait ConvoyRecords: Send + Sync {
 pub struct ConvoyMemory {
     notes: Mutex<BTreeMap<String, ConvoyNotes>>,
     changes: tokio::sync::broadcast::Sender<String>,
-    /// How many times the notes changed since this home started: told and counted together.
-    changed: Mutex<u64>,
+    /// Which launches' notes changed, and how many times, since this home started: told and
+    /// counted together.
+    changed: Mutex<crate::engine_records::UnloggedJournal>,
     /// How many launches, at any home, the convoy views last listed as unreadable.
     unreadable: AtomicU64,
     /// The evidence records each launch's last pass read: a change of one wakes only the
@@ -702,7 +703,7 @@ impl Default for ConvoyMemory {
         Self {
             notes: Mutex::default(),
             changes: tokio::sync::broadcast::channel(256).0,
-            changed: Mutex::new(0),
+            changed: Mutex::default(),
             unreadable: AtomicU64::new(0),
             evidence: Mutex::default(),
         }
@@ -760,7 +761,17 @@ impl ConvoyMemory {
     /// How many times the notes have changed since this home started. Counted after each change
     /// is in place, so a reader that reads this before the notes sees at least those changes.
     pub fn changed(&self) -> u64 {
-        *self.changed.lock().unwrap_or_else(PoisonError::into_inner)
+        self.changed.lock().unwrap_or_else(PoisonError::into_inner).count()
+    }
+
+    /// Where a reader stands that has read every note change counted so far.
+    pub fn notes_read(&self) -> crate::engine_records::UnloggedRead {
+        self.changed.lock().unwrap_or_else(PoisonError::into_inner).read()
+    }
+
+    /// The launches whose notes changed since `read`; `Err` holds why they cannot be named.
+    pub fn noted_since(&self, read: Option<&crate::engine_records::UnloggedRead>) -> Result<BTreeSet<String>, String> {
+        self.changed.lock().unwrap_or_else(PoisonError::into_inner).since(read)
     }
 
     /// Tells the subscribers and counts the change as one step: a subscriber that reads the count
@@ -770,7 +781,7 @@ impl ConvoyMemory {
         let mut changed = self.changed.lock().unwrap_or_else(PoisonError::into_inner);
         // No follower is no reason to fail: one may subscribe later.
         drop(self.changes.send(name.to_owned()));
-        *changed = changed.saturating_add(1);
+        changed.record([name.to_owned()]);
     }
 
     /// The notes on launch `name`; empty when none are held.

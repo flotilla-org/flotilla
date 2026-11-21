@@ -5171,9 +5171,6 @@ mod tests {
                 )
                 .build();
             let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).build();
-            // The views have read every launch above, as a running daemon's have: the measure
-            // waits on their follower, so it would count it catching up on the last launch.
-            fixture.engine.convoys.settled().await;
             let ((), counts) = flotilla_store::load_metrics::measure(async {
                 if reuse {
                     let snapshot = fixture.owner.load_brief_definitions("flotilla", &spec, &workflow).await.unwrap();

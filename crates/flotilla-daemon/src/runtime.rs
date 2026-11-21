@@ -178,8 +178,6 @@ impl DaemonRuntime {
         // Message path the daemon opened over it.
         let (provisioning, lifecycle_followers) = open_provisioning_lifecycles(&daemon).await?;
         daemon.require_lifecycle_reads_installed()?;
-        // The Convoy views read every launch once, here, before any request reads them.
-        phase("compose_convoy_views", daemon.convoy_views()?.opened()).await;
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
         let forge_default_branches = crate::dummy_fleet::dummy_forge_default_branches(daemon_config.dummy_fleet.as_ref());
@@ -1354,7 +1352,6 @@ impl flotilla_provisioning::engine::environment_actuator::LaunchEnvironment for 
 pub(crate) async fn open_engine_reads(daemon: &Arc<InProcessDaemon>) -> Result<Vec<JoinHandle<()>>, String> {
     let (_, followers) = open_provisioning_lifecycles(daemon).await?;
     daemon.require_lifecycle_reads_installed()?;
-    daemon.convoy_views()?.opened().await;
     Ok(followers)
 }
 

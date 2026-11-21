@@ -62,7 +62,6 @@ async fn launches_read_by_of_convoy(others: usize) -> (u64, KeyedGets) {
     }
 
     let vessels = &engine.vessels.vessels;
-    convoys.settled().await;
     let before = (vessels.launches_read(), keyed_gets(&convoys, &engine));
     let read = convoys.reads().vessels().expect("vessels").of_convoy(&launches[0]).expect("of convoy");
     assert_eq!(read.iter().map(|launch| launch.convoy.as_str()).collect::<Vec<_>>(), [launches[0].as_str()]);
@@ -104,7 +103,6 @@ async fn launches_read_by_a_pass(others: usize) -> (u64, KeyedGets) {
     );
 
     let vessels = &engine.vessels.vessels;
-    convoys.settled().await;
     let before = (vessels.launches_read(), keyed_gets(&convoys, &engine));
     reconciler.prepare(&passed).await.expect("prepare");
     (vessels.launches_read() - before.0, keyed_gets(&convoys, &engine) - before.1)
@@ -185,7 +183,6 @@ async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
     while queued.try_recv().is_ok() {}
 
     let vessels = &engine.vessels.vessels;
-    convoys.settled().await;
     let before = (vessels.launches_read(), keyed_gets(&convoys, &engine));
     let (changed, _) = &launches[1];
     publish_brief(&backend, changed, "coder").await;
@@ -246,7 +243,6 @@ async fn queued_by_one_checkout(others: usize) -> (Vec<String>, u64, KeyedGets) 
     tokio::time::sleep(Duration::from_millis(100)).await;
     while queued.try_recv().is_ok() {}
 
-    convoys.settled().await;
     let before = (converted(), keyed_gets(&convoys, &engine));
     let changed = &launches[1];
     engine.checkouts.request("changed", &checkout("changed"), Some(&CheckoutHolder::Convoy(changed.clone())));
@@ -295,9 +291,6 @@ async fn vessels_in_one_environment(others: usize) -> (Vec<EnvironmentVessel>, u
         assert_eq!(every.len(), others + 2, "a full pass finds every vessel: {every:?}");
     }
 
-    // The convoy views' follower reads the writes above through the same port: once it has, the
-    // gets counted below are the delivery's alone.
-    convoys.settled().await;
     let launches = engine.vessels.vessels.launches_read();
     let gets = keyed_gets(&convoys, &engine);
     let (found, reads) = measure_now(|| environment_vessels(convoys.reads().as_ref(), Some(&BTreeSet::from(["shared".to_owned()]))));
@@ -374,7 +367,6 @@ async fn read_by_cards(others: usize, scope: impl FnOnce(&[String]) -> CardScope
     let accounts = OldStoreAccounts::new(backend.clone());
     let scope = scope(&launches);
 
-    convoys.settled().await;
     let before = (engine.terminals.terminals.launches_read(), engine.vessels.vessels.launches_read(), keyed_gets(&convoys, &engine));
     refresh_cards(&backend, NAMESPACE, &NothingDelivered, &tracker, Arc::clone(convoys.reads()), &accounts, &scope)
         .await
@@ -645,8 +637,6 @@ async fn scoped_query_reads(others: usize) -> Vec<flotilla_store::load_metrics::
 
     let CrewedConvoys { store: _store, engine: _engine, convoys, backend, target: (launch, session), .. } =
         crewed_convoys(others, false).await;
-    // The views are filled once, at their first read, as a running daemon's already are.
-    convoys.settled().await;
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
     sessions.list().await.expect("the session views");
     let crew = sessions.get(&session).await.expect("the target's session").status.and_then(|status| status.crew).expect("its crew").id;
@@ -719,7 +709,6 @@ async fn first_fill_reads(convoys: usize, own_environments: bool) -> flotilla_st
     use flotilla_store::{load_metrics::measure, TerminalViews};
 
     let crewed = crewed_convoys(convoys - 1, own_environments).await;
-    crewed.convoys.settled().await;
     let restarted = EngineFixture::over_service(crewed.store.service());
     let started = ResourceBackend::new(InMemoryBackend::default());
     let ((), counts) = measure(async {

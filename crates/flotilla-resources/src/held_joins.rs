@@ -1,7 +1,7 @@
 //! The Vessel and terminal session launches the views join, held once per read port (#3108).
 //!
-//! The Convoy and TerminalSession views both compose from Vessel launches and session launches
-//! (each with its launch facts). [`HeldJoins`] holds them once, for every view of one read port:
+//! The TerminalSession views compose from Vessel launches and session launches (each with its
+//! launch facts). [`HeldJoins`] holds them once, for every view of one read port:
 //! the first read fills it with one read of each kind, and each pass after decodes each launch
 //! that changed once, by name and home. A view reads which launches changed from the journal,
 //! from where it last read, and composes from what is held: no view reads these kinds itself.
@@ -10,15 +10,11 @@
 //! reading the journal registers a [`JoinsReader`] and tells it the sequence it has composed
 //! through; a launch is kept until every reader has composed its last change. Beyond
 //! that, an ended launch is kept while a view could still compose from it:
-//! - a session launch while its Vessel launch is live or serves a convoy view: the TerminalSession
-//!   views list an ended session until it is evicted, which the journal tells them;
-//! - a Vessel launch while it is its work's newest launch and its convoy has not ended, and while
-//!   any session launch held names it, whose holder it is;
-//! - the newest launch of a work or session at a home until no older one is held, so an older
-//!   launch never stands in for it.
-//!
-//! The Convoy views tell which convoys ended by releasing their Vessel launches once they have
-//! composed the ended convoy, and keep what they composed for its works while they hold it.
+//! - a session launch while its Vessel launch is live: the TerminalSession views list an ended
+//!   session until it is evicted, which the journal tells them;
+//! - a Vessel launch while any session launch held names it, whose holder it is;
+//! - the newest launch of a session at a home until no older one is held, so an older launch
+//!   never stands in for it.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -104,19 +100,9 @@ struct Held {
     terminals: BTreeMap<Key, Launch<TerminalRecord>>,
     /// The sessions held for each Vessel launch name, by name and home.
     by_vessel: BTreeMap<String, Vec<Key>>,
-    /// The Vessel launches serving each convoy name, by name and home.
-    by_convoy: BTreeMap<String, Vec<Key>>,
     /// The ended launches held: those an eviction looks at.
     ended_vessels: BTreeSet<Key>,
     ended_terminals: BTreeSet<Key>,
-    /// The Vessel launches the Convoy views released: their convoy ended. A full read forgets
-    /// them, and the views release them again as they compose every convoy again.
-    released: BTreeSet<Key>,
-    /// A released launch was evicted: a Convoy view registered after it composes ended convoys
-    /// without it, so the next read reads every launch again.
-    released_evicted: bool,
-    /// Every launch is read again at the next read.
-    refill_owed: bool,
     /// The commits the cursors were told of before the last pass or full read that completed:
     /// while the count has not moved, a pass would read nothing, and none is made.
     passed: Option<u64>,
@@ -152,10 +138,6 @@ impl HeldJoins {
         let mut state = locked(&self.state);
         let State { held, readers, .. } = &mut *state;
         match held.as_mut() {
-            Some(current) if current.refill_owed => {
-                current.refill(reads)?;
-                current.passed = told;
-            }
             Some(current) if told.is_some() && current.passed == told => {}
             Some(current) => {
                 if let Err(error) = current.pass(reads) {
@@ -175,12 +157,8 @@ impl HeldJoins {
                     vessels: BTreeMap::new(),
                     terminals: BTreeMap::new(),
                     by_vessel: BTreeMap::new(),
-                    by_convoy: BTreeMap::new(),
                     ended_vessels: BTreeSet::new(),
                     ended_terminals: BTreeSet::new(),
-                    released: BTreeSet::new(),
-                    released_evicted: false,
-                    refill_owed: false,
                     passed,
                     unchecked: false,
                     through: None,
@@ -251,16 +229,13 @@ impl HeldJoins {
             .map_or_else(HeldCount::default, |held| HeldCount { vessels: held.vessels.len(), terminals: held.terminals.len() })
     }
 
-    fn register(&self, composes_convoys: bool) -> Arc<AtomicU64> {
+    fn register(&self) -> Arc<AtomicU64> {
         let mut state = locked(&self.state);
         let reader = state.next_reader;
         state.next_reader = state.next_reader.saturating_add(1);
         // It composes everything held at its first read.
         let composed = Arc::new(AtomicU64::new(state.held.as_ref().map_or(0, Held::next)));
         state.readers.insert(reader, Arc::clone(&composed));
-        if let Some(held) = state.held.as_mut().filter(|held| composes_convoys && held.released_evicted) {
-            held.refill_owed = true;
-        }
         composed
     }
 }
@@ -274,10 +249,9 @@ pub struct JoinsReader {
 }
 
 impl JoinsReader {
-    /// Registers a view of `reads`' held joins; `composes_convoys` for a view that composes
-    /// convoys, which reads every launch again if released launches were evicted before it.
-    pub fn register(reads: Arc<dyn LifecycleReads>, composes_convoys: bool) -> Result<Self, String> {
-        let composed = reads.joins()?.register(composes_convoys);
+    /// Registers a view of `reads`' held joins.
+    pub fn register(reads: Arc<dyn LifecycleReads>) -> Result<Self, String> {
+        let composed = reads.joins()?.register();
         Ok(Self { reads, composed })
     }
 
@@ -386,12 +360,8 @@ impl Held {
         self.vessels.clear();
         self.terminals.clear();
         self.by_vessel.clear();
-        self.by_convoy.clear();
         self.ended_vessels.clear();
         self.ended_terminals.clear();
-        self.released.clear();
-        self.released_evicted = false;
-        self.refill_owed = false;
         self.unchecked = true;
         for record in vessels {
             self.hold_vessel(record, None);
@@ -415,8 +385,6 @@ impl Held {
         let changed = self.next();
         if let Some(record) = record {
             self.hold_vessel(record, Some(changed));
-        } else {
-            self.released.remove(&key);
         }
         self.journal(JoinChange::Vessel { name: key.0, home: key.1, convoy, convoy_home });
     }
@@ -436,7 +404,6 @@ impl Held {
 
     fn hold_vessel(&mut self, record: VesselRecord, changed: Option<u64>) {
         let key = (record.name.clone(), record.home.clone());
-        self.by_convoy.entry(record.convoy.clone()).or_default().push(key.clone());
         if record.ended() {
             self.ended_vessels.insert(key.clone());
         }
@@ -454,10 +421,9 @@ impl Held {
         self.terminals.insert(key, Launch { record, changed });
     }
 
-    /// Stops holding Vessel launch `key`; what is released of it stays so.
+    /// Stops holding Vessel launch `key`.
     fn drop_vessel(&mut self, key: &Key) -> Option<VesselRecord> {
         let held = self.vessels.remove(key)?.record;
-        remove_key(&mut self.by_convoy, &held.convoy, key);
         self.ended_vessels.remove(key);
         Some(held)
     }
@@ -509,14 +475,11 @@ impl Held {
             let vessels: Vec<Key> = self
                 .ended_vessels
                 .iter()
-                .filter(|key| self.vessels.get(*key).is_some_and(|launch| composed(launch.changed) && !self.vessel_needed(key, launch)))
+                .filter(|key| self.vessels.get(*key).is_some_and(|launch| composed(launch.changed) && !self.vessel_needed(launch)))
                 .cloned()
                 .collect();
             for key in &vessels {
                 self.drop_vessel(key);
-                if self.released.remove(key) {
-                    self.released_evicted = true;
-                }
             }
             if terminals.is_empty() && vessels.is_empty() {
                 break;
@@ -527,11 +490,8 @@ impl Held {
     /// Whether a view could still compose from ended session launch `launch`.
     fn terminal_needed(&self, launch: &Launch<TerminalRecord>) -> bool {
         let record = &launch.record;
-        // Its Vessel launch's convoy view reads every session held for it.
-        let holder_composed = record.vessel.as_deref().is_some_and(|vessel| {
-            self.named_vessels(vessel).any(|(key, held)| !held.record.ended() || self.convoy_composes(key, &held.record))
-        });
-        if holder_composed {
+        // A live Vessel launch's sessions are all listed.
+        if record.vessel.as_deref().is_some_and(|vessel| self.named_vessels(vessel).any(|(_, held)| !held.record.ended())) {
             return true;
         }
         let session = launched(&record.name);
@@ -541,31 +501,16 @@ impl Held {
         !others.clone().any(|other| other.launch_number() > record.launch_number()) && others.next().is_some()
     }
 
-    /// Whether a view could still compose from ended Vessel launch `launch`.
-    fn vessel_needed(&self, key: &Key, launch: &Launch<VesselRecord>) -> bool {
-        self.convoy_composes(key, &launch.record) || self.by_vessel.get(&launch.record.name).is_some_and(|sessions| !sessions.is_empty())
-    }
-
-    /// Whether the Convoy views compose from Vessel launch `record`: the newest of its work, or
-    /// newest while an older one is held, until its convoy has ended.
-    fn convoy_composes(&self, key: &Key, record: &VesselRecord) -> bool {
-        let mut work = self.work_launches(record).filter(|other| other.name != record.name || other.home != record.home);
-        let newest = !work.clone().any(|other| (other.requested_at, other.launch_number()) > (record.requested_at, record.launch_number()));
-        newest && (!self.released.contains(key) || work.next().is_some())
+    /// Whether a view could still compose from ended Vessel launch `launch`: a session held
+    /// names it as its holder.
+    fn vessel_needed(&self, launch: &Launch<VesselRecord>) -> bool {
+        self.by_vessel.get(&launch.record.name).is_some_and(|sessions| !sessions.is_empty())
     }
 
     /// The Vessel launches held named `name`, at every home.
     fn named_vessels(&self, name: &str) -> impl Iterator<Item = (&Key, &Launch<VesselRecord>)> + '_ {
         let name = name.to_owned();
         self.vessels.range((name.clone(), String::new())..).take_while(move |((held, _), _)| *held == name)
-    }
-
-    /// The Vessel launches held of `record`'s work, for its convoy at its convoy's home.
-    fn work_launches<'a>(&'a self, record: &'a VesselRecord) -> impl Iterator<Item = &'a VesselRecord> + Clone + 'a {
-        let keys = self.by_convoy.get(&record.convoy).map(Vec::as_slice).unwrap_or_default();
-        keys.iter()
-            .filter_map(|key| self.vessels.get(key).map(|launch| &launch.record))
-            .filter(move |other| other.convoy_home == record.convoy_home && other.launch_of == record.launch_of)
     }
 
     /// The launches held of session `session` at `home`.
@@ -617,17 +562,6 @@ impl Joins<'_> {
         }
     }
 
-    /// Every Vessel launch held serving convoy `convoy`, at every home.
-    pub fn vessels_of(&self, convoy: &str) -> Vec<VesselRecord> {
-        let keys = self.held.by_convoy.get(convoy).map(Vec::as_slice).unwrap_or_default();
-        keys.iter().filter_map(|key| self.held.vessels.get(key).map(|launch| launch.record.clone())).collect()
-    }
-
-    /// The convoys the Vessel launches held serve, each by its home and name.
-    pub fn convoys(&self) -> BTreeSet<(String, String)> {
-        self.held.vessels.values().map(|launch| (launch.record.convoy_home.clone(), launch.record.convoy.clone())).collect()
-    }
-
     /// Every session launch held for Vessel launch `vessel`, at every home.
     pub fn sessions_of(&self, vessel: &str) -> Vec<TerminalRecord> {
         let keys = self.held.by_vessel.get(vessel).map(Vec::as_slice).unwrap_or_default();
@@ -655,23 +589,6 @@ impl Joins<'_> {
     /// Every session launch held, at every home.
     pub fn terminals(&self) -> impl Iterator<Item = &TerminalRecord> {
         self.held.terminals.values().map(|launch| &launch.record)
-    }
-
-    /// The Convoy views no longer compose convoy `convoy` homed at `convoy_home` from its Vessel
-    /// launches: it ended, and the views keep what they composed of it. Its ended launches go
-    /// once no view needs them.
-    pub fn release(&mut self, convoy: &str, convoy_home: &str) {
-        let keys = self.held.by_convoy.get(convoy).map(Vec::as_slice).unwrap_or_default();
-        let released: Vec<Key> = keys
-            .iter()
-            .filter(|key| self.held.vessels.get(*key).is_some_and(|launch| launch.record.convoy_home == convoy_home))
-            .cloned()
-            .collect();
-        for key in released {
-            if self.held.released.insert(key) {
-                self.held.unchecked = true;
-            }
-        }
     }
 }
 
@@ -709,8 +626,8 @@ mod tests {
     #[test]
     fn a_reader_drops_while_a_read_holds_the_joins() {
         let reads: Arc<dyn LifecycleReads> = Arc::new(Reads { joins: HeldJoins::default() });
-        let leaving = JoinsReader::register(Arc::clone(&reads), true).expect("register");
-        let staying = JoinsReader::register(Arc::clone(&reads), true).expect("register");
+        let leaving = JoinsReader::register(Arc::clone(&reads)).expect("register");
+        let staying = JoinsReader::register(Arc::clone(&reads)).expect("register");
         staying
             .read(|_| {
                 let (dropped, wait) = mpsc::channel();

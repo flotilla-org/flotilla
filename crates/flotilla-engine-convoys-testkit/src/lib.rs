@@ -24,7 +24,6 @@ pub use home::EngineHome;
 /// One home's engine Convoy path; a decided store it opened lives as long as this value.
 pub struct EngineConvoysHome {
     convoys: Arc<Convoys>,
-    views: Arc<ConvoyViews>,
     reads: Arc<dyn LifecycleReads>,
     meter: Arc<Meter>,
     path: EngineConvoyPath,
@@ -54,10 +53,9 @@ impl EngineConvoysHome {
         drop(records.follow().expect("follow the convoy log"));
         let meter = Arc::new(Meter::default());
         let reads: Arc<dyn LifecycleReads> = Arc::new(WithConvoys::new(reads, records, Arc::clone(&meter)));
-        let views = Arc::new(ConvoyViews::new(namespace, Arc::clone(&reads)));
-        backend.install_engine_records(Arc::clone(&views) as _);
+        backend.install_engine_records(Arc::new(ConvoyViews::new(namespace, Arc::clone(&reads))));
         let path: EngineConvoyPath = Arc::new(ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), clock));
-        Self { convoys, views, reads, meter, path, _dir: None }
+        Self { convoys, reads, meter, path, _dir: None }
     }
 
     /// The keyed gets made through [`Self::reads`] so far, for read-cost tests.
@@ -68,17 +66,6 @@ impl EngineConvoysHome {
     /// The convoy listings made through [`Self::reads`] so far, for read-cost tests.
     pub fn convoy_listings(&self) -> u64 {
         self.meter.convoy_listings()
-    }
-
-    /// The Convoy views `backend` serves, for read-cost tests.
-    pub fn views(&self) -> &Arc<ConvoyViews> {
-        &self.views
-    }
-
-    /// Reads the views, so they have read every write made so far: a read-cost measurement begun
-    /// after it does not count the views' follower catching up on the writes before it.
-    pub async fn settled(&self) {
-        self.views.open().await.expect("read the convoy views");
     }
 
     /// The lifecycle reads the views compose with, with this home's convoys added.
