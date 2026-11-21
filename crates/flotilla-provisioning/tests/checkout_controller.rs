@@ -307,7 +307,7 @@ impl World {
         // The sender is kept by the controller's task: a checkout's backing is never pushed.
         tokio::spawn(async move {
             let _backing = backing;
-            controller.run_with(receiver, recheck_receiver).await;
+            controller.run_with(receiver, recheck_receiver).await.expect("the controller runs");
         });
         Self { _directory: directory, provider, validation, actuator, holds, checkouts, clones, commits, _listener: listener, rechecks }
     }

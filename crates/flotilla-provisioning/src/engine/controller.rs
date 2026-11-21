@@ -46,7 +46,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -403,6 +402,23 @@ where
     }
 }
 
+/// Why a controller ended before its backing closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControllerError {
+    /// Its live resources could not be read at the start.
+    Unreadable { kind: &'static str, error: String },
+}
+
+impl std::fmt::Display for ControllerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable { kind, error } => write!(f, "the live {kind} resources could not be read at the start: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ControllerError {}
+
 /// Kind `K`'s controller at this home.
 pub struct Controller<K: LifecycleKind, A: Actuator<K>> {
     records: Arc<dyn ControlledRecords<K>>,
@@ -430,10 +446,6 @@ pub struct Controller<K: LifecycleKind, A: Actuator<K>> {
     stale_holdings: BTreeSet<String>,
     /// The resource a recheck carrying a person's release ruling is evaluating, for that pass only.
     ruled: Option<String>,
-    /// When the live resources are read again after a failed read at the start or a rescan, and
-    /// how many reads in a row have failed.
-    relist: Option<Timestamp>,
-    relist_failures: u32,
 }
 
 /// A recheck of one resource: by a host probe that saw its backing change, or by a person, whose
@@ -499,13 +511,12 @@ where
             holding: BTreeSet::new(),
             stale_holdings: BTreeSet::new(),
             ruled: None,
-            relist: None,
-            relist_failures: 0,
         })
     }
 
-    /// Runs until `backing` closes.
-    pub async fn run(self, backing: mpsc::Receiver<BackingEvent>) {
+    /// Runs until `backing` closes, or ends at once if its live resources cannot be read at the
+    /// start.
+    pub async fn run(self, backing: mpsc::Receiver<BackingEvent>) -> Result<(), ControllerError> {
         let (_none, rechecks) = mpsc::channel::<Recheck>(1);
         self.run_with(backing, rechecks).await
     }
@@ -513,25 +524,30 @@ where
     /// Runs until `backing` closes, observing again each realised resource named on `rechecks`, and
     /// trying again each retrying one: a host probe that saw its backing change without knowing
     /// what it now is, or saw what a failed attempt lacked arrive.
-    pub async fn run_with<R: Into<Recheck> + Send>(mut self, mut backing: mpsc::Receiver<BackingEvent>, mut rechecks: mpsc::Receiver<R>) {
+    ///
+    /// A start set that cannot be read ends the run with the error. Going on with none would
+    /// never look at a resource that does not change again, such as one whose holder ended while
+    /// the controller was away, and would hide the missing read.
+    pub async fn run_with<R: Into<Recheck> + Send>(
+        mut self,
+        mut backing: mpsc::Receiver<BackingEvent>,
+        mut rechecks: mpsc::Receiver<R>,
+    ) -> Result<(), ControllerError> {
         let mut rechecking = true;
-        let start = self.live("the start");
+        let start = self
+            .records
+            .live()
+            .map_err(|error| ControllerError::Unreadable { kind: K::NAME, error })?
+            .into_iter()
+            .map(|name| (name, Trigger::Start))
+            .collect();
         self.evaluate(start).await;
         loop {
-            let retry = self
-                .retries
-                .values()
-                .chain(&self.relist)
-                .min()
-                .and_then(|at| at.to_datetime())
-                .map(|at| (at - self.clock.now()).to_std().unwrap_or_default());
+            let retry =
+                self.retries.values().min().and_then(|at| at.to_datetime()).map(|at| (at - self.clock.now()).to_std().unwrap_or_default());
             tokio::select! {
                 () = sleep(retry) => {
                     let now = Timestamp::from_datetime(&self.clock.now());
-                    if self.relist.is_some_and(|at| at <= now) {
-                        let live = self.live("a retry");
-                        self.evaluate(live).await;
-                    }
                     let due: Vec<String> = self.retries.iter().filter(|(_, at)| **at <= now).map(|(name, _)| name.clone()).collect();
                     for name in &due {
                         self.retries.remove(name);
@@ -582,7 +598,7 @@ where
                         };
                         self.evaluate(BTreeMap::from([(event.name, trigger)])).await;
                     }
-                    None => return,
+                    None => return Ok(()),
                 },
                 recheck = rechecks.recv(), if rechecking => match recheck.map(Into::into) {
                     Some(Recheck { name, ruled_release }) => {
@@ -596,28 +612,8 @@ where
         }
     }
 
-    /// This home's live resources, each to be looked at as at the start. A failed read is tried
-    /// again on the clock, 1s doubling to 60s, until one succeeds: a controller never goes on as if
-    /// its kind had no resources.
-    fn live(&mut self, when: &str) -> BTreeMap<String, Trigger> {
-        match self.records.live() {
-            Ok(live) => {
-                (self.relist, self.relist_failures) = (None, 0);
-                live.into_iter().map(|name| (name, Trigger::Start)).collect()
-            }
-            Err(error) => {
-                let wait = Duration::from_secs(1 << self.relist_failures.min(6)).min(Duration::from_secs(60));
-                self.relist_failures = self.relist_failures.saturating_add(1);
-                let at = self.clock.now() + chrono::Duration::from_std(wait).unwrap_or_else(|_| chrono::Duration::seconds(60));
-                self.relist = Some(Timestamp::from_datetime(&at));
-                warn!(kind = K::NAME, %error, at = when, retry_in = ?wait, "the live resources could not be read");
-                BTreeMap::new()
-            }
-        }
-    }
-
     /// The resources a pass's changes touch, and why.
-    fn touched(&mut self, followed: Vec<Followed>) -> BTreeMap<String, Trigger> {
+    fn touched(&self, followed: Vec<Followed>) -> BTreeMap<String, Trigger> {
         let home = self.records.home().to_owned();
         let mut touched = BTreeMap::new();
         let mut touch = |name: &str, trigger: Trigger| {
@@ -635,11 +631,14 @@ where
                         touch(name, Trigger::Dependency);
                     }
                 }
-                Followed::Rescan(rescanned) if rescanned == home => {
-                    for name in self.live("a rescan").into_keys() {
-                        touch(&name, Trigger::Own);
+                Followed::Rescan(rescanned) if rescanned == home => match self.records.live() {
+                    Ok(live) => {
+                        for name in live {
+                            touch(&name, Trigger::Own);
+                        }
                     }
-                }
+                    Err(error) => warn!(kind = K::NAME, %error, "the live resources could not be read at a rescan"),
+                },
                 Followed::Rescan(rescanned) => {
                     for (_, names) in self.dependents.iter().filter(|(identity, _)| identity.home == rescanned) {
                         for name in names {

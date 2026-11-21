@@ -1099,16 +1099,10 @@ fn requester_home_at(base: &str, convoy: &str, harness: &str) -> String {
 
 /// Starts this home's AccessDelivery controller as the daemon starts it. It runs until the
 /// handle is dropped.
-fn access_delivery_controller(state: &Arc<ControllerRuntimeState>) -> AbortOnDrop {
-    AbortOnDrop(super::super::spawn_access_delivery_controller(state).expect("the AccessDelivery controller starts"))
-}
-
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+fn access_delivery_controller(state: &Arc<ControllerRuntimeState>) -> tokio_util::task::AbortOnDropHandle<()> {
+    tokio_util::task::AbortOnDropHandle::new(
+        super::super::spawn_access_delivery_controller(state).expect("the AccessDelivery controller starts"),
+    )
 }
 
 /// This home's access deliveries, as the controller leaves them.

@@ -83,6 +83,9 @@ impl<S: Kind + Clone + Send + Sync + 'static> ControlledRecords<PlainLifecycle<S
 
     /// Every record homed here: a plain record lives until it is deleted.
     fn live(&self) -> Result<Vec<String>, String> {
+        // The index of this home's live records: a plain kind has no state and ends by being
+        // deleted, so its rows at this home in `resource_identity_by_home` (home, kind), which
+        // `PlainLog::list` pages through, are exactly its live, not-ended records.
         Ok(self.log.list::<S>(self.log.home()).map_err(|error| error.to_string())?.into_iter().map(|held| held.name).collect())
     }
 

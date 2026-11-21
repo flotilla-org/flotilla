@@ -61,7 +61,7 @@ pub fn run_vessels(
             tokio::spawn(async move {
                 // No probe observes a vessel: its holdings' commits and its rechecks look at it.
                 let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
-                controller.run_with(backings, recheck_events).await
+                controller.run_with(backings, recheck_events).await.expect("the controller runs")
             }),
             tokio::spawn(wake.recheck(namespace.to_owned(), rechecks)),
             tokio::spawn(async move {
