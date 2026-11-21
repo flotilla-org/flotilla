@@ -108,6 +108,18 @@ sibling_generation="$generation_two"
 
 # `flotilla table` as the real CLI does it: flotilla-table beside the resolved binary, never PATH,
 # told this build; the fake sibling refuses another parent build, as flotilla-table does.
+# Process boundary double: `tender identity` answers unless the fixture says Tender is down.
+add_tender_fixture() {
+  cat >>"$1" <<FIXTURE
+if [[ "\${1:-}" == identity ]]; then
+  [[ -z "\${TENDER_LOG:-}" ]] || printf 'identity %s\\n' "$2" >>"\$TENDER_LOG"
+  [[ "\${TENDER_IDENTITY_FAIL:-0}" == 0 ]] || { printf 'tender is not running\\n' >&2; exit 1; }
+  printf 'fingerprint: SHA256:fixture\\n'
+  exit 0
+fi
+FIXTURE
+}
+
 add_sibling_fixture() {
   local bin="$1" generation="$2" build
   build="${generation#*-f}"
@@ -144,7 +156,7 @@ make_generation() {
   local directory="$fixture_root/$generation"
   local bundle="$test_root/bundle-$generation/fleet-candidate-linux-x86_64-gnu2.36"
   mkdir -p "$directory" "$bundle/bin" "$bundle/lib"
-  for name in flotilla flotillad cleat; do
+  for name in flotilla flotillad cleat tender; do
     printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\n' >"$bundle/bin/$name"
     if [[ "$name" == flotilla ]]; then
       cat >>"$bundle/bin/$name" <<EOF
@@ -165,6 +177,7 @@ EOF
       add_post_install_fixture "$bundle/bin/$name" "$generation"
       add_sibling_fixture "$bundle/bin" "$generation"
     fi
+    [[ "$name" != tender ]] || add_tender_fixture "$bundle/bin/$name" "$generation"
     printf 'printf "%s from %s\\n"\n' "$name" "$generation" >>"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
@@ -195,7 +208,7 @@ add_darwin_derivative() {
   local directory="$fixture_root/$generation"
   local bundle="$test_root/darwin-$generation/fleet-signed-darwin-aarch64"
   mkdir -p "$bundle/bin" "$bundle/lib"
-  for name in flotilla flotillad cleat; do
+  for name in flotilla flotillad cleat tender; do
     printf '#!/usr/bin/env bash\n' >"$bundle/bin/$name"
     if [[ "$name" == flotilla ]]; then
       cat >>"$bundle/bin/$name" <<'SH'
@@ -234,6 +247,7 @@ SH
       add_post_install_fixture "$bundle/bin/$name" "$generation"
       add_sibling_fixture "$bundle/bin" "$generation"
     fi
+    [[ "$name" != tender ]] || add_tender_fixture "$bundle/bin/$name" "$generation"
     printf 'printf "%s signed for %s\\n"\n' "$name" "$generation" >>"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
@@ -390,6 +404,16 @@ if [[ -L "$FLEET_INSTALL_ROOT/current" ]]; then
 fi
 printf '%s|%s\n' "$*" "$current" >>"$LAUNCHCTL_LOG"
 # Process boundary double: model launchd registration separately from its process.
+# Tender is a separate launchd job: its registration is kept apart from flotillad's.
+if [[ "$*" == *work.flotilla.tender* ]]; then
+  case "$1" in
+    print) [[ -f "$LAUNCHCTL_STATE.tender.loaded" ]] || exit 1 ;;
+    bootout) rm -f "$LAUNCHCTL_STATE.tender.loaded" ;;
+    bootstrap) touch "$LAUNCHCTL_STATE.tender.loaded" ;;
+    kickstart) [[ -f "$LAUNCHCTL_STATE.tender.loaded" ]] || exit 1; printf '%s\n' "$current" >"$LAUNCHCTL_STATE.tender.running" ;;
+  esac
+  exit 0
+fi
 case "$1" in
   print) [[ -f "$LAUNCHCTL_STATE.loaded" ]] || exit 1 ;;
   bootout)
@@ -426,7 +450,7 @@ case "$1" in
     ;;
 esac
 if [[ "$1" == print-disabled ]]; then
-  printf 'disabled services = {\n    "work.flotilla.flotillad" => %s\n}\n' "${LAUNCHD_AGENT_DISABLED:-false}"
+  printf 'disabled services = {\n    "work.flotilla.flotillad" => %s\n    "work.flotilla.tender" => %s\n}\n' "${LAUNCHD_AGENT_DISABLED:-false}" "${TENDER_AGENT_DISABLED:-false}"
 fi
 SH
 chmod 0755 "$fake_bin/launchctl"
@@ -484,6 +508,7 @@ run_installer() {
     FIXTURE_ROOT="$fixture_root" \
     SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
     LOGINCTL_LOG="$LOGINCTL_LOG" \
+    TENDER_LOG="${TENDER_LOG:-$test_root/tender.log}" \
     FLEET_INSTALL_UNAME_S=Linux \
     FLEET_INSTALL_UNAME_M=x86_64 \
     FLEET_INSTALL_API_URL="https://test.invalid/api/v1" \
@@ -504,6 +529,7 @@ run_darwin_installer() {
     LOGIN_SHELL_PATH="$home/.local/bin:$fake_bin:/usr/bin:/bin" \
     FIXTURE_ROOT="$fixture_root" \
     CODESIGN_LOG="$test_root/codesign.log" \
+    TENDER_LOG="${TENDER_LOG:-$test_root/tender.log}" \
     LAUNCHCTL_LOG="$LAUNCHCTL_LOG" \
     LAUNCHCTL_STATE="$home/launchctl-state" \
     LAUNCHD_AGENT_DISABLED="${LAUNCHD_AGENT_DISABLED:-false}" \
@@ -623,6 +649,25 @@ grep -Fxq 'RestartSec=5' "$unit" || fail 'systemd user unit does not delay resta
 grep -Fxq -- '--user daemon-reload' "$test_root/systemctl.log" || fail 'systemd user manager was not reloaded'
 grep -Fxq -- '--user enable flotillad.service' "$test_root/systemctl.log" || fail 'systemd user unit was not enabled'
 grep -Fxq -- '--user restart flotillad.service' "$test_root/systemctl.log" || fail 'systemd user unit was not started'
+
+# Tender is unhealthy: the install is reported, and flotillad's generation is not rolled back for it.
+: >"$test_root/tender-down.log"
+if TENDER_IDENTITY_FAIL=1 TENDER_CONFIRM_TIMEOUT_SECONDS=1 run_installer "$generation_one" >"$test_root/tender-down.out" 2>&1; then
+  fail 'an installation whose tender does not answer succeeded'
+fi
+grep -Fq 'tender identity' "$test_root/tender-down.out" || fail 'tender health failure was not reported'
+test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
+  || fail 'tender health failure rolled flotillad back'
+tender_unit="$test_root/home/.config/systemd/user/tender.service"
+test -f "$tender_unit" || fail 'tender systemd user unit was not installed'
+grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/tender" serve' "$tender_unit" \
+  || fail 'tender systemd user unit does not run `tender serve`'
+grep -Fxq 'Restart=always' "$tender_unit" || fail 'tender systemd user unit does not always restart'
+if grep -Eq 'TENDER_ROOT|XDG_(STATE|CONFIG)_HOME' "$tender_unit"; then fail 'tender unit relocates Tender state'; fi
+grep -Fxq -- '--user enable tender.service' "$test_root/systemctl.log" || fail 'tender systemd user unit was not enabled'
+grep -Fxq -- '--user restart tender.service' "$test_root/systemctl.log" || fail 'tender systemd user unit was not restarted'
+grep -Fq '# managed by fleet-install' "$test_root/home/.local/bin/tender" || fail 'missing stable tender launcher'
+test "$(grep -c '^identity ' "$test_root/tender.log")" -ge 1 || fail 'tender health was not checked'
 grep -Eq '^enable-linger .+$' "$test_root/loginctl.log" || fail 'systemd lingering was not enabled'
 
 : >"$test_root/systemctl.log"
@@ -1139,14 +1184,26 @@ test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$g
   || fail 'signed Darwin generation was not selected'
 test -f "$darwin_home/.local/opt/flotilla-fleet/releases/$generation_two/lib/libghostty-vt.dylib" \
   || fail 'signed Darwin dynamic library was not installed'
-# flotilla, flotillad, cleat, the library and the flotilla-table sibling, each before and after handoff.
-test "$(grep -c -- '--verify' "$test_root/codesign.log")" = 10 \
+# flotilla, flotillad, cleat, tender, the library and the flotilla-table sibling, each before and after handoff.
+test "$(grep -c -- '--verify' "$test_root/codesign.log")" = 12 \
   || fail 'Darwin upgrade did not verify every Mach-O payload before and after handoff'
 grep -Fq -- "/bin/flotilla-table" "$test_root/codesign.log" || fail 'Darwin upgrade did not verify the sibling signature'
-test "$(grep -c -- '--entitlements' "$test_root/codesign.log")" = 10 \
+test "$(grep -c -- '--entitlements' "$test_root/codesign.log")" = 12 \
   || fail 'Darwin upgrade did not verify every Mach-O entitlement set before and after handoff'
 launch_agent="$darwin_home/Library/LaunchAgents/work.flotilla.flotillad.plist"
 python3 "$repo_root/scripts/fleet_install_test_support.py" assert-launchd "$launch_agent" "$darwin_home" || fail 'Darwin launchd agent content is incorrect'
+tender_agent="$darwin_home/Library/LaunchAgents/work.flotilla.tender.plist"
+python3 "$repo_root/scripts/fleet_install_test_support.py" assert-tender-launchd "$tender_agent" "$darwin_home" || fail 'Darwin tender launchd agent content is incorrect'
+grep -Eq "^bootout gui/[0-9]+/work\\.flotilla\\.tender\\|releases/$generation_one$" "$test_root/launchctl.log" \
+  || fail 'Darwin install did not unload the old tender agent before the generation flip'
+grep -Eq "^bootstrap gui/[0-9]+ $tender_agent\\|releases/$generation_two$" "$test_root/launchctl.log" \
+  || fail 'Darwin install did not bootstrap tender from the selected generation'
+grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.tender\\|releases/$generation_two$" "$test_root/launchctl.log" \
+  || fail 'Darwin install did not restart tender after the generation flip'
+test "$(cat "$darwin_home/launchctl-state.tender.running")" = "releases/$generation_two" || fail 'tender runs the wrong generation'
+cmp -s "$darwin_home/.local/opt/flotilla-fleet/tcc/bin/tender" "$darwin_home/.local/opt/flotilla-fleet/current/bin/tender" \
+  || fail 'Darwin stable root does not carry the selected tender'
+grep -Fxq "identity $generation_two" "$test_root/tender.log" || fail 'Darwin install did not check tender health from the stable root'
 test -d "$darwin_home/Library/Logs/flotilla" \
   || fail 'Darwin install did not create the launchd log directory'
 grep -Eq "^bootout gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$generation_one$" "$test_root/launchctl.log" \
@@ -1162,8 +1219,12 @@ grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$gener
 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-reinstall.out"
 test "$(grep -Ec '^bootout gui/[0-9]+/work\.flotilla\.flotillad\|' "$test_root/launchctl.log")" = 1 \
   || fail 'Darwin exact-generation reinstall did not unload the agent exactly once'
-test "$(grep -Ec '^bootstrap gui/[0-9]+ ' "$test_root/launchctl.log")" = 1 \
+test "$(grep -Ec '^bootstrap gui/[0-9]+ .*flotillad\.plist\|' "$test_root/launchctl.log")" = 1 \
   || fail 'Darwin exact-generation reinstall did not bootstrap the refreshed agent exactly once'
+test "$(grep -Ec '^bootstrap gui/[0-9]+ .*tender\.plist\|' "$test_root/launchctl.log")" = 1 \
+  || fail 'Darwin exact-generation reinstall did not bootstrap the refreshed tender agent exactly once'
+test "$(grep -Ec '^kickstart -k gui/[0-9]+/work\.flotilla\.tender\|' "$test_root/launchctl.log")" = 1 \
+  || fail 'Darwin exact-generation reinstall did not restart tender exactly once'
 test "$(grep -Ec '^kickstart -k gui/[0-9]+/work\.flotilla\.flotillad\|' "$test_root/launchctl.log")" = 1 \
   || fail 'Darwin exact-generation reinstall did not restart the agent exactly once'
 

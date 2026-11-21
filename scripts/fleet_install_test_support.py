@@ -167,6 +167,21 @@ def assert_launchd(args, environ):
     assert agent["KeepAlive"] is True
 
 
+def assert_tender_launchd(args, environ):
+    with open(args[0], "rb") as source:
+        agent = plistlib.load(source)
+    home = args[1]
+    assert agent["Label"] == "work.flotilla.tender"
+    assert agent["ProgramArguments"] == [f"{home}/.local/opt/flotilla-fleet/tcc/bin/tender", "serve"]
+    assert agent["EnvironmentVariables"]["PATH"].split(":")[0] == f"{home}/.local/bin"
+    # Tender's identity and trust live in its own state directory: nothing here relocates them.
+    assert set(agent["EnvironmentVariables"]) == {"PATH"}
+    assert agent["StandardErrorPath"] == f"{home}/Library/Logs/flotilla/tender.stderr.log"
+    assert agent["StandardOutPath"] == f"{home}/Library/Logs/flotilla/tender.stdout.log"
+    assert agent["RunAtLoad"] is True
+    assert agent["KeepAlive"] is True
+
+
 def corrupt_outer_source(args, environ):
     path = Path(args[0])
     manifest = json.loads(path.read_text())
@@ -188,6 +203,7 @@ if __name__ == "__main__":
         "darwin-release": darwin_release,
         "darwin-generation": darwin_generation,
         "assert-launchd": assert_launchd,
+        "assert-tender-launchd": assert_tender_launchd,
         "corrupt-outer-source": corrupt_outer_source,
         "corrupt-outer-digest": corrupt_outer_digest,
     }

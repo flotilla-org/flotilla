@@ -69,7 +69,9 @@ CANARY_PAYLOAD = {
 # consumption, so health rollback to a generation built before it still
 # validates. Remove from the tolerance (move to REQUIRED_PAYLOAD) one roll
 # after every installed generation carries it.
-PRODUCED_PAYLOAD = {"bin/drydock-host"}
+# `bin/tender` is the per-account Tender daemon (rigging's `tender serve`), run beside
+# flotillad as its own service; it follows the same rule.
+PRODUCED_PAYLOAD = {"bin/drydock-host", "bin/tender"}
 # drydock's TypeScript host: an executable wrapper beside flotillad (where the
 # embedded drydock finds `drydock-host-typescript`) and the tree it runs, with
 # production dependencies installed and no symlinks. Required at production,
@@ -1426,6 +1428,20 @@ def write_launchd_agent(destination, label, daemon, path, skills, codex_home, co
         plistlib.dump(content, output, sort_keys=False)
 
 
+def write_launchd_tender_agent(destination, label, tender, path, stderr_path, stdout_path):
+    content = {
+        "Label": label,
+        "ProgramArguments": [tender, "serve"],
+        "EnvironmentVariables": {"PATH": path},
+        "StandardErrorPath": stderr_path,
+        "StandardOutPath": stdout_path,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+    }
+    with open(destination, "wb") as output:
+        plistlib.dump(content, output, sort_keys=False)
+
+
 def refresh_darwin_payload(source, destination):
     # Preserve recovery ordering: prune stale libraries first, then publish each
     # file atomically. This is not a tree-wide transaction: a later copy failure
@@ -1659,6 +1675,9 @@ def main():
     helper.add_argument("socket")
     helper.add_argument("stderr_path")
     helper.add_argument("stdout_path")
+    helper = sub.add_parser("launchd-tender-agent")
+    for argument in ("destination", "label", "tender", "path", "stderr_path", "stdout_path"):
+        helper.add_argument(argument)
     helper = sub.add_parser("darwin-payload")
     helper.add_argument("source")
     helper.add_argument("destination")
@@ -1704,6 +1723,8 @@ def main():
             replace_link(args.source, args.destination)
         elif args.command == "systemd-path":
             systemd_path(args.path, args.home)
+        elif args.command == "launchd-tender-agent":
+            write_launchd_tender_agent(args.destination, args.label, args.tender, args.path, args.stderr_path, args.stdout_path)
         elif args.command == "launchd-agent":
             write_launchd_agent(
                 args.destination,

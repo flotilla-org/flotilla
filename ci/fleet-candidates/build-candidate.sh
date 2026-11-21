@@ -255,6 +255,12 @@ done < <(python3 "$(dirname "${BASH_SOURCE[0]}")/generation_validation.py" sibli
   [[ "$drydock_rev" =~ ^[0-9a-f]{40}$ ]]
   cargo install --locked --force --git https://github.com/flotilla-org/drydock --rev "$drydock_rev" \
     --root "$flotilla_root/target/drydock-host-install" --bin drydock-host drydock-host
+  # Tender is built from the rigging revision this flotilla builds against, the one Cargo.lock
+  # holds for every rigging crate; its own lockfile pins the rest.
+  rigging_rev="$(awk '$0 == "name = \"rigging-tls\"" { found = 1 } found && /^source = / { sub(/.*#/, ""); sub(/"$/, ""); print; exit }' Cargo.lock)"
+  [[ "$rigging_rev" =~ ^[0-9a-f]{40}$ ]]
+  cargo install --locked --force --git https://github.com/flotilla-org/rigging --rev "$rigging_rev" \
+    --root "$flotilla_root/target/tender-install" --bin tender tender
   # The TypeScript host comes from the same drydock revision.
   fetch_exact https://github.com/flotilla-org/drydock.git "$drydock_rev" "$source_root/drydock"
   build_typescript_host "$source_root/drydock" "$flotilla_root/target/drydock-host-typescript"
@@ -291,6 +297,7 @@ done < <(python3 "$(dirname "${BASH_SOURCE[0]}")/generation_validation.py" sibli
 install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
 install -m 0755 "$flotilla_root/target/release/flotillad" "$bundle/bin/flotillad"
 install -m 0755 "$flotilla_root/target/drydock-host-install/bin/drydock-host" "$bundle/bin/drydock-host"
+install -m 0755 "$flotilla_root/target/tender-install/bin/tender" "$bundle/bin/tender"
 mkdir -p "$bundle/share/flotilla"
 cp -R "$flotilla_root/target/drydock-host-typescript" "$bundle/share/flotilla/drydock-host-typescript"
 write_typescript_host_wrapper "$bundle/bin/drydock-host-typescript"
@@ -362,6 +369,7 @@ done
 protocol_version="$(read_protocol_version "$bundle/bin/flotilla")"
 test "$(read_protocol_version "$bundle/bin/flotillad")" = "$protocol_version"
 "$bundle/bin/cleat" launch --help | grep -q -- --tag
+"$bundle/bin/tender" --help >/dev/null
 
 export FLEET_BUNDLE="$bundle"
 export FLEET_PLATFORM="$platform"

@@ -41,6 +41,33 @@ path. Stage the reviewed bootstrap/validator pair first (see "Bootstrap helpers
 and synchronization"). That validator accepts any `bin/flotilla-<command>`, so
 later siblings need no further crossing.
 
+## Tender daemon
+
+Every fleet host runs one [Tender](https://github.com/flotilla-org/rigging/tree/main/crates/tender)
+daemon per account, installed beside flotillad. The candidate carries `bin/tender`, built
+from the Rigging commit `Cargo.lock` locks for every Rigging crate; candidate production
+refuses a bundle without it, while a generation built before it shipped still validates
+as a rollback target. `fleet-install` runs it as its own service, under the same account
+as flotillad: `tender.service` (a systemd user unit running `tender serve`) on Linux, and
+the `work.flotilla.tender` launchd agent (from the stable Darwin root) on macOS. It
+restarts it with every activation and rollback, then requires `tender identity` to answer.
+An unhealthy Tender is reported but never rolls flotillad's generation back.
+
+The installer does not touch Tender's state directory (identity key, authority store,
+`trusted.toml`), so the instance keeps its identity across rolls. A restart withdraws
+the API publications; the epoch changes and publishers publish again.
+
+Pairing is manual. After the roll, confirm each host's fingerprint with `tender identity`,
+then pair each pair of hosts, and each host with the person's own machine:
+
+```sh
+tender trust pair <ssh-destination> --expect-fingerprint <fingerprint>
+```
+
+Run it on one side; it trusts the far key and has the far side trust this one (`--return`
+names how the far side reaches this host). Nothing is trusted before the fingerprint is
+confirmed, which is why pairing is not part of the roll.
+
 ## Stable Darwin executables
 
 On macOS, fleet-install copies the selected generation's signed `flotillad`,
