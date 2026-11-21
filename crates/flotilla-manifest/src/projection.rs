@@ -427,9 +427,10 @@ pub fn project_catalog_fragment(
     headers: &BTreeMap<String, usize>,
 ) -> Catalog {
     let mut catalog = Catalog { ttl_ms, ..Catalog::default() };
+    let forges = input.subjects.map_or(&[][..], |subjects| subjects.forges.as_slice());
     if let Some(nodes) = input.awareness {
         for node in nodes {
-            project_awareness_node(&mut catalog, node, input.convoys, mint, headers.get(&node.id).copied());
+            project_awareness_node(&mut catalog, node, input.convoys, forges, mint, headers.get(&node.id).copied());
         }
         project_readiness(&mut catalog, input.convoys);
         mark_superseded_convoys(&mut catalog, input.convoys);
@@ -459,7 +460,7 @@ pub fn project_catalog_fragment(
 /// Definitions publish even when no convoy or awareness entry exists.
 fn project_repository_memberships(catalog: &mut Catalog, projects: &[ProjectRepositoriesRow]) {
     for project in projects {
-        let project_entity = entity::project(&project.resource.namespace, &project.resource.name, "fleet");
+        let project_entity = entity::project(&project.resource.name);
         let mut facts = vec![
             (SEGMENT_PROJECT, MetadataValue::text(project_entity.id.clone())),
             (KEY_PROJECT_NAME, MetadataValue::text(&project.display_name)),
@@ -467,8 +468,7 @@ fn project_repository_memberships(catalog: &mut Catalog, projects: &[ProjectRepo
             (KEY_PROJECT_REPOSITORY_COUNT, MetadataValue::Integer(project.repositories.len() as i64)),
         ];
         if let Some(parent) = &project.parent {
-            facts
-                .push((crate::keys::KEY_PROJECT_PARENT, MetadataValue::text(entity::project(&parent.namespace, &parent.name, "fleet").id)));
+            facts.push((crate::keys::KEY_PROJECT_PARENT, MetadataValue::text(entity::project(&parent.name).id)));
         }
         catalog.assert_entity(project_entity.clone(), facts, None);
         for membership in &project.repositories {
@@ -508,7 +508,7 @@ fn project_standing_roles(catalog: &mut Catalog, roles: &[StandingRoleRow], conv
         let declared = roles
             .iter()
             .find(|role| role.resource.namespace == convoy.resource.namespace && Some(&role.resource.name) == convoy.ensured_from.as_ref());
-        let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
+        let Some(convoy_entity) = convoy_entity(convoy) else { continue };
         role_by_convoy.insert(convoy_entity.id, declared.map(role_entity));
     }
     for facts in catalog.facts.values_mut() {
@@ -534,7 +534,7 @@ fn role_project(role: &StandingRoleRow) -> &str {
 }
 
 fn role_entity(role: &StandingRoleRow) -> EntityRef {
-    entity::role(&role.resource.namespace, role_project(role), &role.role, "fleet")
+    entity::role(role_project(role), &role.role)
 }
 
 fn standing_attempts<'a>(role: &StandingRoleRow, convoys: &'a [ConvoyRow]) -> Vec<&'a ConvoyRow> {
@@ -549,20 +549,20 @@ fn standing_attempts<'a>(role: &StandingRoleRow, convoys: &'a [ConvoyRow]) -> Ve
 fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
     let entity = role_entity(role);
     let project_name = role_project(role);
-    let project = entity::project(&role.resource.namespace, project_name, "fleet");
+    let project = entity::project(project_name);
     let attempts = standing_attempts(role, convoys);
     let latest = attempts.last().copied();
     let live = attempts.iter().rev().copied().find(|convoy| convoy.is_live());
 
     // The primary target is the live attempt's only vessel. Multi-vessel
     // attempts have no single attach target yet and stay held.
-    let attach =
-        live.and_then(|convoy| match convoy.vessels.as_slice() {
-            [vessel] => vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)).map(|recipe| {
-                (entity::vessel(&convoy.resource.namespace, &convoy.resource.name, &vessel.name, vessel.host.as_str()), recipe)
-            }),
-            _ => None,
-        });
+    let attach = live.and_then(|convoy| match convoy.vessels.as_slice() {
+        [vessel] => vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)).and_then(|recipe| {
+            let target = vessel_entity(convoy, vessel)?;
+            Some((target, recipe))
+        }),
+        _ => None,
+    });
 
     let badge = match (role.hold, live) {
         (Some(StandingRoleHold::RestartLimit), _) => Badge { state: BadgeState::Failed, attention: true },
@@ -643,7 +643,7 @@ fn mark_superseded_convoys(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
                     latest.get(&(&row.resource.namespace, &row.project_ref, role)).is_some_and(|generation| *generation > row.generation)
                 })
         })
-        .map(|row| entity::convoy(&row.resource.namespace, &row.resource.name, &entity::resource_origin(&row.resource)).id)
+        .filter_map(|row| convoy_entity(row).map(|entity| entity.id))
         .collect::<BTreeSet<_>>();
     for facts in catalog.facts.values_mut() {
         let Some(MetadataValue::Text(convoy)) = facts.get(KEY_CONVOY).map(|fact| &fact.value) else {
@@ -660,6 +660,7 @@ fn project_awareness_node(
     catalog: &mut Catalog,
     node: &AwarenessNode,
     convoys: &[ConvoyRow],
+    forges: &[ResourceObject<Forge>],
     mint: &dyn RecipeMint,
     visible: Option<usize>,
 ) {
@@ -672,7 +673,7 @@ fn project_awareness_node(
         catalog.assert_entity(entity, facts, None);
     }
     for entry in &node.entries {
-        project_awareness_entry(catalog, &parent, entry, convoys, mint);
+        project_awareness_entry(catalog, &parent, entry, convoys, forges, mint);
     }
 }
 
@@ -689,28 +690,25 @@ fn awareness_parent_facts(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Vec<(&
             ]
         }
         AwarenessKind::Convoy => {
-            let value = node.id.strip_prefix("convoy/").unwrap_or(&node.id);
-            let Some((namespace, name)) = value.split_once('/') else {
+            let Some(convoy) = node_convoy(node, convoys).and_then(convoy_entity) else {
                 return vec![];
             };
-            let origin = find_convoy(convoys, namespace, name)
-                .map(|row| entity::resource_origin(&row.resource))
-                .unwrap_or_else(|| "fleet".to_owned());
-            let convoy = entity::convoy(namespace, name, &origin);
             vec![(KEY_CONVOY, MetadataValue::text(convoy.id)), (KEY_CONVOY_NAME, MetadataValue::text(node.label.clone()))]
         }
         AwarenessKind::Vessel | AwarenessKind::Issue | AwarenessKind::Independent => vec![],
     }
 }
 
+/// The convoy row a convoy-grouped node's typed ref names.
+fn node_convoy<'a>(node: &AwarenessNode, convoys: &'a [ConvoyRow]) -> Option<&'a ConvoyRow> {
+    let reference = node.refs.first()?;
+    convoys.iter().find(|convoy| convoy.resource == *reference)
+}
+
 fn awareness_node_entity(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Option<(EntityRef, Vec<(&'static str, MetadataValue)>)> {
     match node.kind {
         AwarenessKind::Project => {
-            let (namespace, name) = node.scope.as_ref().map(|scope| (scope.namespace.as_str(), scope.name.as_str())).or_else(|| {
-                let mut parts = node.id.strip_prefix("project/")?.split('/');
-                Some((parts.next()?, parts.next()?))
-            })?;
-            let entity = entity::project(namespace, name, "fleet");
+            let entity = entity::project(&node.scope.as_ref()?.name);
             let mut facts = vec![
                 (SEGMENT_PROJECT, MetadataValue::text(entity.id.clone())),
                 (KEY_PROJECT_NAME, MetadataValue::text(node.label.clone())),
@@ -720,18 +718,15 @@ fn awareness_node_entity(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Option<
             Some((entity, facts))
         }
         AwarenessKind::Convoy => {
-            let value = node.id.strip_prefix("convoy/").unwrap_or(&node.id);
-            let (namespace, name) = value.split_once('/')?;
-            let row = find_convoy(convoys, namespace, name);
-            let origin = row.map(|row| entity::resource_origin(&row.resource)).unwrap_or_else(|| "fleet".to_owned());
-            let entity = entity::convoy(namespace, name, &origin);
-            let semantic_label = row.map(|row| row.name.as_str()).unwrap_or(&node.label);
+            let row = node_convoy(node, convoys)?;
+            let entity = convoy_entity(row)?;
+            let semantic_label = row.name.as_str();
             let mut facts = vec![
                 (KEY_CONVOY, MetadataValue::text(entity.id.clone())),
                 (KEY_CONVOY_NAME, MetadataValue::text(semantic_label)),
                 (KEY_DISPLAY_LABEL, MetadataValue::text(node.label.clone())),
             ];
-            if let Some(phase) = row.and_then(|row| row.phase) {
+            if let Some(phase) = row.phase {
                 facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
             }
             facts.extend(label_tier_facts(semantic_label));
@@ -746,13 +741,14 @@ fn project_awareness_entry(
     parent: &[(&'static str, MetadataValue)],
     entry: &AwarenessEntry,
     convoys: &[ConvoyRow],
+    forges: &[ResourceObject<Forge>],
     mint: &dyn RecipeMint,
 ) {
     let repo = entry.annotations.get(SEGMENT_REPO).cloned();
     if let Some(repo) = &repo {
         assert_repo_entity(catalog, repo);
     }
-    let Some((entity, mut own_facts)) = awareness_entry_entity(entry, convoys) else {
+    let Some((entity, mut own_facts)) = awareness_entry_entity(entry, convoys, forges) else {
         return;
     };
     let mut facts = parent.to_vec();
@@ -769,11 +765,9 @@ fn project_awareness_entry(
     if let Some(host) = entry.annotations.get(KEY_VESSEL_HOST) {
         facts.push((KEY_VESSEL_HOST, MetadataValue::text(host.clone())));
     }
-    let surface_state = match entry.id.parse().ok() {
-        Some(ViewAddress::Convoy { namespace, name }) => find_convoy(convoys, &namespace, &name).map(|row| row.surface_state),
-        Some(ViewAddress::Vessel { namespace, convoy, vessel }) => {
-            find_vessel(convoys, &namespace, &convoy, &vessel).map(|row| row.surface_state)
-        }
+    let surface_state = match entry.kind {
+        AwarenessKind::Convoy => entry_convoy(entry, convoys).map(|row| row.surface_state),
+        AwarenessKind::Vessel => entry_vessel(entry, convoys).map(|(_, row)| row.surface_state),
         _ => None,
     };
     if let Some(state) = surface_state {
@@ -785,10 +779,10 @@ fn project_awareness_entry(
     }
     if let Some(recipe) = awareness_entry_recipe(entry, convoys, mint) {
         catalog.assert_entity(entity.clone(), action_facts(&recipe, "workspace"), None);
-        if let Some(vessel) = match entry.id.parse() {
-            Ok(ViewAddress::Vessel { namespace, convoy, vessel }) => find_vessel(convoys, &namespace, &convoy, &vessel),
-            Ok(ViewAddress::Convoy { namespace, name }) => {
-                find_convoy(convoys, &namespace, &name).and_then(|convoy| (convoy.vessels.len() == 1).then(|| &convoy.vessels[0]))
+        if let Some(vessel) = match entry.kind {
+            AwarenessKind::Vessel => entry_vessel(entry, convoys).map(|(_, vessel)| vessel),
+            AwarenessKind::Convoy => {
+                entry_convoy(entry, convoys).and_then(|convoy| (convoy.vessels.len() == 1).then(|| &convoy.vessels[0]))
             }
             _ => None,
         } {
@@ -798,70 +792,52 @@ fn project_awareness_entry(
     catalog.assert_entity(entity, facts, None);
 }
 
-fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Option<(EntityRef, Vec<(&'static str, MetadataValue)>)> {
+fn awareness_entry_entity(
+    entry: &AwarenessEntry,
+    convoys: &[ConvoyRow],
+    forges: &[ResourceObject<Forge>],
+) -> Option<(EntityRef, Vec<(&'static str, MetadataValue)>)> {
     let mut label = entry.label.clone();
     let (entity, facts) = match entry.kind {
         AwarenessKind::Convoy => {
-            let value = entry.id.strip_prefix("convoy/").unwrap_or(&entry.id);
-            let (namespace, name) = value.split_once('/')?;
-            let row = find_convoy(convoys, namespace, name);
-            let origin = row.map(|row| entity::resource_origin(&row.resource)).unwrap_or_else(|| "fleet".to_owned());
-            let entity = entity::convoy(namespace, name, &origin);
-            let semantic_label = entry.annotations.get(KEY_CONVOY_NAME).map(String::as_str).unwrap_or(name);
+            let row = entry_convoy(entry, convoys)?;
+            let entity = convoy_entity(row)?;
+            let semantic_label = entry.annotations.get(KEY_CONVOY_NAME).map(String::as_str).unwrap_or(&row.name);
             let mut facts =
                 vec![(KEY_CONVOY, MetadataValue::text(entity.id.clone())), (KEY_CONVOY_NAME, MetadataValue::text(semantic_label))];
-            if let Some(phase) = row.and_then(|row| row.phase) {
+            if let Some(phase) = row.phase {
                 facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
             }
             label = semantic_label.to_owned();
             facts.extend(label_tier_facts(semantic_label));
-            if let (None, Some(AwarenessPhase::Convoy(phase))) = (row, &entry.phase) {
-                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
-            }
             (entity, facts)
         }
         AwarenessKind::Vessel => {
-            let value = entry.id.strip_prefix("vessel/").unwrap_or(&entry.id);
-            let mut parts = value.split('/');
-            let (namespace, convoy_name, vessel_name) = (parts.next()?, parts.next()?, parts.next()?);
-            let row = find_convoy(convoys, namespace, convoy_name);
-            let origin = row.map(|row| entity::resource_origin(&row.resource)).unwrap_or_else(|| "fleet".to_owned());
-            let convoy = entity::convoy(namespace, convoy_name, &origin);
-            let convoy_label = row.map(|row| row.name.as_str()).unwrap_or(convoy_name);
-            let vessel_origin = find_vessel(convoys, namespace, convoy_name, vessel_name)
-                .map(|vessel| vessel.host.to_string())
-                .unwrap_or_else(|| origin.clone());
-            let entity = entity::vessel(namespace, convoy_name, vessel_name, &vessel_origin);
+            let (row, vessel) = entry_vessel(entry, convoys)?;
+            let convoy = convoy_entity(row)?;
+            let entity = vessel_entity(row, vessel)?;
             let mut facts = vec![
                 (KEY_CONVOY, MetadataValue::text(convoy.id)),
-                (KEY_CONVOY_NAME, MetadataValue::text(convoy_label)),
+                (KEY_CONVOY_NAME, MetadataValue::text(&row.name)),
                 (KEY_VESSEL, MetadataValue::text(entity.id.clone())),
                 (KEY_VESSEL_NAME, MetadataValue::text(label.clone())),
             ];
-            if let Some(phase) = row.and_then(|row| row.phase) {
+            if let Some(phase) = row.phase {
                 facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
             }
             facts.extend(label_tier_facts(&label));
             (entity, facts)
         }
         AwarenessKind::Issue => {
-            let entity = entry.issue_refs.first().map(entity::issue).unwrap_or_else(|| EntityRef::new("issue", entry.id.clone()));
+            let issue = entry.issue_refs.first()?;
+            let entity = subjects::address_forge(forges, &issue.source.service)
+                .and_then(|forge| entity::issue(&forge, &issue.source.scope, &issue.id))?;
             (entity.clone(), vec![(SEGMENT_ISSUE, MetadataValue::text(entity.id.clone()))])
         }
         AwarenessKind::Independent => {
-            let value = entry.id.rsplit('/').next().unwrap_or(&entry.id);
-            let session_ref = entry
-                .refs
-                .first()
-                .map(|reference| {
-                    format!(
-                        "{}/{}/{}",
-                        reference.host.as_ref().map(ToString::to_string).unwrap_or_else(|| "fleet".to_owned()),
-                        reference.namespace,
-                        reference.name
-                    )
-                })
-                .unwrap_or_else(|| entry.id.clone());
+            let reference = entry.refs.first()?;
+            let value = reference.name.as_str();
+            let session_ref = format!("{}/{}/{}", entity::home(reference)?, reference.namespace, reference.name);
             let entity = entity::session(&session_ref);
             let mut facts = vec![(KEY_SESSION, MetadataValue::text(entity.id.clone()))];
             facts.extend(label_tier_facts(value));
@@ -878,23 +854,19 @@ fn awareness_project_recipe(node: &AwarenessNode, mint: &dyn RecipeMint) -> Opti
     if !matches!(node.kind, AwarenessKind::Project) {
         return None;
     }
-    let address = node.id.parse().ok()?;
-    let ViewAddress::Project { .. } = &address else {
-        return None;
-    };
-    mint.scoped_view(&address)
+    let scope = node.scope.as_ref()?;
+    mint.scoped_view(&ViewAddress::Project { namespace: scope.namespace.clone(), name: scope.name.clone() })
 }
 
 fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &dyn RecipeMint) -> Option<Recipe> {
     if matches!(entry.kind, AwarenessKind::Issue) {
         return None;
     }
-    match entry.id.parse().ok()? {
-        address @ ViewAddress::Project { .. } => mint.scoped_view(&address),
-        ViewAddress::Vessel { namespace, convoy, vessel } => find_vessel(convoys, &namespace, &convoy, &vessel)
-            .and_then(|row| row.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &row.host))),
-        ViewAddress::Convoy { namespace, name } => {
-            let convoy = find_convoy(convoys, &namespace, &name)?;
+    match entry.kind {
+        AwarenessKind::Vessel => entry_vessel(entry, convoys)
+            .and_then(|(_, row)| row.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &row.host))),
+        AwarenessKind::Convoy => {
+            let convoy = entry_convoy(entry, convoys)?;
             let [vessel] = convoy.vessels.as_slice() else {
                 return None;
             };
@@ -904,12 +876,26 @@ fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &
     }
 }
 
-fn find_convoy<'a>(convoys: &'a [ConvoyRow], namespace: &str, name: &str) -> Option<&'a ConvoyRow> {
-    convoys.iter().find(|convoy| convoy.resource.namespace == namespace && convoy.resource.name == name)
+/// The convoy's entity, spelled by the home its row carries. A row without a
+/// home has no entity.
+fn convoy_entity(convoy: &ConvoyRow) -> Option<EntityRef> {
+    Some(entity::convoy(entity::home(&convoy.resource)?, &convoy.resource.name))
 }
 
-fn find_vessel<'a>(convoys: &'a [ConvoyRow], namespace: &str, convoy_name: &str, vessel_name: &str) -> Option<&'a VesselRow> {
-    find_convoy(convoys, namespace, convoy_name)?.vessels.iter().find(|vessel| vessel.name == vessel_name)
+fn vessel_entity(convoy: &ConvoyRow, vessel: &VesselRow) -> Option<EntityRef> {
+    Some(entity::vessel(entity::home(&convoy.resource)?, &convoy.resource.name, &vessel.name))
+}
+
+/// The convoy row an awareness entry's typed ref names.
+fn entry_convoy<'a>(entry: &AwarenessEntry, convoys: &'a [ConvoyRow]) -> Option<&'a ConvoyRow> {
+    let reference = entry.refs.first()?;
+    convoys.iter().find(|convoy| convoy.resource == *reference)
+}
+
+/// The convoy and vessel rows an awareness entry's typed ref names.
+fn entry_vessel<'a>(entry: &AwarenessEntry, convoys: &'a [ConvoyRow]) -> Option<(&'a ConvoyRow, &'a VesselRow)> {
+    let reference = entry.refs.first()?;
+    convoys.iter().find_map(|convoy| convoy.vessels.iter().find(|vessel| vessel.resource == *reference).map(|vessel| (convoy, vessel)))
 }
 
 fn awareness_state(state: AwarenessState) -> &'static str {
@@ -945,10 +931,9 @@ fn summary_text(counts: &AwarenessCounts, visible: usize) -> String {
     summary
 }
 
-fn convoy_identity_facts(convoy: &ConvoyRow) -> Vec<(&'static str, MetadataValue)> {
-    let target = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
+fn convoy_identity_facts(convoy: &ConvoyRow, target: &EntityRef) -> Vec<(&'static str, MetadataValue)> {
     let mut facts = vec![
-        (KEY_CONVOY, MetadataValue::text(target.id)),
+        (KEY_CONVOY, MetadataValue::text(&target.id)),
         (KEY_CONVOY_NAME, MetadataValue::text(&convoy.name)),
         (KEY_DISPLAY_LABEL, MetadataValue::text(&convoy.name)),
     ];
@@ -975,20 +960,12 @@ fn project_readiness(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
         }
     }
     for convoy in convoys {
-        let origin = entity::resource_origin(&convoy.resource);
-        apply(
-            catalog,
-            entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &origin),
-            &convoy.readiness(),
-            matches!(convoy.vessels.as_slice(), [vessel] if vessel.materialize.is_some()),
-        );
+        let Some(convoy_entity) = convoy_entity(convoy) else { continue };
+        apply(catalog, convoy_entity, &convoy.readiness(), matches!(convoy.vessels.as_slice(), [vessel] if vessel.materialize.is_some()));
         for vessel in &convoy.vessels {
-            apply(
-                catalog,
-                entity::vessel(&convoy.resource.namespace, &convoy.resource.name, &vessel.name, vessel.host.as_str()),
-                &vessel.readiness,
-                vessel.materialize.is_some(),
-            );
+            if let Some(vessel_entity) = vessel_entity(convoy, vessel) {
+                apply(catalog, vessel_entity, &vessel.readiness, vessel.materialize.is_some());
+            }
         }
     }
 }
@@ -1021,9 +998,8 @@ fn readiness_badge(badge: Badge, readiness: &Readiness) -> Badge {
 }
 
 fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMint) {
-    let namespace = &convoy.resource.namespace;
-    let origin = entity::resource_origin(&convoy.resource);
-    let project = project_fact(Some(&convoy.project_ref), &origin);
+    let Some(convoy_entity) = convoy_entity(convoy) else { return };
+    let project = project_fact(Some(&convoy.project_ref));
     let repo = convoy.repo.as_ref().map(|repo| repo.0.clone());
     if let Some((entity, facts)) = &project {
         catalog.assert_entity(entity.clone(), facts.clone(), None);
@@ -1031,7 +1007,6 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     if let Some(repo) = &repo {
         assert_repo_entity(catalog, repo);
     }
-    let convoy_entity = entity::convoy(namespace, &convoy.resource.name, &origin);
     let ordinal = (project.is_none() && repo.is_none()).then_some(ARCHIPELAGO_ORDINAL);
     let badge = convoy_badge(convoy.phase, convoy.initializing);
     let done = convoy.vessels.iter().filter(|vessel| vessel.phase == WorkPhase::Complete).count();
@@ -1040,7 +1015,7 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
         facts.push((SEGMENT_REPO, MetadataValue::text(repo.clone())));
         facts.push((KEY_REPO_NAME, MetadataValue::text(repo_label(repo))));
     }
-    facts.extend(convoy_identity_facts(convoy));
+    facts.extend(convoy_identity_facts(convoy, &convoy_entity));
     facts.extend([
         (KEY_CONVOY_WORKFLOW, MetadataValue::text(convoy.workflow_ref.clone())),
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
@@ -1083,9 +1058,7 @@ fn project_vessel(
     repo: Option<&str>,
     mint: &dyn RecipeMint,
 ) {
-    let entity = entity::vessel(&convoy.resource.namespace, &convoy.resource.name, &vessel.name, vessel.host.as_str());
-    let origin = entity::resource_origin(&convoy.resource);
-    let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &origin);
+    let (Some(entity), Some(convoy_entity)) = (vessel_entity(convoy, vessel), convoy_entity(convoy)) else { return };
     let ordinal = (project.is_none() && repo.is_none()).then_some(ARCHIPELAGO_ORDINAL);
     let badge = work_badge(vessel.phase);
     let mut facts = project_facts(project);
@@ -1199,14 +1172,9 @@ fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint
     catalog.assert_entity(entity, facts, ordinal);
 }
 
-fn project_fact(project_ref: Option<&str>, origin: &str) -> Option<(EntityRef, Vec<(&'static str, MetadataValue)>)> {
-    let project_ref = project_ref?;
-    let mut parts = project_ref.split('/');
-    let (namespace, name) = match (parts.next(), parts.next(), parts.next()) {
-        (Some("project"), Some(namespace), Some(name)) => (namespace, name),
-        _ => ("flotilla", project_ref.rsplit('/').next()?),
-    };
-    let entity = entity::project(namespace, name, origin);
+fn project_fact(project_ref: Option<&str>) -> Option<(EntityRef, Vec<(&'static str, MetadataValue)>)> {
+    let name = project_ref?.rsplit('/').next()?;
+    let entity = entity::project(name);
     let mut facts = vec![
         (SEGMENT_PROJECT, MetadataValue::text(entity.id.clone())),
         (KEY_PROJECT_NAME, MetadataValue::text(name)),

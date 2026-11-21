@@ -4,7 +4,8 @@
 //! sites. One entity kind has one id dialect, so two observations of the same
 //! thing fold onto the same wire target.
 
-use flotilla_protocol::{IssueRef, ResourceRef};
+use flotilla_address::{Address, Forge, Kind};
+use flotilla_protocol::{HostName, ResourceRef};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -27,16 +28,23 @@ impl EntityRef {
     }
 }
 
-/// The origin component of control-plane resource identities.
-///
-/// Fleet rows pin remote resources to their host. Locally-merged rows may
-/// omit the host; `fleet` is the canonical origin for that shared store.
-pub fn resource_origin(resource: &ResourceRef) -> String {
-    resource.host.as_ref().map(ToString::to_string).unwrap_or_else(|| "fleet".to_owned())
+/// The record's engine home, the `host:` segment of its address. A record
+/// without one has no entity: there is no default home.
+pub fn home(resource: &ResourceRef) -> Option<&str> {
+    resource.host.as_ref().map(HostName::as_str)
 }
 
-pub fn project(namespace: &str, name: &str, origin: &str) -> EntityRef {
-    EntityRef::new("project", format!("{namespace}/{name}@{origin}"))
+fn address(result: Result<Address, flotilla_address::Error>, what: &str) -> Address {
+    result.unwrap_or_else(|error| panic!("{what} is not a valid address component: {error}"))
+}
+
+fn convoy_address(home: &str, launch: &str) -> Address {
+    address(Address::root(Kind::Host, home).and_then(|host| host.child(Kind::Convoy, launch)), "a convoy launch")
+}
+
+/// A project: `project:<name>`.
+pub fn project(name: &str) -> EntityRef {
+    EntityRef::new("project", address(Address::project(name), "a project name").to_string())
 }
 
 pub fn repo(forge_slug: &str) -> EntityRef {
@@ -59,30 +67,39 @@ pub fn project_repository(namespace: &str, project: &str, repository_key: &str, 
     )
 }
 
-pub fn convoy(namespace: &str, name: &str, origin: &str) -> EntityRef {
-    EntityRef::new("convoy", format!("{namespace}/{name}@{origin}"))
+/// A convoy launch, by the home that holds its record: `host:<home>/convoy:<launch>`.
+pub fn convoy(home: &str, launch: &str) -> EntityRef {
+    EntityRef::new("convoy", convoy_address(home, launch).to_string())
 }
 
-/// A standing project role. Stable across the convoy attempts backing it.
-pub fn role(namespace: &str, project: &str, role: &str, origin: &str) -> EntityRef {
-    EntityRef::new("role", format!("{namespace}/{project}/{role}@{origin}"))
+/// A standing project role, stable across the convoy attempts backing it:
+/// `project:<project>/role:<role>`.
+pub fn role(project: &str, role: &str) -> EntityRef {
+    let address = address(Address::project(project).and_then(|project| project.child(Kind::Role, role)), "a standing role");
+    EntityRef::new("role", address.to_string())
 }
 
-pub fn vessel(namespace: &str, convoy_name: &str, vessel_name: &str, origin: &str) -> EntityRef {
-    EntityRef::new("vessel", format!("{namespace}/{convoy_name}/{vessel_name}@{origin}"))
+/// A convoy's vessel: `host:<home>/convoy:<launch>/vessel:<name>`.
+pub fn vessel(home: &str, launch: &str, vessel_name: &str) -> EntityRef {
+    let address = address(convoy_address(home, launch).child(Kind::Vessel, vessel_name), "a vessel name");
+    EntityRef::new("vessel", address.to_string())
 }
 
-pub fn issue(reference: &IssueRef) -> EntityRef {
-    EntityRef::new("issue", format!("{}/{}#{}", reference.source.service, reference.source.scope, reference.id))
+/// An issue: `forge:<id>/repo:<owner/repo>/issue:<number>`. `None` when the
+/// scope or number is not one the address grammar admits.
+pub fn issue(forge: &Forge, scope: &str, number: &str) -> Option<EntityRef> {
+    let number = number.parse().ok()?;
+    Some(EntityRef::new("issue", Address::issue(forge, scope, number).ok()?.to_string()))
 }
 
-/// Forge-relative change request; independent of the host holding a replica.
-pub fn change_request(service: &str, scope: &str, number: &str) -> EntityRef {
-    EntityRef::new("change_request", format!("{service}/{scope}!{number}"))
+/// A forge-relative change request: `forge:<id>/repo:<owner/repo>/cr:<number>`.
+pub fn change_request(forge: &Forge, scope: &str, number: &str) -> Option<EntityRef> {
+    let number = number.parse().ok()?;
+    Some(EntityRef::new("change_request", Address::change_request(forge, scope, number).ok()?.to_string()))
 }
 
-pub fn forge(forge_id: &str) -> EntityRef {
-    EntityRef::new("forge", forge_id)
+pub fn forge(forge: &Forge) -> EntityRef {
+    EntityRef::new("forge", Address::forge(forge).to_string())
 }
 
 pub fn session(session_ref: &str) -> EntityRef {
@@ -91,33 +108,42 @@ pub fn session(session_ref: &str) -> EntityRef {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{HostName, IssueSource};
+    use flotilla_protocol::HostName;
 
     use super::*;
 
     #[test]
-    fn constructors_pin_one_id_dialect_per_kind() {
-        assert_eq!(convoy("dev", "cutover", "kiwi").id, "dev/cutover@kiwi");
-        assert_eq!(vessel("dev", "cutover", "coder", "kiwi").id, "dev/cutover/coder@kiwi");
-        assert_eq!(role("dev", "andamento", "governor", "fleet").id, "dev/andamento/governor@fleet");
-        assert_eq!(repo("github.com:flotilla-org/flotilla").id, "github.com:flotilla-org/flotilla");
+    fn constructors_build_canonical_address_text() {
+        assert_eq!(convoy("feta", "convoy-7da0#8661").id, "host:feta/convoy:convoy-7da0%238661");
+        assert_eq!(vessel("feta", "fix#8", "work").id, "host:feta/convoy:fix%238/vessel:work");
+        assert_eq!(role("ghostty", "governor").id, "project:ghostty/role:governor");
+        assert_eq!(project("flotilla").id, "project:flotilla");
+        let github = Forge::github();
         assert_eq!(
-            issue(&IssueRef {
-                source: IssueSource { service: "https://github.com".to_owned(), scope: "flotilla-org/flotilla".to_owned() },
-                id: "982".to_owned(),
-            })
-            .id,
-            "https://github.com/flotilla-org/flotilla#982"
+            change_request(&github, "flotilla-org/flotilla", "4407").expect("cr").id,
+            "forge:github/repo:flotilla-org%2Fflotilla/cr:4407"
         );
+        assert_eq!(
+            issue(&github, "flotilla-org/flotilla", "4406").expect("issue").id,
+            "forge:github/repo:flotilla-org%2Fflotilla/issue:4406"
+        );
+        assert_eq!(forge(&github).id, "forge:github");
+        assert_eq!(repo("github.com:flotilla-org/flotilla").id, "github.com:flotilla-org/flotilla");
         assert_eq!(session("feta/dev/terminal-coder").id, "feta/dev/terminal-coder");
     }
 
     #[test]
-    fn resource_origin_prefers_pinned_host_and_has_a_stable_fleet_fallback() {
+    fn a_standing_launch_name_stays_one_segment() {
+        let launch = "project:x/convoy:governor#3";
+        let id = convoy("feta", launch).id;
+        assert_eq!(id.parse::<Address>().expect("canonical").get(Kind::Convoy), Some(launch));
+    }
+
+    #[test]
+    fn home_is_the_records_host_and_never_defaults() {
         let local = ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "cutover");
-        let remote = local.clone().on_host(HostName::new("kiwi"));
-        assert_eq!(resource_origin(&local), "fleet");
-        assert_eq!(resource_origin(&remote), "kiwi");
+        assert_eq!(home(&local), None);
+        assert_eq!(home(&local.on_host(HostName::new("kiwi"))), Some("kiwi"));
     }
 
     #[test]

@@ -2572,12 +2572,12 @@ mod tests {
                 &FlotillaRecipes::new("flotilla"),
             );
             let patches = catalog.reassert_patches();
-            let cr = entity::change_request("github.com", "org/repo", "42");
+            let cr = entity::change_request(&forge_named("github.com"), "org/repo", "42").expect("cr");
             let patch = patches.iter().find(|patch| patch.target == MetadataTarget::Entity(cr.clone())).expect("orphan");
             assert_eq!(patch.set["flotilla.orphaned"].value, MetadataValue::Bool(true));
             assert_eq!(
                 patch.set["flotilla.subject_of.produces"].value,
-                MetadataValue::EntityRefs(vec![entity::convoy("ops", "producer", "kiwi")])
+                MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "producer")])
             );
             // A restart loses all in-memory demand/tasks but retains the store.
             for (_, refresh) in refresher.inner.active.lock().await.drain() {
@@ -3137,5 +3137,12 @@ mod tests {
 
         refresher.release(demand).await;
         assert_eq!(refresher.observation_error(&subject).await, None);
+    }
+
+    fn forge_named(service: &str) -> flotilla_address::Forge {
+        match service {
+            "github" | "github.com" => flotilla_address::Forge::github(),
+            other => flotilla_address::Forge::new(other, flotilla_address::ForgeKind::Forgejo).expect("a valid forge id"),
+        }
     }
 }

@@ -45,8 +45,8 @@ pub fn pane_stamp(pane: PaneTarget, attach_ref: &str, binding: Option<&AttachBin
         fact(KEY_HOST, binding.host.to_string());
         fact(KEY_NAMESPACE, binding.namespace.clone());
         let entity = match (&binding.convoy, &binding.vessel, &binding.session) {
-            (Some(convoy), Some(vessel), _) => Some(entity::vessel(&binding.namespace, convoy, vessel, binding.host.as_str())),
-            (Some(convoy), None, _) => Some(entity::convoy(&binding.namespace, convoy, binding.host.as_str())),
+            (Some(convoy), Some(vessel), _) => Some(entity::vessel(binding.host.as_str(), convoy, vessel)),
+            (Some(convoy), None, _) => Some(entity::convoy(binding.host.as_str(), convoy)),
             (None, _, Some(session)) => Some(entity::session(&format!("{}/{}/{session}", binding.host, binding.namespace))),
             (None, _, None) => None,
         };
@@ -58,11 +58,11 @@ pub fn pane_stamp(pane: PaneTarget, attach_ref: &str, binding: Option<&AttachBin
             fact(KEY_SESSION, format!("{}/{}/{session}", binding.host, binding.namespace));
         }
         if let Some(convoy) = &binding.convoy {
-            fact(KEY_CONVOY, entity::convoy(&binding.namespace, convoy, binding.host.as_str()).id);
+            fact(KEY_CONVOY, entity::convoy(binding.host.as_str(), convoy).id);
         }
         if let Some(vessel) = &binding.vessel {
             if let Some(convoy) = &binding.convoy {
-                fact(KEY_VESSEL, entity::vessel(&binding.namespace, convoy, vessel, binding.host.as_str()).id);
+                fact(KEY_VESSEL, entity::vessel(binding.host.as_str(), convoy, vessel).id);
             }
         }
         if let Some(role) = &binding.role {
@@ -101,10 +101,10 @@ mod tests {
         assert_eq!(patch.target, MetadataTarget::Pane(PaneTarget::Terminal(42)));
         assert_eq!(patch.source_id, SOURCE_ATTACH);
         assert_eq!(patch.set[KEY_SESSION].value, MetadataValue::text("feta/dev/terminal-impl-coder"));
-        assert_eq!(patch.set[KEY_CONVOY].value, MetadataValue::text("dev/manifest-extraction@feta"));
-        assert_eq!(patch.set[KEY_VESSEL].value, MetadataValue::text("dev/manifest-extraction/implement@feta"));
+        assert_eq!(patch.set[KEY_CONVOY].value, MetadataValue::text("host:feta/convoy:manifest-extraction"));
+        assert_eq!(patch.set[KEY_VESSEL].value, MetadataValue::text("host:feta/convoy:manifest-extraction/vessel:implement"));
         assert_eq!(patch.set[KEY_ENTITY_KIND].value, MetadataValue::text("vessel"));
-        assert_eq!(patch.set[KEY_ENTITY_ID].value, MetadataValue::text("dev/manifest-extraction/implement@feta"));
+        assert_eq!(patch.set[KEY_ENTITY_ID].value, MetadataValue::text("host:feta/convoy:manifest-extraction/vessel:implement"));
         assert_eq!(patch.set[KEY_CREW_ROLE].value, MetadataValue::text("coder"));
         assert_eq!(patch.set[KEY_ATTACH_REF].value, MetadataValue::text("implement/coder"));
         assert_eq!(patch.set[KEY_SOURCE].value, MetadataValue::text(SOURCE_FLOTILLA));

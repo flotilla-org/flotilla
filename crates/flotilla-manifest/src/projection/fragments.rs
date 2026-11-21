@@ -141,7 +141,7 @@ mod tests {
                 if optional {
                     fields.push(("optional", MetadataValue::Bool(true)));
                 }
-                catalog.assert_entity(entity::project("dev", if key.is_multiple_of(2) { "even" } else { "odd" }, "fleet"), fields, None);
+                catalog.assert_entity(entity::project(if key.is_multiple_of(2) { "even" } else { "odd" }), fields, None);
                 catalog
             });
             let patches = fragments.replace([(key, next.clone())], ttl);

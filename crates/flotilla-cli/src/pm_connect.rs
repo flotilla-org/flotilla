@@ -379,6 +379,15 @@ impl ConnectorState {
     }
 
     fn update_convoy(&mut self, key: ResourceRef, row: Option<ConvoyRow>) {
+        // Entity ids spell a convoy by its home, so a row without one is a bug
+        // at its source; refuse it rather than invent an origin.
+        let row = row.filter(|row| {
+            let homed = row.resource.host.is_some();
+            if !homed {
+                tracing::error!(convoy = %row.resource.name, "convoy row carries no home host; not projected");
+            }
+            homed
+        });
         if self.convoys.get(&key) == row.as_ref() {
             return;
         }

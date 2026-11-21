@@ -6,12 +6,11 @@ use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 
 use flotilla_manifest::{
-    entity,
     projection::{project_catalog_without_warnings, CatalogInput, SubjectCatalogInput},
     recipe::FlotillaRecipes,
     wire::MetadataTarget,
 };
-use flotilla_protocol::{ConvoyPhase, ConvoyRow, IssueRef, IssueSource, ResourceRef};
+use flotilla_protocol::{ConvoyPhase, ConvoyRow, IssueSource, ResourceRef};
 use flotilla_resources::{ChangeRequest, Issue};
 
 // Behaviour (ADR 0051): non-built-in uncovered services produce a structured
@@ -96,7 +95,7 @@ fn uncovered_subject_service_warns_with_service() {
     });
     let source = IssueSource { service: "forge.example".into(), scope: "org/repo".into() };
     let mut convoy = ConvoyRow::builder()
-        .resource(ResourceRef::new("flotilla/v1", "Convoy", "dev", "work"))
+        .resource(ResourceRef::new("flotilla/v1", "Convoy", "dev", "work").on_host(flotilla_protocol::HostName::new("kiwi")))
         .name("work")
         .project_ref("flotilla")
         .workflow_ref("dev")
@@ -149,12 +148,7 @@ fn uncovered_subject_service_warns_with_service() {
     assert_eq!(warnings.len(), 6);
     assert_eq!(warnings.iter().filter(|event| event["service"] == "other.example").count(), 3);
     assert_eq!(warnings[0]["service"], "forge.example");
-    for target in [
-        entity::change_request("forge.example", "org/repo", "42"),
-        entity::issue(&IssueRef { source: IssueSource { service: "other.example".into(), scope: source.scope }, id: "42".into() }),
-    ] {
-        let target = MetadataTarget::Entity(target);
-        let patch = patches.iter().find(|patch| patch.target == target).expect("visible subject");
-        assert!(!patch.set.contains_key("flotilla.forge"));
-    }
+    // A service no forge claims has no address, so its subjects publish no entity.
+    assert!(patches.iter().all(|patch| !matches!(&patch.target, MetadataTarget::Entity(entity)
+        if matches!(entity.kind.as_str(), "change_request" | "issue"))));
 }

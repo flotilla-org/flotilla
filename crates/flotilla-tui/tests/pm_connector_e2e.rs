@@ -233,13 +233,13 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
         )
     };
     let mut connector = start();
-    let target = MetadataTarget::Entity(entity::change_request("github.com", "org/platform", "42"));
+    let target = MetadataTarget::Entity(entity::change_request(&forge_named("github.com"), "org/platform", "42").expect("cr"));
     wait("bootstrap observation", || sink.value(&target, "flotilla.change_request.title") == Some(MetadataValue::text("initial"))).await;
     wait("subject project edge", || sink.value(&target, "flotilla.project").is_some()).await;
-    let project = MetadataTarget::Entity(entity::project("flotilla", "platform", "fleet"));
+    let project = MetadataTarget::Entity(entity::project("platform"));
     wait("project opening recipe", || sink.value(&project, "action.primary.recipe").is_some()).await;
     assert_eq!(sink.value(&project, "action.primary.recipe"), Some(MetadataValue::text("'flotilla' view 'project/flotilla/platform'")));
-    let role = MetadataTarget::Entity(entity::role("flotilla", "platform", "governor", "fleet"));
+    let role = MetadataTarget::Entity(entity::role("platform", "governor"));
     wait("standing-role current attempt", || sink.value(&role, "flotilla.role.current_attempt").is_some()).await;
     assert!(sink.value(&role, "flotilla.role.attempts").is_some(), "attempt history published");
     // Queued writes happen without waiting for the consumer between them.
@@ -252,8 +252,7 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     second_spec.generation = 2;
     let second = admit_attempt(&daemon, "attempt-2", second_spec).await;
     wait("new current attempt", || {
-        sink.value(&role, "flotilla.role.current_attempt")
-            == Some(MetadataValue::EntityRefs(vec![entity::convoy("flotilla", &second, "local")]))
+        sink.value(&role, "flotilla.role.current_attempt") == Some(MetadataValue::EntityRefs(vec![entity::convoy("local", &second)]))
     })
     .await;
     wait(
@@ -294,4 +293,11 @@ async fn connector_real_daemon_subject_lifecycle() {
 async fn connector_real_wheelhouse_ingress() {
     let socket = std::env::var("FLOTILLA_TEST_WHEELHOUSE_SOCKET").expect("isolated ingress socket");
     lifecycle(Some(WheelhouseHttpSink::new(socket))).await;
+}
+
+fn forge_named(service: &str) -> flotilla_address::Forge {
+    match service {
+        "github" | "github.com" => flotilla_address::Forge::github(),
+        other => flotilla_address::Forge::new(other, flotilla_address::ForgeKind::Forgejo).expect("a valid forge id"),
+    }
 }
