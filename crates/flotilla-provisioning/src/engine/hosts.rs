@@ -31,12 +31,13 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     engine_records::{CommitMark, KindRecords, LogPosition, PatchStatus, Record, Since, Ticks, UnloggedJournal, WriteError},
+    host_records::{HostAliases, HostChange, HostFacts, HostReadError, HostRecords},
     CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
     TRANSPORT_CAPABILITY,
 };
-use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
+use flotilla_schema::{reads, Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
 use serde_json::{json, Value};
@@ -49,6 +50,8 @@ use super::watch::SharedChanges;
 use crate::stored::host::{Class, Condition, HostObservation, HostRecord, Readiness};
 
 const KIND: &str = <HostRecord as Kind>::KIND;
+/// How many Host changes a slow follower may fall behind by; one that lags reads everything again.
+const HOST_CHANGES: usize = 256;
 const HOST: KindCode = <HostRecord as Kind>::CODE;
 const OBSERVATION: KindCode = <HostObservation as Kind>::CODE;
 
@@ -94,13 +97,23 @@ type Records = BTreeMap<(String, String), Held>;
 struct Resident {
     follower: Follower,
     records: Records,
+    /// The display names the records bear, held as they change, so a reference resolves without
+    /// a listing.
+    aliases: HostAliases,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
+/// The display name a held copy bears, if it holds the Host's spec.
+fn display_name(held: Option<&Held>) -> Option<&str> {
+    held.and_then(|held| held.host.as_ref()).map(|(spec, _, _)| spec.display_name.as_str())
+}
+
+/// Reads `name`'s records at `home` again, and returns the references that named it before and
+/// after.
+fn reload(read: &mut Read<'_>, records: &mut Records, aliases: &mut HostAliases, name: &str, home: &str) -> Result<HostChange, StoreError> {
     let host = match read.resolve(HOST, name, home)? {
         Some(id) => match read.load::<HostRecord>(id)? {
             Some(loaded) => Some((loaded.value.spec(), loaded.version, created_at(read, id)?)),
@@ -113,16 +126,21 @@ fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) ->
         None => None,
     };
     let key = (name.to_owned(), home.to_owned());
+    let before = display_name(records.get(&key)).map(str::to_owned);
     if host.is_none() && observation.is_none() {
         records.remove(&key);
     } else {
-        records.insert(key, Held::new(host, observation));
+        records.insert(key.clone(), Held::new(host, observation));
     }
-    Ok(())
+    let after = display_name(records.get(&key));
+    aliases.hold(name, home, before.as_deref(), after);
+    let references = [Some(name), before.as_deref(), after].into_iter().flatten().filter(|name| !name.is_empty()).map(str::to_owned);
+    Ok(HostChange::Changed { references: references.collect() })
 }
 
-fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), StoreError> {
+fn rescan(read: &mut Read<'_>, records: &mut Records, aliases: &mut HostAliases, home: &str) -> Result<(), StoreError> {
     records.retain(|(_, owner), _| owner != home);
+    aliases.forget_home(home);
     let mut names = Vec::new();
     for code in [HOST, OBSERVATION] {
         let mut after = None;
@@ -145,7 +163,7 @@ fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), 
         }
     }
     for name in names {
-        reload(read, records, &name, home)?;
+        reload(read, records, aliases, &name, home)?;
     }
     Ok(())
 }
@@ -332,6 +350,8 @@ pub struct EngineHosts {
     commits: CommitsSeen,
     // One follower for every watcher of these records on this daemon.
     changes: SharedChanges,
+    /// What each refresh found changed, for the planners' wakes.
+    host_changes: tokio::sync::broadcast::Sender<HostChange>,
     /// Held across a write's read and its edit, so the observers at this home write one at a time.
     writing: tokio::sync::Mutex<()>,
     /// This run, which no change outside the log is counted in: a reading resumes only within it,
@@ -355,12 +375,13 @@ impl EngineHosts {
         let follower = Follower::new([HOST, OBSERVATION]);
         let opened = Self {
             changes: SharedChanges::new(Arc::clone(&service), [HOST, OBSERVATION], "hosts"),
+            host_changes: tokio::sync::broadcast::channel(HOST_CHANGES).0,
             commits: CommitsSeen::follow(&service, [HOST, OBSERVATION]),
             service,
             home,
             own_host,
             log,
-            resident: Mutex::new(Resident { follower, records: Records::new() }),
+            resident: Mutex::new(Resident { follower, records: Records::new(), aliases: HostAliases::default() }),
             writing: tokio::sync::Mutex::new(()),
             unlogged: UnloggedJournal::default(),
             clock,
@@ -368,14 +389,14 @@ impl EngineHosts {
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
-            let Resident { follower, records } = &mut *resident;
+            let Resident { follower, records, aliases } = &mut *resident;
             opened
                 .service
                 .with_store(|store| {
                     let mut read = store.read()?;
                     follower.start(&mut read, &homes)?;
                     for home in &homes {
-                        rescan(&mut read, records, home)?;
+                        rescan(&mut read, records, aliases, home)?;
                     }
                     Ok(())
                 })
@@ -389,30 +410,54 @@ impl EngineHosts {
         LogPosition { homes, unlogged: Some(self.unlogged.read()) }
     }
 
-    /// Brings the resident map up to the store: every entry written since the last refresh.
+    /// Brings the resident map up to the store: every entry written since the last refresh. Each
+    /// change it finds is told to [`HostRecords::changes`].
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
         if !self.commits.take() {
             return Ok(resident);
         }
         let homes = self.service.homes();
-        {
-            let Resident { follower, records } = &mut *resident;
+        let changed = {
+            let Resident { follower, records, aliases } = &mut *resident;
             self.service
                 .with_store(|store| {
                     let mut read = store.read()?;
+                    let mut changed = Vec::new();
                     for followed in follower.pass(&mut read, &homes)? {
-                        match followed {
-                            Followed::Changed(identity) => reload(&mut read, records, &identity.name, &identity.home)?,
-                            Followed::Rescan(home) => rescan(&mut read, records, &home)?,
-                        }
+                        changed.push(match followed {
+                            Followed::Changed(identity) => reload(&mut read, records, aliases, &identity.name, &identity.home)?,
+                            Followed::Rescan(home) => {
+                                rescan(&mut read, records, aliases, &home)?;
+                                HostChange::Rescanned
+                            }
+                        });
                     }
-                    Ok(())
+                    Ok(changed)
                 })
                 .map_err(|error| error.to_string())
-                .inspect_err(|_| self.commits.give_back())?;
-        }
+                .inspect_err(|_| self.commits.give_back())?
+        };
+        // No follower is no reason to keep them: one may subscribe later.
+        changed.into_iter().for_each(|change| drop(self.host_changes.send(change)));
         Ok(resident)
+    }
+
+    /// Brings the resident map up to the store at each commit of the Host kinds, so
+    /// [`HostRecords::changes`] tells each change as it lands rather than at the next read. It
+    /// ends with the port.
+    pub fn follow(self: &Arc<Self>) -> Result<tokio::task::JoinHandle<()>, String> {
+        let mut commits = self.changes.subscribe().map_err(|error| error.to_string())?;
+        let hosts = Arc::downgrade(self);
+        Ok(tokio::spawn(reads::attributed(reads::caller("host follower"), async move {
+            while futures::StreamExt::next(&mut commits).await.is_some() {
+                let Some(hosts) = hosts.upgrade() else { return };
+                // A refresh that fails is tried again at the next commit, or the next read.
+                if let Err(error) = hosts.refresh().map(drop) {
+                    tracing::warn!(%error, "the hosts' changes could not be read from the log; retrying");
+                }
+            }
+        })))
     }
 
     fn now(&self) -> DateTime<Utc> {
@@ -689,6 +734,26 @@ impl KindRecords<Host> for EngineHosts {
     }
 }
 
+/// The planners' reads: a reference resolved through the held alias map, then the one Host it names.
+impl HostRecords for EngineHosts {
+    fn resolve(&self, reference: &str) -> Result<Option<HostFacts>, HostReadError> {
+        let resident = self.refresh().map_err(HostReadError::Unreadable)?;
+        let held = |name: &str| resolve(&resident.records, &self.home, name).filter(|(_, held)| held.host.is_some());
+        let Some(name) = resident.aliases.resolve(reference, |name| held(name).is_some())? else { return Ok(None) };
+        Ok(held(&name).and_then(|(home, held)| self.object(&name, home, held)).map(|host| HostFacts {
+            display_name: host.spec.display_name,
+            connection: host.spec.connection,
+            max_vessels: host.spec.max_vessels,
+            status: host.status,
+            name: host.name,
+        }))
+    }
+
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<HostChange> {
+        self.host_changes.subscribe()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,7 +799,7 @@ mod tests {
         service
             .with_store(|store| {
                 let mut read = store.read()?;
-                rescan(&mut read, &mut records, "alpha")
+                rescan(&mut read, &mut records, &mut HostAliases::default(), "alpha")
             })
             .expect("rescan");
         let keys: Vec<_> = records.keys().map(|(name, home)| (name.as_str(), home.as_str())).collect();

@@ -3,6 +3,7 @@ use flotilla_resources::checkout_path::checkout_path_component;
 use flotilla_resources::checkout_records::{CheckoutRecords, HOLDER_ENDED, HOLDER_NOT_OPEN};
 use flotilla_resources::convoy::engine::EngineConvoyPath;
 use flotilla_resources::environment_records::{EnvironmentRecord, EnvironmentRecords};
+use flotilla_resources::host_records::{HostReadError, HostRecords};
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
 use flotilla_resources::vessel_planning::{Held, HeldKind, VesselPlan, VesselPlanner};
 use flotilla_resources::vessel_records::{engine_vessel, VesselRecord};
@@ -80,6 +81,8 @@ pub struct VesselPlanning {
     artifacts: ReplicaReadResolver<Artifact>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     federated_kinds: Option<ReplicaReadResolver<FulfilmentKind>>,
+    /// The planners' Host port: a kind's host by reference, for the providers it advertises.
+    hosts: Option<Arc<dyn HostRecords>>,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
     namespace: String,
@@ -105,6 +108,7 @@ impl VesselPlanning {
             artifacts: backend.including_replicas::<Artifact>(namespace),
             federated_convoys: None,
             federated_kinds: None,
+            hosts: None,
             local_host_ref: None,
             additional_host_refs: Default::default(),
             namespace: namespace.to_string(),
@@ -200,6 +204,12 @@ impl VesselPlanning {
         config_dir: impl Into<PathBuf>,
     ) -> Self {
         Self { brief_templates: CrewBriefTemplateResolver::with_config_dir(config_dir), ..Self::new(backend, namespace, accounts) }
+    }
+
+    /// Reads a kind's host, for an unfrozen vessel's provider, through `hosts`.
+    pub fn with_hosts(mut self, hosts: Arc<dyn HostRecords>) -> Self {
+        self.hosts = Some(hosts);
+        self
     }
 
     pub fn with_worktree_metadata(mut self, resolver: Arc<dyn WorktreeMetadataResolver>) -> Self {
@@ -335,16 +345,16 @@ impl VesselPlanning {
 
     /// A vessel no admission froze an instance for takes the one provider on its kind's
     /// host that realises the kind, as admission would have chosen; with no advertisements
-    /// observed it names none.
+    /// observed, or no Host port to read them from, it names none.
     async fn unfrozen_instance(&self, kind: &ResourceObject<FulfilmentKind>) -> Result<Result<Option<String>, String>, ResourceError> {
-        let hosts = self.backend.including_replicas::<flotilla_resources::Host>(&self.namespace).list().await?.items;
-        let hosts = hosts.into_iter().map(|host| host.object).collect::<Vec<_>>();
-        let host = match flotilla_resources::canonical_host_id(hosts.iter(), &kind.spec.host_ref) {
-            Ok(Some(id)) => hosts.iter().find(|host| host.metadata.name == id.as_str()),
-            Ok(None) => hosts.iter().find(|host| host.metadata.name == kind.spec.host_ref),
-            Err(error) => return Ok(Err(error)),
+        let Some(hosts) = &self.hosts else { return Ok(Ok(None)) };
+        let host = match hosts.resolve(&kind.spec.host_ref) {
+            Ok(host) => host,
+            Err(error @ HostReadError::Ambiguous(_)) => return Ok(Err(error.to_string())),
+            Err(HostReadError::Unreadable(error)) => return Err(ResourceError::other(error)),
         };
         let Some(advertised) = host
+            .as_ref()
             .and_then(|host| host.status.as_ref())
             .and_then(|status| status.capabilities.get(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY))
         else {
@@ -1941,16 +1951,19 @@ mod tests {
         use flotilla_protocol::provider::{
             CheckoutStrategy, EnvironmentClass, MaterialMode, ProviderAdvertisement, ProviderCapabilities, ProviderKind, ProviderReadiness,
         };
+        use flotilla_resources::host_records::{HeldHosts, HostFacts};
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let hosts = backend.using::<flotilla_resources::Host>("flotilla");
-        let host = hosts
-            .create(
-                &InputMeta::builder().name("h".into()).build(),
-                &flotilla_resources::HostSpec { display_name: "h".into(), ..Default::default() },
-            )
-            .await
-            .expect("host");
-        let reconciler = VesselPlanning::new(backend.clone(), "flotilla", accounts(&backend));
+        let hosts = Arc::new(HeldHosts::default());
+        // The kind names its host by display name: the alias resolves to it.
+        let host = |status| HostFacts {
+            name: "host-id".into(),
+            display_name: "h".into(),
+            connection: flotilla_resources::HostConnection::Daemon,
+            max_vessels: None,
+            status,
+        };
+        hosts.put(host(None));
+        let reconciler = VesselPlanning::new(backend.clone(), "flotilla", accounts(&backend)).with_hosts(hosts.clone());
         let kind = FulfilmentKindSpec::builder()
             .host_ref("h".into())
             .pool("cleat".into())
@@ -1990,7 +2003,7 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        hosts.update_status("h", &host.metadata.resource_version, &status).await.expect("host status");
+        hosts.put(host(Some(status)));
         let placement = reconciler.placement_dependency(&vessel, "docker", None).await.expect("read").expect("a provider");
         assert_eq!(placement.instance.as_deref(), Some("only"));
         let placement =
