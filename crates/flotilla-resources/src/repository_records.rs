@@ -25,3 +25,17 @@ pub trait RepositoryRecords: Send + Sync {
     /// Ticks as repositories change, from now on.
     async fn changes(&self) -> Result<BoxStream<'_, ()>, String>;
 }
+
+/// The records among `listed` that are [`crate::repository::workspace_slug_component`] peers of
+/// `spec`: the repositories that can change the workspace slug it is allocated, `spec`'s own
+/// excluded.
+pub fn workspace_slug_peer_records(spec: &RepositorySpec, listed: Vec<Record<Repository>>) -> Vec<Record<Repository>> {
+    let own = spec.key();
+    let others: Vec<Record<Repository>> = listed.into_iter().filter(|record| record.spec.key() != own).collect();
+    let peers: std::collections::BTreeSet<String> =
+        crate::repository::workspace_slug_component(spec, others.iter().map(|record| &record.spec))
+            .into_iter()
+            .map(|peer| peer.key().to_string())
+            .collect();
+    others.into_iter().filter(|record| peers.contains(&record.spec.key().to_string())).collect()
+}

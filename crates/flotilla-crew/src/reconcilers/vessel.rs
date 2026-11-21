@@ -126,19 +126,10 @@ impl VesselPlanning {
     /// read from the engine's records.
     async fn slug_peers(
         &self,
-        repository_key: &flotilla_resources::RepositoryKey,
         spec: &RepositorySpec,
     ) -> Result<BTreeMap<flotilla_resources::RepositoryKey, RepositorySpec>, ResourceError> {
-        let peers = self
-            .repository_records
-            .workspace_slug_peers(spec)
-            .await
-            .map_err(ResourceError::other)?
-            .into_iter()
-            .filter(|record| &record.spec.key() != repository_key)
-            .map(|record| (record.spec.key(), record.spec))
-            .collect();
-        Ok(peers)
+        let peers = self.repository_records.workspace_slug_peers(spec).await.map_err(ResourceError::other)?;
+        Ok(peers.into_iter().map(|record| (record.spec.key(), record.spec)).collect())
     }
 
     /// Why an agent crew must not start yet: its account binding is no longer open.
@@ -831,7 +822,7 @@ impl VesselPlanning {
                         existing.spec.path
                     }
                     None => {
-                        let peers = self.slug_peers(&repository_key, &repository_spec).await?;
+                        let peers = self.slug_peers(&repository_spec).await?;
                         let keyed_repositories = peers
                             .iter()
                             .map(|(key, spec)| (key.clone(), spec))

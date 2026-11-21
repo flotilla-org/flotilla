@@ -2,7 +2,7 @@
 //! its backend: the readers that take the ports run unchanged over a bare backend's records.
 //! Each read is the same keyed or indexed read the engine's port makes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use flotilla_resources::{
     engine_records::Record,
@@ -62,14 +62,8 @@ impl RepositoryRecords for BackendRepositories {
 
     async fn workspace_slug_peers(&self, spec: &RepositorySpec) -> Result<Vec<Record<Repository>>, String> {
         let all = self.backend.using::<Repository>(&self.namespace).list().await.map_err(|error| error.to_string())?;
-        let own = spec.key();
-        let others: Vec<_> = all.items.into_iter().filter(|object| object.spec.key() != own).collect();
-        let names: BTreeSet<String> =
-            flotilla_resources::repository::workspace_slug_component(spec, others.iter().map(|object| &object.spec))
-                .into_iter()
-                .map(|peer| peer.key().to_string())
-                .collect();
-        Ok(others.into_iter().filter(|object| names.contains(&object.spec.key().to_string())).map(Self::record).collect())
+        let listed = all.items.into_iter().map(Self::record).collect();
+        Ok(flotilla_resources::repository_records::workspace_slug_peer_records(spec, listed))
     }
 
     async fn changes(&self) -> Result<BoxStream<'_, ()>, String> {

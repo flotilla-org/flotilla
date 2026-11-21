@@ -288,15 +288,7 @@ impl flotilla_resources::repository_records::RepositoryRecords for EngineReposit
     }
 
     async fn workspace_slug_peers(&self, spec: &RepositorySpec) -> Result<Vec<Record<Repository>>, String> {
-        let all = KindRecords::<Repository>::list(self).await?;
-        let own = spec.key();
-        let candidates: Vec<&Record<Repository>> = all.iter().filter(|record| record.spec.key() != own).collect();
-        let names: std::collections::BTreeSet<String> =
-            flotilla_resources::repository::workspace_slug_component(spec, candidates.iter().map(|record| &record.spec))
-                .into_iter()
-                .map(|peer| peer.key().to_string())
-                .collect();
-        Ok(all.into_iter().filter(|record| names.contains(&record.spec.key().to_string())).collect())
+        Ok(flotilla_resources::repository_records::workspace_slug_peer_records(spec, KindRecords::<Repository>::list(self).await?))
     }
 
     async fn changes(&self) -> Result<BoxStream<'_, ()>, String> {
