@@ -3722,6 +3722,7 @@ async fn hello_and_shutdown_remain_responsive_under_scoped_convoy_load() {
         for index in 0..512 {
             let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", format!("work-{index}"));
             let row = flotilla_protocol::ConvoyRow::builder()
+                .home(flotilla_protocol::HostName::new("local"))
                 .resource(resource)
                 .name(format!("work-{index}"))
                 .workflow_ref("scratch")

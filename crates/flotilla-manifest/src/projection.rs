@@ -431,7 +431,7 @@ pub fn project_catalog_fragment(
         input.subjects.map_or_else(Vec::new, |subjects| subjects.forges.iter().map(|forge| forge.spec.clone()).collect());
     if let Some(nodes) = input.awareness {
         for node in nodes {
-            project_awareness_node(&mut catalog, node, input.convoys, &forges, mint, headers.get(&node.id).copied());
+            project_awareness_node(&mut catalog, node, input.convoys, input.independents, &forges, mint, headers.get(&node.id).copied());
         }
         project_readiness(&mut catalog, input.convoys);
         mark_superseded_convoys(&mut catalog, input.convoys);
@@ -461,7 +461,7 @@ pub fn project_catalog_fragment(
 /// Definitions publish even when no convoy or awareness entry exists.
 fn project_repository_memberships(catalog: &mut Catalog, projects: &[ProjectRepositoriesRow]) {
     for project in projects {
-        let project_entity = entity::project(&project.resource.name);
+        let Some(project_entity) = self::project_entity(&project.resource.name) else { continue };
         let mut facts = vec![
             (SEGMENT_PROJECT, MetadataValue::text(project_entity.id.clone())),
             (KEY_PROJECT_NAME, MetadataValue::text(&project.display_name)),
@@ -469,16 +469,13 @@ fn project_repository_memberships(catalog: &mut Catalog, projects: &[ProjectRepo
             (KEY_PROJECT_REPOSITORY_COUNT, MetadataValue::Integer(project.repositories.len() as i64)),
         ];
         if let Some(parent) = &project.parent {
-            facts.push((crate::keys::KEY_PROJECT_PARENT, MetadataValue::text(entity::project(&parent.name).id)));
+            if let Some(parent) = self::project_entity(&parent.name) {
+                facts.push((crate::keys::KEY_PROJECT_PARENT, MetadataValue::text(parent.id)));
+            }
         }
         catalog.assert_entity(project_entity.clone(), facts, None);
         for membership in &project.repositories {
-            let relation = entity::project_repository(
-                &project.resource.namespace,
-                &project.resource.name,
-                &membership.key.0,
-                membership.subpath.as_deref(),
-            );
+            let relation = entity::project_repository(&project.resource.name, &membership.key.0, membership.subpath.as_deref());
             let mut facts = vec![
                 (KEY_MEMBERSHIP_PROJECT, MetadataValue::text(&project_entity.id)),
                 (KEY_MEMBERSHIP_REPOSITORY_KEY, MetadataValue::text(&membership.key.0)),
@@ -510,7 +507,7 @@ fn project_standing_roles(catalog: &mut Catalog, roles: &[StandingRoleRow], conv
             .iter()
             .find(|role| role.resource.namespace == convoy.resource.namespace && Some(&role.resource.name) == convoy.ensured_from.as_ref());
         let Some(convoy_entity) = convoy_entity(convoy) else { continue };
-        role_by_convoy.insert(convoy_entity.id, declared.map(role_entity));
+        role_by_convoy.insert(convoy_entity.id, declared.and_then(role_entity));
     }
     for facts in catalog.facts.values_mut() {
         let Some(MetadataValue::Text(convoy)) = facts.get(KEY_CONVOY).map(|fact| &fact.value) else {
@@ -534,8 +531,8 @@ fn role_project(role: &StandingRoleRow) -> &str {
     role.project_ref.rsplit('/').next().unwrap_or(&role.project_ref)
 }
 
-fn role_entity(role: &StandingRoleRow) -> EntityRef {
-    entity::role(role_project(role), &role.role)
+pub(crate) fn role_entity(role: &StandingRoleRow) -> Option<EntityRef> {
+    refused(entity::role(role_project(role), &role.role), &role.role)
 }
 
 fn standing_attempts<'a>(role: &StandingRoleRow, convoys: &'a [ConvoyRow]) -> Vec<&'a ConvoyRow> {
@@ -548,9 +545,8 @@ fn standing_attempts<'a>(role: &StandingRoleRow, convoys: &'a [ConvoyRow]) -> Ve
 }
 
 fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
-    let entity = role_entity(role);
     let project_name = role_project(role);
-    let project = entity::project(project_name);
+    let (Some(entity), Some(project)) = (role_entity(role), project_entity(project_name)) else { return };
     let attempts = standing_attempts(role, convoys);
     let latest = attempts.last().copied();
     let live = attempts.iter().rev().copied().find(|convoy| convoy.is_live());
@@ -661,6 +657,7 @@ fn project_awareness_node(
     catalog: &mut Catalog,
     node: &AwarenessNode,
     convoys: &[ConvoyRow],
+    independents: &[IndependentRow],
     forges: &[ForgeSpec],
     mint: &dyn RecipeMint,
     visible: Option<usize>,
@@ -674,7 +671,7 @@ fn project_awareness_node(
         catalog.assert_entity(entity, facts, None);
     }
     for entry in &node.entries {
-        project_awareness_entry(catalog, &parent, entry, convoys, forges, mint);
+        project_awareness_entry(catalog, &parent, entry, convoys, independents, forges, mint);
     }
 }
 
@@ -709,7 +706,7 @@ fn node_convoy<'a>(node: &AwarenessNode, convoys: &'a [ConvoyRow]) -> Option<&'a
 fn awareness_node_entity(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Option<(EntityRef, Vec<(&'static str, MetadataValue)>)> {
     match node.kind {
         AwarenessKind::Project => {
-            let entity = entity::project(&node.scope.as_ref()?.name);
+            let entity = project_entity(&node.scope.as_ref()?.name)?;
             let mut facts = vec![
                 (SEGMENT_PROJECT, MetadataValue::text(entity.id.clone())),
                 (KEY_PROJECT_NAME, MetadataValue::text(node.label.clone())),
@@ -742,6 +739,7 @@ fn project_awareness_entry(
     parent: &[(&'static str, MetadataValue)],
     entry: &AwarenessEntry,
     convoys: &[ConvoyRow],
+    independents: &[IndependentRow],
     forges: &[ForgeSpec],
     mint: &dyn RecipeMint,
 ) {
@@ -749,7 +747,7 @@ fn project_awareness_entry(
     if let Some(repo) = &repo {
         assert_repo_entity(catalog, repo);
     }
-    let Some((entity, mut own_facts)) = awareness_entry_entity(entry, convoys, forges) else {
+    let Some((entity, mut own_facts)) = awareness_entry_entity(entry, convoys, independents, forges) else {
         return;
     };
     let mut facts = parent.to_vec();
@@ -796,6 +794,7 @@ fn project_awareness_entry(
 fn awareness_entry_entity(
     entry: &AwarenessEntry,
     convoys: &[ConvoyRow],
+    independents: &[IndependentRow],
     forges: &[ForgeSpec],
 ) -> Option<(EntityRef, Vec<(&'static str, MetadataValue)>)> {
     let mut label = entry.label.clone();
@@ -837,8 +836,8 @@ fn awareness_entry_entity(
         AwarenessKind::Independent => {
             let reference = entry.refs.first()?;
             let value = reference.name.as_str();
-            let session_ref = format!("{}/{}/{}", entity::home(reference)?, reference.namespace, reference.name);
-            let entity = entity::session(&session_ref);
+            let independent = independents.iter().find(|independent| independent.resource == *reference)?;
+            let entity = entity::session(independent.host.as_str(), &independent.name);
             let mut facts = vec![(KEY_SESSION, MetadataValue::text(entity.id.clone()))];
             facts.extend(label_tier_facts(value));
             (entity, facts)
@@ -876,14 +875,23 @@ fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &
     }
 }
 
-/// The convoy's entity, spelled by the home its row carries. A row without a
-/// home has no entity.
-fn convoy_entity(convoy: &ConvoyRow) -> Option<EntityRef> {
-    Some(entity::convoy(entity::home(&convoy.resource)?, &convoy.resource.name))
+/// An entity the address grammar refuses is an error on its record: the record
+/// is skipped and the rest of the catalog still publishes.
+pub(crate) fn refused(result: Result<EntityRef, entity::Error>, record: &str) -> Option<EntityRef> {
+    result.map_err(|error| tracing::error!(%record, %error, "a record's name is not a valid address component; it has no entity")).ok()
+}
+
+/// The convoy's entity, spelled by the home its row carries.
+pub(crate) fn convoy_entity(convoy: &ConvoyRow) -> Option<EntityRef> {
+    refused(entity::convoy(convoy.home.as_str(), &convoy.resource.name), &convoy.resource.name)
 }
 
 fn vessel_entity(convoy: &ConvoyRow, vessel: &VesselRow) -> Option<EntityRef> {
-    Some(entity::vessel(entity::home(&convoy.resource)?, &convoy.resource.name, &vessel.name))
+    refused(entity::vessel(convoy.home.as_str(), &convoy.resource.name, &vessel.name), &vessel.name)
+}
+
+pub(crate) fn project_entity(name: &str) -> Option<EntityRef> {
+    refused(entity::project(name), name)
 }
 
 /// The convoy row an awareness entry's typed ref names.
@@ -1117,7 +1125,7 @@ fn project_vessel(
                     crew_facts.push((key, MetadataValue::text(value)));
                 }
             }
-            catalog.assert_entity(entity::session(session), crew_facts, ordinal);
+            catalog.assert_entity(EntityRef::new("session", session.clone()), crew_facts, ordinal);
         }
     }
     facts.extend(label_tier_facts(&vessel.name));
@@ -1139,9 +1147,7 @@ fn project_vessel(
 }
 
 fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint: &dyn RecipeMint) {
-    let namespace = &independent.resource.namespace;
-    let session_ref = format!("{}/{namespace}/{}", independent.host, independent.name);
-    let entity = entity::session(&session_ref);
+    let entity = entity::session(independent.host.as_str(), &independent.name);
     let repo = independent.repo_fact.as_ref().map(|repo| repo.0.as_str());
     if let Some(repo) = repo {
         assert_repo_entity(catalog, repo);
@@ -1174,7 +1180,7 @@ fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint
 
 fn project_fact(project_ref: Option<&str>) -> Option<(EntityRef, Vec<(&'static str, MetadataValue)>)> {
     let name = project_ref?.rsplit('/').next()?;
-    let entity = entity::project(name);
+    let entity = project_entity(name)?;
     let mut facts = vec![
         (SEGMENT_PROJECT, MetadataValue::text(entity.id.clone())),
         (KEY_PROJECT_NAME, MetadataValue::text(name)),

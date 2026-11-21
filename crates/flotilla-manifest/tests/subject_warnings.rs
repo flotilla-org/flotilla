@@ -96,6 +96,7 @@ fn uncovered_subject_service_warns_with_service() {
     let source = IssueSource { service: "forge.example".into(), scope: "org/repo".into() };
     let mut convoy = ConvoyRow::builder()
         .resource(ResourceRef::new("flotilla/v1", "Convoy", "dev", "work").on_host(flotilla_protocol::HostName::new("kiwi")))
+        .home(flotilla_protocol::HostName::new("kiwi"))
         .name("work")
         .project_ref("flotilla")
         .workflow_ref("dev")

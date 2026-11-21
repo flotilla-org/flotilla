@@ -317,6 +317,7 @@ mod tests {
     fn convoy_summary_preserves_origin_host_for_action_routing() {
         let row = wire::ConvoyRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "remote-convoy").on_host(HostName::new("feta")))
+            .home(HostName::new("feta"))
             .name("remote-convoy")
             .workflow_ref("review-and-fix")
             .project_ref("flotilla")

@@ -5,7 +5,6 @@
 //! thing fold onto the same wire target.
 
 use flotilla_address::{Address, Forge, Kind};
-use flotilla_protocol::{HostName, ResourceRef};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -28,61 +27,49 @@ impl EntityRef {
     }
 }
 
-/// The record's engine home, the `host:` segment of its address. A record
-/// without one has no entity: there is no default home.
-pub fn home(resource: &ResourceRef) -> Option<&str> {
-    resource.host.as_ref().map(HostName::as_str)
-}
+/// An id the address grammar refuses. The producer skips that record and says
+/// why; it never builds a malformed id and never panics.
+pub type Error = flotilla_address::Error;
 
-fn address(result: Result<Address, flotilla_address::Error>, what: &str) -> Address {
-    result.unwrap_or_else(|error| panic!("{what} is not a valid address component: {error}"))
-}
-
-fn convoy_address(home: &str, launch: &str) -> Address {
-    address(Address::root(Kind::Host, home).and_then(|host| host.child(Kind::Convoy, launch)), "a convoy launch")
+fn convoy_address(home: &str, launch: &str) -> Result<Address, Error> {
+    Address::root(Kind::Host, home)?.child(Kind::Convoy, launch)
 }
 
 /// A project: `project:<name>`.
-pub fn project(name: &str) -> EntityRef {
-    EntityRef::new("project", address(Address::project(name), "a project name").to_string())
+pub fn project(name: &str) -> Result<EntityRef, Error> {
+    Ok(EntityRef::new("project", Address::project(name)?.to_string()))
 }
 
 pub fn repo(forge_slug: &str) -> EntityRef {
     EntityRef::new("repo", forge_slug)
 }
 
-/// Length-prefixed components keep repository keys and subpaths unambiguous.
-pub fn project_repository(namespace: &str, project: &str, repository_key: &str, subpath: Option<&str>) -> EntityRef {
+/// A repository's membership in a project. The address grammar has no spelling
+/// for it, so it is the project's id and the repository key and subpath, each
+/// length-prefixed so the components stay unambiguous. No namespace is in it.
+pub fn project_repository(project: &str, repository_key: &str, subpath: Option<&str>) -> EntityRef {
     let component = |value: &str| format!("{}:{value}", value.len());
     let subpath_presence = if subpath.is_some() { "1" } else { "0" };
     EntityRef::new(
         "project_repository",
-        format!(
-            "{}{}{}{subpath_presence}{}",
-            component(namespace),
-            component(project),
-            component(repository_key),
-            component(subpath.unwrap_or(""))
-        ),
+        format!("{}{}{subpath_presence}{}", component(project), component(repository_key), component(subpath.unwrap_or(""))),
     )
 }
 
 /// A convoy launch, by the home that holds its record: `host:<home>/convoy:<launch>`.
-pub fn convoy(home: &str, launch: &str) -> EntityRef {
-    EntityRef::new("convoy", convoy_address(home, launch).to_string())
+pub fn convoy(home: &str, launch: &str) -> Result<EntityRef, Error> {
+    Ok(EntityRef::new("convoy", convoy_address(home, launch)?.to_string()))
 }
 
 /// A standing project role, stable across the convoy attempts backing it:
 /// `project:<project>/role:<role>`.
-pub fn role(project: &str, role: &str) -> EntityRef {
-    let address = address(Address::project(project).and_then(|project| project.child(Kind::Role, role)), "a standing role");
-    EntityRef::new("role", address.to_string())
+pub fn role(project: &str, role: &str) -> Result<EntityRef, Error> {
+    Ok(EntityRef::new("role", Address::project(project)?.child(Kind::Role, role)?.to_string()))
 }
 
 /// A convoy's vessel: `host:<home>/convoy:<launch>/vessel:<name>`.
-pub fn vessel(home: &str, launch: &str, vessel_name: &str) -> EntityRef {
-    let address = address(convoy_address(home, launch).child(Kind::Vessel, vessel_name), "a vessel name");
-    EntityRef::new("vessel", address.to_string())
+pub fn vessel(home: &str, launch: &str, vessel_name: &str) -> Result<EntityRef, Error> {
+    Ok(EntityRef::new("vessel", convoy_address(home, launch)?.child(Kind::Vessel, vessel_name)?.to_string()))
 }
 
 /// An issue by its address: `forge:<id>/repo:<owner/repo>/issue:<number>`.
@@ -99,22 +86,23 @@ pub fn forge(forge: &Forge) -> EntityRef {
     EntityRef::new("forge", Address::forge(forge).to_string())
 }
 
-pub fn session(session_ref: &str) -> EntityRef {
-    EntityRef::new("session", session_ref)
+/// A terminal session, by the host that acts on it: `<host>/<name>`. The
+/// address grammar spells an agent session only under a role, so this is not an
+/// address; it carries no namespace.
+pub fn session(host: &str, name: &str) -> EntityRef {
+    EntityRef::new("session", format!("{host}/{name}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::HostName;
-
     use super::*;
 
     #[test]
     fn constructors_build_canonical_address_text() {
-        assert_eq!(convoy("feta", "convoy-7da0#8661").id, "host:feta/convoy:convoy-7da0%238661");
-        assert_eq!(vessel("feta", "fix#8", "work").id, "host:feta/convoy:fix%238/vessel:work");
-        assert_eq!(role("ghostty", "governor").id, "project:ghostty/role:governor");
-        assert_eq!(project("flotilla").id, "project:flotilla");
+        assert_eq!(convoy("feta", "convoy-7da0#8661").expect("convoy").id, "host:feta/convoy:convoy-7da0%238661");
+        assert_eq!(vessel("feta", "fix#8", "work").expect("vessel").id, "host:feta/convoy:fix%238/vessel:work");
+        assert_eq!(role("ghostty", "governor").expect("role").id, "project:ghostty/role:governor");
+        assert_eq!(project("flotilla").expect("project").id, "project:flotilla");
         let github = Forge::github();
         let cr = Address::change_request(&github, "flotilla-org/flotilla", 4407).expect("address");
         assert_eq!(change_request(&cr).id, "forge:github/repo:flotilla-org%2Fflotilla/cr:4407");
@@ -122,21 +110,23 @@ mod tests {
         assert_eq!(issue(&issue_address).id, "forge:github/repo:flotilla-org%2Fflotilla/issue:4406");
         assert_eq!(forge(&github).id, "forge:github");
         assert_eq!(repo("github.com:flotilla-org/flotilla").id, "github.com:flotilla-org/flotilla");
-        assert_eq!(session("feta/dev/terminal-coder").id, "feta/dev/terminal-coder");
+        assert_eq!(session("feta", "terminal-coder").id, "feta/terminal-coder");
     }
 
     #[test]
     fn a_standing_launch_name_stays_one_segment() {
         let launch = "project:x/convoy:governor#3";
-        let id = convoy("feta", launch).id;
+        let id = convoy("feta", launch).expect("convoy").id;
         assert_eq!(id.parse::<Address>().expect("canonical").get(Kind::Convoy), Some(launch));
     }
 
     #[test]
-    fn home_is_the_records_host_and_never_defaults() {
-        let local = ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "cutover");
-        assert_eq!(home(&local), None);
-        assert_eq!(home(&local.on_host(HostName::new("kiwi"))), Some("kiwi"));
+    fn a_name_the_grammar_refuses_is_an_error_not_a_panic() {
+        assert!(convoy("", "fix").is_err());
+        assert!(convoy("feta", "").is_err());
+        assert!(vessel("feta", "fix", "").is_err());
+        assert!(role("ghostty", "").is_err());
+        assert!(project("").is_err());
     }
 
     #[test]

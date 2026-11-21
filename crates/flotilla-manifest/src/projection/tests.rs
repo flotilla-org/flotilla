@@ -328,6 +328,7 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
     terminal.cleat_endpoint = Some(endpoint.clone());
     terminal.environment_kind = Some(EnvironmentKind::Direct);
     let convoy = ConvoyRow::builder()
+        .home(reference.host.clone().expect("test convoy is homed"))
         .resource(reference)
         .name("remote")
         .project_ref("flotilla")
@@ -338,7 +339,7 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
         .build();
     let remote_mint = mint().with_host_routes(HostName::new("kiwi"), BTreeMap::from([("feta".to_owned(), "crew-alias".to_owned())]));
     let remote = project_catalog(&catalog_input(std::slice::from_ref(&convoy)), &remote_mint);
-    let vessel_entity = entity::vessel("kiwi", "remote", "coder");
+    let vessel_entity = entity::vessel("kiwi", "remote", "coder").expect("valid address");
     let patch = find_entity(&remote.reassert_patches(), &vessel_entity).clone();
     assert_eq!(text(&patch, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --host 'feta' 'terminal-remote-coder'");
     assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_TRANSPORT), "ssh");
@@ -347,7 +348,7 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
     assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_DAEMON), endpoint.daemon);
     assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_SESSION), endpoint.session);
     assert_eq!(
-        text(find_entity(&remote.reassert_patches(), &entity::convoy("kiwi", "remote")), KEY_SUMMARY_TEXT),
+        text(find_entity(&remote.reassert_patches(), &entity::convoy("kiwi", "remote").expect("valid address")), KEY_SUMMARY_TEXT),
         "waiting for a reviewer"
     );
 
@@ -418,6 +419,7 @@ fn vessel_on_another_machine_attaches_through_its_acting_daemon_only() {
     terminal.cleat_endpoint =
         Some(CleatEndpoint { runtime_root: "/run/cleat".to_owned(), daemon: "b1@1".to_owned(), session: "session-7".to_owned() });
     let convoy = ConvoyRow::builder()
+        .home(reference.host.clone().expect("test convoy is homed"))
         .resource(reference)
         .name("ssh")
         .project_ref("flotilla")
@@ -429,7 +431,7 @@ fn vessel_on_another_machine_attaches_through_its_acting_daemon_only() {
     let catalog = project_catalog(&catalog_input(&[convoy]), &mint().with_host_routes(HostName::new("kiwi"), routes));
 
     let patches = catalog.reassert_patches();
-    for target in [entity::vessel("kiwi", "ssh", "coder"), entity::convoy("kiwi", "ssh")] {
+    for target in [entity::vessel("kiwi", "ssh", "coder").expect("valid address"), entity::convoy("kiwi", "ssh").expect("valid address")] {
         let patch = find_entity(&patches, &target);
         assert_eq!(text(patch, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --host 'udder' 'terminal-ssh-coder'");
         assert_eq!(patch.set[KEY_READINESS_ATTACH_AVAILABLE].value, MetadataValue::Bool(true));
@@ -444,7 +446,7 @@ fn vessel_on_another_machine_attaches_through_its_acting_daemon_only() {
             assert!(!patch.set.contains_key(key), "{target:?} publishes {key}");
         }
     }
-    let vessel = find_entity(&patches, &entity::vessel("kiwi", "ssh", "coder"));
+    let vessel = find_entity(&patches, &entity::vessel("kiwi", "ssh", "coder").expect("valid address"));
     assert_eq!(text(vessel, KEY_VESSEL_HOST), "udder");
     assert_eq!(text(vessel, KEY_VESSEL_CARRIED_BY), "b1");
 }
@@ -453,6 +455,7 @@ fn vessel_on_another_machine_attaches_through_its_acting_daemon_only() {
 fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
     let reference = convoy_ref("dev", "cutover");
     let convoy = ConvoyRow::builder()
+        .home(reference.clone().host.clone().expect("test convoy is homed"))
         .resource(reference.clone())
         .name("cutover")
         .workflow_ref("implement")
@@ -491,8 +494,8 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
         patches.iter().all(|patch| matches!(patch.target, MetadataTarget::Entity(_))),
         "the connector emits no pre-built group targets"
     );
-    let convoy_entity = entity::convoy("kiwi", "cutover");
-    let vessel_entity = entity::vessel("kiwi", "cutover", "coder");
+    let convoy_entity = entity::convoy("kiwi", "cutover").expect("valid address");
+    let vessel_entity = entity::vessel("kiwi", "cutover", "coder").expect("valid address");
     let convoy_patch = find_entity(&patches, &convoy_entity);
     let vessel_patch = find_entity(&patches, &vessel_entity);
 
@@ -517,6 +520,7 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
 fn long_entity_labels_publish_stable_semantic_tiers() {
     let reference = convoy_ref("dev", "convoy-0123456789abcdef");
     let convoy = ConvoyRow::builder()
+        .home(reference.clone().host.clone().expect("test convoy is homed"))
         .resource(reference.clone())
         .name("grouping-live-session")
         .workflow_ref("implement")
@@ -547,10 +551,15 @@ fn long_entity_labels_publish_stable_semantic_tiers() {
     assert_eq!(first, second, "re-assertion must reuse the same label facts");
 
     let cases = [
-        (entity::project("platform-observability-tools"), "platform-observability-tools", "po-tools", "pot"),
-        (entity::convoy("kiwi", &reference.name), "grouping-live-session", "gl-session", "gls"),
-        (entity::vessel("kiwi", &reference.name, "publish-release-notes"), "publish-release-notes", "pr-notes", "prn"),
-        (entity::session("feta/dev/governor"), "governor", "governor", "g"),
+        (entity::project("platform-observability-tools").expect("valid address"), "platform-observability-tools", "po-tools", "pot"),
+        (entity::convoy("kiwi", &reference.name).expect("valid address"), "grouping-live-session", "gl-session", "gls"),
+        (
+            entity::vessel("kiwi", &reference.name, "publish-release-notes").expect("valid address"),
+            "publish-release-notes",
+            "pr-notes",
+            "prn",
+        ),
+        (entity::session("feta", "governor"), "governor", "governor", "g"),
     ];
     for (entity, full, medium, short) in cases {
         let patch = find_entity(&first, &entity);
@@ -598,7 +607,7 @@ fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
     )
     .reassert_patches();
     let issue_patch = find_entity(&patches, &issue_entity("github", issue_ref.source.scope, issue_ref.id));
-    let project_patch = find_entity(&patches, &entity::project("platform"));
+    let project_patch = find_entity(&patches, &entity::project("platform").expect("valid address"));
     assert_eq!(text(issue_patch, KEY_ENTITY_KIND), "issue");
     assert_eq!(
         project_patch.set[KEY_COUNT_ISSUES].value,
@@ -637,6 +646,7 @@ fn awareness_convoy_labels_ignore_legacy_subject_annotations() {
         .build();
 
     let row = ConvoyRow::builder()
+        .home(convoy_ref("dev", "landing").host.clone().expect("test convoy is homed"))
         .resource(convoy_ref("dev", "landing"))
         .name("landing")
         .workflow_ref("implement")
@@ -654,7 +664,7 @@ fn awareness_convoy_labels_ignore_legacy_subject_annotations() {
         &mint(),
     )
     .reassert_patches();
-    let convoy = find_entity(&patches, &entity::convoy("kiwi", "landing"));
+    let convoy = find_entity(&patches, &entity::convoy("kiwi", "landing").expect("valid address"));
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL), "landing");
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL_MEDIUM), "landing");
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL_SHORT), "l");
@@ -662,7 +672,7 @@ fn awareness_convoy_labels_ignore_legacy_subject_annotations() {
     assert_eq!(text(convoy, KEY_CONVOY_NAME), "landing");
     assert!(!convoy.set.contains_key(KEY_CHANGE_REQUEST_NUMBER));
 
-    let project = find_entity(&patches, &entity::project("platform"));
+    let project = find_entity(&patches, &entity::project("platform").expect("valid address"));
     assert_eq!(text(project, KEY_SUMMARY_TEXT), "1 entries · 0 issues · 0 vessels · 0 checkouts");
     assert_eq!(project.set[KEY_COUNT_TOTAL].value, MetadataValue::Integer(1));
     assert_eq!(project.set[KEY_COUNT_CHECKOUTS].value, MetadataValue::Integer(0));
@@ -708,7 +718,7 @@ fn truncated_awareness_summary_reports_exact_omitted_count() {
         &mint(),
     )
     .reassert_patches();
-    let project = find_entity(&patches, &entity::project("platform"));
+    let project = find_entity(&patches, &entity::project("platform").expect("valid address"));
     assert!(text(project, KEY_SUMMARY_TEXT).ends_with("+3 more"));
 }
 
@@ -717,6 +727,7 @@ fn same_role_remote_governors_project_as_distinct_catalog_entities() {
     let governor = |resource_name: &str, project: &str| {
         ConvoyRow::builder()
             .resource(convoy_ref("flotilla", resource_name).on_host(HostName::new("udder")))
+            .home(HostName::new("udder"))
             .name("governor")
             .workflow_ref("standing-governor")
             .phase(ConvoyPhase::Active)
@@ -759,7 +770,7 @@ fn same_role_remote_governors_project_as_distinct_catalog_entities() {
     )
     .reassert_patches();
     for (resource_name, project) in [("governor-andamento-01234567", "andamento"), ("governor-wheelhouse-89abcdef", "wheelhouse")] {
-        let governor = find_entity(&patches, &entity::convoy("udder", resource_name));
+        let governor = find_entity(&patches, &entity::convoy("udder", resource_name).expect("valid address"));
         assert_eq!(text(governor, SEGMENT_PROJECT), format!("project:{project}"));
         assert_eq!(text(governor, KEY_CONVOY), format!("host:udder/convoy:{resource_name}"));
         assert_eq!(text(governor, KEY_CONVOY_NAME), "governor");
@@ -789,7 +800,7 @@ fn empty_project_is_an_idle_zero_count_latent_that_opens_its_scoped_view() {
         &mint(),
     )
     .reassert_patches();
-    let project = find_entity(&patches, &entity::project("empty"));
+    let project = find_entity(&patches, &entity::project("empty").expect("valid address"));
 
     assert_eq!(text(project, KEY_STATUS_STATE), "idle");
     assert_eq!(project.set[KEY_COUNT_TOTAL].value, MetadataValue::Integer(0));
@@ -822,6 +833,7 @@ fn awareness_children_use_their_convoys_canonical_origin() {
         .build();
     let reference = convoy_ref("dev", "cutover");
     let convoy = ConvoyRow::builder()
+        .home(reference.host.clone().expect("test convoy is homed"))
         .resource(reference)
         .name("cutover")
         .project_ref("flotilla")
@@ -865,13 +877,20 @@ fn awareness_repository_group_does_not_masquerade_as_project() {
         .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
         .entries(vec![independent])
         .build();
+    let row = IndependentRow::builder()
+        .resource(ResourceRef::new("flotilla/v1", "TerminalSession", "dev", "governor").on_host(HostName::new("feta")))
+        .name("governor")
+        .host(HostName::new("feta"))
+        .attach("governor")
+        .phase(SessionPhase::Running)
+        .build();
 
     let patches = project_catalog(
         &CatalogInput {
             subjects: None,
             awareness: Some(&[node]),
             convoys: &[],
-            independents: &[],
+            independents: &[row],
             standing_roles: &[],
             project_repositories: &[],
         },
@@ -880,7 +899,7 @@ fn awareness_repository_group_does_not_masquerade_as_project() {
     .reassert_patches();
 
     find_entity(&patches, &entity::repo("flotilla-org/flotilla"));
-    let independent = find_entity(&patches, &entity::session("feta/dev/governor"));
+    let independent = find_entity(&patches, &entity::session("feta", "governor"));
     assert_eq!(text(independent, KEY_DISPLAY_LABEL), "governor");
     assert_eq!(text(independent, KEY_DISPLAY_LABEL_MEDIUM), "governor");
     assert_eq!(text(independent, KEY_DISPLAY_LABEL_SHORT), "g");
@@ -911,7 +930,7 @@ fn independent_session_uses_the_canonical_session_ref() {
         &mint(),
     )
     .reassert_patches();
-    let session = entity::session("feta/dev/scratch");
+    let session = entity::session("feta", "scratch");
     let patch = find_entity(&patches, &session);
     assert_eq!(text(patch, KEY_SESSION), session.id);
     assert_eq!(text(patch, KEY_PRIMARY_ACTION_TARGET), "session:feta/scratch");
@@ -921,6 +940,7 @@ fn independent_session_uses_the_canonical_session_ref() {
 fn catalog_diff_unsets_removed_entity_facts() {
     let reference = convoy_ref("dev", "cutover");
     let with_message = ConvoyRow::builder()
+        .home(reference.clone().host.clone().expect("test convoy is homed"))
         .resource(reference.clone())
         .name("cutover")
         .project_ref("flotilla")
@@ -929,6 +949,7 @@ fn catalog_diff_unsets_removed_entity_facts() {
         .message("boom")
         .build();
     let without_message = ConvoyRow::builder()
+        .home(reference.host.clone().expect("test convoy is homed"))
         .resource(reference)
         .name("cutover")
         .project_ref("flotilla")
@@ -958,7 +979,7 @@ fn catalog_diff_unsets_removed_entity_facts() {
         &mint(),
     );
     let diff = current.diff_patches(&previous);
-    let patch = find_entity(&diff, &entity::convoy("kiwi", "cutover"));
+    let patch = find_entity(&diff, &entity::convoy("kiwi", "cutover").expect("valid address"));
     assert!(patch.unset.contains(&KEY_CONVOY_MESSAGE.to_owned()));
 }
 
@@ -975,6 +996,7 @@ fn badges_preserve_normalized_status_and_attention() {
 #[test]
 fn an_unreadable_convoy_asks_for_attention_with_its_reason_and_no_phase() {
     let unreadable = ConvoyRow::builder()
+        .home(convoy_ref("dev", "broken").host.clone().expect("test convoy is homed"))
         .resource(convoy_ref("dev", "broken"))
         .name("broken")
         .project_ref("flotilla")
@@ -982,7 +1004,7 @@ fn an_unreadable_convoy_asks_for_attention_with_its_reason_and_no_phase() {
         .unreadable("admission document does not decode")
         .build();
     let patches = project_catalog(&catalog_input(&[unreadable]), &mint()).reassert_patches();
-    let patch = find_entity(&patches, &entity::convoy("kiwi", "broken"));
+    let patch = find_entity(&patches, &entity::convoy("kiwi", "broken").expect("valid address"));
 
     assert_eq!(text(patch, KEY_STATUS_STATE), "waiting");
     assert_eq!(patch.set.get(KEY_STATUS_ATTENTION).map(|fact| &fact.value), Some(&MetadataValue::Bool(true)));
@@ -990,10 +1012,35 @@ fn an_unreadable_convoy_asks_for_attention_with_its_reason_and_no_phase() {
     assert!(!patch.set.contains_key(crate::keys::KEY_CONVOY_PHASE), "{patch:?}");
 }
 
+// A name the address grammar refuses is an error on that record: its convoy and
+// vessels have no entity, and the records beside it still publish.
+#[test]
+fn a_record_with_a_name_the_grammar_refuses_is_skipped_not_fatal() {
+    let row = |name: &str| {
+        let reference = convoy_ref("dev", name);
+        ConvoyRow::builder()
+            .home(HostName::new("kiwi"))
+            .resource(reference.clone())
+            .name(name)
+            .project_ref("flotilla")
+            .workflow_ref("implement")
+            .phase(ConvoyPhase::Active)
+            .vessels(vec![vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-x").call()])
+            .build()
+    };
+    let rows = [row(""), row("fine")];
+    let patches = project_catalog(&catalog_input(&rows), &mint()).reassert_patches();
+
+    find_entity(&patches, &entity::convoy("kiwi", "fine").expect("valid address"));
+    let convoys = patches.iter().filter(|patch| matches!(&patch.target, MetadataTarget::Entity(entity) if entity.kind == "convoy")).count();
+    assert_eq!(convoys, 1, "only the record with a valid name has an entity");
+}
+
 #[test]
 fn convoy_summary_surfaces_status_message_ahead_of_progress() {
     let reference = convoy_ref("dev", "waiting");
     let convoy = ConvoyRow::builder()
+        .home(reference.clone().host.clone().expect("test convoy is homed"))
         .resource(reference.clone())
         .name("waiting")
         .project_ref("flotilla")
@@ -1014,7 +1061,7 @@ fn convoy_summary_surfaces_status_message_ahead_of_progress() {
         &mint(),
     )
     .reassert_patches();
-    let patch = find_entity(&patches, &entity::convoy("kiwi", "waiting"));
+    let patch = find_entity(&patches, &entity::convoy("kiwi", "waiting").expect("valid address"));
 
     assert_eq!(text(patch, KEY_STATUS_STATE), "waiting");
     assert_eq!(text(patch, KEY_SUMMARY_TEXT), "2 in pool, all leased");
@@ -1035,6 +1082,7 @@ fn crew_roles_remain_a_flat_fact() {
         agent_session: None,
     }];
     let convoy = ConvoyRow::builder()
+        .home(reference.host.clone().expect("test convoy is homed"))
         .resource(reference)
         .name("cutover")
         .project_ref("flotilla")
@@ -1054,7 +1102,7 @@ fn crew_roles_remain_a_flat_fact() {
         &mint(),
     )
     .reassert_patches();
-    let patch = find_entity(&patches, &entity::vessel("kiwi", "cutover", "coder"));
+    let patch = find_entity(&patches, &entity::vessel("kiwi", "cutover", "coder").expect("valid address"));
     assert_eq!(patch.set[KEY_CREW_ROLES].value, MetadataValue::StringList(vec!["coder".to_owned()]));
 }
 
@@ -1063,6 +1111,7 @@ fn awareness_retains_exact_convoy_phase_for_visibility_controls() {
     for phase in [ConvoyPhase::Active, ConvoyPhase::Landed, ConvoyPhase::Abandoned, ConvoyPhase::Failed] {
         let reference = convoy_ref("dev", "governor-old");
         let convoy = ConvoyRow::builder()
+            .home(reference.clone().host.clone().expect("test convoy is homed"))
             .resource(reference.clone())
             .name("governor".to_owned())
             .project_ref("flotilla")
@@ -1089,10 +1138,10 @@ fn awareness_retains_exact_convoy_phase_for_visibility_controls() {
             .build();
         let rows = [convoy];
         for subject in [&entry, &vessel] {
-            let (_, facts) = awareness_entry_entity(subject, &rows, &[]).expect("published entity facts");
+            let (_, facts) = awareness_entry_entity(subject, &rows, &[], &[]).expect("published entity facts");
             assert!(facts.contains(&(KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str()))));
         }
-        assert!(awareness_entry_entity(&entry, &[], &[]).is_none(), "an entry whose row is absent has no known home");
+        assert!(awareness_entry_entity(&entry, &[], &[], &[]).is_none(), "an entry whose row is absent has no known home");
     }
 }
 
@@ -1108,6 +1157,7 @@ fn only_older_terminal_role_generations_are_superseded() {
     .into_iter()
     .map(|(name, project, role, generation, phase)| {
         ConvoyRow::builder()
+            .home(convoy_ref("dev", name).host.clone().expect("test convoy is homed"))
             .resource(convoy_ref("dev", name))
             .name(role)
             .project_ref(project)
@@ -1131,19 +1181,19 @@ fn only_older_terminal_role_generations_are_superseded() {
     );
     // A detached vessel in Attention must receive the same visibility fact.
     catalog.assert_entity(
-        entity::vessel("kiwi", "old", "govern"),
-        vec![(KEY_CONVOY, MetadataValue::text(entity::convoy("kiwi", "old").id))],
+        entity::vessel("kiwi", "old", "govern").expect("valid address"),
+        vec![(KEY_CONVOY, MetadataValue::text(entity::convoy("kiwi", "old").expect("valid address").id))],
         None,
     );
     mark_superseded_convoys(&mut catalog, &rows);
     for row in &rows {
         let patches = catalog.reassert_patches();
-        let facts = find_entity(&patches, &entity::convoy("kiwi", &row.resource.name));
+        let facts = find_entity(&patches, &entity::convoy("kiwi", &row.resource.name).expect("valid address"));
         assert_eq!(facts.set["flotilla.convoy.superseded"].value, MetadataValue::Bool(row.resource.name == "old"));
     }
     let patches = catalog.reassert_patches();
     assert_eq!(
-        find_entity(&patches, &entity::vessel("kiwi", "old", "govern")).set["flotilla.convoy.superseded"].value,
+        find_entity(&patches, &entity::vessel("kiwi", "old", "govern").expect("valid address")).set["flotilla.convoy.superseded"].value,
         MetadataValue::Bool(true)
     );
 }
@@ -1155,6 +1205,7 @@ fn raw_role_generations_keep_vessel_identity_and_activation_targets_distinct() {
         .map(|(name, generation, phase)| {
             let reference = convoy_ref("dev", name);
             ConvoyRow::builder()
+                .home(reference.clone().host.clone().expect("test convoy is homed"))
                 .resource(reference.clone())
                 .name("governor")
                 .project_ref("project/dev/p")
@@ -1184,8 +1235,8 @@ fn raw_role_generations_keep_vessel_identity_and_activation_targets_distinct() {
     )
     .reassert_patches();
     for row in &rows {
-        let convoy = entity::convoy("kiwi", &row.resource.name);
-        let vessel = entity::vessel("kiwi", &row.resource.name, "govern");
+        let convoy = entity::convoy("kiwi", &row.resource.name).expect("valid address");
+        let vessel = entity::vessel("kiwi", &row.resource.name, "govern").expect("valid address");
         let convoy_patch = find_entity(&patches, &convoy);
         let vessel_patch = find_entity(&patches, &vessel);
         assert_eq!(text(convoy_patch, KEY_DISPLAY_LABEL), "governor");
@@ -1220,6 +1271,7 @@ fn attempt(name: &str, role: &str, generation: u64, phase: ConvoyPhase, ensured_
         })
         .collect();
     ConvoyRow::builder()
+        .home(reference.host.clone().expect("test convoy is homed"))
         .resource(reference)
         .name(role)
         .project_ref("p")
@@ -1240,7 +1292,7 @@ fn role_catalog(roles: &[StandingRoleRow], convoys: &[ConvoyRow]) -> Catalog {
 }
 
 fn role_entity_for(project: &str, role: &str) -> EntityRef {
-    entity::role(project, role)
+    entity::role(project, role).expect("valid address")
 }
 
 #[test]
@@ -1252,9 +1304,9 @@ fn live_standing_role_resolves_its_current_vessel_behind_a_stable_intent() {
 
     let entity = role_entity_for("p", "governor");
     let facts = find_entity(&patches, &entity);
-    let vessel = entity::vessel("kiwi", "convoy-a", "govern");
+    let vessel = entity::vessel("kiwi", "convoy-a", "govern").expect("valid address");
     assert_eq!(text(facts, KEY_ENTITY_KIND), "role");
-    assert_eq!(text(facts, SEGMENT_PROJECT), entity::project("p").id);
+    assert_eq!(text(facts, SEGMENT_PROJECT), entity::project("p").expect("valid address").id);
     assert_eq!(text(facts, KEY_ROLE_NAME), "governor");
     assert_eq!(text(facts, KEY_PRIMARY_ACTION_TARGET), "session:feta/terminal-convoy-a-0");
     assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_STATE), "ready");
@@ -1264,7 +1316,7 @@ fn live_standing_role_resolves_its_current_vessel_behind_a_stable_intent() {
     // The role must not create grouping segments of its backing attempt.
     assert!(!facts.set.contains_key(KEY_CONVOY) && !facts.set.contains_key(KEY_VESSEL));
 
-    for attempt in [entity::convoy("kiwi", "convoy-a"), vessel] {
+    for attempt in [entity::convoy("kiwi", "convoy-a").expect("valid address"), vessel] {
         let facts = find_entity(&patches, &attempt);
         assert_eq!(text(facts, KEY_ROLE), entity.id);
         assert_eq!(facts.set[KEY_CONVOY_STANDING].value, MetadataValue::Bool(true));
@@ -1285,7 +1337,10 @@ fn replacement_generation_changes_the_resolved_target_but_not_the_intent() {
     let patches = after.reassert_patches();
     let facts = find_entity(&patches, &entity);
     assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_STATE), "ready");
-    assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_TARGET), entity::vessel("kiwi", "convoy-b", "govern").action_target());
+    assert_eq!(
+        text(facts, KEY_WORKSPACE_PRIMARY_TARGET),
+        entity::vessel("kiwi", "convoy-b", "govern").expect("valid address").action_target()
+    );
     assert_eq!(text(facts, KEY_STATUS_STATE), "active", "a superseded failure is not the role's state");
 
     let diff = after.diff_patches(&before);
@@ -1356,7 +1411,10 @@ fn two_standing_roles_on_one_project_are_distinct_entities() {
     let patches = role_catalog(&roles, &convoys).reassert_patches();
     for (role, convoy) in [("governor", "convoy-g"), ("quartermaster", "convoy-q")] {
         let facts = find_entity(&patches, &role_entity_for("p", role));
-        assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_TARGET), entity::vessel("kiwi", convoy, "govern").action_target());
+        assert_eq!(
+            text(facts, KEY_WORKSPACE_PRIMARY_TARGET),
+            entity::vessel("kiwi", convoy, "govern").expect("valid address").action_target()
+        );
     }
 }
 
@@ -1365,7 +1423,7 @@ fn task_convoy_sharing_a_role_name_is_not_standing() {
     let role = standing_role("p", "governor");
     let task = attempt().name("convoy-task").role("governor").generation(1).phase(ConvoyPhase::Active).call();
     let patches = role_catalog(&[role], std::slice::from_ref(&task)).reassert_patches();
-    let facts = find_entity(&patches, &entity::convoy("kiwi", "convoy-task"));
+    let facts = find_entity(&patches, &entity::convoy("kiwi", "convoy-task").expect("valid address"));
     assert!(!facts.set.contains_key(KEY_ROLE));
     assert!(!facts.set.contains_key(KEY_CONVOY_STANDING));
     let role = find_entity(&patches, &role_entity_for("p", "governor"));
@@ -1386,7 +1444,7 @@ fn removed_declaration_retracts_the_role_but_keeps_its_attempts_standing() {
     assert!(retracted.unset.iter().any(|key| key == KEY_WORKSPACE_PRIMARY_STATE));
 
     let patches = removed.reassert_patches();
-    let convoy = find_entity(&patches, &entity::convoy("kiwi", "convoy-a"));
+    let convoy = find_entity(&patches, &entity::convoy("kiwi", "convoy-a").expect("valid address"));
     assert_eq!(convoy.set[KEY_CONVOY_STANDING].value, MetadataValue::Bool(true));
     assert!(!convoy.set.contains_key(KEY_ROLE), "an unknown declaration is not confirmed");
 }
@@ -1433,16 +1491,19 @@ fn definitions_publish_multiple_shared_and_subpath_memberships_without_work() {
             .count(),
         3
     );
-    let shared_alpha = entity::project_repository("dev", "alpha", "repo-shared", None);
-    let shared_beta = entity::project_repository("dev", "beta", "repo-shared", Some("src"));
+    let shared_alpha = entity::project_repository("alpha", "repo-shared", None);
+    let shared_beta = entity::project_repository("beta", "repo-shared", Some("src"));
     assert_ne!(shared_alpha, shared_beta);
     assert_eq!(text(find_entity(&patches, &shared_alpha), KEY_MEMBERSHIP_REPOSITORY_KEY), "repo-shared");
     assert_eq!(text(find_entity(&patches, &shared_beta), KEY_MEMBERSHIP_SUBPATH), "src");
     assert_eq!(
-        text(find_entity(&patches, &entity::project_repository("dev", "alpha", "repo-docs", Some("docs"))), KEY_MEMBERSHIP_SUBPATH),
+        text(find_entity(&patches, &entity::project_repository("alpha", "repo-docs", Some("docs"))), KEY_MEMBERSHIP_SUBPATH),
         "docs"
     );
-    assert!(matches!(find_entity(&patches, &entity::project("empty")).set[KEY_PROJECT_REPOSITORY_COUNT].value, MetadataValue::Integer(0)));
+    assert!(matches!(
+        find_entity(&patches, &entity::project("empty").expect("valid address")).set[KEY_PROJECT_REPOSITORY_COUNT].value,
+        MetadataValue::Integer(0)
+    ));
     assert!(patches.iter().all(
         |patch| !matches!(&patch.target, MetadataTarget::Entity(entity) if entity.kind == "repo" && patch.set.contains_key(SEGMENT_PROJECT))
     ));
@@ -1453,6 +1514,7 @@ fn membership_removal_retracts_relation_while_project_remains() {
     let before = [membership_project("alpha", &[("repo-a", Some("github.com:org/a"), None)])];
     let after = [membership_project("alpha", &[])];
     let workspace = ConvoyRow::builder()
+        .home(convoy_ref("dev", "open-workspace").host.clone().expect("test convoy is homed"))
         .resource(convoy_ref("dev", "open-workspace"))
         .name("open-workspace")
         .workflow_ref("implement")
@@ -1482,17 +1544,24 @@ fn membership_removal_retracts_relation_while_project_remains() {
         },
         &mint(),
     );
-    let relation = entity::project_repository("dev", "alpha", "repo-a", None);
+    let relation = entity::project_repository("alpha", "repo-a", None);
     let patch = find_entity(&second.diff_patches(&first), &relation).clone();
     assert!(patch.unset.contains(&KEY_MEMBERSHIP_REPOSITORY_KEY.to_owned()));
-    assert!(second.reassert_patches().iter().any(|patch| patch.target == MetadataTarget::Entity(entity::convoy("kiwi", "open-workspace"))));
-    assert_eq!(text(find_entity(&second.reassert_patches(), &entity::project("alpha")), KEY_PROJECT_NAME), "alpha display");
+    assert!(second
+        .reassert_patches()
+        .iter()
+        .any(|patch| patch.target == MetadataTarget::Entity(entity::convoy("kiwi", "open-workspace").expect("valid address"))));
+    assert_eq!(
+        text(find_entity(&second.reassert_patches(), &entity::project("alpha").expect("valid address")), KEY_PROJECT_NAME),
+        "alpha display"
+    );
 }
 
 #[test]
 fn shared_repository_entity_is_independent_of_convoy_generation_order() {
     let convoys = ["first", "second"].map(|name| {
         ConvoyRow::builder()
+            .home(convoy_ref("dev", name).host.clone().expect("test convoy is homed"))
             .resource(convoy_ref("dev", name))
             .name(name)
             .workflow_ref("implement")
@@ -1534,7 +1603,7 @@ fn live_role_carries_its_attempts_vessel_attention() {
     live.phase = Some(ConvoyPhase::Interrupted);
     let interrupted = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live)).reassert_patches();
     let interrupted_role = find_entity(&interrupted, &role_entity_for("p", "governor"));
-    let interrupted_convoy = find_entity(&interrupted, &entity::convoy("kiwi", "convoy-a"));
+    let interrupted_convoy = find_entity(&interrupted, &entity::convoy("kiwi", "convoy-a").expect("valid address"));
     assert!(!interrupted_role.set.contains_key(KEY_STATUS_ATTENTION));
     assert!(!interrupted_convoy.set.contains_key(KEY_STATUS_ATTENTION));
     assert_eq!(text(interrupted_role, KEY_STATUS_STATE), "waiting");
@@ -1606,6 +1675,7 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     let source = IssueSource { service: "github".into(), scope: "org/flotilla".into() };
     let subject = Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: "42".into() };
     let mut convoy = ConvoyRow::builder()
+        .home(convoy_ref("flotilla", "ship-it").host.clone().expect("test convoy is homed"))
         .resource(convoy_ref("flotilla", "ship-it"))
         .name("ship-it")
         .project_ref("flotilla")
@@ -1646,7 +1716,7 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     assert_eq!(text(patch, KEY_DISPLAY_LABEL), "f!42");
     assert_eq!(text(patch, KEY_DISPLAY_LABEL_SHORT), "f!42");
     assert_eq!(text(patch, "flotilla.change_request.readiness"), "unknown");
-    let convoy = find_entity(&patches, &entity::convoy("kiwi", "ship-it"));
+    let convoy = find_entity(&patches, &entity::convoy("kiwi", "ship-it").expect("valid address"));
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL), "ship-it");
     assert_eq!(convoy.set["flotilla.subject.produces"].value, MetadataValue::EntityRefs(vec![cr]));
 }
@@ -1689,6 +1759,7 @@ fn subject_window_and_successive_role_attempts_exclude_unlinked_records() {
         id: "42".into(),
     };
     let mut old = ConvoyRow::builder()
+        .home(convoy_ref("flotilla", "old").host.clone().expect("test convoy is homed"))
         .resource(convoy_ref("flotilla", "old"))
         .name("old")
         .project_ref("flotilla")
@@ -1745,12 +1816,18 @@ fn subject_window_and_successive_role_attempts_exclude_unlinked_records() {
     input.convoys = &rows;
     input.standing_roles = &roles;
     let patches = project_catalog(&input, &mint()).reassert_patches();
-    let role = find_entity(&patches, &entity::role("platform", "governor"));
-    assert_eq!(role.set["flotilla.role.current_attempt"].value, MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "new")]));
+    let role = find_entity(&patches, &entity::role("platform", "governor").expect("valid address"));
+    assert_eq!(
+        role.set["flotilla.role.current_attempt"].value,
+        MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "new").expect("valid address")])
+    );
     assert_eq!(role.set["flotilla.subject.produces"].value, MetadataValue::EntityRefs(vec![cr.clone()]));
     assert_eq!(
         find_entity(&patches, &cr).set["flotilla.subject_of"].value,
-        MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "new"), entity::role("platform", "governor")])
+        MetadataValue::EntityRefs(vec![
+            entity::convoy("kiwi", "new").expect("valid address"),
+            entity::role("platform", "governor").expect("valid address")
+        ])
     );
 }
 
@@ -1763,8 +1840,11 @@ fn standing_attempt_edges_and_crew_sessions_survive_re_admission() {
     let before = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live_old));
     let patches = before.reassert_patches();
     let facts = find_entity(&patches, &role_entity_for("p", "governor"));
-    assert_eq!(facts.set["flotilla.role.current_attempt"].value, MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "old")]));
-    assert_eq!(facts.set["flotilla.role.crew_sessions"].value, MetadataValue::EntityRefs(vec![entity::session("feta/dev/terminal-old-0")]));
+    assert_eq!(
+        facts.set["flotilla.role.current_attempt"].value,
+        MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "old").expect("valid address")])
+    );
+    assert_eq!(facts.set["flotilla.role.crew_sessions"].value, MetadataValue::EntityRefs(vec![entity::session("feta", "terminal-old-0")]));
     assert_eq!(facts.set["flotilla.role.restart_count"].value, MetadataValue::Integer(2));
     assert_eq!(text(facts, "flotilla.role.desired_state"), "running");
     let mut old = live_old;
@@ -1773,10 +1853,16 @@ fn standing_attempt_edges_and_crew_sessions_survive_re_admission() {
     let after = role_catalog(std::slice::from_ref(&role), &[new, old.clone()]);
     let diff = after.diff_patches(&before);
     let facts = find_entity(&diff, &role_entity_for("p", "governor"));
-    assert_eq!(facts.set["flotilla.role.current_attempt"].value, MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "new")]));
+    assert_eq!(
+        facts.set["flotilla.role.current_attempt"].value,
+        MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "new").expect("valid address")])
+    );
     assert_eq!(
         facts.set["flotilla.role.attempts"].value,
-        MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "old"), entity::convoy("kiwi", "new")])
+        MetadataValue::EntityRefs(vec![
+            entity::convoy("kiwi", "old").expect("valid address"),
+            entity::convoy("kiwi", "new").expect("valid address")
+        ])
     );
     let between = role_catalog(&[role], &[old]);
     let diff = between.diff_patches(&after);
@@ -1944,6 +2030,7 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
         .expect("replicate convoy");
     let project = |convoy: &ResourceObject<Convoy>, observations: &SubjectCatalogInput| {
         let rows = [ConvoyRow::builder()
+            .home(convoy_ref("flotilla", "ship-it").host.clone().expect("test convoy is homed"))
             .resource(convoy_ref("flotilla", "ship-it"))
             .name("ship-it")
             .workflow_ref("dev")
@@ -1999,7 +2086,7 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
     let local = project(&convoy, &local_observations);
     assert_eq!(local, project(&remote_convoy, &remote_observations));
     let patches = local.reassert_patches();
-    let convoy = find_entity(&patches, &entity::convoy("kiwi", "ship-it"));
+    let convoy = find_entity(&patches, &entity::convoy("kiwi", "ship-it").expect("valid address"));
     assert_eq!(
         convoy.set["flotilla.subject.produces"].value,
         MetadataValue::EntityRefs(vec![cr_entity("github.com", "org/flotilla", "42"), cr_entity("lab", "team/cleat", "281")])
@@ -2018,7 +2105,10 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
     assert_eq!(text(issue, KEY_DISPLAY_LABEL_SHORT), "wheelhouse/c#7");
     assert_eq!(issue.set["flotilla.issue.labels"].value, MetadataValue::StringList(vec!["ready".into()]));
     assert_eq!(issue.set["flotilla.issue.assignees"].value, MetadataValue::StringList(vec!["alice".into()]));
-    assert_eq!(issue.set["flotilla.subject_of.works_on"].value, MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "ship-it")]));
+    assert_eq!(
+        issue.set["flotilla.subject_of.works_on"].value,
+        MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "ship-it").expect("valid address")])
+    );
     let forge = find_entity(&patches, &entity::forge(&forge_named("lab")));
     assert_eq!(text(forge, "flotilla.forge.web_url"), "https://forge.example/git");
     assert_eq!(text(forge, "flotilla.forge.change_request_url_template"), "{web_url}/{scope}/pulls/{number}");
@@ -2085,6 +2175,7 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
                 [tc.draw(gs::integers::<usize>().min_value(0).max_value(4))];
         let resource = convoy_ref("dev", &format!("convoy-{index}"));
         let mut convoy = ConvoyRow::builder()
+            .home(resource.host.clone().expect("test convoy is homed"))
             .resource(resource)
             .name(format!("convoy-{index}"))
             .project_ref(format!("project/dev/p{project}"))
@@ -2277,6 +2368,7 @@ fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
     }
     let convoys = [42, 43].map(|number| {
         let mut row = ConvoyRow::builder()
+            .home(convoy_ref("dev", "live").host.clone().expect("test convoy is homed"))
             .resource(convoy_ref("dev", "live"))
             .name("live")
             .project_ref("flotilla")
@@ -2382,7 +2474,7 @@ fn orphaned_request_keeps_departed_convoy_edge_until_terminal() {
             assert_eq!(patch.set["flotilla.orphaned"].value, MetadataValue::Bool(true));
             assert_eq!(
                 patch.set["flotilla.subject_of.produces"].value,
-                MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "departed")])
+                MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "departed").expect("valid address")])
             );
         } else {
             assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(cr.clone())));
@@ -2454,6 +2546,7 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
         Subject { kind: SubjectKind::Issue, source, id: number.to_string() },
     ];
     let mut convoy = ConvoyRow::builder()
+        .home(convoy_ref("dev", "work").host.clone().expect("test convoy is homed"))
         .resource(convoy_ref("dev", "work"))
         .name("work")
         .project_ref("flotilla")
@@ -2595,6 +2688,7 @@ fn catalog_readiness_explains_unavailable_attachment_and_clears_on_recovery(tc: 
         }],
     };
     let mut convoy = ConvoyRow::builder()
+        .home(reference.host.clone().expect("test convoy is homed"))
         .resource(reference)
         .name("governor")
         .project_ref("flotilla")
@@ -2605,8 +2699,8 @@ fn catalog_readiness_explains_unavailable_attachment_and_clears_on_recovery(tc: 
     let mut input = catalog_input(std::slice::from_ref(&convoy));
     input.awareness = awareness_mode.then_some(nodes.as_slice());
     let before = project_catalog(&input, &mint());
-    let convoy_entity = entity::convoy("kiwi", "provisioning");
-    let vessel_entity = entity::vessel("kiwi", "provisioning", "coder");
+    let convoy_entity = entity::convoy("kiwi", "provisioning").expect("valid address");
+    let vessel_entity = entity::vessel("kiwi", "provisioning", "coder").expect("valid address");
     let patches = before.reassert_patches();
     for entity in [&convoy_entity, &vessel_entity] {
         let facts = find_entity(&patches, entity);
@@ -2644,6 +2738,7 @@ fn catalog_readiness_multi_vessel_attachment_and_unknown_evidence() {
     let mut work = vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).call();
     work.readiness = Readiness::default();
     let mut convoy = ConvoyRow::builder()
+        .home(reference.host.clone().expect("test convoy is homed"))
         .resource(reference)
         .name("governor")
         .project_ref("flotilla")
@@ -2652,7 +2747,7 @@ fn catalog_readiness_multi_vessel_attachment_and_unknown_evidence() {
         .vessels(vec![work])
         .build();
     let patches = project_catalog(&catalog_input(std::slice::from_ref(&convoy)), &mint()).reassert_patches();
-    let facts = find_entity(&patches, &entity::convoy("kiwi", "provisioning"));
+    let facts = find_entity(&patches, &entity::convoy("kiwi", "provisioning").expect("valid address"));
     assert_eq!(text(facts, KEY_CONVOY_PHASE), "active");
     assert_eq!(text(facts, KEY_READINESS_STATE), "unknown");
     assert_eq!(text(facts, KEY_STATUS_STATE), "waiting");
@@ -2664,12 +2759,12 @@ fn catalog_readiness_multi_vessel_attachment_and_unknown_evidence() {
     second.materialize = Some("terminal-reviewer".into());
     convoy.vessels.push(second);
     let patches = project_catalog(&catalog_input(&[convoy]), &mint()).reassert_patches();
-    let facts = find_entity(&patches, &entity::convoy("kiwi", "provisioning"));
+    let facts = find_entity(&patches, &entity::convoy("kiwi", "provisioning").expect("valid address"));
     assert_eq!(text(facts, KEY_READINESS_STATE), "ready");
     assert_eq!(facts.set[KEY_READINESS_ATTACH_AVAILABLE].value, MetadataValue::Bool(false));
     assert!(!facts.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
     for name in ["coder", "reviewer"] {
-        let facts = find_entity(&patches, &entity::vessel("kiwi", "provisioning", name));
+        let facts = find_entity(&patches, &entity::vessel("kiwi", "provisioning", name).expect("valid address"));
         assert_eq!(facts.set[KEY_READINESS_ATTACH_AVAILABLE].value, MetadataValue::Bool(true));
         assert!(facts.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
     }
@@ -2748,12 +2843,13 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
         command_preview: "codex".into(),
         requested_stance: None,
         effective_stance: None,
-        session: Some("feta/dev/session-work".into()),
+        session: Some("feta/session-work".into()),
         adapter: Some("codex".into()),
         model: known_model.then(|| "gpt-6.1-sol".into()),
         agent_session: None,
     }];
     let convoy = ConvoyRow::builder()
+        .home(reference.host.clone().expect("test convoy is homed"))
         .resource(reference)
         .name("placement")
         .project_ref("flotilla")
@@ -2763,7 +2859,7 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
         .vessels(vec![row])
         .build();
     let patches = project_catalog(&catalog_input(&[convoy]), &mint()).reassert_patches();
-    let patch = find_entity(&patches, &entity::vessel("kiwi", "placement", "work"));
+    let patch = find_entity(&patches, &entity::vessel("kiwi", "placement", "work").expect("valid address"));
     assert_eq!(text(patch, KEY_VESSEL_KIND), kind);
     assert_eq!(text(patch, KEY_VESSEL_POLICY), "policy-work");
     assert_eq!(text(patch, KEY_VESSEL_ENV), "env-work");
@@ -2778,7 +2874,7 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
             .expect("structured placement alternatives"),
         viable
     );
-    let convoy_patch = find_entity(&patches, &entity::convoy("kiwi", "placement"));
+    let convoy_patch = find_entity(&patches, &entity::convoy("kiwi", "placement").expect("valid address"));
     for (convoy_key, vessel_key) in [
         (KEY_CONVOY_POLICY, KEY_VESSEL_POLICY),
         (KEY_CONVOY_KIND, KEY_VESSEL_KIND),
@@ -2800,7 +2896,7 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
     if contained {
         assert_eq!(text(patch, KEY_VESSEL_IMAGE_SHORT_DIGEST), "abcdef123456");
     }
-    let crew = find_entity(&patches, &entity::session("feta/dev/session-work"));
+    let crew = find_entity(&patches, &entity::session("feta", "session-work"));
     assert_eq!(text(crew, KEY_CREW_ADAPTER), "codex");
     assert_eq!(crew.set.contains_key(KEY_CREW_MODEL), known_model);
     if known_model {
@@ -2815,6 +2911,7 @@ fn placement_catalog_omits_unknown_facts() {
     let reference = convoy_ref("dev", "unknown");
     let row = vessel().convoy(&reference).name("work").phase(WorkPhase::Pending).call();
     let convoy = ConvoyRow::builder()
+        .home(reference.host.clone().expect("test convoy is homed"))
         .resource(reference)
         .name("unknown")
         .project_ref("flotilla")
@@ -2823,7 +2920,7 @@ fn placement_catalog_omits_unknown_facts() {
         .vessels(vec![row])
         .build();
     let patches = project_catalog(&catalog_input(&[convoy]), &mint()).reassert_patches();
-    let patch = find_entity(&patches, &entity::vessel("kiwi", "unknown", "work"));
+    let patch = find_entity(&patches, &entity::vessel("kiwi", "unknown", "work").expect("valid address"));
     for key in [
         KEY_VESSEL_KIND,
         KEY_VESSEL_POLICY,
@@ -2884,9 +2981,12 @@ fn project_parent_is_raw_catalog_metadata() {
     };
     let before = build(&projects);
     let patches = before.reassert_patches();
-    let child_entity = entity::project("child");
-    assert_eq!(text(find_entity(&patches, &child_entity), crate::keys::KEY_PROJECT_PARENT), entity::project("root").id);
-    assert!(!find_entity(&patches, &entity::project("root")).set.contains_key(crate::keys::KEY_PROJECT_PARENT));
+    let child_entity = entity::project("child").expect("valid address");
+    assert_eq!(
+        text(find_entity(&patches, &child_entity), crate::keys::KEY_PROJECT_PARENT),
+        entity::project("root").expect("valid address").id
+    );
+    assert!(!find_entity(&patches, &entity::project("root").expect("valid address")).set.contains_key(crate::keys::KEY_PROJECT_PARENT));
     let after = build(&[membership_project("root", &[]), membership_project("child", &[])]);
     assert!(after.diff_patches(&before).iter().any(|patch| patch.target == MetadataTarget::Entity(child_entity.clone())
         && patch.unset.contains(&crate::keys::KEY_PROJECT_PARENT.to_string())));
@@ -2956,7 +3056,7 @@ fn running_governor_survives_two_abandoned_namesakes(tc: hegel::TestCase) {
         for awareness in [None, Some(nodes.as_slice())] {
             let input = CatalogInput { awareness, standing_roles: std::slice::from_ref(&role), ..catalog_input(&rows) };
             let patches = project_catalog(&input, &mint()).reassert_patches();
-            let live_entity = entity::convoy("kiwi", "live");
+            let live_entity = entity::convoy("kiwi", "live").expect("valid address");
             let live = find_entity(&patches, &live_entity);
             assert_eq!(text(live, KEY_CONVOY), live_entity.id);
             assert_eq!(text(live, KEY_CONVOY_NAME), "governor");
@@ -2964,7 +3064,7 @@ fn running_governor_survives_two_abandoned_namesakes(tc: hegel::TestCase) {
             assert_eq!(text(live, KEY_CONVOY_PHASE), "active");
             assert_eq!(live.set[KEY_CONVOY_SUPERSEDED].value, MetadataValue::Bool(false));
             for name in ["old-a", "old-b"] {
-                let old_entity = entity::convoy("kiwi", name);
+                let old_entity = entity::convoy("kiwi", name).expect("valid address");
                 let old = find_entity(&patches, &old_entity);
                 assert_eq!(text(old, KEY_CONVOY), old_entity.id);
                 assert_eq!(text(old, KEY_CONVOY_NAME), "governor");
@@ -2972,14 +3072,16 @@ fn running_governor_survives_two_abandoned_namesakes(tc: hegel::TestCase) {
                 assert_eq!(old.set[KEY_CONVOY_SUPERSEDED].value, MetadataValue::Bool(true));
             }
             // The stable address lifts the live attempt, while preserving history edges.
-            let standing = find_entity(&patches, &role_entity(&role));
+            let standing = find_entity(&patches, &role_entity(&role).expect("role entity"));
             assert_eq!(text(standing, KEY_STATUS_STATE), "active");
             assert_eq!(text(standing, KEY_CONVOY_PHASE), "active");
             assert_eq!(standing.set[KEY_ROLE_CURRENT_ATTEMPT].value, MetadataValue::EntityRefs(vec![live_entity]));
             // History edges intentionally sort by generation, independent of input order.
             assert_eq!(
                 standing.set[KEY_ROLE_ATTEMPTS].value,
-                MetadataValue::EntityRefs(["old-a", "old-b", "live"].map(|name| entity::convoy("kiwi", name)).to_vec())
+                MetadataValue::EntityRefs(
+                    ["old-a", "old-b", "live"].map(|name| entity::convoy("kiwi", name).expect("valid address")).to_vec()
+                )
             );
         }
     }
@@ -3009,7 +3111,7 @@ fn structured_action_facts_preserve_addresses_and_raw_arguments(tc: hegel::TestC
         (Recipe::command("command:test", argv.clone()), "command", "command:test".to_owned(), Some(argv)),
     ];
     for (recipe, kind, target, expected_argv) in cases {
-        let entity = entity::session("feta/dev/test");
+        let entity = entity::session("feta", "test");
         let mut catalog = Catalog::default();
         catalog.assert_entity(entity.clone(), action_facts(&recipe, "pane"), None);
         let patches = catalog.reassert_patches();
@@ -3051,7 +3153,7 @@ fn structured_actions_keep_legacy_recipe_spelling() {
 // becomes an address-only action; viewers must never retain stale arguments.
 #[test]
 fn structured_action_diff_retracts_obsolete_arguments() {
-    let entity = entity::session("feta/dev/test");
+    let entity = entity::session("feta", "test");
     let catalog_for = |recipe: Recipe| {
         let mut catalog = Catalog::default();
         catalog.assert_entity(entity.clone(), action_facts(&recipe, "pane"), None);
@@ -3149,6 +3251,7 @@ async fn convoy_inbox_facts_are_raw_and_retractable() {
         }
         convoy.status = Some(status);
         let row = ConvoyRow::builder()
+            .home(convoy_ref("dev", "inbox").host.clone().expect("test convoy is homed"))
             .resource(convoy_ref("dev", "inbox"))
             .name("inbox")
             .project_ref("flotilla")
@@ -3202,7 +3305,7 @@ async fn convoy_inbox_facts_are_raw_and_retractable() {
         input.subjects = Some(&records);
         let catalog = project_catalog(&input, &mint());
         let patches = catalog.reassert_patches();
-        let target = entity::convoy("kiwi", "inbox");
+        let target = entity::convoy("kiwi", "inbox").expect("valid address");
         let facts = find_entity(&patches, &target);
         assert_eq!(facts.set[KEY_CONVOY_HELD].value, MetadataValue::Bool(held));
         let MetadataValue::StringList(holds) = &facts.set[KEY_CONVOY_HOLDS].value else { panic!("hold facts") };

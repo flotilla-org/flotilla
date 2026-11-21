@@ -667,6 +667,8 @@ pub struct LiveConvoyRecord {
     pub address: RoleAddress,
     pub record_name: String,
     pub owner_host: HostName,
+    /// The host holding the convoy's record, when it is known.
+    pub record_home: Option<HostName>,
 }
 
 /// The caller a command's reads count for when whoever sent it names none.

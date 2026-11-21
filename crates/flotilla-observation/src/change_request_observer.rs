@@ -2577,7 +2577,7 @@ mod tests {
             assert_eq!(patch.set["flotilla.orphaned"].value, MetadataValue::Bool(true));
             assert_eq!(
                 patch.set["flotilla.subject_of.produces"].value,
-                MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "producer")])
+                MetadataValue::EntityRefs(vec![entity::convoy("kiwi", "producer").expect("valid address")])
             );
             // A restart loses all in-memory demand/tasks but retains the store.
             for (_, refresh) in refresher.inner.active.lock().await.drain() {

@@ -73,6 +73,7 @@ tempfile = { workspace = true }
 [target.'cfg(unix)'.dev-dependencies]
 flotilla-daemon = { path = "../flotilla-daemon" }
 flotilla-daemon-testkit = { path = "../flotilla-daemon-testkit" }
+flotilla-dummy-fleet = { path = "../flotilla-dummy-fleet" }
 flotilla-engine-convoys-testkit = { path = "../flotilla-engine-convoys-testkit" }
 flotilla-provisioning = { path = "../flotilla-provisioning" }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }

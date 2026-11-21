@@ -1120,6 +1120,10 @@ pub struct ConvoyRow {
     /// Row identity and merge key across hosts.
     #[shape(key)]
     pub resource: ResourceRef,
+    /// The host holding this convoy's record: the `host:` segment of every
+    /// address the convoy and its vessels have. Required, so a row without a
+    /// home cannot be built.
+    pub home: HostName,
     /// Stable role identity when this record participates in role addressing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_role: Option<String>,

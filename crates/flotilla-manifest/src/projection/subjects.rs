@@ -150,13 +150,13 @@ pub(super) fn project_role_attempts(catalog: &mut Catalog, role: &StandingRoleRo
         let sessions = convoy
             .vessels
             .iter()
-            .filter_map(|vessel| {
-                vessel.materialize.as_ref().map(|name| entity::session(&format!("{}/{}/{}", vessel.host, convoy.resource.namespace, name)))
-            })
+            .filter_map(|vessel| vessel.materialize.as_ref().map(|name| entity::session(vessel.host.as_str(), name)))
             .collect::<BTreeSet<_>>();
         facts.push((KEY_ROLE_CREW_SESSIONS, MetadataValue::EntityRefs(sessions.into_iter().collect())));
     }
-    catalog.assert_entity(role_entity(role), facts, None);
+    if let Some(role_entity) = role_entity(role) {
+        catalog.assert_entity(role_entity, facts, None);
+    }
 }
 
 /// The declared and built-in forges share the PM connector contract.
@@ -233,8 +233,8 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     }
 
     for role in input.standing_roles {
-        let role_ref = role_entity(role);
-        projects.insert(role_ref.clone(), entity::project(super::role_project(role)).id);
+        let (Some(role_ref), Some(project)) = (role_entity(role), super::project_entity(super::role_project(role))) else { continue };
+        projects.insert(role_ref.clone(), project.id);
         let attempts = standing_attempts(role, input.convoys);
         let current = attempts.iter().rev().find(|convoy| convoy.is_live()).copied();
         let mut facts = Vec::new();
@@ -261,15 +261,19 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         {
             continue;
         }
+        let history_convoy = |history: &flotilla_resources::ChangeRequestSubjectHistory| {
+            super::refused(entity::convoy(&history.origin, &history.convoy), &history.convoy)
+        };
         let departed_producer = record.spec.subject_of.iter().any(|history| {
-            history.relationship == Relationship::Produces && !present_convoys.contains(&entity::convoy(&history.origin, &history.convoy))
+            history.relationship == Relationship::Produces
+                && history_convoy(history).is_some_and(|convoy| !present_convoys.contains(&convoy))
         });
         if departed_producer {
             orphaned.insert(subject.clone());
         }
         if orphaned.contains(subject) {
             for history in &record.spec.subject_of {
-                let convoy = entity::convoy(&history.origin, &history.convoy);
+                let Some(convoy) = history_convoy(history) else { continue };
                 links.entry(subject.clone()).or_default().entry(history.relationship).or_default().insert(convoy);
             }
         }
@@ -291,7 +295,15 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         let forge = address::subject_address(subject, &forge_specs)
             .ok()
             .and_then(|address| address.get(AddressKind::Forge).map(str::to_owned))
-            .and_then(|id| AddressForge::new(id, ForgeKind::Github.into()).ok());
+            .and_then(|id| {
+                // The forge's own kind: a declared forge's, else the built-in GitHub.
+                let kind = match forge_specs.iter().find(|spec| spec.forge_id == id) {
+                    Some(spec) => spec.kind,
+                    None if id == flotilla_address::GITHUB_FORGE_ID => ForgeKind::Github,
+                    None => return None,
+                };
+                AddressForge::new(id, kind.into()).ok()
+            });
         match forge {
             Some(forge) => {
                 forges.insert(service, entity::forge(&forge));

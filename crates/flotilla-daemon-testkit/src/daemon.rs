@@ -299,6 +299,16 @@ impl TestDaemon {
         MainSocket(socket.to_path_buf(), tokio::spawn(flotilla_daemon::stopped_store::serve_resource_socket(listener, daemon)))
     }
 
+    /// The daemon as a client connection reads it, for a consumer such as the PM connector.
+    pub fn handle(&self) -> Arc<dyn DaemonHandle> {
+        Arc::clone(&self.daemon) as Arc<dyn DaemonHandle>
+    }
+
+    /// The host this daemon is.
+    pub fn host_name(&self) -> &HostName {
+        &self.composition.host
+    }
+
     /// The directory that holds the daemon's configuration and its state, as `--config-dir` and
     /// `--state-dir` name it.
     pub fn config_dir(&self) -> std::path::PathBuf {

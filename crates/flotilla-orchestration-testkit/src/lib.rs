@@ -192,6 +192,7 @@ async fn seed_convoy_routing_row(
     let resource =
         flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", record).on_host(daemon.host_name().clone());
     let row = flotilla_protocol::ConvoyRow::builder()
+        .home(daemon.host_name().clone())
         .resource(resource.clone())
         .maybe_address_role(role.map(str::to_string))
         .name(role.unwrap_or(record).to_string())

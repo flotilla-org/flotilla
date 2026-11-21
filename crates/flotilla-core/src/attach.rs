@@ -290,6 +290,25 @@ impl<'a> AttachResolver<'a> {
         Ok(matches.as_slice().first().filter(|_| matches.len() == 1).map(|project| project.metadata.name.clone()))
     }
 
+    /// The host holding a record read with this provenance.
+    async fn provenance_home(&self, provenance: &ResourceProvenance) -> Option<HostName> {
+        match provenance {
+            ResourceProvenance::Local => Some(self.host_name.clone()),
+            ResourceProvenance::Replica { origin_root, .. } => self.host_registry.host_name_for_node(origin_root).await,
+        }
+    }
+
+    /// The host holding the named convoy's record, when one record names it.
+    async fn convoy_home(&self, namespace: &str, name: &str) -> Option<HostName> {
+        let convoys = self.resource_backend.including_replicas::<ResourceConvoy>(namespace).list().await.ok()?.items;
+        let mut named = convoys.iter().filter(|source| source.object.metadata.name == name);
+        let source = named.next()?;
+        if named.next().is_some() {
+            return None;
+        }
+        self.provenance_home(&source.provenance).await
+    }
+
     async fn resolve_live_convoy_record(
         &self,
         reference: &str,
@@ -370,10 +389,12 @@ impl<'a> AttachResolver<'a> {
                     && candidates.get(1).is_none_or(|(next, _)| source.object.spec.generation > next.object.spec.generation) =>
             {
                 let project = source.object.spec.project_ref.clone();
+                let record_home = self.provenance_home(&source.provenance).await;
                 Ok(Some(LiveConvoyRecord {
                     address: RoleAddress { project, role: role.to_string() },
                     record_name: source.object.metadata.name.clone(),
                     owner_host: owner_host.clone(),
+                    record_home,
                 }))
             }
             candidates => {
@@ -426,6 +447,7 @@ impl<'a> AttachResolver<'a> {
                             .map(|status| attach_convoy_phase(status.phase)),
                     )
                     .convoy(record.record_name)
+                    .maybe_convoy_home(record.record_home)
                     .role(record.address.role)
                     .build();
                 return Ok(ResolvedAttach { plan, binding: Some(binding) });
@@ -1125,11 +1147,17 @@ impl AttachTarget {
             Self::Local(session) => {
                 let (plan, host) = resolver.attach_plan_for_session(reads, reference, session, seat).await?;
                 let labels = &session.metadata.labels;
+                let convoy = labels.get(CONVOY_LABEL).cloned();
+                let convoy_home = match &convoy {
+                    Some(convoy) => resolver.convoy_home(&session.metadata.namespace, convoy).await,
+                    None => None,
+                };
                 let binding = AttachBinding::builder()
                     .host(host)
                     .namespace(session.metadata.namespace.clone())
                     .session(session.metadata.name.clone())
-                    .maybe_convoy(labels.get(CONVOY_LABEL).cloned())
+                    .maybe_convoy(convoy)
+                    .maybe_convoy_home(convoy_home)
                     .maybe_vessel(labels.get(VESSEL_LABEL).cloned())
                     .role(labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone()))
                     .build();
@@ -1149,6 +1177,7 @@ impl AttachTarget {
                     .namespace(row.namespace.clone())
                     .maybe_session(row.session.clone())
                     .maybe_convoy(row.convoy_ref.clone().or_else(|| Some(row.convoy.clone()).filter(|convoy| convoy != "-")))
+                    .maybe_convoy_home(row.convoy_home.clone())
                     .maybe_vessel(vessel)
                     .maybe_role(role)
                     .build();

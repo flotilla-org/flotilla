@@ -236,10 +236,10 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     let target = MetadataTarget::Entity(cr_entity("github.com", "org/platform", "42"));
     wait("bootstrap observation", || sink.value(&target, "flotilla.change_request.title") == Some(MetadataValue::text("initial"))).await;
     wait("subject project edge", || sink.value(&target, "flotilla.project").is_some()).await;
-    let project = MetadataTarget::Entity(entity::project("platform"));
+    let project = MetadataTarget::Entity(entity::project("platform").expect("valid address"));
     wait("project opening recipe", || sink.value(&project, "action.primary.recipe").is_some()).await;
     assert_eq!(sink.value(&project, "action.primary.recipe"), Some(MetadataValue::text("'flotilla' view 'project/flotilla/platform'")));
-    let role = MetadataTarget::Entity(entity::role("platform", "governor"));
+    let role = MetadataTarget::Entity(entity::role("platform", "governor").expect("valid address"));
     wait("standing-role current attempt", || sink.value(&role, "flotilla.role.current_attempt").is_some()).await;
     assert!(sink.value(&role, "flotilla.role.attempts").is_some(), "attempt history published");
     // Queued writes happen without waiting for the consumer between them.
@@ -252,7 +252,8 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     second_spec.generation = 2;
     let second = admit_attempt(&daemon, "attempt-2", second_spec).await;
     wait("new current attempt", || {
-        sink.value(&role, "flotilla.role.current_attempt") == Some(MetadataValue::EntityRefs(vec![entity::convoy("local", &second)]))
+        sink.value(&role, "flotilla.role.current_attempt")
+            == Some(MetadataValue::EntityRefs(vec![entity::convoy("local", &second).expect("valid address")]))
     })
     .await;
     wait(

@@ -17,6 +17,7 @@ use tracing::instrument::WithSubscriber;
 async fn connector_rebuilds_warn_only_on_gap_transitions() {
     let convoy = ConvoyRow::builder()
         .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "work").on_host(HostName::new("kiwi")))
+        .home(HostName::new("kiwi"))
         .name("work")
         .workflow_ref("dev")
         .project_ref("dev")

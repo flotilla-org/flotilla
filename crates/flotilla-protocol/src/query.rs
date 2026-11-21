@@ -614,6 +614,9 @@ pub struct FleetListRow {
     /// `convoy`, which is the role address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy_ref: Option<String>,
+    /// The host holding the convoy's record. Absent for a row with no convoy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convoy_home: Option<HostName>,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subjects: Vec<crate::result_set::ConvoySubjectRow>,
@@ -633,7 +636,7 @@ pub struct FleetListRow {
     /// Namespace the crew session lives in on its owning host.
     pub namespace: String,
     /// Crew session name — with `host` and `namespace` this is the
-    /// `flotilla.session` pane join key. Absent for crewless convoy rows.
+    /// `flotilla.session` pane join key (`<host>/<session>`). Absent for crewless convoy rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     pub staleness: FleetStaleness,

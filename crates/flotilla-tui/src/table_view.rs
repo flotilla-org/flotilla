@@ -1799,6 +1799,7 @@ mod tests {
         use flotilla_protocol::result_set::{ConvoyPhase as WirePhase, ConvoyRow, ReadinessBlocker};
         let mut row = ConvoyRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "capacity"))
+            .home(flotilla_protocol::HostName::new("local"))
             .name("governor")
             .workflow_ref("governor")
             .project_ref("dev")
@@ -1966,6 +1967,7 @@ mod tests {
         use flotilla_protocol::result_set::ConvoyRow;
         let row = ConvoyRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "broken"))
+            .home(flotilla_protocol::HostName::new("local"))
             .name("broken")
             .workflow_ref("implement")
             .project_ref("dev")

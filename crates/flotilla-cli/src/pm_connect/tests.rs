@@ -79,7 +79,7 @@ fn mint() -> FlotillaRecipes {
 }
 
 fn independent_entity(name: &str) -> MetadataTarget {
-    MetadataTarget::Entity(entity::session(&format!("feta/dev/{name}")))
+    MetadataTarget::Entity(entity::session("feta", name))
 }
 
 #[test]
@@ -697,7 +697,7 @@ fn standing_roles_publish_and_retract_role_entities() {
         state: Default::default(),
     }));
     assert_eq!(state.apply_event(&set), Applied::Updated);
-    let target = MetadataTarget::Entity(entity::role("platform", "governor"));
+    let target = MetadataTarget::Entity(entity::role("platform", "governor").expect("valid address"));
     let published = state.rebuild(&mint());
     assert!(published.iter().any(|patch| patch.target == target && patch.set.contains_key("workspace.primary.state")));
     assert!(
@@ -729,7 +729,7 @@ fn project_membership_full_refresh_and_delta_retract_without_activity() {
             subpath: Some("src".to_owned()),
         }],
     };
-    let relation = entity::project_repository("dev", "alpha", "repo-a", Some("src"));
+    let relation = entity::project_repository("alpha", "repo-a", Some("src"));
     assert!(state.cursors().iter().any(|cursor| cursor.query == QueryId::ProjectRepositories { scope: None }));
     assert_eq!(
         state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
@@ -834,6 +834,7 @@ fn subject_envelope() -> flotilla_protocol::ResourceReadEnvelope {
 fn linked_subject_convoy() -> ConvoyRow {
     ConvoyRow::builder()
         .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "ship-it").on_host(HostName::new("kiwi")))
+        .home(HostName::new("kiwi"))
         .name("ship-it")
         .workflow_ref("dev")
         .project_ref("flotilla")
@@ -1687,7 +1688,7 @@ fn connector_admits_hold_ledger_and_message_records() {
         state.apply_resource_records(&envelope).expect("admit replica record");
         envelopes.push(envelope);
     }
-    let target = MetadataTarget::Entity(entity::convoy("kiwi", "ship-it"));
+    let target = MetadataTarget::Entity(entity::convoy("kiwi", "ship-it").expect("valid address"));
     let patches = state.rebuild(&mint());
     let facts = patches.iter().find(|patch| patch.target == target).expect("convoy facts");
     assert_eq!(facts.set["flotilla.convoy.held"].value, MetadataValue::Bool(true));
@@ -2123,7 +2124,10 @@ async fn query_gap_preserves_other_queries_and_their_next_deltas() {
         .expect("contiguous unaffected delta");
     wait_until(|| sink.publications().len() == 3).await;
     assert_eq!(daemon.recoveries.lock().expect("recoveries").len(), 1);
-    assert!(sink.publications()[2].1.iter().any(|patch| patch.target == MetadataTarget::Entity(entity::convoy("kiwi", "ship-it"))));
+    assert!(sink.publications()[2]
+        .1
+        .iter()
+        .any(|patch| patch.target == MetadataTarget::Entity(entity::convoy("kiwi", "ship-it").expect("valid address"))));
     assert_eq!(daemon.subscribe_calls.load(Ordering::SeqCst), 1);
     assert_eq!(daemon.watch_starts.load(Ordering::SeqCst), resources::KINDS.len());
     handle.abort();
@@ -2376,6 +2380,7 @@ fn homed_convoy(host: &str, launch: &str, standing: bool, subjects: Vec<flotilla
             .host(HostName::new(host))
             .materialize(format!("terminal-{launch}"))
             .build()])
+        .home(HostName::new(host))
         .resource(resource)
         .name(launch)
         .workflow_ref("implement")
@@ -2458,7 +2463,7 @@ fn every_record_projects_one_entity_under_its_address() {
             })
             .collect()
     };
-    let convoy_id = |home: &str, launch: &str| entity::convoy(home, launch).id;
+    let convoy_id = |home: &str, launch: &str| entity::convoy(home, launch).expect("valid address").id;
     assert_eq!(
         ids("convoy"),
         [convoy_id("feta", local), convoy_id("feta", standing), convoy_id("udder", remote)].into_iter().collect(),
@@ -2468,9 +2473,13 @@ fn every_record_projects_one_entity_under_its_address() {
     assert_eq!(ids("role"), ["project:x/role:governor".to_owned()].into_iter().collect());
     assert_eq!(
         ids("vessel"),
-        [entity::vessel("feta", local, "work").id, entity::vessel("feta", standing, "work").id, entity::vessel("udder", remote, "work").id]
-            .into_iter()
-            .collect()
+        [
+            entity::vessel("feta", local, "work").expect("valid address").id,
+            entity::vessel("feta", standing, "work").expect("valid address").id,
+            entity::vessel("udder", remote, "work").expect("valid address").id
+        ]
+        .into_iter()
+        .collect()
     );
     let find =
         |id: &str| patches.iter().find(|patch| matches!(&patch.target, MetadataTarget::Entity(entity) if entity.id == id)).expect("entity");
@@ -2482,9 +2491,12 @@ fn every_record_projects_one_entity_under_its_address() {
     assert_eq!(convoy.set["flotilla.subject.produces"].value, MetadataValue::EntityRefs(vec![request.clone()]));
     assert!(convoy.set.contains_key(KEY_PRIMARY_ACTION_RECIPE), "attach facts on the convoy");
     let request = find(&request.id);
-    assert_eq!(request.set[KEY_SUBJECT_OF].value, MetadataValue::EntityRefs(vec![entity::convoy("feta", local)]));
+    assert_eq!(request.set[KEY_SUBJECT_OF].value, MetadataValue::EntityRefs(vec![entity::convoy("feta", local).expect("valid address")]));
     for (home, launch) in [("feta", local), ("feta", standing), ("udder", remote)] {
-        assert!(find(&entity::vessel(home, launch, "work").id).set.contains_key(KEY_PRIMARY_ACTION_RECIPE), "{launch} vessel attaches");
+        assert!(
+            find(&entity::vessel(home, launch, "work").expect("valid address").id).set.contains_key(KEY_PRIMARY_ACTION_RECIPE),
+            "{launch} vessel attaches"
+        );
     }
 }
 

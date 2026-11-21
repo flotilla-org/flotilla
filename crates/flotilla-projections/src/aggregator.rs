@@ -1732,7 +1732,11 @@ impl Aggregator {
                     continue;
                 }
             };
-            let row = self.summarize(&reference, &viewed);
+            let Some(home) = reference.host.clone() else {
+                tracing::warn!(convoy = %reference.name, "the convoy reference carries no home; it has no row");
+                continue;
+            };
+            let row = self.summarize(&reference, home, &viewed);
             match convoy.provenance {
                 ResourceProvenance::Local => {
                     local_replacement.insert(row.resource.clone(), row);
@@ -1753,7 +1757,13 @@ impl Aggregator {
                     let reference = self.convoy_key_ref(key)?;
                     let row = match self.effective_convoy_key(key) {
                         Some(item) => match self.viewed(item) {
-                            Ok(viewed) => Some(self.summarize(&reference, &viewed)),
+                            Ok(viewed) => match reference.host.clone() {
+                                Some(home) => Some(self.summarize(&reference, home, &viewed)),
+                                None => {
+                                    tracing::warn!(convoy = %reference.name, "the convoy reference carries no home; it has no row");
+                                    return None;
+                                }
+                            },
                             Err(error) => {
                                 // Keep the row as it is, and project it again.
                                 tracing::warn!(convoy = %reference.name, %error, "the engine convoy did not read; its row stays until a retry");
@@ -2855,12 +2865,13 @@ impl Aggregator {
         flotilla_resources::convoy::engine::viewed_read(&self.convoy_engine, read)
     }
 
-    fn summarize(&self, resource: &ResourceRef, convoy: &ResourceObject<Convoy>) -> ConvoyRow {
+    fn summarize(&self, resource: &ResourceRef, home: HostName, convoy: &ResourceObject<Convoy>) -> ConvoyRow {
         #[cfg(test)]
         self.summarized_convoys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(reason) = unreadable_reason(convoy) {
             return ConvoyRow::builder()
                 .resource(resource.clone())
+                .home(home)
                 .name(&convoy.metadata.name)
                 .unreadable(reason.clone())
                 .generation(convoy.spec.generation)
@@ -2976,6 +2987,7 @@ impl Aggregator {
             *promise_counts.entry(format!("{}/{}", promise.vessel, promise.role)).or_default().entry(state).or_default() += 1;
         }
         ConvoyRow::builder()
+            .home(home)
             .promise_counts(promise_counts)
             .admission_blockers(
                 status
@@ -3151,7 +3163,7 @@ impl Aggregator {
                 });
                 let observed_crew = session.and_then(|session| session.object.status.as_ref()?.crew.as_ref());
                 CrewMemberSummary {
-                    session: session.map(|session| format!("{}/{}/{}", vessel_host, convoy_ref.namespace, session.object.metadata.name)),
+                    session: session.map(|session| format!("{}/{}", vessel_host, session.object.metadata.name)),
                     adapter: observed_crew.map(|crew| crew.adapter.clone()),
                     model: observed_crew.and_then(|crew| crew.model.clone()),
                     role: process.role.clone(),
@@ -5657,7 +5669,7 @@ mod tests {
         convoy.spec.project_ref = "andamento".to_string();
         let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-0123456789abcdef");
 
-        let row = aggregator.summarize(&reference, &convoy);
+        let row = aggregator.summarize(&reference, HostName::new("local"), &convoy);
 
         assert_eq!(row.name, "governor");
         assert_eq!(row.generation, 3);
@@ -5677,7 +5689,7 @@ mod tests {
         convoy.spec.repositories[0].repo_ref = repository_key;
         let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "dialect");
 
-        let row = aggregator.summarize(&reference, &convoy);
+        let row = aggregator.summarize(&reference, HostName::new("local"), &convoy);
 
         assert_eq!(row.repo, Some(flotilla_protocol::RepoKey("flotilla-org/flotilla".to_string())));
     }
@@ -7269,7 +7281,7 @@ mod tests {
                     aggregator.terminal_sessions.insert(session_key(&source), source);
                 }
                 aggregator.read_engine_checkouts();
-                let row = aggregator.summarize(&reference, &convoy);
+                let row = aggregator.summarize(&reference, HostName::new("local"), &convoy);
                 assert_eq!(row.phase, Some(ConvoyPhase::Active), "readiness must not rewrite lifecycle");
                 assert_eq!(row.readiness().state, expected, "operation {op}");
                 if op == 1 || op == 2 {
@@ -7551,7 +7563,7 @@ mod tests {
     ) -> (flotilla_protocol::result_set::ReadinessState, Vec<(String, String)>) {
         // The scripted readings changed without a commit: read them as a rescan does.
         aggregator.read_engine_checkouts();
-        let row = aggregator.summarize(reference, convoy);
+        let row = aggregator.summarize(reference, HostName::new("local"), convoy);
         let readiness = row.readiness().clone();
         let provisioning =
             |blocker: &&flotilla_protocol::result_set::ReadinessBlocker| matches!(blocker.resource.kind.as_str(), "Checkout" | "Clone");
@@ -7598,7 +7610,7 @@ mod tests {
         // The held checkouts' read fails: the vessel is blocked on its checkouts, with the reason.
         reads.errors.lock().expect("errors").insert((Kind, "checkout-a".into()), "checkout store unavailable".into());
         aggregator.read_engine_checkouts();
-        let row = aggregator.summarize(&reference, &convoy);
+        let row = aggregator.summarize(&reference, HostName::new("local"), &convoy);
         assert_eq!(row.readiness().state, ReadinessState::Blocked);
         assert!(row.readiness().explanation().contains("checkout store unavailable"), "{}", row.readiness().explanation());
     }
@@ -8156,7 +8168,7 @@ mod tests {
                     row.configured_limits,
                     Some(ConfiguredResourceLimits { cpus: Some(8), cpu_shares: None, build_jobs: Some(2), linker_threads: Some(4) })
                 );
-                assert_eq!(row.crew[0].session.as_deref(), Some(format!("{host}/flotilla/terminal-placement-coder").as_str()));
+                assert_eq!(row.crew[0].session.as_deref(), Some(format!("{host}/terminal-placement-coder").as_str()));
             }
         }
     }
@@ -8274,7 +8286,7 @@ mod tests {
             assert_eq!(row.host, HostName::new("udder"));
             assert_eq!(row.carried_by, Some(HostName::new(machine)));
             assert_eq!(row.materialize.as_deref(), Some("terminal-ssh-coder"));
-            assert_eq!(row.crew[0].session.as_deref(), Some("udder/flotilla/terminal-ssh-coder"));
+            assert_eq!(row.crew[0].session.as_deref(), Some("udder/terminal-ssh-coder"));
             assert_eq!(row.surface_state, SurfaceState::Working);
             assert_eq!(row.readiness.state, ReadinessState::Provisioning);
             assert_eq!(row.readiness.blockers[0].resource.host, Some(HostName::new("udder")));
@@ -8386,6 +8398,7 @@ mod tests {
         state.write().await.local_rows.insert(
             stale_ref.clone(),
             ConvoyRow::builder()
+                .home(HostName::new("local"))
                 .resource(stale_ref)
                 .name("deleted-during-outage")
                 .workflow_ref("scratch")
