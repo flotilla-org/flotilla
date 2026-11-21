@@ -3,7 +3,6 @@ use flotilla_resources::checkout_path::checkout_path_component;
 use flotilla_resources::checkout_records::{CheckoutRecords, HOLDER_ENDED, HOLDER_NOT_OPEN};
 use flotilla_resources::convoy::engine::EngineConvoyPath;
 use flotilla_resources::environment_records::{EnvironmentRecord, EnvironmentRecords};
-use flotilla_resources::host_records::{HostReadError, HostRecords};
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
 use flotilla_resources::vessel_planning::{Held, HeldKind, VesselPlan, VesselPlanner};
 use flotilla_resources::vessel_records::{engine_vessel, VesselRecord};
@@ -81,8 +80,6 @@ pub struct VesselPlanning {
     artifacts: ReplicaReadResolver<Artifact>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     federated_kinds: Option<ReplicaReadResolver<FulfilmentKind>>,
-    /// The planners' Host port: a kind's host by reference, for the providers it advertises.
-    hosts: Option<Arc<dyn HostRecords>>,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
     namespace: String,
@@ -108,7 +105,6 @@ impl VesselPlanning {
             artifacts: backend.including_replicas::<Artifact>(namespace),
             federated_convoys: None,
             federated_kinds: None,
-            hosts: None,
             local_host_ref: None,
             additional_host_refs: Default::default(),
             namespace: namespace.to_string(),
@@ -204,12 +200,6 @@ impl VesselPlanning {
         config_dir: impl Into<PathBuf>,
     ) -> Self {
         Self { brief_templates: CrewBriefTemplateResolver::with_config_dir(config_dir), ..Self::new(backend, namespace, accounts) }
-    }
-
-    /// Reads a kind's host, for an unfrozen vessel's provider, through `hosts`.
-    pub fn with_hosts(mut self, hosts: Arc<dyn HostRecords>) -> Self {
-        self.hosts = Some(hosts);
-        self
     }
 
     pub fn with_worktree_metadata(mut self, resolver: Arc<dyn WorktreeMetadataResolver>) -> Self {
@@ -328,44 +318,16 @@ impl VesselPlanning {
         }
     }
 
+    /// The kind `vessel` is realised from and the provider instance admission froze for it.
+    /// Admission freezes one for every placement but a host-direct one, which needs none.
     async fn placement_dependency(
         &self,
         vessel: &ResourceObject<Vessel>,
         name: &str,
         decision: Option<&PlacementDecision>,
-    ) -> Result<Result<Placement, String>, ResourceError> {
-        let frozen = decision.and_then(|decision| decision.provider_instance.clone());
+    ) -> Result<Placement, ResourceError> {
         let kind = Self::snapshot_dependency(&self.kinds, self.federated_kinds.as_ref(), vessel, name).await?;
-        match frozen {
-            Some(instance) => Ok(Ok(Placement { kind, instance: Some(instance) })),
-            None if kind.spec.realisation == FulfilmentRealisation::HostDirect => Ok(Ok(Placement { kind, instance: None })),
-            None => Ok(self.unfrozen_instance(&kind).await?.map(|instance| Placement { kind, instance })),
-        }
-    }
-
-    /// A vessel no admission froze an instance for takes the one provider on its kind's
-    /// host that realises the kind, as admission would have chosen; with no advertisements
-    /// observed, or no Host port to read them from, it names none.
-    async fn unfrozen_instance(&self, kind: &ResourceObject<FulfilmentKind>) -> Result<Result<Option<String>, String>, ResourceError> {
-        let Some(hosts) = &self.hosts else { return Ok(Ok(None)) };
-        let host = match hosts.resolve(&kind.spec.host_ref) {
-            Ok(host) => host,
-            Err(error @ HostReadError::Ambiguous(_)) => return Ok(Err(error.to_string())),
-            Err(HostReadError::Unreadable(error)) => return Err(ResourceError::other(error)),
-        };
-        let Some(advertised) = host
-            .as_ref()
-            .and_then(|host| host.status.as_ref())
-            .and_then(|status| status.capabilities.get(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY))
-        else {
-            return Ok(Ok(None));
-        };
-        let providers: Vec<flotilla_protocol::provider::ProviderAdvertisement> = match serde_json::from_value(advertised.clone()) {
-            Ok(providers) => providers,
-            Err(error) => return Ok(Err(format!("{}: invalid provider advertisements: {error}", kind.spec.host_ref))),
-        };
-        Ok(flotilla_resources::provider_placement::match_provider(&kind.spec.host_ref, &kind.spec.realisation, None, &providers)
-            .map(|provider| Some(provider.instance.clone())))
+        Ok(Placement { kind, instance: decision.and_then(|decision| decision.provider_instance.clone()) })
     }
 
     /// What `environment` means for `vessel`. A lost one names the vessel's checkouts that are
@@ -588,8 +550,7 @@ impl VesselPlanning {
         }
 
         let placement = match self.placement_dependency(obj, &obj.spec.fulfilment_kind_ref, placement_decision.as_ref()).await {
-            Ok(Ok(placement)) => placement,
-            Ok(Err(message)) => return Ok(VesselPrepared::failed(message)),
+            Ok(placement) => placement,
             Err(ResourceError::NotFound { .. }) => {
                 return Ok(VesselPrepared::failed_try(format!("fulfilment kind {} not found", obj.spec.fulfilment_kind_ref)))
             }
@@ -1862,7 +1823,7 @@ mod tests {
                 let (reconciler, vessel) = (&reconciler, &vessel);
                 async move { reconciler.placement_dependency(vessel, name, decision.as_ref()).await }
             };
-            let placement = resolve(kind_snapshot, Some(decision(Some("decided")))).await.expect("kind snapshot").expect("a kind");
+            let placement = resolve(kind_snapshot, Some(decision(Some("decided")))).await.expect("kind snapshot");
             assert_eq!((placement.kind.spec.pool.as_str(), placement.instance.as_deref()), ("passthrough", Some("decided")));
             assert!(matches!(resolve("ordinary-kind", None).await, Err(ResourceError::NotFound { .. })));
         }
@@ -1942,74 +1903,6 @@ mod tests {
             reconciler.plan(&launch).await.expect("plan"),
             VesselPlan::Failed { cause: "vessel work missing from convoy snapshot".into(), retryable: false }
         );
-    }
-
-    // A vessel no admission froze an instance for takes the one provider its kind's host
-    // advertises for the realisation, and none before any is observed; a frozen instance wins.
-    #[tokio::test]
-    async fn an_unfrozen_vessel_takes_the_one_provider_its_host_advertises() {
-        use flotilla_protocol::provider::{
-            CheckoutStrategy, EnvironmentClass, MaterialMode, ProviderAdvertisement, ProviderCapabilities, ProviderKind, ProviderReadiness,
-        };
-        use flotilla_provisioning_testkit::hosts::HeldHosts;
-        use flotilla_resources::host_records::HostFacts;
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let hosts = Arc::new(HeldHosts::default());
-        // The kind names its host by display name: the alias resolves to it.
-        let host = |status| HostFacts {
-            name: "host-id".into(),
-            display_name: "h".into(),
-            connection: flotilla_resources::HostConnection::Daemon,
-            max_vessels: None,
-            status,
-        };
-        hosts.put(host(None));
-        let reconciler = VesselPlanning::new(backend.clone(), "flotilla", accounts(&backend)).with_hosts(hosts.clone());
-        let kind = FulfilmentKindSpec::builder()
-            .host_ref("h".into())
-            .pool("cleat".into())
-            .realisation(FulfilmentRealisation::DockerPerVessel { image: None })
-            .build();
-        backend.using::<FulfilmentKind>("flotilla").create(&InputMeta::builder().name("docker".into()).build(), &kind).await.expect("kind");
-        let vessel = backend
-            .using::<Vessel>("flotilla")
-            .create(
-                &InputMeta::builder().name("vessel".into()).build(),
-                &VesselSpec {
-                    convoy_ref: "convoy".into(),
-                    vessel_name: "work".into(),
-                    fulfilment_kind_ref: "docker".into(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                },
-            )
-            .await
-            .expect("vessel");
-        let unobserved = reconciler.placement_dependency(&vessel, "docker", None).await.expect("read").expect("a placement");
-        assert_eq!(unobserved.instance, None);
-        let providers = [("host-direct", EnvironmentClass::HostDirect), ("only", EnvironmentClass::Dummy)].map(|(instance, class)| {
-            ProviderAdvertisement {
-                instance: instance.into(),
-                kind: Some(ProviderKind::new(class, "fixture")),
-                readiness: ProviderReadiness::Ready,
-                capabilities: ProviderCapabilities {
-                    material_modes: vec![MaterialMode::Shared],
-                    checkout_strategies: vec![CheckoutStrategy::HostWorktree],
-                    ..Default::default()
-                },
-            }
-        });
-        let status = flotilla_resources::HostStatus {
-            capabilities: [(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers))]
-                .into_iter()
-                .collect(),
-            ..Default::default()
-        };
-        hosts.put(host(Some(status)));
-        let placement = reconciler.placement_dependency(&vessel, "docker", None).await.expect("read").expect("a provider");
-        assert_eq!(placement.instance.as_deref(), Some("only"));
-        let placement =
-            reconciler.placement_dependency(&vessel, "docker", Some(&decision(Some("frozen")))).await.expect("read").expect("frozen");
-        assert_eq!(placement.instance.as_deref(), Some("frozen"));
     }
 
     #[tokio::test]

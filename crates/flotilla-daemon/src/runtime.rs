@@ -899,21 +899,22 @@ fn spawn_controller_loops(
                 secondaries.push(Box::new(flotilla_provisioning::engine::vessel::VesselConvoyWake::new(service)));
                 (
                     secondaries,
-                    ConvoyReconciler::new(daemon.lifecycle_reads(), daemon.convoy_engine_path(), daemon.crew_message_path())
-                        .with_hosts(daemon.host_records())
-                        .with_occupancy(backend.clone(), &namespace_string)
-                        .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))
-                        .with_forges(backend.definitions::<Forge>(&namespace_string))
-                        .with_change_requests(
-                            backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
-                            daemon.change_request_stale_after(),
-                        )
-                        .with_artifacts(backend.including_replicas::<flotilla_resources::Artifact>(&namespace_string))
-                        .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
-                        .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(
-                            backend.clone(),
-                            &namespace_string,
-                        )),
+                    ConvoyReconciler::new(
+                        daemon.lifecycle_reads(),
+                        daemon.host_records(),
+                        daemon.convoy_engine_path(),
+                        daemon.crew_message_path(),
+                    )
+                    .with_occupancy(backend.clone(), &namespace_string)
+                    .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))
+                    .with_forges(backend.definitions::<Forge>(&namespace_string))
+                    .with_change_requests(
+                        backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
+                        daemon.change_request_stale_after(),
+                    )
+                    .with_artifacts(backend.including_replicas::<flotilla_resources::Artifact>(&namespace_string))
+                    .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
+                    .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), &namespace_string)),
                 )
             }
         }),
@@ -1280,7 +1281,6 @@ fn vessel_planning(state: &Arc<ControllerRuntimeState>, backend: &ResourceBacken
         state.config.base_path().as_path().to_path_buf(),
     )
     .with_lifecycle_reads(state.daemon.lifecycle_reads())
-    .with_hosts(state.daemon.host_records())
     .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(state), change_requests: None }))
     .with_federated_dependencies(backend, CanonicalHostId::resolved(state.local_host_ref.clone()))
     .with_additional_host_refs(state.ssh_host_refs())

@@ -31,7 +31,7 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     engine_records::{CommitMark, KindRecords, LogPosition, PatchStatus, Record, Since, Ticks, UnloggedJournal, WriteError},
-    host_records::{HostAliases, HostChange, HostFacts, HostReadError, HostRecords, HOST_CHANGES},
+    host_records::{HostChange, HostFacts, HostRecords, HOST_CHANGES},
     CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
@@ -95,23 +95,14 @@ type Records = BTreeMap<(String, String), Held>;
 struct Resident {
     follower: Follower,
     records: Records,
-    /// The display names the records bear, held as they change, so a reference resolves without
-    /// a listing.
-    aliases: HostAliases,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The display name a held copy bears, if it holds the Host's spec.
-fn display_name(held: Option<&Held>) -> Option<&str> {
-    held.and_then(|held| held.host.as_ref()).map(|(spec, _, _)| spec.display_name.as_str())
-}
-
-/// Reads `name`'s records at `home` again, and returns the references that named it before and
-/// after.
-fn reload(read: &mut Read<'_>, records: &mut Records, aliases: &mut HostAliases, name: &str, home: &str) -> Result<HostChange, StoreError> {
+/// Reads `name`'s records at `home` again.
+fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
     let host = match read.resolve(HOST, name, home)? {
         Some(id) => match read.load::<HostRecord>(id)? {
             Some(loaded) => Some((loaded.value.spec(), loaded.version, created_at(read, id)?)),
@@ -124,21 +115,16 @@ fn reload(read: &mut Read<'_>, records: &mut Records, aliases: &mut HostAliases,
         None => None,
     };
     let key = (name.to_owned(), home.to_owned());
-    let before = display_name(records.get(&key)).map(str::to_owned);
     if host.is_none() && observation.is_none() {
         records.remove(&key);
     } else {
-        records.insert(key.clone(), Held::new(host, observation));
+        records.insert(key, Held::new(host, observation));
     }
-    let after = display_name(records.get(&key));
-    aliases.hold(name, home, before.as_deref(), after);
-    let references = [Some(name), before.as_deref(), after].into_iter().flatten().filter(|name| !name.is_empty()).map(str::to_owned);
-    Ok(HostChange::Changed { references: references.collect() })
+    Ok(())
 }
 
-fn rescan(read: &mut Read<'_>, records: &mut Records, aliases: &mut HostAliases, home: &str) -> Result<(), StoreError> {
+fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), StoreError> {
     records.retain(|(_, owner), _| owner != home);
-    aliases.forget_home(home);
     let mut names = Vec::new();
     for code in [HOST, OBSERVATION] {
         let mut after = None;
@@ -161,7 +147,7 @@ fn rescan(read: &mut Read<'_>, records: &mut Records, aliases: &mut HostAliases,
         }
     }
     for name in names {
-        reload(read, records, aliases, &name, home)?;
+        reload(read, records, &name, home)?;
     }
     Ok(())
 }
@@ -379,7 +365,7 @@ impl EngineHosts {
             home,
             own_host,
             log,
-            resident: Mutex::new(Resident { follower, records: Records::new(), aliases: HostAliases::default() }),
+            resident: Mutex::new(Resident { follower, records: Records::new() }),
             writing: tokio::sync::Mutex::new(()),
             unlogged: UnloggedJournal::default(),
             clock,
@@ -387,14 +373,14 @@ impl EngineHosts {
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
-            let Resident { follower, records, aliases } = &mut *resident;
+            let Resident { follower, records } = &mut *resident;
             opened
                 .service
                 .with_store(|store| {
                     let mut read = store.read()?;
                     follower.start(&mut read, &homes)?;
                     for home in &homes {
-                        rescan(&mut read, records, aliases, home)?;
+                        rescan(&mut read, records, home)?;
                     }
                     Ok(())
                 })
@@ -417,16 +403,19 @@ impl EngineHosts {
         }
         let homes = self.service.homes();
         let changed = {
-            let Resident { follower, records, aliases } = &mut *resident;
+            let Resident { follower, records } = &mut *resident;
             self.service
                 .with_store(|store| {
                     let mut read = store.read()?;
                     let mut changed = Vec::new();
                     for followed in follower.pass(&mut read, &homes)? {
                         changed.push(match followed {
-                            Followed::Changed(identity) => reload(&mut read, records, aliases, &identity.name, &identity.home)?,
+                            Followed::Changed(identity) => {
+                                reload(&mut read, records, &identity.name, &identity.home)?;
+                                HostChange::Changed { name: identity.name }
+                            }
                             Followed::Rescan(home) => {
-                                rescan(&mut read, records, aliases, &home)?;
+                                rescan(&mut read, records, &home)?;
                                 HostChange::Rescanned
                             }
                         });
@@ -732,14 +721,11 @@ impl KindRecords<Host> for EngineHosts {
     }
 }
 
-/// The planners' reads: a reference resolved through the held alias map, then the one Host it names.
+/// The planners' reads: one Host by name, from the resident map.
 impl HostRecords for EngineHosts {
-    fn resolve(&self, reference: &str) -> Result<Option<HostFacts>, HostReadError> {
-        let resident = self.refresh().map_err(HostReadError::Unreadable)?;
-        let held = |name: &str| resolve(&resident.records, &self.home, name).filter(|(_, held)| held.host.is_some());
-        let Some(name) = resident.aliases.resolve(reference, |name| held(name).is_some())? else { return Ok(None) };
-        Ok(held(&name).and_then(|(home, held)| self.object(&name, home, held)).map(|host| HostFacts {
-            display_name: host.spec.display_name,
+    fn get(&self, name: &str) -> Result<Option<HostFacts>, String> {
+        let resident = self.refresh()?;
+        Ok(resolve(&resident.records, &self.home, name).and_then(|(home, held)| self.object(name, home, held)).map(|host| HostFacts {
             connection: host.spec.connection,
             max_vessels: host.spec.max_vessels,
             status: host.status,
@@ -797,7 +783,7 @@ mod tests {
         service
             .with_store(|store| {
                 let mut read = store.read()?;
-                rescan(&mut read, &mut records, &mut HostAliases::default(), "alpha")
+                rescan(&mut read, &mut records, "alpha")
             })
             .expect("rescan");
         let keys: Vec<_> = records.keys().map(|(name, home)| (name.as_str(), home.as_str())).collect();

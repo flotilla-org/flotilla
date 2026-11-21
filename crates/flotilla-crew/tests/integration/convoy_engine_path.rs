@@ -16,7 +16,7 @@ use flotilla_resources::{
     artifact::blob_digest_of,
     convoy::engine::{Actor, EngineConvoyPath, EngineConvoys, OldPromises, VerdictScope},
     engine_records::{KindRecords, LogPosition, Record, Since},
-    host_records::HostFacts,
+    host_records::{HostFacts, HostRecords},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
     Artifact, ArtifactSpec, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Convoy, ConvoyPhase,
     ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Forge, InputMeta, Observation,
@@ -335,19 +335,19 @@ async fn an_abandoned_convoys_merged_pr_is_the_observers_verdict() {
 }
 
 fn reconciler(backend: &ResourceBackend, engine: Arc<Recording>) -> ConvoyReconciler {
-    reconciler_reading(backend, engine, flotilla_provisioning_testkit::EngineFixture::default().reads())
+    reconciler_on(backend, engine, Arc::new(HeldHosts::default()))
 }
 
-/// [`reconciler`], reading the engine's lifecycle readings through `reads`.
-fn reconciler_reading(
-    backend: &ResourceBackend,
-    engine: Arc<Recording>,
-    reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
-) -> ConvoyReconciler {
-    reconciler_messaging(backend, engine, reads, crate::common::detached_messages())
+/// [`reconciler`], reading the hosts its placements chose through `hosts`.
+fn reconciler_on(backend: &ResourceBackend, engine: Arc<Recording>, hosts: Arc<dyn HostRecords>) -> ConvoyReconciler {
+    let reads = flotilla_provisioning_testkit::EngineFixture::default().reads();
+    let path: EngineConvoyPath = engine;
+    ConvoyReconciler::new(reads, hosts, path, crate::common::detached_messages())
+        .with_artifacts(backend.including_replicas::<Artifact>(NAMESPACE))
 }
 
-/// [`reconciler_reading`], reading the engine's messages through `messages`.
+/// [`reconciler`], reading the engine's lifecycle readings through `reads` and its messages through
+/// `messages`.
 fn reconciler_messaging(
     backend: &ResourceBackend,
     engine: Arc<Recording>,
@@ -355,7 +355,8 @@ fn reconciler_messaging(
     messages: flotilla_crew::ports::MessagePath,
 ) -> ConvoyReconciler {
     let path: EngineConvoyPath = engine;
-    ConvoyReconciler::new(reads, path, messages).with_artifacts(backend.including_replicas::<Artifact>(NAMESPACE))
+    ConvoyReconciler::new(reads, Arc::new(HeldHosts::default()), path, messages)
+        .with_artifacts(backend.including_replicas::<Artifact>(NAMESPACE))
 }
 
 // Behaviour: the observed ledger is the engine's Submit by an observer, and the controller writes
@@ -481,7 +482,7 @@ async fn a_capacity_wait_is_a_note() {
         }),
     });
     let engine = Arc::new(Recording { holds: true, ..Default::default() });
-    let reconciler = reconciler(&backend, Arc::clone(&engine)).with_hosts(hosts.clone());
+    let reconciler = reconciler_on(&backend, Arc::clone(&engine), hosts.clone());
     let prepared = reconciler.prepare(&convoy).await.expect("prepare full");
     let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
     assert!(outcome.patch.is_none());
@@ -616,7 +617,7 @@ fn host_with_slots(name: &str, free: u32) -> HostFacts {
         )]),
         ..Default::default()
     };
-    HostFacts { name: name.into(), display_name: name.into(), connection: HostConnection::Daemon, max_vessels: None, status: Some(status) }
+    HostFacts { name: name.into(), connection: HostConnection::Daemon, max_vessels: None, status: Some(status) }
 }
 
 // Behaviour: a capacity wait notes in its home's memory the host it waits on, so that host's
@@ -629,7 +630,7 @@ async fn a_capacity_wait_notes_the_host_it_waits_on() {
     let mut convoy = ledger_convoy(&backend).await;
     convoy.status.as_mut().expect("status").placement_decision = Some(placement_on("feta"));
     let engine = Arc::new(Recording { holds: true, ..Default::default() });
-    let reconciler = reconciler(&backend, Arc::clone(&engine)).with_hosts(hosts.clone());
+    let reconciler = reconciler_on(&backend, Arc::clone(&engine), hosts.clone());
 
     reconciler.prepare(&convoy).await.expect("prepare full");
     assert!(engine.memory.get("c").waits_for_capacity());
@@ -689,16 +690,14 @@ async fn a_host_change_wakes_only_the_convoys_waiting_on_it() {
     assert_eq!(woken, BTreeSet::from(["c".to_string()]));
 }
 
-// Behaviour: what each capacity wake reads a changed record as standing on: a host by its name
-// and display name, a vessel or convoy by the host its placement targets, an environment by its
-// host; a convoy with no placement stands on none.
+// Behaviour: what each capacity wake reads a changed record as standing on: a vessel or convoy by
+// the host its placement targets, an environment by its host; a convoy with no placement stands on
+// none.
 #[tokio::test]
 async fn a_capacity_change_names_the_hosts_it_is_on() {
     use flotilla_crew::convoy::{convoy_hosts, environment_hosts, vessel_hosts};
     use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Vessel, VesselSpec, VesselStatus};
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let host = HostFacts { display_name: "Feta".into(), ..host_with_slots("feta", 0) };
-    assert_eq!(host.references(), BTreeSet::from(["Feta".to_string(), "feta".to_string()]));
 
     let mut convoy = ledger_convoy(&backend).await;
     assert!(convoy_hosts(&convoy).is_empty(), "no placement, no host");

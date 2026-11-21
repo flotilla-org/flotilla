@@ -7,7 +7,6 @@ mod convoy_reconcile;
 mod environment_vessels;
 mod liveness_contract;
 mod message_reads;
-mod placement_tiebreak_capacity_wait;
 mod read_costs;
 mod review_bundle;
 mod review_bundle_aggregator;

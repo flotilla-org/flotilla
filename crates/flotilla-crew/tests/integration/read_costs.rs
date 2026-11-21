@@ -96,7 +96,12 @@ async fn launches_read_by_a_pass(others: usize) -> (u64, KeyedGets) {
         launches.push(launch);
     }
     let passed = backend.clone().using::<Convoy>(NAMESPACE).get(&launches[0]).await.expect("the convoy's view");
-    let reconciler = ConvoyReconciler::new(Arc::clone(convoys.reads()), convoys.path(), crate::common::detached_messages());
+    let reconciler = ConvoyReconciler::new(
+        Arc::clone(convoys.reads()),
+        Arc::new(flotilla_provisioning_testkit::hosts::HeldHosts::default()),
+        convoys.path(),
+        crate::common::detached_messages(),
+    );
 
     let vessels = &engine.vessels.vessels;
     convoys.settled().await;

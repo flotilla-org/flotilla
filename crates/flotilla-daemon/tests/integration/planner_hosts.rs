@@ -2,11 +2,8 @@
 //! touches only what an operator touches, and holds before and after the planners moved onto their
 //! Host port.
 //!
-//! A host reference by display name and a vessel with no frozen provider reach the planners only
-//! from convoys an earlier generation admitted: admission records the canonical host and freezes
-//! the provider. Those are proven at the planners (`placement_tiebreak_capacity_wait`, the vessel
-//! planner's `an_unfrozen_vessel_takes_the_one_provider_its_host_advertises`) and at the engine's
-//! port (`the_planners_resolve_a_host_by_reference_and_hear_its_changes`).
+//! Admission names each placement's host by its canonical Host name and freezes its provider, so
+//! the planners read a host only by that name.
 
 use std::time::Duration;
 
@@ -35,15 +32,13 @@ fn waits_for_capacity(convoy: &str) -> impl Fn(&ResourceObject<Convoy>) -> bool 
 /// An SSH host this daemon owns, declared by the operator rather than in `hosts.toml`: no home
 /// serves its vessels, so a convoy placed on it waits on its capacity until the host changes.
 const BOX: &str = "box";
-/// The display name the box's kind names it by.
-const BOX_ALIAS: &str = "box-alias";
-/// Host-direct crews on the box, naming it by its alias.
+/// Host-direct crews on the box.
 const BOX_KIND: &str = "box-crews";
 
 /// The box, capped at `max_vessels`, as the operator declares it.
 fn box_spec(owner: &str, max_vessels: u32) -> HostSpec {
     HostSpec {
-        display_name: BOX_ALIAS.into(),
+        display_name: BOX.into(),
         connection: HostConnection::SshHost { owning_daemon: owner.into(), destination: "crew@box".into() },
         max_vessels: Some(max_vessels),
         single_tenant: true,
@@ -51,8 +46,7 @@ fn box_spec(owner: &str, max_vessels: u32) -> HostSpec {
     }
 }
 
-// Behaviour (#4413): a convoy waiting for room on a capped host, which its kind names by display
-// name, stops waiting once the operator raises the host's cap. The Host change alone wakes it: no
+// Behaviour (#4413): a convoy waiting for room on a capped host stops waiting once the operator raises the host's cap. The Host change alone wakes it: no
 // controller resync falls within the wait.
 #[tokio::test(start_paused = true)]
 async fn a_convoy_waiting_for_room_is_woken_when_its_host_raises_its_cap() {
@@ -66,7 +60,7 @@ async fn a_convoy_waiting_for_room_is_woken_when_its_host_raises_its_cap() {
     observed.fulfilment_facts = [(BOX_KIND.to_owned(), facts)].into();
     observed.capabilities.insert(flotilla_resources::AGENT_ADAPTERS_CAPABILITY.into(), serde_json::json!([DUMMY_AGENT_ADAPTER]));
     patch_host_status(&daemon, BOX, observed).await;
-    let kind = FulfilmentKindSpec { realisation: FulfilmentRealisation::HostDirect, ..fulfilment_kind(BOX_ALIAS) };
+    let kind = FulfilmentKindSpec { realisation: FulfilmentRealisation::HostDirect, ..fulfilment_kind(BOX) };
     daemon.apply::<FulfilmentKind>(BOX_KIND, kind).await;
 
     let first = daemon.dispatch(CrewMix::Coder, BOX_KIND).await;

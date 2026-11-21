@@ -5,6 +5,8 @@ use std::{
 };
 use std::{collections::HashMap, sync::Arc};
 
+use flotilla_provisioning_testkit::hosts::HeldHosts;
+
 use crate::convoy::ConvoyReconciler;
 use crate::engine_home::EngineHome;
 use crate::{agent_reads, agents};
@@ -1111,7 +1113,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                 // Primary status watches drive completion rollup; use the
                 // explicit merged observation rather than a network refresher.
                 secondaries: Vec::new(),
-                reconciler: ConvoyReconciler::new(home.reads(), home.path(), home.message_path())
+                reconciler: ConvoyReconciler::new(home.reads(), Arc::new(HeldHosts::default()), home.path(), home.message_path())
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(60)),
                 backend: backend.clone(),
             }
@@ -1298,15 +1300,15 @@ fn convoy_controller(
     table: &LeafSubscriptionTable,
     stale_after: Option<Duration>,
 ) -> tokio::task::JoinHandle<Result<(), ResourceError>> {
-    let reconciler = ConvoyReconciler::new(home.reads(), home.path(), home.message_path());
+    // These convoys place on no host: no Host is read and no Host change wakes them.
+    let hosts = Arc::new(HeldHosts::default());
+    let reconciler = ConvoyReconciler::new(home.reads(), hosts.clone(), home.path(), home.message_path());
     let reconciler = match stale_after {
         Some(stale_after) => reconciler.with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), stale_after),
         None => reconciler,
     };
     // The daemon's wakes: an evidence change (a change request observed merged) wakes the convoy
     // whose promise it settles, as well as the leaf rows' wakes.
-    // These convoys place on no host: no Host change wakes them.
-    let hosts = Arc::new(flotilla_provisioning_testkit::hosts::HeldHosts::default());
     let mut secondaries = ConvoyReconciler::secondary_watches(backend, "flotilla", hosts, home.path(), home.message_path());
     secondaries.push(table.reconciler_wake_watch());
     secondaries.push(Box::new(crate::convoy::EngineConvoyWake { engine: home.path() }));
