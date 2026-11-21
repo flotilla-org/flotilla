@@ -225,6 +225,8 @@ async fn declaring_a_forges_daemon_identity_wakes_the_repository_on_it() {
     let daemon = TestDaemon::builder()
         .settings("host_name = \"rehearsal\"\n\n[credentials.forgejo]\nlab = \"lab-daemon\"\n")
         .forges(forges)
+        // No resync within the test, so only the wake can make the Repository look again.
+        .resync(Duration::from_secs(24 * 60 * 60))
         .start()
         .await;
     let lab = ForgeSpec::builder()
