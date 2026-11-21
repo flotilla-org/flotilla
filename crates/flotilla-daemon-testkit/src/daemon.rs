@@ -325,6 +325,12 @@ impl TestDaemon {
     /// Restart the daemon over the same store, as a process restart does.
     /// Vendor backings and crew processes survive; the new daemon adopts them.
     pub async fn restart(self) -> Self {
+        self.stop().await.start().await
+    }
+
+    /// Stop the daemon, as a process restart's first half does, leaving its store in the
+    /// directory for an operator's command to read while no daemon holds it.
+    pub async fn stop(self) -> StoppedDaemon {
         let Self { daemon, fleet, runtime, front_door, operator, composition, dispatched, dir } = self;
         drop(operator);
         let _ = front_door.send(true);
@@ -334,13 +340,21 @@ impl TestDaemon {
         }
         drop(daemon);
         tokio::task::yield_now().await;
-        let config = Arc::new(ConfigStore::with_base(dir.path().join("config")));
-        let mut discovery = discovery(&dir, composition.forges.as_ref());
-        fleet.install(&mut discovery);
-        let (daemon, runtime, front_door) = untouched(composition.refused(), compose(&composition, config, discovery, &dir)).await;
-        assert_eq!(daemon.node_id(), &node, "restart preserves the daemon's identity");
-        let operator = Operator::connect(&daemon).await;
-        Self { daemon, fleet, runtime: Some(runtime), front_door, operator, composition, dispatched, dir }
+        StoppedDaemon { fleet, composition, dispatched, dir, node }
+    }
+
+    /// Serve this daemon's main socket at `socket`, as `flotillad` serves the operator's process,
+    /// for a command run with `--socket`. Dropping the returned guard stops serving it.
+    pub fn serve_socket(&self, socket: &std::path::Path) -> MainSocket {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap_or_else(|error| panic!("bind {}: {error}", socket.display()));
+        let daemon = Arc::clone(&self.daemon);
+        MainSocket(socket.to_path_buf(), tokio::spawn(flotilla_daemon::stopped_store::serve_resource_socket(listener, daemon)))
+    }
+
+    /// The directory that holds the daemon's configuration and its state, as `--config-dir` and
+    /// `--state-dir` name it.
+    pub fn config_dir(&self) -> std::path::PathBuf {
+        self.dir.path().join("config")
     }
 
     /// Restart the daemon's process, as `flotillad` exiting and starting again does. The dummy
@@ -762,6 +776,39 @@ impl TestDaemon {
             })
         };
         self.wait("the dummy kind's harness", probed).within(SEED_WAIT).await;
+    }
+}
+
+/// A daemon that was stopped over its store: [`TestDaemon::stop`] without the restart's second half.
+pub struct StoppedDaemon {
+    fleet: Arc<DummyFleet>,
+    composition: Composition,
+    dispatched: AtomicU64,
+    dir: tempfile::TempDir,
+    node: flotilla_protocol::NodeId,
+}
+
+impl StoppedDaemon {
+    /// Start the daemon again over the same store, as a process restart does.
+    pub async fn start(self) -> TestDaemon {
+        let Self { fleet, composition, dispatched, dir, node } = self;
+        let config = Arc::new(ConfigStore::with_base(dir.path().join("config")));
+        let mut discovery = discovery(&dir, composition.forges.as_ref());
+        fleet.install(&mut discovery);
+        let (daemon, runtime, front_door) = untouched(composition.refused(), compose(&composition, config, discovery, &dir)).await;
+        assert_eq!(daemon.node_id(), &node, "restart preserves the daemon's identity");
+        let operator = Operator::connect(&daemon).await;
+        TestDaemon { daemon, fleet, runtime: Some(runtime), front_door, operator, composition, dispatched, dir }
+    }
+}
+
+/// A daemon's main socket, served until dropped.
+pub struct MainSocket(std::path::PathBuf, tokio::task::JoinHandle<()>);
+
+impl Drop for MainSocket {
+    fn drop(&mut self) {
+        self.1.abort();
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 

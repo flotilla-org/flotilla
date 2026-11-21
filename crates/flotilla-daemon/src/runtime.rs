@@ -1350,6 +1350,17 @@ impl flotilla_provisioning::engine::environment_actuator::LaunchEnvironment for 
     }
 }
 
+/// The reads of the engine's records a daemon serves, installed as [`DaemonRuntime::start`]
+/// installs them and with none of what it runs: no controller, no periodic task, nothing that acts
+/// on the host. For a daemon opened over a copy of a stopped host's store to be read, not run. The
+/// tasks that follow the stores' changes are returned, to be stopped with the daemon.
+pub(crate) async fn open_engine_reads(daemon: &Arc<InProcessDaemon>) -> Result<Vec<JoinHandle<()>>, String> {
+    let (_, followers) = open_provisioning_lifecycles(daemon).await?;
+    daemon.require_lifecycle_reads_installed()?;
+    daemon.convoy_views()?.opened().await;
+    Ok(followers)
+}
+
 /// The provisioning kinds' engine homes over the decided store (#3629 layer 3), each restored
 /// with the resources this home holds, and the task that tells environment readers (the
 /// aggregator) what changed among the environments, written here or replicated.

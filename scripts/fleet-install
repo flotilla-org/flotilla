@@ -955,9 +955,9 @@ require_daemon_stopped() {
   fi
 }
 
-# The stopped daemon's stores on disk, read by the candidate as its first start reads them: every
-# record decoded, the engine import rehearsed at the daemon's real home, the retirement preview,
-# frozen references and the operational entries in this host's observation roots.
+# The stopped daemon's engine store on disk, read by the candidate as its first start reads it: every
+# record decoded, the retirement preview, frozen references, the operational entries in this host's
+# observation roots and the bound charter inputs of manifest roots.
 validate_stopped_store() {
   local candidate="$1"
   shift
@@ -1311,7 +1311,7 @@ host_preflight() {
 
 usage() {
   echo 'usage: fleet-install [--min-free-bytes N] [--max-wait-seconds N] [--from DIR] [--rollback --reason WHY] [--offline [--start]] [--no-rollback] [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
-  echo '--offline installs onto a stopped host: it refuses a running daemon, validates the stores on disk with the candidate (records decoded, engine import rehearsed, retirement, frozen references, operational entries), switches current, and does not start flotillad; --start then starts it and confirms its health and drains cleat as an online install does' >&2
+  echo '--offline installs onto a stopped host: it refuses a running daemon, validates the stores on disk with the candidate (records decoded, retirement, frozen references, operational entries), switches current, and does not start flotillad; --start then starts it and confirms its health and drains cleat as an online install does' >&2
   echo '--no-rollback: a failed health confirmation is reported as UNHEALTHY and the new generation stays installed and current; without it, the previous generation is restored' >&2
   echo '--rollback --reason WHY installs a generation whose flotilla commit is older than the live one (on a forward install the flag is ignored and no reason is recorded); every install compares commits, which needs github.com (override: FLEET_INSTALL_FLOTILLA_REPOSITORY, for tests)' >&2
   echo 'defaults: --min-free-bytes 5368709120 (5 GiB); --max-wait-seconds 600; ordinary confirmation 90 seconds' >&2
