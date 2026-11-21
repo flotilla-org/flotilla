@@ -3,7 +3,9 @@
 //! The feed lists the kind once, at a position, and then follows it: each batch of changes asks
 //! the port what changed since the feed's position and reads only those names again, by name. A
 //! position the port can no longer resume from is listed afresh. Watchers take the names each
-//! batch changed and convert only those records.
+//! batch changed and convert only those records, as that batch read them: a watcher that takes
+//! several batches at once still reads each state they passed through, such as a retired
+//! launch's ending, which its port lets go once the feed has read past it.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -29,9 +31,10 @@ pub(crate) type Copies<R> = BTreeMap<String, Vec<Record<R>>>;
 
 /// What one pass of the feed did.
 #[derive(Debug)]
-pub(crate) enum Batch {
-    /// These names' records were read again.
-    Changed(Arc<BTreeSet<String>>),
+pub(crate) enum Batch<R: Resource> {
+    /// These names' records were read again: `read` holds their copies as this pass read them,
+    /// a name read gone holding none.
+    Changed { names: Arc<BTreeSet<String>>, read: Arc<Copies<R>> },
     /// Every record was listed afresh.
     Relisted,
     /// The pass could not read what changed; the records stand as they were.
@@ -48,17 +51,17 @@ pub(crate) struct FeedState<R: Resource> {
     /// The serial of the last batch: 0 for the first listing.
     pub(crate) serial: u64,
     /// The latest batches, each with its serial.
-    batches: VecDeque<(u64, Batch)>,
+    batches: VecDeque<(u64, Batch<R>)>,
 }
 
 impl<R: Resource> FeedState<R> {
     /// The batches after `serial`; `None` where some are no longer held.
-    pub(crate) fn after(&self, serial: u64) -> Option<impl Iterator<Item = &Batch>> {
+    pub(crate) fn after(&self, serial: u64) -> Option<impl Iterator<Item = &Batch<R>>> {
         let oldest = self.batches.front().map_or(self.serial + 1, |(first, _)| *first);
         (serial + 1 >= oldest).then(|| self.batches.iter().filter(move |(held, _)| *held > serial).map(|(_, batch)| batch))
     }
 
-    fn push(&mut self, batch: Batch) {
+    fn push(&mut self, batch: Batch<R>) {
         self.serial += 1;
         self.batches.push_back((self.serial, batch));
         if self.batches.len() > BATCHES {
@@ -243,15 +246,17 @@ async fn follow<R: Resource>(records: &dyn KindRecords<R>, state: &Mutex<FeedSta
                 Some(error) => Batch::Failed(error),
                 None => {
                     let mut state = locked(state);
+                    let mut batch = Copies::<R>::new();
                     for (name, copies) in read {
                         if copies.is_empty() {
                             state.records.remove(&name);
                         } else {
-                            state.records.insert(name, copies);
+                            state.records.insert(name.clone(), copies.clone());
+                            batch.insert(name, copies);
                         }
                     }
                     state.position = through;
-                    state.push(Batch::Changed(Arc::new(names)));
+                    state.push(Batch::Changed { names: Arc::new(names), read: Arc::new(batch) });
                     return Passed::Read(state.serial);
                 }
             }
@@ -369,6 +374,12 @@ mod tests {
             for mark in self.marks.lock().expect("marks").iter() {
                 mark.store(true, Ordering::SeqCst);
             }
+        }
+
+        /// Removes `name`'s record, as its port lets a retired one go.
+        fn remove(&self, name: &str) {
+            self.records.lock().expect("records").retain(|held| held.name != name);
+            self.written.lock().expect("written").push(name.into());
         }
 
         fn tick(&self) {
@@ -505,6 +516,35 @@ mod tests {
         let (later, _later) = watch().await;
         assert_eq!(later.len(), 2);
         assert_eq!(records.listings.load(Ordering::SeqCst), 2);
+    }
+
+    // Behaviour: a watcher that takes several of the feed's batches at once reads each as the feed
+    // read it: a record one batch changed and the next read gone is told changed, then gone, as a
+    // retired launch's ending is told before it leaves.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_watcher_behind_the_feed_reads_each_batch_as_it_was_read() {
+        let records = Arc::new(Counted::<Vessel>::default());
+        records.put("v#1", 1);
+        let backend = crate::test_store::memory_backend();
+        backend.install_engine_kind::<Vessel>(records.clone());
+        let watch = || async { backend.definitions::<Vessel>("flotilla").engine_watch().await.expect("served").expect("watch") };
+        let (_, mut behind) = watch().await;
+        let (_, mut ahead) = watch().await;
+
+        // The watcher ahead takes each batch as it is read; the one behind takes none until both
+        // are read.
+        records.put("v#1", 2);
+        records.tick();
+        assert_eq!(named(&ahead.next().await.expect("event").expect("read")), ("modified", "v#1".to_owned()));
+        records.remove("v#1");
+        records.tick();
+        assert_eq!(named(&ahead.next().await.expect("event").expect("read")), ("deleted", "v#1".to_owned()));
+
+        let first = behind.next().await.expect("event").expect("read");
+        assert_eq!(named(&first), ("modified", "v#1".to_owned()), "the change is told before the record leaves");
+        let ReadWatchEvent::Modified(read) = first else { unreachable!() };
+        assert_eq!(read.object.metadata.resource_version, "2");
+        assert_eq!(named(&behind.next().await.expect("event").expect("read")), ("deleted", "v#1".to_owned()));
     }
 
     // Behaviour: a view of an engine kind reads every change committed before the read, without

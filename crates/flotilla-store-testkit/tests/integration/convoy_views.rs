@@ -946,6 +946,7 @@ fn retired(name: &str) -> ConvoyRecord {
 }
 
 /// The next event a watcher reads: its launch, and its phase and message, or `None` where it left.
+/// Its bound is on paused time, which moves only while nothing the views do is under way.
 async fn next_event<E: std::fmt::Debug>(
     watch: &mut (impl futures::Stream<Item = Result<ReadWatchEvent<Convoy>, E>> + Unpin),
 ) -> (String, Option<(ConvoyPhase, Option<String>)>) {
@@ -995,7 +996,7 @@ async fn read_through_a_change_of<E: std::fmt::Debug>(
 // Behaviour (#3108 retirement): a held launch that ends and retires is read by its watcher with how
 // it ended exactly once and then leaves, on the watcher's next read, not at a later sweep. The
 // views hold nothing of it after, and a read by name still gives its ending.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_retired_launch_is_told_ended_once_then_leaves_the_views() {
     let (reads, views, backend) = installed(&["open#1"]);
     let mut watch = backend.including_replicas::<Convoy>("flotilla").watch().await.expect("watch");
@@ -1018,7 +1019,7 @@ async fn a_retired_launch_is_told_ended_once_then_leaves_the_views() {
 // Behaviour (#3108 retirement): a launch the views first see retired, born ended or ended and
 // retired between two passes, is read by its watcher with how it ended exactly once and then
 // leaves; the views hold nothing of it after.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_launch_first_seen_retired_is_told_ended_once_then_leaves() {
     let (reads, views, backend) = installed(&["open#1"]);
     let mut watch = backend.including_replicas::<Convoy>("flotilla").watch().await.expect("watch");
