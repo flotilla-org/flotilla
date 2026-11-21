@@ -21,9 +21,11 @@ use flotilla_credentials::{
 };
 use flotilla_environment::environment::{vessel_ops, EntryKind, VesselAgent};
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provisioning::engine::access_deliveries::HeldDelivery;
 use flotilla_resources::{
+    access_delivery::convoy_of_access,
     account_access::{requester_home, requester_material, AccessName},
-    AccessDelivery, Convoy, PinUnpack, ResourceObject, Vessel, CONVOY_LABEL,
+    Convoy, PinUnpack, ResourceObject, Vessel,
 };
 use flotilla_schema::Timestamp;
 use flotilla_vessel_delivery::{
@@ -445,11 +447,11 @@ pub(super) async fn redeliver_central_logins(
     let Some(material) = state.agent_material.as_ref() else { return Ok(None) };
     let backend = state.daemon.resource_backend();
     let now = Timestamp::from_datetime(&state.daemon.clock().now());
-    let records = backend.using::<AccessDelivery>(namespace).list().await.map_err(|error| format!("list access deliveries: {error}"))?;
+    let records = state.access_deliveries().here()?;
     let mut login = None;
     let vessels = tokio::sync::OnceCell::new();
     let mut next_retry: Option<Timestamp> = None;
-    for record in records.items {
+    for record in records {
         let Some(landed) = record.spec.needs.get(LOGIN).filter(|landed| HarnessLogin::is_central(&landed.digest)) else { continue };
         let retry = record.spec.retry.as_ref().filter(|retry| retry.need == LOGIN);
         if let Some(retry) = retry {
@@ -506,7 +508,7 @@ pub(super) async fn redeliver_central_logins(
         }
         // One record's write losing a race with a launch must not hold back every later crew;
         // the next rotation reads it afresh.
-        match status::record_push(state, namespace, &record, LOGIN, &digest, pushed, LOGIN_PUSH_RETRY_LIMIT).await {
+        match status::record_push(state, &record, LOGIN, &digest, pushed, LOGIN_PUSH_RETRY_LIMIT).await {
             Ok(Some(at)) => next_retry = Some(next_retry.map_or(at, |next| next.min(at))),
             Ok(None) => {}
             Err(error) => {
@@ -518,8 +520,9 @@ pub(super) async fn redeliver_central_logins(
 }
 
 /// The live vessel an access record's crew is aboard, by the access key [`frozen_crew`] composes.
-fn record_vessel<'a>(vessels: &'a [ResourceObject<Vessel>], record: &ResourceObject<AccessDelivery>) -> Option<&'a ResourceObject<Vessel>> {
-    let convoy = record.metadata.labels.get(CONVOY_LABEL)?;
+fn record_vessel<'a>(vessels: &'a [ResourceObject<Vessel>], record: &HeldDelivery) -> Option<&'a ResourceObject<Vessel>> {
+    let convoy = convoy_of_access(&record.spec.access)?;
+    let convoy = &convoy;
     vessels.iter().find(|vessel| {
         vessel.metadata.deletion_timestamp.is_none()
             && &vessel.spec.convoy_ref == convoy

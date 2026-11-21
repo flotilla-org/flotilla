@@ -3,35 +3,32 @@
 //! state of a delivery that failed. `convoy explain` reads it; launch honours its retry.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    future::Future,
+    collections::BTreeMap,
     path::Path,
-    pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
-use flotilla_engine_convoys::holds::{crew_accesses, each};
-use flotilla_engine_store::{follow::Followed, watch::EngineWatch};
-use flotilla_provisioning::stored::environment::Environment;
-use flotilla_schema::Kind;
-use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
+use async_trait::async_trait;
+use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
+use flotilla_provisioning::{
+    engine::{
+        access_deliveries::{AccessDeliveries, HeldDelivery},
+        controller::{Actuator, Backing, Holding, ProviderFailure, Usability},
+        plain_controlled::PlainLifecycle,
+    },
+    stored::environment::Environment,
+};
+use flotilla_resources::{
+    access_delivery::{convoy_of_access, record_name, DeliveredNeed, DeliveryMechanism, DeliveryRetry},
+    account_access::{requester_convoy_dir, REQUESTER_HOME_DIR, REQUESTER_MATERIAL_DIR},
+    AccessDeliverySpec,
+};
+use flotilla_schema::{Identity, Kind, KindCode, Timestamp};
+use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use flotilla_state_machines::{
     machines::convoy::{Convoy as EngineConvoy, ConvoyLabel},
-    Resource as EngineResource, StateValue,
-};
-
-use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
-
-use flotilla_resources::{
-    access_delivery::{record_name, DeliveredNeed, DeliveryMechanism, DeliveryRetry},
-    account_access::{requester_convoy_dir, REQUESTER_HOME_DIR, REQUESTER_MATERIAL_DIR},
-    AccessDelivery, AccessDeliverySpec, Convoy, InputMeta, ResourceError, ResourceObject, CONVOY_LABEL,
-};
-use flotilla_schema::Timestamp;
-use flotilla_store::{
-    controller::{ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
-    ResourceBackend,
+    Cause, CauseCategory, Resource as EngineResource, StateValue,
 };
 use flotilla_vessel_delivery::{Access, Action, FetchBy, Liveness, Mechanism, Plan};
 
@@ -47,10 +44,10 @@ const PERMANENT: &str = "permanent, not retried: ";
 
 /// One access's status at one place, as launch read it before delivering.
 pub(in crate::runtime) struct AccessStatus {
-    namespace: String,
-    meta: InputMeta,
+    deliveries: AccessDeliveries,
+    name: String,
     identity: AccessDeliverySpec,
-    existing: Option<ResourceObject<AccessDelivery>>,
+    existing: Option<HeldDelivery>,
 }
 
 impl AccessStatus {
@@ -60,13 +57,9 @@ impl AccessStatus {
         access: &str,
         harness: &str,
     ) -> Result<Self, String> {
+        let deliveries = state.access_deliveries();
         let name = record_name(access, launch.env_ref);
-        let existing = match state.daemon.resource_backend().using::<AccessDelivery>(launch.namespace).get(&name).await {
-            Ok(existing) => Some(existing),
-            Err(ResourceError::NotFound { .. }) => None,
-            Err(error) => return Err(format!("read access delivery `{name}`: {error}")),
-        };
-        let meta = InputMeta::builder().name(name).labels(BTreeMap::from([(CONVOY_LABEL.to_string(), launch.convoy.to_string())])).build();
+        let existing = deliveries.get(&name)?;
         let identity = AccessDeliverySpec {
             access: access.to_string(),
             place: launch.env_ref.to_string(),
@@ -75,7 +68,7 @@ impl AccessStatus {
             needs: existing.as_ref().map(|existing| existing.spec.needs.clone()).unwrap_or_default(),
             retry: None,
         };
-        Ok(Self { namespace: launch.namespace.to_string(), meta, identity, existing })
+        Ok(Self { deliveries, name, identity, existing })
     }
 
     /// Refuse a delivery before its recorded retry is due.
@@ -133,14 +126,11 @@ impl AccessStatus {
     }
 
     async fn write(&self, state: &ControllerRuntimeState, spec: AccessDeliverySpec) -> Result<(), String> {
-        let records = state.daemon.resource_backend().using::<AccessDelivery>(&self.namespace);
-        let name = &self.meta.name;
-        let written = match &self.existing {
-            Some(existing) if existing.spec == spec => return Ok(()),
-            Some(existing) => records.update(&self.meta, &existing.metadata.resource_version, &spec).await.map(drop),
-            None => records.create(&self.meta, &spec).await.map(drop),
-        };
-        written.map_err(|error| format!("record access delivery `{name}`: {error}"))
+        if self.existing.as_ref().is_some_and(|existing| existing.spec == spec) {
+            return Ok(());
+        }
+        let now = Timestamp::from_datetime(&state.daemon.clock().now());
+        self.deliveries.write(&self.name, self.existing.as_ref().map(|existing| existing.version), &spec, now).map(drop)
     }
 }
 
@@ -149,8 +139,7 @@ impl AccessStatus {
 /// the push has failed `limit` times in a row.
 pub(in crate::runtime) async fn record_push(
     state: &ControllerRuntimeState,
-    namespace: &str,
-    record: &ResourceObject<AccessDelivery>,
+    record: &HeldDelivery,
     need: &str,
     digest: &str,
     pushed: Result<(), String>,
@@ -173,14 +162,7 @@ pub(in crate::runtime) async fn record_push(
             Some(DeliveryRetry { need: need.to_string(), attempts, error: bounded(&error), next_at })
         }
     };
-    let meta = InputMeta::builder().name(record.metadata.name.clone()).labels(record.metadata.labels.clone()).build();
-    state
-        .daemon
-        .resource_backend()
-        .using::<AccessDelivery>(namespace)
-        .update(&meta, &record.metadata.resource_version, &spec)
-        .await
-        .map_err(|error| format!("record access delivery `{}`: {error}", record.metadata.name))?;
+    state.access_deliveries().write(&record.name, Some(record.version), &spec, Timestamp::from_datetime(&now))?;
     Ok(spec.retry.filter(|retry| retry.need == need && retry.attempts < limit).map(|retry| retry.next_at))
 }
 
@@ -208,182 +190,146 @@ fn bounded(error: &str) -> String {
     }
 }
 
-/// Removes a record once its place or its convoy is recorded as ended; the home went with the
-/// place, and the access ended with the convoy. A record is reconciled when it changes and when
-/// its place or its convoy ends ([`EndingWake`]).
-pub(in crate::runtime) fn status_controller(
-    state: std::sync::Arc<ControllerRuntimeState>,
-    namespace: String,
-) -> (Vec<Box<dyn SecondaryWatch<Primary = AccessDelivery>>>, AccessStatusReconciler) {
-    let wake = EndingWake { service: state.daemon.decided_store() };
-    (vec![Box::new(wake)], AccessStatusReconciler { state, namespace, held: Default::default() })
+/// What ends a delivery, as the store holds its place and its convoy now.
+#[derive(Debug, Default)]
+struct Ending {
+    place_gone: bool,
+    convoy_gone: bool,
+    /// Why it is held: its place or its convoy is not found here.
+    unresolved: Vec<String>,
+    /// The records of its place and its convoy, whose commits look at it again.
+    followed: Vec<Identity>,
 }
 
-/// What one pass over the decided log woke: the records whose place or convoy ended.
-#[derive(Default)]
-struct Woken {
-    records: BTreeSet<String>,
-    /// A home's state moved without entries: which of its resources ended is unknown.
-    rescanned: bool,
+impl Ending {
+    fn ended(&self) -> bool {
+        self.place_gone || self.convoy_gone
+    }
 }
 
-/// Wakes the records whose place's environment or whose convoy has ended, from the decided log:
-/// the records themselves do not change when either ends. Each is found through its index: a
-/// place's by `by_place`, a convoy's crew's by `by_access` with each of its crew's access keys.
-#[derive(Clone)]
-struct EndingWake {
-    service: Arc<Service>,
+/// The record of kind `code` named `name`: this home's, else the first other home's.
+fn find(read: &mut Read<'_>, code: KindCode, name: &str, home: &str) -> Result<Option<(ResourceId, Identity)>, StoreError> {
+    let mut found = None;
+    for id in read.resolve_named(code, name)? {
+        let Some((identity, _)) = read.identity(id)? else { continue };
+        let here = identity.home == home;
+        if found.is_none() || here {
+            found = Some((id, identity));
+        }
+        if here {
+            break;
+        }
+    }
+    Ok(found)
 }
 
-impl EndingWake {
-    fn woken(read: &mut Read<'_>, followed: Vec<Followed>) -> Result<Woken, StoreError> {
-        let environment = <EngineResource<Environment> as Kind>::CODE;
-        let convoy = <EngineResource<EngineConvoy> as Kind>::CODE;
-        let mut woken = Woken::default();
-        let mut wake = |read: &mut Read<'_>, id| {
-            if let Some((identity, _)) = read.identity(id)? {
-                woken.records.insert(identity.name);
+/// Judges `delivery` against its place and its convoy, read in `read`. A place that ended is gone:
+/// its environment is not launched again. A convoy that ended is gone too: a launch is ended,
+/// never deleted, and holds no access. Not finding either is no record that it ended: the delivery
+/// is held, and its requester state stays. Imported ended convoys rely on the start pass (#3108
+/// ruling (x)): one held only by an access delivery the old fleet had not yet removed retires once
+/// this removes it.
+fn ending(read: &mut Read<'_>, delivery: &AccessDeliverySpec, home: &str, host_direct: &str) -> Result<Ending, StoreError> {
+    let environment = <EngineResource<Environment> as Kind>::CODE;
+    let convoy_code = <EngineResource<EngineConvoy> as Kind>::CODE;
+    let mut ending = Ending::default();
+    let place = &delivery.place;
+    // The host-direct place never ends.
+    if place != host_direct {
+        match find(read, environment, place, home)? {
+            Some((id, identity)) => {
+                match read.load::<EngineResource<Environment>>(id)? {
+                    Some(loaded) => ending.place_gone = !loaded.value.state().live(),
+                    None => ending.unresolved.push(format!("its place `{place}` is not found")),
+                }
+                ending.followed.push(identity);
             }
-            Ok(())
-        };
-        for followed in followed {
-            let identity = match followed {
-                Followed::Changed(identity) => identity,
-                Followed::Rescan(_) => {
-                    woken.rescanned = true;
-                    continue;
-                }
-            };
-            let id = read.resolve(identity.kind, &identity.name, &identity.home)?;
-            if identity.kind == environment {
-                // One no longer held (deleted or expunged) has ended too.
-                let live = match id {
-                    Some(id) => read.load::<EngineResource<Environment>>(id)?.is_some_and(|loaded| loaded.value.state().live()),
-                    None => false,
-                };
-                if !live {
-                    each(read, &AccessDeliverySpec::by_place(&identity.name), &mut wake)?;
-                }
-            } else if identity.kind == convoy {
-                // One no longer held names no crew: its records wait for their places to end.
-                let Some(loaded) = id.map(|id| read.load::<EngineResource<EngineConvoy>>(id)).transpose()?.flatten() else {
-                    continue;
-                };
-                if loaded.value.state().label() != ConvoyLabel::Open {
-                    for access in crew_accesses(&loaded.value)? {
-                        each(read, &AccessDeliverySpec::by_access(&access), &mut wake)?;
-                    }
-                }
+            None => {
+                ending.unresolved.push(format!("its place `{place}` is not found"));
+                ending.followed.push(Identity { kind: environment, name: place.clone(), home: home.to_owned() });
             }
         }
-        Ok(woken)
     }
-}
-
-impl SecondaryWatch for EndingWake {
-    type Primary = AccessDelivery;
-
-    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = AccessDelivery>> {
-        Box::new(self.clone())
-    }
-
-    fn spawn(
-        self: Box<Self>,
-        _backend: ResourceBackend,
-        _namespace: String,
-        sender: WorkQueueSender,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
-        Box::pin(async move {
-            let codes = [<EngineResource<Environment> as Kind>::CODE, <EngineResource<EngineConvoy> as Kind>::CODE];
-            let mut watch =
-                EngineWatch::start(Arc::clone(&self.service), codes).map_err(|error| ResourceError::other(error.to_string()))?;
-            loop {
-                let woken = match watch.next(Self::woken).await {
-                    Ok(woken) => woken,
-                    Err(error) => {
-                        tracing::warn!(%error, "the access delivery wake could not read the log; retrying at the next commit");
-                        continue;
-                    }
-                };
-                if woken.rescanned {
-                    sender.send_every();
+    if let Some(convoy) = convoy_of_access(&delivery.access) {
+        match find(read, convoy_code, &convoy, home)? {
+            Some((id, identity)) => {
+                match read.load::<EngineResource<EngineConvoy>>(id)? {
+                    Some(loaded) => ending.convoy_gone = loaded.value.state().label() != ConvoyLabel::Open,
+                    None => ending.unresolved.push(format!("its convoy `{convoy}` is not found")),
                 }
-                for record in woken.records {
-                    if sender.send(record).await.is_err() {
-                        return Ok(());
-                    }
-                }
+                ending.followed.push(identity);
             }
-        })
+            None => {
+                ending.unresolved.push(format!("its convoy `{convoy}` is not found"));
+                ending.followed.push(Identity { kind: convoy_code, name: convoy, home: home.to_owned() });
+            }
+        }
     }
+    Ok(ending)
 }
 
-pub(in crate::runtime) struct AccessStatusReconciler {
-    state: std::sync::Arc<ControllerRuntimeState>,
-    namespace: String,
+/// AccessDelivery's actuator on the engine [`Controller`] (#3964, #4415): a record is released,
+/// and so removed, once its place or its convoy is recorded as ended; the home went with the place,
+/// and the access ended with the convoy. Its holders are its place's Environment and its convoy,
+/// whose commits look at it again, as its own do. An SSH host's requester state goes with a
+/// convoy's end; a failure keeps the record, retried at the injected clock's backoff.
+///
+/// [`Controller`]: flotilla_provisioning::engine::controller::Controller
+pub(in crate::runtime) struct AccessDeliveryActuator {
+    state: Arc<ControllerRuntimeState>,
+    service: Arc<Service>,
+    home: String,
     /// Each record held because its place or convoy cannot be found, by name, with the reason
     /// last logged: a hold is logged when it begins or its reason changes, not at every pass.
-    held: std::sync::Mutex<BTreeMap<String, String>>,
+    held: Mutex<BTreeMap<String, String>>,
+    /// The failed releases of each record in a row, which its next try's backoff doubles from.
+    failures: Mutex<BTreeMap<String, u32>>,
 }
 
-impl AccessStatusReconciler {
-    pub(in crate::runtime) async fn retire(&self, record: &ResourceObject<AccessDelivery>) -> Result<(), String> {
-        let backend = self.state.daemon.resource_backend();
-        let place = &record.spec.place;
-        let mut unresolved = Vec::new();
-        // A place that ended is gone: its environment is not launched again. One not found here
-        // is no record that it ended.
-        let place_gone = *place != self.state.host_direct_environment_name
-            && match self.state.environment(place).await? {
-                Some(environment) => environment.ended(),
-                None => {
-                    unresolved.push(format!("its place `{place}` is not found"));
-                    false
-                }
-            };
-        // A convoy that ended is gone too: a launch is ended, never deleted, and holds no access.
-        // One not found here is no record that it ended: its requester state stays. Imported
-        // ended convoys rely on this pass at start-up (#3108 ruling (x)): one held only by an
-        // access delivery the old fleet had not yet removed retires once this removes it.
-        let convoy_gone = match record.metadata.labels.get(CONVOY_LABEL) {
-            Some(convoy) => match backend.including_replicas::<Convoy>(&self.namespace).get(convoy).await {
-                Ok(read) => read.object.status.is_some_and(|status| status.phase.is_terminal()),
-                Err(ResourceError::NotFound { .. }) => {
-                    unresolved.push(format!("its convoy `{convoy}` is not found"));
-                    false
-                }
-                Err(error) => return Err(error.to_string()),
-            },
-            None => false,
-        };
-        if !(place_gone || convoy_gone) {
-            self.hold(&record.metadata.name, (!unresolved.is_empty()).then(|| unresolved.join("; ")));
+impl AccessDeliveryActuator {
+    pub(in crate::runtime) fn new(state: Arc<ControllerRuntimeState>) -> Self {
+        let service = state.daemon.decided_store();
+        let home = service.home().to_owned();
+        Self { state, service, home, held: Mutex::default(), failures: Mutex::default() }
+    }
+
+    /// How `delivery` stands against its place and its convoy now.
+    async fn ending(&self, delivery: &AccessDeliverySpec) -> Result<Ending, String> {
+        let (service, delivery) = (Arc::clone(&self.service), delivery.clone());
+        let (home, host_direct) = (self.home.clone(), self.state.host_direct_environment_name.clone());
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+            service.with_store(|store| ending(&mut store.read()?, &delivery, &home, &host_direct))
+        }))
+        .await
+        .map_err(|error| format!("read access delivery ending: {error}"))?
+        .map_err(|error| error.to_string())
+    }
+
+    /// Removes the requester state of `delivery`'s convoy from its SSH host once the convoy has
+    /// ended. With the place gone too the host is no longer ours to drive, so nothing is removed.
+    async fn release_requester_state(&self, delivery: &AccessDeliverySpec) -> Result<(), String> {
+        let ending = self.ending(delivery).await?;
+        if !ending.convoy_gone || ending.place_gone {
             return Ok(());
         }
-        self.hold(&record.metadata.name, None);
-        // The access ended with its convoy: its requester state goes from an SSH host, whose
-        // dirs nothing else removes. A failure keeps the record, so the next pass retries. With the
-        // place gone too the host is no longer ours to drive, so the record goes without cleanup.
-        if convoy_gone && !place_gone {
-            match (record.metadata.labels.get(CONVOY_LABEL), self.state.ssh_host.get(place)) {
-                (Some(convoy), Some(profile)) => remove_requester_state(profile.runner.as_ref(), convoy).await?,
-                (convoy, None) => tracing::debug!(%place, ?convoy, "no SSH host profile for the place; requester state not removed"),
-                (None, Some(_)) => {}
+        let place = &delivery.place;
+        match (convoy_of_access(&delivery.access), self.state.ssh_host.get(place)) {
+            (Some(convoy), Some(profile)) => remove_requester_state(profile.runner.as_ref(), &convoy).await,
+            (convoy, None) => {
+                tracing::debug!(%place, ?convoy, "no SSH host profile for the place; requester state not removed");
+                Ok(())
             }
-        }
-        match backend.using::<AccessDelivery>(&self.namespace).delete(&record.metadata.name).await {
-            Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
-            Err(error) => Err(format!("remove access delivery `{}`: {error}", record.metadata.name)),
+            (None, Some(_)) => Ok(()),
         }
     }
 
     /// Notes `name` held for `reason`, or no longer held with none; a hold is logged when it
     /// begins or its reason changes.
     fn hold(&self, name: &str, reason: Option<String>) {
-        let mut held = self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         match reason {
             Some(reason) if held.get(name) != Some(&reason) => {
-                tracing::warn!(namespace = %self.namespace, delivery = %name, %reason, "access delivery held: not retired, requester state kept");
+                tracing::warn!(delivery = %name, %reason, "access delivery held: not retired, requester state kept");
                 held.insert(name.to_owned(), reason);
             }
             Some(_) => {}
@@ -391,6 +337,60 @@ impl AccessStatusReconciler {
                 held.remove(name);
             }
         }
+    }
+}
+
+#[async_trait]
+impl Actuator<PlainLifecycle<AccessDeliverySpec>> for AccessDeliveryActuator {
+    /// A record held is its own backing.
+    async fn observe(&self, name: &str, _: &AccessDeliverySpec) -> Result<Backing, Cause> {
+        Ok(Backing::Present { identity: name.to_owned() })
+    }
+
+    /// Never asked: a record is realised as soon as launch writes it.
+    async fn realise(&self, name: &str, _: &AccessDeliverySpec) -> Result<String, ProviderFailure> {
+        Ok(name.to_owned())
+    }
+
+    async fn release(&self, name: &str, delivery: &AccessDeliverySpec, _: Option<&str>) -> Result<(), ProviderFailure> {
+        match self.release_requester_state(delivery).await {
+            Ok(()) => {
+                self.failures.lock().unwrap_or_else(PoisonError::into_inner).remove(name);
+                self.hold(name, None);
+                Ok(())
+            }
+            Err(error) => {
+                let failures = {
+                    let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
+                    let failures = failures.entry(name.to_owned()).or_default();
+                    *failures = failures.saturating_add(1);
+                    *failures
+                };
+                let retry_at = Timestamp::from_datetime(&(self.state.daemon.clock().now() + retry_delay(failures)));
+                Err(ProviderFailure { cause: Cause::new(CauseCategory::External, error), retryable: true, retry_at: Some(retry_at) })
+            }
+        }
+    }
+
+    fn followed(&self) -> Vec<KindCode> {
+        vec![<EngineResource<Environment> as Kind>::CODE, <EngineResource<EngineConvoy> as Kind>::CODE]
+    }
+
+    /// Its holders are its only inputs.
+    fn dependencies(&self, _: &AccessDeliverySpec) -> Vec<Identity> {
+        Vec::new()
+    }
+
+    fn holder(&self, read: &mut Read<'_>, name: &str, delivery: &AccessDeliverySpec) -> Result<Holding, StoreError> {
+        let ending = ending(read, delivery, &self.home, &self.state.host_direct_environment_name)?;
+        let ended = ending.ended();
+        self.hold(name, (!ended && !ending.unresolved.is_empty()).then(|| ending.unresolved.join("; ")));
+        Ok(Holding { ended, records: ending.followed })
+    }
+
+    /// Nothing waits: a record is never tried.
+    fn usability(&self, _: &mut Read<'_>, _: &AccessDeliverySpec) -> Result<Vec<Usability>, StoreError> {
+        Ok(Vec::new())
     }
 }
 
@@ -423,41 +423,6 @@ const REMOVE_TREES: &str = r#"for path in "$@"; do
   chmod -R u+rwX -- "$path" 2>/dev/null || true
   rm -rf -- "$path" || exit 1
 done"#;
-
-impl Reconciler for AccessStatusReconciler {
-    type Resource = AccessDelivery;
-    type Prepared = ();
-
-    async fn prepare(&self, record: &ResourceObject<AccessDelivery>) -> Result<(), ResourceError> {
-        self.retire(record).await.map_err(ResourceError::other)
-    }
-
-    fn reconcile(
-        &self,
-        _obj: &ResourceObject<AccessDelivery>,
-        _prepared: &(),
-        _now: chrono::DateTime<chrono::Utc>,
-    ) -> ReconcileOutcome<AccessDelivery> {
-        ReconcileOutcome::new(None)
-    }
-
-    async fn run_finalizer(&self, _obj: &ResourceObject<AccessDelivery>) -> Result<(), ResourceError> {
-        Ok(())
-    }
-
-    fn finalizer_name(&self) -> Option<&'static str> {
-        None
-    }
-
-    fn reconcile_error_policy(&self) -> Option<ReconcileErrorPolicy> {
-        Some(ReconcileErrorPolicy {
-            max_consecutive_failures: 8,
-            initial_backoff: FIRST_RETRY,
-            max_backoff: LAST_RETRY,
-            exhaustion: ReconcileErrorExhaustion::Retry,
-        })
-    }
-}
 
 #[cfg(test)]
 mod tests {

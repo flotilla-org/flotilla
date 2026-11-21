@@ -208,12 +208,12 @@ pub fn convoy_holding(read: &mut Read<'_>, name: &str, home: &str) -> Result<Hol
     let record = item.record;
     let Some(read_at) = item.revision.as_deref().and_then(|version| version.parse::<u64>().ok()) else {
         warn!(checkout = name, convoy = %record.name, revision = ?item.revision, "a checkout's holder has no version read; it is held open");
-        return Ok(Holding { ended: false, record: Some(record) });
+        return Ok(Holding::followed(false, record));
     };
     // Not held here yet: its entries wake the checkout once they replicate.
-    let Some(convoy) = read.resolve(CONVOY, &record.name, &record.home)? else { return Ok(Holding { ended: false, record: Some(record) }) };
+    let Some(convoy) = read.resolve(CONVOY, &record.name, &record.home)? else { return Ok(Holding::followed(false, record)) };
     let ended = ended_since(read, convoy, read_at)?;
-    Ok(Holding { ended, record: Some(record) })
+    Ok(Holding::followed(ended, record))
 }
 
 /// Whether engine Convoy `id` has ended since version `read_at`: an entry after it delivers or
