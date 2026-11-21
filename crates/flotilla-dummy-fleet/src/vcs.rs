@@ -223,6 +223,11 @@ impl Vcs for DummyVcs {
         if self.recorded(path) && self.dirty(path) {
             return Ok(CheckoutRemoval::PreservedCheckout { path: target.into(), reason: CheckoutPreservationReason::DirtyCheckout });
         }
+        if self.recorded(path)
+            && dummy_draw(self.fleet.config.seed, "checkout-refused", target) < self.fleet.config.vcs.refused_removal_rate
+        {
+            return Ok(CheckoutRemoval::PreservedCheckout { path: target.into(), reason: CheckoutPreservationReason::DifferentBranch });
+        }
         let advanced = self.recorded(path) && self.unpushed(path);
         self.remove(target).await?;
         Ok(match advanced {
@@ -308,7 +313,11 @@ impl Vcs for DummyVcs {
     }
 
     async fn commits_beyond_base(&self, base_ref: Option<&str>) -> Result<(String, usize), String> {
-        Ok((base_ref.unwrap_or("origin/main").to_string(), 0))
+        let base_ref = base_ref.unwrap_or("origin/main");
+        if dummy_draw(self.fleet.config.seed, "checkout-unjudged", &self.root.to_string_lossy()) < self.fleet.config.vcs.unjudged_rate {
+            return Err(format!("the dummy VCS could not compare the branch with {base_ref}"));
+        }
+        Ok((base_ref.to_string(), 0))
     }
 
     async fn clean_revision(&self) -> Result<String, String> {
@@ -505,7 +514,7 @@ mod host_tests {
         let root = ExecutionEnvironmentPath::new("/workspace/fleet");
         for (dirty_rate, unpushed_rate) in [(0.0, 0.0), (1.0, 1.0)] {
             let settings = DummyFleetConfig {
-                vcs: flotilla_config::dummy_fleet::DummyVcsConfig { dirty_rate, unpushed_rate },
+                vcs: flotilla_config::dummy_fleet::DummyVcsConfig { dirty_rate, unpushed_rate, ..Default::default() },
                 ..DummyFleetConfig::default()
             };
             let factory = DummyVcsFactory { fleet: DummyFleet::new(settings) };
