@@ -11,20 +11,16 @@
 //! [`Controller`]: super::controller::Controller
 //! [`Actuator::holder`]: super::controller::Actuator::holder
 
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
 use flotilla_engine_store::plain::{PendingChange, PlainError, PlainLog};
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
-use flotilla_schema_sqlite::StoreHandle;
 use flotilla_state_machines::machines::lifecycle::{LifecycleKind, LifecycleState};
 
 use super::{
     controller::{Controlled, ControlledRecords},
     EngineError, Step,
 };
-
-/// How often a deletion that loses a race to another writer of its name reads and tries again.
-const DELETE_ATTEMPTS: usize = 3;
 
 /// Plain kind `S` as the lifecycle kind its controller and actuator are written for: its request
 /// is the record.
@@ -44,33 +40,22 @@ pub struct PlainControlled<S> {
 }
 
 impl<S> PlainControlled<S> {
-    /// This home's records of `S` in `store`, deleted as `writer`.
-    pub fn new(store: Arc<StoreHandle>, writer: &'static str) -> Self {
-        Self::over(PlainLog::new(store), writer)
-    }
-
     /// The records of `S` homed at `log`'s home, deleted as `writer`.
     pub fn over(log: PlainLog, writer: &'static str) -> Self {
         Self { log, writer, kind: PhantomData }
     }
 
-    /// Deletes `name` as it is now; one already gone is done.
+    /// Deletes `name` at the version just read; one already gone is done. A write that wins the
+    /// race commits, which wakes the controller to release it again.
     fn delete(&self, name: &str, at: Timestamp) -> Result<(), EngineError>
     where
         S: Kind,
     {
-        let change = PendingChange::new(NewChange::new(self.writer, at));
-        let mut lost = None;
-        for _ in 0..DELETE_ATTEMPTS {
-            let Some(current) = self.log.get::<S>(name, self.log.home()).map_err(failed)? else { return Ok(()) };
-            match self.log.delete::<S>(name, current.version, &change) {
-                Ok(()) | Err(PlainError::Missing { .. }) => return Ok(()),
-                Err(error @ PlainError::Conflict { .. }) => lost = Some(error),
-                Err(error) => return Err(failed(error)),
-            }
+        let Some(current) = self.log.get::<S>(name, self.log.home()).map_err(failed)? else { return Ok(()) };
+        match self.log.delete::<S>(name, current.version, &PendingChange::new(NewChange::new(self.writer, at))) {
+            Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),
+            Err(error) => Err(failed(error)),
         }
-        let last = lost.map(|error| error.to_string()).unwrap_or_default();
-        Err(EngineError::Failed(format!("delete {} {name}: lost {DELETE_ATTEMPTS} races with its writers, the last: {last}", S::KIND)))
     }
 }
 
