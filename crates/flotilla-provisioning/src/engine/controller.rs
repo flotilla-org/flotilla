@@ -871,7 +871,12 @@ where
             (Done::Realised(Ok(identity)), _) => {
                 let refused = self.write(name, Step::Realised { identity: identity.clone() }).await;
                 if refused.is_none() && self.actuator.holds() {
-                    again = self.lifecycles.get(name).is_some_and(|resource| matches!(resource.state(), LifecycleState::Realised { .. }));
+                    again = self
+                        .records
+                        .get(name)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|resource| matches!(resource.state(), LifecycleState::Realised { .. }));
                 }
                 if let Some(EngineError::Refused(_)) = refused {
                     // It ended while the work ran: what the work made is torn down.
