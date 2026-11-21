@@ -55,11 +55,6 @@ impl AccessDeliveries {
         Self { log: PlainLog::new(store) }
     }
 
-    /// The home they are written at.
-    pub fn home(&self) -> &str {
-        self.log.home()
-    }
-
     /// The delivery `name` homed here.
     pub fn get(&self, name: &str) -> Result<Option<HeldDelivery>, String> {
         self.log.get::<AccessDeliverySpec>(name, self.log.home()).map_err(|error| format!("read access delivery `{name}`: {error}"))
