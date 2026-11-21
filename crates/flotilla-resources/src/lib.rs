@@ -73,6 +73,7 @@ mod fulfilment_kind;
 pub mod held_joins;
 #[doc(hidden)]
 pub mod host;
+pub mod host_records;
 pub mod image_build_records;
 mod issue;
 pub mod labels;

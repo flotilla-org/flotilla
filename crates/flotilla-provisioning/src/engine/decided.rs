@@ -35,6 +35,8 @@ pub struct DecidedPorts {
     pub manifest_roots: Arc<dyn ManifestRoots>,
     /// Each standing role's running values, written by the home that admits it.
     pub standing_roles: Arc<dyn StandingRoles>,
+    /// Host, also installed among `records`: the planners read it through its port alone.
+    pub hosts: Arc<EngineHosts>,
 }
 
 /// Opens the ports over `service`, whose own Host is `own_host`.
@@ -47,6 +49,8 @@ pub fn open_ports(service: &Arc<Service>, own_host: &str, clock: Arc<dyn Clock>)
     // ChangeRequest and Issue: written by their source's observer, read at every home.
     let source_observers = Arc::new(LateSourceObservers::default());
     let observations = Arc::new(EngineObservations::open(Arc::clone(service), clock())?.observed_by(source_observers.clone()));
+    // Host, which every placement reads and this home's observers write only on change.
+    let hosts = Arc::new(EngineHosts::open(Arc::clone(service), own_host.to_owned(), clock())?);
     let records: Vec<Arc<dyn EnginePort>> = vec![
         Arc::clone(&accounts) as Arc<dyn EnginePort>,
         Arc::clone(&manifest_roots) as Arc<dyn EnginePort>,
@@ -59,8 +63,7 @@ pub fn open_ports(service: &Arc<Service>, own_host: &str, clock: Arc<dyn Clock>)
         Arc::new(EngineAccessDeliveries::open(Arc::clone(service), clock())?),
         // FulfilmentKind, which admission and the vessel reconciler read and admission's snapshots write.
         Arc::new(EngineKinds::open(Arc::clone(service), clock())?),
-        // Host, which every placement reads and this home's observers write only on change.
-        Arc::new(EngineHosts::open(Arc::clone(service), own_host.to_owned(), clock())?),
+        Arc::clone(&hosts) as Arc<dyn EnginePort>,
     ];
     Ok(DecidedPorts {
         records,
@@ -71,5 +74,6 @@ pub fn open_ports(service: &Arc<Service>, own_host: &str, clock: Arc<dyn Clock>)
         accounts,
         manifest_roots,
         standing_roles: Arc::new(EngineStandingRoles::open(Arc::clone(service), clock())),
+        hosts,
     })
 }

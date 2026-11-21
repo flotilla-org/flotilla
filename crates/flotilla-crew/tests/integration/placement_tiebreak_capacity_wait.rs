@@ -4,20 +4,23 @@ use std::collections::BTreeMap;
 use chrono::Utc;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_protocol::{CanonicalHostId, FulfilmentAllocation, FulfilmentAllocationCandidate, PlacementDecision, PlacementTargetHost};
-use flotilla_resources::{Convoy, ConvoySpec, ConvoyStatus, FulfilmentFacts, Host, HostSpec, HostStatus, InputMeta};
+use flotilla_resources::{
+    host_records::{HeldHosts, HostFacts},
+    Convoy, ConvoySpec, ConvoyStatus, FulfilmentFacts, HostConnection, HostStatus, InputMeta,
+};
 use flotilla_store::ResourceBackend;
 
 #[tokio::test]
 async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resumes_when_capacity_returns() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let hosts = backend.using::<Host>("flotilla");
-    let host = hosts
-        .create(
-            &InputMeta::builder().name("host-id".to_string()).build(),
-            &HostSpec { display_name: "feta".to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("host");
+    let hosts = std::sync::Arc::new(HeldHosts::default());
+    let host = |name: &str, status: Option<HostStatus>| HostFacts {
+        name: name.into(),
+        display_name: "feta".into(),
+        connection: HostConnection::Daemon,
+        max_vessels: None,
+        status,
+    };
     let full = HostStatus {
         ready: true,
         heartbeat_at: Some(Utc::now()),
@@ -27,7 +30,7 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
         )]),
         ..Default::default()
     };
-    let host = hosts.update_status("host-id", &host.metadata.resource_version, &full).await.expect("full host");
+    hosts.put(host("host-id", Some(full.clone())));
     let convoys = backend.using::<Convoy>("flotilla");
     let convoy = convoys
         .create(
@@ -76,22 +79,16 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
         crate::common::detached_convoys(),
         crate::common::detached_messages(),
     )
-    .with_hosts(backend.including_replicas::<Host>("flotilla"));
+    .with_hosts(hosts.clone());
     let wait = reconciler.capacity_wait(&convoy).await.expect("judge full");
     assert!(wait.as_ref().is_some_and(|wait| wait.contains("linux-docker") && wait.contains("no free vessel slots")), "{wait:?}");
 
     let mut free = full;
     free.fulfilment_facts.get_mut("linux-docker").expect("facts").free_vessel_slots = Some(1);
-    hosts.update_status("host-id", &host.metadata.resource_version, &free).await.expect("capacity restored");
+    hosts.put(host("host-id", Some(free)));
     assert_eq!(reconciler.capacity_wait(&convoy).await.expect("judge free"), None, "restored capacity ends the wait");
 
-    hosts
-        .create(
-            &InputMeta::builder().name("another-host-id".to_string()).build(),
-            &HostSpec { display_name: "feta".to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("second host with same display name");
+    hosts.put(host("another-host-id", None));
     let wait = reconciler.capacity_wait(&convoy).await.expect("an ambiguous host waits instead of failing");
     assert!(wait.as_ref().is_some_and(|wait| wait.contains("ambiguous")), "{wait:?}");
 }

@@ -729,7 +729,7 @@ async fn capped_ssh_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
         daemon.convoy_engine_path(),
         daemon.crew_message_path(),
     )
-    .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
+    .with_hosts(daemon.host_records())
     .with_occupancy(backend.clone(), "flotilla")
     .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
     let gate = |name: String| {
@@ -881,7 +881,7 @@ async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order()
         daemon.convoy_engine_path(),
         daemon.crew_message_path(),
     )
-    .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
+    .with_hosts(daemon.host_records())
     .with_occupancy(backend.clone(), "flotilla")
     .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
     let mut waits = Vec::new();
@@ -1022,7 +1022,7 @@ async fn all_candidates_full_means_the_convoy_waits() {
         daemon.convoy_engine_path(),
         daemon.crew_message_path(),
     )
-    .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
+    .with_hosts(daemon.host_records())
     .with_occupancy(backend.clone(), "flotilla")
     .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
     let convoy = backend.clone().using::<ResourceConvoy>("flotilla").get(&launch).await.expect("third convoy");

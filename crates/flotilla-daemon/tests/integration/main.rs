@@ -9,6 +9,7 @@ mod engine_only;
 mod operator_commands;
 mod overlay_replication;
 mod peer_connect_flow;
+mod planner_hosts;
 mod project_cli;
 mod reconciled_remote_turn;
 mod test_daemon;

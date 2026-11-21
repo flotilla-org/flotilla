@@ -36,7 +36,7 @@ use flotilla_provisioning::checkout_runtime::ChangeRequestObservations;
 use flotilla_provisioning::engine::ProvisioningLifecycles;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
-use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Host, Repository, Resource, ResourceError, Vessel};
+use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Repository, Resource, ResourceError, Vessel};
 use flotilla_store::{
     controller::ControllerLoop,
     load_metrics::{attributed, caller, inherit_or, within, Attributed},
@@ -885,6 +885,7 @@ fn spawn_controller_loops(
                 let mut secondaries = ConvoyReconciler::secondary_watches(
                     &backend,
                     &namespace_string,
+                    daemon.host_records(),
                     daemon.convoy_engine_path(),
                     daemon.crew_message_path(),
                 );
@@ -899,7 +900,7 @@ fn spawn_controller_loops(
                 (
                     secondaries,
                     ConvoyReconciler::new(daemon.lifecycle_reads(), daemon.convoy_engine_path(), daemon.crew_message_path())
-                        .with_hosts(backend.including_replicas::<Host>(&namespace_string))
+                        .with_hosts(daemon.host_records())
                         .with_occupancy(backend.clone(), &namespace_string)
                         .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))
                         .with_forges(backend.definitions::<Forge>(&namespace_string))
@@ -1279,6 +1280,7 @@ fn vessel_planning(state: &Arc<ControllerRuntimeState>, backend: &ResourceBacken
         state.config.base_path().as_path().to_path_buf(),
     )
     .with_lifecycle_reads(state.daemon.lifecycle_reads())
+    .with_hosts(state.daemon.host_records())
     .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(state), change_requests: None }))
     .with_federated_dependencies(backend, CanonicalHostId::resolved(state.local_host_ref.clone()))
     .with_additional_host_refs(state.ssh_host_refs())

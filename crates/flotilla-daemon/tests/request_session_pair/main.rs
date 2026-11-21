@@ -2920,7 +2920,7 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
             topology.follower.convoy_engine_path(),
             topology.follower.crew_message_path(),
         )
-        .with_hosts(placement.including_replicas::<Host>(namespace))
+        .with_hosts(topology.follower.host_records())
         .with_vessels(placement.including_replicas::<Vessel>(namespace)),
         backend: placement.clone(),
     };

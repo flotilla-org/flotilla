@@ -759,6 +759,8 @@ pub struct InProcessDaemon {
     convoy_views: std::sync::OnceLock<Arc<flotilla_store::ConvoyViews>>,
     /// The account kinds' records (#3824 layer 1): the engine's.
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
+    /// The Host records, the planners' Host port (#4413): the engine's.
+    hosts: Arc<flotilla_provisioning::engine::hosts::EngineHosts>,
     manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
     standing_roles: Arc<dyn flotilla_resources::standing_roles::StandingRoles>,
     /// The forge observers, which write only what they observe once the engine's observation records are installed.
@@ -883,6 +885,8 @@ pub struct ComposedEngine {
     pub accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     pub manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
     pub standing_roles: Arc<dyn flotilla_resources::standing_roles::StandingRoles>,
+    /// Host, which the planners read through its port alone (#4413).
+    pub hosts: Arc<flotilla_provisioning::engine::hosts::EngineHosts>,
 }
 
 /// Opens the decided store once the daemon's identity is resolved; the composition root supplies it.
@@ -1466,6 +1470,9 @@ impl InProcessDaemon {
             Arc::clone(&open_awaiting),
         ));
         drop(convoy_records.follow()?);
+        // The planners' wakes hear each Host change as it lands.
+        let hosts = Arc::clone(&engine.hosts);
+        drop(hosts.follow()?);
         // This home retires its ended convoys as their holds release.
         drop(flotilla_engine_convoys::retire::follow(Arc::clone(&convoys), Arc::clone(&clock))?);
         let daemon = Arc::new_cyclic(|self_weak| Self {
@@ -1547,6 +1554,7 @@ impl InProcessDaemon {
             accounts,
             manifest_roots,
             standing_roles,
+            hosts,
             change_request_observer,
             issue_observer,
             resource_backend: resource_backend.clone(),
@@ -2411,6 +2419,11 @@ impl InProcessDaemon {
     /// The attentions: the engine's once its Message path is installed, the old store's before.
     pub fn attentions(&self) -> Arc<dyn flotilla_resources::attentions::Attentions> {
         self.resource_backend.attentions()
+    }
+
+    /// The Host port the planners read (#4413): the engine's Host records.
+    pub fn host_records(&self) -> Arc<dyn flotilla_resources::host_records::HostRecords> {
+        self.hosts.clone()
     }
 
     /// The account kinds' records: the engine's.

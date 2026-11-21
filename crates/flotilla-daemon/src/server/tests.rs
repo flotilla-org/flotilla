@@ -29,7 +29,7 @@ use flotilla_protocol::{
     StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    Convoy, ConvoySpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta,
+    Convoy, ConvoySpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, HarnessFacts, HostSpec, HostStatus, InputMeta,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceError, Selector, TerminalAttentionState, TerminalBrief,
     TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel,
 };
@@ -488,9 +488,11 @@ pub(super) async fn daemon_with_decided_store(
                 accounts,
                 manifest_roots,
                 standing_roles,
+                hosts,
             } = open_ports(&store, &identity.host_id.to_string(), identity.clock)?;
             Ok(flotilla_core::in_process::ComposedEngine {
                 standing_roles,
+                hosts,
                 service: store,
                 records,
                 observations,
@@ -1842,7 +1844,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
             remote_daemon.convoy_engine_path(),
             remote_daemon.crew_message_path(),
         )
-        .with_hosts(placed.including_replicas::<Host>("flotilla"))
+        .with_hosts(remote_daemon.host_records())
         .with_vessels(placed.including_replicas::<Vessel>("flotilla")),
         backend: placed.clone(),
     };
@@ -1893,7 +1895,8 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
         &placed,
         "flotilla",
         flotilla_crew::reconcilers::vessel::VesselPlanning::new(placed.clone(), "flotilla", remote_daemon.account_records())
-            .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
+            .with_lifecycle_reads(remote_daemon.lifecycle_reads())
+            .with_hosts(remote_daemon.host_records()),
         Arc::clone(&install_engine(&remote_daemon).vessels.lifecycles),
         remote_daemon.lifecycle_reads(),
         remote_daemon.decided_store(),
