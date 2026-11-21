@@ -2027,7 +2027,7 @@ mod busy_daemon_retry {
     // a broken record the same way whether the daemon is running (`--from-daemon`) or stopped
     // (`--from-store`), because a stopped store is opened by the daemon the candidate composes
     // and read through the same resource API.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_running_and_a_stopped_engine_store_are_validated_alike_through_the_cli() {
         use clap::Parser;
         use flotilla_cli::cli::args::{Cli, SubCommand};
