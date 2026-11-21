@@ -8,6 +8,10 @@
 //! that has not arrived, such as a replica of its convoy, is a retryable failure. Waiting for a
 //! holding to be realised spends no try.
 //!
+//! Once realised, its plan seats its crews, and their terminal sessions are its holdings: a
+//! session's commit observes it again, which seats the next crew or breaks a launch whose crew
+//! cannot be seated.
+//!
 //! The launch's holder is its convoy, read by the vessel requester, which releases the launch;
 //! what it holds ends with it through their own holders. Nothing is torn down here.
 
@@ -26,11 +30,12 @@ use flotilla_state_machines::{
 };
 
 use super::controller::{Actuator, Backing, Holding, Holdings, ProviderFailure, Usability};
-use crate::stored::{checkout::CheckoutKind, clone::CloneKind, environment::EnvironmentKind};
+use crate::stored::{checkout::CheckoutKind, clone::CloneKind, environment::EnvironmentKind, terminal_session::TerminalSessionKind};
 
 const ENVIRONMENT: KindCode = <Resource<Lifecycle<EnvironmentKind>> as Kind>::CODE;
 const CLONE: KindCode = <Resource<Lifecycle<CloneKind>> as Kind>::CODE;
 const CHECKOUT: KindCode = <Resource<Lifecycle<CheckoutKind>> as Kind>::CODE;
+const TERMINAL_SESSION: KindCode = <Resource<Lifecycle<TerminalSessionKind>> as Kind>::CODE;
 
 /// The Vessel kind's actuator over its planner.
 pub struct VesselActuator {
@@ -53,6 +58,7 @@ fn usability(held: &Held) -> Usability {
         HeldKind::Environment => ENVIRONMENT,
         HeldKind::Clone => CLONE,
         HeldKind::Checkout => CHECKOUT,
+        HeldKind::Terminal => TERMINAL_SESSION,
     };
     Usability { fact: Identity { kind, name: held.launch.clone(), home: held.home.clone() }, usable: held.ready }
 }
@@ -121,7 +127,7 @@ impl Actuator<VesselKind> for VesselActuator {
     }
 
     fn followed(&self) -> Vec<KindCode> {
-        vec![ENVIRONMENT, CLONE, CHECKOUT]
+        vec![ENVIRONMENT, CLONE, CHECKOUT, TERMINAL_SESSION]
     }
 
     fn dependencies(&self, _: &VesselSpec) -> Vec<Identity> {

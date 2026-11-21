@@ -28,7 +28,7 @@ use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::{codex_central_auth_path, AgentMaterialRegistry, CodexCentralRefresher, CredentialStore};
 use flotilla_crew::convoy::ConvoyReconciler;
-use flotilla_crew::reconcilers::vessel::{ConvoyVesselWake, CrewSeats, VesselPlanning};
+use flotilla_crew::reconcilers::vessel::{ConvoyVesselWake, VesselPlanning};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
@@ -861,23 +861,6 @@ fn spawn_controller_loops(
                 (RepositoryReconciler::secondary_watches(discovered.clone(), decided.clone()), reconciler)
             }
         }),
-        controller!(Vessel, {
-            let state = Arc::clone(&state);
-            move |backend: ResourceBackend, namespace_string: String| {
-                // A ready vessel's crews are seated as it, its sessions, its convoy, its crews'
-                // bindings and their briefs change; the Vessel controller writes its edges.
-                let mut secondaries = CrewSeats::secondary_watches();
-                secondaries.push(Box::new(ConvoyVesselWake::new(
-                    &backend,
-                    &namespace_string,
-                    state.daemon.lifecycle_reads(),
-                    state.daemon.convoy_engine_path(),
-                    state.daemon.account_records(),
-                )));
-                let planning = Arc::new(vessel_planning(&state, &backend, &namespace_string));
-                (secondaries, CrewSeats::new(planning).with_rechecks(state.vessel_rechecks.clone()))
-            }
-        }),
         controller!(Convoy, {
             let daemon = Arc::clone(&state.daemon);
             move |backend: ResourceBackend, namespace_string: String| {
@@ -1292,8 +1275,9 @@ fn vessel_planning(state: &Arc<ControllerRuntimeState>, backend: &ResourceBacken
 }
 
 /// The Vessel controller (#3108): the single writer of this home's vessel launches, realising each
-/// in its environment once what its planner requests for it is realised. Its holdings' commits
-/// wake it; its convoy's, its crews' bindings' and its seats' changes are told as rechecks.
+/// in its environment once what its planner requests for it is realised, then seating its crews.
+/// Its holdings' commits, its crews' sessions among them, wake it; its convoy's, its crews'
+/// bindings' and their briefs' changes are told as rechecks.
 fn spawn_vessel_controller(
     state: &Arc<ControllerRuntimeState>,
     engine: &ProvisioningLifecycles,

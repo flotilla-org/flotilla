@@ -146,7 +146,7 @@ async fn publish_brief(backend: &ResourceBackend, convoy: &str, role: &str) {
     }
 }
 
-/// The vessel launches queued, and the launches read and keyed gets made, when one convoy's brief
+/// The vessel launches rechecked, and the launches read and keyed gets made, when one convoy's brief
 /// artifact changes with `others` other convoys each holding a launch.
 async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
     let store = OtherHome::open("home");
@@ -163,8 +163,8 @@ async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
 
     let accounts: Arc<dyn AccountRecords> = Arc::new(OldStoreAccounts::new(backend.clone()));
     let wake = ConvoyVesselWake::new(&backend, NAMESPACE, Arc::clone(convoys.reads()), convoys.path(), accounts);
-    let (sender, mut queued) = WorkQueueSender::channel();
-    let waking = tokio::spawn(Box::new(wake).spawn(backend.clone(), NAMESPACE.to_owned(), sender));
+    let (sender, mut queued) = tokio::sync::mpsc::channel(256);
+    let waking = tokio::spawn(wake.recheck(NAMESPACE.to_owned(), sender));
 
     // The wake's watches open after it is spawned: the first convoy's brief is published until it
     // is heard.
@@ -180,8 +180,7 @@ async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
     .await
     .expect("the wake hears a brief");
     assert_eq!(&heard, warm_vessel);
-    // A queued name is not sent again until the controller takes it, which this test never does;
-    // the settle lets any earlier publish's wake finish its read before the count starts.
+    // The settle lets any earlier publish's wake finish its read before the count starts.
     tokio::time::sleep(Duration::from_millis(100)).await;
     while queued.try_recv().is_ok() {}
 

@@ -23,7 +23,8 @@
 //!   one deadline for the kind, never an interval;
 //! - a commit of a record it holds ([`Actuator::holdings`]): a kind that holds others, such as a
 //!   vessel its environment and checkouts, requests them and waits for each to be realised; once
-//!   it is realised, such a commit observes it again.
+//!   it is realised, such a commit observes it again. Its realisation observes it once, so that
+//!   what it holds as a realised resource, such as a vessel's crew sessions, is requested.
 //!
 //! Waiting is not a try: a request waits on its usability facts and its holdings without
 //! spending any of its attempts.
@@ -839,9 +840,11 @@ where
         self.in_flight.insert(name.to_owned());
     }
 
-    /// Records what a flight, or a pushed backing fact, found. True when it found a realised
-    /// resource's backing gone or broken after its holder ended: its release owns the ending, so
-    /// the finding ends nothing and the release is tried again.
+    /// Records what a flight, or a pushed backing fact, found. True when the resource is to be
+    /// looked at again at once: a holding kind's resource just realised, observed for what it holds
+    /// once realised; or a realised resource whose backing it found gone or broken after its holder
+    /// ended, whose release owns the ending, so the finding ends nothing and the release is tried
+    /// again.
     async fn finish(&mut self, name: &str, done: Done) -> bool {
         let resource = match self.records.get(name) {
             Ok(Some(resource)) => resource,
@@ -852,7 +855,7 @@ where
             }
         };
         let state = resource.state().clone();
-        let mut left_to_release = false;
+        let mut again = false;
         // A new try ran: what it found decides any later one.
         let scheduled = if matches!(done, Done::Observed(..) | Done::Held(Ok(_))) { None } else { self.retries.remove(name) };
         if let Done::Observed(_, Some(holdings)) = &done {
@@ -866,7 +869,11 @@ where
             // A realised resource's holdings read again: its observation, not this read, ends it.
             (Done::Held(Err(failure)), _) => warn!(kind = K::NAME, name, cause = ?failure.cause, "holdings could not be read"),
             (Done::Realised(Ok(identity)), _) => {
-                if let Some(EngineError::Refused(_)) = self.write(name, Step::Realised { identity: identity.clone() }).await {
+                let refused = self.write(name, Step::Realised { identity: identity.clone() }).await;
+                if refused.is_none() && self.actuator.holds() {
+                    again = self.lifecycles.get(name).is_some_and(|resource| matches!(resource.state(), LifecycleState::Realised { .. }));
+                }
+                if let Some(EngineError::Refused(_)) = refused {
                     // It ended while the work ran: what the work made is torn down.
                     if !state.live() {
                         let request = resource.spec().clone();
@@ -904,15 +911,15 @@ where
                 self.write(name, Step::Realised { identity }).await;
             }
             (Done::Observed(Ok(Backing::Absent { reason }), _), LifecycleState::Realised { .. }) => {
-                left_to_release = self.vanish(name, resource.spec(), VanishCause::Lost { reason }).await;
+                again = self.vanish(name, resource.spec(), VanishCause::Lost { reason }).await;
             }
             (Done::Observed(Ok(Backing::Failed { reason }), _), LifecycleState::Realised { .. }) => {
-                left_to_release = self.vanish(name, resource.spec(), VanishCause::Failed { reason }).await;
+                again = self.vanish(name, resource.spec(), VanishCause::Failed { reason }).await;
             }
             (Done::Observed(Err(cause), _), _) => warn!(kind = K::NAME, name, ?cause, "observation failed"),
             _ => {}
         }
-        left_to_release
+        again
     }
 
     /// Ends realised `name` vanished for `cause`, unless its holder has ended: then a release is

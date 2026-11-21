@@ -4,7 +4,9 @@
 //! The Vessel controller at the launch's home asks the planner before each try. The planner
 //! requests, idempotently at that home, the environment, clones and checkouts the launch holds,
 //! and reports each one's realisation; the launch is realised in its environment once every
-//! holding is realised. The planner writes no vessel edge.
+//! holding is realised. Once it is realised, the planner seats its crews: each crew's terminal
+//! session is a holding of the realised launch, whose commits have it planned again. The planner
+//! writes no vessel edge.
 
 /// The kind of a record a vessel launch holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -12,6 +14,8 @@ pub enum HeldKind {
     Environment,
     Clone,
     Checkout,
+    /// A crew's terminal session, held once the launch is realised.
+    Terminal,
 }
 
 /// One record a vessel launch holds: a launch of its kind at its home, and whether it is realised.
