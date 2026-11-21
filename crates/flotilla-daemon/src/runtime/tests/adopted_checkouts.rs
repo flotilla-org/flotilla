@@ -83,6 +83,9 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         let observed = daemon.discovered_checkouts().all().len();
         (held, observed)
     };
+    // The first convoy's own checkout is held asynchronously, after its create returns; the
+    // baseline is taken once it has landed, so only a duplicate's write can move the count.
+    wait_until(|| async { checkout_count().await.0 == 1 }).await;
     let checkout_count_before = checkout_count().await;
     let duplicate_id = daemon
         .execute(
