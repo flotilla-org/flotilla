@@ -2,7 +2,7 @@ use super::*;
 use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::{definition_provenance::SEEDING_MANAGER, FulfilmentGrant, PlacementImageSource};
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn canonicalizes_display_name_kind_host_refs_to_the_host_id() {
     let host_id = "b2aac222-host-id";
     let home = EngineBackend::open_in(host_id, NAMESPACE);
@@ -60,8 +60,10 @@ async fn canonicalizes_display_name_kind_host_refs_to_the_host_id() {
         .create(&empty_meta("a-collision"), &host_direct("collision"))
         .await
         .expect("seed ambiguous kind");
-    let previous =
-        BTreeMap::from([("direct-udder".to_string(), FulfilmentFacts { observed_at: Utc::now(), ..FulfilmentFacts::default() })]);
+    let previous = BTreeMap::from([(
+        "direct-udder".to_string(),
+        FulfilmentFacts { observed_at: flotilla_resources::clock::now(), ..FulfilmentFacts::default() },
+    )]);
     let runner = Arc::new(DiscoveryMockRunner::builder().build());
     let facts = observe_fulfilment_facts(
         &backend,
@@ -168,7 +170,7 @@ fn seeded_labels() -> BTreeMap<String, String> {
 }
 
 // Seeding writes this host's kinds directly, labelled as seeding's.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn seeding_writes_host_direct_and_docker_kinds() {
     let home = EngineBackend::open_in("host-test", NAMESPACE);
     let backend = home.backend.clone();
@@ -186,7 +188,7 @@ async fn seeding_writes_host_direct_and_docker_kinds() {
     assert_eq!(docker.metadata.labels, seeded_labels());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn kind_seeding_keeps_operator_grants_and_corrects_owned_drift() {
     let home = EngineBackend::open_in("host-test", NAMESPACE);
     let profile = manual_profile("host-test", false);
@@ -242,7 +244,7 @@ async fn kind_seeding_keeps_operator_grants_and_corrects_owned_drift() {
     assert_eq!(steady.metadata.resource_version, reconciled.metadata.resource_version, "steady seeding must not rewrite the kind");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn kind_seeding_refreshes_platform_and_adopts_unlabelled_kinds() {
     let home = EngineBackend::open_in("host-test", NAMESPACE);
     let backend = home.backend.clone();
@@ -266,7 +268,7 @@ async fn kind_seeding_refreshes_platform_and_adopts_unlabelled_kinds() {
     assert_eq!(docker.metadata.labels, seeded_labels(), "seeding adopts the unlabelled kind");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn kind_seeding_leaves_kind_managed_elsewhere_untouched() {
     let home = EngineBackend::open_in("host-test", NAMESPACE);
     let backend = home.backend.clone();
@@ -300,7 +302,7 @@ async fn kind_seeding_leaves_kind_managed_elsewhere_untouched() {
     assert_eq!(unchanged.metadata.resource_version, manifest.metadata.resource_version, "seeding must not rewrite a managed kind");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn startup_registration_skips_repos_without_origin_and_gates_docker_kind() {
     let temp = TempDir::new().expect("tempdir");
     let git_repo = TestGitRepo::init(temp.path().join("repo-no-origin"));

@@ -757,7 +757,7 @@ async fn ssh_host_codex_crew_starts_in_a_prepared_flotilla_home() {
 // Review #3659, #3907 contract 8: an SSH host Claude crew has no ambient-login
 // fallback. Without an account binding the launch is refused with the reason,
 // and nothing starts or touches the host's configuration.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ssh_host_claude_crew_without_a_delivered_credential_is_refused_with_the_reason() {
     let Err(error) = try_launch_on_ssh_host("claude-code", false).await else {
         panic!("an SSH host Claude crew without a credential must not launch");
@@ -863,7 +863,7 @@ fn write_executable(path: &Path, script: &str) {
 // runs is the pinned harness its access layer delivered (#3909). Mutation
 // check: `sh -lc` in the SSH runner fails it.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ssh_host_harness_path_is_composed_and_never_the_login_profile() {
     // The home holds the vessel's cleat runtime, a socket directory (SUN_LEN).
     let remote = flotilla_test_support::TestSocketDir::new();
@@ -968,7 +968,7 @@ async fn ssh_host_harness_path_is_composed_and_never_the_login_profile() {
 
 // Acceptance (#3722): a supply variable that flotilla also sets for the
 // session is a configuration error for that host, and nothing starts.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_supply_overriding_a_flotilla_variable_is_a_host_configuration_error() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
@@ -996,7 +996,7 @@ async fn a_supply_overriding_a_flotilla_variable_is_a_host_configuration_error()
 // Supplies describe installations only: one that sets a variable a
 // registered family keeps its account state in is a host configuration
 // error, so the host's ambient Claude home can never reach a crew through it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_supply_setting_a_family_account_variable_is_a_host_configuration_error() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
@@ -1123,7 +1123,7 @@ async fn provision(daemon: &InProcessDaemon) -> Option<flotilla_resources::Accou
 /// Reopens the requester's binding a second later, as an explicit rebind does.
 async fn rebind(daemon: &InProcessDaemon, convoy: &str) {
     let current = binding(daemon, convoy).await;
-    let now = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + chrono::Duration::seconds(1)));
+    let now = flotilla_schema::Timestamp::from_datetime(&(flotilla_resources::clock::now() + chrono::Duration::seconds(1)));
     let reopened = super::launch_support::pending_binding(convoy, "coder", "claude-box-a", "box-a@example.com", now);
     assert_eq!(reopened.spec.requester, current.spec.requester);
     daemon.account_records().rebind(NAMESPACE, reopened, None, now).await.expect("rebind");
@@ -1172,7 +1172,7 @@ async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
     let bound = binding(&runtime.daemon, &runtime.convoy).await;
-    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
+    let now = flotilla_schema::Timestamp::from_datetime(&flotilla_resources::clock::now());
     let revoked = flotilla_resources::account_access::BindingState::Revoked {
         reason: "binding revoked: no authorizing grant".into(),
         delivered_until: Some(now),
@@ -1342,7 +1342,7 @@ async fn failed_delivery_waits_for_its_retry_and_is_cleared_once_delivered() {
 // #3663: a delivery refused on positive evidence is recorded as permanent and never
 // retried. Here the current supply no longer declares the crew's frozen source, so the
 // skills need is refused; a later launch is refused without another attempt.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_permanent_refusal_is_recorded_and_never_retried() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));

@@ -5,7 +5,7 @@ use flotilla_engine_messages::view::record_name;
 use flotilla_resources::attentions::Subject;
 use tokio_util::task::AbortOnDropHandle;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     let temp = tempfile::tempdir().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"credential-refresh-test\"\n").expect("daemon config");
@@ -67,7 +67,7 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     assert!(open().await.is_empty());
 
     // When the vessel's current run of failures began, as the store reports it; a full fix ends it.
-    let episode = std::cell::Cell::new(chrono::Utc::now());
+    let episode = std::cell::Cell::new(flotilla_resources::clock::now());
     let failure = |message: &str, should_surface| CredentialRefreshError {
         environment_ref: "standing-vessel".to_string(),
         credential_name: Some("github-app".to_string()),
@@ -98,7 +98,9 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     .expect("the same credential keeps failing");
     assert!(open().await.is_empty(), "an acknowledged attention is not raised again while the same credentials fail");
     reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[]).await.expect("recovery");
-    episode.set(chrono::Utc::now());
+    // The next run of failures begins after what was told and acknowledged of the last.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    episode.set(flotilla_resources::clock::now());
     reconcile_credential_refresh_attention_in(
         &*daemon.attentions(),
         &backend,
@@ -118,7 +120,9 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     .expect("retain alert during retry");
     assert_eq!(open().await.len(), 1);
     reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[]).await.expect("clear on recovery");
-    episode.set(chrono::Utc::now());
+    // The next run of failures begins after what was told and acknowledged of the last.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    episode.set(flotilla_resources::clock::now());
     assert!(open().await.is_empty());
 
     // Each change of the failing set is told: {github-app}, then {github-app, forgejo}, then {github-app}.
@@ -142,7 +146,9 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         .expect("partial fix");
     assert!(open().await.is_empty(), "a partial fix leaves the acknowledgement standing");
     reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[]).await.expect("full fix");
-    episode.set(chrono::Utc::now());
+    // The next run of failures begins after what was told and acknowledged of the last.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    episode.set(flotilla_resources::clock::now());
     reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &[failure("outage", true)])
         .await
         .expect("fails again");
@@ -157,6 +163,8 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     assert!(open().await.is_empty(), "acknowledged while the same credential fails");
     let forgejo = CredentialRefreshError { credential_name: Some("forgejo".to_string()), ..failure("token refused", true) };
     let both = [failure("outage", true), forgejo];
+    // It starts failing after the acknowledgement.
+    tokio::time::advance(Duration::from_secs(1)).await;
     reconcile_credential_refresh_attention_in(&*daemon.attentions(), &backend, NAMESPACE, &both).await.expect("another starts failing");
     let told = open().await;
     assert_eq!(told.len(), 1, "a newly failing credential is told again");
@@ -188,7 +196,7 @@ fn docker_environment_metadata_decodes_non_empty_credential_scopes() {
 // declarations and config corrections clear them. The diagnosis is advisory: the heartbeat
 // makes it, but the engine Host keeps only conditions that block readiness or forge
 // observation (`host_import.rs`), so it is read where the heartbeat reads it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn daemon_forgejo_credential_mapping_heartbeat_lifecycle() {
     let temp = TempDir::new().expect("tempdir");
     credential_mapping_config(temp.path(), Some("lba"));
@@ -229,7 +237,7 @@ async fn daemon_forgejo_credential_mapping_heartbeat_lifecycle() {
 
 // Advisory diagnosis errors must not propagate into the heartbeat. The
 // wrapper's Option result enforces that boundary even for malformed config.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn daemon_forgejo_credential_mapping_errors_are_advisory_and_retry() {
     let temp = TempDir::new().expect("tempdir");
     credential_mapping_config(temp.path(), None);
@@ -244,7 +252,7 @@ async fn daemon_forgejo_credential_mapping_errors_are_advisory_and_retry() {
 // An unqualified host-local mapping can serve a source-addressed request whose Forge is
 // declared at another home, with no local checkout. The engine keeps no namespaces, so the
 // other home's declaration is the one outside this daemon's.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn daemon_forgejo_credential_mapping_resolves_replica_in_another_namespace() {
     let temp = TempDir::new().expect("tempdir");
     credential_mapping_config(temp.path(), Some("lab"));
@@ -259,7 +267,7 @@ async fn daemon_forgejo_credential_mapping_resolves_replica_in_another_namespace
 
 // #2577: startup manifests must finish a pass before absence is diagnosed;
 // their late Forge declarations satisfy the mapping without a checkout.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn daemon_forgejo_credential_mapping_waits_for_manifest_pass() {
     let temp = TempDir::new().expect("tempdir");
     credential_mapping_config(temp.path(), Some("lab"));
@@ -278,7 +286,7 @@ async fn daemon_forgejo_credential_mapping_waits_for_manifest_pass() {
         revision: "r1".into(),
         complete: true,
         documents: Default::default(),
-        at: chrono::Utc::now(),
+        at: flotilla_resources::clock::now(),
     };
     roots.record_pass(NAMESPACE, &root.name, pass).await.expect("completed empty pass");
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("settled source").is_some());
@@ -288,7 +296,7 @@ async fn daemon_forgejo_credential_mapping_waits_for_manifest_pass() {
 
 // #2577: an unrelated replica cursor cannot establish Forge absence. The
 // Forge snapshot can be empty or contain the declaration after startup.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn daemon_forgejo_credential_mapping_waits_for_forge_replication() {
     let temp = TempDir::new().expect("tempdir");
     credential_mapping_config(temp.path(), Some("lab"));
@@ -328,7 +336,7 @@ fn daemon_forgejo_credential_mapping_sequences(tc: hegel::TestCase) {
     let operations = (0..tc.draw(gs::integers::<usize>().min_value(1).max_value(12)))
         .map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(5)))
         .collect::<Vec<_>>();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
     runtime.block_on(async {
         let temp = TempDir::new().expect("tempdir");
         credential_mapping_config(temp.path(), None);
@@ -366,7 +374,7 @@ fn daemon_forgejo_credential_mapping_sequences(tc: hegel::TestCase) {
     });
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn agent_environment_is_staged_at_the_runner_writable_config_base() {
     let runner = PersistentPathRecordingRunner::default();
 
@@ -532,7 +540,7 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
     assert_eq!(delivery.agent_connection, None);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -667,7 +675,7 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn codex_credential_and_agent_material_conflict_before_container_creation() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -765,7 +773,7 @@ async fn codex_credential_and_agent_material_conflict_before_container_creation(
     assert!(provider.create_opts.lock().await.is_none(), "conflicting config must fail before creating a container");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unprovisioned_central_codex_credential_fails_before_registry_preflight() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -994,7 +1002,7 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
 }
 
 // Credential attention ignores terminal convoy history before decoding it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn credential_attention_reads_only_live_convoys() {
     use flotilla_engine_convoys_testkit::{land, single_agent, EngineHome};
     let home = EngineHome::open_in("home", "flotilla");
@@ -1241,11 +1249,11 @@ impl RunningCards {
 
 // Behaviour: rebinding a convoy's account refreshes that convoy's running crew's card, with no
 // other event, and no other convoy's.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_rebind_reaches_a_running_sessions_card_with_no_other_event() {
     let cards = RunningCards::start().await;
     let other = cards.source.settled("cards-session-1", 1).await;
-    let now = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + chrono::Duration::seconds(1)));
+    let now = flotilla_schema::Timestamp::from_datetime(&(flotilla_resources::clock::now() + chrono::Duration::seconds(1)));
     let reopened = super::launch_support::pending_binding(&cards.convoys[0], "coder", "claude-b", "b@example.com", now);
     cards.daemon.account_records().rebind(NAMESPACE, reopened, None, now).await.expect("rebind");
 
@@ -1257,7 +1265,7 @@ async fn a_rebind_reaches_a_running_sessions_card_with_no_other_event() {
 
 // Behaviour: a change to the grants of the fulfilment kind a crew was placed by reaches its
 // running card, with no other event, and no card of a crew placed by another kind.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_fulfilment_kinds_grants_reach_a_running_sessions_card_with_no_other_event() {
     let cards = RunningCards::start().await;
     cards.source.settled("cards-session-0", 1).await;
@@ -1276,7 +1284,7 @@ async fn a_fulfilment_kinds_grants_reach_a_running_sessions_card_with_no_other_e
 // Behaviour: admitting a convoy and tearing it down, which write and delete its placement
 // snapshot, read only that convoy's card: the running crews of the other convoys are not read
 // again. (d11 finding 2: each admission and teardown re-read every card, one after another.)
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn admitting_and_tearing_down_a_convoy_reads_only_its_cards() {
     let cards = RunningCards::start().await;
     let first = cards.source.settled("cards-session-0", 1).await;
@@ -1295,7 +1303,7 @@ async fn admitting_and_tearing_down_a_convoy_reads_only_its_cards() {
 
 // Behaviour: an image build becoming built reaches the running card of a crew on its image, with
 // no other event: the card lists the image's verified tools. A crew on no image is not read again.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_built_image_reaches_a_running_sessions_card_with_no_other_event() {
     let cards = RunningCards::start().await;
     cards.source.settled("cards-session-0", 1).await;
@@ -1309,7 +1317,7 @@ async fn a_built_image_reaches_a_running_sessions_card_with_no_other_event() {
 
 // Behaviour: the build of an image no crew runs reaches no card: its launch and its becoming built
 // read no running crew's card again, neither the one on another image nor the one on none.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unrelated_images_build_reads_no_card() {
     let cards = RunningCards::start().await;
     let first = cards.source.settled("cards-session-0", 1).await;
@@ -1329,7 +1337,7 @@ async fn an_unrelated_images_build_reads_no_card() {
 
 // Behaviour: a launch whose card could not be rendered gets its card at the next credential pass,
 // whatever woke it: here a binding of the other convoy's crew.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_launch_whose_card_failed_gets_it_at_the_next_pass() {
     let cards = RunningCards::start().await;
     cards.source.settled("cards-session-1", 1).await;
@@ -1358,7 +1366,7 @@ async fn a_launch_whose_card_failed_gets_it_at_the_next_pass() {
 // Behaviour: a convoy's change after admission refreshes no card, and reads no card's convoy: what
 // a card reads of its convoy is frozen at admission. The change here is a subject linked through
 // the Convoy path, after the crew's launch rendered its card.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_convoy_change_refreshes_no_card() {
     let cards = RunningCards::start().await;
     cards.source.settled("cards-session-0", 1).await;

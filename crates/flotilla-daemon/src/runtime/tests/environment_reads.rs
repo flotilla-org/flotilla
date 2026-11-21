@@ -2,7 +2,7 @@ use super::*;
 
 // Daemon adoption and credential delivery use engine readiness; adoption uses its backing identity too.
 // Every ending but a realised launch is not ready, and a read error is never read as readiness.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn daemon_reads_environment_readiness_and_identity_without_a_copy() {
     use super::super::environments::{environment_readiness, EnvironmentReadiness};
     use flotilla_provisioning_testkit::Ending;

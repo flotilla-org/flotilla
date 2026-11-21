@@ -216,7 +216,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         &flotilla_resources::external_patches::resume_crew_work(
             "work".to_string(),
             "coder".to_string(),
-            Utc::now(),
+            flotilla_resources::clock::now(),
             "follow-up".to_string(),
             None,
             ResumeIntent::Reopen,
@@ -232,11 +232,11 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
             "actionable-review".to_string(),
             flotilla_resources::TurnDeliveryEpisode::builder()
                 .subject_revision("abc".to_string())
-                .evidence_at(Utc::now())
-                .judged_claim_at(Utc::now())
+                .evidence_at(flotilla_resources::clock::now())
+                .judged_claim_at(flotilla_resources::clock::now())
                 .outcome(flotilla_resources::TurnDeliveryOutcome::Delivered {
                     rung: flotilla_resources::TurnDeliveryRung::WarmSession,
-                    delivered_at: Utc::now(),
+                    delivered_at: flotilla_resources::clock::now(),
                 })
                 .build(),
             "work".to_string(),
@@ -605,7 +605,7 @@ async fn a_handoffs_credential_delivery_does_not_wait_behind_other_environments(
 
 // Delivering one environment reads it by key and index: the reads do not grow with the
 // environments around it, and none reads a whole kind.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_deliverys_reads_do_not_grow_with_unrelated_environments() {
     let fixture = KeyedDelivery::new("credential-keyed-reads").await;
     fixture.work("measured-work", "env-a").await;

@@ -60,7 +60,7 @@ async fn end_convoy(daemon: &InProcessDaemon, convoy: &str) {
 // Behaviour: a grant reaches the convoys whose bindings use its credential and the open convoys
 // here still waiting for a binding, as they are when it comes: a convoy admitted since the
 // watch's last grant is reached, and one ended since is not.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_grant_reaches_the_open_unbound_convoys_as_they_are_when_it_comes() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (daemon, bound) = binding_daemon(temp.path()).await;
