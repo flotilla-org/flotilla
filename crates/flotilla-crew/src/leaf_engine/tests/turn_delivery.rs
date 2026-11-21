@@ -728,7 +728,8 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
 }
 
 // Empty queued evidence may still repair stale queued-turn attention. Across
-// every convoy phase, preserve unrelated attention and avoid no-op status writes.
+// every convoy phase, preserve unrelated attention and avoid no-op status writes;
+// a Landed launch shows no attention, so there is none to repair.
 #[hegel::test]
 fn empty_queued_batches_preserve_attention_cleanup(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -760,9 +761,11 @@ fn empty_queued_batches_preserve_attention_cleanup(tc: hegel::TestCase) {
         let mut notes = home.engine().memory().subscribe();
         wake.observe_queued_turns("flotilla", &before, &BTreeMap::new(), now).await.unwrap();
         let after = resolver.get(&launch).await.unwrap();
-        let expected = if attention_kind == 1 { None } else { attention };
+        // A Landed launch's view shows no attention, so it has none to repair.
+        let shown = phase != ConvoyPhase::Landed;
+        let expected = if attention_kind == 1 || !shown { None } else { attention };
         assert_eq!(after.status.as_ref().unwrap().attention, expected);
-        assert_eq!(!notes_changed(&mut notes), attention_kind != 1);
+        assert_eq!(notes_changed(&mut notes), attention_kind == 1 && shown);
     });
 }
 
