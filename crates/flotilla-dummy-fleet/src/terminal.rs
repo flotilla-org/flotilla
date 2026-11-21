@@ -19,7 +19,9 @@ use flotilla_environment::environment::dummy::{dummy_draw, DUMMY_FLEET_ENV};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{arg::Arg, TerminalStatus};
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_terminal::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag, TerminalSubmission};
+use flotilla_terminal::{
+    ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSessionTag, TerminalSubmission,
+};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
@@ -147,6 +149,8 @@ pub(crate) struct DummySessions {
     /// The environments whose backings were destroyed: cleat cannot start a session inside a
     /// container that is gone, so a launch there is refused.
     destroyed: Mutex<HashSet<String>>,
+    /// The sessions their pool lost: cleat's daemon reports each absent, not exited.
+    lost: Mutex<HashSet<String>>,
 }
 
 impl DummySessions {
@@ -172,6 +176,17 @@ impl DummySessions {
 
     fn destroyed(&self, environment: &str) {
         self.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(environment.to_owned());
+    }
+
+    /// `name` was lost from its pool, as a previous process's fleet recorded.
+    pub(crate) fn restore_lost(&self, name: String) {
+        self.lock().remove(&name);
+        self.lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name);
+    }
+
+    /// Whether the pool lost `name`.
+    fn is_lost(&self, name: &str) -> bool {
+        self.lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(name)
     }
 
     /// Whether `environment`'s backing was destroyed.
@@ -240,6 +255,9 @@ impl DummySessions {
         let mut destroyed: Vec<String> = self.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect();
         destroyed.sort();
         events.extend(destroyed.into_iter().map(|environment| Event::SessionsDestroyed { environment }));
+        let mut lost: Vec<String> = self.lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect();
+        lost.sort();
+        events.extend(lost.into_iter().map(|session| Event::Lost { session }));
         events
     }
 
@@ -271,6 +289,14 @@ impl DummySessions {
             })
             .map(|(name, _)| name.clone())?;
         sessions.remove(&name)?.stop();
+        Some(name)
+    }
+
+    /// Lose the session of `role`'s crew in convoy `convoy` from its pool, as a cleat daemon that
+    /// no longer has it does, returning its name.
+    pub(crate) fn lose_crew(&self, convoy: &str, role: &str) -> Option<String> {
+        let name = self.end_crew(convoy, role)?;
+        self.lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.clone());
         Some(name)
     }
 }
@@ -322,6 +348,18 @@ impl DummyTerminalPool {
 impl TerminalPool for DummyTerminalPool {
     fn tracks_session_liveness(&self) -> bool {
         true
+    }
+
+    /// A session that ended reads as stopped, as an exited process does; one its pool lost reads
+    /// as absent, as cleat reports a session its daemon no longer has.
+    async fn session_liveness(&self, session_id: &str) -> Result<TerminalSessionLiveness, String> {
+        Ok(if self.own(session_id).is_some() {
+            TerminalSessionLiveness::Running
+        } else if self.fleet.sessions.is_lost(session_id) {
+            TerminalSessionLiveness::Absent
+        } else {
+            TerminalSessionLiveness::Stopped
+        })
     }
 
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {

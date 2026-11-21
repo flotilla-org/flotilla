@@ -189,6 +189,7 @@ impl DummyFleet {
             Event::Killed { session } => {
                 self.sessions.lock().remove(&session);
             }
+            Event::Lost { session } => self.sessions.restore_lost(session),
             Event::SessionsDestroyed { environment } => self.sessions.restore_destroyed(environment),
             Event::Turn { session, text, key, at_unix_ms } => match self.sessions.get(&session) {
                 Some(session) => session.restore_turn(crate::terminal::DeliveredTurn { text, key, at_unix_ms }),
@@ -302,6 +303,14 @@ impl DummyFleet {
     pub fn end_crew(&self, convoy: &str, role: &str) -> bool {
         let Some(name) = self.sessions.end_crew(convoy, role) else { return false };
         self.record(&Event::Killed { session: name });
+        true
+    }
+
+    /// Lose the session of `role`'s crew in convoy `convoy` from its pool, as a cleat daemon that
+    /// no longer has it does: the pool reports it absent. False when no such crew runs.
+    pub fn lose_crew(&self, convoy: &str, role: &str) -> bool {
+        let Some(name) = self.sessions.lose_crew(convoy, role) else { return false };
+        self.record(&Event::Lost { session: name });
         true
     }
 

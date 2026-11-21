@@ -697,6 +697,12 @@ impl TestDaemon {
         self.fleet.end_crew(convoy, role)
     }
 
+    /// Lose the session of `role`'s crew in convoy `convoy` from its pool, as a cleat daemon that
+    /// no longer has it does. False when no such crew runs.
+    pub fn lose_crew(&self, convoy: &str, role: &str) -> bool {
+        self.fleet.lose_crew(convoy, role)
+    }
+
     /// What the fakes counted.
     pub fn counts(&self) -> DummyFleetSnapshot {
         self.fleet.snapshot()

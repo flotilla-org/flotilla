@@ -12,7 +12,9 @@ use flotilla_protocol::{
     table::Row,
     AgentActivity, AgentSessionReading, CommandAction, QueryId, ResultSet,
 };
-use flotilla_resources::{ChangeRequest, Convoy, ConvoyPhase, ObservedChangeRequestState, ResourceObject, TerminalSession};
+use flotilla_resources::{
+    ChangeRequest, Convoy, ConvoyPhase, ObservedChangeRequestState, ResourceObject, TerminalSession, TerminalSessionPhase,
+};
 
 fn text<'a>(row: &'a Row, column: &str) -> &'a str {
     row.get(column).and_then(serde_json::Value::as_str).unwrap_or_default()
@@ -523,4 +525,67 @@ async fn fleet_health_counts_a_capped_hosts_free_slots_from_its_engine_vessels()
         .find(|kind| kind.name == DUMMY_FULFILMENT_KIND)
         .unwrap_or_else(|| panic!("the dummy fulfilment kind: {health:?}"));
     assert_eq!((kind.max_vessels, kind.free_vessel_slots), (Some(4), Some(3)), "{kind:?}");
+}
+
+// #4421: a crew whose terminal session vanishes from its pool mid-run is relaunched from its
+// brief, and its convoy lands. The landed convoy then retires, and the lost launch with it.
+#[tokio::test(start_paused = true)]
+async fn a_landed_convoy_whose_crew_session_was_lost_retires_with_the_lost_launch() {
+    let daemon = TestDaemon::builder().agent("turn_delay_ms = 5000").start().await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let launched = daemon
+        .wait("the coder's session", |session: &ResourceObject<TerminalSession>| {
+            session.metadata.labels.get(flotilla_resources::CONVOY_LABEL) == Some(&convoy) && daemon.counts().sessions_launched == 1
+        })
+        .await;
+    let lost = launched.metadata.name;
+    assert!(daemon.lose_crew(&convoy, "coder"), "the coder's session vanishes from its pool");
+    daemon.wait("Landed", in_phase(&convoy, ConvoyPhase::Landed)).await;
+    assert_eq!(daemon.counts().sessions_launched, 2, "the coder relaunched once: {:?}", daemon.counts());
+    daemon.wait_reached("Retired", "convoy", "Retired", |row| text(row, "resource.name") == convoy).await;
+    daemon.wait_gone::<TerminalSession>(&lost).await;
+}
+
+// #4421: a stalled crew whose session its pool loses is not relaunched, so its lost launch stays
+// its session's newest. An operator completes the crew and the convoy lands. The convoy and the
+// lost launch retire, and stay retired once the daemon restarts and reads every launch again.
+#[tokio::test(start_paused = true)]
+async fn a_landed_convoy_whose_stalled_crew_lost_its_session_retires_with_the_lost_launch() {
+    let daemon = TestDaemon::builder().agent("stall_rate = 1.0").start().await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    daemon
+        .wait("a stall", |found: &ResourceObject<Convoy>| {
+            found.metadata.name == convoy && found.status.as_ref().is_some_and(|status| status.stalled.is_some())
+        })
+        .await;
+    let session = daemon.wait("the coder's session", |session: &ResourceObject<TerminalSession>| session.spec.role == "coder").await;
+    let lost = session.metadata.name.clone();
+    let flotilla_resources::TerminalSessionSource::Agent { context, .. } = session.spec.source else { panic!("an agent session") };
+    assert!(daemon.lose_crew(&convoy, "coder"), "the coder's session vanishes from its pool");
+    daemon
+        .wait("the session lost", |session: &ResourceObject<TerminalSession>| {
+            session.metadata.name == lost && session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Lost)
+        })
+        .await;
+    let completed = daemon
+        .execute(CommandAction::CrewComplete {
+            context: flotilla_protocol::query::CrewCommandContext {
+                namespace: Some(NAMESPACE.into()),
+                convoy: Some(convoy.clone()),
+                vessel_ref: Some(context.vessel_ref),
+                role: Some("coder".into()),
+                ..Default::default()
+            },
+            message: Some("operator accepted the ledger-less claim".into()),
+            disposition: None,
+        })
+        .await;
+    assert_eq!(completed, CommandValue::Ok);
+    daemon.wait("Landed", in_phase(&convoy, ConvoyPhase::Landed)).await;
+    assert_eq!(daemon.counts().sessions_launched, 1, "the stalled coder was not relaunched: {:?}", daemon.counts());
+    daemon.wait_reached("Retired", "convoy", "Retired", |row| text(row, "resource.name") == convoy).await;
+    daemon.wait_gone::<TerminalSession>(&lost).await;
+    let daemon = daemon.restart().await;
+    daemon.wait_reached("Retired", "convoy", "Retired", |row| text(row, "resource.name") == convoy).await;
+    daemon.wait_gone::<TerminalSession>(&lost).await;
 }

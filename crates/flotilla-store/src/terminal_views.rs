@@ -872,7 +872,8 @@ impl KindRecords<TerminalSession> for TerminalViews {
     }
 
     /// This home's newest launch of `name`, read afresh so a home reads its own writes, else
-    /// another home's as listed. A released launch reads as absent, as from a listing.
+    /// another home's as listed. A released launch reads as absent, as from a listing, and so does
+    /// one that ended and that the held joins no longer hold: nothing composes from it (#4421).
     async fn get(&self, name: &str) -> Result<Option<Record<TerminalSession>>, String> {
         let here = self.home();
         // While the listing holds every commit counted, this home's session is read from it: its
@@ -883,10 +884,16 @@ impl KindRecords<TerminalSession> for TerminalViews {
             }
         }
         let owned = name.to_owned();
-        let record = self.blocking(move |reads| reads.terminals()?.get(&owned, None)).instrument(info_span!("terminal_views.record"));
+        let record = self
+            .blocking(move |reads| {
+                let Some(record) = reads.terminals()?.get(&owned, None)? else { return Ok(None) };
+                let evicted = record.ended() && reads.joins()?.read(reads, |joins| joins.terminal(&record.name, &record.home).is_none())?;
+                Ok(Some((record, evicted)))
+            })
+            .instrument(info_span!("terminal_views.record"));
         let record = record.await.map_err(|error| error.to_string())?;
-        if let Some(record) = record.filter(|record| record.home == here) {
-            if record.reading == LifecycleReading::Released {
+        if let Some((record, evicted)) = record.filter(|(record, _)| record.home == here) {
+            if evicted || record.reading == LifecycleReading::Released {
                 return Ok(None);
             }
             return self.here_record(record).await;

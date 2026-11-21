@@ -739,6 +739,17 @@ impl ConvoyViews {
                     // One that cannot be read is not held as retiring: its watchers read it gone.
                     listing.records.extend(convoys.named(name, Some(home))?.records.into_iter().filter(|record| record.retired));
                 }
+                // The joins hold every launch again after a refill (a restart among them), those of
+                // convoys that retired before it too, and the listing leaves those out: each is
+                // released as composing it when it ended did, so its ended launches go (#4421).
+                reads.joins()?.read(reads, |mut joins| {
+                    for (home, name) in joins.convoys().into_iter().filter(|key| !listed.contains(key) && !unlisted.contains(key)) {
+                        if convoys.named(&name, Some(&home))?.records.iter().any(|record| record.retired) {
+                            joins.release(&name, &home);
+                        }
+                    }
+                    Ok::<_, String>(())
+                })??;
                 Ok(listing)
             })
             .await?;

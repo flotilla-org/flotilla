@@ -623,6 +623,11 @@ impl Joins<'_> {
         keys.iter().filter_map(|key| self.held.vessels.get(key).map(|launch| launch.record.clone())).collect()
     }
 
+    /// The convoys the Vessel launches held serve, each by its home and name.
+    pub fn convoys(&self) -> BTreeSet<(String, String)> {
+        self.held.vessels.values().map(|launch| (launch.record.convoy_home.clone(), launch.record.convoy.clone())).collect()
+    }
+
     /// Every session launch held for Vessel launch `vessel`, at every home.
     pub fn sessions_of(&self, vessel: &str) -> Vec<TerminalRecord> {
         let keys = self.held.by_vessel.get(vessel).map(Vec::as_slice).unwrap_or_default();
