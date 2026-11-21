@@ -9,7 +9,7 @@ use flotilla_daemon::runtime::RuntimeOptions;
 use flotilla_daemon_testkit::daemon::{TestDaemon, NAMESPACE};
 use flotilla_dummy_fleet::{
     catalog::{self, CrewMix, DUMMY_FULFILMENT_KIND},
-    DummyFleetSnapshot,
+    CrewScript, DummyFleetSnapshot, SCRIPT_LINE_PREFIX,
 };
 use flotilla_protocol::{
     commands::{CommandValue, CrewSupervisionAction},
@@ -1400,4 +1400,63 @@ async fn two_daemons_replicate_every_kind() {
     let _peering = TestDaemon::peer(&a, &b).await;
     assert_every_kind_replicated(&before_a, &before_b, &b).await;
     assert_every_kind_replicated(&before_b, &before_a, &a).await;
+}
+
+// #4409: a coder that pushed and submitted its change request waits idle, its decision ledger
+// still open, for the turn its brief promises when the PR's checks settle. The checks take five
+// minutes. Before they settle the stall judge has nudged the idle seat its one time and escalated
+// its stall, so no nudge will wake it: the fleet's coders waited twenty minutes on their checks,
+// past the default ladder's two nudges. The stock `checks-settled` rule still hands the coder a
+// turn about that head, whether the checks pass or fail, and the coder, acting on it, finishes its
+// work. The PR is not merged meanwhile, so no other rule fires.
+#[tokio::test(start_paused = true)]
+async fn a_coder_waiting_on_its_checks_gets_a_turn_when_they_pass() {
+    a_coder_waiting_on_its_checks_gets_a_turn_when_they_settle(0.0, "pass").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_coder_waiting_on_its_checks_gets_a_turn_when_they_fail() {
+    a_coder_waiting_on_its_checks_gets_a_turn_when_they_settle(1.0, "fail").await;
+}
+
+async fn a_coder_waiting_on_its_checks_gets_a_turn_when_they_settle(fail_rate: f64, settled: &str) {
+    const CHECKS_RULE: &str = "checks-settled";
+    let fleet = TestDaemon::builder()
+        .change_request(&format!("merge_after_ms = 86400000\nchecks_after_ms = 300000\nchecks_fail_rate = {fail_rate}\n"))
+        .start()
+        .await;
+    let mut workflow = CrewMix::Coder.workflow(LONG_RUNNER_TURNS);
+    // The coder waits idle for one turn from the turn rules once it has submitted its PR.
+    for crew in &mut workflow.roles {
+        let flotilla_resources::CrewSource::Agent { prompt: Some(prompt), .. } = &mut crew.source else { panic!("a dummy agent") };
+        let mut script = CrewScript::from_brief(prompt, LONG_RUNNER_TURNS).expect("the coder's script");
+        let CrewScript::Coder { awaited_turns, .. } = &mut script else { panic!("a coder") };
+        *awaited_turns = 1;
+        *prompt = format!("Dummy crew `{}`.\n{SCRIPT_LINE_PREFIX} {}", crew.role, script.render());
+    }
+    let mut rule = flotilla_resources::single_agent_workflow_spec().turn_delivery.shift_remove(CHECKS_RULE).expect("the stock rule");
+    rule.to.vessel = "coder".into();
+    workflow.turn_delivery.insert(CHECKS_RULE.into(), rule);
+    let ladder = flotilla_resources::StallNudgePolicy::builder().max_per_episode(1).idle_grace_seconds(60).build();
+    workflow.stall_nudges.insert("coder/coder".into(), ladder);
+    fleet.apply::<WorkflowTemplate>("shepherding-coder", workflow).await;
+    let name = create_through_admission(&fleet, "shepherding-coder-0", "shepherding-coder").await;
+
+    let escalated = |status: &ConvoyStatus| {
+        status.stalls.about(Some(("coder", "coder"))).is_some_and(|stall| stall.rung != flotilla_resources::StallRung::Nudge)
+            && !status.turn_deliveries.contains_key(CHECKS_RULE)
+    };
+    fleet.wait("the idle coder's stall escalated before its checks settle", convoy(&name, escalated)).await;
+    let suffix = format!("@{settled}");
+    let delivered = |status: &ConvoyStatus| {
+        status.turn_deliveries.get(CHECKS_RULE).is_some_and(|delivery| {
+            delivery.episodes.iter().any(|episode| {
+                episode.subject_revision.ends_with(&suffix)
+                    && matches!(episode.outcome, flotilla_resources::TurnDeliveryOutcome::MessageAccepted { new_turn: true, .. })
+            })
+        })
+    };
+    fleet.wait("the checks turn", convoy(&name, delivered)).await;
+    let answered = |_: &ResourceObject<Convoy>| fleet.counts().crews_completed == 1;
+    fleet.wait("the coder acting on its checks turn", answered).await;
 }

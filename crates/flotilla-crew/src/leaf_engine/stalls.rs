@@ -420,6 +420,12 @@ pub(super) fn declared_stall<'a>(status: &'a ConvoyStatus, vessel: &str, role: &
     status.stalls.about(Some((vessel, role))).filter(|stall| stall.source == StallEvidenceSource::Crew)
 }
 
+/// Whether the judge's open note on crew `role@vessel` is a stall it judged from what it observed
+/// (the seat idle), not one the crew declared.
+fn judged_stall(status: &ConvoyStatus, vessel: &str, role: &str) -> bool {
+    status.stalls.about(Some((vessel, role))).is_some_and(|stall| stall.source != StallEvidenceSource::Crew)
+}
+
 /// Shared by supervisor delivery and the operator backstop, so both identify
 /// the same crew and provide commands targeting the exact convoy record and crew.
 pub(super) fn stall_supervision_brief(convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> String {
@@ -532,7 +538,9 @@ fn seat_interrupted(vessels: &BTreeMap<String, ResourceObject<flotilla_resources
 /// Workflow-declared checks, review and merged settlement rules run during active crew work too,
 /// including custom rules. Merged settlement also resumes stalled crews so they
 /// can resolve remaining promises and claim completion; conflict probes retain
-/// their active delivery behavior.
+/// their active delivery behavior. A seat the judge stalls on its idleness is still at work: a
+/// crew waiting on its checks idles until they settle, and its stall reads the seat Stalled, so
+/// it keeps its turns (#4409). Only a stall the crew declared waits on its supervisor instead.
 pub(super) fn is_active_change_request_probe(
     status: &ConvoyStatus,
     rule: &TurnDeliveryRule,
@@ -561,7 +569,8 @@ pub(super) fn is_active_change_request_probe(
             work.finished_at.is_none()
                 && (is_conflict_probe(leaf)
                     || ((promise_rejection || is_merged_settlement_probe(leaf)) && work.phase == CrewWorkPhase::Stalled)
-                    || matches!(work.phase, CrewWorkPhase::Working | CrewWorkPhase::Interrupted))
+                    || matches!(work.phase, CrewWorkPhase::Working | CrewWorkPhase::Interrupted)
+                    || (work.phase == CrewWorkPhase::Stalled && judged_stall(status, &rule.to.vessel, &rule.to.role)))
         })
 }
 

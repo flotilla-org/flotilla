@@ -19,7 +19,7 @@ use flotilla_environment::environment::dummy::dummy_draw;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ChangeRequest, ChangeRequestStatus as ProtocolStatus};
 use flotilla_provider_runtime::{CommandRunner, ObservationError};
-use flotilla_resources::{ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState};
+use flotilla_resources::{ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState, ObservedChecks};
 
 use crate::{state::Event, DummyFleet};
 
@@ -39,6 +39,8 @@ pub(crate) struct DummyForge {
     seed: u64,
     merge_after: Duration,
     close_rate: f64,
+    checks_after: Option<Duration>,
+    checks_fail_rate: f64,
     repositories: Mutex<HashMap<String, BTreeMap<u64, DummyChangeRequest>>>,
 }
 
@@ -53,6 +55,8 @@ impl DummyForge {
             seed: config.seed,
             merge_after: Duration::from_millis(config.change_request.merge_after_ms),
             close_rate: config.change_request.close_rate,
+            checks_after: config.change_request.checks_after_ms.map(Duration::from_millis),
+            checks_fail_rate: config.change_request.checks_fail_rate,
             repositories: Mutex::new(HashMap::new()),
         }
     }
@@ -130,6 +134,19 @@ impl DummyForge {
         }
     }
 
+    /// The checks at the head: pending until their delay has passed, then failing at the
+    /// configured rate or passing. None when the forge is configured with no checks.
+    fn checks(&self, repository: &str, request: &DummyChangeRequest, number: u64) -> Option<ObservedChecks> {
+        let checks_after = self.checks_after?;
+        Some(if request.opened_at.elapsed() < checks_after {
+            ObservedChecks::Pending
+        } else if dummy_draw(self.seed, "change-request-checks", &format!("{repository}#{number}")) < self.checks_fail_rate {
+            ObservedChecks::Fail
+        } else {
+            ObservedChecks::Pass
+        })
+    }
+
     fn protocol_request(&self, repository: &str, number: u64, request: &DummyChangeRequest) -> ChangeRequest {
         ChangeRequest {
             title: request.title.clone(),
@@ -185,7 +202,9 @@ impl ChangeRequestTracker for DummyChangeRequestTracker {
                         review_requested_from_owner: Observation::known(false, observed_at),
                         state: Observation::known(forge.state(&self.repository, request, *number), observed_at),
                         head_sha: Observation::known(request.head_sha.clone(), observed_at),
-                        checks: Observation::unknown(observed_at),
+                        checks: forge
+                            .checks(&self.repository, request, *number)
+                            .map_or_else(|| Observation::unknown(observed_at), |checks| Observation::known(checks, observed_at)),
                         review: ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, observed_at) },
                         mergeable: Observation::unknown(observed_at),
                     })
@@ -296,7 +315,7 @@ mod tests {
 
     fn fleet(merge_after_ms: u64, close_rate: f64) -> Arc<DummyFleet> {
         DummyFleet::new(DummyFleetConfig {
-            change_request: DummyChangeRequestConfig { merge_after_ms, close_rate },
+            change_request: DummyChangeRequestConfig { merge_after_ms, close_rate, ..Default::default() },
             ..DummyFleetConfig::default()
         })
     }

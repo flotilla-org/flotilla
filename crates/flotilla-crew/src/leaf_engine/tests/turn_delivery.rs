@@ -1600,3 +1600,66 @@ fn failure_writer_requeues_on_cancel_and_never_frees_a_newer_slot() {
     drop(writer);
     assert!(pending.lock().expect("pending")[&key].writing, "a newer writer keeps its slot");
 }
+
+// #4409: a seat the judge stalls on its idleness, waiting on its checks, keeps its checks and
+// review turns; one whose crew declared a stall waits on its supervisor and does not.
+#[test]
+fn only_a_declared_stall_holds_a_seats_checks_turns() {
+    use flotilla_resources::{StallEvidenceSource, StallRung, StalledCondition};
+
+    let rule = flotilla_resources::single_agent_workflow_spec().turn_delivery.shift_remove("checks-settled").expect("the stock rule");
+    let leaf = Leaf {
+        address: LeafAddress::ChangeRequest { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into(), number: 4409 },
+        field_path: ".checks".into(),
+        operator: LeafOperator::NotEqual,
+        literal: "pending".into(),
+    };
+    let seat = |phase| {
+        let mut status = flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() };
+        let work = flotilla_resources::CrewWorkState::builder().phase(phase).build();
+        status.crew_work.entry("work".into()).or_default().insert("coder".into(), work);
+        status
+    };
+    let eligible =
+        |status: &flotilla_resources::ConvoyStatus| super::super::stalls::is_active_change_request_probe(status, &rule, &leaf, &[]);
+
+    assert!(eligible(&seat(CrewWorkPhase::Working)));
+
+    let mut judged = seat(CrewWorkPhase::Stalled);
+    judged.stalls.set(StalledCondition {
+        leaves: vec![Leaf {
+            address: LeafAddress::Work { convoy: "c".into(), work: "work".into() },
+            field_path: ".crew.coder.phase".into(),
+            operator: LeafOperator::Equal,
+            literal: "Done".into(),
+        }],
+        maker: Some(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() }),
+        evidence: "idle; no live governor for project flotilla".into(),
+        source: StallEvidenceSource::Hook,
+        cause: None,
+        began_at: Utc::now(),
+        rung: StallRung::Operator,
+        supervisor: None,
+        supervision_message: None,
+        supervision_index: None,
+        supervision_exhausted: false,
+        reason: None,
+        proposed_disposition: None,
+        nudge_history: Vec::new(),
+    });
+    assert!(eligible(&judged), "a seat stalled on its idleness keeps its checks turns");
+
+    let mut declared = seat(CrewWorkPhase::Working);
+    external_patches::mark_crew_stalled(
+        "c".into(),
+        "work".into(),
+        "coder".into(),
+        Utc::now(),
+        flotilla_resources::StallReason::Infra,
+        None,
+        "CI is down".into(),
+    )
+    .apply(&mut declared);
+    assert_eq!(declared.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+    assert!(!eligible(&declared), "a declared stall waits on its supervisor");
+}
