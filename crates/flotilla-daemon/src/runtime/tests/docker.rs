@@ -2,7 +2,7 @@ use super::*;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_environment::environment::{EnvironmentProvisionError, EnvironmentToolAssetKind};
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn local_profile_does_not_advertise_docker_without_interior_cleat() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -39,7 +39,7 @@ async fn local_profile_does_not_advertise_docker_without_interior_cleat() {
         flotilla_protocol::provider::ProviderReadiness::MissingTool { reason } if reason.contains("cleat")));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_state() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -149,7 +149,7 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
     assert!(cleat_state.as_path().is_dir(), "durable tool state must exist before the provider delivers it");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn docker_provisioning_fails_loudly_without_interior_cleat_assets() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -208,7 +208,7 @@ async fn docker_provisioning_fails_loudly_without_interior_cleat_assets() {
     assert!(provider.create_opts.lock().await.is_none(), "the incomplete container must not be created");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_refuses_missing_store() {
     for outcome in [RegistryPreflightOutcome::Success, RegistryPreflightOutcome::MissingStore] {
         let temp = TempDir::new().expect("tempdir");
@@ -331,7 +331,7 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
 // never through the crew's work credentials. Without that grant provisioning
 // refuses before the provider runs; a local build's image ID needs no
 // registry credential.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
     use flotilla_resources::{
         CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, FleetDesignation, FleetDesignationSpec, HostActionSelector,
@@ -482,14 +482,14 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
     teardown_archives_staged_sessions(false).await;
 }
 
 // A stopped agent cannot wedge deletion: teardown still destroys its backing
 // and archives the persistent session records already staged on the host.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn docker_teardown_with_dead_agent_still_destroys_and_archives_staged_sessions() {
     teardown_archives_staged_sessions(true).await;
 }
@@ -597,7 +597,7 @@ async fn teardown_archives_staged_sessions(dead_agent: bool) {
 
 // #2840: a restart can lose the container status after Docker creation.
 // Finalization must rediscover the backing rather than deleting only local files.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -657,7 +657,7 @@ async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
     assert!(destroyed.load(Ordering::SeqCst), "missing status must not leave the backing container running");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn docker_provisioning_reports_unavailable_flotilla_cli() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -712,7 +712,7 @@ async fn docker_provisioning_reports_unavailable_flotilla_cli() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -788,12 +788,12 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
     assert!(provider.create_opts.lock().await.is_none(), "reserved mount collisions should fail before invoking the provider");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn remotely_placed_docker_shared_clone_provisions_across_two_stores() {
     remote_shared_clone_placement_reaches_running(true).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn provisioned_environment_discovers_and_registers_interior_agent_adapters() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -865,7 +865,7 @@ async fn provisioned_environment_discovers_and_registers_interior_agent_adapters
     assert_eq!(error, "image `contained-image` declares agent adapter `missing-adapter`, but interior discovery did not find it");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -1009,7 +1009,7 @@ impl ProvisionedEnvironment for DeadAgentEnvironment {
 
 // Docker Shared material must remain host-backed throughout the session, even
 // though the provider also receives pushed executable tools. One glue case.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn docker_codex_home_is_a_rw_host_mount_and_is_not_pushed() {
     use flotilla_environment::environment::{docker::DockerEnvironmentProvider, ProvisionedMount, ProvisionedMountMode};
     let root = TempDir::new().unwrap();
@@ -1043,7 +1043,7 @@ async fn docker_codex_home_is_a_rw_host_mount_and_is_not_pushed() {
 
 // #3765 S6: a missing guest harness must fail the actual cloud image probe,
 // even when no adapter was discovered. Empty needs require no guest command.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cloud_image_probe_refuses_missing_harness() {
     let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
         id: EnvironmentId::new("cloud-probe"),
@@ -1075,7 +1075,7 @@ async fn cloud_image_probe_refuses_missing_harness() {
 // #3765 B1: post-provider credential/probe failures must preserve an adopted
 // backing too, while a fresh backing is destroyed and fails terminally.
 // The fake represents the remote environment destruction boundary.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn controller_setup_rollback_preserves_adopted_and_destroys_fresh_backing() {
     struct Adopted(TestInteriorEnvironment);
     #[async_trait]

@@ -10,13 +10,12 @@ fn convoy_listings(reads: &CallerReads) -> u64 {
 // Startup runs one pass. Watch notifications reconcile current Message evidence
 // only, even when replica/session events arrive in separate batches, and no timer
 // wakes the task.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn startup_runs_one_pass_and_watches_drive_the_rest() {
     let temp = tempfile::tempdir().expect("config");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"supervisor-turns-test\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
     let _engine = engine(&daemon);
-    tokio::time::pause();
     let (convoy_sender, convoy_receiver) = futures::channel::mpsc::unbounded();
     let (session_sender, session_receiver) = futures::channel::mpsc::unbounded();
     let receivers = Arc::new(StdMutex::new(Some((convoy_receiver, session_receiver))));
@@ -54,7 +53,7 @@ async fn startup_runs_one_pass_and_watches_drive_the_rest() {
 
 // A Message committed on the engine's Message path runs a pass, heard from the store's commits:
 // with no convoy to reconcile, nothing beyond the admission loads or converts a message.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_message_commit_runs_a_pass_without_listing_messages() {
     let temp = tempfile::tempdir().expect("config");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"supervisor-turn-message-test\"\n").expect("daemon config");

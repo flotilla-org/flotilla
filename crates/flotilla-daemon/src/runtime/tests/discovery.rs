@@ -4,7 +4,7 @@ use crate::testkits::engine::engine;
 use crate::testkits::engine::session_request;
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn remote_rustc_wrapper_stages_once_in_a_private_directory() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -22,7 +22,7 @@ async fn remote_rustc_wrapper_stages_once_in_a_private_directory() {
     assert_eq!(fs::metadata(&path).expect("wrapper metadata").ino(), inode, "unchanged wrapper should not be replaced");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn bad_ssh_host_does_not_block_daemon_startup_or_other_hosts() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"ssh-resilience-test\"\n").expect("daemon config");
@@ -187,11 +187,10 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
     )
     .await
     .expect("register SSH resources");
-    profile
-        .fulfilment_facts
-        .write()
-        .await
-        .insert("host-direct-ssh-test-host".into(), flotilla_resources::FulfilmentFacts { observed_at: Utc::now(), ..Default::default() });
+    profile.fulfilment_facts.write().await.insert(
+        "host-direct-ssh-test-host".into(),
+        flotilla_resources::FulfilmentFacts { observed_at: flotilla_resources::clock::now(), ..Default::default() },
+    );
     let claude_dir = temp.path().join(".claude");
     std::fs::create_dir_all(&claude_dir).expect("create remote Claude dir");
     std::fs::write(claude_dir.join(".credentials.json"), r#"{"claudeAiOauth":{"expiresAt":1756000000000}}"#)
@@ -397,7 +396,7 @@ use super::vessel_support::{vessels_over, RunnerVesselAgents};
 // placement with the reason: no agent reach, no runtime directory, a platform
 // whose tools this generation lacks, or no agent build. A platform never
 // probed successfully (an SSH blip) is diagnostic only.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ssh_host_without_vessel_agents_is_refused_at_placement() {
     let system = if cfg!(target_os = "macos") { "Darwin" } else { "Linux" };
     assert_eq!(HostPlatform::from_uname(system, std::env::consts::ARCH), HostPlatform::controller());
@@ -438,7 +437,7 @@ async fn ssh_host_without_vessel_agents_is_refused_at_placement() {
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent: reach,
     };
-    let now = chrono::Utc::now();
+    let now = flotilla_resources::clock::now();
     let refused = |conditions: Vec<flotilla_resources::HostCondition>, ready: bool| {
         let status = flotilla_resources::HostStatus { ready, heartbeat_at: Some(now), conditions, ..Default::default() };
         flotilla_admission::support::unready_placement_refusal("host-direct-b1", "b1", Some(&status), now)

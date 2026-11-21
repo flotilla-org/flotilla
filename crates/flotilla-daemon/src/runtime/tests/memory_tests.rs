@@ -42,7 +42,7 @@ impl CommandRunner for MemoryIncidentRunner {
 
 // #2653: death evidence must survive backing loss, duplicate observations and
 // environment deletion. Last successful usage and recovery paths stay visible.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     use flotilla_protocol::{EnvironmentExitCause, EnvironmentMemoryLimits, EnvironmentRuntimeObservation};
     let temp = TempDir::new().expect("tempdir");
@@ -201,7 +201,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
 
 // A failed observation has no separate liveness authority: Unknown preserves
 // the ready backing for retry, regardless of the engine's inaccessible state.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn observation_error_preserves_backing_and_retries() {
     for terminal in [true, false] {
         let temp = TempDir::new().expect("tempdir");

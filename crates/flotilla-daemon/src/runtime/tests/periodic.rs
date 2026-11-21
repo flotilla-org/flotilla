@@ -10,7 +10,7 @@ use crate::runtime::tasks::{spawn_periodic_task, PeriodicTaskStart};
 
 // Behaviour: a WARN a periodic pass emits is written to the JSON log with the trace and span ids
 // of the pass's own span, named after its task.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_warning_inside_a_periodic_pass_carries_its_trace() {
     let provider = SdkTracerProvider::builder().build();
     let logs = flotilla_log_testkit::Logs::default();

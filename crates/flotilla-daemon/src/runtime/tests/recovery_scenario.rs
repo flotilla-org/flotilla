@@ -263,7 +263,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
                 .digest(flotilla_resources::artifact::blob_digest_of(b"ledger"))
                 .size(1)
                 .media_type("text/markdown".to_string())
-                .expires_at(Utc::now() + chrono::Duration::days(1))
+                .expires_at(flotilla_resources::clock::now() + chrono::Duration::days(1))
                 .build(),
         )
         .await

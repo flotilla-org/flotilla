@@ -2,7 +2,7 @@ use super::*;
 use crate::runtime::primitives::{turn_key, type_turn};
 use flotilla_terminal::drafts::ComposerDrafts;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_homes() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -261,7 +261,7 @@ async fn accepted_but_unconfirmed_delivery_is_never_retyped() {
 // logged at info, naming the turn's message and its session, though the pool writes nothing for it.
 #[tokio::test(start_paused = true)]
 async fn a_keyed_turn_is_typed_once_unless_it_was_judged_lost() {
-    let now = chrono::Utc::now();
+    let now = flotilla_resources::clock::now();
     let ms = |at: chrono::DateTime<chrono::Utc>| u64::try_from(at.timestamp_millis()).expect("after the epoch");
     let recent = ms(now - chrono::Duration::minutes(1));
     let lapsed = ms(now - flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR - chrono::Duration::minutes(1));

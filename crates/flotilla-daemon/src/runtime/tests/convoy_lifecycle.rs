@@ -69,7 +69,7 @@ impl CloneRuntime for UnusedCloneRuntime {
 
 // Behaviour (#3108): a clone requested of the engine (renewed demand for it) wakes standing
 // ensure admission through the engine's clone changes, not an old Clone watch.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_requested_clone_wakes_standing_ensure_admission() {
     let backend = flotilla_store_memory::engine_home_backend();
     let engine = flotilla_provisioning_testkit::clones::RunningClones::start("home", Arc::new(UnusedCloneRuntime));
@@ -94,7 +94,7 @@ async fn a_requested_clone_wakes_standing_ensure_admission() {
         .expect("a wake");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn standing_ensure_dependency_changes_emit_wakes() {
     let home = flotilla_engine_convoys_testkit::EngineHome::open_in("home", NAMESPACE);
     let backend = home.backend().clone();
@@ -157,7 +157,7 @@ async fn standing_ensure_dependency_changes_emit_wakes() {
 /// #1413: pins the cross-controller race itself — the checkout is gone
 /// before the convoy's vessels are released, and the vessel requester must
 /// still release them instead of wedging forever on the deleted evidence.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout_first() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -192,13 +192,13 @@ async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout
         flotilla_protocol::CanonicalHostId::resolved(host.as_str()),
         [],
     );
-    let pass = requests.sync_once(Utc::now()).await.expect("vessel requests");
+    let pass = requests.sync_once(flotilla_resources::clock::now()).await.expect("vessel requests");
 
     assert_eq!(pass.released, vec![launch.clone()], "the convoy's vessels must still be released after the checkout was collected first");
     assert_eq!(engine.vessels.vessels.get(&launch, None).expect("read").expect("launch").reading, LifecycleReading::Released);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn checkout_removals_queue_across_environments_and_release_capacity() {
     struct GatedRemovalRunner {
         started: tokio::sync::mpsc::UnboundedSender<()>,
@@ -273,7 +273,7 @@ async fn checkout_removals_queue_across_environments_and_release_capacity() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn checkout_archive_catalog_keeps_custom_roots_after_checkout_resources_are_gone() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-catalog-test\"\n").expect("daemon config");
@@ -317,7 +317,7 @@ async fn checkout_archive_catalog_keeps_custom_roots_after_checkout_resources_ar
     assert!(recent.exists());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn archive_sweep_continues_to_the_next_remote_root_after_a_timeout() {
     struct SweepRunner {
         roots: StdMutex<Vec<String>>,
@@ -369,12 +369,12 @@ async fn archive_sweep_continues_to_the_next_remote_root_after_a_timeout() {
     let _ = task.await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn remotely_placed_host_direct_shared_clone_provisions_across_two_stores() {
     remote_shared_clone_placement_reaches_running(false).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
     let temp = TempDir::new().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"daemon-restart-adapter-regression-test\"\n").expect("daemon config");
@@ -392,7 +392,7 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
         &DaemonHealthIdentity {
             generation: Some("generation-1".to_string()),
             version: "1.0.0".to_string(),
-            started_at: Utc::now() - chrono::Duration::minutes(1),
+            started_at: flotilla_resources::clock::now() - chrono::Duration::minutes(1),
         },
         &RuntimeHealth::default(),
     )
@@ -410,8 +410,11 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
     let mut restarted_profile = first_profile.clone();
     restarted_profile.available_agent_adapters.remove("claude-code");
     let runtime_health = RuntimeHealth::default();
-    let second_health =
-        DaemonHealthIdentity { generation: Some("generation-2".to_string()), version: "1.0.0".to_string(), started_at: Utc::now() };
+    let second_health = DaemonHealthIdentity {
+        generation: Some("generation-2".to_string()),
+        version: "1.0.0".to_string(),
+        started_at: flotilla_resources::clock::now(),
+    };
     let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
     {
         let _guard = tracing::dispatcher::set_default(&logging);
@@ -464,7 +467,7 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
             &DaemonHealthIdentity {
                 generation: Some("generation-3".to_string()),
                 version: "1.0.0".to_string(),
-                started_at: Utc::now() + chrono::Duration::minutes(1),
+                started_at: flotilla_resources::clock::now() + chrono::Duration::minutes(1),
             },
             &third_runtime_health,
         )
@@ -581,7 +584,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
         &engine_path,
         &convoys,
         &convoy_name,
-        &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: chrono::Utc::now() },
+        &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: flotilla_resources::clock::now() },
     )
     .await
     .expect("branch scanned");
@@ -924,6 +927,7 @@ fn crew_provisioning_recovers_lost_session_after_in_process_daemon_restart_and_r
         .spawn(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
+                .start_paused(true)
                 .build()
                 .expect("test runtime")
                 .block_on(crew_provisioning_recovery_scenario());
@@ -972,7 +976,7 @@ async fn the_checkout_controller_finds_a_forgejo_change_request_landed() {
         .observing_authority("test-host".to_string())
         .build();
     let created = records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("change request");
-    let observed_at = Utc::now();
+    let observed_at = flotilla_resources::clock::now();
     let status = flotilla_resources::ChangeRequestStatus {
         title: Default::default(),
         author: Default::default(),
