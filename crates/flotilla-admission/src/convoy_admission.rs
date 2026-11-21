@@ -31,7 +31,7 @@ use flotilla_protocol::{
 use flotilla_provider_runtime::{CommandRunner, ObservationError};
 use flotilla_resources::address::{record_name, remote_change_request_address};
 use flotilla_resources::checkout_path::checkout_path;
-use flotilla_resources::convoy::engine::{split_launch, standing_name, EngineConvoyPath, EngineConvoys};
+use flotilla_resources::convoy::engine::{split_launch, standing_name, EngineConvoyPath};
 use flotilla_resources::convoy::reconcile::{admitted_snapshot, SnapshotRefusal};
 use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
 use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
@@ -108,7 +108,7 @@ pub struct ConvoyAdmission {
     /// The checkouts this host's refresh discovered.
     discovered_checkouts: DiscoveredCheckouts,
     lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
-    /// The account kinds' records: the old store's, or the engine's behind `[primitives]`.
+    /// The account kinds' records.
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
@@ -131,8 +131,7 @@ pub struct ConvoyAdmission {
     #[builder(default = std::sync::RwLock::new(Arc::new(crate::random::SeededRandom::from_entropy())))]
     random: std::sync::RwLock<Arc<dyn crate::random::RandomSource>>,
     fulfilment_decider: Arc<dyn FulfilmentDecider>,
-    /// The engine's convoys, which admission reserves and creates launches on, installed at startup.
-    #[builder(default)]
+    /// The engine's convoys, which admission reserves and creates launches on.
     convoys: EngineConvoyPath,
     /// Serializes the identity selector check with Convoy creation on the owner host.
     #[builder(default)]
@@ -926,11 +925,7 @@ impl ConvoyAdmission {
     /// Reserves the next launch of `launch_of` on the engine. The launch's name keys everything
     /// admission writes for it; a reservation never admitted is a gap in the launch numbers.
     pub async fn reserve_launch(&self, launch_of: &str) -> Result<String, String> {
-        self.engine()?.reserve(launch_of).await
-    }
-
-    fn engine(&self) -> Result<Arc<dyn EngineConvoys>, String> {
-        self.convoys.get().cloned().ok_or_else(|| "convoys are admitted on the engine, which is not installed".to_owned())
+        self.convoys.reserve(launch_of).await
     }
 
     /// Admits reserved launch `name` on the engine as admission froze it: `spec` at the launch's
@@ -972,7 +967,7 @@ impl ConvoyAdmission {
             spec,
             status: Some(ConvoyStatus { workflow_snapshot: Some(workflow_snapshot), ..seed }),
         };
-        self.engine()?.admit_reserved(&convoy).await
+        self.convoys.admit_reserved(&convoy).await
     }
 
     async fn prepared_brief_query(&self, namespace: &str, admission: &PreparedConvoyAdmission) -> Result<Option<StoreQuery>, String> {

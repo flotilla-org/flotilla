@@ -33,7 +33,7 @@ pub enum ConvoyVerb {
     Explain(ConvoyExplainArgs),
     /// Manage the work aboard a convoy's vessels
     Work(ConvoyWorkNoun),
-    /// An operator's attributed verdict on one promise (with `[primitives]` on)
+    /// An operator's attributed verdict on one promise
     Promise(ConvoyPromiseNoun),
     /// Delete a convoy and tear down its managed resources
     Delete(ConvoyDeleteArgs),

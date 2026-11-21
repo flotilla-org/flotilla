@@ -32,9 +32,7 @@ impl CountedMessages {
     }
 
     fn path(self: &Arc<Self>) -> crate::ports::MessagePath {
-        let path = crate::ports::MessagePath::default();
-        let _ = path.set(Arc::clone(self) as Arc<dyn EngineMessages>);
-        path
+        Arc::clone(self) as Arc<dyn EngineMessages>
     }
 }
 
@@ -168,10 +166,10 @@ async fn paused_wake(
         Arc::new(UnavailableChangeRequests),
         flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    let table = LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, home.reads(), 3)
-        .with_message_path(messages)
-        .with_convoy_engine(home.path())
-        .with_clock(Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>);
+    let engines = crate::leaf_engine::Engines { messages, convoys: home.path() };
+    let table =
+        LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, home.reads(), engines, 3)
+            .with_clock(Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>);
     table.set_turn_delivery_actuator(delivery).await;
     (ReconcilerWake::new(table), clock)
 }
@@ -206,7 +204,7 @@ async fn an_idle_judge_reads_no_messages_for_ended_launches() {
         home.end(&backend, &launch, ConvoyPhase::Landed).await;
         assert_eq!(home.view(&backend, &launch).await.status.expect("status").phase, ConvoyPhase::Landed);
     }
-    let messages = CountedMessages::over(home.message_path().get().cloned().expect("the Message path"));
+    let messages = CountedMessages::over(home.message_path());
     let (wake, _clock) = paused_wake(&backend, &home, messages.path(), Arc::default()).await;
     let loop_task = run(&wake);
     // The first pass settles each ended launch's stall records, once.
@@ -229,7 +227,7 @@ async fn an_idle_judge_reads_no_messages_for_ended_launches() {
 /// hook, now.
 async fn idle_coder_on_the_loop() -> (Case, Arc<CountedMessages>, tokio::task::JoinHandle<Result<(), String>>) {
     let case = idle_nudge_scenario().await;
-    let messages = CountedMessages::over(case.home.message_path().get().cloned().expect("the Message path"));
+    let messages = CountedMessages::over(case.home.message_path());
     let (wake, clock) = paused_wake(&case.backend, &case.home, messages.path(), case.delivery.clone()).await;
     let loop_task = run(&wake);
     elapse(1, &loop_task).await;
@@ -309,7 +307,7 @@ async fn a_lagged_feed_judges_every_live_launch_once() {
         case.home.keep(&case.backend, &launch, "work", "coder").await;
         case.home.end(&case.backend, &launch, ConvoyPhase::Landed).await;
     }
-    let messages = CountedMessages::over(case.home.message_path().get().cloned().expect("the Message path"));
+    let messages = CountedMessages::over(case.home.message_path());
     let (wake, clock) = paused_wake(&case.backend, &case.home, messages.path(), case.delivery.clone()).await;
     let loop_task = run(&wake);
     elapse(1, &loop_task).await;
@@ -346,7 +344,7 @@ async fn a_seat_change_reads_only_that_seat() {
     case.home.session(&case.vessel, "reviewer", "reviewer-session", "env");
     let (coder, reviewer) = (case.launch("resumed-coder"), case.launch("reviewer-session"));
     let reviewer_seat = flotilla_resources::crew_role_address("wheelhouse", &case.work, "work", "reviewer");
-    let messages = CountedMessages::over(case.home.message_path().get().cloned().expect("the Message path"));
+    let messages = CountedMessages::over(case.home.message_path());
     let (wake, clock) = paused_wake(&case.backend, &case.home, messages.path(), case.delivery.clone()).await;
     for session in ["resumed-coder", "reviewer-session"] {
         observe_agent(&case.home, session, TerminalAttentionState::Working, TerminalAttentionSource::Hook, clock.now());
@@ -385,7 +383,7 @@ async fn a_seat_change_reads_only_that_seat() {
 #[tokio::test(start_paused = true)]
 async fn a_turn_bound_reads_its_session_again_when_due() {
     let case = idle_nudge_scenario().await;
-    let messages = CountedMessages::over(case.home.message_path().get().cloned().expect("the Message path"));
+    let messages = CountedMessages::over(case.home.message_path());
     let (wake, clock) = paused_wake(&case.backend, &case.home, messages.path(), case.delivery.clone()).await;
     observe_agent(&case.home, "resumed-coder", TerminalAttentionState::Working, TerminalAttentionSource::Hook, clock.now());
     let loop_task = run(&wake);

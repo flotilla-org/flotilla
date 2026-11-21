@@ -140,8 +140,7 @@ mod tests {
                             .collect(),
                             ..Default::default()
                         },
-                    )
-                    .expect("stalled note");
+                    );
                     if terminal {
                         flotilla_engine_convoys_testkit::land(&path, &home.convoy(&launch).await).await;
                     } else {
@@ -401,8 +400,7 @@ mod tests {
             &home.convoys.path(),
             &launch,
             &ConvoyStatus { stalls: std::iter::once(stall).collect(), ..Default::default() },
-        )
-        .expect("an operator-level stall");
+        );
         use flotilla_engine_messages::awaiting::AwaitingReplies;
         let records = AwaitingReplies::open("home-a", home.service()).expect("records");
         let seat: flotilla_address::Address = "project:flotilla/convoy:demo/role:coder".parse().expect("seat");
@@ -485,6 +483,7 @@ mod tests {
                 Arc::clone(&event_sink),
                 refresher,
                 home.engine.reads(),
+                flotilla_crew::leaf_engine::Engines { messages: home.messages.messages(), convoys: home.convoys.path() },
             ));
             let fleet = FleetService::new(AggregatorProjectionState::new(), host_name.clone(), None);
             let convoy_engine = home.convoys.path();
@@ -1383,7 +1382,7 @@ mod tests {
             )
             .await;
         // Its crew submits the change request it opened to its pr promise.
-        let engine = fixture.convoy_engine.get().expect("the Convoy path");
+        let engine = &fixture.convoy_engine;
         let convoy = fixture.home.convoy(&launch).await;
         let submission = Submission {
             reference: "cr/github.com/owner/one/42".into(),

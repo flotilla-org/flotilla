@@ -1875,3 +1875,14 @@ async fn a_mutable_tag_is_refused_before_any_docker_call() {
     assert!(error.contains("mutable tags are unsupported"), "{error}");
     assert!(runner.calls().is_empty());
 }
+
+// Behaviour: an environment spec's mount becomes the provisioned mount of the same paths and mode.
+#[test]
+fn a_spec_mount_becomes_the_provisioned_mount_of_the_same_paths_and_mode() {
+    use flotilla_resources::{EnvironmentMount, EnvironmentMountMode};
+
+    for (spec_mode, mode) in [(EnvironmentMountMode::Ro, ProvisionedMountMode::Ro), (EnvironmentMountMode::Rw, ProvisionedMountMode::Rw)] {
+        let mount = EnvironmentMount { source_path: "/host/source".into(), target_path: "/guest/target".into(), mode: spec_mode };
+        assert_eq!(ProvisionedMount::from(&mount), ProvisionedMount::new("/host/source", "/guest/target", mode));
+    }
+}

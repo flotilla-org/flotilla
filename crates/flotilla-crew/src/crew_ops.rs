@@ -144,14 +144,10 @@ pub struct CrewService {
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     #[builder(default)]
     capability_source: RwLock<Option<Arc<dyn flotilla_capability_contract::SessionCapabilitySource>>>,
-    #[builder(default)]
     capability_cards: CapabilityCardTracker,
-    /// The `[primitives]` switch's Message path; empty while it is off.
-    #[builder(default)]
+    /// The engine's Messages.
     pub(crate) message_path: crate::ports::MessagePath,
-    /// The `[primitives]` switch's Convoy path (#3587 layer 6): with it set,
-    /// the engine decides each convoy it holds; empty while the switch is off.
-    #[builder(default)]
+    /// The engine's Convoys (#3587 layer 6): the engine decides each convoy it holds.
     pub(crate) convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
     /// Which seats a vessel serves (#3629 layer 8).
     pub(crate) vessel_seats: Arc<dyn flotilla_resources::vessel_seats::VesselSeats>,
@@ -2331,16 +2327,14 @@ impl CrewService {
             .instrument(tracing::info_span!("crew_handoff.deliver"))
             .await;
             if let Err(error) = handoff_result {
-                return match flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, &context.convoy, &previous_status) {
-                    Ok(()) => Err(error),
-                    Err(restore_error) => Err(format!("{error}; could not restore crew work after handoff failure: {restore_error}")),
-                };
+                flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, &context.convoy, &previous_status);
+                return Err(error);
             }
             Ok(())
         }
         .await;
-        if let (Err(_), Ok(engine)) = (&handed_off, self.message_primitives()) {
-            if let Err(error) = engine.withdraw(&context.namespace, &receiver, &message_name, &context.convoy).await {
+        if handed_off.is_err() {
+            if let Err(error) = self.message_primitives().withdraw(&context.namespace, &receiver, &message_name, &context.convoy).await {
                 tracing::warn!(convoy = %context.convoy, message = %message_name, %error, "a failed handoff's admitted turn was not withdrawn");
             }
         }
@@ -2707,7 +2701,7 @@ impl CrewService {
         let messages = self.queued_briefs(namespace, &seats).await.map_err(|error| error.to_string())?;
         let withdrawn = messages.last().map(|message| message.body.clone());
         let mut closed = BTreeSet::new();
-        let primitives = self.message_primitives().map_err(|error| error.to_string())?;
+        let primitives = self.message_primitives();
         for message in messages {
             let message = message.standing;
             if let Err(error) = primitives.withdraw(namespace, &message.seat, &message.name, name).await {
@@ -3326,7 +3320,7 @@ impl CrewService {
                 .apply(&mut next);
             }
             if current.status.as_ref() != Some(&next) {
-                flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, &current.metadata.name, &next)?;
+                flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, &current.metadata.name, &next);
             }
         }
         Ok(())
@@ -3529,10 +3523,8 @@ impl CrewService {
         previous_status: flotilla_resources::ConvoyStatus,
     ) -> Result<(), String> {
         if let Err(error) = self.reconcile_resumed_work_credentials(namespace, environment_ref).await {
-            return match flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, name, &previous_status) {
-                Ok(()) => Err(error),
-                Err(restore_error) => Err(format!("{error}; could not restore crew work after credential failure: {restore_error}")),
-            };
+            flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, name, &previous_status);
+            return Err(error);
         }
         Ok(())
     }
@@ -3543,10 +3535,8 @@ impl CrewService {
         previous_status: &flotilla_resources::ConvoyStatus,
         error: String,
     ) -> String {
-        match flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, name, previous_status) {
-            Ok(()) => error,
-            Err(restore_error) => format!("{error}; could not restore crew work after delivery failure: {restore_error}"),
-        }
+        flotilla_resources::convoy::engine::set_notes(&self.convoy_engine, name, previous_status);
+        error
     }
 
     /// A delete of convoy `name`. A convoy ends on the engine and is never deleted (#3108): once

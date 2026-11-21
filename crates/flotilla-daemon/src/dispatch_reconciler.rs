@@ -901,7 +901,7 @@ mod tests {
         let widgets = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("widgets").status.expect("status");
         assert_eq!(widgets.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 1);
         let ended = backend.convoy(&watched).await;
-        backend.convoys.path().get().expect("the Convoy path").abandon(&ended, "operator", "abandoned").await.expect("end the launch");
+        backend.convoys.path().abandon(&ended, "operator", "abandoned").await.expect("end the launch");
         told_of(&mut wake, &watched, true).await;
         let moved = backend.admit("moved", on("overlap-0"), single_agent("coder")).await;
         told_of(&mut wake, &moved, false).await;
@@ -1168,7 +1168,7 @@ mod tests {
         // reopened/retriaged issue forever. Which phases are terminal is
         // ConvoyPhase's own mapping; here the launch lives, then ends.
         assert_eq!(reconciler.reconcile_once().await.expect("live pass").queued, 0);
-        backend.convoys.path().get().expect("the Convoy path").abandon(&convoy, "operator", "abandoned").await.expect("end the launch");
+        backend.convoys.path().abandon(&convoy, "operator", "abandoned").await.expect("end the launch");
         told_of(&mut wake, &launch, true).await;
         assert_eq!(reconciler.reconcile_once().await.expect("ended pass").queued, 1);
         assert_eq!(timed(&metrics).0, 1);

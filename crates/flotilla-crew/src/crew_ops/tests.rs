@@ -214,28 +214,27 @@ async fn admit_crewed(engine: &EngineHome, crewed: &Crewed<'_>) -> (String, Stri
 }
 
 async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    fixture_with_message_path(phase, Default::default()).await
+    fixture_with_message_path(phase, None).await
 }
 
 /// [`fixture`], with the Message path the crew service and its leaf subscriptions share, as the
-/// composition root wires them; the engine's path at this home unless `message_path` is already
-/// set.
+/// composition root wires them; the engine's path at this home unless `message_path` is set.
 async fn fixture_with_message_path(
     phase: CrewWorkPhase,
-    message_path: crate::ports::MessagePath,
+    message_path: Option<crate::ports::MessagePath>,
 ) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
     build_fixture(phase, message_path, None, crew_spec(), &[], |_, _| {}).await
 }
 
 /// [`fixture`], its convoy admitted with `spec`.
 async fn spec_fixture(phase: CrewWorkPhase, spec: ConvoySpec) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    build_fixture(phase, Default::default(), None, spec, &[], |_, _| {}).await
+    build_fixture(phase, None, None, spec, &[], |_, _| {}).await
 }
 
 /// [`fixture`], its convoy in Project `work`, declared at the home before anything watches it.
 async fn project_fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
     let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).project_ref("work".into()).build();
-    build_fixture(phase, Default::default(), Some("work"), spec, &[], |_, _| {}).await
+    build_fixture(phase, None, Some("work"), spec, &[], |_, _| {}).await
 }
 
 /// The fixture convoy's spec: workflow `workflow`, for role `crew` in project `flotilla`.
@@ -270,14 +269,14 @@ async fn prelude_fixture(
     prelude: &[Crewed<'_>],
     shape: impl FnOnce(&mut WorkflowSnapshot, &[(String, String)]),
 ) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, Held) {
-    build_fixture(phase, Default::default(), None, crew_spec(), prelude, shape).await
+    build_fixture(phase, None, None, crew_spec(), prelude, shape).await
 }
 
 /// The fixture at a home whose fleet is designated and which declares `project`, its crew
 /// service on `message_path`, or on the home's Message path when that is not set.
 async fn build_fixture(
     phase: CrewWorkPhase,
-    message_path: crate::ports::MessagePath,
+    message_path: Option<crate::ports::MessagePath>,
     project: Option<&str>,
     spec: ConvoySpec,
     prelude: &[Crewed<'_>],
@@ -304,14 +303,16 @@ async fn build_fixture(
             .await
             .expect("the convoy's project");
     }
-    if message_path.get().is_none() {
-        let _ = message_path.set(engine.messages.messages());
-    }
+    let message_path = message_path.unwrap_or_else(|| engine.messages.messages());
     let refresher =
         ChangeRequestRefresher::new(backend.clone(), "host".into(), Arc::new(UnusedForge), ChangeRequestRefreshCadence::default());
-    let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::new(RecordingEventSink::default()), refresher, engine.reads())
-        .with_message_path(message_path.clone())
-        .with_convoy_engine(engine.path());
+    let subscriptions = LeafSubscriptionTable::new(
+        backend.clone(),
+        Arc::new(RecordingEventSink::default()),
+        refresher,
+        engine.reads(),
+        crate::leaf_engine::Engines { messages: message_path.clone(), convoys: engine.path() },
+    );
     let probe = Arc::new(StagingProbe {
         backend: backend.clone(),
         launch: std::sync::OnceLock::new(),

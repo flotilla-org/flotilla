@@ -387,8 +387,8 @@ impl CrewActions<'_> {
     }
 
     /// An operator's verdict on one promise (#3587 layer 6): the engine's
-    /// attributed `Keep` or `Retract`. It needs an operator principal, the
-    /// `[primitives]` switch, and a convoy the engine holds.
+    /// attributed `Keep` or `Retract`. It needs an operator principal and a
+    /// convoy the engine holds.
     pub async fn execute_action_convoy_promise_verdict(
         &self,
         id: u64,
@@ -412,7 +412,7 @@ impl CrewActions<'_> {
                     .await
                     .map_err(|error| error.to_string())?;
                 let engine = flotilla_resources::convoy::engine::deciding(&self.crew.convoy_engine, &current)
-                    .ok_or_else(|| format!("convoy `{convoy}` is not decided by the engine here; promise verdicts need `[primitives]`"))?;
+                    .ok_or_else(|| format!("convoy `{convoy}` is not decided by the engine here"))?;
                 engine.verdict(&current, promise, *keep, &principal.name, reason).await
             }
             .await;

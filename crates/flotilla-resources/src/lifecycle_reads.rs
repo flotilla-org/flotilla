@@ -145,7 +145,7 @@ pub trait LifecycleReads: Send + Sync {
     fn joins(&self) -> Result<&crate::held_joins::HeldJoins, String>;
 
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
-    /// `None` when the engine holds no such resource: the switch is off, or it was written before.
+    /// `None` when the engine holds no such resource: it was written before the engine took over.
     ///
     /// Lossy compatibility adapter. Authoritative lifecycle consumers use `try_reading`
     /// so a read failure cannot select stale status.

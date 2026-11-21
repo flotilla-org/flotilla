@@ -1284,7 +1284,7 @@ mod tests {
             // The engine ends the launch; it stays readable, ended.
             let convoy = self.backend.using::<ResourceConvoy>(namespace).get(name).await.map_err(|e| e.to_string())?;
             let path = self.home().convoys.path();
-            path.get().expect("the Convoy path").abandon(&convoy, "operator", "reaped").await
+            path.abandon(&convoy, "operator", "reaped").await
         }
     }
 
@@ -1433,7 +1433,7 @@ mod tests {
     async fn fail_current(admission: &Admission) {
         let convoy = admission.home().convoy(&current(admission)).await;
         let path = admission.home().convoys.path();
-        path.get().expect("the Convoy path").fail(&convoy, "operator", "failed").await.expect("fixture operation succeeds");
+        path.fail(&convoy, "operator", "failed").await.expect("fixture operation succeeds");
     }
 
     // Behaviour (#3108 retirement): a standing generation's end holds it until its role's pass

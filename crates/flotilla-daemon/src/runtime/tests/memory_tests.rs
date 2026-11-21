@@ -161,6 +161,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         Arc::clone(&engine.vessels.lifecycles),
         daemon.lifecycle_reads(),
         daemon.decided_store(),
+        daemon.convoy_engine_path(),
     );
     let reading = || engine.vessels.vessels.get(&launch, None).expect("read").expect("launch").reading;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {

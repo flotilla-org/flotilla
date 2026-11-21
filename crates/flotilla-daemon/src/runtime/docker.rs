@@ -368,7 +368,7 @@ impl DockerControllerRuntime {
             }
         };
         let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + material_deliveries.len());
-        provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
+        provisioned_mounts.extend(spec.mounts.iter().map(flotilla_environment::environment::ProvisionedMount::from));
         deliver_agent_material(&provider.capabilities(), &material_deliveries, &mut tools, &mut provisioned_mounts).await?;
         let jobs = context.rust_build_jobs().await?;
         let opts = CreateOpts {

@@ -828,14 +828,7 @@ impl ReconcilerWake {
     /// a failed withdrawal is judged again after a while.
     async fn end_settled_stalls(&self, tick: StallTick<'_>, convoy: &ResourceObject<Convoy>, status: &ConvoyStatus, stalls: &Stalls) {
         let StallTick { namespace, .. } = tick;
-        let primitives = match self.subscriptions.message_primitives() {
-            Ok(primitives) => primitives,
-            Err(error) => {
-                tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "ending settled stall records failed");
-                tick.retry();
-                return;
-            }
-        };
+        let primitives = self.subscriptions.message_primitives();
         let project = convoy.spec.project_ref.as_str();
         let address = |vessel: &str, role: &str| crew_role_address(project, &convoy.metadata.name, vessel, role);
         let stalled = stalls
@@ -896,7 +889,7 @@ impl ReconcilerWake {
         if pass.is_empty() {
             return Ok(());
         }
-        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        let primitives = self.subscriptions.message_primitives();
         if let Some(wait) = primitives.delivery_wait(namespace).await? {
             // The designation's change judges them.
             tracing::debug!(namespace, %wait, "stall judging waits");
@@ -1015,7 +1008,7 @@ impl ReconcilerWake {
             unread.iter().flat_map(|(seat, _, turns)| turns.iter().map(|record| (seat.clone(), record.clone()))).collect();
         let mut read: HashMap<String, Vec<_>> = HashMap::new();
         if !receivers.is_empty() || !named.is_empty() {
-            let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+            let primitives = self.subscriptions.message_primitives();
             for message in primitives.seat_standings(namespace, &receivers, &named).await.map_err(|error| error.to_string())? {
                 read.entry(message.seat.clone()).or_default().push(message);
             }
@@ -1064,7 +1057,7 @@ impl ReconcilerWake {
         .map_err(|error| error.to_string())?;
         // Charter notifications follow the projects, the receivers and the designation.
         if pass.charter {
-            let notices = self.subscriptions.message_primitives().map_err(|error| error.to_string())?.charter_notices(namespace);
+            let notices = self.subscriptions.message_primitives().charter_notices(namespace);
             flotilla_messaging::reconcile_charter_notifications_with_receivers(
                 notices.as_ref(),
                 self.subscriptions.inner.charter_brief_renderer.as_ref(),
@@ -2091,7 +2084,7 @@ impl ReconcilerWake {
     ) -> Result<String, String> {
         use sha2::Digest;
 
-        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        let primitives = self.subscriptions.message_primitives();
         let receiver = crew_role_address(&convoy.spec.project_ref, &convoy.metadata.name, vessel, role);
         let guidance = primitives.latest_guidance(namespace, &receiver, None).await.map_err(|error| error.to_string())?;
         let mut digest = sha2::Sha256::new();
@@ -2120,7 +2113,7 @@ impl ReconcilerWake {
         limit: usize,
         leaf: &Leaf,
     ) -> Result<Vec<StallNudge>, String> {
-        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        let primitives = self.subscriptions.message_primitives();
         let project = &convoy.spec.project_ref;
         let sender = Party::fleet(NUDGE_SENDER).inbox(primitives.as_ref(), namespace, project).await?;
         let seat = Party::Seat { project: project.clone(), convoy: convoy.metadata.name.clone(), role: role.to_owned() };

@@ -320,22 +320,6 @@ macro_rules! dispatch_manifest_apply_resource_kind {
     }};
 }
 
-/// Drives a typed read of every kind in the embedded durable store.
-///
-/// Embedded stores use this startup pass to isolate rows whose persisted
-/// representation no longer decodes under the running schema. Other backends
-/// cannot contain an untyped local row and need no scan.
-pub async fn quarantine_undecodable_stored_objects(backend: &ResourceBackend, namespace: &str) -> Result<(), ResourceError> {
-    if !backend.durable_local() {
-        return Ok(());
-    }
-    // A kind an engine port serves holds no old-store records to decode.
-    for registered in REGISTERED_RESOURCE_KINDS.iter().filter(|registered| !backend.engine_serves(registered.kind)) {
-        list_resource_kind(backend, namespace, registered.kind).await?;
-    }
-    Ok(())
-}
-
 /// Read the local stream position for a registered kind (including aliases).
 pub async fn current_resource_kind_position(
     backend: &ResourceBackend,

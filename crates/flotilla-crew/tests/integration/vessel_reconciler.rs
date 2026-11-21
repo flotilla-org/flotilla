@@ -2534,7 +2534,7 @@ async fn a_vessel_reaches_ready_from_wakes_alone(#[case] remote: bool) {
         &backend,
         NAMESPACE,
         lease_engine.reads(),
-        Arc::new(std::sync::OnceLock::new()),
+        crate::common::detached_convoys(),
         accounts,
     );
     let (rechecks, recheck_events) = tokio::sync::mpsc::channel(64);

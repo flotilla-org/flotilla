@@ -724,10 +724,14 @@ async fn capped_ssh_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
     let chosen = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind).expect("chosen candidate");
     assert_eq!((chosen.free_vessel_slots, chosen.max_vessels, chosen.available), (Some(0), Some(1), false), "{allocation:?}");
 
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
-        .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
-        .with_occupancy(backend.clone(), "flotilla")
-        .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(
+        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        daemon.convoy_engine_path(),
+        daemon.crew_message_path(),
+    )
+    .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
+    .with_occupancy(backend.clone(), "flotilla")
+    .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
     let gate = |name: String| {
         let reconciler = &reconciler;
         let convoys = convoys.clone();
@@ -872,10 +876,14 @@ async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order()
     for (index, decision) in decisions.into_iter().enumerate() {
         launches.push(admit_placed(&daemon, &format!("convoy-{index}"), decision).await);
     }
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
-        .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
-        .with_occupancy(backend.clone(), "flotilla")
-        .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(
+        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        daemon.convoy_engine_path(),
+        daemon.crew_message_path(),
+    )
+    .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
+    .with_occupancy(backend.clone(), "flotilla")
+    .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
     let mut waits = Vec::new();
     for name in &launches {
         let convoy = convoys.get(name).await.expect("convoy");
@@ -1009,10 +1017,14 @@ async fn all_candidates_full_means_the_convoy_waits() {
     assert!(allocation.candidates.iter().all(|candidate| !candidate.available), "{allocation:?}");
     // Equal candidates break ties by name, so the Docker host's gate is the one under test.
     assert_eq!(third.kind, "docker-feta");
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
-        .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
-        .with_occupancy(backend.clone(), "flotilla")
-        .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(
+        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        daemon.convoy_engine_path(),
+        daemon.crew_message_path(),
+    )
+    .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
+    .with_occupancy(backend.clone(), "flotilla")
+    .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>("flotilla"));
     let convoy = backend.clone().using::<ResourceConvoy>("flotilla").get(&launch).await.expect("third convoy");
     let wait = reconciler.capacity_wait(&convoy).await.expect("capacity");
     assert!(wait.as_ref().is_some_and(|wait| wait.contains("no free vessel slots")), "{wait:?}");

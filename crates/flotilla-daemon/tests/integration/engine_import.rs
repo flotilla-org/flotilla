@@ -414,11 +414,10 @@ async fn imported_ended_convoys_pass_the_convoy_reconciler_and_write_nothing() {
     assert_eq!(accessed, home, "the convoy's home retires it");
 
     let backend = daemon.resource_backend();
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(daemon.lifecycle_reads())
-        .with_engine(daemon.convoy_engine_path())
-        .with_messages(daemon.crew_message_path())
-        .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>(NS))
-        .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), NS));
+    let reconciler =
+        flotilla_crew::convoy::ConvoyReconciler::new(daemon.lifecycle_reads(), daemon.convoy_engine_path(), daemon.crew_message_path())
+            .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>(NS))
+            .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), NS));
     let convoys = backend.using::<Convoy>(NS);
     let listed: Vec<String> = convoys.list().await.expect("list").items.into_iter().map(|convoy| convoy.metadata.name).collect();
     // The import's four never reach the views. The exception retired just now, and the views
@@ -471,9 +470,8 @@ async fn records_naming_a_lost_convoy_import_against_a_retired_tombstone_and_sta
     let backend = daemon.resource_backend();
     let tombstone = backend.using::<Convoy>(NS).get("gone#1").await.expect("the tombstone, read by its launch though retired");
     assert!(backend.using::<Convoy>(NS).list().await.expect("list").items.is_empty(), "the tombstone retired at the import");
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(daemon.lifecycle_reads())
-        .with_engine(daemon.convoy_engine_path())
-        .with_messages(daemon.crew_message_path());
+    let reconciler =
+        flotilla_crew::convoy::ConvoyReconciler::new(daemon.lifecycle_reads(), daemon.convoy_engine_path(), daemon.crew_message_path());
     reconciler.prepare(&tombstone).await.expect("a pass over the tombstone");
     assert_eq!(writer_of(convoy, "gone#1"), flotilla_engine_store::IMPORT_WRITER);
     assert_eq!(writer_of(message, settled), flotilla_engine_store::IMPORT_WRITER);

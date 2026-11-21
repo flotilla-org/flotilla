@@ -7,6 +7,7 @@ mod dummy_fleet;
 mod dummy_fleet_writes;
 mod engine_import;
 mod engine_only;
+mod operator_commands;
 mod overlay_replication;
 mod peer_connect_flow;
 mod project_cli;

@@ -15,7 +15,7 @@ fn check(file: &str, actual: &str) {
     assert_eq!(actual, snapshot, "{file} changed; review and rerun with UPDATE_DDL_SNAPSHOT=1");
 }
 
-// Behaviour (CLAUDE.md schema review): the Message switch's store DDL is deterministic and
+// Behaviour (CLAUDE.md schema review): the Message store's DDL is deterministic and
 // checked in, so any shape change shows in review as a diff.
 #[test]
 fn message_store_ddl_matches_the_snapshot() {

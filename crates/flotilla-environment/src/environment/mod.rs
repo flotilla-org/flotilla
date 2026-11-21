@@ -271,6 +271,16 @@ impl ProvisionedMount {
     }
 }
 
+impl From<&flotilla_resources::EnvironmentMount> for ProvisionedMount {
+    fn from(mount: &flotilla_resources::EnvironmentMount) -> Self {
+        let mode = match mount.mode {
+            flotilla_resources::EnvironmentMountMode::Ro => ProvisionedMountMode::Ro,
+            flotilla_resources::EnvironmentMountMode::Rw => ProvisionedMountMode::Rw,
+        };
+        Self::new(&mount.source_path, &mount.target_path, mode)
+    }
+}
+
 /// What is at a path, never following a final symbolic link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {

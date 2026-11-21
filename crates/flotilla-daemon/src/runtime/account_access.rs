@@ -14,8 +14,8 @@
 //! - The provision controller reconciles one provision at its place, on its binding's events.
 //!   A withdrawal that fails is retried with backoff.
 //!
-//! Both read and write the account kinds through [`AccountRecords`]: the old store's with
-//! `[primitives]` off, the engine's with it on (#3824 layer 1), and are woken by its changes.
+//! Both read and write the account kinds through [`AccountRecords`], the engine's (#3824 layer 1),
+//! and are woken by its changes.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

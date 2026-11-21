@@ -762,7 +762,7 @@ pub struct InProcessDaemon {
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
     standing_roles: Arc<dyn flotilla_resources::standing_roles::StandingRoles>,
-    /// The forge observers, which the engine's observation records switch to observer-only writes.
+    /// The forge observers, which write only what they observe once the engine's observation records are installed.
     change_request_observer: flotilla_observation::change_request_observer::ChangeRequestRefresher,
     issue_observer: flotilla_observation::issue_observer::IssueRefresher,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
@@ -806,10 +806,7 @@ pub struct InProcessDaemon {
     /// What this daemon has seen of its crews' progress beside their AgentSessions: in memory
     /// only, for its stall check and delivery confirmation (#3108).
     crew_progress: Arc<flotilla_resources::agent_activity::ProgressFacts>,
-    /// The same path, as crew code reaches it: through its EngineMessages port.
-    crew_message_path: flotilla_crew::ports::MessagePath,
-    /// The engine's Convoy path (#3587 layer 6), as crew code and the convoy reconciler reach it;
-    /// filled at composition.
+    /// The engine's Convoys (#3587 layer 6), as crew code and the convoy reconciler reach them.
     convoy_engine_path: flotilla_resources::convoy::engine::EngineConvoyPath,
     /// The engine Convoys behind that path, for readers of its records and its home's memory.
     engine_convoys: Arc<Convoys>,
@@ -1411,8 +1408,9 @@ impl InProcessDaemon {
             Arc::new(ProviderIssueObservationSource { backend: resource_backend.clone(), query_port: Arc::clone(&issue_query_port) }),
             flotilla_observation::issue_observer::IssueRefreshCadence::default(),
         );
-        let crew_message_path = flotilla_crew::ports::MessagePath::default();
-        let convoy_engine_path = flotilla_resources::convoy::engine::EngineConvoyPath::default();
+        let crew_message_path: flotilla_crew::ports::MessagePath = messages.clone();
+        let convoy_engine_path: flotilla_resources::convoy::engine::EngineConvoyPath =
+            Arc::new(ConvoyEngine::new(Arc::clone(&convoys), resource_backend.clone(), Arc::clone(&clock)));
         let change_request_observer = change_request_refresher.clone();
         let issue_observer = issue_refresher.clone();
         let leaf_subscriptions = LeafSubscriptionTable::with_issues(
@@ -1421,10 +1419,9 @@ impl InProcessDaemon {
             change_request_refresher,
             issue_refresher,
             lifecycle_reads.clone(),
+            flotilla_crew::leaf_engine::Engines { messages: Arc::clone(&crew_message_path), convoys: Arc::clone(&convoy_engine_path) },
         )
         .with_clock(Arc::clone(&clock))
-        .with_message_path(Arc::clone(&crew_message_path))
-        .with_convoy_engine(Arc::clone(&convoy_engine_path))
         .with_charter_brief_renderer(Arc::new(flotilla_crew::charter_notifications::LiveCharterBriefRenderer::new(
             resource_backend.clone(),
             Arc::clone(&config),
@@ -1472,9 +1469,6 @@ impl InProcessDaemon {
         drop(convoy_records.follow()?);
         // This home retires its ended convoys as their holds release.
         drop(flotilla_engine_convoys::retire::follow(Arc::clone(&convoys), Arc::clone(&clock))?);
-        let convoy_engine: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> =
-            Arc::new(ConvoyEngine::new(Arc::clone(&convoys), resource_backend.clone(), Arc::clone(&clock)));
-        convoy_engine_path.set(convoy_engine).map_err(|_| "the Convoy path is already installed".to_owned())?;
         let daemon = Arc::new_cyclic(|self_weak| Self {
             dispatch_board_cache,
             repos: Arc::clone(&repos),
@@ -1535,7 +1529,6 @@ impl InProcessDaemon {
             message_receivers: projection_ports::MessageReceivers(Arc::clone(&messages)),
             messages,
             crew_progress: Arc::new(flotilla_resources::agent_activity::ProgressFacts::new(clock.now())),
-            crew_message_path,
             convoy_engine_path,
             engine_convoys: convoys,
             convoy_records,
@@ -2426,8 +2419,8 @@ impl InProcessDaemon {
         self.accounts.clone()
     }
 
-    /// Serves ChangeRequest and Issue from the engine's records, and switches
-    /// the observers to write only what they observe. Records nothing demands after one lease are
+    /// Serves ChangeRequest and Issue from the engine's records, and has
+    /// the observers write only what they observe. Records nothing demands after one lease are
     /// swept.
     pub fn install_observation_records(
         &self,
@@ -2477,22 +2470,20 @@ impl InProcessDaemon {
     }
 
     /// Installs the Message path opened at composition (#3317) into its readers: the resource
-    /// backend's attentions and Message records, and the crew's port.
+    /// backend's attentions and Message records.
     fn install_message_path(&self) -> Result<(), String> {
         let primitives = Arc::clone(&self.messages);
         primitives.install_lifecycle_reads(self.lifecycle_reads())?;
         let (change_request, issue) = self.crew.message_observation_staleness();
         primitives.install_observation_staleness(change_request, issue)?;
         self.resource_backend.install_attentions(Arc::clone(&primitives) as Arc<dyn flotilla_resources::attentions::Attentions>);
-        self.resource_backend
-            .install_engine_records(Arc::new(MessageRecords::new(Arc::clone(&primitives), Arc::clone(&self.provisioning_namespace))));
-        let engine: Arc<dyn flotilla_messaging::EngineMessages> = primitives;
-        self.crew_message_path.set(engine).map_err(|_| "the crew's Message path is already installed".to_owned())
+        self.resource_backend.install_engine_records(Arc::new(MessageRecords::new(primitives, Arc::clone(&self.provisioning_namespace))));
+        Ok(())
     }
 
-    /// The crew's Message path: the engine's, filled at composition.
+    /// The crew's Messages: the engine's.
     pub fn crew_message_path(&self) -> flotilla_crew::ports::MessagePath {
-        Arc::clone(&self.crew_message_path)
+        Arc::clone(&self.messages) as _
     }
 
     /// The engine Convoys at this daemon's home.
@@ -2500,7 +2491,7 @@ impl InProcessDaemon {
         &self.engine_convoys
     }
 
-    /// The engine's Convoy path, filled at composition.
+    /// The engine's Convoys.
     pub fn convoy_engine_path(&self) -> flotilla_resources::convoy::engine::EngineConvoyPath {
         Arc::clone(&self.convoy_engine_path)
     }

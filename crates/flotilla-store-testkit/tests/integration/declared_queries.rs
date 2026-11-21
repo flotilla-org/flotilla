@@ -1,16 +1,9 @@
-use axum::{
-    extract::{Path, State},
-    http::Uri,
-    routing::get,
-    Json, Router,
-};
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
     Convoy, InputMeta, Message, MessagePhase, MessageRelation, MessageSpec, MessageStatus, MessageSubmission, OwnerReference,
     ResourceProvenance,
 };
-use flotilla_store::{query_resource_kind, MessageQuery, OwnerQuery, ResourceBackend, StoreExt, StoreQuery};
-use flotilla_store_http::HttpBackend;
+use flotilla_store::{MessageQuery, OwnerQuery, ResourceBackend, StoreExt, StoreQuery};
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 use flotilla_store_testkit::fixtures::{convoy_meta, convoy_spec};
@@ -31,19 +24,6 @@ impl flotilla_resources::Resource for LegacyChangeRequest {
         <flotilla_resources::ChangeRequest as flotilla_resources::Resource>::QUERYABLE_NUMERIC_FIELDS;
 }
 
-// HTTP boundary stand-in: it rejects missing/invalid query parameters and
-// executes the received contract against an independent real memory store.
-async fn endpoint(
-    State(backend): State<ResourceBackend>,
-    Path((namespace, kind)): Path<(String, String)>,
-    uri: Uri,
-) -> Json<serde_json::Value> {
-    let parameters: BTreeMap<String, String> =
-        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()).into_owned().collect();
-    assert_eq!(parameters.len(), 1, "query protocol sends exactly storeQuery");
-    let query: StoreQuery = serde_json::from_str(parameters.get("storeQuery").expect("required storeQuery")).expect("valid query");
-    Json(query_resource_kind(&backend, &namespace, &kind, &query).await.expect("enforce query"))
-}
 async fn seed(backend: &ResourceBackend) {
     for (name, label) in [("a", "target"), ("b", "other"), ("shadow", "other")] {
         let mut meta = convoy_meta(name);
@@ -107,7 +87,7 @@ async fn seed(backend: &ResourceBackend) {
 }
 async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     // The Environment admission query must have the same candidate cover on
-    // memory, SQLite (sync/async/file), hybrid and resource HTTP adapters.
+    // memory, SQLite (sync/async/file), and hybrid adapters.
     for (name, spec) in [
         (
             "current-direct",
@@ -843,15 +823,6 @@ async fn shared_query_contract() {
         seed(backend).await;
         contract(backend, backend).await;
     }
-    let server = ResourceBackend::new(InMemoryBackend::default());
-    seed(&server).await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = Router::new().route("/apis/flotilla.work/v1/namespaces/{namespace}/{kind}", get(endpoint)).with_state(server.clone());
-    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let http = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), format!("http://{addr}")));
-    contract(&http, &server).await;
-    task.abort();
 }
 
 // Index results agree with direct equality semantics after every generated

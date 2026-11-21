@@ -574,7 +574,7 @@ pub(in crate::in_process) async fn admit_convoy(daemon: &InProcessDaemon, convoy
 /// `daemon`'s engine Convoy writer, for the edges a test drives: verdicts, links, failure.
 pub(in crate::in_process) fn convoy_engine(daemon: &InProcessDaemon) -> Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> {
     test_engine(daemon);
-    Arc::clone(daemon.convoy_engine_path().get().expect("the Convoy path is installed"))
+    daemon.convoy_engine_path()
 }
 
 /// Admits `convoy` with `spec` and `status` in namespace `flotilla` on `daemon`; see [`admit_convoy`].

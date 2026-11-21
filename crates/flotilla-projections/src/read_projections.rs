@@ -112,15 +112,15 @@ pub struct ReadProjections<'a> {
     pub clock: &'a Arc<dyn Clock>,
     pub leaf_subscriptions: &'a dyn LeafSubscriptionRead,
     pub fleet: &'a FleetService,
-    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
+    /// The engine's provisioning readings (#3629 layer 4).
     pub lifecycles: &'a dyn crate::ports::LifecycleReads,
-    /// The `[primitives]` Convoy path: explanations show the engine's promises (#3587 layer 8).
+    /// The engine's Convoys: explanations show the engine's promises (#3587 layer 8).
     pub convoy_engine: &'a flotilla_resources::convoy::engine::EngineConvoyPath,
-    /// The account kinds' records: the old store's, or the engine's behind `[primitives]`.
+    /// The account kinds' records.
     pub accounts: &'a dyn flotilla_resources::account_access::AccountRecords,
-    /// The ManifestRoots: the old store's, or the engine's behind `[primitives]` (#3824 layer 2c).
+    /// The ManifestRoots (#3824 layer 2c).
     pub manifest_roots: &'a dyn flotilla_resources::manifest_roots::ManifestRoots,
-    /// The attentions: the old store's, or the engine's behind `[primitives]`.
+    /// The attentions.
     pub attentions: Arc<dyn Attentions>,
 }
 

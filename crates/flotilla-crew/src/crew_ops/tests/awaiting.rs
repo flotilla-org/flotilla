@@ -243,11 +243,9 @@ impl flotilla_messaging::CharterNotices for NoCharterNotices {
     }
 }
 
-fn wired(messages: &Arc<RecordingMessages>) -> MessagePath {
-    let path = MessagePath::default();
+fn wired(messages: &Arc<RecordingMessages>) -> Option<MessagePath> {
     let engine: Arc<dyn EngineMessages> = messages.clone();
-    assert!(path.set(engine).is_ok(), "the path is set once");
-    path
+    Some(engine)
 }
 
 // Behaviour (#3587 ruling 6353439323): a send whose awaiting-reply record fails to write is not

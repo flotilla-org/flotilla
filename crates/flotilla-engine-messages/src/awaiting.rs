@@ -1,4 +1,4 @@
-//! AwaitingReply on the engine behind the `[primitives]` switch (#3587 layer 7).
+//! AwaitingReply on the engine (#3587 layer 7).
 //!
 //! [`AwaitingReplies`] is this home's writer of the sender's half of a Reply
 //! or Outcome exchange (#3587 awaiting-reply ruling). The record is homed at

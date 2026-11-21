@@ -1,14 +1,12 @@
 //! #3154: Host status is a latest-value observation (WORKLOAD.md
-//! `host_heartbeat`). Status patches commit only observation changes, the
-//! heartbeat keeps `heartbeat_at` fresh for readiness, and the Host stream
-//! keeps one resumable event so lagging watchers relist.
+//! `host_heartbeat`). Status patches commit only observation changes, and the
+//! Host stream keeps one resumable event so lagging watchers relist.
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use flotilla_protocol::SleepInhibitionHealth;
 use flotilla_resources::{
     ConditionValue, FulfilmentFacts, Host, HostCondition, HostSpec, HostStatusPatch, InputMeta, ResourceError, WatchStart,
-    HEARTBEAT_READY_TTL_SECS, HEARTBEAT_REFRESH_SECS,
 };
 use flotilla_store::{apply_status_patch, ResourceBackend, TypedResolver};
 use hegel::generators as gs;
@@ -83,8 +81,7 @@ enum Step {
 }
 
 fn draw_step(tc: &hegel::TestCase) -> Step {
-    // Advances straddle HEARTBEAT_REFRESH_SECS (20 s) and the 60 s readiness
-    // TTL; the two-value floor, toolchain and health domains make "unchanged"
+    // Advances vary the observation times; the two-value floor, toolchain and health domains make "unchanged"
     // observations common, so both commit and elision branches are drawn.
     let advance = tc.draw(gs::integers::<i64>().min_value(0).max_value(45));
     match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
@@ -103,7 +100,6 @@ struct Model {
     /// Readiness as last computed by a heartbeat: a failed sleep inhibition blocks it.
     ready: Option<bool>,
     stored_heartbeat_at: Option<DateTime<Utc>>,
-    latest_heartbeat_at: Option<DateTime<Utc>>,
 }
 
 async fn run_steps(backend: ResourceBackend, steps: &[Step]) {
@@ -120,13 +116,11 @@ async fn run_steps(backend: ResourceBackend, steps: &[Step]) {
         let (patch, expect_commit) = match *step {
             Step::Heartbeat { advance, below_floor } => {
                 now += Duration::seconds(advance);
-                // Commit when the floor judgement changed, or when the stored heartbeat is at least the refresh window old.
-                let stale = model.stored_heartbeat_at.is_none_or(|stored| now - stored >= Duration::seconds(HEARTBEAT_REFRESH_SECS));
+                // Commit when the floor or readiness judgement changed.
                 let ready = model.sleep_failed != Some(true);
-                let commit = model.below_floor != Some(below_floor) || model.ready != Some(ready) || stale;
+                let commit = model.below_floor != Some(below_floor) || model.ready != Some(ready);
                 model.below_floor = Some(below_floor);
                 model.ready = Some(ready);
-                model.latest_heartbeat_at = Some(now);
                 if commit {
                     model.stored_heartbeat_at = Some(now);
                 }
@@ -159,20 +153,14 @@ async fn run_steps(backend: ResourceBackend, steps: &[Step]) {
         );
         assert_eq!(matches!(status.sleep_inhibition, SleepInhibitionHealth::Failed { .. }), model.sleep_failed == Some(true));
         assert_eq!(model.ready.map(|_| status.ready), model.ready, "step {index}");
-        // Readers judging freshness against the latest heartbeat see a stored
-        // heartbeat_at within the refresh window, well inside the readiness TTL.
+        // A timestamp-only heartbeat is declined, so the stored time is that of the last commit.
         assert_eq!(status.heartbeat_at, model.stored_heartbeat_at, "step {index}");
-        if let (Some(stored), Some(latest)) = (status.heartbeat_at, model.latest_heartbeat_at) {
-            assert!(latest - stored < Duration::seconds(HEARTBEAT_REFRESH_SECS), "step {index}: stored heartbeat lags {}", latest - stored);
-            assert!(status.heartbeat_is_fresh(latest + Duration::seconds(HEARTBEAT_READY_TTL_SECS - HEARTBEAT_REFRESH_SECS)));
-        }
     }
 }
 
 // Behaviour (#3154): across any interleaving of heartbeat, fulfilment and
 // sleep-inhibition observations, a Host status patch commits exactly when an
-// observation changes or the stored heartbeat needs refreshing, and the stored
-// status always carries the latest observations. Run on both backends.
+// observation changes, and the stored status always carries the latest observations. Run on both backends.
 #[hegel::test]
 fn host_status_commits_only_observation_changes(tc: hegel::TestCase) {
     let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(16));
@@ -184,40 +172,12 @@ fn host_status_commits_only_observation_changes(tc: hegel::TestCase) {
     });
 }
 
-// Behaviour (#3154): an otherwise unchanged heartbeat is declined until the
-// stored heartbeat is exactly HEARTBEAT_REFRESH_SECS old (the boundary the
-// generated property rarely draws), then commits.
-#[tokio::test]
-async fn unchanged_heartbeat_commits_at_the_refresh_boundary() {
-    let backend = flotilla_store_testkit::sqlite_backend().expect("sqlite backend");
-    let hosts = host(&backend).await;
-    apply_status_patch(&hosts, HOST, &heartbeat(start(), false)).await.expect("first heartbeat");
-    let first = version(&hosts).await;
-    let just_inside = start() + Duration::seconds(HEARTBEAT_REFRESH_SECS - 1);
-    apply_status_patch(&hosts, HOST, &heartbeat(just_inside, false)).await.expect("declined heartbeat");
-    assert_eq!(version(&hosts).await, first, "a heartbeat inside the refresh window commits nothing");
-    let boundary = start() + Duration::seconds(HEARTBEAT_REFRESH_SECS);
-    let status = apply_status_patch(&hosts, HOST, &heartbeat(boundary, false)).await.expect("refresh heartbeat").status.expect("status");
-    assert_eq!(status.heartbeat_at, Some(boundary));
-}
-
-// Behaviour (#3154): a heartbeat earlier than the stored one (wall-clock
-// regression) commits, so a future-dated heartbeat cannot look fresh forever.
-#[tokio::test]
-async fn heartbeat_commits_after_a_clock_regression() {
-    let backend = flotilla_store_testkit::sqlite_backend().expect("sqlite backend");
-    let hosts = host(&backend).await;
-    apply_status_patch(&hosts, HOST, &heartbeat(start(), false)).await.expect("first heartbeat");
-    let regressed = start() - Duration::seconds(1);
-    let status = apply_status_patch(&hosts, HOST, &heartbeat(regressed, false)).await.expect("heartbeat").status.expect("status");
-    assert_eq!(status.heartbeat_at, Some(regressed));
-}
-
 async fn assert_host_stream_keeps_one_event(backend: ResourceBackend) {
     let hosts = host(&backend).await;
     let created = version(&hosts).await;
+    // Each beat flips the floor judgement, so each is an observation change that commits.
     for beat in 0..4 {
-        apply_status_patch(&hosts, HOST, &heartbeat(start() + Duration::seconds(30 * beat), false)).await.expect("heartbeat");
+        apply_status_patch(&hosts, HOST, &heartbeat(start() + Duration::seconds(30 * beat), beat % 2 == 1)).await.expect("heartbeat");
     }
     let latest = version(&hosts).await;
 

@@ -809,7 +809,7 @@ async fn waits_fire_once_and_cancelled_waits_do_not() {
     let convoys = daemon.daemon.resource_backend().using::<Convoy>("flotilla");
     let current = convoys.get(&watched).await.unwrap();
     let engine = daemon.daemon.convoy_engine_path();
-    engine.get().expect("the Convoy path").fail(&current, "operator", "failed").await.unwrap();
+    engine.fail(&current, "operator", "failed").await.unwrap();
     let mut received = client.until(|message| message["type"] == "wait_fired").await;
     let fired = received.last().unwrap().clone();
     assert_eq!((fired["id"].as_str(), fired["value"].as_str()), (Some("w"), Some("Failed")));

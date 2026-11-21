@@ -71,8 +71,12 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
         )
         .await
         .expect("decision");
-    let reconciler = ConvoyReconciler::new(std::sync::Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads))
-        .with_hosts(backend.including_replicas::<Host>("flotilla"));
+    let reconciler = ConvoyReconciler::new(
+        std::sync::Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        crate::common::detached_convoys(),
+        crate::common::detached_messages(),
+    )
+    .with_hosts(backend.including_replicas::<Host>("flotilla"));
     let wait = reconciler.capacity_wait(&convoy).await.expect("judge full");
     assert!(wait.as_ref().is_some_and(|wait| wait.contains("linux-docker") && wait.contains("no free vessel slots")), "{wait:?}");
 

@@ -150,6 +150,13 @@ pub trait TurnDeliveryActuator: Send + Sync {
     async fn hold(&self, request: &CrewTurnIntent, act: &HoldAct, reason: &str) -> Result<(), String>;
 }
 
+/// The engine's Messages and Convoys, which the table reads and writes them through.
+#[derive(Clone)]
+pub struct Engines {
+    pub messages: crate::ports::MessagePath,
+    pub convoys: flotilla_resources::convoy::engine::EngineConvoyPath,
+}
+
 #[derive(Clone)]
 pub struct LeafSubscriptionTable {
     inner: Arc<LeafSubscriptionTableInner>,
@@ -160,9 +167,9 @@ struct LeafSubscriptionTableInner {
     clock: Arc<dyn flotilla_resources::Clock>,
     backend: ResourceBackend,
     watch_views: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<wake::LeafViews>>>>,
-    /// The Message path, installed at startup.
+    /// The engine's Messages.
     message_path: crate::ports::MessagePath,
-    /// The `[primitives]` Convoy path: promises are read from the engine when it holds a convoy.
+    /// The engine's Convoys: promises are read from the engine when it holds a convoy.
     convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
     charter_brief_renderer: Arc<dyn flotilla_messaging::CharterBriefRenderer>,
     event_sink: Arc<dyn EventSink>,
@@ -219,18 +226,8 @@ impl LeafSubscriptionTable {
         self
     }
 
-    pub fn with_convoy_engine(mut self, path: flotilla_resources::convoy::engine::EngineConvoyPath) -> Self {
-        Arc::get_mut(&mut self.inner).expect("configure the convoy path before sharing subscriptions").convoy_engine = path;
-        self
-    }
-
-    pub fn with_message_path(mut self, path: crate::ports::MessagePath) -> Self {
-        Arc::get_mut(&mut self.inner).expect("configure the message path before sharing subscriptions").message_path = path;
-        self
-    }
-
-    pub(crate) fn message_primitives(&self) -> Result<Arc<dyn flotilla_messaging::EngineMessages>, flotilla_resources::ResourceError> {
-        crate::ports::installed_messages(&self.inner.message_path)
+    pub(crate) fn message_primitives(&self) -> Arc<dyn flotilla_messaging::EngineMessages> {
+        Arc::clone(&self.inner.message_path)
     }
 
     pub fn new(
@@ -238,8 +235,9 @@ impl LeafSubscriptionTable {
         event_sink: Arc<dyn EventSink>,
         change_requests: ChangeRequestRefresher,
         lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+        engines: Engines,
     ) -> Self {
-        Self::with_episode_limit(backend, event_sink, change_requests, lifecycle_reads, 3)
+        Self::with_episode_limit(backend, event_sink, change_requests, lifecycle_reads, engines, 3)
     }
 
     pub fn with_episode_limit(
@@ -247,11 +245,12 @@ impl LeafSubscriptionTable {
         event_sink: Arc<dyn EventSink>,
         change_requests: ChangeRequestRefresher,
         lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+        engines: Engines,
         episode_limit: u32,
     ) -> Self {
         let issues =
             IssueRefresher::new(backend.clone(), "unavailable".into(), Arc::new(UnavailableIssues), IssueRefreshCadence::default());
-        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, lifecycle_reads, episode_limit)
+        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, lifecycle_reads, engines, episode_limit)
     }
 
     pub fn with_issues(
@@ -260,8 +259,9 @@ impl LeafSubscriptionTable {
         change_requests: ChangeRequestRefresher,
         issues: IssueRefresher,
         lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+        engines: Engines,
     ) -> Self {
-        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, lifecycle_reads, 3)
+        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, lifecycle_reads, engines, 3)
     }
 
     fn with_issues_and_episode_limit(
@@ -270,6 +270,7 @@ impl LeafSubscriptionTable {
         change_requests: ChangeRequestRefresher,
         issues: IssueRefresher,
         lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+        engines: Engines,
         episode_limit: u32,
     ) -> Self {
         // The limit judges the latest run of retained episodes (at most limit+1).
@@ -284,8 +285,8 @@ impl LeafSubscriptionTable {
                 clock: Arc::new(flotilla_resources::SystemClock),
                 backend,
                 watch_views: Default::default(),
-                message_path: Default::default(),
-                convoy_engine: Default::default(),
+                message_path: engines.messages,
+                convoy_engine: engines.convoys,
                 charter_brief_renderer: Arc::new(flotilla_messaging::CharterProseRenderer),
                 event_sink,
                 rows: Mutex::new(HashMap::new()),

@@ -3,7 +3,7 @@
 //! [`EngineConvoyPath`], the way the composition root installs them; and launches admitted on it
 //! the way admission admits them.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 mod counted;
 mod home;
@@ -12,7 +12,7 @@ pub use counted::KeyedGets;
 use counted::{Meter, WithConvoys};
 use flotilla_engine_convoys::{convoy_engine::ConvoyEngine, convoy_records::EngineConvoyRecords, convoys::Convoys};
 use flotilla_resources::{
-    convoy::engine::{engine_name, set_notes, EngineConvoyPath, EngineConvoys, VerdictScope},
+    convoy::engine::{engine_name, set_notes, EngineConvoyPath, VerdictScope},
     lifecycle_reads::LifecycleReads,
     Clock, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, ObjectMeta, ResourceObject, Selector, VesselRequirement,
     WorkflowSnapshot,
@@ -56,9 +56,7 @@ impl EngineConvoysHome {
         let reads: Arc<dyn LifecycleReads> = Arc::new(WithConvoys::new(reads, records, Arc::clone(&meter)));
         let views = Arc::new(ConvoyViews::new(namespace, Arc::clone(&reads)));
         backend.install_engine_records(Arc::clone(&views) as _);
-        let path: EngineConvoyPath = Arc::new(OnceLock::new());
-        let engine: Arc<dyn EngineConvoys> = Arc::new(ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), clock));
-        assert!(path.set(engine).is_ok(), "a new path is empty");
+        let path: EngineConvoyPath = Arc::new(ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), clock));
         Self { convoys, views, reads, meter, path, _dir: None }
     }
 
@@ -131,13 +129,13 @@ impl EngineConvoysHome {
 /// The status's other fields this home notes are kept as its notes, and a status that ended
 /// Failed or Abandoned ends the launch so. Returns the launch's name.
 pub async fn launch(path: &EngineConvoyPath, mut convoy: ResourceObject<Convoy>) -> String {
-    let engine = path.get().expect("the Convoy path is installed");
+    let engine = path;
     let of = engine_name(&convoy).expect("a convoy names what it is a launch of");
     let launch = engine.reserve(&of).await.expect("reserve a launch");
     convoy.metadata.name = launch.clone();
     engine.admit_reserved(&convoy).await.expect("admit the launch");
     if let Some(status) = &convoy.status {
-        set_notes(path, &launch, status).expect("note the launch's status");
+        set_notes(path, &launch, status);
         match status.phase {
             ConvoyPhase::Failed => engine.fail(&convoy, "operator", "failed").await.expect("fail the launch"),
             ConvoyPhase::Abandoned => engine.abandon(&convoy, "operator", "abandoned").await.expect("abandon the launch"),
@@ -150,7 +148,7 @@ pub async fn launch(path: &EngineConvoyPath, mut convoy: ResourceObject<Convoy>)
 /// Keeps the promises of every work of launch `convoy` at `path`'s home, as an operator's verdict
 /// on each: it reads Landing.
 pub async fn keep_all(path: &EngineConvoyPath, convoy: &ResourceObject<Convoy>) {
-    let engine = path.get().expect("the Convoy path is installed");
+    let engine = path;
     let snapshot = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).expect("a launch's frozen workflow");
     for vessel in &snapshot.vessels {
         let scope = VerdictScope { vessel: vessel.name.clone(), role: None };
@@ -161,7 +159,7 @@ pub async fn keep_all(path: &EngineConvoyPath, convoy: &ResourceObject<Convoy>) 
 /// [`keep_all`], then delivers launch `convoy`: it reads Landed.
 pub async fn land(path: &EngineConvoyPath, convoy: &ResourceObject<Convoy>) {
     keep_all(path, convoy).await;
-    path.get().expect("the Convoy path is installed").deliver(convoy, "claim").await.expect("deliver the launch");
+    path.deliver(convoy, "claim").await.expect("deliver the launch");
 }
 
 /// Convoy `name` in `namespace` as admission hands it to the engine: `spec`, and `status` with

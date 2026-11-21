@@ -29,7 +29,7 @@ use flotilla_state_machines::{
     EdgeEventOf, EdgePayload, InputRead, Label, Log, LogError, Machine, Resource, StoredState, StoredWrite, Version,
 };
 
-/// The kinds the `[primitives]` switch moves: Message, and the minimal
+/// The kinds the engine's first layers moved: Message, and the minimal
 /// AgentSession and the Person its receipts are written on. Codes are the production
 /// registry's (`flotilla_state_machines::kinds`), never reassigned here.
 pub struct MachineRegistry {
@@ -81,7 +81,7 @@ pub fn drop_retired_tables(connection: &rusqlite::Connection) -> rusqlite::Resul
     connection.execute_batch("DROP VIEW IF EXISTS \"convoy_quota_view\";\nDROP TABLE IF EXISTS \"convoy_quota\";")
 }
 
-/// Registers the engine's crew kind the `[primitives]` switch moves (#3629 layer 6): Vessel, the
+/// Registers the engine's crew kind (#3629 layer 6): Vessel, the
 /// placement lease, under its production code.
 pub fn register_crew(kinds: &mut KindRegistry) -> Result<(), RegistryError> {
     kinds.register::<Resource<vessel::Vessel>>()?;

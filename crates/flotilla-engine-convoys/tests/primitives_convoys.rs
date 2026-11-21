@@ -1,4 +1,4 @@
-//! Convoy on the engine behind the `[primitives]` switch (#3587 layer 6):
+//! Convoy on the engine (#3587 layer 6):
 //! this home's Convoy writer over the decided store.
 
 use std::sync::Arc;

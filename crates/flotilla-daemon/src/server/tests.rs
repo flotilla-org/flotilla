@@ -1,4 +1,3 @@
-use flotilla_store_http::HttpBackend;
 use std::{
     collections::{BTreeMap, HashMap},
     os::unix::fs::MetadataExt,
@@ -31,10 +30,10 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Convoy, ConvoySpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceError, ResourceProvenance, Selector, TerminalAttentionState,
-    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, WatchEvent, WatchStart,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceError, Selector, TerminalAttentionState, TerminalBrief,
+    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel,
 };
-use flotilla_store::{controller::ControllerLoop, ResourceBackend};
+use flotilla_store::controller::ControllerLoop;
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use tokio::{
@@ -244,36 +243,42 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
         }
     });
 
-    let remote = ResourceBackend::new(HttpBackend::from_unix_socket(&socket_path).expect("build Unix-socket resource client"));
-    let overlay = remote.including_replicas::<Convoy>("flotilla").list().await.expect("list overlay over Unix-socket HTTP");
-    assert!(overlay.items.iter().any(|item| {
-        item.object.metadata.name == replica_row
-            && matches!(
-                item.provenance,
-                ResourceProvenance::Replica { ref origin_root, .. }
-                    if origin_root == &NodeId::new("remote-root")
-            )
-    }));
-    let replica = remote.including_replicas::<Convoy>("flotilla").get(&replica_row).await.expect("get replica over Unix-socket HTTP");
-    assert!(matches!(
-        replica.provenance,
-        ResourceProvenance::Replica { ref origin_root, .. } if origin_root == &NodeId::new("remote-root")
-    ));
-    let listed = remote.using::<Convoy>("flotilla").list().await.expect("list convoys over Unix-socket HTTP");
-    assert_eq!(listed.items.len(), 1);
-    let mut watch =
-        remote.using::<Convoy>("flotilla").watch(WatchStart::resuming_from(&listed)).await.expect("watch convoys over Unix-socket HTTP");
+    let client = rigging_tls::client_builder().unix_socket(socket_path.as_path()).build().expect("build Unix-socket resource client");
+    let paths = <Convoy as flotilla_resources::Resource>::API_PATHS;
+    let url = format!("http://flotilla.local/apis/{}/{}/namespaces/flotilla/{}", paths.group, paths.version, paths.plural);
+    let names = |list: &serde_json::Value| -> Vec<String> {
+        list["items"].as_array().expect("items").iter().map(|item| item["metadata"]["name"].as_str().expect("name").to_owned()).collect()
+    };
+    let overlay: serde_json::Value = client
+        .get(&url)
+        .query(&[("includeReplicas", "true")])
+        .send()
+        .await
+        .expect("list overlay over Unix-socket HTTP")
+        .json()
+        .await
+        .expect("overlay JSON");
+    assert!(names(&overlay).contains(&replica_row), "the overlay lists the replica row");
+    let listed: serde_json::Value =
+        client.get(&url).send().await.expect("list convoys over Unix-socket HTTP").json().await.expect("list JSON");
+    assert_eq!(names(&listed).len(), 1);
+    assert!(names(&listed)[0].starts_with("before-watch"), "{listed}");
+    let mut watch = client
+        .get(&url)
+        .query(&[("watch", "true"), ("resourceVersion", listed["metadata"]["resourceVersion"].as_str().expect("list version"))])
+        .send()
+        .await
+        .expect("watch convoys over Unix-socket HTTP");
 
     let after_watch = home.admit("after-watch", spec(), single_agent("coder")).await;
-    let event = tokio::time::timeout(Duration::from_secs(2), futures::StreamExt::next(&mut watch))
+    let chunk = tokio::time::timeout(Duration::from_secs(2), watch.chunk())
         .await
         .expect("HTTP watch event timeout")
-        .expect("HTTP watch ended")
-        .expect("valid HTTP watch event");
-    assert!(matches!(
-        event,
-        WatchEvent::Added(object) if object.metadata.name == after_watch
-    ));
+        .expect("HTTP watch failed")
+        .expect("HTTP watch ended");
+    let event: serde_json::Value = serde_json::from_slice(&chunk).expect("valid HTTP watch event");
+    assert_eq!(event["type"], "ADDED");
+    assert_eq!(event["object"]["metadata"]["name"], after_watch.as_str());
 
     server.abort();
     std::fs::remove_file(&socket_path).expect("remove resource HTTP socket");
@@ -429,8 +434,14 @@ async fn main_socket_serves_http_and_framed_connections_side_by_side() {
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     let body: serde_json::Value = serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1).expect("hello JSON");
     assert_eq!(body["protocol_fingerprint"], flotilla_protocol::PROTOCOL_FINGERPRINT);
-    let remote = ResourceBackend::new(HttpBackend::from_unix_socket(&socket_path).expect("resource client"));
-    remote.using::<Convoy>("flotilla").list().await.expect("the resource API is served on the same socket");
+    let client = rigging_tls::client_builder().unix_socket(socket_path.as_path()).build().expect("resource client");
+    let paths = <Convoy as flotilla_resources::Resource>::API_PATHS;
+    let listed = client
+        .get(format!("http://flotilla.local/apis/{}/{}/namespaces/flotilla/{}", paths.group, paths.version, paths.plural))
+        .send()
+        .await
+        .expect("the resource API is served on the same socket");
+    assert!(listed.status().is_success(), "{}", listed.status());
 
     // The framed connection is still live after the HTTP traffic.
     framed.write(Message::Request { id: 7, request: Request::ListRepos }).await.expect("write request");
@@ -1830,9 +1841,13 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     let controller = ControllerLoop {
         primary: placed.using::<Convoy>("flotilla"),
         secondaries: Vec::new(),
-        reconciler: flotilla_crew::convoy::ConvoyReconciler::new(remote_daemon.lifecycle_reads())
-            .with_hosts(placed.including_replicas::<Host>("flotilla"))
-            .with_vessels(placed.including_replicas::<Vessel>("flotilla")),
+        reconciler: flotilla_crew::convoy::ConvoyReconciler::new(
+            remote_daemon.lifecycle_reads(),
+            remote_daemon.convoy_engine_path(),
+            remote_daemon.crew_message_path(),
+        )
+        .with_hosts(placed.including_replicas::<Host>("flotilla"))
+        .with_vessels(placed.including_replicas::<Vessel>("flotilla")),
         backend: placed.clone(),
     };
     let controller_task = tokio::spawn(controller.run());
@@ -1886,6 +1901,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
         Arc::clone(&install_engine(&remote_daemon).vessels.lifecycles),
         remote_daemon.lifecycle_reads(),
         remote_daemon.decided_store(),
+        remote_daemon.convoy_engine_path(),
     );
     // Stands in for the placement's TerminalSession controller, whose own tests cover it: each
     // session its vessel requested is realised.

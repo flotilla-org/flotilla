@@ -151,9 +151,9 @@ mod tests {
     #[test]
     fn check_names_rejected_peers() {
         let mut feta = host("feta", false, None);
-        feta.link = PeerConnectionState::Rejected { reason: "peer feta has [primitives] on, this host has it off".into() };
+        feta.link = PeerConnectionState::Rejected { reason: "peer feta runs a different build".into() };
         let refused = check(Ok(response(vec![host("kiwi", true, None), feta]))).expect("local row present");
-        assert_eq!(refused, vec!["feta: rejected: peer feta has [primitives] on, this host has it off".to_string()]);
+        assert_eq!(refused, vec!["feta: rejected: peer feta runs a different build".to_string()]);
     }
 
     // Generation diagnostics are invariant under host ordering, preserve all

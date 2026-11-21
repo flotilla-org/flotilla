@@ -29,8 +29,6 @@ const KIND: &str = "ChangeRequest";
 /// The caller a subject's refresh loop reads as.
 const REFRESHER: &str = "change request refresh";
 #[cfg(test)]
-use flotilla_store_http::HttpBackend;
-#[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
 use futures::{FutureExt, StreamExt};
 use tokio::{
@@ -622,7 +620,7 @@ impl ChangeRequestRefresher {
         self.inner.cadence.stale_after
     }
 
-    /// The engine's observation records, which composition installs behind `[primitives]`.
+    /// The engine's observation records, which composition installs.
     pub fn engine(&self) -> &EngineObservers {
         &self.inner.engine
     }
@@ -2465,11 +2463,12 @@ mod tests {
         }
     }
 
-    // HTTP boundary: an invalid endpoint deterministically refuses backend I/O,
-    // without a server or a live request. Cleanup errors must not retire monitoring.
+    // An engine home refuses the kind's reads and writes until its port is installed, so backend
+    // I/O fails deterministically. Cleanup errors must not retire monitoring.
     #[tokio::test]
     async fn failed_collection_keeps_retained_monitoring() {
-        let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), "invalid://resource-store"));
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        backend.compose_as_engine_home();
         let refresher =
             ChangeRequestRefresher::new(backend, "node".into(), Arc::new(UnavailableSource), ChangeRequestRefreshCadence::default());
         let subject = ChangeRequestKey::new(

@@ -243,7 +243,7 @@ pub struct Aggregator {
     #[builder(skip)]
     engine_checkout_home: Option<String>,
     bootstrapping: bool,
-    /// The `[primitives]` Convoy path (#3587 layer 8), and the namespace its
+    /// The engine's Convoys (#3587 layer 8), and the namespace their
     /// changed convoys are named in.
     convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
     engine_namespace: String,
@@ -260,7 +260,7 @@ pub struct Aggregator {
     emitted_queries: HashSet<QueryId>,
     #[builder(skip)]
     attach_resolver: Option<Arc<dyn AttachCapabilityResolver>>,
-    /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
+    /// The engine's provisioning readings (#3629 layer 4).
     #[builder(skip = Arc::new(crate::ports::NoLifecycleReads))]
     lifecycle_reads: Arc<dyn crate::ports::LifecycleReads>,
     #[builder(skip)]
@@ -351,7 +351,22 @@ impl Aggregator {
     #[cfg(test)]
     pub fn new(state: AggregatorProjectionState, local_host: HostName, event_tx: broadcast::Sender<DaemonEvent>) -> Self {
         let event_rx = event_tx.subscribe();
-        Self::with_events(state, local_host, Arc::new(BroadcastEventSink::new(event_tx)), event_rx)
+        // The engine holds none of the test's convoys: their rows show them as stored. A test of
+        // its own engine installs one through `with_convoy_engine`.
+        // The home follows its log on a runtime, which a synchronous test lacks: it follows on one
+        // that lives as long as the process.
+        static FOLLOWING: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let _following = FOLLOWING.get_or_init(|| tokio::runtime::Runtime::new().expect("a runtime to follow on")).enter();
+        let engine_backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let home: &'static flotilla_engine_convoys_testkit::EngineConvoysHome =
+            Box::leak(Box::new(flotilla_engine_convoys_testkit::EngineConvoysHome::open(
+                "detached",
+                "flotilla",
+                &engine_backend,
+                Arc::new(flotilla_resources::SystemClock),
+                Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+            )));
+        Self::with_events(state, local_host, Arc::new(BroadcastEventSink::new(event_tx)), event_rx, home.path())
     }
 
     pub fn with_events(
@@ -359,6 +374,7 @@ impl Aggregator {
         local_host: HostName,
         event_sink: Arc<dyn EventSink>,
         event_rx: broadcast::Receiver<DaemonEvent>,
+        convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
     ) -> Self {
         Self {
             #[cfg(test)]
@@ -392,7 +408,7 @@ impl Aggregator {
             held_launches: HeldLaunches::default(),
             engine_checkout_home: None,
             bootstrapping: false,
-            convoy_engine: Default::default(),
+            convoy_engine,
             engine_namespace: String::new(),
             projection_delivery: ConvoyProjectionDelivery::Immediate,
             projection_full: false,
@@ -455,7 +471,15 @@ impl Aggregator {
         self
     }
 
-    /// Rows read a convoy's promises from the engine when it holds the convoy.
+    /// Names the changed convoys the engine reports in `namespace`.
+    pub fn with_engine_namespace(mut self, namespace: &str) -> Self {
+        self.engine_namespace = namespace.to_owned();
+        self
+    }
+
+    /// Rows read a convoy's promises from `engine` when it holds the convoy, and its changed convoys
+    /// are named in `namespace`.
+    #[cfg(test)]
     pub fn with_convoy_engine(mut self, engine: flotilla_resources::convoy::engine::EngineConvoyPath, namespace: &str) -> Self {
         self.convoy_engine = engine;
         self.engine_namespace = namespace.to_owned();
@@ -633,7 +657,7 @@ impl Aggregator {
 
         // An engine edge writes no old record: follow the engine's changes to
         // re-project the convoy's row (#3587 layer 8).
-        let mut engine_changes = self.convoy_engine.get().map(|engine| engine.changes());
+        let mut engine_changes = Some(self.convoy_engine.changes());
         // Environments are the engine's: their changes come from its log (#3108).
         let mut environment_changes = self.lifecycle_reads.environments().ok().map(|environments| environments.changes());
         // So are clones: a checkout's readiness reads its clone launch.
@@ -2794,7 +2818,7 @@ impl Aggregator {
                     && session.object.metadata.labels.get(VESSEL_LABEL).is_some_and(|value| value == vessel)
                     && self.read_host(&session.provenance).as_ref() == Some(vessel_host)
                     && self.attachable_sessions.contains(&session_key(session))
-                    // Last: behind `[primitives]` it is an engine read.
+                    // Last: it is an engine read.
                     && self.session_running(session)
             })
             .min_by_key(|session| &session.object.metadata.name)

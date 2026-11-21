@@ -262,11 +262,14 @@ fn supervision_wake_over(backend: &ResourceBackend, home: &EngineHome, reads: Ar
         Arc::new(UnavailableChangeRequests),
         flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    ReconcilerWake::new(
-        LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, reads, limit)
-            .with_message_path(home.message_path())
-            .with_convoy_engine(home.path()),
-    )
+    ReconcilerWake::new(LeafSubscriptionTable::with_episode_limit(
+        backend.clone(),
+        broadcast_test_sink(event_tx),
+        refresher,
+        reads,
+        crate::leaf_engine::Engines { messages: home.message_path(), convoys: home.path() },
+        limit,
+    ))
 }
 
 /// The supervision scenario: a coder's work launched on the engine, and the leaf subscriptions
@@ -1108,8 +1111,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                 // Primary status watches drive completion rollup; use the
                 // explicit merged observation rather than a network refresher.
                 secondaries: Vec::new(),
-                reconciler: ConvoyReconciler::new(home.reads())
-                    .with_engine(home.path())
+                reconciler: ConvoyReconciler::new(home.reads(), home.path(), home.message_path())
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(60)),
                 backend: backend.clone(),
             }
@@ -1296,7 +1298,7 @@ fn convoy_controller(
     table: &LeafSubscriptionTable,
     stale_after: Option<Duration>,
 ) -> tokio::task::JoinHandle<Result<(), ResourceError>> {
-    let reconciler = ConvoyReconciler::new(home.reads()).with_engine(home.path());
+    let reconciler = ConvoyReconciler::new(home.reads(), home.path(), home.message_path());
     let reconciler = match stale_after {
         Some(stale_after) => reconciler.with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), stale_after),
         None => reconciler,
@@ -1757,6 +1759,14 @@ async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
     assert!(first_brief.contains(&format!("Decision ledger: {ledger}")), "{first_brief}");
 }
 
+/// The engines of a home of their own, for a table whose test reads none of their records. The
+/// home lives as long as the process.
+fn detached_engines() -> super::Engines {
+    let home: &'static EngineHome =
+        Box::leak(Box::new(EngineHome::install(&ResourceBackend::new(InMemoryBackend::default()), "flotilla", "detached")));
+    super::Engines { messages: home.message_path(), convoys: home.path() }
+}
+
 /// A subscription table whose readings serve no held checkouts; a test that holds checkouts gives
 /// the table its own readings.
 fn served_table(
@@ -1764,7 +1774,7 @@ fn served_table(
     event_sink: Arc<dyn super::EventSink>,
     change_requests: ChangeRequestRefresher,
 ) -> LeafSubscriptionTable {
-    LeafSubscriptionTable::new(backend, event_sink, change_requests, agent_reads())
+    LeafSubscriptionTable::new(backend, event_sink, change_requests, agent_reads(), detached_engines())
 }
 
 /// A subscription table over `home`'s engine, as a daemon serving it builds one.
@@ -1774,9 +1784,13 @@ fn engine_table(
     event_sink: Arc<dyn super::EventSink>,
     change_requests: ChangeRequestRefresher,
 ) -> LeafSubscriptionTable {
-    LeafSubscriptionTable::new(backend, event_sink, change_requests, home.reads())
-        .with_message_path(home.message_path())
-        .with_convoy_engine(home.path())
+    LeafSubscriptionTable::new(
+        backend,
+        event_sink,
+        change_requests,
+        home.reads(),
+        super::Engines { messages: home.message_path(), convoys: home.path() },
+    )
 }
 
 /// A turn's subject: the kind and name of the address its subject reference names, at its

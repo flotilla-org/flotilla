@@ -249,7 +249,7 @@ pub struct ExplainedCheckout {
     pub pushed: Option<ExplainedCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landed: Option<ExplainedCondition>,
-    /// The engine's judgement of the checkout, when `[primitives]` is on and the engine holds it.
+    /// The engine's judgement of the checkout, when the engine holds it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<crate::LifecycleReading>,
     /// The clone launch a worktree checkout is made from, as the engine reads it (#3108).
@@ -1028,8 +1028,8 @@ pub enum CommandAction {
         message: Option<String>,
     },
     /// An operator keeps (or retracts) one promise by its label, with a
-    /// reason: the engine's verdict edge (#3587 layer 6). Refused while
-    /// `[primitives]` is off or the engine does not hold the convoy.
+    /// reason: the engine's verdict edge (#3587 layer 6). Refused when the
+    /// engine does not hold the convoy.
     ConvoyPromiseVerdict {
         convoy: String,
         promise: String,
@@ -1290,8 +1290,8 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "is_false")]
         include_replicas: bool,
     },
-    /// Every ManifestRoot of every home, as the daemon's ManifestRoot port reads them (the old
-    /// store's, or the engine's behind `[primitives]`, #3824 layer 2c).
+    /// Every ManifestRoot of every home, as the daemon's ManifestRoot port reads them (#3824
+    /// layer 2c).
     QueryManifestRoots {
         namespace: String,
     },

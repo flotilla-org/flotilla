@@ -1,11 +1,11 @@
 //! The ManifestRoot port (#3824 layer 2c): every reader and writer of manifest roots goes through
-//! [`ManifestRoots`]. With `[primitives]` off it is the old store's ManifestRoot resources, their
-//! spec and status; with it on, the engine's ManifestRoot machine, whose records the 2026-10-26
-//! ruling keeps (applied revision, baselines, refusals, source error) and whose phases are a
-//! judgement.
+//! [`ManifestRoots`]: the engine's ManifestRoot machine, whose records the 2026-10-26 ruling keeps
+//! (applied revision, baselines, refusals, source error) and whose phases are a judgement. The
+//! store-testkit's old-store fixture implements the port over ManifestRoot resources, spec and
+//! status, for tests.
 //!
 //! Callers see one shape, [`RootView`], in the old resource's vocabulary, so the reconciler, the
-//! views and the CLI read either store alike. A root is written only at its home: the host that
+//! views and the CLI read either implementation alike. A root is written only at its home: the host that
 //! declares it.
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -927,13 +927,7 @@ mod governor_relay {
         }
         assert_eq!(governor_snapshot(udder).await.1, first_snapshot, "relay must not rewrite an admitted snapshot");
         // A convoy ends on the engine and is never deleted: the first admission is retired by abandoning it.
-        udder
-            .convoy_engine_path()
-            .get()
-            .expect("udder's Convoy path")
-            .abandon(&first_convoy, "operator", "retire first admission")
-            .await
-            .expect("retire first admission");
+        udder.convoy_engine_path().abandon(&first_convoy, "operator", "retire first admission").await.expect("retire first admission");
         let result = admit_governor(udder).await;
         assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "re-admission failed: {result:?}");
         expected_snapshot = workflow.clone();

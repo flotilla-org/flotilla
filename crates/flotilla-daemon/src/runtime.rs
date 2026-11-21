@@ -266,11 +266,6 @@ impl DaemonRuntime {
         let runtime_health = RuntimeHealth::default().with_restart_history_dir(config.state_dir().as_path().to_path_buf());
         runtime_health.host_observations.record_provider_advertisements(profile.environment_providers.clone()).await;
 
-        result_phase("quarantine_undecodable_stored_objects", async {
-            flotilla_store::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace).await
-        })
-        .await
-        .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
         result_phase("register_startup_resources", register_startup_resources(&daemon, &options.namespace, &profile)).await?;
         let registered_image_caches = local_registry
             .environment_providers
@@ -904,9 +899,7 @@ fn spawn_controller_loops(
                 secondaries.push(Box::new(flotilla_provisioning::engine::vessel::VesselConvoyWake::new(service)));
                 (
                     secondaries,
-                    ConvoyReconciler::new(daemon.lifecycle_reads())
-                        .with_engine(daemon.convoy_engine_path())
-                        .with_messages(daemon.crew_message_path())
+                    ConvoyReconciler::new(daemon.lifecycle_reads(), daemon.convoy_engine_path(), daemon.crew_message_path())
                         .with_hosts(backend.including_replicas::<Host>(&namespace_string))
                         .with_occupancy(backend.clone(), &namespace_string)
                         .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))

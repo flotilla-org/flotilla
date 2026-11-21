@@ -82,7 +82,6 @@ flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 rigging-replay-testkit = { workspace = true }
 flotilla-forgejo-providers = { path = "../flotilla-forgejo-providers" }
 flotilla-github-providers = { path = "../flotilla-github-providers" }
-flotilla-store-http = { path = "../flotilla-store-http" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
