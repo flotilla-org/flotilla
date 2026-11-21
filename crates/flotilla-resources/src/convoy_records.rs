@@ -168,7 +168,10 @@ impl UnreadableLaunch {
     /// The launch as an old Convoy object in `namespace`: its name, project and workflow, the
     /// reason under [`crate::CONVOY_UNREADABLE_ANNOTATION`], and no status.
     pub fn read_view(&self, namespace: &str) -> ResourceObject<Convoy> {
-        let mut labels = BTreeMap::from([(PROJECT_LABEL.to_owned(), self.project.clone())]);
+        let mut labels = BTreeMap::from([
+            (PROJECT_LABEL.to_owned(), self.project.clone()),
+            (crate::labels::LAUNCH_OF_LABEL.to_owned(), self.launch_of.clone()),
+        ]);
         labels.retain(|_, value| !value.is_empty());
         ResourceObject {
             metadata: ObjectMeta {
@@ -562,8 +565,11 @@ impl ConvoyRecord {
             ..ConvoyStatus::default()
         };
 
-        let mut labels =
-            BTreeMap::from([(PROJECT_LABEL.to_owned(), self.project.clone()), (ROLE_LABEL.to_owned(), self.role().to_owned())]);
+        let mut labels = BTreeMap::from([
+            (PROJECT_LABEL.to_owned(), self.project.clone()),
+            (ROLE_LABEL.to_owned(), self.role().to_owned()),
+            (crate::labels::LAUNCH_OF_LABEL.to_owned(), self.launch_of.clone()),
+        ]);
         labels.retain(|_, value| !value.is_empty());
         let document = &self.admission;
         // What admission wrote for the launch, under the annotations its readers find it by.
@@ -670,6 +676,24 @@ pub trait ConvoyRecords: Send + Sync {
     /// Every launch at every home this store holds; one that cannot be read is listed as
     /// unreadable.
     fn every(&self) -> Result<ConvoyListing, String>;
+    /// Every home's launches of `of` in `project` that have not retired, read through the kind's
+    /// `by_launch` index; one that cannot be read is listed as unreadable. The default filters
+    /// [`ConvoyRecords::every`].
+    fn launches_of(&self, of: &str, project: &str) -> Result<ConvoyListing, String> {
+        let mut listing = self.every()?;
+        listing.records.retain(|record| record.project == project && record.launch_of == of);
+        listing.unreadable.retain(|launch| launch.project == project && launch.launch_of == of);
+        Ok(listing)
+    }
+    /// Every home's launches in `project` that have not ended, read through the kind's
+    /// `open_by_project` index; one that cannot be read is listed as unreadable. The default
+    /// filters [`ConvoyRecords::every`], for a port that keeps no index.
+    fn open_in(&self, project: &str) -> Result<ConvoyListing, String> {
+        let mut listing = self.every()?;
+        listing.records.retain(|record| record.project == project && record.ended.is_none());
+        listing.unreadable.retain(|launch| launch.project == project);
+        Ok(listing)
+    }
     /// The launches whose records change, as they are written or replicated here, from now on.
     fn changes(&self) -> tokio::sync::broadcast::Receiver<ConvoyChange> {
         tokio::sync::broadcast::channel(1).1

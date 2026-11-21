@@ -25,7 +25,7 @@ use flotilla_resources::{
     promises::SubmissionVerdict,
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
-use flotilla_schema::{Code, CodeEnum, Event, Kind, KindCode, Timestamp};
+use flotilla_schema::{Code, CodeEnum, Event, IndexQuery, Kind, KindCode, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Loaded, Read, ResourceId, Snapshot, StoreError};
 use flotilla_state_machines::{
     machines::{
@@ -92,6 +92,28 @@ impl EngineConvoyRecords {
 
     /// Every launch at `home`. One whose record cannot be read is listed as unreadable, so it
     /// neither hides the others nor reads as absent.
+    /// Every home's launches `query` selects through its index, retired ones left out.
+    fn paged(read: &mut Read<'_>, stalls: &OpenAwaiting, query: &IndexQuery<ConvoySpec>) -> Result<ConvoyListing, StoreError> {
+        let mut listing = ConvoyListing::default();
+        let mut after = None;
+        loop {
+            let page = read.page(query, after.as_ref(), PAGE)?;
+            for id in page.ids {
+                if let Some(loaded) = read.load::<Resource<Convoy>>(id)? {
+                    match entry(read, stalls, loaded, Retired::Skip)? {
+                        Some(Ok(record)) => listing.records.push(record),
+                        Some(Err(unreadable)) => listing.unreadable.push(unreadable),
+                        None => {}
+                    }
+                }
+            }
+            after = page.next;
+            if after.is_none() {
+                return Ok(listing);
+            }
+        }
+    }
+
     fn scan(read: &mut Read<'_>, stalls: &OpenAwaiting, home: &str) -> Result<ConvoyListing, StoreError> {
         let mut listing = ConvoyListing::default();
         let mut after = None;
@@ -161,6 +183,18 @@ impl ConvoyRecords for EngineConvoyRecords {
             let Some((id, _)) = read.integer_index_keys_before(&query, &home, i64::MAX, 1)?.first().copied() else { return Ok(None) };
             let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
             record(read, &self.stalls, loaded)
+        })
+    }
+
+    fn open_in(&self, project: &str) -> Result<ConvoyListing, String> {
+        let address = Address::project(project).map_err(|error| format!("project `{project}`: {error}"))?;
+        self.read(&format!("open launches in {project}"), |read| Self::paged(read, &self.stalls, &ConvoySpec::open_by_project(&address)))
+    }
+
+    fn launches_of(&self, of: &str, project: &str) -> Result<ConvoyListing, String> {
+        let address = Address::project(project).map_err(|error| format!("project `{project}`: {error}"))?;
+        self.read(&format!("launches of {of} in {project}"), |read| {
+            Self::paged(read, &self.stalls, &ConvoySpec::by_launch(&address, &of.to_owned()))
         })
     }
 

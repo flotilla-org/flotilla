@@ -267,6 +267,16 @@ impl ConvoyRecords for CountedConvoys {
         self.records.every()
     }
 
+    fn launches_of(&self, of: &str, project: &str) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.launches_of(of, project)
+    }
+
+    fn open_in(&self, project: &str) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.open_in(project)
+    }
+
     fn changes(&self) -> tokio::sync::broadcast::Receiver<ConvoyChange> {
         self.records.changes()
     }

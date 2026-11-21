@@ -26,8 +26,8 @@ use futures::{stream::BoxStream, StreamExt};
 
 use flotilla_resources::{
     convoy_compose::{compose_listing, compose_named, Composed},
-    convoy_records::{ConvoyChange, ConvoyRecords},
-    engine_records::{KindRecords, LogPosition, Record, Since, WriteError},
+    convoy_records::{ConvoyChange, ConvoyListing, ConvoyRecords},
+    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, WriteError},
     lifecycle_reads::{ChangeCursor, CursorSince, LifecycleReads},
     terminal_records::TerminalChange,
     vessel_records::VesselChange,
@@ -85,6 +85,31 @@ impl ConvoyViews {
 
     /// Every launch at every home that has not retired. Those that cannot be read are counted as
     /// unreadable.
+    /// The launches `sources` name, each read through its key or the `open_by_project` index,
+    /// composed; this home's alone when `local`.
+    fn covering(&self, sources: &BTreeSet<Source>, local: bool) -> Result<Vec<Composed>, String> {
+        let convoys = self.convoys()?;
+        let mut listing = ConvoyListing::default();
+        for source in sources {
+            listing.extend(match source {
+                Source::Named(name) => convoys.named(name, None)?,
+                Source::OpenIn(project) => convoys.open_in(project)?,
+                Source::Launches(project, of) => convoys.launches_of(of, project)?,
+            });
+        }
+        // A launch two sources name is composed once.
+        let mut seen = BTreeSet::new();
+        listing.records.retain(|record| seen.insert((record.name.clone(), record.home.clone())));
+        let mut seen = BTreeSet::new();
+        listing.unreadable.retain(|launch| seen.insert((launch.name.clone(), launch.home.clone())));
+        let here = convoys.home().to_owned();
+        if local {
+            listing.records.retain(|record| record.home == here);
+            listing.unreadable.retain(|launch| launch.home == here);
+        }
+        compose_listing(self.reads.as_ref(), &self.namespace, listing)
+    }
+
     fn every(&self) -> Result<Vec<Composed>, String> {
         let convoys = self.convoys()?;
         let listing = convoys.every()?;
@@ -225,6 +250,157 @@ fn least(throughs: impl IntoIterator<Item = BTreeMap<String, u64>>) -> BTreeMap<
     least
 }
 
+/// What a launch read for a cover is read through.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Source {
+    /// Every home's launch of the name.
+    Named(String),
+    /// Every home's open launch in the project, through the `open_by_project` index.
+    OpenIn(String),
+    /// Every home's launch of a name in a project that has not retired, through the `by_launch`
+    /// index.
+    Launches(String, String),
+}
+
+/// What one part of a cover selects, as the launches it may select are read.
+#[derive(Clone, Debug)]
+enum Term {
+    /// The launches these name, each a name or a project's launches: a project's are read only
+    /// when another part keeps the open ones alone.
+    Sources(Vec<Part>),
+    /// Only launches that have not ended: a live phase, or none yet.
+    Live,
+    /// Something no read here selects by.
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+enum Part {
+    Named(String),
+    /// Every launch in the project, ended or not: no index reads these.
+    Project(String),
+    /// The project's open launches.
+    OpenIn(String),
+    /// Every launch of the name, in a project another part names.
+    LaunchOf(String),
+    /// The launches of a name in a project.
+    Launches(String, String),
+}
+
+/// The index keys of the project and launch-of labels, as the store's query index names them.
+static PROJECT_KEY: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("label:{}", flotilla_resources::labels::PROJECT_LABEL));
+static LAUNCH_OF_KEY: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("label:{}", flotilla_resources::labels::LAUNCH_OF_LABEL));
+
+/// The phases of a launch that has not ended.
+const LIVE_PHASES: [&str; 5] = ["Pending", "Active", "Interrupted", "Landing", "Anchored"];
+
+/// The launches `cover` may select, as reads by key and of projects' open launches; `None` when
+/// it selects by anything else, or by a project with no part keeping the open launches alone.
+fn sources_of(cover: &IndexCover) -> Option<BTreeSet<Source>> {
+    match term(cover) {
+        Term::Sources(parts) => parts
+            .into_iter()
+            .map(|part| match part {
+                Part::Named(name) => Some(Source::Named(name)),
+                Part::OpenIn(project) => Some(Source::OpenIn(project)),
+                Part::Launches(project, of) => Some(Source::Launches(project, of)),
+                Part::Project(_) | Part::LaunchOf(_) => None,
+            })
+            .collect(),
+        Term::Live | Term::Unknown => None,
+    }
+}
+
+fn term(cover: &IndexCover) -> Term {
+    match cover {
+        IndexCover::AnyKey(keys) => {
+            let part = |(key, value): &(String, String)| match key.as_str() {
+                "field:metadata.name" => Some(Some(Part::Named(value.clone()))),
+                "field:spec.project_ref" => Some(Some(Part::Project(value.clone()))),
+                key if key == PROJECT_KEY.as_str() => Some(Some(Part::Project(value.clone()))),
+                key if key == LAUNCH_OF_KEY.as_str() => Some(Some(Part::LaunchOf(value.clone()))),
+                "field:status.phase" if LIVE_PHASES.contains(&value.as_str()) => Some(None),
+                "missing:status.phase" => Some(None),
+                _ => None,
+            };
+            let parts: Option<Vec<Option<Part>>> = keys.iter().map(part).collect();
+            match parts {
+                Some(parts) if !parts.is_empty() && parts.iter().all(Option::is_some) => {
+                    Term::Sources(parts.into_iter().flatten().collect())
+                }
+                Some(parts) if !parts.is_empty() && parts.iter().all(Option::is_none) => Term::Live,
+                _ => Term::Unknown,
+            }
+        }
+        IndexCover::All(parts) => {
+            let terms: Vec<Term> = parts.iter().map(term).collect();
+            let live = terms.iter().any(|term| matches!(term, Term::Live));
+            // One project and one name it is a launch of: the launch index reads them.
+            let single = |pick: fn(&Part) -> Option<&String>| {
+                let values: BTreeSet<&String> = terms
+                    .iter()
+                    .filter_map(|term| match term {
+                        Term::Sources(parts) if parts.len() == 1 => pick(&parts[0]),
+                        _ => None,
+                    })
+                    .collect();
+                (values.len() == 1).then(|| values.into_iter().next().cloned()).flatten()
+            };
+            let project = single(|part| match part {
+                Part::Project(project) => Some(project),
+                _ => None,
+            });
+            let launch_of = single(|part| match part {
+                Part::LaunchOf(of) => Some(of),
+                _ => None,
+            });
+            if let (Some(project), Some(of)) = (project, launch_of) {
+                return Term::Sources(vec![Part::Launches(project, of)]);
+            }
+            // Any part's sources hold every launch all parts select; with a part keeping the open
+            // launches alone, a project's are its open ones. A part naming launches drives first.
+            let mut drivers: Vec<Vec<Part>> = terms
+                .into_iter()
+                .filter_map(|term| match term {
+                    Term::Sources(parts) => Some(parts),
+                    _ => None,
+                })
+                .collect();
+            drivers.sort_by_key(|parts| parts.iter().filter(|part| matches!(part, Part::Project(_) | Part::LaunchOf(_))).count());
+            match drivers.into_iter().next() {
+                Some(parts) if live => Term::Sources(parts.into_iter().map(open).collect()),
+                Some(parts) => Term::Sources(parts),
+                None if live => Term::Live,
+                None => Term::Unknown,
+            }
+        }
+        IndexCover::Any(parts) => {
+            let terms: Vec<Term> = parts.iter().map(term).collect();
+            if !terms.is_empty() && terms.iter().all(|term| matches!(term, Term::Live)) {
+                return Term::Live;
+            }
+            let mut union = Vec::new();
+            for term in terms {
+                match term {
+                    Term::Sources(parts) => union.extend(parts),
+                    Term::Live | Term::Unknown => return Term::Unknown,
+                }
+            }
+            Term::Sources(union)
+        }
+    }
+}
+
+/// A project's launches as its open ones, where another part keeps the open launches alone.
+fn open(part: Part) -> Part {
+    match part {
+        Part::Project(project) => Part::OpenIn(project),
+        part => part,
+    }
+}
+
 impl std::fmt::Debug for ConvoyViews {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("ConvoyViews").field("namespace", &self.namespace).finish_non_exhaustive()
@@ -328,6 +504,14 @@ impl KindRecords<Convoy> for ConvoyViews {
     /// The launches of the name a listing holds: never a retired one.
     async fn sources_named(&self, name: &str) -> Result<Vec<Record<Convoy>>, String> {
         self.copies_of(name, false).await
+    }
+
+    /// The launches `cover` selects, where it selects by name or by the projects whose live
+    /// launches it reads: those are read by key and through the `open_by_project` index, and only
+    /// they are composed. `None` for any other cover, which a reader answers from every launch.
+    async fn covered(&self, cover: &IndexCover, local: bool) -> Option<Result<Vec<Record<Convoy>>, String>> {
+        let sources = sources_of(cover)?;
+        Some(self.blocking(move |views| views.covering(&sources, local)).await.map(|composed| composed.into_iter().map(record).collect()))
     }
 
     async fn positioned(&self) -> Result<(Vec<Record<Convoy>>, LogPosition), String> {
