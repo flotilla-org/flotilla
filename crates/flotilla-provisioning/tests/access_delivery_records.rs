@@ -142,3 +142,38 @@ async fn the_engine_keeps_the_access_delivery_contract() {
     writes_through_another_namespace_are_refused(&backend).await;
     assert!(backend.store().list_raw(flotilla_store::ResourceKind::of::<AccessDelivery>(), NS).await.expect("old rows").items.is_empty());
 }
+
+// #4415: the access layer writes its deliveries through the plain kind's log, and the engine
+// controller reads the ones homed here as realised lifecycles: a release removes one, again a
+// no-op, and a write from a stale version is refused.
+#[test]
+fn the_controller_reads_this_homes_deliveries_as_realised_and_a_release_removes_one() {
+    use flotilla_provisioning::engine::{access_deliveries::AccessDeliveries, controller::ControlledRecords, Step};
+    use flotilla_state_machines::machines::lifecycle::LifecycleState;
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let service =
+        Service::open(&directory.path().join("decided.sqlite"), "alpha", flotilla_resources::access_delivery::registry().expect("kinds"))
+            .expect("store");
+    let deliveries = AccessDeliveries::new(service.store());
+    let controlled = deliveries.controlled();
+    let version = deliveries.write("access-a", None, &spec("demo-1", "/h"), Timestamp::ZERO).expect("created");
+    deliveries.write("access-b", None, &spec("demo-2", "/h"), Timestamp::ZERO).expect("created");
+    assert!(deliveries.write("access-a", None, &spec("demo-1", "/h"), Timestamp::ZERO).is_err(), "created once");
+
+    assert_eq!(controlled.live().expect("live"), ["access-a", "access-b"]);
+    let held = controlled.get("access-a").expect("read").expect("held");
+    assert_eq!((held.spec(), held.state()), (&spec("demo-1", "/h"), &LifecycleState::Realised { identity: "access-a".into() }));
+
+    let edited = deliveries.write("access-a", Some(version), &spec("demo-1", "/moved"), Timestamp::ZERO).expect("edited");
+    assert!(
+        deliveries.write("access-a", Some(version), &spec("demo-1", "/stale"), Timestamp::ZERO).is_err(),
+        "refused from a stale version"
+    );
+    assert_eq!(deliveries.get("access-a").expect("read").map(|held| (held.version, held.spec.home)), Some((edited, "/moved".into())));
+
+    controlled.step("access-a", &Step::Released, Timestamp::ZERO).expect("released");
+    assert_eq!(controlled.get("access-a").expect("read"), None, "removed");
+    controlled.step("access-a", &Step::Released, Timestamp::ZERO).expect("already gone");
+    assert_eq!(controlled.live().expect("live"), ["access-b"]);
+}

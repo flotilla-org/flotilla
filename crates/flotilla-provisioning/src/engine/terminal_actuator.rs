@@ -427,15 +427,15 @@ where
     fn holder(&self, read: &mut Read<'_>, _: &str, request: &TerminalSessionRequest) -> Result<Holding, StoreError> {
         let environment = &request.environment;
         if state_of::<EnvironmentKind>(read, &environment.name, &environment.home)?.is_none_or(|state| !state.live()) {
-            return Ok(Holding { ended: true, record: Some(environment.identity()) });
+            return Ok(Holding::followed(true, environment.identity()));
         }
         // A crew's vessel lease is homed here, and its sessions are requested only once the lease
         // exists (every vessel reconciled here is leased, placed or not): an absent lease has ended.
         let Some(vessel) = request.holder.as_ref().and_then(holder_vessel) else {
-            return Ok(Holding { ended: false, record: Some(environment.identity()) });
+            return Ok(Holding::followed(false, environment.identity()));
         };
         let ended = state_of::<VesselKind>(read, vessel, &self.home)?.is_none_or(|state| !state.live());
-        Ok(Holding { ended, record: Some(Identity { kind: VESSEL, name: vessel.to_owned(), home: self.home.clone() }) })
+        Ok(Holding::followed(ended, Identity { kind: VESSEL, name: vessel.to_owned(), home: self.home.clone() }))
     }
 
     fn usability(&self, read: &mut Read<'_>, request: &TerminalSessionRequest) -> Result<Vec<Usability>, StoreError> {

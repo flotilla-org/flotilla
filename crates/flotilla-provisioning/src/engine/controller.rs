@@ -37,6 +37,11 @@
 //! Who writes what: the holder's controller requests a resource (`Lifecycles::request`, or
 //! `replace_launch` for a successor launch); this controller writes every edge after that,
 //! including the predecessor's `Vanish` once it sees the successor requested.
+//!
+//! The controller reaches its kind through [`ControlledRecords`]: a lifecycle kind's home
+//! ([`Controller::start`]), or another kind's records read as lifecycles
+//! ([`Controller::over`]), such as a plain kind's ([`super::plain_controlled`]), whose every
+//! record is realised and whose release removes it.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -110,13 +115,14 @@ pub struct Usability {
     pub usable: bool,
 }
 
-/// A resource's holder as its controller reads it.
+/// A resource's holders as its controller reads them. A resource may be held by more than one,
+/// such as an access delivery by its place and by its convoy: it is released once any has ended.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Holding {
-    /// The holder has ended: the resource is released once nothing it serves is live.
+    /// A holder has ended: the resource is released once nothing it serves is live.
     pub ended: bool,
-    /// The holder's record, when it has one: its commits look at the resource again.
-    pub record: Option<Identity>,
+    /// Each holder's record: its commits look at the resource again.
+    pub records: Vec<Identity>,
 }
 
 impl Holding {
@@ -127,7 +133,12 @@ impl Holding {
 
     /// A holder whose end is judged from `ended` alone, followed through no record.
     pub fn ended(ended: bool) -> Holding {
-        Holding { ended, record: None }
+        Holding { ended, records: Vec::new() }
+    }
+
+    /// One holder, ended as `ended` says, followed through its `record`.
+    pub fn followed(ended: bool, record: Identity) -> Holding {
+        Holding { ended, records: vec![record] }
     }
 }
 
@@ -252,7 +263,7 @@ enum Done {
 #[derive(Clone)]
 struct Found {
     holder_ended: bool,
-    holder: Option<Identity>,
+    holders: Vec<Identity>,
     usability: Vec<Usability>,
     /// Whether everything it holds is requested; always for a kind that holds nothing.
     holdings_complete: bool,
@@ -312,9 +323,88 @@ async fn sleep(wait: Option<std::time::Duration>) {
     }
 }
 
+/// One resource as its controller reads it: its name, its request and its lifecycle state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Controlled<R> {
+    pub name: String,
+    pub request: R,
+    pub state: LifecycleState,
+}
+
+impl<R> Controlled<R> {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn spec(&self) -> &R {
+        &self.request
+    }
+
+    pub fn state(&self) -> &LifecycleState {
+        &self.state
+    }
+}
+
+/// The resources of one kind a controller is the single writer of at its home: what it reads of
+/// each, and the steps it writes. A lifecycle kind's home is one ([`Controller::start`]); a kind
+/// with no lifecycle of its own is hosted by reading its records as lifecycles
+/// ([`Controller::over`]).
+pub trait ControlledRecords<K: LifecycleKind>: Send + Sync {
+    /// The kind's code: commits of it at [`ControlledRecords::home`] touch its resources.
+    fn code(&self) -> KindCode;
+    /// The home the resources are homed at.
+    fn home(&self) -> &str;
+    /// The resource `name` homed here, if it is held.
+    fn get(&self, name: &str) -> Result<Option<Controlled<K::Request>>, String>;
+    /// The names of this home's live resources: the work set at the start and at a rescan.
+    fn live(&self) -> Result<Vec<String>, String>;
+    /// Applies `step` to `name`, as [`Lifecycles::step`] does.
+    fn step(&self, name: &str, step: &Step, at: Timestamp) -> Result<(), EngineError>;
+    /// Ends the predecessor of successor launch `name`, as [`Lifecycles::finish_launch_request`]
+    /// does; a kind whose resources are not launches has none.
+    fn finish_launch_request(&self, name: &str, at: Timestamp) -> Result<(), EngineError>;
+}
+
+/// A lifecycle kind's home as its controller's records.
+struct LifecycleRecords<K: LifecycleKind>(Arc<dyn Lifecycles<K>>);
+
+impl<K> ControlledRecords<K> for LifecycleRecords<K>
+where
+    K: LifecycleKind,
+    Resource<Lifecycle<K>>: flotilla_schema::Kind,
+{
+    fn code(&self) -> KindCode {
+        <Resource<Lifecycle<K>> as flotilla_schema::Kind>::CODE
+    }
+
+    fn home(&self) -> &str {
+        self.0.home()
+    }
+
+    fn get(&self, name: &str) -> Result<Option<Controlled<K::Request>>, String> {
+        Ok(self.0.get(name).map(|resource| Controlled {
+            name: resource.name().to_owned(),
+            request: resource.spec().clone(),
+            state: resource.state().clone(),
+        }))
+    }
+
+    fn live(&self) -> Result<Vec<String>, String> {
+        Ok(self.0.live().iter().map(|resource| resource.name().to_owned()).collect())
+    }
+
+    fn step(&self, name: &str, step: &Step, at: Timestamp) -> Result<(), EngineError> {
+        self.0.step(name, step, at).map(drop)
+    }
+
+    fn finish_launch_request(&self, name: &str, at: Timestamp) -> Result<(), EngineError> {
+        self.0.finish_launch_request(name, at)
+    }
+}
+
 /// Kind `K`'s controller at this home.
 pub struct Controller<K: LifecycleKind, A: Actuator<K>> {
-    lifecycles: Arc<dyn Lifecycles<K>>,
+    records: Arc<dyn ControlledRecords<K>>,
     actuator: Arc<A>,
     clock: Arc<dyn Clock>,
     watch: EngineWatch,
@@ -361,21 +451,34 @@ impl<K, A> Controller<K, A>
 where
     K: LifecycleKind,
     K::Request: Clone + Send + Sync + 'static,
-    Resource<Lifecycle<K>>: flotilla_schema::Kind,
     A: Actuator<K>,
 {
-    /// Follows kind `K` and the records the actuator names from now; [`Controller::run`] begins
-    /// with the start pass.
+    /// Follows lifecycle kind `K` and the records the actuator names from now; [`Controller::run`]
+    /// begins with the start pass.
     pub fn start(
         lifecycles: Arc<dyn Lifecycles<K>>,
         actuator: Arc<A>,
         clock: Arc<dyn Clock>,
         service: Arc<Service>,
+    ) -> Result<Self, StoreError>
+    where
+        Resource<Lifecycle<K>>: flotilla_schema::Kind,
+    {
+        Self::over(Arc::new(LifecycleRecords(lifecycles)), actuator, clock, service)
+    }
+
+    /// Follows the kind `records` holds and the records the actuator names from now, as
+    /// [`Controller::start`] does for a lifecycle kind's home.
+    pub fn over(
+        records: Arc<dyn ControlledRecords<K>>,
+        actuator: Arc<A>,
+        clock: Arc<dyn Clock>,
+        service: Arc<Service>,
     ) -> Result<Self, StoreError> {
-        let code = <Resource<Lifecycle<K>> as flotilla_schema::Kind>::CODE;
+        let code = records.code();
         let watch = EngineWatch::start(service, std::iter::once(code).chain(actuator.followed()))?;
         Ok(Self {
-            lifecycles,
+            records,
             actuator,
             clock,
             watch,
@@ -405,7 +508,14 @@ where
     /// what it now is, or saw what a failed attempt lacked arrive.
     pub async fn run_with<R: Into<Recheck> + Send>(mut self, mut backing: mpsc::Receiver<BackingEvent>, mut rechecks: mpsc::Receiver<R>) {
         let mut rechecking = true;
-        let start = self.lifecycles.live().iter().map(|resource| (resource.name().to_owned(), Trigger::Start)).collect();
+        let start = match self.records.live() {
+            Ok(live) => live.into_iter().map(|name| (name, Trigger::Start)).collect(),
+            // Each is looked at again at its next commit.
+            Err(error) => {
+                warn!(kind = K::NAME, %error, "the live resources could not be read at the start");
+                BTreeMap::new()
+            }
+        };
         self.evaluate(start).await;
         loop {
             let retry =
@@ -479,7 +589,7 @@ where
 
     /// The resources a pass's changes touch, and why.
     fn touched(&self, followed: Vec<Followed>) -> BTreeMap<String, Trigger> {
-        let home = self.lifecycles.home().to_owned();
+        let home = self.records.home().to_owned();
         let mut touched = BTreeMap::new();
         let mut touch = |name: &str, trigger: Trigger| {
             let held = touched.entry(name.to_owned()).or_insert(trigger);
@@ -496,11 +606,14 @@ where
                         touch(name, Trigger::Dependency);
                     }
                 }
-                Followed::Rescan(rescanned) if rescanned == home => {
-                    for resource in self.lifecycles.live() {
-                        touch(resource.name(), Trigger::Own);
+                Followed::Rescan(rescanned) if rescanned == home => match self.records.live() {
+                    Ok(live) => {
+                        for name in live {
+                            touch(&name, Trigger::Own);
+                        }
                     }
-                }
+                    Err(error) => warn!(kind = K::NAME, %error, "the live resources could not be read at a rescan"),
+                },
                 Followed::Rescan(rescanned) => {
                     for (_, names) in self.dependents.iter().filter(|(identity, _)| identity.home == rescanned) {
                         for name in names {
@@ -522,9 +635,11 @@ where
     async fn evaluate_touched(&mut self, touched: BTreeMap<String, Trigger>) {
         let mut held = Vec::new();
         for (name, trigger) in touched {
-            match self.lifecycles.get(&name).filter(|resource| resource.state().live()) {
-                Some(resource) => held.push((name, trigger, resource)),
-                None => self.forget(&name),
+            match self.records.get(&name) {
+                Ok(Some(resource)) if resource.state().live() => held.push((name, trigger, resource)),
+                Ok(_) => self.forget(&name),
+                // Read again at the next event touching it.
+                Err(error) => warn!(kind = K::NAME, name, %error, "controller read failed"),
             }
         }
         if held.is_empty() {
@@ -538,7 +653,7 @@ where
                 requests
                     .iter()
                     .map(|(name, request)| {
-                        let Holding { ended: holder_ended, record: holder } = actuator.holder(read, name, request)?;
+                        let Holding { ended: holder_ended, records: holders } = actuator.holder(read, name, request)?;
                         let (blockers, release_waits) = if holder_ended {
                             (actuator.release_blockers(read, name, request)?, actuator.release_waits(read, name, request)?)
                         } else {
@@ -546,7 +661,7 @@ where
                         };
                         Ok(Found {
                             holder_ended,
-                            holder,
+                            holders,
                             usability: actuator.usability(read, request)?,
                             holdings_complete: true,
                             blockers,
@@ -607,10 +722,10 @@ where
 
     /// A successor launch `name` is requested: its predecessor, if still realised, is gone.
     async fn end_predecessor(&self, name: &str) {
-        let lifecycles = Arc::clone(&self.lifecycles);
+        let records = Arc::clone(&self.records);
         let owned = name.to_owned();
         let at = Timestamp::from_datetime(&self.clock.now());
-        let written = tokio::task::spawn_blocking(carry(move || lifecycles.finish_launch_request(&owned, at)))
+        let written = tokio::task::spawn_blocking(carry(move || records.finish_launch_request(&owned, at)))
             .await
             .unwrap_or_else(|error| Err(EngineError::Failed(format!("lifecycle write did not finish: {error}"))));
         if let Err(error) = written {
@@ -689,7 +804,14 @@ where
     /// resource's backing gone or broken after its holder ended: its release owns the ending, so
     /// the finding ends nothing and the release is tried again.
     async fn finish(&mut self, name: &str, done: Done) -> bool {
-        let Some(resource) = self.lifecycles.get(name) else { return false };
+        let resource = match self.records.get(name) {
+            Ok(Some(resource)) => resource,
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(kind = K::NAME, name, %error, "controller read failed; what the flight found is not recorded");
+                return false;
+            }
+        };
         let state = resource.state().clone();
         let mut left_to_release = false;
         // A new try ran: what it found decides any later one.
@@ -804,7 +926,9 @@ where
     /// as a realised resource's failed release, is never retried on time.
     fn schedule(&mut self, name: &str, retry_at: Option<Timestamp>) {
         let Some(retry_at) = retry_at else { return };
-        if let Some(Judgement::Retrying { next, .. }) = self.lifecycles.get(name).map(|resource| judge::<K>(resource.state())) {
+        if let Ok(Some(Judgement::Retrying { next, .. })) =
+            self.records.get(name).map(|resource| resource.map(|resource| judge::<K>(resource.state())))
+        {
             self.retries.insert(name.to_owned(), retry_at.max(next));
         }
     }
@@ -812,10 +936,10 @@ where
     /// Applies `step` to `name` on a blocking thread: the home's write takes the store's lock.
     /// The engine's refusal, if it did not take the step; it is logged here.
     async fn write(&self, name: &str, step: Step) -> Option<EngineError> {
-        let lifecycles = Arc::clone(&self.lifecycles);
+        let records = Arc::clone(&self.records);
         let owned = name.to_owned();
         let at = Timestamp::from_datetime(&self.clock.now());
-        let written = tokio::task::spawn_blocking(carry(move || lifecycles.step(&owned, &step, at).map(|_| ())))
+        let written = tokio::task::spawn_blocking(carry(move || records.step(&owned, &step, at)))
             .await
             .unwrap_or_else(|error| Err(EngineError::Failed(format!("lifecycle write did not finish: {error}"))));
         let error = written.err()?;
@@ -828,7 +952,7 @@ where
         depends.extend(found.usability.iter().map(|usability| usability.fact.clone()));
         depends.extend(found.blockers.iter().cloned());
         depends.extend(found.release_waits.iter().cloned());
-        depends.extend(found.holder.iter().cloned());
+        depends.extend(found.holders.iter().cloned());
         if self.depends.get(name) == Some(&depends) {
             return;
         }
