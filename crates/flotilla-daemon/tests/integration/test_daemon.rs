@@ -603,17 +603,14 @@ fn delivery(convoy: &str, work: &str, place: &str) -> AccessDeliverySpec {
     }
 }
 
-/// `convoy`'s coder's Realised environment, and the work its vessel does.
+/// `convoy`'s coder's Realised environment, and the work whose crew the coder is, as the
+/// convoy's admitted workflow records it.
 async fn coder_environment(daemon: &TestDaemon, convoy: &str) -> (String, String) {
     let ready = daemon.wait_row("a Realised environment", "environment", "", of_convoy(convoy, "Realised")).await;
     let place = text(&ready, "resource.name").to_owned();
-    // `env-<convoy>-<work>-<n>`.
-    let launch_of = flotilla_resources::convoy::launch_of(convoy);
-    let work = place
-        .strip_prefix(&format!("env-{launch_of}-"))
-        .and_then(|rest| rest.rsplit_once('-'))
-        .map(|(work, _)| work.to_owned())
-        .expect("the environment names its work");
+    let admitted = daemon.get::<Convoy>(convoy).await.expect("the convoy").status.expect("status").workflow_snapshot.expect("workflow");
+    let work =
+        admitted.vessels.into_iter().find(|work| work.crew.iter().any(|crew| crew.role == "coder")).expect("a work with a coder").name;
     (place, work)
 }
 

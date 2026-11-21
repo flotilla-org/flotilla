@@ -764,3 +764,62 @@ async fn a_failure_whose_giving_up_was_not_written_gives_up_at_start_without_try
         .await;
     assert!(world.actuator.script().realised.is_empty(), "the provider is not tried again");
 }
+
+/// The environments' records, whose live set cannot be read the first `failing` times.
+struct UnreadableAtFirst {
+    records: super::LifecycleRecords<EnvironmentKind>,
+    failing: Mutex<u32>,
+}
+
+impl super::ControlledRecords<EnvironmentKind> for UnreadableAtFirst {
+    fn code(&self) -> KindCode {
+        self.records.code()
+    }
+
+    fn home(&self) -> &str {
+        self.records.home()
+    }
+
+    fn get(&self, name: &str) -> Result<Option<super::Controlled<EnvironmentRequest>>, String> {
+        self.records.get(name)
+    }
+
+    fn live(&self) -> Result<Vec<String>, String> {
+        let mut failing = self.failing.lock().expect("failing");
+        if *failing > 0 {
+            *failing -= 1;
+            return Err("the store is busy".into());
+        }
+        self.records.live()
+    }
+
+    fn step(&self, name: &str, step: &Step, at: Timestamp) -> Result<(), crate::engine::EngineError> {
+        self.records.step(name, step, at)
+    }
+
+    fn finish_launch_request(&self, name: &str, at: Timestamp) -> Result<(), crate::engine::EngineError> {
+        self.records.finish_launch_request(name, at)
+    }
+}
+
+// A start set that cannot be read is read again on the clock: a resource whose holder ended
+// while the controller was away is still released, with no commit to wake it.
+#[tokio::test]
+async fn an_unreadable_start_set_is_read_again() {
+    let mut world = World::open();
+    world.record("holder-a");
+    world.request("a");
+    world.environments.step("a", &Step::Realised { identity: "id-a".into() }, World::now()).expect("realised before");
+    world.record_step("holder-a", Step::Released);
+    let records = UnreadableAtFirst {
+        records: super::LifecycleRecords(Arc::clone(&world.environments) as Arc<dyn Lifecycles<EnvironmentKind>>),
+        failing: Mutex::new(2),
+    };
+    let controller = Controller::over(Arc::new(records), Arc::clone(&world.actuator), Arc::new(SystemClock), Arc::clone(&world.service))
+        .expect("controller");
+    let (sender, receiver) = mpsc::channel(8);
+    world.backing = Some(sender);
+    tokio::spawn(controller.run(receiver));
+    world.until("a released once its start set was read", |world| world.state("a").gone()).await;
+    assert_eq!(world.actuator.script().released, [("a".to_owned(), Some("id-a".to_owned()))]);
+}
