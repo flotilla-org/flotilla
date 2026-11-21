@@ -887,11 +887,7 @@ impl KindRecords<TerminalSession> for TerminalViews {
         let record = self
             .blocking(move |reads| {
                 let Some(record) = reads.terminals()?.get(&owned, None)? else { return Ok(None) };
-                let evicted = record.ended()
-                    && matches!(
-                        reads.joins().and_then(|joins| joins.read(reads, |joins| joins.terminal(&record.name, &record.home).is_none())),
-                        Ok(true)
-                    );
+                let evicted = record.ended() && reads.joins()?.read(reads, |joins| joins.terminal(&record.name, &record.home).is_none())?;
                 Ok(Some((record, evicted)))
             })
             .instrument(info_span!("terminal_views.record"));

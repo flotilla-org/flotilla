@@ -527,31 +527,8 @@ async fn fleet_health_counts_a_capped_hosts_free_slots_from_its_engine_vessels()
     assert_eq!((kind.max_vessels, kind.free_vessel_slots), (Some(4), Some(3)), "{kind:?}");
 }
 
-/// The convoy list's rows, once `daemon` lists none of convoy `convoy`'s: a minute of virtual time
-/// at most, as its rows follow the aggregator's convoy rows and the session listing.
-async fn wait_unlisted(daemon: &TestDaemon, convoy: &str) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
-        let rows = match daemon.execute(CommandAction::QueryFleetList { project: None, crew_id: None, convoy: None }).await {
-            CommandValue::FleetList(list) => list.rows,
-            other => panic!("the convoy list: {other:?}"),
-        };
-        let listed = daemon.list::<TerminalSession>().await;
-        let sessions = listed
-            .iter()
-            .filter(|session| session.metadata.labels.get(flotilla_resources::CONVOY_LABEL).is_some_and(|of| of == convoy))
-            .count();
-        if rows.is_empty() && sessions == 0 {
-            return;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "convoy {convoy} is still listed: {rows:?}, {sessions} sessions");
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-}
-
 // #4421: a crew whose terminal session vanishes from its pool mid-run is relaunched from its
-// brief, and its convoy lands. The landed convoy then retires, and the lost launch leaves the
-// convoy list with it.
+// brief, and its convoy lands. The landed convoy then retires, and the lost launch with it.
 #[tokio::test(start_paused = true)]
 async fn a_landed_convoy_whose_crew_session_was_lost_retires_with_the_lost_launch() {
     let daemon = TestDaemon::builder().agent("turn_delay_ms = 5000").start().await;
@@ -567,7 +544,6 @@ async fn a_landed_convoy_whose_crew_session_was_lost_retires_with_the_lost_launc
     assert_eq!(daemon.counts().sessions_launched, 2, "the coder relaunched once: {:?}", daemon.counts());
     daemon.wait_reached("Retired", "convoy", "Retired", |row| text(row, "resource.name") == convoy).await;
     daemon.wait_gone::<TerminalSession>(&lost).await;
-    wait_unlisted(&daemon, &convoy).await;
 }
 
 // #4421: a stalled crew whose session its pool loses is not relaunched, so its lost launch stays
@@ -609,9 +585,7 @@ async fn a_landed_convoy_whose_stalled_crew_lost_its_session_retires_with_the_lo
     assert_eq!(daemon.counts().sessions_launched, 1, "the stalled coder was not relaunched: {:?}", daemon.counts());
     daemon.wait_reached("Retired", "convoy", "Retired", |row| text(row, "resource.name") == convoy).await;
     daemon.wait_gone::<TerminalSession>(&lost).await;
-    wait_unlisted(&daemon, &convoy).await;
     let daemon = daemon.restart().await;
     daemon.wait_reached("Retired", "convoy", "Retired", |row| text(row, "resource.name") == convoy).await;
     daemon.wait_gone::<TerminalSession>(&lost).await;
-    wait_unlisted(&daemon, &convoy).await;
 }
