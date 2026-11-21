@@ -15,12 +15,11 @@ use flotilla_resources::{
     address::{artifact_address, record_name, stored_change_request_address},
     artifact::blob_digest_of,
     convoy::engine::{Actor, EngineConvoyPath, EngineConvoys, OldPromises, VerdictScope},
-    engine_records::{KindRecords, LogPosition, Record, Since},
     host_records::{HostFacts, HostRecords},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
     Artifact, ArtifactSpec, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Convoy, ConvoyPhase,
-    ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Forge, InputMeta, Observation,
-    ObservedChangeRequestState, ResourceObject, VesselRequirement, WorkflowSnapshot,
+    ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, Observation, ObservedChangeRequestState,
+    ResourceObject, VesselRequirement, WorkflowSnapshot,
 };
 use flotilla_store::{
     controller::Reconciler,
@@ -1167,65 +1166,30 @@ async fn an_opening_wake_queues_the_convoys_already_reading_its_kind() {
     assert_eq!(reads.calls_by_kind().get("Convoy").copied().unwrap_or_default(), 0, "{reads}");
 }
 
-/// The Forges the engine serves, or a refusal to list them while `failing`.
+/// The Forge port with no forge declared, or a refusal to read any while `failing`.
 #[derive(Debug, Default)]
 struct Forges {
     failing: std::sync::atomic::AtomicBool,
 }
 
-#[async_trait]
-impl KindRecords<Forge> for Forges {
-    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
-        Vec::new()
-    }
-    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
-        flotilla_resources::engine_records::Ticks::AtCommit
-    }
-    fn home(&self) -> String {
-        "kiwi".into()
-    }
-    async fn get(&self, _: &str) -> Result<Option<Record<Forge>>, String> {
-        self.list().await.map(|_| None)
-    }
-    async fn list(&self) -> Result<Vec<Record<Forge>>, String> {
-        self.sources().await
-    }
-    async fn sources(&self) -> Result<Vec<Record<Forge>>, String> {
+impl Forges {
+    fn read(&self) -> Result<(), String> {
         if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("the forges are unreadable".into());
         }
-        Ok(Vec::new())
+        Ok(())
     }
-    async fn positioned(&self) -> Result<(Vec<Record<Forge>>, LogPosition), String> {
-        Ok((self.sources().await?, LogPosition::default()))
+}
+
+#[async_trait]
+impl flotilla_resources::forge_records::ForgeRecords for Forges {
+    async fn forge(&self, _: &str) -> Result<Option<flotilla_resources::ForgeSpec>, String> {
+        self.read().map(|()| None)
     }
-    async fn position(&self) -> Result<LogPosition, String> {
-        Ok(LogPosition::default())
+    async fn at_service_url(&self, _: &str) -> Result<Option<flotilla_resources::ForgeSpec>, String> {
+        self.read().map(|()| None)
     }
-    async fn changed_since(&self, _: &LogPosition) -> Result<Since, String> {
-        self.sources().await?;
-        Ok(Since::Changed { names: Default::default(), through: LogPosition::default() })
-    }
-    async fn copies(&self, _: &str) -> Result<Vec<Record<Forge>>, String> {
-        self.sources().await
-    }
-    async fn apply(
-        &self,
-        _: &str,
-        _: Option<u64>,
-        _: &BTreeMap<String, String>,
-        _: &BTreeMap<String, String>,
-        _: &flotilla_resources::ForgeSpec,
-    ) -> Result<Record<Forge>, flotilla_resources::engine_records::WriteError> {
-        Err("read only".to_owned().into())
-    }
-    async fn set_status(&self, _: &str, _: u64, _: &()) -> Result<Record<Forge>, flotilla_resources::engine_records::WriteError> {
-        Err(String::from("read only").into())
-    }
-    async fn delete(&self, _: &str) -> Result<(), String> {
-        Err("read only".into())
-    }
-    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
+    async fn changes(&self) -> Result<futures::stream::BoxStream<'_, Result<flotilla_resources::ForgeSpec, String>>, String> {
         Ok(futures::StreamExt::boxed(futures::stream::pending()))
     }
 }
@@ -1239,14 +1203,13 @@ async fn a_convoy_failing_before_its_first_note_is_woken_by_any_change_request()
     use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let forges = Arc::new(Forges { failing: true.into() });
-    backend.install_engine_kind::<Forge>(Arc::clone(&forges) as Arc<dyn KindRecords<Forge>>);
     let mut convoy = ledger_convoy(&backend).await;
     convoy.status.as_mut().expect("status").promises.clear();
     submit_pr(&mut convoy, 1);
     let engine = Arc::new(Recording { holds: true, ..Default::default() });
     let reconciler = reconciler(&backend, Arc::clone(&engine))
         .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180))
-        .with_forges(backend.definitions::<flotilla_resources::Forge>(NAMESPACE));
+        .with_forges(Arc::clone(&forges) as Arc<dyn flotilla_resources::forge_records::ForgeRecords>);
 
     // A probe convoy reads change requests, written until the wake has started and heard one.
     engine.memory.note_evidence("probe", "ChangeRequest", (10_000..10_500).map(change_request_name).collect());

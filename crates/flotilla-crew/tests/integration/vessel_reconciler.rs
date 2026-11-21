@@ -174,9 +174,14 @@ impl TestVessels<'_> {
 /// The planner under test, reading the engine's records from `engine`.
 fn test_vessel_reconciler<'a>(backend: ResourceBackend, namespace: &str, engine: &'a EngineFixture) -> TestVessels<'a> {
     let planning = Arc::new(
-        VesselPlanning::new(backend.clone(), namespace, Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone())))
-            .with_worktree_metadata(Arc::new(TestWorktreeMetadata(engine.reads())))
-            .with_lifecycle_reads(engine.reads()),
+        VesselPlanning::new(
+            backend.clone(),
+            namespace,
+            Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone())),
+            flotilla_provisioning_testkit::serve_repositories(&backend, namespace),
+        )
+        .with_worktree_metadata(Arc::new(TestWorktreeMetadata(engine.reads())))
+        .with_lifecycle_reads(engine.reads()),
     );
     TestVessels { planning, engine }
 }
@@ -2519,11 +2524,16 @@ async fn a_vessel_reaches_ready_from_wakes_alone(#[case] remote: bool) {
     let accounts: Arc<dyn flotilla_resources::account_access::AccountRecords> =
         Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone()));
     let planning = Arc::new(
-        VesselPlanning::new(backend.clone(), NAMESPACE, Arc::clone(&accounts))
-            .with_worktree_metadata(Arc::new(TestWorktreeMetadata(lease_engine.reads())))
-            .with_lifecycle_reads(lease_engine.reads())
-            // A convoy homed elsewhere is read from its replica, as the runtime's planner reads it.
-            .with_federated_dependencies(&backend, CanonicalHostId::resolved(HOST_REF)),
+        VesselPlanning::new(
+            backend.clone(),
+            NAMESPACE,
+            Arc::clone(&accounts),
+            flotilla_provisioning_testkit::serve_repositories(&backend, NAMESPACE),
+        )
+        .with_worktree_metadata(Arc::new(TestWorktreeMetadata(lease_engine.reads())))
+        .with_lifecycle_reads(lease_engine.reads())
+        // A convoy homed elsewhere is read from its replica, as the runtime's planner reads it.
+        .with_federated_dependencies(&backend, CanonicalHostId::resolved(HOST_REF)),
     );
     let wake = flotilla_crew::reconcilers::vessel::ConvoyVesselWake::new(
         &backend,

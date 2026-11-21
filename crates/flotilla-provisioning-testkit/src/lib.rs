@@ -184,3 +184,26 @@ pub fn image_build_spec() -> flotilla_resources::ImageBuildSpec {
         .reservation(ImageBuildReservation { cpu: 1, disk_bytes: 1 })
         .build()
 }
+
+/// Serves Repository on `backend` from the engine, as a daemon does, and returns that port: the
+/// planners' reads and the test's writes through `backend` reach the same records. The decided
+/// store lives in a temporary directory left to the operating system.
+pub fn serve_repositories(
+    backend: &flotilla_store::ResourceBackend,
+    namespace: &str,
+) -> Arc<flotilla_provisioning::engine::repositories::EngineRepositories> {
+    let dir = tempfile::TempDir::new().expect("decided store directory");
+    let registry = flotilla_provisioning::stored::decided_registry().expect("decided registry");
+    let home = backend.local_root().map(|root| root.to_string()).unwrap_or_else(|_| "test".to_owned());
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(&dir.path().join("decided.sqlite"), &home, registry).expect("decided store"),
+    );
+    std::mem::forget(dir);
+    let repositories = Arc::new(
+        flotilla_provisioning::engine::repositories::EngineRepositories::open(service, Arc::new(flotilla_resources::SystemClock))
+            .expect("repositories"),
+    );
+    backend.serve_engine_in(namespace);
+    backend.install_engine_records(Arc::clone(&repositories));
+    repositories
+}

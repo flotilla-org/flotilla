@@ -761,6 +761,9 @@ impl MessagePrimitives {
                 records.repositories.insert(name.clone(), repository);
             }
         }
+        // Left as a whole-kind read (#4414): a spelling asks it (`repository_at`, an address with no
+        // key to it), which is address resolution, not a delivery read. It belongs on the generic
+        // read surface (#4412 E), a query by address, and moves there rather than getting a port.
         if asked.every_repository {
             let backend = self.backend().map_err(ResourceError::other)?;
             for repository in backend.including_replicas::<Repository>(&namespace).list().await?.items {

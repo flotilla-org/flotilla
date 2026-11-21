@@ -761,6 +761,8 @@ pub struct InProcessDaemon {
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     /// The Host records, the planners' Host port (#4413): the engine's.
     hosts: Arc<flotilla_provisioning::engine::hosts::EngineHosts>,
+    forges: Arc<dyn flotilla_resources::forge_records::ForgeRecords>,
+    repositories: Arc<dyn flotilla_resources::repository_records::RepositoryRecords>,
     manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
     standing_roles: Arc<dyn flotilla_resources::standing_roles::StandingRoles>,
     /// The forge observers, which write only what they observe once the engine's observation records are installed.
@@ -883,6 +885,8 @@ pub struct ComposedEngine {
     /// the daemon installs its judgement once composed.
     pub source_observers: Arc<flotilla_resources::engine_records::LateSourceObservers>,
     pub accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
+    pub forges: Arc<dyn flotilla_resources::forge_records::ForgeRecords>,
+    pub repositories: Arc<dyn flotilla_resources::repository_records::RepositoryRecords>,
     pub manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
     pub standing_roles: Arc<dyn flotilla_resources::standing_roles::StandingRoles>,
     /// Host, which the planners read through its port alone (#4413).
@@ -1436,6 +1440,8 @@ impl InProcessDaemon {
         let admission_free_space_path = Arc::new(std::sync::RwLock::new(admission_free_space_path));
         let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
         let accounts = Arc::clone(&engine.accounts);
+        let forges = Arc::clone(&engine.forges);
+        let repositories = Arc::clone(&engine.repositories);
         let manifest_roots = Arc::clone(&engine.manifest_roots);
         let standing_roles = Arc::clone(&engine.standing_roles);
         let crew = Arc::new(
@@ -1551,6 +1557,8 @@ impl InProcessDaemon {
             change_stream_rounds: Default::default(),
             lifecycle_reads: Arc::clone(&lifecycle_reads),
             accounts,
+            forges,
+            repositories,
             manifest_roots,
             standing_roles,
             hosts,
@@ -2422,6 +2430,16 @@ impl InProcessDaemon {
     /// The Host port the planners read (#4413): the engine's Host records.
     pub fn host_records(&self) -> Arc<dyn flotilla_resources::host_records::HostRecords> {
         self.hosts.clone()
+    }
+
+    /// The Forge port: keyed and indexed reads of the declared forges, with no listing.
+    pub fn forge_records(&self) -> Arc<dyn flotilla_resources::forge_records::ForgeRecords> {
+        self.forges.clone()
+    }
+
+    /// The Repository port: keyed and indexed reads, with no listing.
+    pub fn repository_records(&self) -> Arc<dyn flotilla_resources::repository_records::RepositoryRecords> {
+        self.repositories.clone()
     }
 
     /// The account kinds' records: the engine's.
