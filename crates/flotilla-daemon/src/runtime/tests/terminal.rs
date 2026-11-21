@@ -13,7 +13,7 @@ fn missing_tool_session_is_stopped_but_a_dead_generation_is_lost() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
     let home = EngineHome::open_in("host", NAMESPACE);
     let backend = home.backend().clone();
@@ -65,7 +65,7 @@ async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
     assert_eq!(fulfilment_grants_for_terminal(&backend, &context).await, Some(restricted));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn contained_terminal_session_never_falls_back_from_the_requested_interior_pool() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -120,13 +120,13 @@ async fn contained_terminal_session_never_falls_back_from_the_requested_interior
     assert_eq!(error, "terminal pool cleat unavailable for environment contained-work");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn contained_claude_launch_uses_granted_invocation_environment_without_ambient_config() {
     assert_contained_claude_invocation_home(LaunchObservationRecord::Present).await;
 }
 
 // Advisory observation failures must not discard the inline card or prevent launch.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn contained_claude_launch_keeps_inline_card_without_session_observation() {
     assert_contained_claude_invocation_home(LaunchObservationRecord::Missing).await;
 }
@@ -134,7 +134,7 @@ async fn contained_claude_launch_keeps_inline_card_without_session_observation()
 // Capability context and endpoint reads are advisory: the assignment and delivered
 // credentials must still reach the harness when those reads fail. The convoy itself is
 // not advisory: its frozen crew is what vessel delivery delivers (#3964).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn contained_claude_launch_survives_capability_context_read_failures() {
     assert_contained_claude_invocation_home(LaunchObservationRecord::MissingEnvironment).await;
 }
@@ -233,7 +233,7 @@ async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtim
     assert!(!durable_checkout.join(".flotilla/briefs").exists(), "empty durable brief directory should be removed");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn terminal_teardown_kills_a_persisted_session_after_runtime_restart() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = temp.path().join("config");
@@ -280,7 +280,7 @@ async fn terminal_teardown_kills_a_persisted_session_after_runtime_restart() {
     assert!(!logs.text().contains("terminal session"), "routine teardown warned: {}", logs.text());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn codex_interactive_prompt_is_observed_as_needing_input() {
     use flotilla_state_machines::machines::agent_session::Activity;
     use std::os::unix::fs::PermissionsExt;
@@ -371,7 +371,7 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
     let reads = flotilla_core::in_process::DecidedAgentSessions::new(
         Arc::clone(&service),
         Arc::new(flotilla_resources::SystemClock),
-        Arc::new(flotilla_resources::agent_activity::ProgressFacts::new(chrono::Utc::now())),
+        Arc::new(flotilla_resources::agent_activity::ProgressFacts::new(flotilla_resources::clock::now())),
     );
     let crew_attention = |observation: &flotilla_provisioning::engine::terminal_actuator::ScreenReading| {
         use flotilla_resources::agent_activity::AgentSessionReads as _;
@@ -430,7 +430,7 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
         .expect("a failed crew never blocks another crew from the same central login");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = temp.path().join("config");
@@ -468,7 +468,7 @@ async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
 // Item 12: a convoy's end releases its checkout and its sessions together, so the checkout, and
 // the exit receipt inside it, can be removed before the session's release reaches the receipt.
 // Removing it then has nothing left to do; it is no error.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_exit_receipt_whose_checkout_is_already_removed_is_removed() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = temp.path().join("config");
@@ -512,7 +512,7 @@ async fn an_exit_receipt_whose_checkout_is_already_removed_is_removed() {
 // yet typed and waits, without blocking, while a typed one settles; the kill
 // leaves it reserved, so the engine delivery adapter still records its receipt.
 // A turn that never settles is aborted at the bound.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
     #[derive(Debug, Clone, Copy)]
     enum Turn {
@@ -556,7 +556,6 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
             .working_directory(ExecutionEnvironmentPath::new("/repo"))
             .build()])
             .await;
-        tokio::time::pause();
         let stop = tokio_util::sync::CancellationToken::new();
         let cancelled = stop.clone();
         // The adapter's turn: not yet typed until teardown cancels it,
@@ -602,7 +601,6 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
                 }
             }
         }
-        tokio::time::resume();
     }
 }
 
@@ -750,7 +748,7 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
 
 // #4173: Claude Code's shell is the session's declared one, else the bash its
 // PATH finds; a place without bash still launches, leaving the choice to Claude.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn claude_shell_is_declared_from_the_session_path() {
     use std::os::unix::fs::PermissionsExt;
     let runner = flotilla_provider_runtime::ProcessCommandRunner;

@@ -6,7 +6,7 @@ use flotilla_resources::clone_records::CloneRecords as _;
 
 // Behaviour (#3108): reconcile-now on a convoy queues its launch at the Convoy controller and
 // writes nothing; a launch this home does not hold is refused as not found.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reconcile_now_queues_the_launch_at_the_convoy_controller() {
     use flotilla_executor::executor_actions::ExecutorActionPort;
 
@@ -57,7 +57,7 @@ impl CloneRuntime for MissingRepositoryCloneRuntime {
 
 // Behaviour (#3108): a clone the Clone controller gives up on shows its cause in convoy explain,
 // on the checkout made from it, beside the convoy controller's own events.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn clone_controller_failure_is_visible_in_convoy_explain() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -196,7 +196,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn fleet_health_surfaces_an_expired_ambient_claude_login_without_any_crew_dispatched() {
     let temp = TempDir::new().expect("tempdir");
     let home = temp.path().join("home");
@@ -244,7 +244,7 @@ async fn fleet_health_surfaces_an_expired_ambient_claude_login_without_any_crew_
 
 // Fleet health consumes the persisted Host heartbeat. Exhaustion must be
 // visible through that public query, and recovery must remove the diagnosis.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn controller_exhaustion_alarm_is_visible_in_fleet_health() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"controller-exhaustion-health-test\"\n").expect("daemon config");
@@ -358,7 +358,7 @@ async fn an_overrunning_pass_is_reported_and_still_runs_to_completion() {
     assert_eq!(prompt, 7);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn convoy_ensure_timeout_degrades_runtime_health_until_recovery() {
     let runtime_health = RuntimeHealth::default();
     runtime_health.report_convoy_ensure_timeout(Duration::from_secs(60));
@@ -372,10 +372,10 @@ async fn convoy_ensure_timeout_degrades_runtime_health_until_recovery() {
     assert!(runtime_health.conditions().await.is_empty(), "a completed pass should restore fleet health");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn issue_budget_backoff_surfaces_a_nonblocking_host_condition() {
     let runtime_health = RuntimeHealth::default();
-    let reset = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let reset = (flotilla_resources::clock::now() + chrono::Duration::hours(1)).to_rfc3339();
     runtime_health.issue_polling.note(&format!("github rate limited (budget=REST search, identity=host gh login, reset_at={reset})"));
     assert!(runtime_health.conditions().await.is_empty(), "search has a separate rate limit");
     runtime_health
@@ -389,12 +389,12 @@ async fn issue_budget_backoff_surfaces_a_nonblocking_host_condition() {
     assert!(condition.message.contains(&reset));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn daemon_reports_recent_abnormal_restart_frequency_in_fleet_health() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"abnormal-restart-frequency-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
-    let now = Utc::now();
+    let now = flotilla_resources::clock::now();
     fs::write(
         config.state_dir().join("flotillad-abnormal-exits.json"),
         serde_json::to_vec(&json!({
@@ -436,7 +436,7 @@ async fn daemon_reports_recent_abnormal_restart_frequency_in_fleet_health() {
 
 // Losing an agent adapter blocks placement, while the same live daemon can
 // still observe forges and finish the work already admitted.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn capability_regression_keeps_live_forge_observer() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"capability-observer-test\"\n").expect("config");
@@ -453,7 +453,7 @@ async fn capability_regression_keeps_live_forge_observer() {
     let backend = daemon.resource_backend();
     let status = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("host").status.expect("status");
     assert!(!status.ready);
-    assert!(status.heartbeat_is_fresh(Utc::now()));
+    assert!(status.heartbeat_is_fresh(flotilla_resources::clock::now()));
     let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "test/repo".into() };
     assert_eq!(
         flotilla_observation::forge_observation::source_owner(&backend, NAMESPACE, &source).await.expect("live forge observer"),

@@ -17,7 +17,7 @@ async fn launch_standing(
     daemon.resource_backend().using::<Convoy>(NAMESPACE).get(&launch).await.expect("launched convoy")
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn standing_backing_inspection_accepts_durable_pre_provisioning_failure() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -39,7 +39,7 @@ async fn standing_backing_inspection_accepts_durable_pre_provisioning_failure() 
             phase: flotilla_resources::ConvoyPhase::Failed,
             provisioning: Some(ConvoyProvisioningState::NotStarted),
             message: Some("workflow validation failed".to_string()),
-            finished_at: Some(Utc::now()),
+            finished_at: Some(flotilla_resources::clock::now()),
             ..flotilla_engine_convoys_testkit::single_agent("coder")
         },
     )
@@ -57,7 +57,7 @@ async fn standing_backing_inspection_accepts_durable_pre_provisioning_failure() 
     state.verify_backing_dead(&convoy).await.expect("provisioning never started, so no backing can be live");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn standing_backing_inspection_accepts_local_absence_only_after_startup_observation() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -76,7 +76,7 @@ async fn standing_backing_inspection_accepts_local_absence_only_after_startup_ob
         &daemon,
         "quartermaster",
         flotilla_resources::ConvoyStatus {
-            provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
+            provisioning: Some(ConvoyProvisioningState::Started { started_at: flotilla_resources::clock::now() }),
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                 cascade: None,
                 vessels: vec![VesselRequirement::builder()
@@ -136,7 +136,7 @@ async fn standing_backing_inspection_accepts_local_absence_only_after_startup_ob
     assert!(state.verify_backing_dead(&remote).await.is_err(), "the local pass cannot prove absence on a remote host");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_phase() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -158,7 +158,7 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
             &daemon,
             name,
             flotilla_resources::ConvoyStatus {
-                provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
+                provisioning: Some(ConvoyProvisioningState::Started { started_at: flotilla_resources::clock::now() }),
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                     cascade: None,
                     vessels: vec![VesselRequirement::builder()
@@ -220,7 +220,7 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
     assert!(refusal.contains("no Docker container identity"), "unexpected refusal: {refusal}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing() {
     for (instance, extra_provider, succeeds) in
         [(None, false, true), (Some("docker"), true, true), (Some("absent"), false, false), (None, true, true)]
@@ -346,7 +346,7 @@ impl flotilla_environment::environment::EnvironmentProvider for ListingInterleav
 // d13: the periodic pass read the live environments, then listed the containers. An environment
 // whose teardown began between the two had no container and was judged lost. Only a container
 // gone while its environment is still wanted is a loss.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn teardown_begun_while_the_pass_lists_containers_is_not_a_loss() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -409,7 +409,7 @@ async fn teardown_begun_while_the_pass_lists_containers_is_not_a_loss() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn environment_readoption_marks_missing_container_lost() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -450,7 +450,7 @@ async fn environment_readoption_marks_missing_container_lost() {
     assert!(daemon.environment_registry_for_environment(&env_id).is_none());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_failed_environment_names_the_engine_checkouts_made_in_it() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -500,7 +500,7 @@ async fn a_failed_environment_names_the_engine_checkouts_made_in_it() {
     assert_eq!(reason, "no container identity; recover work from retained checkout(s): /hulls/kept");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn transient_environment_liveness_error_remains_ready_for_retry() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -538,7 +538,7 @@ async fn transient_environment_liveness_error_remains_ready_for_retry() {
     assert!(daemon.environment_registry_for_environment(&env_id).is_none());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn failed_environment_readoption_does_not_block_a_live_sibling() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -604,7 +604,7 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
 // #3765 S1/S6: cloud Unknown must not abort a sibling's loss detection.
 // The in-memory provider represents the remote API boundary; durable status
 // transitions run through the real runtime and resource backend.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cloud_unknown_does_not_abort_gone_sibling() {
     use flotilla_environment::environment::{GoneCause, ObservationState, ProviderObservation, UnknownReason};
     struct CloudHandle {
@@ -840,7 +840,7 @@ async fn cloud_scheduler_bounds_refills_and_cancels_without_starving_siblings() 
 
 // A restarted flotillad readopts a running Docker vessel and serves its agent forward
 // again, so the crews already aboard resume delivering hooks over HTTP.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn docker_readoption_restores_the_daemon_forward() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -896,7 +896,7 @@ async fn docker_readoption_restores_the_daemon_forward() {
 // before the vessel layer, and the backing this provision created is destroyed.
 // A cloud sandbox takes its provider's path even beside a Docker input, never
 // the Docker path, which would record it Ready as a local backing.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cloud_backing_without_a_descriptor_is_discarded() {
     let image = format!("example.test/crew@sha256:{}", "a".repeat(64));
     let docker = flotilla_resources::DockerEnvironmentSpec {

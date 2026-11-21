@@ -2,7 +2,7 @@ use super::*;
 
 // Glue: `reconcile-now clone` reads the engine's clone: a ready one is left alone, an ended one
 // starts its next launch, and a read failure is reported rather than guessed past.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn operator_reads_a_ready_clone_and_renews_an_ended_one() {
     use flotilla_core::in_process::OperatorReconciler;
     use flotilla_provisioning_testkit::{CloneFixture, Ending};

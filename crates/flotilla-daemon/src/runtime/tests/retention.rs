@@ -52,7 +52,7 @@ async fn deleted(artifacts: &TypedResolver<Artifact>, name: &str) {
 
 // Behaviour (#3108): retention wakes when the next unpinned artifact expires, with no timer and
 // no further change: an artifact due to expire soon is reaped at its expiry, a pinned one stays.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_artifact_is_reaped_at_its_expiry_without_a_timer() {
     let state = tempfile::tempdir().expect("state dir");
     let blobs = Arc::new(TieredBlobStore::new(state.path(), Vec::new()));
@@ -62,7 +62,8 @@ async fn an_artifact_is_reaped_at_its_expiry_without_a_timer() {
     let artifacts = backend.using::<Artifact>(NAMESPACE);
     let digest = blobs.put(b"review notes").await.expect("put blob");
     for (subject, pinned) in [("soon", false), ("kept", true)] {
-        let spec = spec("demo", "review-round", subject, &digest, Utc::now() + chrono::Duration::milliseconds(300), pinned);
+        let spec =
+            spec("demo", "review-round", subject, &digest, flotilla_resources::clock::now() + chrono::Duration::milliseconds(300), pinned);
         artifacts.create(&InputMeta::builder().name(name("demo", "review-round", subject)).build(), &spec).await.expect("create artifact");
     }
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -80,7 +81,7 @@ async fn an_artifact_is_reaped_at_its_expiry_without_a_timer() {
 // Behaviour (#3108): a blob put for an artifact whose write then fails is collected once its
 // grace has passed, while the daemon runs: its writer tells retention, and no restart is needed.
 // A blob an artifact references stays.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_blob_whose_artifact_write_failed_is_collected_without_a_restart() {
     let state = tempfile::tempdir().expect("state dir");
     let blobs = Arc::new(TieredBlobStore::new(state.path(), Vec::new()));
@@ -91,13 +92,13 @@ async fn a_blob_whose_artifact_write_failed_is_collected_without_a_restart() {
     // is written before retention starts: with no grace, retention's first look at the stores
     // collects a blob put before it whose artifact its listing does not yet hold.
     let held = blobs.put(b"held body").await.expect("put blob");
-    let far = Utc::now() + chrono::Duration::days(3650);
+    let far = flotilla_resources::clock::now() + chrono::Duration::days(3650);
     let squatter = spec("demo", "brief", "another", &held, far, true);
     artifacts.create(&InputMeta::builder().name(name("demo", "brief", "brief")).build(), &squatter).await.expect("squatter");
     let task =
         tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), Duration::ZERO, RuntimeHealth::default()));
     // Retention has started once it has reaped a probe.
-    let probe = spec("demo", "probe", "probe", &held, Utc::now() - chrono::Duration::seconds(1), false);
+    let probe = spec("demo", "probe", "probe", &held, flotilla_resources::clock::now() - chrono::Duration::seconds(1), false);
     artifacts.create(&InputMeta::builder().name(name("demo", "probe", "probe")).build(), &probe).await.expect("probe");
     deleted(&artifacts, &name("demo", "probe", "probe")).await;
 
@@ -120,7 +121,7 @@ async fn a_blob_whose_artifact_write_failed_is_collected_without_a_restart() {
 // artifact at each change. Each of N convoys' artifact writes is followed by a probe that has
 // already expired, which retention deletes: N passes, and the artifacts' rows retention reads
 // stay within a small multiple of N rather than growing with N at every pass.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn retention_reads_each_artifact_change_once() {
     const RETENTION: &str = "artifact gc (retention_reads_each_artifact_change_once)";
     const CONVOYS: usize = 24;
@@ -134,11 +135,11 @@ async fn retention_reads_each_artifact_change_once() {
         run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE, RuntimeHealth::default()),
     ));
     let digest = blobs.put(b"decision ledger").await.expect("put blob");
-    let far = Utc::now() + chrono::Duration::days(3650);
+    let far = flotilla_resources::clock::now() + chrono::Duration::days(3650);
     for convoy in (0..CONVOYS).map(|n| format!("convoy-{n}")) {
         let ledger = spec(&convoy, "decision-ledger", "ledger", &digest, far, true);
         artifacts.create(&InputMeta::builder().name(name(&convoy, "decision-ledger", "ledger")).build(), &ledger).await.expect("ledger");
-        let probe = spec(&convoy, "probe", "probe", &digest, Utc::now() - chrono::Duration::seconds(1), false);
+        let probe = spec(&convoy, "probe", "probe", &digest, flotilla_resources::clock::now() - chrono::Duration::seconds(1), false);
         artifacts.create(&InputMeta::builder().name(name(&convoy, "probe", "probe")).build(), &probe).await.expect("probe");
         deleted(&artifacts, &name(&convoy, "probe", "probe")).await;
     }
@@ -150,7 +151,7 @@ async fn retention_reads_each_artifact_change_once() {
 
 // Behaviour (#3108): retention failing past its retries stops retrying on a backoff and shows in
 // the host's health with its reason, once, until a pass succeeds.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn retention_failing_past_its_retries_shows_in_the_hosts_health() {
     const THEN: &str = "the next change or expiry retries it";
     let health = RuntimeHealth::default();

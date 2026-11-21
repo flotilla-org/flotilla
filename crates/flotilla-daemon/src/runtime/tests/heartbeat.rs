@@ -5,7 +5,7 @@ use crate::testkits::engine::{admit_convoy, engine};
 use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::FulfilmentGrant;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn heartbeat_publishes_ambient_claude_expiry_metadata_without_material() {
     let temp = TempDir::new().expect("tempdir");
     let home = temp.path().join("home");
@@ -107,7 +107,7 @@ async fn spawned_fulfilment_probe_task_publishes_facts_after_heartbeat() {
     assert!(temp.path().join("probe-cwd").is_dir(), "image probes run in the probe directory, which the task creates");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts() {
     struct GatedProbeRunner {
         entered: Arc<Notify>,
@@ -239,7 +239,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
         model_probes.entries.insert(
             model.into(),
             flotilla_resources::CachedModelProbe {
-                observed_at: Utc::now(),
+                observed_at: flotilla_resources::clock::now(),
                 fact: Some(flotilla_resources::ModelFact { usable, source: flotilla_resources::ModelFactSource::Probe }),
             },
         );
@@ -272,7 +272,8 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
     assert_eq!(model_probes, ModelProbeState::default());
 
     let mut previous = status.fulfilment_facts;
-    previous.get_mut("host-direct-async-facts-test").expect("prior fact").observed_at = Utc::now() - chrono::Duration::minutes(10);
+    previous.get_mut("host-direct-async-facts-test").expect("prior fact").observed_at =
+        flotilla_resources::clock::now() - chrono::Duration::minutes(10);
     let failing_runner = Arc::new(DiscoveryMockRunner::builder().build());
     let after_failure = observe_fulfilment_facts(
         &daemon.resource_backend(),
@@ -302,7 +303,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
 // surfaces without a query or peer-summary message, including while offline.
 // The engine Host carries only the description's architecture (`host_import.rs`), so that
 // is what the remote home changes.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn host_description_watch_publishes_offline_replica_updates() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"host-watch-observer\"\n").expect("daemon config");
@@ -318,7 +319,7 @@ async fn host_description_watch_publishes_offline_replica_updates() {
                 .system(flotilla_protocol::SystemInfo { arch: Some(arch.into()), ..Default::default() })
                 .build(),
         ),
-        heartbeat_at: Some(Utc::now()),
+        heartbeat_at: Some(flotilla_resources::clock::now()),
         ..Default::default()
     };
     remote.host("remote-host", &HostSpec::default(), Some(&described("amd64"))).await;
@@ -357,7 +358,7 @@ async fn host_description_watch_publishes_offline_replica_updates() {
     let _ = projection.await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn heartbeat_task_updates_host_status_without_socket_server() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"heartbeat-no-socket-test\"\n").expect("daemon config");
@@ -377,7 +378,7 @@ async fn heartbeat_task_updates_host_status_without_socket_server() {
         &host_id,
         &flotilla_resources::HostStatusPatch::SleepInhibition {
             health: flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures: 3, message: "polkit denied".to_string() },
-            observed_at: Utc::now(),
+            observed_at: flotilla_resources::clock::now(),
         },
     )
     .await
@@ -429,7 +430,7 @@ async fn heartbeat_task_updates_host_status_without_socket_server() {
 
 // Behaviour (real test item 5): a credential declared after the host's heartbeat published is
 // judged at once, not an interval later, so a dispatch right after the declaration finds it held.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_credential_declared_after_a_heartbeat_is_held_without_waiting_for_the_next() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"heartbeat-declaration-wake-test\"\n").expect("daemon config");
@@ -499,7 +500,7 @@ async fn a_credential_declared_after_a_heartbeat_is_held_without_waiting_for_the
     let _ = heartbeat.await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn peer_summary_does_not_author_transitional_host_or_policy_rows() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"peer-summary-no-materialization-test\"\n").expect("daemon config");
@@ -546,7 +547,7 @@ impl CommandRunner for UnselectedProbeRunner {
 // kind or reuse stale affirmative evidence. Every combination of both runtime
 // kinds, zero and two matching instances, present/absent prior facts and pool
 // availability.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn unresolved_fulfilment_provider_publishes_unknown() {
     use flotilla_environment::environment::{command_provider, EnvironmentInput};
     for docker in [false, true] {
@@ -582,7 +583,7 @@ async fn unresolved_fulfilment_provider_publishes_unknown() {
                             );
                         }
                     }
-                    let prior_time = Utc::now() - chrono::Duration::minutes(1);
+                    let prior_time = flotilla_resources::clock::now() - chrono::Duration::minutes(1);
                     let previous = if prior {
                         BTreeMap::from([(
                             "kind".into(),
@@ -635,7 +636,7 @@ async fn unresolved_fulfilment_provider_publishes_unknown() {
 // #4002: grants come from observation. A host-direct kind stored with a GUI
 // session grant, as kinds were derived before, loses it once its host's probe
 // sees no display; a host whose probe observes one is granted it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn headless_host_is_not_granted_a_gui_session() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"headless-test\"\n").expect("daemon config");
@@ -677,7 +678,7 @@ async fn headless_host_is_not_granted_a_gui_session() {
 
 // #4093: a host whose crews are given the pinned harnesses (an SSH host) reports each at
 // its pin, though it has no `claude` or `codex` of its own on PATH.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_host_given_pinned_harnesses_reports_their_pins_without_installing_them() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"pinned-test\"\n").expect("daemon config");
@@ -722,7 +723,7 @@ async fn a_host_given_pinned_harnesses_reports_their_pins_without_installing_the
 // #4002: a daemon host's capped Docker kind publishes the free slots counted
 // from every vessel placed on the host, host-direct ones included, and keeps
 // them current while a recent probe is reused.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"docker-cap-test\"\nmax_vessels = 2\n").expect("daemon config");
@@ -820,7 +821,7 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
 
 // #4002: an unknown observation is not one. A host-direct kind keeps its GUI
 // grant when no environment provider can probe its host.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn unknown_observation_keeps_a_gui_grant() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"unknown-gui-test\"\n").expect("daemon config");
@@ -887,7 +888,7 @@ impl HostReads {
 
 // Behaviour: a heartbeat tick that finds nothing changed since the tick before reads the Hosts
 // once and writes nothing.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_idle_heartbeat_reads_the_hosts_once_and_writes_nothing() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"idle-heartbeat-test\"\n").expect("daemon config");
@@ -923,7 +924,7 @@ impl HostStatusPublish for CountedPublish {
 
 // Behaviour: heartbeat ticks that observe what was last published make no patch and publish
 // nothing, though the store would also write nothing for them.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn unchanged_heartbeats_publish_nothing() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"unchanged-heartbeat-test\"\n").expect("daemon config");
@@ -946,7 +947,7 @@ async fn unchanged_heartbeats_publish_nothing() {
 
 // Behaviour: free disk crossing the admission floor publishes the Host's judgement once, and the
 // ticks after it, observing the same side of the floor, publish nothing.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_floor_crossing_publishes_once() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"floor-crossing-test\"\n").expect("daemon config");
@@ -998,7 +999,7 @@ impl crate::blob_store::BlobStore for UnreachableFleet {
 
 // Behaviour: the answering daemon's own fleet row shows its free disk, version, uptime and blob
 // sync as read in memory now, none of which the stored Host carries.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_local_fleet_row_reads_its_figures_in_memory() {
     use crate::blob_store::BlobStore as _;
     let temp = TempDir::new().expect("tempdir");
@@ -1010,7 +1011,7 @@ async fn the_local_fleet_row_reads_its_figures_in_memory() {
         Arc::new(crate::blob_store::TieredBlobStore::new(&temp.path().join("blobs"), vec![("fleet".into(), Arc::new(UnreachableFleet))]));
     blobs.put(b"written while the fleet is away").await.expect("local-first put");
     blobs.sync_once().await.expect("sync pass");
-    let started_at = Utc::now() - chrono::Duration::minutes(5);
+    let started_at = flotilla_resources::clock::now() - chrono::Duration::minutes(5);
     daemon
         .install_local_host_identity(flotilla_core::in_process::local_host::LocalHostIdentity {
             version: "local-row-version".into(),
@@ -1045,7 +1046,7 @@ async fn the_local_fleet_row_reads_its_figures_in_memory() {
 
 // Behaviour: a fulfilment probe tick that observes the facts it published before reads the Hosts
 // once and writes nothing.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_idle_fulfilment_probe_reads_the_hosts_once_and_writes_nothing() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"idle-probe-test\"\n").expect("daemon config");

@@ -165,7 +165,7 @@ fn checkout_grants(refs: &[&str]) -> CloneCredentials {
     CloneCredentials::from_annotations(&annotations).expect("decode checkout grants")
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_cloud_clone_runs_git_with_its_repository_grant_delivered() {
     let vessel = cloud_vessel().await;
 
@@ -193,7 +193,7 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_cloud_clone_without_a_usable_grant_names_the_repository_forge_and_grant() {
     for (refs, reason) in [
         (&[][..], "requires a sign-in, and no credential grant covers this repository"),

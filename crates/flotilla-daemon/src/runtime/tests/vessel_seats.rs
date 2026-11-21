@@ -5,7 +5,7 @@ use flotilla_resources::vessel_seats::VesselSeats;
 // Behaviour (#3629 layer 8, #3108): a vessel's seats are the newest launch of each session the
 // engine holds for it, by role: a relaunch serves its role in place of the launch it follows, and
 // another vessel's launches serve none of its seats.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_vessels_seats_are_the_newest_launches_it_holds() {
     let terminals = TerminalsFixture::default();
     let coder = terminals.request(&TerminalsFixture::agent("vessel-a", "coder", "env-a"));
