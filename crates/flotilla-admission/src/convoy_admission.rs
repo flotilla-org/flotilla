@@ -1094,24 +1094,15 @@ impl ConvoyAdmission {
         };
         let terminals =
             self.backend.query_declared::<ResourceTerminalSession>(namespace, &terminal_query).await.map_err(|error| error.to_string())?;
-        let ensures = self
-            .backend
-            .query_declared::<ConvoyEnsure>(
-                namespace,
-                &StoreQuery {
-                    field_values: BTreeMap::from([("spec.project_ref".into(), visible.into_iter().collect())]),
-                    include_replicas: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        // The visible projects' ensures, from the declarations the request read.
+        let ensures: Vec<ResourceObject<ConvoyEnsure>> =
+            ensures.into_iter().filter(|ensure| visible.contains(&ensure.spec.project_ref)).collect();
         snapshot.insert_definitions::<Project>(projects)?;
         snapshot.insert_definitions::<CrewDefaults>(defaults)?;
         snapshot.insert_definitions::<FleetDesignation>(fleet)?;
         snapshot.insert::<ResourceConvoy>(convoys)?;
         snapshot.insert::<ResourceTerminalSession>(terminals)?;
-        snapshot.insert::<ConvoyEnsure>(ensures)?;
+        snapshot.insert_definitions::<ConvoyEnsure>(ensures)?;
         Ok(snapshot.finish())
     }
 
@@ -2070,6 +2061,8 @@ impl AdmissionReadContext<'_> {
         snapshot.insert_definitions::<Project>(projects)?;
         snapshot.insert_definitions::<FleetDesignation>(fleet)?;
         snapshot.insert_definitions::<CrewDefaults>(defaults)?;
+        // The standing roles whose current generations a brief shows.
+        snapshot.insert_definitions::<ConvoyEnsure>(flotilla_store::read_definition_catalog::<ConvoyEnsure>(backend, namespace).await?)?;
         snapshot.insert_definitions::<Forge>(forges)?;
         snapshot.insert_definitions::<WorkflowTemplate>(workflows)?;
         snapshot.insert_definitions::<ImageLayer>(image_layers)?;
