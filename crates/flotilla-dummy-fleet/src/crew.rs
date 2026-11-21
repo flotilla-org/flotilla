@@ -5,10 +5,11 @@
 //!
 //! A brief selects its script with a line `dummy-script: <script> [key=value]…`:
 //!
-//! - `coder [review=<role>] [repo=<owner/name>] [kept-<kind>=<reference>]…`
+//! - `coder [review=<role>] [repo=<owner/name>] [await-turns=<n>] [kept-<kind>=<reference>]…`
 //!   promises a change request, opens one on the dummy forge (or on the
 //!   configured shared forge) and submits it, optionally asks a peer to review
-//!   it and waits for the reply, then completes. A kind its role has kept, which
+//!   it and waits for the reply, waits idle for `n` more turns (such as the
+//!   turn its checks settling delivers), then completes. A kind its role has kept, which
 //!   the adapter reads from the brief's [`KEPT_PROMISES_HEADING`] list, it
 //!   skips: a kept `pr` with its review, a kept `decision-ledger` submission.
 //! - `responder reply=<role>` answers every turn with a handoff to `reply`,
@@ -59,6 +60,9 @@ pub enum CrewScript {
     Coder {
         reviewer: Option<String>,
         repository: String,
+        /// Turns from flotilla's turn rules it waits for, idle, after its review: shepherding its
+        /// change request.
+        awaited_turns: u32,
         /// The reference of each promise kind its role has kept, by kind.
         kept: BTreeMap<String, String>,
     },
@@ -90,7 +94,7 @@ impl CrewScript {
 
     /// A coder whose role has kept nothing.
     pub fn coder(reviewer: Option<String>, repository: String) -> Self {
-        Self::Coder { reviewer, repository, kept: BTreeMap::new() }
+        Self::Coder { reviewer, repository, awaited_turns: 0, kept: BTreeMap::new() }
     }
 
     pub fn parse(line: &str, default_turns: u32) -> Result<Self, String> {
@@ -106,6 +110,10 @@ impl CrewScript {
             "coder" => Self::Coder {
                 reviewer: take(&mut parameters, "review"),
                 repository: take(&mut parameters, "repo").unwrap_or_else(|| DEFAULT_REPOSITORY.into()),
+                awaited_turns: match take(&mut parameters, "await-turns") {
+                    Some(turns) => turns.parse().map_err(|_| format!("coder await-turns `{turns}` is not a number"))?,
+                    None => 0,
+                },
                 kept: {
                     let kinds = parameters.keys().filter_map(|key| key.strip_prefix(KEPT_PREFIX)).map(str::to_owned).collect::<Vec<_>>();
                     kinds
@@ -133,12 +141,15 @@ impl CrewScript {
 
     pub fn render(&self) -> String {
         match self {
-            Self::Coder { reviewer, repository, kept } => {
+            Self::Coder { reviewer, repository, awaited_turns, kept } => {
                 let mut line = "coder".to_string();
                 if let Some(reviewer) = reviewer {
                     line.push_str(&format!(" review={reviewer}"));
                 }
                 line.push_str(&format!(" repo={repository}"));
+                if *awaited_turns > 0 {
+                    line.push_str(&format!(" await-turns={awaited_turns}"));
+                }
                 for (kind, reference) in kept {
                     line.push_str(&format!(" {KEPT_PREFIX}{kind}={reference}"));
                 }
@@ -386,7 +397,9 @@ impl Crew {
         let ending = match self.begin().await {
             Some(ending) => Some(ending),
             None => match script {
-                CrewScript::Coder { reviewer, repository, kept } => self.code(reviewer, &repository, &kept).await,
+                CrewScript::Coder { reviewer, repository, awaited_turns, kept } => {
+                    self.code(reviewer, &repository, awaited_turns, &kept).await
+                }
                 CrewScript::Responder { reply_to } => self.respond(&reply_to).await,
                 CrewScript::Governor { aide, turns } => self.govern(&aide, turns).await,
                 CrewScript::Supervisor => self.supervise().await,
@@ -467,7 +480,13 @@ impl Crew {
         None
     }
 
-    async fn code(&mut self, reviewer: Option<String>, repository: &str, kept: &BTreeMap<String, String>) -> Option<Ending> {
+    async fn code(
+        &mut self,
+        reviewer: Option<String>,
+        repository: &str,
+        awaited_turns: u32,
+        kept: &BTreeMap<String, String>,
+    ) -> Option<Ending> {
         // A ledger its role has kept is not submitted again.
         if kept.contains_key("decision-ledger") {
             self.script_finished = true;
@@ -501,6 +520,14 @@ impl Crew {
         if let Some(reviewer) = reviewer {
             self.hand_off(&reviewer, &format!("Please review {url} {LAST_TURN_MARKER}")).await?;
             self.next_turn().await?;
+        }
+        // Shepherding: it waits idle for the turns its brief promises, as its checks settle. A
+        // nudge or other turn meanwhile it takes and goes idle again, as it is still waiting.
+        let mut taken = 0;
+        while taken < awaited_turns {
+            if is_turn_rule_turn(&self.next_turn().await?) {
+                taken += 1;
+            }
         }
         self.settle_promises().await
     }
@@ -818,6 +845,11 @@ fn turn_length(config: &DummyFleetConfig, session: &str, turns: usize) -> Durati
     Duration::from_millis(agent.turn_delay_ms + spread as u64)
 }
 
+/// Whether a turn carries a message from flotilla's turn rules, as its header names them.
+fn is_turn_rule_turn(turn: &str) -> bool {
+    turn.lines().any(|line| line.starts_with("[from flotilla (system) · turn rules"))
+}
+
 /// Delivered turns are framed `[from <sender> (<relation>)…]`; a peer's
 /// handoff is a task, anything else (supervision, the operator) is guidance.
 fn is_peer_turn(turn: &str) -> bool {
@@ -908,6 +940,7 @@ mod tests {
             CrewScript::Coder {
                 reviewer: Some("reviewer".into()),
                 repository: "acme/app".into(),
+                awaited_turns: 1,
                 kept: [("pr".into(), "https://forge/acme/app/pulls/1".into()), ("decision-ledger".into(), "ledger-1".into())].into(),
             },
             CrewScript::Responder { reply_to: "coder".into() },

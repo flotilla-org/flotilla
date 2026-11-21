@@ -187,6 +187,13 @@ pub struct DummyChangeRequestConfig {
     /// Probability that a change request is observed closed instead of merged.
     #[serde(default, deserialize_with = "deserialize_rate")]
     pub close_rate: f64,
+    /// Time after opening at which a change request's checks settle; they are
+    /// pending until then. Without it the forge reports no checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks_after_ms: Option<u64>,
+    /// Probability that a change request's checks settle failing instead of passing.
+    #[serde(default, deserialize_with = "deserialize_rate")]
+    pub checks_fail_rate: f64,
 }
 
 /// The Forgejo forge, such as the rehearsal's fake forge, that dummy coders
