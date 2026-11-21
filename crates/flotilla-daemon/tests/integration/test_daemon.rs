@@ -13,7 +13,8 @@ use flotilla_protocol::{
     AgentActivity, AgentSessionReading, CommandAction, QueryId, ResultSet,
 };
 use flotilla_resources::{
-    ChangeRequest, Convoy, ConvoyPhase, ObservedChangeRequestState, ResourceObject, TerminalSession, TerminalSessionPhase,
+    access_delivery::access_key, AccessDelivery, AccessDeliverySpec, ChangeRequest, Convoy, ConvoyPhase, ObservedChangeRequestState,
+    ResourceObject, TerminalSession, TerminalSessionPhase,
 };
 
 fn text<'a>(row: &'a Row, column: &str) -> &'a str {
@@ -588,4 +589,52 @@ async fn a_landed_convoy_whose_stalled_crew_lost_its_session_retires_with_the_lo
     let daemon = daemon.restart().await;
     daemon.wait_reached("Retired", "convoy", "Retired", |row| text(row, "resource.name") == convoy).await;
     daemon.wait_gone::<TerminalSession>(&lost).await;
+}
+
+/// An access to `convoy`'s coder in its `work`, delivered at `place`.
+fn delivery(convoy: &str, work: &str, place: &str) -> AccessDeliverySpec {
+    AccessDeliverySpec {
+        access: access_key("fleet", convoy, work, "coder"),
+        place: place.to_owned(),
+        harness: "claude-code".into(),
+        home: "/requesters/probe".into(),
+        needs: Default::default(),
+        retry: None,
+    }
+}
+
+/// `convoy`'s coder's Realised environment, and the work its vessel does.
+async fn coder_environment(daemon: &TestDaemon, convoy: &str) -> (String, String) {
+    let ready = daemon.wait_row("a Realised environment", "environment", "", of_convoy(convoy, "Realised")).await;
+    let place = text(&ready, "resource.name").to_owned();
+    // `env-<convoy>-<work>-<n>`.
+    let launch_of = flotilla_resources::convoy::launch_of(convoy);
+    let work = place
+        .strip_prefix(&format!("env-{launch_of}-"))
+        .and_then(|rest| rest.rsplit_once('-'))
+        .map(|(work, _)| work.to_owned())
+        .expect("the environment names its work");
+    (place, work)
+}
+
+// #4415: an access delivered at a live place follows that place: kept while its environment
+// lives, and removed once the vendor's loss ends the environment, though nothing writes the record
+// then. Runs the same on the old ControllerLoop reconciler and on the engine Controller.
+#[tokio::test(start_paused = true)]
+async fn an_access_delivery_follows_its_environment_and_goes_when_it_ends() {
+    let daemon = TestDaemon::builder().agent("turn_delay_ms = 600000").start().await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let (place, work) = coder_environment(&daemon, &convoy).await;
+    daemon.apply::<AccessDelivery>("at-the-place", delivery(&convoy, &work, &place)).await;
+    // The reconciles its creation wakes run while its place and convoy are live, and keep it.
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    assert!(daemon.get::<AccessDelivery>("at-the-place").await.is_some(), "kept while its environment lives");
+
+    assert!(DummyVendor::vanish(daemon.vendor(), &place), "the vendor holds {place}");
+    daemon
+        .wait_row("Lost", "environment", "", |row| {
+            text(row, "resource.name") == place && text(row, "state") == "Gone" && text(row, "ending") == "Lost"
+        })
+        .await;
+    daemon.wait_gone::<AccessDelivery>("at-the-place").await;
 }

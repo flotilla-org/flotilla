@@ -967,10 +967,7 @@ fn spawn_controller_loops(
         )
     });
     // #3964: each access's delivery status, removed with its place or convoy.
-    controllers.push(controller!(flotilla_resources::AccessDelivery, {
-        let state = Arc::clone(&state);
-        move |_backend: ResourceBackend, namespace: String| access_layer::status::status_controller(Arc::clone(&state), namespace)
-    }));
+    controllers.extend(spawn_access_delivery_controller(&state));
     controllers
 }
 
@@ -1319,6 +1316,26 @@ fn spawn_vessel_controller(
         }))),
         Err(error) => {
             error!(%error, "the Vessel controller could not start; vessels will not launch");
+            None
+        }
+    }
+}
+
+/// The AccessDelivery controller (#3964, #4415): the single writer of this home's access
+/// deliveries' removal, judging each against its place's Environment and its convoy at the start
+/// and whenever it, its place or its convoy changes.
+fn spawn_access_delivery_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHandle<()>> {
+    use flotilla_provisioning::engine::controller::Controller;
+    let records = Arc::new(state.access_deliveries().controlled());
+    let actuator = Arc::new(access_layer::status::AccessDeliveryActuator::new(Arc::clone(state)));
+    match Controller::over(records, actuator, state.daemon.clock_for_scenarios(), state.daemon.decided_store()) {
+        Ok(controller) => Some(tokio::spawn(counted(state, "engine AccessDelivery", async move {
+            // No probe observes a delivery: its place's and its convoy's commits look at it.
+            let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
+            controller.run(backings).await
+        }))),
+        Err(error) => {
+            error!(%error, "the AccessDelivery controller could not start; ended accesses will not be removed");
             None
         }
     }

@@ -1097,6 +1097,29 @@ fn requester_home_at(base: &str, convoy: &str, harness: &str) -> String {
     flotilla_resources::account_access::requester_home(Path::new(base), convoy, "coder", harness).display().to_string()
 }
 
+/// What the AccessDelivery controller does for delivery `name` held as `delivery` when its place
+/// or its convoy changes: judges it against them and, once one has ended, releases it, which
+/// removes it.
+async fn controller_pass(
+    state: &Arc<ControllerRuntimeState>,
+    name: &str,
+    delivery: &flotilla_resources::AccessDeliverySpec,
+) -> Result<(), String> {
+    use flotilla_provisioning::engine::{
+        controller::{Actuator, ControlledRecords},
+        Step,
+    };
+    let actuator = super::super::access_layer::status::AccessDeliveryActuator::new(Arc::clone(state));
+    let service = state.daemon.decided_store();
+    let holding = service.with_store(|store| actuator.holder(&mut store.read()?, name, delivery)).map_err(|error| error.to_string())?;
+    if !holding.ended {
+        return Ok(());
+    }
+    actuator.release(name, delivery, None).await.map_err(|failure| failure.cause.detail)?;
+    let now = flotilla_schema::Timestamp::from_datetime(&state.daemon.clock().now());
+    state.access_deliveries().controlled().step(name, &Step::Released, now).map_err(|error| error.to_string())
+}
+
 /// Ends convoy launch `convoy` at `daemon`'s home, as an operator's abandon ends it.
 async fn end_convoy(daemon: &InProcessDaemon, convoy: &str) {
     let view = daemon.resource_backend().using::<Convoy>(NAMESPACE).get(convoy).await.expect("convoy");
@@ -1377,11 +1400,10 @@ async fn access_status_goes_with_its_convoy() {
     let backend = runtime.daemon.resource_backend();
     let records = backend.clone().using::<flotilla_resources::AccessDelivery>(NAMESPACE);
     let [record] = records.list().await.expect("records").items.try_into().expect("one record");
-    let (_, reconciler) = super::super::access_layer::status::status_controller(Arc::clone(&runtime.state), NAMESPACE.to_string());
-    reconciler.retire(&record).await.expect("retire");
+    controller_pass(&runtime.state, &record.metadata.name, &record.spec).await.expect("retire");
     assert_eq!(records.list().await.expect("records").items.len(), 1, "kept while its place and convoy remain");
     end_convoy(&runtime.daemon, &runtime.convoy).await;
-    reconciler.retire(&record).await.expect("retire");
+    controller_pass(&runtime.state, &record.metadata.name, &record.spec).await.expect("retire");
     assert!(records.list().await.expect("records").items.is_empty(), "removed with its convoy");
 }
 
@@ -1402,13 +1424,12 @@ async fn retiring_a_convoy_removes_its_requester_state_from_the_ssh_host() {
     let backend = runtime.daemon.resource_backend();
     let records = backend.clone().using::<flotilla_resources::AccessDelivery>(NAMESPACE);
     let [record] = records.list().await.expect("records").items.try_into().expect("one record");
-    let (_, reconciler) = super::super::access_layer::status::status_controller(Arc::clone(&runtime.state), NAMESPACE.to_string());
-    reconciler.retire(&record).await.expect("retire");
+    controller_pass(&runtime.state, &record.metadata.name, &record.spec).await.expect("retire");
     assert_eq!(requester_files(&host), before, "kept while its convoy remains");
     end_convoy(&runtime.daemon, &runtime.convoy).await;
-    reconciler.retire(&record).await.expect("retire");
+    controller_pass(&runtime.state, &record.metadata.name, &record.spec).await.expect("retire");
     assert_eq!(requester_files(&host), Vec::<PathBuf>::new(), "removed with its convoy");
-    reconciler.retire(&record).await.expect("retiring again is a no-op");
+    controller_pass(&runtime.state, &record.metadata.name, &record.spec).await.expect("retiring again is a no-op");
 }
 
 // #3108: not finding an access's convoy or place is no record that it ended. A delivery whose
@@ -1429,17 +1450,16 @@ async fn an_unresolvable_convoy_or_place_holds_the_access_and_its_requester_stat
     let backend = runtime.daemon.resource_backend();
     let records = backend.clone().using::<flotilla_resources::AccessDelivery>(NAMESPACE);
     let [record] = records.list().await.expect("records").items.try_into().expect("one record");
-    let (_, reconciler) = super::super::access_layer::status::status_controller(Arc::clone(&runtime.state), NAMESPACE.to_string());
-    let mut convoyless = record.clone();
-    convoyless.metadata.labels.insert(flotilla_resources::CONVOY_LABEL.to_string(), "not-imported".to_string());
-    reconciler.retire(&convoyless).await.expect("held");
-    let mut placeless = record.clone();
-    placeless.spec.place = "env-not-here".to_string();
-    reconciler.retire(&placeless).await.expect("held");
+    let mut convoyless = record.spec.clone();
+    convoyless.access = flotilla_resources::access_delivery::with_convoy(&convoyless.access, "not-imported").expect("an access key");
+    controller_pass(&runtime.state, &record.metadata.name, &convoyless).await.expect("held");
+    let mut placeless = record.spec.clone();
+    placeless.place = "env-not-here".to_string();
+    controller_pass(&runtime.state, &record.metadata.name, &placeless).await.expect("held");
     assert_eq!(records.list().await.expect("records").items.len(), 1, "held while its convoy or place cannot be found");
     assert_eq!(requester_files(&host), before, "the requester state stays");
     end_convoy(&runtime.daemon, &runtime.convoy).await;
-    reconciler.retire(&record).await.expect("retire");
+    controller_pass(&runtime.state, &record.metadata.name, &record.spec).await.expect("retire");
     assert!(records.list().await.expect("records").items.is_empty(), "removed once its launch ended");
     assert_eq!(requester_files(&host), Vec::<PathBuf>::new(), "its requester state goes with it");
 }

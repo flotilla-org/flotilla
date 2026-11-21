@@ -146,6 +146,11 @@ impl ControllerRuntimeState {
         Ok(address)
     }
 
+    /// This home's access deliveries on the engine's write path (#4415).
+    pub(super) fn access_deliveries(&self) -> flotilla_provisioning::engine::access_deliveries::AccessDeliveries {
+        flotilla_provisioning::engine::access_deliveries::AccessDeliveries::new(self.daemon.decided_store().store())
+    }
+
     /// The environment `name`, at whichever home holds it: the engine's (#3108). The read is a
     /// store transaction, so it runs off the async workers.
     pub(super) async fn environment(&self, name: &str) -> Result<Option<EnvironmentRecord>, String> {
