@@ -69,6 +69,10 @@ pub(crate) enum Event {
     Killed {
         session: String,
     },
+    /// A session its pool lost: gone from cleat's daemon, which reports it absent.
+    Lost {
+        session: String,
+    },
     SessionsDestroyed {
         environment: String,
     },
