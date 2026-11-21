@@ -26,6 +26,40 @@ use flotilla_state_machines::{
 use super::{awaiting::AwaitingReplies, MessagePrimitives};
 use flotilla_inbox::{InboxBackend, Observations};
 
+/// Adds the time `expr` took to `slot`.
+macro_rules! timed {
+    ($slot:expr, $expr:expr) => {{
+        let started = std::time::Instant::now();
+        let value = $expr;
+        $slot += started.elapsed();
+        value
+    }};
+}
+
+/// How long one sweep spent on each kind of read, recorded on its `message_sweep.scan` span: the
+/// sweep reads every open message each pass, so its cost is what these add up to.
+#[derive(Default)]
+struct SweepTimes {
+    open: usize,
+    refresh: std::time::Duration,
+    inbox: std::time::Duration,
+    receipts: std::time::Duration,
+    conditions: std::time::Duration,
+    ended_seat: std::time::Duration,
+}
+
+impl SweepTimes {
+    fn record(&self, span: &tracing::Span) {
+        let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
+        span.record("open", self.open);
+        span.record("refresh_ms", ms(self.refresh));
+        span.record("inbox_ms", ms(self.inbox));
+        span.record("receipts_ms", ms(self.receipts));
+        span.record("conditions_ms", ms(self.conditions));
+        span.record("ended_seat_ms", ms(self.ended_seat));
+    }
+}
+
 /// This home's open messages, and the replies and successors naming them.
 #[derive(Debug, Default)]
 pub struct OpenMessages {
@@ -338,14 +372,38 @@ impl MessagePrimitives {
     ///
     /// A refused edge is evidence not yet observed; the next sweep retries.
     pub async fn sweep(&self, namespace: &str, now: Timestamp, index: &mut OpenMessages) -> Result<SweepReport, String> {
-        index.refresh_off_thread(self).await?;
+        let span = tracing::info_span!(
+            "message_sweep.scan",
+            open = tracing::field::Empty,
+            refresh_ms = tracing::field::Empty,
+            inbox_ms = tracing::field::Empty,
+            receipts_ms = tracing::field::Empty,
+            conditions_ms = tracing::field::Empty,
+            ended_seat_ms = tracing::field::Empty,
+        );
+        let mut times = SweepTimes::default();
+        let report = tracing::Instrument::instrument(self.sweep_open(namespace, now, index, &mut times), span.clone()).await;
+        times.record(&span);
+        report
+    }
+
+    /// [`Self::sweep`], adding the time each kind of read took to `times`.
+    async fn sweep_open(
+        &self,
+        namespace: &str,
+        now: Timestamp,
+        index: &mut OpenMessages,
+        times: &mut SweepTimes,
+    ) -> Result<SweepReport, String> {
+        timed!(times.refresh, index.refresh_off_thread(self).await)?;
+        times.open = index.open().count();
         let mut report = SweepReport::default();
         let roles = self.roles(namespace).await?;
         // A message this pass drops undelivered tells the operator, as these roles name them.
         self.dead_letters.learn(&roles);
         let inbox = self.inbox();
         for name in index.open().map(str::to_owned).collect::<Vec<_>>() {
-            let Some(message) = inbox.get_async(&name).await.map_err(|error| error.to_string())? else { continue };
+            let Some(message) = timed!(times.inbox, inbox.get_async(&name).await).map_err(|error| error.to_string())? else { continue };
             let spec = message.spec().clone();
             let state = message.state().clone();
             if let Some(deadline) = spec.deadline {
@@ -356,7 +414,7 @@ impl MessagePrimitives {
                 report.due_at(message.since().saturating_add(spec.unbound_after).saturating_add(1), now);
             }
             if state == MessageState::Pending {
-                if let Some((receiver, transport)) = self.committed_receipt(&name)? {
+                if let Some((receiver, transport)) = timed!(times.receipts, self.committed_receipt(&name))? {
                     match inbox.deliver(&name, Deliver { receiver, transport }).await {
                         Ok(()) => {
                             report.reconciled += 1;
@@ -410,7 +468,7 @@ impl MessagePrimitives {
                 }
             }
             if let Expectation::Outcome { condition } = &spec.expectation {
-                if let Ok(value) = self.conditions().value(namespace, condition).await {
+                if let Ok(value) = timed!(times.conditions, self.conditions().value(namespace, condition).await) {
                     let holds = value == flotilla_resources::ThreeValue::True;
                     self.world().update(|world| world.condition.put(&Ref::new(condition.to_string()), holds));
                     if holds {
@@ -423,7 +481,9 @@ impl MessagePrimitives {
                 }
             }
             if let Some(condition) = spec.delivery_condition.as_ref().filter(|_| state == MessageState::Pending) {
-                if self.conditions().value(namespace, condition).await == Ok(flotilla_resources::ThreeValue::False) {
+                if timed!(times.conditions, self.conditions().value(namespace, condition).await)
+                    == Ok(flotilla_resources::ThreeValue::False)
+                {
                     self.world().update(|world| world.condition.put(&Ref::new(condition.to_string()), false));
                     if let Some(by) = roles.address("turn-rules") {
                         if drop_message(inbox, &name, DropReason::Withdrawn { by, authority: condition.address.clone() }).await {
@@ -439,7 +499,7 @@ impl MessagePrimitives {
             // launch's authority, at the message's own home (#3108). A reply that did come settled
             // it above.
             if matches!(state, MessageState::Pending | MessageState::Awaiting { .. }) {
-                if let Some(convoy) = self.ended_seat(&spec.inbox)? {
+                if let Some(convoy) = timed!(times.ended_seat, self.ended_seat(&spec.inbox))? {
                     self.world().update(|world| world.authority.put(&Ref::new(convoy.as_str()), true));
                     if drop_message(inbox, &name, DropReason::Withdrawn { by: convoy.clone(), authority: convoy }).await {
                         report.convoy_ended += 1;
@@ -467,7 +527,7 @@ impl MessagePrimitives {
                 report.undeliverable += 1;
             }
         }
-        index.refresh_off_thread(self).await?;
+        timed!(times.refresh, index.refresh_off_thread(self).await)?;
         Ok(report)
     }
 

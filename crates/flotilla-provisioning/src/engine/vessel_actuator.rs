@@ -62,18 +62,47 @@ fn failure(detail: String, retryable: bool) -> ProviderFailure {
     ProviderFailure::new(Cause::new(CauseCategory::External, detail), retryable)
 }
 
+/// What a plan shows of the launch's backing: present in its environment once realised, absent
+/// while it still waits.
+fn backing(plan: &VesselPlan) -> Backing {
+    match plan {
+        VesselPlan::Ready { environment, .. } | VesselPlan::Waiting { realised_in: Some(environment), .. } => {
+            Backing::Present { identity: environment.clone() }
+        }
+        VesselPlan::Waiting { realised_in: None, .. } => Backing::Absent { reason: None },
+        VesselPlan::Lost { reason } => Backing::Absent { reason: Some(reason.clone()) },
+        VesselPlan::Failed { cause, .. } => Backing::Failed { reason: cause.clone() },
+    }
+}
+
+/// What a plan holds: complete only once it reaches its environment, as each step of a plan needs
+/// the one before it realised.
+fn held(plan: &VesselPlan) -> Result<Holdings, ProviderFailure> {
+    match plan {
+        VesselPlan::Ready { held, .. } => Ok(Holdings { held: held.iter().map(usability).collect(), complete: true }),
+        VesselPlan::Waiting { held, .. } => Ok(Holdings { held: held.iter().map(usability).collect(), complete: false }),
+        // Before it is realised, a lost environment is one try: the policy bounds how many.
+        VesselPlan::Lost { reason } => Err(failure(reason.clone(), true)),
+        VesselPlan::Failed { cause, retryable } => Err(failure(cause.clone(), *retryable)),
+    }
+}
+
 #[async_trait]
 impl Actuator<VesselKind> for VesselActuator {
     /// Present in its environment once realised, absent while it still waits: an unrealised
     /// launch's observation writes nothing, and a realised one waiting again keeps running.
     async fn observe(&self, name: &str, _: &VesselSpec) -> Result<Backing, Cause> {
-        match self.plan(name).await.map_err(|failure| failure.cause)? {
-            VesselPlan::Ready { environment, .. } | VesselPlan::Waiting { realised_in: Some(environment), .. } => {
-                Ok(Backing::Present { identity: environment })
-            }
-            VesselPlan::Waiting { realised_in: None, .. } => Ok(Backing::Absent { reason: None }),
-            VesselPlan::Lost { reason } => Ok(Backing::Absent { reason: Some(reason) }),
-            VesselPlan::Failed { cause, .. } => Ok(Backing::Failed { reason: cause }),
+        Ok(backing(&self.plan(name).await.map_err(|failure| failure.cause)?))
+    }
+
+    /// One plan serves both: what the launch holds and whether it is realised.
+    async fn observe_holding(&self, name: &str, _: &VesselSpec) -> (Option<Holdings>, Result<Backing, Cause>)
+    where
+        VesselSpec: Sync,
+    {
+        match self.plan(name).await {
+            Ok(plan) => (held(&plan).ok(), Ok(backing(&plan))),
+            Err(failure) => (None, Err(failure.cause)),
         }
     }
 
@@ -115,12 +144,6 @@ impl Actuator<VesselKind> for VesselActuator {
     /// Complete only once the plan reaches its environment: each step of a plan needs the one
     /// before it realised, as a contained environment's mounts need its checkouts.
     async fn holdings(&self, name: &str, _: &VesselSpec) -> Result<Holdings, ProviderFailure> {
-        match self.plan(name).await? {
-            VesselPlan::Ready { held, .. } => Ok(Holdings { held: held.iter().map(usability).collect(), complete: true }),
-            VesselPlan::Waiting { held, .. } => Ok(Holdings { held: held.iter().map(usability).collect(), complete: false }),
-            // Before it is realised, a lost environment is one try: the policy bounds how many.
-            VesselPlan::Lost { reason } => Err(failure(reason, true)),
-            VesselPlan::Failed { cause, retryable } => Err(failure(cause, retryable)),
-        }
+        held(&self.plan(name).await?)
     }
 }

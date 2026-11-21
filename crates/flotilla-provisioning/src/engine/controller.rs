@@ -213,6 +213,16 @@ pub trait Actuator<K: LifecycleKind>: Send + Sync + 'static {
     async fn holdings(&self, _name: &str, _request: &K::Request) -> Result<Holdings, ProviderFailure> {
         Ok(Holdings::none())
     }
+    /// One observation of a holding kind: its holdings, as [`Actuator::holdings`] reads them, and its
+    /// backing, as [`Actuator::observe`] does. A kind that reads both from one source overrides it to
+    /// read that source once.
+    async fn observe_holding(&self, name: &str, request: &K::Request) -> (Option<Holdings>, Result<Backing, Cause>)
+    where
+        K::Request: Sync,
+    {
+        let holdings = self.holdings(name, request).await.ok();
+        (holdings, self.observe(name, request).await)
+    }
 }
 
 /// Why a resource is looked at.
@@ -789,8 +799,12 @@ where
                 let span = info_span!("engine_controller.observe", kind = K::NAME, name);
                 self.flights.spawn(inherit(
                     async move {
-                        let holdings = if holds { actuator.holdings(&owned, &request).await.ok() } else { None };
-                        let done = Done::Observed(actuator.observe(&owned, &request).await, holdings);
+                        let (holdings, observed) = if holds {
+                            actuator.observe_holding(&owned, &request).await
+                        } else {
+                            (None, actuator.observe(&owned, &request).await)
+                        };
+                        let done = Done::Observed(observed, holdings);
                         (owned, done)
                     }
                     .instrument(span),
