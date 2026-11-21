@@ -1,11 +1,11 @@
 //! ADR 0051: replicated observations are the sole subject fact source.
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_address::{Forge as AddressForge, ForgeKind as AddressForgeKind};
+use flotilla_address::Forge as AddressForge;
 use flotilla_protocol::{IssueSource, Relationship, Subject, SubjectKind};
 use flotilla_resources::{
-    Forge, ForgeKind, Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability,
-    ObservedReviewDecision, ResourceObject,
+    address, ForgeKind, ForgeSpec, Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability,
+    ObservedReviewDecision,
 };
 
 use super::{
@@ -32,27 +32,14 @@ use crate::keys::{
 
 const BUILTIN_GITHUB_SERVICE: &str = "github.com";
 
-/// The forge an issue source's service names, as an address forge. Only a
-/// declared forge or the built-in GitHub has one.
-pub(super) fn address_forge(forges: &[ResourceObject<Forge>], service: &str) -> Option<AddressForge> {
-    if let Some(record) = super::subject_forge(forges, service) {
-        let kind = match record.spec.kind {
-            ForgeKind::Github => AddressForgeKind::Github,
-            ForgeKind::Forgejo => AddressForgeKind::Forgejo,
-        };
-        return AddressForge::new(record.spec.forge_id.clone(), kind).ok();
-    }
-    // The built-in forge is spelled as a bare host or as its URL.
-    let host = service.trim_start_matches("https://").trim_end_matches('/');
-    (host == BUILTIN_GITHUB_SERVICE || host == flotilla_address::GITHUB_FORGE_ID).then(AddressForge::github)
-}
-
-fn subject_entity(forges: &[ResourceObject<Forge>], subject: &Subject) -> Option<EntityRef> {
-    let forge = address_forge(forges, &subject.source.service)?;
-    match subject.kind {
-        SubjectKind::Issue => entity::issue(&forge, &subject.source.scope, &subject.id),
-        SubjectKind::ChangeRequest => entity::change_request(&forge, &subject.source.scope, &subject.id),
-    }
+/// The entity a convoy subject names, through the one stored-spelling →
+/// address resolver, which also reads the encoded host and URL spellings.
+fn subject_entity(forges: &[ForgeSpec], subject: &Subject) -> Option<EntityRef> {
+    let address = address::subject_address(subject, forges).ok()?;
+    Some(match subject.kind {
+        SubjectKind::Issue => entity::issue(&address),
+        SubjectKind::ChangeRequest => entity::change_request(&address),
+    })
 }
 
 fn assert_subject(catalog: &mut Catalog, target: EntityRef, facts: Vec<(&'static str, MetadataValue)>) {
@@ -194,6 +181,7 @@ fn project_forge(catalog: &mut Catalog, forge: &AddressForge, kind: ForgeKind, w
 
 pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, observations: &SubjectCatalogInput) {
     project_inbox(catalog, input, observations);
+    let forge_specs: Vec<ForgeSpec> = observations.forges.iter().map(|forge| forge.spec.clone()).collect();
     let mut links: BTreeMap<Subject, BTreeMap<Relationship, BTreeSet<EntityRef>>> = BTreeMap::new();
     let mut projects = BTreeMap::new();
     let mut landed = BTreeSet::new();
@@ -217,7 +205,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
             if !visible {
                 continue;
             }
-            if let Some(subject_entity) = subject_entity(&observations.forges, &entry.subject) {
+            if let Some(subject_entity) = subject_entity(&forge_specs, &entry.subject) {
                 forward.entry(entry.relationship).or_default().insert(subject_entity);
             }
             links.entry(entry.subject.clone()).or_default().entry(entry.relationship).or_default().insert(convoy_entity.clone());
@@ -236,13 +224,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     }
 
     for record in &observations.forges {
-        if let Ok(forge) = AddressForge::new(
-            record.spec.forge_id.clone(),
-            match record.spec.kind {
-                ForgeKind::Github => AddressForgeKind::Github,
-                ForgeKind::Forgejo => AddressForgeKind::Forgejo,
-            },
-        ) {
+        if let Ok(forge) = AddressForge::new(record.spec.forge_id.clone(), record.spec.kind.into()) {
             project_forge(catalog, &forge, record.spec.kind, &record.spec.https_url);
         }
     }
@@ -300,15 +282,21 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     for repo in &observations.references.repositories {
         aliases.entry(&repo.source).or_insert(repo.alias.as_str());
     }
+    // The forge a subject's presentation links to is the declared Forge that
+    // covers its service, else the built-in GitHub; the subject's own id
+    // comes from the stored-spelling resolver.
     let services: BTreeSet<_> = links.keys().map(|subject| subject.source.service.as_str()).collect();
     let forges: BTreeMap<_, _> = services
         .into_iter()
         .filter_map(|service| {
-            if let Some(forge) = address_forge(&observations.forges, service) {
-                Some((service, entity::forge(&forge)))
-            } else {
-                catalog.uncovered_services.insert(service.to_owned());
-                None
+            let declared = super::subject_forge(&observations.forges, service)
+                .and_then(|forge| AddressForge::new(forge.spec.forge_id.clone(), forge.spec.kind.into()).ok());
+            match declared.or_else(|| (service == BUILTIN_GITHUB_SERVICE).then(AddressForge::github)) {
+                Some(forge) => Some((service, entity::forge(&forge))),
+                None => {
+                    catalog.uncovered_services.insert(service.to_owned());
+                    None
+                }
             }
         })
         .collect();
@@ -349,7 +337,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         if !links.contains_key(subject) {
             continue;
         }
-        let Some(target) = subject_entity(&observations.forges, subject) else { continue };
+        let Some(target) = subject_entity(&forge_specs, subject) else { continue };
         let mut facts = identity_facts(subject);
         facts.extend(change_request_facts(status, landed.contains(subject)));
         if orphaned.contains(subject) {
@@ -366,7 +354,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         if !links.contains_key(&subject) {
             continue;
         }
-        let Some(target) = subject_entity(&observations.forges, &subject) else { continue };
+        let Some(target) = subject_entity(&forge_specs, &subject) else { continue };
         let mut facts = identity_facts(&subject);
         if let Some(status) = &record.status {
             observe(&mut facts, KEY_ISSUE_TITLE, KEY_ISSUE_TITLE_OBSERVED_AT, &status.title);
@@ -480,5 +468,33 @@ fn project_inbox(catalog: &mut Catalog, input: &CatalogInput<'_>, records: &Subj
         facts.push((KEY_CONVOY_PENDING_MESSAGES, MetadataValue::StringList(pending.into_values().collect())));
         facts.push((KEY_CONVOY_STUCK_MESSAGES, MetadataValue::StringList(stuck.into_values().collect())));
         catalog.assert_entity(target, facts, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use flotilla_protocol::IssueSource;
+    use flotilla_resources::{ForgeKind, ForgeSpec};
+
+    use super::*;
+
+    // A declared issue subject on a Forge installed under a path is stored with
+    // its location encoded in the service; it must still name the Forge.
+    #[test]
+    fn an_encoded_installation_spelling_resolves_to_its_forge() {
+        let forge = ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(ForgeKind::Forgejo)
+            .hosts(["git.example.com".into()].into_iter().collect())
+            .https_url("https://git.example.com/forgejo".into())
+            .git_ssh_host("git.example.com".into())
+            .build();
+        let subject = Subject {
+            kind: SubjectKind::Issue,
+            source: IssueSource { service: "git.example.com%2fforgejo".into(), scope: "team/cleat".into() },
+            id: "7".into(),
+        };
+        assert_eq!(subject_entity(&[forge], &subject).expect("resolves").id, "forge:lab/repo:team%2Fcleat/issue:7");
+        assert_eq!(subject_entity(&[], &subject), None, "no declared Forge, no address");
     }
 }

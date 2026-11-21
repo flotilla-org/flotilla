@@ -597,7 +597,7 @@ fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
         &mint(),
     )
     .reassert_patches();
-    let issue_patch = find_entity(&patches, &entity::issue(&forge_named("github"), &issue_ref.source.scope, &issue_ref.id).expect("issue"));
+    let issue_patch = find_entity(&patches, &issue_entity("github", issue_ref.source.scope, issue_ref.id));
     let project_patch = find_entity(&patches, &entity::project("platform"));
     assert_eq!(text(issue_patch, KEY_ENTITY_KIND), "issue");
     assert_eq!(
@@ -841,7 +841,7 @@ fn awareness_children_use_their_convoys_canonical_origin() {
         &mint(),
     )
     .reassert_patches();
-    let issue_patch = find_entity(&patches, &entity::issue(&forge_named("github"), &issue_ref.source.scope, &issue_ref.id).expect("issue"));
+    let issue_patch = find_entity(&patches, &issue_entity("github", issue_ref.source.scope, issue_ref.id));
 
     assert_eq!(text(issue_patch, KEY_CONVOY), "host:kiwi/convoy:cutover");
 }
@@ -1639,7 +1639,7 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     input.awareness = Some(&[]);
     input.subjects = Some(&observations);
     let patches = project_catalog(&input, &mint()).reassert_patches();
-    let cr = entity::change_request(&forge_named("github"), "org/flotilla", "42").expect("cr");
+    let cr = cr_entity("github", "org/flotilla", "42");
     let patch = find_entity(&patches, &cr);
     assert_eq!(patch.set["flotilla.forge"].value, MetadataValue::EntityRefs(vec![entity::forge(&forge_named("github"))]));
     assert!(!patch.set.contains_key("flotilla.change_request.state"));
@@ -1710,7 +1710,7 @@ fn subject_window_and_successive_role_attempts_exclude_unlinked_records() {
     let mut input = catalog_input(&[]);
     input.subjects = Some(&observations);
     let unlinked = project_catalog(&input, &mint()).reassert_patches();
-    let cr = entity::change_request(&forge_named("github.com"), "org/flotilla", "42").expect("cr");
+    let cr = cr_entity("github.com", "org/flotilla", "42");
     assert!(
         !unlinked.iter().any(|patch| patch.target == MetadataTarget::Entity(cr.clone())),
         "unlinked records are outside this projection"
@@ -2002,12 +2002,9 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
     let convoy = find_entity(&patches, &entity::convoy("kiwi", "ship-it"));
     assert_eq!(
         convoy.set["flotilla.subject.produces"].value,
-        MetadataValue::EntityRefs(vec![
-            entity::change_request(&forge_named("github.com"), "org/flotilla", "42").expect("cr"),
-            entity::change_request(&forge_named("lab"), "team/cleat", "281").expect("cr")
-        ])
+        MetadataValue::EntityRefs(vec![cr_entity("github.com", "org/flotilla", "42"), cr_entity("lab", "team/cleat", "281")])
     );
-    let first = find_entity(&patches, &entity::change_request(&forge_named("github.com"), "org/flotilla", "42").expect("cr"));
+    let first = find_entity(&patches, &cr_entity("github.com", "org/flotilla", "42"));
     // Replicated subjects join the same shared project on every host.
     assert_eq!(text(first, SEGMENT_PROJECT), "project:platform");
     assert_eq!(text(first, KEY_DISPLAY_LABEL), "flotilla/c!42");
@@ -2016,7 +2013,7 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
     assert_eq!(text(first, "flotilla.change_request.checks"), "pass");
     assert_eq!(text(first, "flotilla.change_request.author.observed_at"), "2026-10-02T12:00:00+00:00");
     assert_eq!(first.set["flotilla.forge"].value, MetadataValue::EntityRefs(vec![entity::forge(&forge_named("github"))]));
-    let issue = find_entity(&patches, &entity::issue(&forge_named("lab"), "team/cleat", "7").expect("issue"));
+    let issue = find_entity(&patches, &issue_entity("lab", "team/cleat", "7"));
     assert_eq!(text(issue, SEGMENT_PROJECT), "project:platform");
     assert_eq!(text(issue, KEY_DISPLAY_LABEL_SHORT), "wheelhouse/c#7");
     assert_eq!(issue.set["flotilla.issue.labels"].value, MetadataValue::StringList(vec!["ready".into()]));
@@ -2155,14 +2152,13 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
         // Unlinked records are outside subject projection; awareness may
         // independently publish the issue, but must not publish a request.
         if count == 0 {
-            assert!(!patches.iter().any(|patch| patch.target
-                == MetadataTarget::Entity(entity::change_request(&forge_named("github"), "org/repo", "42").expect("cr"))));
+            assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(cr_entity("github", "org/repo", "42"))));
             continue;
         }
         for subject in &subjects {
             let target = match subject.kind {
-                SubjectKind::ChangeRequest => entity::change_request(&forge_named("github"), "org/repo", "42").expect("cr"),
-                SubjectKind::Issue => entity::issue(&forge_named(&subject.source.service), &subject.source.scope, "42").expect("issue"),
+                SubjectKind::ChangeRequest => cr_entity("github", "org/repo", "42"),
+                SubjectKind::Issue => issue_entity(&subject.source.service, &subject.source.scope, "42"),
             };
             let actual = find_entity(&patches, &target).set.get(SEGMENT_PROJECT).map(|value| &value.value);
             let wanted = (expected.len() == 1).then(|| MetadataValue::text(expected.first().expect("unique project")));
@@ -2306,7 +2302,7 @@ fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
     input.subjects = Some(&observations);
     let patches = project_catalog(&input, &mint()).reassert_patches();
     for (number, (_, status)) in &expected {
-        let patch = find_entity(&patches, &entity::change_request(&forge_named("github"), "org/repo", &number.to_string()).expect("cr"));
+        let patch = find_entity(&patches, &cr_entity("github", "org/repo", number.to_string()));
         let expected_title = status.as_ref().expect("status").title.value.as_deref();
         assert_eq!(
             patch.set.get("flotilla.change_request.title").and_then(|value| match &value.value {
@@ -2358,7 +2354,7 @@ fn orphaned_request_keeps_departed_convoy_edge_until_terminal() {
             ),
         )
         .expect("record");
-    let cr = entity::change_request(&forge_named("github"), "org/repo", "42").expect("cr");
+    let cr = cr_entity("github", "org/repo", "42");
     for state in [
         ObservedChangeRequestState::Open,
         ObservedChangeRequestState::Draft,
@@ -2529,12 +2525,8 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
     assert_eq!(text(facts, "flotilla.forge.issue_url_template"), "{web_url}/{scope}/issues/{number}", "{mode:?}");
     for subject in &subjects {
         let target = match subject.kind {
-            SubjectKind::ChangeRequest => {
-                entity::change_request(&forge_named(&expected_id["forge:".len()..]), "org/repo", &subject.id).expect("cr")
-            }
-            SubjectKind::Issue => {
-                entity::issue(&forge_named(&expected_id["forge:".len()..]), &subject.source.scope, &subject.id).expect("issue")
-            }
+            SubjectKind::ChangeRequest => cr_entity("github.com", "org/repo", &subject.id),
+            SubjectKind::Issue => issue_entity(&subject.source.service, &subject.source.scope, &subject.id),
         };
         if count == 0 {
             assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(target.clone())));
@@ -3253,4 +3245,17 @@ fn forge_named(service: &str) -> flotilla_address::Forge {
         "github" | "github.com" => flotilla_address::Forge::github(),
         other => flotilla_address::Forge::new(other, flotilla_address::ForgeKind::Forgejo).expect("a valid forge id"),
     }
+}
+
+fn cr_entity(service: &str, scope: impl AsRef<str>, number: impl AsRef<str>) -> EntityRef {
+    let address =
+        flotilla_resources::address::stored_change_request_address(service, scope.as_ref(), number.as_ref().parse().expect("number"), &[])
+            .expect("a resolvable service");
+    entity::change_request(&address)
+}
+
+fn issue_entity(service: &str, scope: impl AsRef<str>, number: impl AsRef<str>) -> EntityRef {
+    let address = flotilla_resources::address::stored_issue_address(service, scope.as_ref(), number.as_ref().parse().expect("number"), &[])
+        .expect("a resolvable service");
+    entity::issue(&address)
 }

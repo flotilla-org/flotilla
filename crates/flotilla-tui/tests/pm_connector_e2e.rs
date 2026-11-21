@@ -233,7 +233,7 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
         )
     };
     let mut connector = start();
-    let target = MetadataTarget::Entity(entity::change_request(&forge_named("github.com"), "org/platform", "42").expect("cr"));
+    let target = MetadataTarget::Entity(cr_entity("github.com", "org/platform", "42"));
     wait("bootstrap observation", || sink.value(&target, "flotilla.change_request.title") == Some(MetadataValue::text("initial"))).await;
     wait("subject project edge", || sink.value(&target, "flotilla.project").is_some()).await;
     let project = MetadataTarget::Entity(entity::project("platform"));
@@ -295,9 +295,9 @@ async fn connector_real_wheelhouse_ingress() {
     lifecycle(Some(WheelhouseHttpSink::new(socket))).await;
 }
 
-fn forge_named(service: &str) -> flotilla_address::Forge {
-    match service {
-        "github" | "github.com" => flotilla_address::Forge::github(),
-        other => flotilla_address::Forge::new(other, flotilla_address::ForgeKind::Forgejo).expect("a valid forge id"),
-    }
+fn cr_entity(service: &str, scope: impl AsRef<str>, number: impl AsRef<str>) -> flotilla_manifest::wire::EntityRef {
+    let address =
+        flotilla_resources::address::stored_change_request_address(service, scope.as_ref(), number.as_ref().parse().expect("number"), &[])
+            .expect("a resolvable service");
+    flotilla_manifest::entity::change_request(&address)
 }

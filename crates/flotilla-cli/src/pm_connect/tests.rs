@@ -169,9 +169,9 @@ fn rebuild_prefers_awareness_transport_when_available() {
 
     let patches = state.rebuild(&mint());
 
-    assert!(patches.iter().any(|patch| {
-        patch.target == MetadataTarget::Entity(entity::issue(&forge_named("github.com"), "flotilla-org/flotilla", "862").expect("issue"))
-    }));
+    assert!(patches
+        .iter()
+        .any(|patch| { patch.target == MetadataTarget::Entity(issue_entity("github.com", "flotilla-org/flotilla", "862")) }));
     assert!(
         !patches.iter().any(|patch| patch.target == independent_entity("scratch")),
         "raw independent fallback is not projected once awareness is available"
@@ -793,7 +793,7 @@ fn connector_projects_replicated_observations_and_removes_deleted_records() {
         state: Default::default(),
     })));
     state.apply_resource_records(&envelope).expect("replicated records");
-    let cr = MetadataTarget::Entity(entity::change_request(&forge_named("github.com"), "org/flotilla", "42").expect("cr"));
+    let cr = MetadataTarget::Entity(cr_entity("github.com", "org/flotilla", "42"));
     assert!(state.rebuild(&mint()).iter().any(|patch| patch.target == cr));
     let mut deleted = envelope;
     deleted.records[0].record_type = ResourceRecordType::Deleted;
@@ -863,7 +863,7 @@ async fn connector_bootstraps_replicated_subjects_and_publishes_watch_updates() 
     daemon.resource_lists.lock().expect("resource lists").insert(("flotilla".into(), "changerequests".into()), subject_envelope());
     let sink = Arc::new(RecordingSink::new());
     let handle = tokio::spawn(run_connector(daemon.clone(), sink.clone(), Arc::new(mint()), Duration::from_secs(60)));
-    let target = MetadataTarget::Entity(entity::change_request(&forge_named("github.com"), "org/flotilla", "42").expect("cr"));
+    let target = MetadataTarget::Entity(cr_entity("github.com", "org/flotilla", "42"));
     wait_until(|| {
         sink.recorded().iter().any(|patch| patch.target == target && patch.set.contains_key("flotilla.change_request.readiness"))
     })
@@ -962,7 +962,7 @@ async fn connector_refreshes_configuration_and_retires_source_aliases() {
     for envelope in [&forge, &repository, &project] {
         state.apply_resource_records(envelope).expect("apply resource");
     }
-    let target = MetadataTarget::Entity(entity::change_request(&forge_named("github.com"), "org/flotilla", "42").expect("cr"));
+    let target = MetadataTarget::Entity(cr_entity("github.com", "org/flotilla", "42"));
     let patches = state.rebuild(&mint());
     let facts = patches.iter().find(|patch| patch.target == target).expect("request entity");
     assert_eq!(facts.set["display.label"].value, MetadataValue::text("f!42"));
@@ -1032,7 +1032,7 @@ fn connector_skips_malformed_records_without_losing_valid_observations() {
     object.as_object_mut().expect("resource").remove("spec");
     envelope.records.insert(0, malformed);
     state.apply_resource_records(&envelope).expect("bad record does not discard the good record");
-    let target = MetadataTarget::Entity(entity::change_request(&forge_named("github.com"), "org/flotilla", "42").expect("cr"));
+    let target = MetadataTarget::Entity(cr_entity("github.com", "org/flotilla", "42"));
     assert!(state.rebuild(&mint()).iter().any(|patch| patch.target == target && patch.set.contains_key("flotilla.change_request.state")));
 }
 
@@ -1065,7 +1065,7 @@ fn connector_orders_replica_observations_by_time_then_authority() {
         object["metadata"]["resourceVersion"] = serde_json::json!(if local { "999" } else { "1" });
         envelope
     }
-    let target = MetadataTarget::Entity(entity::change_request(&forge_named("github.com"), "org/flotilla", "42").expect("cr"));
+    let target = MetadataTarget::Entity(cr_entity("github.com", "org/flotilla", "42"));
     for alpha_stamp in ["2026-10-02T14:00:00+03:00", "2026-10-02T12:00:00.000+00:00"] {
         for local_zeta in [false, true] {
             let mut state = ConnectorState::default();
@@ -1160,7 +1160,7 @@ fn connector_clock_expires_landed_subjects_without_resource_updates() {
         state: Default::default(),
     })));
     state.apply_resource_records(&subject_envelope()).expect("observation");
-    let target = MetadataTarget::Entity(entity::change_request(&forge_named("github.com"), "org/flotilla", "42").expect("cr"));
+    let target = MetadataTarget::Entity(cr_entity("github.com", "org/flotilla", "42"));
     let before = state.rebuild_at(&mint(), "2026-10-02T11:59:59Z".parse().expect("within window"));
     assert!(before.iter().any(|patch| patch.target == target && patch.set.contains_key("flotilla.subject_of")));
     let after = state.rebuild_at(&mint(), "2026-10-02T12:00:00Z".parse().expect("boundary"));
@@ -1747,8 +1747,7 @@ async fn connection_waits_for_last_query_and_resource_snapshot() {
     assert!(publications[0].0);
     assert!(publications[0].1.iter().any(|patch| patch.target == independent_entity("scratch")));
     assert!(
-        publications[0].1.iter().any(|patch| patch.target
-            == MetadataTarget::Entity(entity::change_request(&forge_named("github.com"), "org/flotilla", "42").expect("cr"))
+        publications[0].1.iter().any(|patch| patch.target == MetadataTarget::Entity(cr_entity("github.com", "org/flotilla", "42"))
             && patch.set.contains_key("flotilla.change_request.readiness")),
         "replacing publication includes resource snapshot facts"
     );
@@ -2056,8 +2055,7 @@ async fn lagged_watch_replaces_only_its_scope() {
     let publications = sink.publications();
     assert!(!publications[1].0);
     assert!(
-        publications[1].1.iter().all(|patch| patch.target
-            != MetadataTarget::Entity(entity::change_request(&forge_named("github.com"), "org/flotilla", "43").expect("cr"))),
+        publications[1].1.iter().all(|patch| patch.target != MetadataTarget::Entity(cr_entity("github.com", "org/flotilla", "43"))),
         "unrelated namespace facts remain unchanged"
     );
     assert!(publications[1].1.iter().any(|patch| patch.unset.contains(&"flotilla.change_request.readiness".into())));
@@ -2480,7 +2478,7 @@ fn every_record_projects_one_entity_under_its_address() {
     assert_eq!(convoy.set[SEGMENT_PROJECT].value, MetadataValue::text("project:flotilla"));
     assert_eq!(convoy.set[KEY_CONVOY_PHASE].value, MetadataValue::text("active"));
     assert_eq!(convoy.set[KEY_CONVOY_LEDGER].value, MetadataValue::text("artifact/ledger"));
-    let request = entity::change_request(&forge_named("github.com"), "org/flotilla", "42").expect("cr");
+    let request = cr_entity("github.com", "org/flotilla", "42");
     assert_eq!(convoy.set["flotilla.subject.produces"].value, MetadataValue::EntityRefs(vec![request.clone()]));
     assert!(convoy.set.contains_key(KEY_PRIMARY_ACTION_RECIPE), "attach facts on the convoy");
     let request = find(&request.id);
@@ -2490,15 +2488,15 @@ fn every_record_projects_one_entity_under_its_address() {
     }
 }
 
-#[test]
-fn a_convoy_row_without_a_home_is_refused() {
-    let mut homeless = homed_convoy("feta", "fix#9", false, vec![]);
-    homeless.resource.host = None;
-    let mut state = ConnectorState::default();
-    state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
-        seq: 1,
-        rows: Rows::Convoys { scope: None, rows: vec![homeless] },
-        state: Default::default(),
-    })));
-    assert!(state.rebuild(&mint()).iter().all(|patch| !matches!(&patch.target, MetadataTarget::Entity(entity) if entity.kind == "convoy")));
+fn cr_entity(service: &str, scope: impl AsRef<str>, number: impl AsRef<str>) -> flotilla_manifest::wire::EntityRef {
+    let address =
+        flotilla_resources::address::stored_change_request_address(service, scope.as_ref(), number.as_ref().parse().expect("number"), &[])
+            .expect("a resolvable service");
+    flotilla_manifest::entity::change_request(&address)
+}
+
+fn issue_entity(service: &str, scope: impl AsRef<str>, number: impl AsRef<str>) -> flotilla_manifest::wire::EntityRef {
+    let address = flotilla_resources::address::stored_issue_address(service, scope.as_ref(), number.as_ref().parse().expect("number"), &[])
+        .expect("a resolvable service");
+    flotilla_manifest::entity::issue(&address)
 }

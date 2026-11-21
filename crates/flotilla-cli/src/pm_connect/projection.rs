@@ -381,7 +381,6 @@ impl Projection {
     }
 }
 
-/// The convoy an awareness entry's typed ref names. The entry id is an opaque key.
 /// The convoy a convoy-grouped awareness node's typed ref names.
 pub(super) fn node_links(node: &AwarenessNode) -> Vec<Dependency> {
     match node.refs.first() {
@@ -392,6 +391,7 @@ pub(super) fn node_links(node: &AwarenessNode) -> Vec<Dependency> {
     }
 }
 
+/// The convoy an awareness entry's typed ref names. The entry id is an opaque key.
 pub(super) fn entry_links(entry: &flotilla_protocol::AwarenessEntry) -> Vec<Dependency> {
     match entry.refs.first() {
         Some(reference) if reference.kind == "Convoy" => vec![Dependency::Convoy(reference.namespace.clone(), reference.name.clone())],

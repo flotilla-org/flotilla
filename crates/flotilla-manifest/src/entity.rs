@@ -85,17 +85,14 @@ pub fn vessel(home: &str, launch: &str, vessel_name: &str) -> EntityRef {
     EntityRef::new("vessel", address.to_string())
 }
 
-/// An issue: `forge:<id>/repo:<owner/repo>/issue:<number>`. `None` when the
-/// scope or number is not one the address grammar admits.
-pub fn issue(forge: &Forge, scope: &str, number: &str) -> Option<EntityRef> {
-    let number = number.parse().ok()?;
-    Some(EntityRef::new("issue", Address::issue(forge, scope, number).ok()?.to_string()))
+/// An issue by its address: `forge:<id>/repo:<owner/repo>/issue:<number>`.
+pub fn issue(address: &Address) -> EntityRef {
+    EntityRef::new("issue", address.to_string())
 }
 
-/// A forge-relative change request: `forge:<id>/repo:<owner/repo>/cr:<number>`.
-pub fn change_request(forge: &Forge, scope: &str, number: &str) -> Option<EntityRef> {
-    let number = number.parse().ok()?;
-    Some(EntityRef::new("change_request", Address::change_request(forge, scope, number).ok()?.to_string()))
+/// A forge-relative change request by its address: `forge:<id>/repo:<owner/repo>/cr:<number>`.
+pub fn change_request(address: &Address) -> EntityRef {
+    EntityRef::new("change_request", address.to_string())
 }
 
 pub fn forge(forge: &Forge) -> EntityRef {
@@ -119,14 +116,10 @@ mod tests {
         assert_eq!(role("ghostty", "governor").id, "project:ghostty/role:governor");
         assert_eq!(project("flotilla").id, "project:flotilla");
         let github = Forge::github();
-        assert_eq!(
-            change_request(&github, "flotilla-org/flotilla", "4407").expect("cr").id,
-            "forge:github/repo:flotilla-org%2Fflotilla/cr:4407"
-        );
-        assert_eq!(
-            issue(&github, "flotilla-org/flotilla", "4406").expect("issue").id,
-            "forge:github/repo:flotilla-org%2Fflotilla/issue:4406"
-        );
+        let cr = Address::change_request(&github, "flotilla-org/flotilla", 4407).expect("address");
+        assert_eq!(change_request(&cr).id, "forge:github/repo:flotilla-org%2Fflotilla/cr:4407");
+        let issue_address = Address::issue(&github, "flotilla-org/flotilla", 4406).expect("address");
+        assert_eq!(issue(&issue_address).id, "forge:github/repo:flotilla-org%2Fflotilla/issue:4406");
         assert_eq!(forge(&github).id, "forge:github");
         assert_eq!(repo("github.com:flotilla-org/flotilla").id, "github.com:flotilla-org/flotilla");
         assert_eq!(session("feta/dev/terminal-coder").id, "feta/dev/terminal-coder");

@@ -15,8 +15,8 @@ use flotilla_protocol::{
     EnvironmentKind, HostName, ReferenceContext, ViewAddress,
 };
 use flotilla_resources::{
-    ChangeRequest, ChangeRequestStatus, Forge, Issue, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
-    ObservedReviewDecision, ResourceObject,
+    ChangeRequest, ChangeRequestStatus, Forge, ForgeSpec, Issue, Observation, ObservedChangeRequestState, ObservedChecks,
+    ObservedMergeability, ObservedReviewDecision, ResourceObject,
 };
 
 use crate::{
@@ -427,10 +427,11 @@ pub fn project_catalog_fragment(
     headers: &BTreeMap<String, usize>,
 ) -> Catalog {
     let mut catalog = Catalog { ttl_ms, ..Catalog::default() };
-    let forges = input.subjects.map_or(&[][..], |subjects| subjects.forges.as_slice());
+    let forges: Vec<ForgeSpec> =
+        input.subjects.map_or_else(Vec::new, |subjects| subjects.forges.iter().map(|forge| forge.spec.clone()).collect());
     if let Some(nodes) = input.awareness {
         for node in nodes {
-            project_awareness_node(&mut catalog, node, input.convoys, forges, mint, headers.get(&node.id).copied());
+            project_awareness_node(&mut catalog, node, input.convoys, &forges, mint, headers.get(&node.id).copied());
         }
         project_readiness(&mut catalog, input.convoys);
         mark_superseded_convoys(&mut catalog, input.convoys);
@@ -660,7 +661,7 @@ fn project_awareness_node(
     catalog: &mut Catalog,
     node: &AwarenessNode,
     convoys: &[ConvoyRow],
-    forges: &[ResourceObject<Forge>],
+    forges: &[ForgeSpec],
     mint: &dyn RecipeMint,
     visible: Option<usize>,
 ) {
@@ -741,7 +742,7 @@ fn project_awareness_entry(
     parent: &[(&'static str, MetadataValue)],
     entry: &AwarenessEntry,
     convoys: &[ConvoyRow],
-    forges: &[ResourceObject<Forge>],
+    forges: &[ForgeSpec],
     mint: &dyn RecipeMint,
 ) {
     let repo = entry.annotations.get(SEGMENT_REPO).cloned();
@@ -795,7 +796,7 @@ fn project_awareness_entry(
 fn awareness_entry_entity(
     entry: &AwarenessEntry,
     convoys: &[ConvoyRow],
-    forges: &[ResourceObject<Forge>],
+    forges: &[ForgeSpec],
 ) -> Option<(EntityRef, Vec<(&'static str, MetadataValue)>)> {
     let mut label = entry.label.clone();
     let (entity, facts) = match entry.kind {
@@ -830,8 +831,7 @@ fn awareness_entry_entity(
         }
         AwarenessKind::Issue => {
             let issue = entry.issue_refs.first()?;
-            let entity = subjects::address_forge(forges, &issue.source.service)
-                .and_then(|forge| entity::issue(&forge, &issue.source.scope, &issue.id))?;
+            let entity = entity::issue(&flotilla_resources::address::issue_reference_address(issue, forges).ok()?);
             (entity.clone(), vec![(SEGMENT_ISSUE, MetadataValue::text(entity.id.clone()))])
         }
         AwarenessKind::Independent => {
