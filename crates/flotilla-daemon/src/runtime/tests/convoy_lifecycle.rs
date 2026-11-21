@@ -643,12 +643,16 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
 
     // B's checkout and its CR observations, decided records homed at B, reach A as B's log does.
     flotilla_provisioning_testkit::replicate_home(&checkout_home.service, "checkout-root", &decided);
-    let reconciler =
-        ConvoyReconciler::new(authority_daemon.lifecycle_reads(), Arc::clone(&engine_path), authority_daemon.crew_message_path())
-            .with_change_requests(
-                authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
-                authority_daemon.change_request_stale_after(),
-            );
+    let reconciler = ConvoyReconciler::new(
+        authority_daemon.lifecycle_reads(),
+        authority_daemon.host_records(),
+        Arc::clone(&engine_path),
+        authority_daemon.crew_message_path(),
+    )
+    .with_change_requests(
+        authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
+        authority_daemon.change_request_stale_after(),
+    );
     // Fresh replicated evidence settles it: the reconciler observes the branch's change request,
     // one edge a pass as the controller runs it, then delivers the launch.
     let mut current = convoys.get(&convoy_name).await.expect("get Landing convoy");

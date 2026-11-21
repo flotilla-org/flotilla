@@ -4,6 +4,7 @@ pub mod checkouts;
 pub mod clones;
 pub mod engine_backend;
 pub mod environments;
+pub mod hosts;
 pub mod image_build;
 mod memory_store;
 pub mod other_home;

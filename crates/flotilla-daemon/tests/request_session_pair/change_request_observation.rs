@@ -273,6 +273,7 @@ async fn remote_change_request_scenario(late_watcher: bool) {
     // engine, one edge a pass.
     let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(
         requester.lifecycle_reads(),
+        requester.host_records(),
         requester.convoy_engine_path(),
         requester.crew_message_path(),
     )

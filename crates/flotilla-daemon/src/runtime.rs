@@ -36,7 +36,7 @@ use flotilla_provisioning::checkout_runtime::ChangeRequestObservations;
 use flotilla_provisioning::engine::ProvisioningLifecycles;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
-use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Host, Repository, Resource, ResourceError, Vessel};
+use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Repository, Resource, ResourceError, Vessel};
 use flotilla_store::{
     controller::ControllerLoop,
     load_metrics::{attributed, caller, inherit_or, within, Attributed},
@@ -885,6 +885,7 @@ fn spawn_controller_loops(
                 let mut secondaries = ConvoyReconciler::secondary_watches(
                     &backend,
                     &namespace_string,
+                    daemon.host_records(),
                     daemon.convoy_engine_path(),
                     daemon.crew_message_path(),
                 );
@@ -898,21 +899,22 @@ fn spawn_controller_loops(
                 secondaries.push(Box::new(flotilla_provisioning::engine::vessel::VesselConvoyWake::new(service)));
                 (
                     secondaries,
-                    ConvoyReconciler::new(daemon.lifecycle_reads(), daemon.convoy_engine_path(), daemon.crew_message_path())
-                        .with_hosts(backend.including_replicas::<Host>(&namespace_string))
-                        .with_occupancy(backend.clone(), &namespace_string)
-                        .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))
-                        .with_forges(backend.definitions::<Forge>(&namespace_string))
-                        .with_change_requests(
-                            backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
-                            daemon.change_request_stale_after(),
-                        )
-                        .with_artifacts(backend.including_replicas::<flotilla_resources::Artifact>(&namespace_string))
-                        .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
-                        .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(
-                            backend.clone(),
-                            &namespace_string,
-                        )),
+                    ConvoyReconciler::new(
+                        daemon.lifecycle_reads(),
+                        daemon.host_records(),
+                        daemon.convoy_engine_path(),
+                        daemon.crew_message_path(),
+                    )
+                    .with_occupancy(backend.clone(), &namespace_string)
+                    .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))
+                    .with_forges(backend.definitions::<Forge>(&namespace_string))
+                    .with_change_requests(
+                        backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
+                        daemon.change_request_stale_after(),
+                    )
+                    .with_artifacts(backend.including_replicas::<flotilla_resources::Artifact>(&namespace_string))
+                    .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
+                    .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), &namespace_string)),
                 )
             }
         }),

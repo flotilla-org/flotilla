@@ -84,6 +84,7 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
         accounts,
         manifest_roots,
         standing_roles,
+        hosts,
     } = open_ports(&service, &own_host, identity.clock)?;
     Ok(ComposedEngine {
         service,
@@ -95,6 +96,7 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
         accounts,
         manifest_roots,
         standing_roles,
+        hosts,
     })
 }
 

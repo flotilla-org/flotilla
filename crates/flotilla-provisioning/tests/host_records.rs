@@ -437,3 +437,52 @@ async fn the_image_inventory_and_a_fulfilment_fact_written_together_both_stand()
     );
     assert_eq!(status.capabilities[IMAGE_DIGESTS_CAPABILITY], json!({"cache-a": ["sha256:c"]}), "the inventory stands");
 }
+
+// Behaviour (#4413): the planners' Host port reads one Host by name from the resident records, and
+// each change of a Host, its deletion among them, lands on the port's followers by name.
+#[tokio::test(start_paused = true)]
+async fn the_planners_read_a_host_by_name_and_hear_its_changes() {
+    use flotilla_resources::host_records::{HostChange, HostRecords};
+    let directory = tempfile::tempdir().expect("temp dir");
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::host::register(&mut kinds).expect("register");
+    let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
+    // The clock follows the runtime's paused time.
+    let records = Arc::new(EngineHosts::open(service, "kiwi".into(), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open"));
+    let _following = records.follow().expect("follow");
+    let mut changes = HostRecords::changes(records.as_ref());
+    let ssh = |max_vessels: u32| HostSpec {
+        display_name: "feta".into(),
+        connection: HostConnection::SshHost { owning_daemon: "kiwi".into(), destination: "crew@b1".into() },
+        max_vessels: Some(max_vessels),
+        ..HostSpec::default()
+    };
+    let apply = |spec: HostSpec| {
+        let records = Arc::clone(&records);
+        async move { records.apply("b1", None, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("apply") }
+    };
+    let changed = HostChange::Changed { name: "b1".into() };
+    let cap = || HostRecords::get(records.as_ref(), "b1").expect("read").map(|host| host.max_vessels);
+
+    assert_eq!(cap(), None);
+    apply(ssh(2)).await;
+    assert_eq!(heard(&mut changes).await, changed, "a new host is heard by its name");
+    assert_eq!(cap(), Some(Some(2)));
+    assert_eq!(HostRecords::get(records.as_ref(), "feta"), Ok(None), "a display name names no host");
+
+    apply(ssh(3)).await;
+    assert_eq!(heard(&mut changes).await, changed);
+    assert_eq!(cap(), Some(Some(3)));
+
+    records.delete("b1").await.expect("delete");
+    assert_eq!(heard(&mut changes).await, changed);
+    assert_eq!(cap(), None);
+}
+
+/// The next Host change the port tells, within a virtual minute: one that never comes fails the
+/// test rather than hanging it.
+async fn heard(
+    changes: &mut tokio::sync::broadcast::Receiver<flotilla_resources::host_records::HostChange>,
+) -> flotilla_resources::host_records::HostChange {
+    tokio::time::timeout(std::time::Duration::from_secs(60), changes.recv()).await.expect("a change within the bound").expect("a change")
+}

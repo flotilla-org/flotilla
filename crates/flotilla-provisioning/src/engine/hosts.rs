@@ -31,12 +31,13 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     engine_records::{CommitMark, KindRecords, LogPosition, PatchStatus, Record, Since, Ticks, UnloggedJournal, WriteError},
+    host_records::{HostChange, HostFacts, HostRecords, HOST_CHANGES},
     CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
     TRANSPORT_CAPABILITY,
 };
-use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
+use flotilla_schema::{reads, Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
 use serde_json::{json, Value};
@@ -100,6 +101,7 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Reads `name`'s records at `home` again.
 fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
     let host = match read.resolve(HOST, name, home)? {
         Some(id) => match read.load::<HostRecord>(id)? {
@@ -332,6 +334,8 @@ pub struct EngineHosts {
     commits: CommitsSeen,
     // One follower for every watcher of these records on this daemon.
     changes: SharedChanges,
+    /// What each refresh found changed, for the planners' wakes.
+    host_changes: tokio::sync::broadcast::Sender<HostChange>,
     /// Held across a write's read and its edit, so the observers at this home write one at a time.
     writing: tokio::sync::Mutex<()>,
     /// This run, which no change outside the log is counted in: a reading resumes only within it,
@@ -355,6 +359,7 @@ impl EngineHosts {
         let follower = Follower::new([HOST, OBSERVATION]);
         let opened = Self {
             changes: SharedChanges::new(Arc::clone(&service), [HOST, OBSERVATION], "hosts"),
+            host_changes: tokio::sync::broadcast::channel(HOST_CHANGES).0,
             commits: CommitsSeen::follow(&service, [HOST, OBSERVATION]),
             service,
             home,
@@ -389,30 +394,57 @@ impl EngineHosts {
         LogPosition { homes, unlogged: Some(self.unlogged.read()) }
     }
 
-    /// Brings the resident map up to the store: every entry written since the last refresh.
+    /// Brings the resident map up to the store: every entry written since the last refresh. Each
+    /// change it finds is told to [`HostRecords::changes`].
     fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
         let mut resident = locked(&self.resident);
         if !self.commits.take() {
             return Ok(resident);
         }
         let homes = self.service.homes();
-        {
+        let changed = {
             let Resident { follower, records } = &mut *resident;
             self.service
                 .with_store(|store| {
                     let mut read = store.read()?;
+                    let mut changed = Vec::new();
                     for followed in follower.pass(&mut read, &homes)? {
-                        match followed {
-                            Followed::Changed(identity) => reload(&mut read, records, &identity.name, &identity.home)?,
-                            Followed::Rescan(home) => rescan(&mut read, records, &home)?,
-                        }
+                        changed.push(match followed {
+                            Followed::Changed(identity) => {
+                                reload(&mut read, records, &identity.name, &identity.home)?;
+                                HostChange::Changed { name: identity.name }
+                            }
+                            Followed::Rescan(home) => {
+                                rescan(&mut read, records, &home)?;
+                                HostChange::Rescanned
+                            }
+                        });
                     }
-                    Ok(())
+                    Ok(changed)
                 })
                 .map_err(|error| error.to_string())
-                .inspect_err(|_| self.commits.give_back())?;
-        }
+                .inspect_err(|_| self.commits.give_back())?
+        };
+        // No follower is no reason to keep them: one may subscribe later.
+        changed.into_iter().for_each(|change| drop(self.host_changes.send(change)));
         Ok(resident)
+    }
+
+    /// Brings the resident map up to the store at each commit of the Host kinds, so
+    /// [`HostRecords::changes`] tells each change as it lands rather than at the next read. It
+    /// ends with the port.
+    pub fn follow(self: &Arc<Self>) -> Result<tokio::task::JoinHandle<()>, String> {
+        let mut commits = self.changes.subscribe().map_err(|error| error.to_string())?;
+        let hosts = Arc::downgrade(self);
+        Ok(tokio::spawn(reads::attributed(reads::caller("host follower"), async move {
+            while futures::StreamExt::next(&mut commits).await.is_some() {
+                let Some(hosts) = hosts.upgrade() else { return };
+                // A refresh that fails is tried again at the next commit, or the next read.
+                if let Err(error) = hosts.refresh().map(drop) {
+                    tracing::warn!(%error, "the hosts' changes could not be read from the log; retrying");
+                }
+            }
+        })))
     }
 
     fn now(&self) -> DateTime<Utc> {
@@ -686,6 +718,23 @@ impl KindRecords<Host> for EngineHosts {
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
         self.changes.subscribe().map_err(|error| error.to_string())
+    }
+}
+
+/// The planners' reads: one Host by name, from the resident map.
+impl HostRecords for EngineHosts {
+    fn get(&self, name: &str) -> Result<Option<HostFacts>, String> {
+        let resident = self.refresh()?;
+        Ok(resolve(&resident.records, &self.home, name).and_then(|(home, held)| self.object(name, home, held)).map(|host| HostFacts {
+            connection: host.spec.connection,
+            max_vessels: host.spec.max_vessels,
+            status: host.status,
+            name: host.name,
+        }))
+    }
+
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<HostChange> {
+        self.host_changes.subscribe()
     }
 }
 
