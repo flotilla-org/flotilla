@@ -356,24 +356,15 @@ impl ReconcilerWake {
         let mut inbox_changes = self.subscriptions.message_primitives().inbox_changes().map_err(|error| error.to_string())?;
         let mut agent_changes = self.subscriptions.inner.lifecycle_reads.agent_sessions().ok().and_then(|reads| reads.changes().ok());
         let clock = Arc::clone(&self.subscriptions.inner.clock);
-        let mut jumps = clock.jumps();
         let mut schedule = StallSchedule::default();
         self.sync_rows(&namespace, &convoy_objects).await?;
 
         loop {
             self.judge_scheduled(&namespace, &convoy_objects, clock.now(), &mut schedule).await?;
-            // Measured on the daemon's clock, again whenever that clock jumps.
+            // Measured on the daemon's clock.
             let due_wait = schedule.next_due().map(|due| (due - clock.now()).to_std().unwrap_or_default());
             tokio::select! {
                 () = tokio::time::sleep(due_wait.unwrap_or_default()), if due_wait.is_some() => {}
-                jumped = async {
-                    match jumps.as_mut() {
-                        Some(jumps) => jumps.changed().await,
-                        None => std::future::pending().await,
-                    }
-                } => if jumped.is_err() {
-                    jumps = None;
-                },
                 event = convoy_watch.recv() => {
                     let selected = match event {
                         Ok(Some(name)) => {
@@ -790,7 +781,7 @@ impl ReconcilerWake {
                         ceiling: RetryCeiling::default(),
                     },
                     freshness_demand: None,
-                    created_at: Utc::now(),
+                    created_at: flotilla_resources::clock::now(),
                     episode_key: EpisodeKeyFields::default(),
                 });
             }
@@ -806,7 +797,7 @@ impl ReconcilerWake {
                             watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
                             maker: maker.clone(),
                             freshness_demand: None,
-                            created_at: Utc::now(),
+                            created_at: flotilla_resources::clock::now(),
                             episode_key: EpisodeKeyFields::default(),
                         });
                     }
@@ -916,7 +907,7 @@ impl ReconcilerWake {
                                 watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
                                 maker: LeafMaker::Actor { vessel: vessel.clone(), role: role.clone() },
                                 freshness_demand: None,
-                                created_at: Utc::now(),
+                                created_at: flotilla_resources::clock::now(),
                                 episode_key: EpisodeKeyFields::default(),
                             });
                         }
@@ -951,7 +942,7 @@ impl ReconcilerWake {
                         },
                         maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
                         freshness_demand: None,
-                        created_at: Utc::now(),
+                        created_at: flotilla_resources::clock::now(),
                         episode_key: EpisodeKeyFields::default(),
                     });
                 }
@@ -983,7 +974,7 @@ impl ReconcilerWake {
                             watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
                             maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
                             freshness_demand: None,
-                            created_at: Utc::now(),
+                            created_at: flotilla_resources::clock::now(),
                             episode_key: EpisodeKeyFields::default(),
                         });
                     }
@@ -1126,8 +1117,8 @@ impl ReconcilerWake {
                             leaves: entry.leaves,
                             watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
                             maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
-                            freshness_demand: Some(Utc::now()),
-                            created_at: Utc::now(),
+                            freshness_demand: Some(flotilla_resources::clock::now()),
+                            created_at: flotilla_resources::clock::now(),
                             episode_key: EpisodeKeyFields::default(),
                         });
                     }
@@ -1163,7 +1154,7 @@ impl ReconcilerWake {
                     },
                     maker,
                     freshness_demand: Some(claim_at),
-                    created_at: Utc::now(),
+                    created_at: flotilla_resources::clock::now(),
                     episode_key: EpisodeKeyFields {
                         source: Some(delivery.source.clone()),
                         convoy: Some(convoy.metadata.name.clone()),

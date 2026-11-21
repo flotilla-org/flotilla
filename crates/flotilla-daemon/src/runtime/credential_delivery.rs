@@ -392,7 +392,7 @@ impl CredentialDelivery {
     /// next Codex login retry.
     async fn next_deadline(&self) -> Option<tokio::time::Instant> {
         let refresh = self.store.next_github_app_refresh_at().await.map(|at| {
-            let wait = (at - chrono::Utc::now()).to_std().unwrap_or_default();
+            let wait = (at - flotilla_resources::clock::now()).to_std().unwrap_or_default();
             tokio::time::Instant::now() + wait
         });
         // Failing environments only: the failures map holds no other.

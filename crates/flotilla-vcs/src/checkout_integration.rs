@@ -2,7 +2,6 @@
 use flotilla_resources::checkout_integration::{remote_ref_for_branch, CONVOY_ASSOCIATION_UNAVAILABLE};
 use std::{collections::BTreeMap, path::Path};
 
-use chrono::Utc;
 use flotilla_resources::{
     ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, ChangeRequestStatus, CheckoutIntegrationStatus, CheckoutSpec,
     ConditionValue, Convoy, CrewWorkPhase, IntegrationCondition, LandedEvidence, ObservedChangeRequestState, RemoteRefObservation,
@@ -137,7 +136,7 @@ async fn inspect_checkout_integration_with_association(
     observe_remote_ref: bool,
     recorded_landing: Option<ChangeRequestIntegrationInput<'_>>,
 ) -> CheckoutIntegrationStatus {
-    let observed_at = Utc::now().to_rfc3339();
+    let observed_at = flotilla_resources::clock::now().to_rfc3339();
     let clean = if matches!(spec, CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_some()) {
         let check = match checkout_path.to_str() {
             Some(path) => providers.vcs.local_clone_is_clean(path).await,

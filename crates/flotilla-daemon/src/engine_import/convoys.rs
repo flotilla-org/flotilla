@@ -58,7 +58,7 @@ pub(super) fn launch_numbers(_: &Source, target: &mut Import, carried: &mut Carr
         }
     }
     let highest = carried.convoy_launches.highest(&home);
-    let now = NewChange::new(IMPORT_WRITER, Timestamp::from_datetime(&chrono::Utc::now()));
+    let now = NewChange::new(IMPORT_WRITER, Timestamp::from_datetime(&flotilla_resources::clock::now()));
     match target.raise_launches(&home, highest, &now) {
         Ok(()) => report.tally(KIND, format!("launch numbers raised to {highest}")),
         Err(reason) => report.refused.push(ImportRefusal { kind: KIND, record: "<launch numbers>".to_owned(), reason }),

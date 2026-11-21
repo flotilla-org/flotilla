@@ -103,7 +103,7 @@ impl EngineMessagesHome {
     /// confirmed, the way the daemon's delivery records one: the session registered and bound to
     /// the message's inbox, then its receipt, then its deliver.
     pub async fn deliver_turn(&self, receiver: &str, record: &str, session: &str) {
-        deliver_turn(&self.primitives, &self.namespace, receiver, record, session, chrono::Utc::now()).await;
+        deliver_turn(&self.primitives, &self.namespace, receiver, record, session, flotilla_resources::clock::now()).await;
     }
 
     /// Every message this home holds, in the old shape the crew reads: listed by the generic
@@ -114,7 +114,7 @@ impl EngineMessagesHome {
 
     /// One sweep of this home's open messages, now, on from what `open` followed.
     pub async fn sweep(&self, open: &mut OpenMessages) -> Result<SweepReport, String> {
-        self.primitives.sweep(&self.namespace, Timestamp::from_datetime(&chrono::Utc::now()), open).await
+        self.primitives.sweep(&self.namespace, Timestamp::from_datetime(&flotilla_resources::clock::now()), open).await
     }
 
     /// The path as the crew's Message port.

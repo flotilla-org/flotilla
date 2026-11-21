@@ -49,6 +49,8 @@ pub struct DummyFleet {
     command_error_samples: Mutex<Vec<String>>,
     /// Submissions the pools were asked for, numbering each attempt's refusal draw.
     pub(crate) submissions: AtomicU64,
+    /// Moves with each change the fleet records.
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl DummyFleet {
@@ -122,6 +124,7 @@ impl DummyFleet {
                 counters: Counters::default(),
                 command_error_samples: Mutex::default(),
                 submissions: AtomicU64::new(0),
+                changes: tokio::sync::watch::Sender::new(0),
             }
         })
     }
@@ -157,6 +160,12 @@ impl DummyFleet {
 
     pub(crate) fn record(&self, event: &Event) {
         self.journal.record(event);
+        self.changes.send_modify(|changes| *changes += 1);
+    }
+
+    /// Changes as the fleet records them: each one its vendors, forge, crews or counters make.
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     /// Apply an event a previous process's fleet recorded.

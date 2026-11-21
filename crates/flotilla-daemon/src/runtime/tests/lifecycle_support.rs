@@ -758,7 +758,7 @@ pub(super) async fn record_successful_empty_branch_scan(daemon: &InProcessDaemon
         &daemon.convoy_engine_path(),
         &daemon.resource_backend().using::<Convoy>(NAMESPACE),
         convoy,
-        &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: chrono::Utc::now() },
+        &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: flotilla_resources::clock::now() },
     )
     .await
     .expect("record empty branch discovery for test provider");

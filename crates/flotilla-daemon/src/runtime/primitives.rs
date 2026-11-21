@@ -326,7 +326,7 @@ impl MessageDelivery {
         if wait.is_some() {
             return Ok(None);
         }
-        let now = Timestamp::from_datetime(&Utc::now());
+        let now = Timestamp::from_datetime(&flotilla_resources::clock::now());
         // Receipts first: a turn confirmed before its session's teardown records
         // its receipt before rebind unbinds and ends that session (#3894).
         let collected = self.collect_turns(false).instrument(info_span!("message_delivery.collect_turns")).await;
@@ -372,7 +372,7 @@ impl MessageDelivery {
         }
         self.show_held_turns();
         let until = |at: Timestamp| Duration::from_micros(u64::try_from(at.since(now)).unwrap_or(0));
-        let held = self.held.next_expiry().map(|at| at.saturating_duration_since(std::time::Instant::now()));
+        let held = self.held.next_expiry().map(|at| at.saturating_duration_since(tokio::time::Instant::now()));
         Ok([report.next_due.map(until), awaiting_next.map(until), held].into_iter().flatten().min())
     }
 
@@ -383,7 +383,10 @@ impl MessageDelivery {
         let inbox = flotilla_engine_messages::roles::checkout_inspector(self.primitives.home())?;
         let consumer = self
             .primitives
-            .register_service(flotilla_engine_messages::roles::CHECKOUT_INSPECTOR, Timestamp::from_datetime(&Utc::now()))
+            .register_service(
+                flotilla_engine_messages::roles::CHECKOUT_INSPECTOR,
+                Timestamp::from_datetime(&flotilla_resources::clock::now()),
+            )
             .await?;
         Ok((inbox, consumer))
     }
@@ -551,7 +554,7 @@ impl MessageDelivery {
                 // Typed, but no stable busy signal followed: held, never retyped, until the agent's
                 // record confirms it or the hold runs out.
                 Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)) => {
-                    let until = std::time::Instant::now()
+                    let until = tokio::time::Instant::now()
                         + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
                     info!(%session, messages = ?turn.members, submitted_at = %turn.submitted_at, "a turn typed without confirmation is held");
                     self.held.hold(turn.members.iter().cloned(), until);
@@ -564,7 +567,7 @@ impl MessageDelivery {
                     let mut turn = turn;
                     turn.submitted_at = typed_at.unwrap_or(turn.submitted_at);
                     let left = (turn.submitted_at + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR) - self.state.daemon.clock().now();
-                    let until = std::time::Instant::now() + left.to_std().unwrap_or_default();
+                    let until = tokio::time::Instant::now() + left.to_std().unwrap_or_default();
                     info!(%session, messages = ?turn.members, submitted_at = %turn.submitted_at, "a turn typed before this daemon started is held");
                     self.held.hold(turn.members.iter().cloned(), until);
                     self.held_turns.push(turn);
@@ -574,7 +577,7 @@ impl MessageDelivery {
                 Err(error) => debug!(%session, %error, "engine turn delivery did not complete"),
             }
         }
-        for message in self.held.expire(std::time::Instant::now()) {
+        for message in self.held.expire(tokio::time::Instant::now()) {
             warn!(message_id = %message, "a held turn's hold ran out unconfirmed; it may be typed again");
         }
         settled
@@ -700,7 +703,8 @@ impl MessageDelivery {
             return;
         }
         // A turn confirmed at once was never held: its hold starts now.
-        let until = std::time::Instant::now() + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
+        let until =
+            tokio::time::Instant::now() + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
         self.held.hold(refused.iter().filter(|message| !self.held.is_held(message)).cloned().collect::<Vec<_>>(), until);
         turn.members = refused;
         turn.confirmed = true;

@@ -122,7 +122,7 @@ impl flotilla_issue_tracker::IssueProvider for ForgejoIssueProvider {
             query.push(("q", search.clone()));
         }
         let (value, has_more) = self.forge.get_json(&format!("repos/{}/issues", source.scope), &query).await?;
-        let fetched_at = Utc::now();
+        let fetched_at = flotilla_resources::clock::now();
         let raw_items = value.as_array().ok_or("Forgejo issue list response was not an array")?;
         let items = raw_items
             .iter()
@@ -135,7 +135,8 @@ impl flotilla_issue_tracker::IssueProvider for ForgejoIssueProvider {
 
     async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String> {
         let (value, _) = self.forge.get_json(&format!("repos/{}/issues/{}", reference.source.scope, reference.id), &[]).await?;
-        parse_issue(&reference.source, &value, Utc::now()).ok_or_else(|| format!("failed to parse Forgejo issue {}", reference.id))
+        parse_issue(&reference.source, &value, flotilla_resources::clock::now())
+            .ok_or_else(|| format!("failed to parse Forgejo issue {}", reference.id))
     }
 
     async fn list_changed_since(&self, source: &IssueSource, since: &str, count: usize) -> Result<IssueChangeset, String> {
@@ -148,7 +149,7 @@ impl flotilla_issue_tracker::IssueProvider for ForgejoIssueProvider {
             ("limit", limit.to_string()),
         ];
         let (value, has_more) = self.forge.get_json(&format!("repos/{}/issues", source.scope), &query).await?;
-        let fetched_at = Utc::now();
+        let fetched_at = flotilla_resources::clock::now();
         let raw_items = value.as_array().ok_or("Forgejo changed-since response was not an array")?;
         let mut updated = Vec::new();
         let mut closed = Vec::new();

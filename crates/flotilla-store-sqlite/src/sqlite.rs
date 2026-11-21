@@ -21,6 +21,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
+use flotilla_resources::clock::busy;
 use flotilla_resources::{Convoy, ReadResourceObject, ReplicaCursor, Resource, ResourceProvenance};
 use flotilla_resources::{ResourceList, ResourceTombstone, WatchEvent, WatchStart};
 use futures::{stream, StreamExt};
@@ -459,6 +460,8 @@ impl SqliteBackend {
     }
 
     pub async fn open_async(path: impl AsRef<Path>) -> Result<Self, ResourceError> {
+        // Each connection's work runs on its own thread, which the runtime cannot see.
+        let _busy = busy();
         let connection = Connection::open(&path).await.map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
         let mut backend = Self::from_async_connection(connection, EventRetention::default()).await?;
         let started = Instant::now();
@@ -525,6 +528,7 @@ impl SqliteBackend {
     }
 
     async fn from_async_connection(connection: Connection, event_retention: EventRetention) -> Result<Self, ResourceError> {
+        let _busy = busy();
         let writer_meter = connection
             .call(move |connection| {
                 let meter = statements::configure(connection).map_err(|err| Self::map_sqlite(err, "configure sqlite writer statements"))?;
@@ -1318,6 +1322,8 @@ impl SqliteBackend {
         let depth = DepthClaim::new(self.writer_depth.clone());
         let meter = Arc::clone(&self.writer_meter);
         let load_metrics = Arc::clone(&self.load_metrics);
+        // The connection's thread works where the runtime cannot see it.
+        let _busy = busy();
         self.connection
             .call(move |connection| {
                 let queue_wait = started.elapsed();
@@ -1390,6 +1396,7 @@ impl SqliteBackend {
             let meter = Arc::clone(self.reader_meters.get(index).unwrap_or(&self.writer_meter));
             let load_metrics = Arc::clone(&self.load_metrics);
             let read_warnings = self.read_warnings.clone();
+            let _busy = busy();
             connection
                 .call(move |connection| {
                     let _lease = lease;
@@ -1589,7 +1596,7 @@ impl SqliteBackend {
                 Ok(ResourceEventDecodeQuarantine { kind: resource_kind, namespace, name, event_version, error, quarantined_at })
             })
             .collect::<Result<Vec<_>, ResourceError>>()?;
-        let cutoff = (Utc::now() - chrono::Duration::hours(FIELD_OWNERSHIP_VIOLATION_TTL_HOURS)).to_rfc3339();
+        let cutoff = (flotilla_resources::clock::now() - chrono::Duration::hours(FIELD_OWNERSHIP_VIOLATION_TTL_HOURS)).to_rfc3339();
         connection
             .execute_cached("DELETE FROM field_ownership_violations WHERE unixepoch(observed_at) < unixepoch(?1)", [cutoff])
             .map_err(|err| Self::map_sqlite(err, "expire field ownership violations"))?;
@@ -2451,7 +2458,7 @@ impl SqliteBackend {
                     ON CONFLICT(origin_root,group_name,version,kind,namespace,name) DO UPDATE SET
                     body_json=excluded.body_json,event_type=excluded.event_type,last_synced_at=excluded.last_synced_at,error=excluded.error,quarantined_at=CASE WHEN replica_apply_quarantine.body_json=excluded.body_json THEN replica_apply_quarantine.quarantined_at ELSE excluded.quarantined_at END
                     WHERE replica_apply_quarantine.body_json<>excluded.body_json OR replica_apply_quarantine.error<>excluded.error",
-                    params![origin,key.0,key.1,key.2,key.3,mutation.name,mutation.value.to_string(),event_type,mutation.synced_at.to_rfc3339(),error.to_string(),Utc::now().to_rfc3339()])
+                    params![origin,key.0,key.1,key.2,key.3,mutation.name,mutation.value.to_string(),event_type,mutation.synced_at.to_rfc3339(),error.to_string(),flotilla_resources::clock::now().to_rfc3339()])
                     .map_err(|err| Self::map_sqlite(err, "quarantine rejected replica"))?;
                 if changed != 0 {
                     tracing::warn!(%origin, kind=%key.2, namespace=%key.3, name=%mutation.name, %error, "quarantined rejected replica; continuing batch");
@@ -2660,7 +2667,7 @@ impl SqliteBackend {
         let (invalid, failures) = failures;
         if !invalid.is_empty() {
             self.cleanup_call(quarantine_key.clone(), "quarantine invalid resource", move |connection| {
-                let quarantined_at = Utc::now();
+                let quarantined_at = flotilla_resources::clock::now();
                 let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource decode quarantine"))?;
                 for (name, body, error) in &invalid {
                     let unchanged = tx
@@ -2802,7 +2809,7 @@ impl SqliteBackend {
                     owner_references: meta.owner_references.clone(),
                     finalizers: meta.finalizers.clone(),
                     deletion_timestamp: meta.deletion_timestamp,
-                    creation_timestamp: Utc::now(),
+                    creation_timestamp: flotilla_resources::clock::now(),
                     merge,
                 },
                 spec: Self::clone_through_serde(&spec)?,
@@ -2988,7 +2995,7 @@ impl SqliteBackend {
             object.metadata.resource_version = version.to_string();
 
             let (event_kind, encoded) = if !object.metadata.finalizers.is_empty() && object.metadata.deletion_timestamp.is_none() {
-                object.metadata.deletion_timestamp = Some(Utc::now());
+                object.metadata.deletion_timestamp = Some(flotilla_resources::clock::now());
                 let encoded = Self::encode_object(resource_kind, &object)?;
                 let body_json =
                     serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
@@ -3443,7 +3450,7 @@ impl SqliteBackend {
     /// Record undecodable replayed events. An event compaction removed after
     /// the reader saw it is skipped: compaction also retires its quarantine.
     fn persist_replay_failures(conn: &mut RusqliteConnection, key: &StoreKey, failures: &[ReplayFailure]) -> Result<(), ResourceError> {
-        let quarantined_at = Utc::now().to_rfc3339();
+        let quarantined_at = flotilla_resources::clock::now().to_rfc3339();
         let tx = conn.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource event decode quarantine"))?;
         let compacted_through = Self::compaction_floor(&tx, key)?;
         for failure in failures.iter().filter(|failure| failure.event_version > compacted_through) {

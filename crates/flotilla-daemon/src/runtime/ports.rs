@@ -182,7 +182,7 @@ impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
                     Arc::strong_count(entry) > 1
                         || entry.try_lock().map_or(true, |lookup| {
                             lookup.success.as_ref().is_some_and(|(expires, _)| *expires > now)
-                                || lookup.retry_at.is_some_and(|at| at > Utc::now())
+                                || lookup.retry_at.is_some_and(|at| at > flotilla_resources::clock::now())
                         })
                 });
                 cache.last_prune = Some(now);
@@ -194,7 +194,7 @@ impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
             return Ok(Some(branch.clone()));
         }
         lookup.success = None;
-        if let Some(retry_at) = lookup.retry_at.filter(|at| *at > Utc::now()) {
+        if let Some(retry_at) = lookup.retry_at.filter(|at| *at > flotilla_resources::clock::now()) {
             return Err(format!("github rate limited (budget=REST core, identity=host gh login, retry_at={})", retry_at.to_rfc3339()));
         }
         lookup.retry_at = None;

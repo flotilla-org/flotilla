@@ -249,7 +249,7 @@ mod tests {
             for (vessel, state) in convoy.vessels.iter().enumerate() {
                 let Some(tearing_down) = state else { continue };
                 let mut metadata = meta(&format!("{name}-v{vessel}"), index as i64);
-                metadata.deletion_timestamp = tearing_down.then(Utc::now);
+                metadata.deletion_timestamp = tearing_down.then(crate::clock::now);
                 vessels.push(ResourceObject {
                     metadata,
                     spec: VesselSpec {

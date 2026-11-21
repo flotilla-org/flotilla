@@ -118,7 +118,7 @@ impl IssuePollingHealth {
             .expect("issue polling health lock poisoned")
             .current
             .as_ref()
-            .and_then(|(reset, message)| (*reset > Utc::now()).then(|| message.clone()))
+            .and_then(|(reset, message)| (*reset > flotilla_resources::clock::now()).then(|| message.clone()))
     }
 
     pub fn condition(&self) -> Option<HostCondition> {
@@ -129,7 +129,7 @@ impl IssuePollingHealth {
                 .value(ConditionValue::False)
                 .reason("LowRemainingBudget")
                 .message(message)
-                .observed_at(Utc::now())
+                .observed_at(flotilla_resources::clock::now())
                 .blocks_readiness(false)
                 // Budget backoff is source-scoped; it does not withdraw every forge on this host.
                 .blocks_forge_observation(false)
@@ -284,7 +284,7 @@ impl SharedIssueRefresh {
                 return Ok((cached.cursor.clone(), result));
             }
         }
-        let cursor = Utc::now().to_rfc3339();
+        let cursor = flotilla_resources::clock::now().to_rfc3339();
         let result = provider.query(source, params, page, PAGE_SIZE).await?;
         if let Some(mut previous) = previous {
             let mut current = result.clone();
@@ -393,7 +393,7 @@ impl SharedIssueRefresh {
             }
         }
         let oldest = entry.cursors.lock().expect("shared issue cursors lock poisoned").values().min().copied().unwrap_or(since_time);
-        let next_cursor = Utc::now();
+        let next_cursor = flotilla_resources::clock::now();
         let result = provider.list_changed_since(source, &oldest.to_rfc3339(), PAGE_SIZE).await;
         match &result {
             Ok(changes) => {
@@ -528,7 +528,7 @@ impl MaterializedWindow {
 }
 
 fn suspension_deadline(query: &QueryId, reset: chrono::DateTime<Utc>) -> tokio::time::Instant {
-    let until_reset = reset.signed_duration_since(Utc::now()).to_std().unwrap_or(Duration::ZERO);
+    let until_reset = reset.signed_duration_since(flotilla_resources::clock::now()).to_std().unwrap_or(Duration::ZERO);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     query.hash(&mut hasher);
     let jitter = Duration::from_secs(1 + hasher.finish() % MAX_RATE_LIMIT_JITTER.as_secs());
@@ -631,7 +631,7 @@ async fn load_window(
             let provider = resolver.issue_provider_for(&source).await.map_err(|message| unavailable(Some(source.clone()), message))?;
             // Capture before the request. Re-reading changes is safe; skipping an
             // update that arrived during the request is not.
-            let refresh_cursor = Utc::now().to_rfc3339();
+            let refresh_cursor = flotilla_resources::clock::now().to_rfc3339();
             shared_refresh.register(&source, query, &refresh_cursor, &provider);
             let (refresh_cursor, page) = shared_refresh
                 .page(&source, &params, 1, &provider, state)
@@ -908,7 +908,11 @@ async fn publish_awareness_sets(state: &AggregatorProjectionState, event_sink: &
 }
 
 fn demand_state(has_more: bool, conditions: Vec<ResultSetCondition>) -> ResultSetState {
-    ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more }), conditions, truncated: false }
+    ResultSetState {
+        demand: Some(DemandBackedMetadata { as_of: flotilla_resources::clock::now(), has_more }),
+        conditions,
+        truncated: false,
+    }
 }
 
 fn unavailable(source: Option<IssueSource>, message: impl Into<String>) -> ResultSetCondition {
@@ -2248,9 +2252,10 @@ mod tests {
         let (materializer, mut events) = manager(&state, &query, vec![source], provider.clone());
         let _ = next_event(&mut events).await;
 
+        // The cursor is the daemon's clock, which on paused time moves only with the runtime's.
+        tokio::time::advance(Duration::from_millis(2)).await;
         materializer.refresh(&query);
         let _ = next_event(&mut events).await;
-        std::thread::sleep(Duration::from_millis(2));
         tokio::time::advance(REFRESH_INTERVAL + Duration::from_millis(1)).await;
         let _ = next_event(&mut events).await;
 

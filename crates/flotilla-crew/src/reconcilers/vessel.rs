@@ -13,7 +13,6 @@ use std::{
     sync::Arc,
 };
 
-use chrono::Utc;
 use flotilla_agent::adapter::{adapter_enabling_env, required_agent_adapters, CrewBriefTemplateResolver};
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision};
@@ -601,7 +600,7 @@ impl VesselPlanning {
         // A convoy read without its snapshot is not ready yet: admission has
         // not frozen it, or a replica briefly holds an older body (#4137).
         let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else {
-            let waited = Utc::now() - obj.metadata.creation_timestamp;
+            let waited = flotilla_resources::clock::now() - obj.metadata.creation_timestamp;
             if waited > VESSEL_SNAPSHOT_WAIT_WARN_AFTER {
                 warn!(vessel = %obj.metadata.name, convoy = %obj.spec.convoy_ref, %waited, "vessel still waiting for its convoy's workflow snapshot");
             } else {

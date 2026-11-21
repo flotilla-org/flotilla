@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::Utc;
 use flotilla_protocol::{
     issue_query::READY_ISSUE_LABEL, DemandBackedMetadata, IssueRef, IssueRow, QueryChanges, QueryCursor, QueryId, ResultDelta, ResultSet,
     ResultSetCondition, ResultSetState, Rows,
@@ -251,7 +250,7 @@ fn unavailable_issues_result_set(query: QueryId) -> ResultSet {
         seq: 1,
         rows: Rows::Issues { scope, search, label, rows: vec![] },
         state: ResultSetState {
-            demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: false }),
+            demand: Some(DemandBackedMetadata { as_of: flotilla_resources::clock::now(), has_more: false }),
             conditions: vec![ResultSetCondition::IssueSourceUnavailable {
                 source: None,
                 message: "issue source materialization is pending".to_string(),
@@ -266,6 +265,7 @@ mod tests {
     use flotilla_protocol::{Issue, IssueSource, IssueState, QueryScope};
 
     use super::*;
+    use chrono::Utc;
 
     fn issues(name: &str) -> QueryId {
         QueryId::Issues { scope: QueryScope::new("flotilla", name), search: None, label: None }

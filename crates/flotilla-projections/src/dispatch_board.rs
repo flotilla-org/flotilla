@@ -94,7 +94,7 @@ impl DispatchBoardCache {
     {
         self.read_snapshot(source, load).await.map(|(_, board)| {
             let mut board = (*board).clone();
-            board.age_seconds = Utc::now().signed_duration_since(board.observed_at).num_seconds().max(0) as u64;
+            board.age_seconds = flotilla_resources::clock::now().signed_duration_since(board.observed_at).num_seconds().max(0) as u64;
             board
         })
     }
@@ -178,7 +178,6 @@ async fn refresh(shared: Weak<Shared>, source: IssueSource, entry: SharedEntry) 
     }
 }
 
-use chrono::Utc;
 use flotilla_resources::{IssueSourceResolution, Project, Repository, ResourceObject};
 use flotilla_store::ResourceBackend;
 pub type DispatchBoardInputs = BTreeMap<
@@ -203,8 +202,13 @@ pub struct DispatchBoard<'a> {
 }
 impl DispatchBoard<'_> {
     pub async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<flotilla_protocol::DispatchBoardResponse, String> {
-        let readiness =
-            crate::read_projections::ReadProjections::dispatch_queue(self.backend, &self.namespace, project_filter, Utc::now()).await?;
+        let readiness = crate::read_projections::ReadProjections::dispatch_queue(
+            self.backend,
+            &self.namespace,
+            project_filter,
+            flotilla_resources::clock::now(),
+        )
+        .await?;
         let repositories = self.dispatch_board_repositories_internal(project_filter).await?;
         Ok(flotilla_protocol::DispatchBoardResponse { readiness, repositories })
     }
@@ -242,7 +246,8 @@ impl DispatchBoard<'_> {
                 .into_values()
                 .map(|board| {
                     let mut board = (*board).clone();
-                    board.age_seconds = Utc::now().signed_duration_since(board.observed_at).num_seconds().max(0) as u64;
+                    board.age_seconds =
+                        flotilla_resources::clock::now().signed_duration_since(board.observed_at).num_seconds().max(0) as u64;
                     board
                 })
                 .collect())
@@ -404,7 +409,7 @@ pub mod tests {
     pub fn board(source: &IssueSource, count: usize) -> DispatchBoardRepository {
         DispatchBoardRepository {
             source: source.clone(),
-            observed_at: Utc::now(),
+            observed_at: flotilla_resources::clock::now(),
             age_seconds: 0,
             refresh_error: None,
             issues: (0..count)
@@ -414,7 +419,7 @@ pub mod tests {
                         .title(format!("Issue {id}"))
                         .state(IssueState::Open)
                         .url(format!("https://github.com/{}/issues/{id}", source.scope))
-                        .updated_at(Utc::now().to_rfc3339())
+                        .updated_at(flotilla_resources::clock::now().to_rfc3339())
                         .labels(vec!["ready".into()])
                         .blocked_by(vec![])
                         .pull_requests(vec![])

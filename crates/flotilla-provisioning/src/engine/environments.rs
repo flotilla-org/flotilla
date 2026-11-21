@@ -418,7 +418,7 @@ impl EnvironmentRecords for EngineEnvironments {
                 .ok_or_else(|| format!("image build {build} is demanded at no home this one follows"))
         };
         let request = request_of(spec, vessel, builder_home)?;
-        let at = Timestamp::from_datetime(&chrono::Utc::now());
+        let at = Timestamp::from_datetime(&flotilla_resources::clock::now());
         self.lifecycles.request(name, request, at).map(|_| true).map_err(|error| format!("request environment {name}: {error}"))
     }
 }

@@ -10,7 +10,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_change_request::{BoundObservations, ChangeRequestAdmission, ChangeRequestTracker, CrewGithubLoginsByRequest, MergeCheck};
 use flotilla_config::dummy_fleet::DummyFleetConfig;
 use flotilla_discovery_api::{
@@ -79,7 +78,7 @@ impl DummyForge {
                     branch: branch.into(),
                     title: title.into(),
                     opened_at: tokio::time::Instant::now(),
-                    opened_at_ms: Utc::now().timestamp_millis(),
+                    opened_at_ms: flotilla_resources::clock::now().timestamp_millis(),
                     head_sha: format!("{:040x}", (dummy_draw(self.seed, "head", &format!("{repository}#{number}")) * 1e15) as u64),
                 };
                 fleet.record(&Self::event(repository, number, &request));
@@ -103,7 +102,7 @@ impl DummyForge {
 
     /// A change request a previous process opened, as old on this process's clock as on the wall clock.
     pub(crate) fn restore(&self, repository: String, number: u64, branch: String, title: String, opened_at_ms: i64, head_sha: String) {
-        let age = Duration::from_millis(u64::try_from(Utc::now().timestamp_millis() - opened_at_ms).unwrap_or(0));
+        let age = Duration::from_millis(u64::try_from(flotilla_resources::clock::now().timestamp_millis() - opened_at_ms).unwrap_or(0));
         let now = tokio::time::Instant::now();
         let opened_at = now.checked_sub(age).unwrap_or(now);
         let request = DummyChangeRequest { branch, title, opened_at, opened_at_ms, head_sha };
@@ -174,7 +173,7 @@ impl ChangeRequestTracker for DummyChangeRequestTracker {
         _merge_check: Option<&dyn MergeCheck>,
     ) -> Result<BoundObservations, ObservationError> {
         let forge = &self.fleet.forge;
-        let observed_at = Utc::now();
+        let observed_at = flotilla_resources::clock::now();
         Ok(numbers
             .iter()
             .map(|number| {

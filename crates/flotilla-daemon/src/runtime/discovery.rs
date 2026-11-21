@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::CredentialStore;
@@ -305,7 +304,7 @@ pub(super) async fn apply_ssh_host_observation(
                 .value(ConditionValue::False)
                 .reason("Unreachable")
                 .message(error)
-                .observed_at(Utc::now())
+                .observed_at(flotilla_resources::clock::now())
                 // SSH host and capacity faults do not affect the owning daemon forge reader.
                 .blocks_forge_observation(false)
                 .build()]
@@ -318,7 +317,7 @@ pub(super) async fn apply_ssh_host_observation(
                 .value(ConditionValue::False)
                 .reason("MeasurementUnavailable")
                 .message(format!("could not measure free space at {} over SSH", profile.repo_default_dir))
-                .observed_at(Utc::now())
+                .observed_at(flotilla_resources::clock::now())
                 // SSH host and capacity faults do not affect the owning daemon forge reader.
                 .blocks_forge_observation(false)
                 .build(),
@@ -389,7 +388,7 @@ pub(super) async fn apply_ssh_host_observation(
         vessel_slots,
         // This timestamp is the owning daemon's last successful SSH probe,
         // never a heartbeat emitted by a daemon on the target host.
-        heartbeat_at: probe_succeeded.then(Utc::now),
+        heartbeat_at: probe_succeeded.then(flotilla_resources::clock::now),
         ready,
         // The figures themselves change with every reading; only the judgement is the Host's.
         below_free_space_floor: super::health::below_floor(free_bytes, daemon.admission_free_space_floor_bytes()?),
@@ -417,7 +416,7 @@ pub(super) async fn ssh_host_vessel_conditions(vessels: Option<&SshHostVessels>,
                 .value(ConditionValue::False)
                 .reason(refusal.reason)
                 .message(refusal.message)
-                .observed_at(Utc::now())
+                .observed_at(flotilla_resources::clock::now())
                 .blocks_readiness(refusal.blocks_readiness)
                 .blocks_forge_observation(false)
                 .build()
@@ -634,7 +633,8 @@ pub(super) async fn observe_fulfilment_facts(
     // Rotate the starting kind each pass: a persistently slow kind must not always take
     // the first slice of the host-wide deadline.
     if !kinds.is_empty() {
-        let offset = (Utc::now().timestamp() as usize / FULFILMENT_CHANGE_CHECK_INTERVAL.as_secs() as usize) % kinds.len();
+        let offset =
+            (flotilla_resources::clock::now().timestamp() as usize / FULFILMENT_CHANGE_CHECK_INTERVAL.as_secs() as usize) % kinds.len();
         kinds.rotate_left(offset);
     }
     for kind in kinds {
@@ -669,7 +669,7 @@ pub(super) async fn observe_fulfilment_facts(
             FulfilmentRealisation::DockerPerVessel { image: None } => {
                 facts.insert(
                     kind.metadata.name.clone(),
-                    FulfilmentFacts { observed_at: Utc::now(), free_vessel_slots, ..Default::default() },
+                    FulfilmentFacts { observed_at: flotilla_resources::clock::now(), free_vessel_slots, ..Default::default() },
                 );
                 continue;
             }
@@ -682,8 +682,12 @@ pub(super) async fn observe_fulfilment_facts(
             // stale affirmative evidence with a fresh unknown observation.
             // Unknown is not an observation, so the kind's grants stay as
             // they are.
-            let unknown =
-                FulfilmentFacts { image: image.map(Into::into), observed_at: Utc::now(), free_vessel_slots, ..Default::default() };
+            let unknown = FulfilmentFacts {
+                image: image.map(Into::into),
+                observed_at: flotilla_resources::clock::now(),
+                free_vessel_slots,
+                ..Default::default()
+            };
             facts.insert(kind.metadata.name.clone(), unknown);
             continue;
         };
@@ -694,7 +698,10 @@ pub(super) async fn observe_fulfilment_facts(
             .get(&name)
             .filter(|prior| {
                 prior.image.as_ref().map(|image| &image.image_ref) == image.as_ref()
-                    && Utc::now().signed_duration_since(prior.observed_at).to_std().is_ok_and(|age| age < Duration::from_secs(300))
+                    && flotilla_resources::clock::now()
+                        .signed_duration_since(prior.observed_at)
+                        .to_std()
+                        .is_ok_and(|age| age < Duration::from_secs(300))
             })
             .cloned();
         let observed = match current {

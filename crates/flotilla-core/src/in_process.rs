@@ -70,7 +70,6 @@ use std::{
 
 use async_trait::async_trait;
 use attach::AttachResolver;
-use chrono::Utc;
 #[cfg(test)]
 use flotilla_admission::convoy_admission::PlacementResolution;
 use flotilla_admission::convoy_admission::PreparedConvoyAdmission;
@@ -4539,7 +4538,7 @@ impl InProcessDaemon {
         }
     }
     pub async fn dispatch_queue_internal(&self, project_filter: Option<&str>) -> Result<DispatchQueueResponse, String> {
-        let observed_at = Utc::now();
+        let observed_at = flotilla_resources::clock::now();
         read_projections::ReadProjections::dispatch_queue(
             &self.resource_backend,
             &self.provisioning_namespace().await,
@@ -4588,7 +4587,7 @@ impl InProcessDaemon {
     }
 
     pub async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String> {
-        let now = Utc::now();
+        let now = flotilla_resources::clock::now();
         let namespace = self.provisioning_namespace().await;
         let reads = self.resource_backend.clone();
         self.refresh_resource_host_summaries_with_backend(&reads).await?;

@@ -71,14 +71,14 @@ impl GitHubIssueProvider {
     async fn poll_board(&self, source: &IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
         let mut cache = self.poll.state.lock().await;
         let existing = cache.entry(source.scope.clone()).or_insert(self.poll.load(&source.scope)?);
-        if let Some(retry_at) = existing.retry_at.filter(|at| *at > Utc::now()) {
+        if let Some(retry_at) = existing.retry_at.filter(|at| *at > flotilla_resources::clock::now()) {
             return Err(rate_limit_error_for("GraphQL", &retry_at.timestamp().to_string()));
         }
         if existing.pending.is_none() {
             // Empty initial collections have no item revision to establish a
             // cursor. Start their delta window before inventory acquisition;
             // the existing one-second overlap covers same-second additions.
-            let inventory_started_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let inventory_started_at = flotilla_resources::clock::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             // Older cache generations may lack REST items. Refill that inventory
             // once, retaining native details; ordinary refreshes remain deltas.
             let refill = existing.issues.details.keys().any(|id| !existing.issues.items.contains_key(id));
@@ -145,7 +145,7 @@ impl GitHubIssueProvider {
             if pending.issues.is_empty() && pending.pulls.is_empty() {
                 break;
             }
-            if let Some(retry_at) = existing.retry_at.filter(|at| *at > Utc::now()) {
+            if let Some(retry_at) = existing.retry_at.filter(|at| *at > flotilla_resources::clock::now()) {
                 return Err(rate_limit_error_for("GraphQL", &retry_at.timestamp().to_string()));
             }
             let issue_count = pending.issues.len().min(BOARD_BATCH_SIZE);
@@ -159,7 +159,7 @@ impl GitHubIssueProvider {
             let parsed = parsed?;
             if let Some(limit) = &parsed.limit {
                 let mut next = existing.clone();
-                next.retry_at = limit.retry_at.or(Some(Utc::now() + chrono::Duration::minutes(1)));
+                next.retry_at = limit.retry_at.or(Some(flotilla_resources::clock::now() + chrono::Duration::minutes(1)));
                 self.poll.save(&source.scope, &next)?;
                 *existing = next;
                 return Err(rate_limit_error_for("GraphQL", &existing.retry_at.expect("budget deadline").timestamp().to_string()));
@@ -418,7 +418,7 @@ fn parse_board(
     // Direct adapter observations have a completion timestamp; the daemon
     // cache owns serving age/error and stamps its own completed observation.
     Ok(DispatchBoardRepository {
-        observed_at: Utc::now(),
+        observed_at: flotilla_resources::clock::now(),
         age_seconds: 0,
         refresh_error: None,
         source: source.clone(),
@@ -494,7 +494,7 @@ impl flotilla_issue_tracker::IssueProvider for GitHubIssueProvider {
 
     async fn query(&self, source: &IssueSource, params: &IssueQuery, page: u32, count: usize) -> Result<IssueResultPage, String> {
         let per_page = clamp_per_page(count);
-        let as_of = Utc::now();
+        let as_of = flotilla_resources::clock::now();
         let (items, has_more, total) = match &params.search {
             None => {
                 let label = params.label.as_ref().map(|label| format!("&labels={}", urlencoding::encode(label))).unwrap_or_default();
@@ -539,7 +539,8 @@ impl flotilla_issue_tracker::IssueProvider for GitHubIssueProvider {
         let endpoint = format!("repos/{}/issues/{}", reference.source.scope, reference.id);
         let body = gh_api_get!(self.api, &endpoint, &self.host_root)?;
         let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
-        parse_issue(&reference.source, &value, Utc::now()).ok_or_else(|| format!("failed to parse issue {}", reference.id))
+        parse_issue(&reference.source, &value, flotilla_resources::clock::now())
+            .ok_or_else(|| format!("failed to parse issue {}", reference.id))
     }
 
     async fn dispatch_board(&self, source: &IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
@@ -637,7 +638,7 @@ impl flotilla_issue_tracker::IssueProvider for GitHubIssueProvider {
         // caller's cursor: a previous consumer may have failed before it
         // committed the changes and must be able to retry without another 200.
         let items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
-        let as_of = Utc::now();
+        let as_of = flotilla_resources::clock::now();
         let since = since.parse::<DateTime<Utc>>().map_err(|error| format!("invalid issue refresh cursor: {error}"))?;
         let has_more = response.has_next_page
             && items.last().is_some_and(|item| {

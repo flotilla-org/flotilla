@@ -49,7 +49,7 @@ impl Held {
     fn raised_at(&self) -> DateTime<Utc> {
         self.message.since().to_datetime().unwrap_or_else(|| {
             tracing::debug!(message = self.message.name(), "an attention's time is unreadable; it reads as raised now");
-            Utc::now()
+            flotilla_resources::clock::now()
         })
     }
 

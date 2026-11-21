@@ -178,7 +178,7 @@ async fn declarations(backend: &ResourceBackend, namespace: &str) -> Result<Decl
 /// idempotent per-item observation records absorb. This daemon never judges itself unready for
 /// want of evidence. Admission readiness never withdraws forge observation.
 pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<Option<NodeId>, String> {
-    let now = Utc::now();
+    let now = flotilla_resources::clock::now();
     let preferred = declarations(backend, namespace).await?.preferred_observer(source).map(|(_, home)| home);
     let local = backend.local_root().map_err(|e| e.to_string())?;
     let mut candidates = BTreeMap::new();

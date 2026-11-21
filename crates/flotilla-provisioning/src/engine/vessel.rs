@@ -30,7 +30,7 @@ use std::{
     },
 };
 
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use flotilla_engine_store::follow::Followed;
 use flotilla_resources::{
     convoy::admission::AdmissionDocument,
@@ -335,7 +335,7 @@ impl EngineVessels {
     }
 
     fn now() -> Timestamp {
-        Timestamp::from_datetime(&Utc::now())
+        Timestamp::from_datetime(&flotilla_resources::clock::now())
     }
 
     fn records(

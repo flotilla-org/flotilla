@@ -490,7 +490,7 @@ impl ResourceManifestReconciler {
         // still reports: the pass is complete, so it advances the applied revision and prunes the
         // records of the documents it did not reach (the ManifestRoot spec's rule). Refusals, drift
         // and orphans are judged from the records it leaves.
-        let pass = PassReport { revision, complete: true, documents, at: chrono::Utc::now() };
+        let pass = PassReport { revision, complete: true, documents, at: flotilla_resources::clock::now() };
         self.roots.record_pass(&self.default_namespace, &self.root_name(), pass).await?;
         Ok(report)
     }
@@ -776,7 +776,7 @@ impl ResourceManifestReconciler {
                 let mut state = document_state(phase, reason, actual_hash.clone(), effective_desired, actual_hash, previous);
                 state.resolved_token = Some(resolution.token.clone());
                 state.resolution_outcome = Some(outcome);
-                state.observed_at = chrono::Utc::now();
+                state.observed_at = flotilla_resources::clock::now();
                 self.clear_warnings(identity);
                 return Ok(state);
             }
@@ -992,7 +992,7 @@ fn document_state(
         live_hash,
         desired_hash,
         baseline_hash,
-        observed_at: chrono::Utc::now(),
+        observed_at: flotilla_resources::clock::now(),
         resolved_token: previous.and_then(|state| state.resolved_token.clone()),
         resolution_outcome: previous.and_then(|state| state.resolution_outcome.clone()),
         removed_in: None,

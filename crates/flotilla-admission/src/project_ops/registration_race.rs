@@ -58,7 +58,7 @@ impl RacingRepositories {
                 Arc::clone(crate::test_support::no_held_checkouts()),
             );
             let prepared = reconciler.prepare(&repository).await.map_err(|error| error.to_string())?;
-            let outcome = reconciler.reconcile(&repository, &prepared, chrono::Utc::now());
+            let outcome = reconciler.reconcile(&repository, &prepared, flotilla_resources::clock::now());
             let patch = outcome.patch.expect("repository status patch");
             apply_status_patch(&repositories, name, &patch).await.map(drop).map_err(|error| error.to_string())
         }

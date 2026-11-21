@@ -301,7 +301,7 @@ impl<T: Resource> DefinitionResolver<T> {
         let provenance = if record.home == home {
             ResourceProvenance::Local
         } else {
-            ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: Utc::now() }
+            ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: flotilla_resources::clock::now() }
         };
         ReadResourceObject { object: self.object(record), provenance }
     }
@@ -733,7 +733,7 @@ impl<T: Resource> DefinitionResolver<T> {
         let context = causal_context(&sources);
         let next_counter = context.get(&local_root).copied().unwrap_or_default().saturating_add(1);
         let dot = CausalDot { author_root: local_root.clone(), author_counter: next_counter };
-        let now = Utc::now();
+        let now = flotilla_resources::clock::now();
         let has_value_changes =
             requested.iter().any(|(field, value)| current_spec.as_ref().and_then(|current| current.get(field)) != Some(value));
         let resolves_existing_view = current.is_some() && !has_value_changes;
@@ -834,7 +834,7 @@ impl<T: Resource> DefinitionResolver<T> {
             FieldMergeMetadata {
                 dot,
                 seen: context.clone(),
-                written_at: Utc::now(),
+                written_at: flotilla_resources::clock::now(),
                 writer: Some(WriterIdentity::operator().with_source("definition-delete")),
             },
         );
@@ -842,7 +842,7 @@ impl<T: Resource> DefinitionResolver<T> {
         merge.seen.insert(local_root, next_counter);
         merge.conflicts.clear();
         let mut meta = InputMeta::from(&current.metadata);
-        meta.deletion_timestamp = Some(Utc::now());
+        meta.deletion_timestamp = Some(flotilla_resources::clock::now());
 
         match self.backend.using::<T>(&self.namespace).get(name).await {
             Ok(local) => {

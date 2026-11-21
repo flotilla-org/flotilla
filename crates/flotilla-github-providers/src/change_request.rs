@@ -1,7 +1,6 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_forge_github::gh_api_get;
 use flotilla_forge_github::github::clamp_per_page;
 use flotilla_forge_github::github::GhApi;
@@ -228,7 +227,7 @@ impl GitHubChangeRequest {
         if !repository.is_object() {
             return Err(format!("GitHub GraphQL repository {} unavailable", self.repo_slug).into());
         }
-        let observed_at = Utc::now();
+        let observed_at = flotilla_resources::clock::now();
         let mut statuses = HashMap::new();
         let (mut pages, mut nodes) = (0, 0);
         let mut cooldown: Option<ObservationError> = None;
@@ -466,7 +465,7 @@ impl flotilla_change_request::ChangeRequestTracker for GitHubChangeRequest {
                 if let Some(detail) = next.pulls.details.get(&id) {
                     let mut validated: flotilla_resources::ChangeRequestStatus =
                         serde_json::from_value(detail.clone()).map_err(|e| e.to_string())?;
-                    let now = Utc::now();
+                    let now = flotilla_resources::clock::now();
                     validated.title.observed_at = now;
                     validated.author.observed_at = now;
                     validated.review_decision.observed_at = now;

@@ -437,7 +437,7 @@ impl DummyTerminalPool {
         let turn = DeliveredTurn {
             text: text.into(),
             key: key.map(str::to_owned),
-            at_unix_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+            at_unix_ms: u64::try_from(flotilla_resources::clock::now().timestamp_millis()).unwrap_or_default(),
         };
         self.fleet.record(&Event::Turn {
             session: session_name.into(),

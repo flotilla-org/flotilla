@@ -220,7 +220,8 @@ async fn maintain_and_publish(
         ),
     }
     if let Some(health) = observation.changed {
-        apply_status_patch(hosts, host_id, &HostStatusPatch::SleepInhibition { health, observed_at: chrono::Utc::now() }).await?;
+        apply_status_patch(hosts, host_id, &HostStatusPatch::SleepInhibition { health, observed_at: flotilla_resources::clock::now() })
+            .await?;
     }
     Ok(())
 }

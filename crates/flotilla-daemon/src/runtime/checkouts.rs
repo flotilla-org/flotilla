@@ -317,7 +317,9 @@ pub(super) struct AttentionHolds {
 impl CheckoutHolds for AttentionHolds {
     async fn held(&self, convoy: &str, home: &str, checkout: &str, reason: &str) {
         let fact = Fact::CheckoutHeld { convoy: convoy.to_owned(), host: home.to_owned(), checkout: checkout.to_owned() };
-        if let Err(error) = self.daemon.attentions().raise(&self.namespace, &Attention::new(fact, reason, chrono::Utc::now())).await {
+        if let Err(error) =
+            self.daemon.attentions().raise(&self.namespace, &Attention::new(fact, reason, flotilla_resources::clock::now())).await
+        {
             warn!(%checkout, %error, "a held checkout could not be told to a person");
         }
     }

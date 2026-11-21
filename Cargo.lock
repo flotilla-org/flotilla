@@ -4104,6 +4104,7 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-protocol",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

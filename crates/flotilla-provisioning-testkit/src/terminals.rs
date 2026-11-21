@@ -155,7 +155,7 @@ impl TerminalsFixture {
     }
 
     fn step(&self, launch: &str, step: Step) {
-        self.step_at(launch, step, Timestamp::from_datetime(&chrono::Utc::now()));
+        self.step_at(launch, step, Timestamp::from_datetime(&flotilla_resources::clock::now()));
     }
 
     fn step_at(&self, launch: &str, step: Step, at: Timestamp) {

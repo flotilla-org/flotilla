@@ -175,7 +175,7 @@ pub fn convoy(namespace: &str, name: &str, spec: ConvoySpec, status: ConvoyStatu
             owner_references: Vec::new(),
             finalizers: Vec::new(),
             deletion_timestamp: None,
-            creation_timestamp: chrono::Utc::now(),
+            creation_timestamp: flotilla_resources::clock::now(),
             merge: None,
         },
         spec,

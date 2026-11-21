@@ -1,7 +1,6 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_forge_forgejo::{ForgejoClient, ForgejoIssueProviderConfig};
 use flotilla_protocol::ChangeRequest;
 use flotilla_protocol::ChangeRequestStatus;
@@ -133,7 +132,7 @@ impl ForgejoChangeRequestProvider {
     }
 
     fn observed_status(&self, value: &serde_json::Value) -> ObservedStatus {
-        let observed_at = Utc::now();
+        let observed_at = flotilla_resources::clock::now();
         let state = if value["merged"].as_bool() == Some(true) || !value["merged_at"].is_null() {
             Some(ObservedChangeRequestState::Merged)
         } else if value["state"] == "closed" {
@@ -323,10 +322,13 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
                         (merge_check, status.state.value, value["mergeable"].as_bool())
                     {
                         if let Some(candidate) = merge_candidate(*number, &value) {
-                            status.mergeable = Observation { value: merge_check.mergeability(&candidate).await, observed_at: Utc::now() };
+                            status.mergeable = Observation {
+                                value: merge_check.mergeability(&candidate).await,
+                                observed_at: flotilla_resources::clock::now(),
+                            };
                         }
                     }
-                    let observed_at = Utc::now();
+                    let observed_at = flotilla_resources::clock::now();
                     match self.read_reviews(*number).await {
                         Ok(reviews) => {
                             let crew = crew_logins.get(number).map(Vec::as_slice).unwrap_or(&[]);
@@ -346,14 +348,14 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
                     }
                     if let Some(head) = status.head_sha.value.clone() {
                         status.checks = match self.read_checks(&head).await {
-                            Ok(value) => Observation { value, observed_at: Utc::now() },
+                            Ok(value) => Observation { value, observed_at: flotilla_resources::clock::now() },
                             Err(error @ ObservationError::RateLimited { .. }) => {
                                 statuses.insert(*number, Err(error));
                                 continue;
                             }
                             Err(error) => {
                                 tracing::warn!(number, %error, "Forgejo commit status unavailable");
-                                Observation::unknown(Utc::now())
+                                Observation::unknown(flotilla_resources::clock::now())
                             }
                         };
                     }
@@ -467,6 +469,7 @@ mod tests {
     use flotilla_provider_runtime::ChannelLabel;
 
     use super::*;
+    use chrono::Utc;
     use flotilla_fake_forge::{
         recorded::{ManualClock, RecordedWorld, RECORDED_ORIGIN, RECORDED_TOKEN},
         FakeForge, ForgeSettings, InProcessClient, ItemEdit, ItemState, NewIssue, NewPull, NewReview, RepoRef, ReviewState,

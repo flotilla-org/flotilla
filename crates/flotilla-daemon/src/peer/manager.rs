@@ -287,7 +287,7 @@ impl PeerManager {
     }
 
     pub fn note_dial_attempt(&mut self, label: &ConfigLabel) {
-        self.peer_dial_status.entry(label.clone()).or_default().last_attempt = Some(Utc::now());
+        self.peer_dial_status.entry(label.clone()).or_default().last_attempt = Some(flotilla_resources::clock::now());
     }
 
     pub fn note_dial_result(&mut self, label: &ConfigLabel, result: Result<(), &str>) {

@@ -1206,7 +1206,7 @@ impl CrewService {
                 context.convoy.clone(),
                 context.vessel.clone(),
                 context.caller_role.clone(),
-                chrono::Utc::now(),
+                flotilla_resources::clock::now(),
                 reason,
                 proposed_disposition,
                 message,
@@ -2191,7 +2191,7 @@ impl CrewService {
                     context.vessel.clone(),
                     context.caller_role.clone(),
                     target.to_string(),
-                    chrono::Utc::now(),
+                    flotilla_resources::clock::now(),
                     message.to_string(),
                 ),
             )

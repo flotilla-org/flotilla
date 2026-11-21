@@ -133,7 +133,7 @@ impl OtherHome {
 
     /// Sends everything this home holds to `target`, heard now.
     pub fn replicate_to(&self, target: &Service) {
-        self.replicate_to_at(target, Utc::now());
+        self.replicate_to_at(target, flotilla_resources::clock::now());
     }
 
     /// Sends everything this home holds to `target`, heard at `at`.
@@ -145,7 +145,7 @@ impl OtherHome {
 /// Sends everything `from`, homed at `home`, holds to `target`, heard now: one peer's log arriving
 /// at another, as a snapshot round. For tests of two daemons' decided stores.
 pub fn replicate_home(from: &Service, home: &str, target: &Service) {
-    replicate_home_at(from, home, target, Utc::now());
+    replicate_home_at(from, home, target, flotilla_resources::clock::now());
 }
 
 /// [`replicate_home`], heard at `at`.
@@ -167,7 +167,7 @@ pub fn replicate_home_at(from: &Service, home: &str, target: &Service, at: DateT
 pub fn replicate_home_tail(from: &Service, home: &str, target: &Service) {
     let after = target.last_sequence(home).expect("the target's sequence for the home");
     let mut frames = Vec::new();
-    from.serve(Some(after), Timestamp::from_datetime(&Utc::now()), |frame| {
+    from.serve(Some(after), Timestamp::from_datetime(&flotilla_resources::clock::now()), |frame| {
         frames.push(frame.to_vec());
         Ok(())
     })
@@ -202,7 +202,7 @@ pub fn other_home_for(target: &Arc<Service>, home: &str) -> Arc<OtherHome> {
 /// Writes Host `name` at its own home (`node-of-<name>`), as its daemon would publish it, and
 /// replicates that home into `target`, heard now.
 pub async fn put_host_at_its_home(target: &Arc<Service>, name: &str, spec: &HostSpec, status: Option<&HostStatus>) {
-    put_host_at_its_home_heard(target, name, spec, status, Utc::now()).await;
+    put_host_at_its_home_heard(target, name, spec, status, flotilla_resources::clock::now()).await;
 }
 
 /// [`put_host_at_its_home`], its home last heard at `at`.

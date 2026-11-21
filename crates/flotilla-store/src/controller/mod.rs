@@ -292,7 +292,7 @@ impl WorkQueueSender {
         self.metrics.enqueued.increment();
         let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
         if progress.queued.is_empty() && progress.processing.is_none() {
-            progress.last_progress = Some(Utc::now());
+            progress.last_progress = Some(flotilla_resources::clock::now());
         }
         if progress.queued.contains_key(&name) {
             self.metrics.enqueued_coalesced.increment();
@@ -316,14 +316,14 @@ impl WorkQueueSender {
         let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
         let wait = progress.queued.remove(name).map_or(Duration::ZERO, |at| at.elapsed());
         progress.processing = Some(name.into());
-        progress.last_progress = Some(Utc::now());
+        progress.last_progress = Some(flotilla_resources::clock::now());
         wait
     }
 
     fn made_progress(&self) {
         let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
         progress.processing = None;
-        progress.last_progress = Some(Utc::now());
+        progress.last_progress = Some(flotilla_resources::clock::now());
     }
 
     /// Why the controller stopped retrying `name`, if it has: its last error, repeated until the
@@ -937,8 +937,10 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                     if let Some(disposition) = reconciler.retry_disposition(&object) {
                         match disposition {
-                            crate::ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at => {
-                                let delay = (next_attempt_at - Utc::now()).to_std().unwrap_or_default();
+                            crate::ControllerRetryDisposition::Retryable { next_attempt_at }
+                                if flotilla_resources::clock::now() < next_attempt_at =>
+                            {
+                                let delay = (next_attempt_at - flotilla_resources::clock::now()).to_std().unwrap_or_default();
                                 Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await;
                                 return Ok(());
                             }
@@ -955,7 +957,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                     attempted_reconcile = true;
                     let prepared = reconciler.prepare(&object).await?;
-                    let outcome = reconciler.reconcile(&object, &prepared, Utc::now());
+                    let outcome = reconciler.reconcile(&object, &prepared, flotilla_resources::clock::now());
                     for actuation in outcome.actuations {
                         Self::apply_actuation(&primary.backend, &primary.namespace, actuation).await?;
                     }

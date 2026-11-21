@@ -206,7 +206,7 @@ pub(super) async fn reconcile_credential_refresh_attention_in(
         }
     }
     for ((convoy, vessel), credentials) in held {
-        let began_at = since.get(&(convoy.clone(), vessel.clone())).copied().unwrap_or_else(Utc::now);
+        let began_at = since.get(&(convoy.clone(), vessel.clone())).copied().unwrap_or_else(flotilla_resources::clock::now);
         let subject = Subject::Vessel { convoy: convoy.clone(), vessel: vessel.clone() };
         let before = open.get(&subject);
         // A credential already told stays told while it keeps failing, persistent or not.
@@ -227,7 +227,7 @@ pub(super) async fn reconcile_credential_refresh_attention_in(
             // None open: one a person acknowledged answers only the credentials it named.
             None => match attentions.acknowledged(namespace, Sender::Capabilities, &subject, began_at).await? {
                 Some(seen) if told.keys().all(|credential| self::told(&seen).contains(credential)) => continue,
-                Some(_) => Utc::now(),
+                Some(_) => flotilla_resources::clock::now(),
                 None => began_at,
             },
         };

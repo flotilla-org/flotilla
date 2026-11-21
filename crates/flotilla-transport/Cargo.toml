@@ -22,4 +22,5 @@ flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" 
 flotilla-build-features-types = { path = "../flotilla-build-features-types" }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

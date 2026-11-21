@@ -170,7 +170,7 @@ impl VesselRequests {
         // The convoys the next pass reads; every convoy when none.
         let mut convoys: Option<BTreeSet<ConvoyKey>> = None;
         loop {
-            let now = Utc::now();
+            let now = flotilla_resources::clock::now();
             match convoys {
                 None => {
                     let pass = self.sync_once(now).await?;
@@ -189,7 +189,7 @@ impl VesselRequests {
             let next = due.values().min().copied();
             let falls_due = async move {
                 match next {
-                    Some(at) => tokio::time::sleep((at - Utc::now()).to_std().unwrap_or(Duration::ZERO)).await,
+                    Some(at) => tokio::time::sleep((at - flotilla_resources::clock::now()).to_std().unwrap_or(Duration::ZERO)).await,
                     None => futures::future::pending().await,
                 }
             };
@@ -208,7 +208,7 @@ impl VesselRequests {
             while let Some(change) = ready(checkout_changes.try_recv()) {
                 woken.checkout(change)?;
             }
-            let now = Utc::now();
+            let now = flotilla_resources::clock::now();
             woken.convoys.extend(due.iter().filter(|(_, at)| **at <= now).map(|(key, _)| key.clone()));
             convoys = self.woken_convoys(woken, &refused).await?;
         }

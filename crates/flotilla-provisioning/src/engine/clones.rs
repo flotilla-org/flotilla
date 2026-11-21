@@ -140,7 +140,7 @@ impl EngineClones {
     }
 
     fn now() -> Timestamp {
-        Timestamp::from_datetime(&chrono::Utc::now())
+        Timestamp::from_datetime(&flotilla_resources::clock::now())
     }
 
     /// One try at the launch that serves `request` for `clone`.

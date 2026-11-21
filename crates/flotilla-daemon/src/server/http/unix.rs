@@ -12,6 +12,7 @@ use std::{
 };
 
 use axum::Router;
+use flotilla_transport::traffic::Tracked;
 use rigging_http_serve::{Caller, UnixConnectionPolicy};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -36,13 +37,13 @@ pub(in crate::server) async fn serve_sniffed(
     shutdown: impl Future<Output = ()> + Send,
 ) -> io::Result<()> {
     let policy = UnixConnectionPolicy::new(&stream, |peer| Caller::Custom(caller(PeerCredential::from_kernel(peer.uid, peer.pid))))?;
-    policy.serve_connection(Sniffed { first: Some(first_byte), stream }, router, shutdown).await
+    policy.serve_connection(Sniffed { first: Some(first_byte), stream: Tracked::new(stream) }, router, shutdown).await
 }
 
 /// Replays the sniffed byte before the rest of the stream.
 struct Sniffed {
     first: Option<u8>,
-    stream: UnixStream,
+    stream: Tracked<UnixStream>,
 }
 
 impl AsyncRead for Sniffed {

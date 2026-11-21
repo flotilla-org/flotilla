@@ -4,7 +4,6 @@ pub mod observation;
 use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_protocol::ChangeRequest;
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
@@ -85,7 +84,7 @@ pub trait ChangeRequestTracker: Send + Sync {
                 flotilla_protocol::ChangeRequestStatus::Merged => ObservedChangeRequestState::Merged,
                 flotilla_protocol::ChangeRequestStatus::Closed => ObservedChangeRequestState::Closed,
             };
-            let observed_at = Utc::now();
+            let observed_at = flotilla_resources::clock::now();
             statuses.insert(
                 *number,
                 Ok(ChangeRequestStatus {

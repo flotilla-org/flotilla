@@ -7,7 +7,7 @@ use std::{
 pub(crate) mod retention;
 
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_protocol::CallerCrew;
 use flotilla_resources::{
@@ -97,7 +97,7 @@ impl BriefArtifactWriter for SystemBriefArtifactWriter {
         let expires_at = i64::try_from(self.retention_days)
             .ok()
             .and_then(Duration::try_days)
-            .and_then(|duration| Utc::now().checked_add_signed(duration))
+            .and_then(|duration| flotilla_resources::clock::now().checked_add_signed(duration))
             .ok_or_else(|| "brief retention is too large".to_string())?;
         // Put last, so only the artifact's write can fail after it.
         let digest = self.blobs.put_with_media_type(content, "text/markdown").await?;
@@ -112,7 +112,7 @@ impl BriefArtifactWriter for SystemBriefArtifactWriter {
             .digest(digest.as_str().to_string())
             .size(content.len() as u64)
             .media_type("text/markdown".to_string())
-            .recorded_at(Utc::now())
+            .recorded_at(flotilla_resources::clock::now())
             .expires_at(expires_at)
             .pinned(prior.as_ref().is_some_and(|artifact| artifact.spec.pinned))
             .build();
@@ -225,7 +225,7 @@ impl ArtifactService<'_> {
         let expires_at = i64::try_from(days)
             .ok()
             .and_then(Duration::try_days)
-            .and_then(|duration| Utc::now().checked_add_signed(duration))
+            .and_then(|duration| flotilla_resources::clock::now().checked_add_signed(duration))
             .ok_or_else(|| format!("artifact retention for `{}` is too large", input.kind))?;
         // The body is put last: nothing here fails after it, and a caller whose write of the
         // artifact fails tells the store (`BlobStore::unwritten`).
@@ -242,7 +242,7 @@ impl ArtifactService<'_> {
             .digest(digest.as_str().to_string())
             .size(size)
             .media_type(input.media_type)
-            .recorded_at(Utc::now())
+            .recorded_at(flotilla_resources::clock::now())
             .expires_at(expires_at)
             .pinned(prior.as_ref().is_some_and(|object| object.spec.pinned))
             .build();
@@ -335,7 +335,7 @@ impl ArtifactService<'_> {
     pub(crate) async fn retention(&self, grace: std::time::Duration) -> Result<Retention, String> {
         let listed = self.backend.including_replicas::<Artifact>(self.namespace).list_replica_sources().await;
         let mut retention = Retention::new(grace);
-        let now = Utc::now();
+        let now = flotilla_resources::clock::now();
         for item in listed.map_err(|error| error.to_string())?.items {
             retention.apply(ReadWatchEvent::Added(item), now);
         }
@@ -348,7 +348,7 @@ impl ArtifactService<'_> {
         let resolver = self.backend.using::<Artifact>(self.namespace);
         for name in names {
             match resolver.delete(&name).await {
-                Ok(()) | Err(ResourceError::NotFound { .. }) => retention.deleted(&name, Utc::now()),
+                Ok(()) | Err(ResourceError::NotFound { .. }) => retention.deleted(&name, flotilla_resources::clock::now()),
                 Err(error) => return Err(format!("delete artifact {name}: {error}")),
             }
         }
@@ -366,6 +366,7 @@ mod tests {
 
     use super::{ArtifactBody, *};
     use crate::blob_store::MemoryBlobStore;
+    use chrono::Utc;
 
     #[tokio::test]
     // #2719: charter revision survives with the rendered artifact across homes.
