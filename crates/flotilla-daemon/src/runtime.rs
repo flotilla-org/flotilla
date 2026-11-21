@@ -967,10 +967,7 @@ fn spawn_controller_loops(
         )
     });
     // #3964: each access's delivery status, removed with its place or convoy.
-    controllers.push(controller!(flotilla_resources::AccessDelivery, {
-        let state = Arc::clone(&state);
-        move |_backend: ResourceBackend, namespace: String| access_layer::status::status_controller(Arc::clone(&state), namespace)
-    }));
+    controllers.extend(spawn_access_delivery_controller(&state));
     controllers
 }
 
@@ -1051,6 +1048,14 @@ fn archive_shipper(
 }
 
 /// `work` with its engine reads counted for `caller` in this daemon's controller metrics.
+/// Runs an engine controller, logging the error it ends with: one that cannot read its start set
+/// stops rather than going on as if its kind had no resources.
+async fn reported(run: impl std::future::Future<Output = Result<(), flotilla_provisioning::engine::controller::ControllerError>>) {
+    if let Err(error) = run.await {
+        error!(%error, "an engine controller ended");
+    }
+}
+
 fn counted<F: std::future::Future>(state: &ControllerRuntimeState, caller: &str, work: F) -> Attributed<F> {
     attributed(Arc::clone(&state.controller_metrics.for_kind(caller).reads), work)
 }
@@ -1080,7 +1085,7 @@ fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>, engine: &Pr
         Arc::new(VesselLaunchEnvironment { backend: state.daemon.resource_backend(), namespace: state.namespace.clone() }),
     );
     match Controller::start(Arc::clone(&engine.environments), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
-        Ok(controller) => Some(tokio::spawn(counted(state, "engine Environment", controller.run(backings)))),
+        Ok(controller) => Some(tokio::spawn(counted(state, "engine Environment", reported(controller.run(backings))))),
         Err(error) => {
             error!(%error, "the Environment controller could not start; environments will not launch");
             None
@@ -1106,7 +1111,7 @@ fn spawn_clone_controller(state: &Arc<ControllerRuntimeState>, engine: &Provisio
         Ok(controller) => Some(tokio::spawn(counted(state, "engine Clone", async move {
             // No probe observes a clone's backing: what it waits on is in the log.
             let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
-            controller.run(backings).await
+            reported(controller.run(backings)).await
         }))),
         Err(error) => {
             error!(%error, "the Clone controller could not start; clones will not launch");
@@ -1158,7 +1163,7 @@ fn spawn_image_build_controller(state: &Arc<ControllerRuntimeState>, engine: &Pr
             tokio::spawn(counted(state, "engine ImageBuild", async move {
                 // No probe observes a build's backing: the image stays in its cache.
                 let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
-                controller.run(backings).await
+                reported(controller.run(backings)).await
             })),
         ],
         Err(error) => {
@@ -1200,7 +1205,7 @@ fn spawn_terminal_controller(
             let probe =
                 TerminalProbe::new(provider, records, backings).with_progress(state.daemon.crew_progress()).with_briefs(briefs, rechecks);
             tasks.push(tokio::spawn(attributed(caller("TerminalProbe"), probe.run(TERMINAL_PROBE_EVERY))));
-            Some(tokio::spawn(counted(state, "engine TerminalSession", controller.run_with(backing_events, recheck_events))))
+            Some(tokio::spawn(counted(state, "engine TerminalSession", reported(controller.run_with(backing_events, recheck_events)))))
         }
         Err(error) => {
             error!(%error, "the TerminalSession controller could not start; terminal sessions will not launch");
@@ -1263,7 +1268,7 @@ fn spawn_checkout_controller(
         Ok(controller) => Some(tokio::spawn(counted(state, "engine Checkout", async move {
             // A checkout's backing is observed at a recheck, not pushed.
             let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
-            controller.run_with(backings, rechecks).await
+            reported(controller.run_with(backings, rechecks)).await
         }))),
         Err(error) => {
             error!(%error, "the Checkout controller could not start; checkouts will not launch");
@@ -1315,10 +1320,30 @@ fn spawn_vessel_controller(
         Ok(controller) => Some(tokio::spawn(counted(state, "engine Vessel", async move {
             // No probe observes a vessel: its holdings' commits and its rechecks look at it.
             let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
-            controller.run_with(backings, rechecks).await
+            reported(controller.run_with(backings, rechecks)).await
         }))),
         Err(error) => {
             error!(%error, "the Vessel controller could not start; vessels will not launch");
+            None
+        }
+    }
+}
+
+/// The AccessDelivery controller (#3964, #4415): the single writer of this home's access
+/// deliveries' removal, judging each against its place's Environment and its convoy at the start
+/// and whenever it, its place or its convoy changes.
+fn spawn_access_delivery_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHandle<()>> {
+    use flotilla_provisioning::engine::controller::Controller;
+    let records = Arc::new(state.access_deliveries().controlled());
+    let actuator = Arc::new(access_layer::status::AccessDeliveryActuator::new(Arc::clone(state)));
+    match Controller::over(records, actuator, state.daemon.clock_for_scenarios(), state.daemon.decided_store()) {
+        Ok(controller) => Some(tokio::spawn(counted(state, "engine AccessDelivery", async move {
+            // No probe observes a delivery: its place's and its convoy's commits look at it.
+            let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
+            reported(controller.run(backings)).await
+        }))),
+        Err(error) => {
+            error!(%error, "the AccessDelivery controller could not start; ended accesses will not be removed");
             None
         }
     }

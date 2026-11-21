@@ -334,7 +334,7 @@ impl Builder {
         // The sender is kept by the controller's task: a build's backing is never pushed.
         self.tasks.push(tokio::spawn(async move {
             let _backing = backing;
-            controller.run(backings).await;
+            controller.run(backings).await.expect("the controller runs");
         }));
     }
 

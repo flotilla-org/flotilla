@@ -24,6 +24,7 @@ pub mod launch_log;
 pub mod log_cursor;
 pub mod manifest_root;
 pub mod observations;
+pub mod plain_controlled;
 pub mod plain_records;
 pub mod projects;
 pub(crate) mod provenance;

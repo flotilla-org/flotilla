@@ -97,7 +97,7 @@ impl World {
         tokio::spawn(async move {
             // No backing is pushed for a vessel: its holdings' commits and rechecks look at it.
             let _backing = backing;
-            controller.run_with(backings, recheck_events).await
+            controller.run_with(backings, recheck_events).await.expect("the controller runs")
         });
         self.rechecks = Some(rechecks);
     }

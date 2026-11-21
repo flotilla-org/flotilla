@@ -212,7 +212,7 @@ impl RunningClones {
         // The senders are kept by the controller's task: nothing is pushed to it.
         running.controllers.push(tokio::spawn(async move {
             let _senders = (backing, rechecks);
-            controller.run_with(backings, recheck_receiver).await;
+            controller.run_with(backings, recheck_receiver).await.expect("the controller runs");
         }));
         running
     }
@@ -256,7 +256,7 @@ impl RunningClones {
         // The sender is kept by the controller's task: a clone's backing is never pushed.
         let controller = tokio::spawn(async move {
             let _backing = backing;
-            controller.run(backings).await;
+            controller.run(backings).await.expect("the controller runs");
         });
         Self {
             service,

@@ -764,3 +764,61 @@ async fn a_failure_whose_giving_up_was_not_written_gives_up_at_start_without_try
         .await;
     assert!(world.actuator.script().realised.is_empty(), "the provider is not tried again");
 }
+
+/// The environments' records, whose live set cannot be read.
+struct Unreadable(super::LifecycleRecords<EnvironmentKind>);
+
+impl super::ControlledRecords<EnvironmentKind> for Unreadable {
+    fn code(&self) -> KindCode {
+        self.0.code()
+    }
+
+    fn home(&self) -> &str {
+        self.0.home()
+    }
+
+    fn get(&self, name: &str) -> Result<Option<super::Controlled<EnvironmentRequest>>, String> {
+        self.0.get(name)
+    }
+
+    fn live(&self) -> Result<Vec<String>, String> {
+        Err("the store is busy".into())
+    }
+
+    fn step(&self, name: &str, step: &Step, at: Timestamp) -> Result<(), crate::engine::EngineError> {
+        self.0.step(name, step, at)
+    }
+
+    fn finish_launch_request(&self, name: &str, at: Timestamp) -> Result<(), crate::engine::EngineError> {
+        self.0.finish_launch_request(name, at)
+    }
+}
+
+// A start set that cannot be read ends the controller with the error, at once and on no timer:
+// going on with none would never retire a resource whose holder ended while it was away.
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_start_set_ends_the_controller_with_the_error() {
+    let world = World::open();
+    world.record("holder-a");
+    world.request("a");
+    world.environments.step("a", &Step::Realised { identity: "id-a".into() }, World::now()).expect("realised before");
+    world.record_step("holder-a", Step::Released);
+    let records = Unreadable(super::LifecycleRecords(Arc::clone(&world.environments) as Arc<dyn Lifecycles<EnvironmentKind>>));
+    let controller = Controller::over(
+        Arc::new(records),
+        Arc::clone(&world.actuator),
+        Arc::new(VirtualClock::new(chrono::Utc::now())),
+        Arc::clone(&world.service),
+    )
+    .expect("controller");
+    let (_backing, receiver) = mpsc::channel(8);
+    let ran = tokio::time::timeout(Duration::from_secs(3600), controller.run(receiver)).await.expect("the run ends");
+    assert_eq!(
+        ran,
+        Err(super::ControllerError::Unreadable {
+            kind: <EnvironmentKind as flotilla_state_machines::machines::lifecycle::LifecycleKind>::NAME,
+            error: "the store is busy".into()
+        })
+    );
+    assert!(world.actuator.script().released.is_empty(), "nothing is released without its start set");
+}

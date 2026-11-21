@@ -175,7 +175,7 @@ impl World {
         // The sender is kept by the controller's task: a clone's backing is never pushed.
         tokio::spawn(async move {
             let _backing = _backing;
-            controller.run(receiver).await;
+            controller.run(receiver).await.expect("the controller runs");
         });
         Self {
             clones: Arc::new(EngineClones::over(lifecycles, Arc::clone(&service))),
