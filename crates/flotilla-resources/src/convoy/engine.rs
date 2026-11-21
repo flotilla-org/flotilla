@@ -13,10 +13,7 @@
 //! admitted before the engine took over, until the cut-over import) stays on the old
 //! path: [`EngineConvoys::holds`] is the one question callers ask first.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 
