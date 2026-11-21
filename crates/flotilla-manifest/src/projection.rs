@@ -903,27 +903,18 @@ fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &
     }
 }
 
-/// Awareness convoy ids are `ViewAddress` strings. Ids written before that
-/// (`convoy/<ns>/<name>` raw) are read for one generation.
+/// Awareness convoy and vessel ids are `ViewAddress` strings.
 fn convoy_id_parts(id: &str) -> Option<(String, String)> {
     match id.parse() {
         Ok(ViewAddress::Convoy { namespace, name }) => Some((namespace, name)),
-        Ok(_) => None,
-        Err(_) => {
-            let (namespace, name) = id.strip_prefix("convoy/").unwrap_or(id).split_once('/')?;
-            Some((namespace.to_owned(), name.to_owned()))
-        }
+        _ => None,
     }
 }
 
 fn vessel_id_parts(id: &str) -> Option<(String, String, String)> {
     match id.parse() {
         Ok(ViewAddress::Vessel { namespace, convoy, vessel }) => Some((namespace, convoy, vessel)),
-        Ok(_) => None,
-        Err(_) => {
-            let mut parts = id.strip_prefix("vessel/").unwrap_or(id).split('/');
-            Some((parts.next()?.to_owned(), parts.next()?.to_owned(), parts.next()?.to_owned()))
-        }
+        _ => None,
     }
 }
 
