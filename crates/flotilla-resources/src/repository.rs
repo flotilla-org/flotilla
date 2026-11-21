@@ -574,6 +574,15 @@ pub fn repository_display_labels<'a>(
         .collect()
 }
 
+/// The catalog targets ([`RepositorySpec::matches_catalog_target`]) under which a repository that
+/// could share `spec`'s workspace slug is found: `spec`'s own leaf and catalog slugs, as written
+/// and as [`repository_workspace_slugs`] normalizes them. Reading the repositories at each of these
+/// finds the ones that collide with `spec` on a leaf slug or on a catalog slug.
+pub fn workspace_slug_targets(spec: &RepositorySpec) -> BTreeSet<String> {
+    let (leaf, catalog) = (spec.leaf_slug(), spec.catalog_slug());
+    BTreeSet::from([normalize_workspace_slug(&leaf), normalize_workspace_slug(&catalog), leaf, catalog])
+}
+
 /// Short, path-safe repository names, qualified only when names collide.
 ///
 /// Repository keys remain opaque identity and must not leak into paths as the

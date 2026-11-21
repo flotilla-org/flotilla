@@ -16,6 +16,7 @@ use flotilla_engine_store::{
     follow::{Followed, Follower},
     plain::{PendingChange, PlainError, PlainLog},
 };
+use flotilla_resources::repository::forge_service_url_key;
 use flotilla_resources::{
     definition_provenance::{SUPERSEDED_BY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION},
     engine_records::{CommitMark, IndexCover, KindRecords, LogPosition, Record, Since, Ticks, WriteError},
@@ -264,6 +265,43 @@ impl EngineRepositories {
             }
         }
         Err(format!("write {KIND} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers").into())
+    }
+}
+
+impl EngineRepositories {
+    /// Every home's records holding `value` at declared field `path`, from the resident index.
+    async fn indexed(&self, path: &str, value: &str) -> Result<Vec<Record<Repository>>, String> {
+        let cover = IndexCover::AnyKey(std::collections::BTreeSet::from([(format!("field:{path}"), value.to_owned())]));
+        self.covered(&cover, false).await.unwrap_or_else(|| Ok(Vec::new()))
+    }
+}
+
+/// The repository port, over the resident map and its index.
+#[async_trait::async_trait]
+impl flotilla_resources::repository_records::RepositoryRecords for EngineRepositories {
+    async fn repository(&self, key: &str) -> Result<Option<Record<Repository>>, String> {
+        KindRecords::<Repository>::get(self, key).await
+    }
+
+    async fn on_forge(&self, service_url: &str) -> Result<Vec<Record<Repository>>, String> {
+        self.indexed(flotilla_resources::repository::FORGE_SERVICE_URL_FIELD, forge_service_url_key(service_url)).await
+    }
+
+    async fn with_catalog_target(&self, target: &str) -> Result<Vec<Record<Repository>>, String> {
+        let found = self.indexed("spec.catalog_targets.*", target).await?;
+        // Each name as several homes' copies resolve.
+        let mut names: Vec<String> = found.into_iter().map(|record| record.name).collect();
+        names.sort();
+        names.dedup();
+        let mut resolved = Vec::new();
+        for name in names {
+            resolved.extend(KindRecords::<Repository>::get(self, &name).await?);
+        }
+        Ok(resolved)
+    }
+
+    async fn changes(&self) -> Result<BoxStream<'_, ()>, String> {
+        KindRecords::<Repository>::changes(self).await
     }
 }
 

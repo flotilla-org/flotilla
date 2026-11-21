@@ -524,3 +524,29 @@ async fn fleet_health_counts_a_capped_hosts_free_slots_from_its_engine_vessels()
         .unwrap_or_else(|| panic!("the dummy fulfilment kind: {health:?}"));
     assert_eq!((kind.max_vessels, kind.free_vessel_slots), (Some(4), Some(3)), "{kind:?}");
 }
+
+// #4414: a vessel's planner reads the repositories its clone path could collide with by index, not
+// by listing the kind. A repository with no collision still has its shared clone planned, at the
+// path its own slug names.
+#[tokio::test(start_paused = true)]
+async fn a_shared_clone_is_planned_for_the_convoys_repository() {
+    let daemon = TestDaemon::builder().start().await;
+    daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let clone = daemon.wait("the crew's clone", |_: &ResourceObject<flotilla_resources::Clone>| true).await;
+    assert!(clone.spec.path.ends_with("/fleet"), "the clone is at its repository's slug: {}", clone.spec.path);
+}
+
+// #4414: a convoy resolves its change request's address through the forge its repository is on,
+// read by host rather than by listing every forge; the dummy forge is declared, so the request is
+// found and the convoy lands on its merge.
+#[tokio::test(start_paused = true)]
+async fn a_convoys_change_request_evidence_finds_its_declared_forge() {
+    let daemon = TestDaemon::builder().change_request("merge_after_ms = 1000").start().await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    daemon
+        .wait("its merged change request", |found: &ResourceObject<ChangeRequest>| {
+            found.status.as_ref().is_some_and(|status| status.state.value == Some(ObservedChangeRequestState::Merged))
+        })
+        .await;
+    daemon.wait("the convoy landed on it", in_phase(&convoy, ConvoyPhase::Landed)).await;
+}

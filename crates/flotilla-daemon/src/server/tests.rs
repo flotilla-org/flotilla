@@ -486,6 +486,8 @@ pub(super) async fn daemon_with_decided_store(
                 change_request_branches,
                 source_observers,
                 accounts,
+                forges,
+                repositories,
                 manifest_roots,
                 standing_roles,
             } = open_ports(&store, &identity.host_id.to_string(), identity.clock)?;
@@ -498,6 +500,8 @@ pub(super) async fn daemon_with_decided_store(
                 change_request_branches,
                 source_observers,
                 accounts,
+                forges,
+                repositories,
                 manifest_roots,
             })
         }) as futures::future::BoxFuture<'static, _>

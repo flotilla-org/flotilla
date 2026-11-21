@@ -759,6 +759,8 @@ pub struct InProcessDaemon {
     convoy_views: std::sync::OnceLock<Arc<flotilla_store::ConvoyViews>>,
     /// The account kinds' records (#3824 layer 1): the engine's.
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
+    forges: Arc<dyn flotilla_resources::forge_records::ForgeRecords>,
+    repositories: Arc<dyn flotilla_resources::repository_records::RepositoryRecords>,
     manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
     standing_roles: Arc<dyn flotilla_resources::standing_roles::StandingRoles>,
     /// The forge observers, which write only what they observe once the engine's observation records are installed.
@@ -881,6 +883,8 @@ pub struct ComposedEngine {
     /// the daemon installs its judgement once composed.
     pub source_observers: Arc<flotilla_resources::engine_records::LateSourceObservers>,
     pub accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
+    pub forges: Arc<dyn flotilla_resources::forge_records::ForgeRecords>,
+    pub repositories: Arc<dyn flotilla_resources::repository_records::RepositoryRecords>,
     pub manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
     pub standing_roles: Arc<dyn flotilla_resources::standing_roles::StandingRoles>,
 }
@@ -1432,6 +1436,8 @@ impl InProcessDaemon {
         let admission_free_space_path = Arc::new(std::sync::RwLock::new(admission_free_space_path));
         let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
         let accounts = Arc::clone(&engine.accounts);
+        let forges = Arc::clone(&engine.forges);
+        let repositories = Arc::clone(&engine.repositories);
         let manifest_roots = Arc::clone(&engine.manifest_roots);
         let standing_roles = Arc::clone(&engine.standing_roles);
         let crew = Arc::new(
@@ -1545,6 +1551,8 @@ impl InProcessDaemon {
             lifecycle_reads: Arc::clone(&lifecycle_reads),
             convoy_views: Default::default(),
             accounts,
+            forges,
+            repositories,
             manifest_roots,
             standing_roles,
             change_request_observer,
@@ -2411,6 +2419,16 @@ impl InProcessDaemon {
     /// The attentions: the engine's once its Message path is installed, the old store's before.
     pub fn attentions(&self) -> Arc<dyn flotilla_resources::attentions::Attentions> {
         self.resource_backend.attentions()
+    }
+
+    /// The Forge port: keyed and indexed reads of the declared forges, with no listing.
+    pub fn forge_records(&self) -> Arc<dyn flotilla_resources::forge_records::ForgeRecords> {
+        self.forges.clone()
+    }
+
+    /// The Repository port: keyed and indexed reads, with no listing.
+    pub fn repository_records(&self) -> Arc<dyn flotilla_resources::repository_records::RepositoryRecords> {
+        self.repositories.clone()
     }
 
     /// The account kinds' records: the engine's.
