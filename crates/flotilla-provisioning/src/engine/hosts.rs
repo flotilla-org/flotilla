@@ -31,7 +31,7 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     engine_records::{CommitMark, KindRecords, LogPosition, PatchStatus, Record, Since, Ticks, UnloggedJournal, WriteError},
-    host_records::{HostAliases, HostChange, HostFacts, HostReadError, HostRecords},
+    host_records::{HostAliases, HostChange, HostFacts, HostReadError, HostRecords, HOST_CHANGES},
     CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
@@ -50,8 +50,6 @@ use super::watch::SharedChanges;
 use crate::stored::host::{Class, Condition, HostObservation, HostRecord, Readiness};
 
 const KIND: &str = <HostRecord as Kind>::KIND;
-/// How many Host changes a slow follower may fall behind by; one that lags reads everything again.
-const HOST_CHANGES: usize = 256;
 const HOST: KindCode = <HostRecord as Kind>::CODE;
 const OBSERVATION: KindCode = <HostObservation as Kind>::CODE;
 

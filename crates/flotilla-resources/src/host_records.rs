@@ -7,10 +7,7 @@
 //! There is no list: the later placement auction replaces what serves this port without
 //! touching the planners.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{Mutex, PoisonError},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{HostConnection, HostStatus};
 
@@ -121,96 +118,36 @@ impl HostAliases {
     }
 }
 
-/// How many changes a slow follower may fall behind by; one that lags reads everything again.
-const CHANGES: usize = 256;
-
-/// A [`HostRecords`] over hosts held in memory, for a planner's tests: each put or removal is told
-/// to its followers.
-pub struct HeldHosts {
-    held: Mutex<(BTreeMap<String, HostFacts>, HostAliases)>,
-    changes: tokio::sync::broadcast::Sender<HostChange>,
-}
-
-impl Default for HeldHosts {
-    fn default() -> Self {
-        Self { held: Mutex::default(), changes: tokio::sync::broadcast::channel(CHANGES).0 }
-    }
-}
-
-impl HeldHosts {
-    /// Holds `host`, replacing the host of its name.
-    pub fn put(&self, host: HostFacts) {
-        let mut references = host.references();
-        {
-            let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-            let (hosts, aliases) = &mut *held;
-            let before = hosts.get(&host.name).map(|before| before.display_name.clone());
-            references.extend(before.iter().filter(|name| !name.is_empty()).cloned());
-            aliases.hold(&host.name, "", before.as_deref(), Some(&host.display_name));
-            hosts.insert(host.name.clone(), host);
-        }
-        drop(self.changes.send(HostChange::Changed { references }));
-    }
-
-    /// Drops the host named `name`.
-    pub fn remove(&self, name: &str) {
-        let removed = {
-            let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-            let (hosts, aliases) = &mut *held;
-            let removed = hosts.remove(name);
-            aliases.hold(name, "", removed.as_ref().map(|host| host.display_name.as_str()), None);
-            removed
-        };
-        if let Some(removed) = removed {
-            drop(self.changes.send(HostChange::Changed { references: removed.references() }));
-        }
-    }
-}
-
-impl HostRecords for HeldHosts {
-    fn resolve(&self, reference: &str) -> Result<Option<HostFacts>, HostReadError> {
-        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        let (hosts, aliases) = &*held;
-        Ok(aliases.resolve(reference, |name| hosts.contains_key(name))?.and_then(|name| hosts.get(&name).cloned()))
-    }
-
-    fn changes(&self) -> tokio::sync::broadcast::Receiver<HostChange> {
-        self.changes.subscribe()
-    }
-}
+/// How many changes a slow follower of a [`HostRecords`] may fall behind by; one that lags wakes
+/// every waiter, as a rescan does.
+pub const HOST_CHANGES: usize = 256;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn host(name: &str, display_name: &str) -> HostFacts {
-        HostFacts {
-            name: name.into(),
-            display_name: display_name.into(),
-            connection: HostConnection::Daemon,
-            max_vessels: None,
-            status: None,
-        }
-    }
-
     // Behaviour (#4413): a reference resolves as `canonical_host_id` resolves it over every host:
-    // by name first, else by a display name one host bears; several hosts bearing it refuse it.
+    // by name first, else by a display name one host bears; several hosts bearing it refuse it. The
+    // aliases follow a removal and a rename.
     #[test]
     fn a_reference_resolves_by_name_then_by_a_display_name_one_host_bears() {
-        let hosts = HeldHosts::default();
-        hosts.put(host("host-id", "feta"));
-        hosts.put(host("feta-2", "feta-2-display"));
-        hosts.put(host("named", "host-id"));
-        let resolved = |reference: &str| hosts.resolve(reference).map(|host| host.map(|host| host.name));
-        assert_eq!(resolved("host-id"), Ok(Some("host-id".into())), "a name wins over a display name");
-        assert_eq!(resolved("feta"), Ok(Some("host-id".into())));
-        assert_eq!(resolved("nobody"), Ok(None));
-        hosts.put(host("another-host-id", "feta"));
-        assert_eq!(resolved("feta"), Err(HostReadError::Ambiguous("feta".into())));
-        hosts.remove("another-host-id");
-        assert_eq!(resolved("feta"), Ok(Some("host-id".into())), "the alias follows the removal");
-        hosts.put(host("host-id", "brie"));
-        assert_eq!((resolved("feta"), resolved("brie")), (Ok(None), Ok(Some("host-id".into()))), "the alias follows a rename");
+        let mut aliases = HostAliases::default();
+        let names = std::cell::RefCell::new(BTreeSet::from(["host-id", "feta-2", "named"]));
+        aliases.hold("host-id", "", None, Some("feta"));
+        aliases.hold("feta-2", "", None, Some("feta-2-display"));
+        aliases.hold("named", "", None, Some("host-id"));
+        let resolved = |aliases: &HostAliases, reference: &str| aliases.resolve(reference, |name| names.borrow().contains(name));
+        assert_eq!(resolved(&aliases, "host-id"), Ok(Some("host-id".into())), "a name wins over a display name");
+        assert_eq!(resolved(&aliases, "feta"), Ok(Some("host-id".into())));
+        assert_eq!(resolved(&aliases, "nobody"), Ok(None));
+        names.borrow_mut().insert("another-host-id");
+        aliases.hold("another-host-id", "", None, Some("feta"));
+        assert_eq!(resolved(&aliases, "feta"), Err(HostReadError::Ambiguous("feta".into())));
+        names.borrow_mut().remove("another-host-id");
+        aliases.hold("another-host-id", "", Some("feta"), None);
+        assert_eq!(resolved(&aliases, "feta"), Ok(Some("host-id".into())), "the alias follows the removal");
+        aliases.hold("host-id", "", Some("feta"), Some("brie"));
+        assert_eq!((resolved(&aliases, "feta"), resolved(&aliases, "brie")), (Ok(None), Ok(Some("host-id".into()))), "and a rename");
     }
 
     // Behaviour (#4413): two homes' copies of one host bearing a display name are one host, not
@@ -225,18 +162,5 @@ mod tests {
         assert!(aliases.resolve("feta", |_| false).is_err());
         aliases.forget_home("beta");
         assert_eq!(aliases.resolve("feta", |_| false), Ok(Some("host-id".into())));
-    }
-
-    // Behaviour (#4413): a change names the host by every reference it bore before and after.
-    #[test]
-    fn a_change_names_the_references_before_and_after() {
-        let hosts = HeldHosts::default();
-        hosts.put(host("host-id", "feta"));
-        let mut changes = hosts.changes();
-        hosts.put(host("host-id", "brie"));
-        hosts.remove("host-id");
-        let references = |names: &[&str]| HostChange::Changed { references: names.iter().map(|name| (*name).to_owned()).collect() };
-        assert_eq!(changes.try_recv(), Ok(references(&["brie", "feta", "host-id"])));
-        assert_eq!(changes.try_recv(), Ok(references(&["brie", "host-id"])));
     }
 }

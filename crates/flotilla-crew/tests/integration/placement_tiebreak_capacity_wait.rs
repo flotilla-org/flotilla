@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 use chrono::Utc;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_protocol::{CanonicalHostId, FulfilmentAllocation, FulfilmentAllocationCandidate, PlacementDecision, PlacementTargetHost};
+use flotilla_provisioning_testkit::hosts::HeldHosts;
 use flotilla_resources::{
-    host_records::{HeldHosts, HostFacts},
-    Convoy, ConvoySpec, ConvoyStatus, FulfilmentFacts, HostConnection, HostStatus, InputMeta,
+    host_records::HostFacts, Convoy, ConvoySpec, ConvoyStatus, FulfilmentFacts, HostConnection, HostStatus, InputMeta,
 };
 use flotilla_store::ResourceBackend;
 

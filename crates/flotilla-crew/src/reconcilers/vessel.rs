@@ -1951,7 +1951,8 @@ mod tests {
         use flotilla_protocol::provider::{
             CheckoutStrategy, EnvironmentClass, MaterialMode, ProviderAdvertisement, ProviderCapabilities, ProviderKind, ProviderReadiness,
         };
-        use flotilla_resources::host_records::{HeldHosts, HostFacts};
+        use flotilla_provisioning_testkit::hosts::HeldHosts;
+        use flotilla_resources::host_records::HostFacts;
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let hosts = Arc::new(HeldHosts::default());
         // The kind names its host by display name: the alias resolves to it.

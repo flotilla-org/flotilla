@@ -727,15 +727,10 @@ impl<W: Resource> SecondaryWatch for CapacityWake<W> {
 /// does for what is placed on it. A change names the host by every reference it bore, so it wakes
 /// only the convoys noted as waiting on one of them; a rescan wakes every convoy waiting on any
 /// host.
+#[derive(Clone)]
 pub struct HostCapacityWake {
     pub hosts: Arc<dyn HostRecords>,
     pub engine: EngineConvoyPath,
-}
-
-impl std::clone::Clone for HostCapacityWake {
-    fn clone(&self) -> Self {
-        Self { hosts: Arc::clone(&self.hosts), engine: Arc::clone(&self.engine) }
-    }
 }
 
 impl SecondaryWatch for HostCapacityWake {

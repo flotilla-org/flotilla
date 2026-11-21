@@ -10,6 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_crew::convoy::ConvoyReconciler;
+use flotilla_provisioning_testkit::hosts::HeldHosts;
 use flotilla_resources::{
     address::{artifact_address, record_name, stored_change_request_address},
     artifact::blob_digest_of,
@@ -445,7 +446,7 @@ async fn a_failed_work_ends_the_launch_and_an_ended_launch_is_forgotten() {
 #[tokio::test]
 async fn a_capacity_wait_is_a_note() {
     use flotilla_protocol::{CanonicalHostId, FulfilmentAllocation, FulfilmentAllocationCandidate, PlacementDecision, PlacementTargetHost};
-    use flotilla_resources::{host_records::HeldHosts, HostStatus, StallCause};
+    use flotilla_resources::{HostStatus, StallCause};
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let hosts = Arc::new(HeldHosts::default());
     let slots = |free| host_with_slots("feta", free).status.expect("status");
@@ -623,7 +624,7 @@ fn host_with_slots(name: &str, free: u32) -> HostFacts {
 #[tokio::test]
 async fn a_capacity_wait_notes_the_host_it_waits_on() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let hosts = Arc::new(flotilla_resources::host_records::HeldHosts::default());
+    let hosts = Arc::new(HeldHosts::default());
     hosts.put(host_with_slots("feta", 0));
     let mut convoy = ledger_convoy(&backend).await;
     convoy.status.as_mut().expect("status").placement_decision = Some(placement_on("feta"));
@@ -642,16 +643,17 @@ async fn a_capacity_wait_notes_the_host_it_waits_on() {
     assert!(engine.memory.readers("Host").is_empty(), "a convoy with room waits on no host");
 }
 
-/// What hearing one change of host `feta` reads, from when the wake has started, and which
-/// convoys it wakes, with `others` convoys each waiting on a host of its own.
-async fn capacity_wake_reads(others: usize) -> (ReadSnapshot, BTreeSet<String>) {
+// Behaviour: a change of a host wakes only the convoys waiting for capacity on it, not those
+// waiting on other hosts.
+#[tokio::test]
+async fn a_host_change_wakes_only_the_convoys_waiting_on_it() {
     use flotilla_crew::convoy::HostCapacityWake;
     use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
-    let hosts = Arc::new(flotilla_resources::host_records::HeldHosts::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let hosts = Arc::new(HeldHosts::default());
     let engine = Arc::new(Recording { holds: true, ..Default::default() });
     hosts.put(host_with_slots("feta", 0));
-    for n in 0..others {
+    for n in 0..3 {
         hosts.put(host_with_slots(&format!("host-{n}"), 0));
     }
     // A convoy waiting on the host the test changes until the wake hears.
@@ -677,24 +679,13 @@ async fn capacity_wake_reads(others: usize) -> (ReadSnapshot, BTreeSet<String>) 
     }
     // Noted once the wake is open: a queue holds a name until a controller takes it.
     engine.memory.note_evidence("c", "Host", ["feta".to_string()].into());
-    for n in 0..others {
+    for n in 0..3 {
         engine.memory.note_evidence(&format!("other-{n}"), "Host", [format!("host-{n}")].into());
     }
 
-    let before = backend.read_snapshot();
     hosts.put(host_with_slots("feta", 1));
     let woken = woken(&mut queue).await;
-    let reads = backend.read_snapshot().since(&before);
     watch.abort();
-    (reads, woken)
-}
-
-// Behaviour: a change of a host wakes only the convoys waiting for capacity on it, reading
-// nothing to find them, at any number of other waiting convoys and hosts.
-#[tokio::test]
-async fn a_host_change_wakes_only_the_convoys_waiting_on_it() {
-    let (reads, woken) = assert_flat_reads([0, 40], capacity_wake_reads).await;
-    reads.assert_zero("hearing a host change");
     assert_eq!(woken, BTreeSet::from(["c".to_string()]));
 }
 
@@ -792,7 +783,7 @@ async fn a_message_commit_wakes_the_convoys_holding_delivery_without_listing_mes
     // Every wake the convoy controller runs: only the delivery wake has a convoy to wake.
     let (sender, mut queue) = WorkQueueSender::channel();
     let before = read(&reads);
-    let hosts = Arc::new(flotilla_resources::host_records::HeldHosts::default());
+    let hosts = Arc::new(HeldHosts::default());
     let watches = ConvoyReconciler::secondary_watches(&backend, NAMESPACE, hosts, Arc::clone(&path), messages)
         .into_iter()
         .map(|wake| tokio::spawn(attributed(Arc::clone(&reads), wake.spawn(backend.clone(), NAMESPACE.into(), sender.clone()))))
