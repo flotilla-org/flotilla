@@ -35,9 +35,9 @@ use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tracing::{debug, warn};
 
-mod old_convoys;
+mod engine_convoys;
 
-pub use old_convoys::OldConvoyWorks;
+pub use engine_convoys::EngineConvoyWorks;
 
 /// How many launches of a work may be lost in a row before no more are requested: a work whose
 /// every launch is lost is not chased for ever.

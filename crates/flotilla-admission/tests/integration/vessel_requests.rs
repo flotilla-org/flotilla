@@ -87,7 +87,10 @@ async fn a_placed_work_is_launched_at_the_home_that_serves_its_host() {
 
     let kiwi_vessels = VesselsFixture::at("kiwi");
     let kiwi_requests = VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(kiwi.backend().clone(), NAMESPACE)),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+            Arc::clone(kiwi.convoys.reads()),
+            NAMESPACE,
+        )),
         kiwi_vessels.reads.clone(),
         sanctioned(),
         CanonicalHostId::resolved("kiwi-host"),
@@ -97,7 +100,10 @@ async fn a_placed_work_is_launched_at_the_home_that_serves_its_host() {
 
     let feta_vessels = VesselsFixture::at("feta");
     let feta_requests = VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(feta.backend().clone(), NAMESPACE)),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+            Arc::clone(feta.convoys.reads()),
+            NAMESPACE,
+        )),
         feta_vessels.reads.clone(),
         sanctioned(),
         CanonicalHostId::resolved("feta-host"),
@@ -124,7 +130,10 @@ async fn a_daemon_launches_the_works_placed_on_its_ssh_hosts() {
 
     let vessels = VesselsFixture::at("owner");
     let requests = VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(owner.backend().clone(), NAMESPACE)),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+            Arc::clone(owner.convoys.reads()),
+            NAMESPACE,
+        )),
         vessels.reads.clone(),
         sanctioned(),
         CanonicalHostId::resolved("owner-host"),
@@ -145,7 +154,10 @@ async fn an_unplaced_local_work_runs_here_until_its_convoy_is_reclaimed() {
     let vessels = VesselsFixture::at("home");
     let requests = |gate: bool| {
         VesselRequests::new(
-            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(home.backend().clone(), NAMESPACE)),
+            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+                Arc::clone(home.convoys.reads()),
+                NAMESPACE,
+            )),
             Arc::clone(&vessels.reads),
             Arc::new(Gate(gate)),
             CanonicalHostId::resolved("home-host"),

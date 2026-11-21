@@ -1850,7 +1850,10 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     };
     let controller_task = tokio::spawn(controller.run());
     let requests = flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(placed.clone(), "flotilla")),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+            remote_daemon.lifecycle_reads(),
+            "flotilla",
+        )),
         remote_daemon.lifecycle_reads(),
         Arc::new(SanctionedRelease),
         flotilla_protocol::CanonicalHostId::resolved(remote_host_id.as_str()),

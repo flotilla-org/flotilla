@@ -834,8 +834,8 @@ fn spawn_controller_loops(
     let mut controllers = vec![
         spawn_vessel_requests(
             flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
-                std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(
-                    backend.clone(),
+                std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+                    state.daemon.lifecycle_reads(),
                     namespace_string.clone(),
                 )),
                 state.daemon.lifecycle_reads(),

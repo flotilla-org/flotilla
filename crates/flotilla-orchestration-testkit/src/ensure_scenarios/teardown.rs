@@ -357,7 +357,7 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
     let gate = std::sync::Arc::new(Sanctioned::default());
     // The convoys as the daemon reads them, homed at its node, where its launches are held.
     let requests = flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(daemon.resource_backend(), "flotilla")),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(daemon.lifecycle_reads(), "flotilla")),
         daemon.lifecycle_reads(),
         gate.clone(),
         flotilla_protocol::CanonicalHostId::resolved("local"),

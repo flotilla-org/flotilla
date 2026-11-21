@@ -2938,18 +2938,18 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
             Err(format!("convoy {} is kept for the test", convoy))
         }
     }
-    let requests = |backend: &ResourceBackend, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>, host: &str| {
+    let requests = |reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>, host: &str| {
         flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
-            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), namespace)),
+            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(reads.clone(), namespace)),
             reads,
             Arc::new(Kept),
             flotilla_protocol::CanonicalHostId::resolved(host),
             [],
         )
     };
-    let feta_requests = requests(&placement, Arc::clone(&reads), &remote_host_id);
+    let feta_requests = requests(Arc::clone(&reads), &remote_host_id);
     let kiwi_requests =
-        requests(&dispatcher, engine(&topology.leader).reads(), &topology.leader.local_host_id().expect("kiwi host identity").to_string());
+        requests(engine(&topology.leader).reads(), &topology.leader.local_host_id().expect("kiwi host identity").to_string());
     let feta_vessels = &engine(&topology.follower).vessels;
     eventually(Duration::from_secs(5), Duration::from_millis(10), "feta launches its vessel", || async {
         feta_requests.sync_once(Utc::now()).await.expect("feta vessel requests");

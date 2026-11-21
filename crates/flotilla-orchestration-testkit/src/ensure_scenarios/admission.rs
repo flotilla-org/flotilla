@@ -30,7 +30,10 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
     // The governor's work runs in its first launch, which a host reboot loses with its container.
     let requests = |daemon: &InProcessDaemon| {
         VesselRequests::new(
-            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), "flotilla")),
+            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+                daemon.lifecycle_reads(),
+                "flotilla",
+            )),
             daemon.lifecycle_reads(),
             Arc::new(NeverReleased),
             // The host the governor's work is placed on: the standing agent's.

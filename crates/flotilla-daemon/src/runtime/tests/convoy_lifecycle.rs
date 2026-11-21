@@ -186,7 +186,7 @@ async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout
     // The checkout authority's `OwnerTerminal` cascade already collected
     // the managed checkout: the engine holds no checkout for this convoy.
     let requests = flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), NAMESPACE)),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(daemon.lifecycle_reads(), NAMESPACE)),
         daemon.lifecycle_reads(),
         Arc::new(super::super::ports::DaemonVesselReleaseGate { daemon: Arc::clone(&daemon), namespace: NAMESPACE.to_owned() }),
         flotilla_protocol::CanonicalHostId::resolved(host.as_str()),

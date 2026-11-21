@@ -1,43 +1,45 @@
-//! [`ConvoyWorks`] read from the old store's Convoy objects, local and replicated: the bridge until
-//! the engine Convoy implements the port from its records (#3108), when this is deleted.
+//! [`ConvoyWorks`] read from the engine's convoy launches, this home's and those replicated here
+//! (#3108, #4412): each launch is composed by its key, and the changes come from the launches'
+//! records as they are written or replicated.
 
-use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use flotilla_protocol::CanonicalHostId;
-use flotilla_resources::{Convoy, ReadResourceObject, ReadWatchEvent, ResourceObject, ResourceProvenance, WorkPhase};
-use flotilla_store::ResourceBackend;
+use flotilla_resources::{
+    convoy_compose::compose, convoy_records::ConvoyChange, lifecycle_reads::LifecycleReads, Convoy, ReadResourceObject, ResourceObject,
+    ResourceProvenance, WorkPhase,
+};
+use flotilla_store::load_metrics::carry;
 use futures::{stream::BoxStream, StreamExt};
+use tokio::sync::broadcast::error::RecvError;
 
 use super::{ConvoyStanding, ConvoyTouched, ConvoyWorks, ConvoyWorksRead, WorkNeedingVessel};
 
-/// The old store's convoys in one namespace, at the home `backend` serves.
+/// The engine's convoy launches in one namespace, read through `reads`.
 #[derive(Clone)]
-pub struct OldConvoyWorks {
-    backend: ResourceBackend,
+pub struct EngineConvoyWorks {
+    reads: Arc<dyn LifecycleReads>,
     namespace: String,
 }
 
-impl OldConvoyWorks {
-    pub fn new(backend: ResourceBackend, namespace: impl Into<String>) -> Self {
-        Self { backend, namespace: namespace.into() }
+impl EngineConvoyWorks {
+    pub fn new(reads: Arc<dyn LifecycleReads>, namespace: impl Into<String>) -> Self {
+        Self { reads, namespace: namespace.into() }
     }
 
-    fn here(&self) -> String {
-        self.backend.local_root().map(|root| root.as_str().to_owned()).unwrap_or_default()
+    /// `work` over the readings, on a blocking thread: the engine's reads are synchronous.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&dyn LifecycleReads, &str) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let (reads, namespace) = (Arc::clone(&self.reads), self.namespace.clone());
+        tokio::task::spawn_blocking(carry(move || work(reads.as_ref(), &namespace))).await.map_err(|error| error.to_string())?
     }
 
-    /// Every convoy read here, by name and home.
-    async fn convoys(&self) -> Result<BTreeMap<(String, String), ResourceObject<Convoy>>, String> {
-        let here = self.here();
-        let sources = self.backend.including_replicas::<Convoy>(&self.namespace).list().await.map_err(|error| error.to_string())?.items;
-        Ok(sources.into_iter().map(|source| homed(source, &here)).collect())
-    }
-
-    /// Convoy `convoy` homed at `convoy_home`, read by its name.
+    /// Launch `convoy` held at `convoy_home`, composed by its key.
     async fn read(&self, convoy: &str, convoy_home: &str) -> Result<Option<ResourceObject<Convoy>>, String> {
-        let here = self.here();
-        let copies = self.backend.including_replicas::<Convoy>(&self.namespace).get_all(convoy).await.map_err(|error| error.to_string())?;
-        Ok(copies.items.into_iter().map(|source| homed(source, &here)).find(|((_, home), _)| home == convoy_home).map(|(_, convoy)| convoy))
+        let (convoy, convoy_home) = (convoy.to_owned(), convoy_home.to_owned());
+        self.blocking(move |reads, namespace| Ok(compose(reads, namespace, &convoy, Some(&convoy_home))?.map(|view| view.object))).await
     }
 }
 
@@ -64,15 +66,12 @@ fn works(name: &str, convoy_home: &str, convoy: &ResourceObject<Convoy>) -> Vec<
         .collect()
 }
 
-fn home(provenance: &ResourceProvenance, here: &str) -> String {
-    match provenance {
+/// The home of a composed launch read at `here`.
+fn home_of(view: &ReadResourceObject<Convoy>, here: &str) -> String {
+    match &view.provenance {
         ResourceProvenance::Local => here.to_owned(),
         ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
     }
-}
-
-fn homed(source: ReadResourceObject<Convoy>, here: &str) -> ((String, String), ResourceObject<Convoy>) {
-    ((source.object.metadata.name.clone(), home(&source.provenance, here)), source.object)
 }
 
 /// Whether a work in `phase` runs on a vessel.
@@ -94,9 +93,21 @@ fn placed_host(convoy: &ResourceObject<Convoy>, work: &str) -> Option<Option<Can
 }
 
 #[async_trait::async_trait]
-impl ConvoyWorks for OldConvoyWorks {
+impl ConvoyWorks for EngineConvoyWorks {
+    /// Every live launch at every home, each composed by its key: read at the first pass and after
+    /// missed changes alone.
     async fn works_needing_vessel(&self) -> Result<Vec<WorkNeedingVessel>, String> {
-        Ok(self.convoys().await?.iter().flat_map(|((name, convoy_home), convoy)| works(name, convoy_home, convoy)).collect())
+        self.blocking(|reads, namespace| {
+            let convoys = reads.convoys()?;
+            let here = convoys.home().to_owned();
+            let mut needing = Vec::new();
+            for record in convoys.every()?.records.into_iter().filter(|record| record.ended.is_none()) {
+                let Some(view) = compose(reads, namespace, &record.name, Some(&record.home))? else { continue };
+                needing.extend(works(&view.object.metadata.name, &home_of(&view, &here), &view.object));
+            }
+            Ok(needing)
+        })
+        .await
     }
 
     async fn convoy(&self, convoy: &str, convoy_home: &str) -> Result<Option<ConvoyWorksRead>, String> {
@@ -117,19 +128,15 @@ impl ConvoyWorks for OldConvoyWorks {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ConvoyTouched>, String> {
-        let here = self.here();
-        let watch = self.backend.including_replicas::<Convoy>(&self.namespace).watch().await.map_err(|error| error.to_string())?;
-        Ok(watch
-            .map(move |event| match event {
-                Ok(ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) | ReadWatchEvent::Deleted(read)) => {
-                    let ((convoy, convoy_home), _) = homed(read, &here);
-                    ConvoyTouched::Convoy { convoy, convoy_home }
-                }
-                Ok(ReadWatchEvent::DeletedByName { tombstone, provenance }) => {
-                    ConvoyTouched::Convoy { convoy: tombstone.name, convoy_home: home(&provenance, &here) }
-                }
-                Err(_) => ConvoyTouched::Every,
-            })
-            .boxed())
+        let changes = self.reads.convoys()?.changes();
+        Ok(futures::stream::unfold(changes, |mut changes| async move {
+            let touched = match changes.recv().await {
+                Ok(ConvoyChange::Changed { name, home }) => ConvoyTouched::Convoy { convoy: name, convoy_home: home },
+                Ok(ConvoyChange::Rescanned) | Err(RecvError::Lagged(_)) => ConvoyTouched::Every,
+                Err(RecvError::Closed) => return None,
+            };
+            Some((touched, changes))
+        })
+        .boxed())
     }
 }
