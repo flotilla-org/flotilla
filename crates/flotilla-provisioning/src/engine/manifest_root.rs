@@ -33,7 +33,6 @@ use flotilla_state_machines::{Home, Resource, WriteError};
 
 use chrono::{DateTime, Utc};
 
-use super::manifest_root_import::document_name;
 use super::reads::created_at;
 use super::resume::followed_since;
 use super::watch::CommitsSeen;
@@ -43,6 +42,16 @@ use crate::stored::manifest_root::{
 };
 
 const ROOT: KindCode = <Resource<ManifestRoot> as Kind>::CODE;
+
+/// The engine's name of a document key: the status's map-key encoding, under which the reconciler
+/// looks its records up. A key with no such encoding is refused, never renamed.
+pub fn document_name(key: &DocumentKey) -> Result<DocumentName, String> {
+    match serde_json::to_value(key) {
+        Ok(serde_json::Value::String(encoded)) => Ok(DocumentName(encoded)),
+        Ok(other) => Err(format!("document {}: key encodes as {other}, not text", key.path)),
+        Err(error) => Err(format!("document {}: key does not encode: {error}", key.path)),
+    }
+}
 
 /// The name `name` was declared under: a generation's name without its `.<n>`.
 pub(crate) fn base(name: &str) -> &str {

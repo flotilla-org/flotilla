@@ -1,9 +1,8 @@
-//! The fleet on the engine store alone (#3108, ADR 0064): a daemon composed with
-//! no old resource store runs an ordinary convoy from admission to delivery, and
-//! every fact it reads or writes on the way is an engine record. Any access to the
-//! old store fails the scenario with where the access came from.
+//! The fleet on the engine store alone (#3108, ADR 0064): a daemon runs an ordinary
+//! convoy from admission to delivery, and every fact it reads or writes on the way is
+//! an engine record.
 
-use flotilla_daemon_testkit::daemon::{OldStoreMode, TestDaemon};
+use flotilla_daemon_testkit::daemon::TestDaemon;
 use flotilla_dummy_fleet::catalog::{CrewMix, DUMMY_FULFILMENT_KIND};
 use flotilla_protocol::table::Row;
 
@@ -26,22 +25,8 @@ fn names<'a>(column: &'a str, name: &'a str) -> impl Fn(&Row) -> bool + 'a {
 // its promise; the convoy is delivered, and everything held for it ends Gone.
 #[tokio::test(start_paused = true)]
 async fn on_the_engine_alone_a_convoy_is_delivered_and_its_resources_end_gone() {
-    let daemon = TestDaemon::builder().old_store(OldStoreMode::Unavailable).start().await;
+    let daemon = TestDaemon::builder().start().await;
     delivered_convoy(&daemon).await;
-    daemon.assert_old_store_untouched();
-}
-
-// The same convoy over a recording old store: lists, by stage, every access the
-// scenario still makes there, and where each first came from.
-#[tokio::test(start_paused = true)]
-#[ignore = "a census of the old store's remaining accesses, run by hand"]
-async fn census_of_old_store_accesses_on_the_way_to_delivery() {
-    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
-    let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(delivered_convoy(&daemon))).await;
-    println!("{}", daemon.old_store_report().expect("recorded"));
-    if let Err(failure) = outcome {
-        std::panic::resume_unwind(failure);
-    }
 }
 
 // `flotilla apply` of an AccountProvision writes the engine's record, and the provision
@@ -50,8 +35,7 @@ async fn census_of_old_store_accesses_on_the_way_to_delivery() {
 #[tokio::test(start_paused = true)]
 async fn an_applied_account_provision_wakes_its_controller_on_the_engine() {
     use flotilla_resources::account_access::{ProvisionPlan, UpdateMode};
-    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
-    daemon.stage("provision");
+    let daemon = TestDaemon::builder().start().await;
     let spec = flotilla_resources::AccountProvisionSpec {
         binding: flotilla_schema::Ref::new("absent-binding".to_owned(), "elsewhere".to_owned()),
         place: "no-such-environment".into(),
@@ -67,9 +51,6 @@ async fn an_applied_account_provision_wakes_its_controller_on_the_engine() {
     };
     daemon.apply::<flotilla_resources::AccountProvision>("applied", spec).await;
     daemon.wait_gone::<flotilla_resources::AccountProvision>("applied").await;
-    // Other controllers still reach the old store meanwhile; no access is of an account kind.
-    let report = daemon.old_store_report().expect("recorded");
-    assert!(!report.contains("Account"), "the provision reached the old store:\n{report}");
 }
 
 // The resource commands read a crew's clones and environments from the engine. The provisioning
@@ -78,9 +59,8 @@ async fn an_applied_account_provision_wakes_its_controller_on_the_engine() {
 async fn the_resource_commands_read_clones_and_environments_from_the_engine() {
     use flotilla_protocol::{CommandAction, CommandValue};
     use flotilla_resources::{Clone, Environment};
-    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
+    let daemon = TestDaemon::builder().start().await;
     daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
-    daemon.stage("lifecycle");
     daemon.wait("the crew's clone", |_: &flotilla_resources::ResourceObject<Clone>| true).await;
     daemon.wait("the crew's environment", |_: &flotilla_resources::ResourceObject<Environment>| true).await;
     let (clones, environments) = (daemon.list::<Clone>().await, daemon.list::<Environment>().await);
@@ -98,11 +78,6 @@ async fn the_resource_commands_read_clones_and_environments_from_the_engine() {
         .await;
     let CommandValue::Error { message } = deleted else { panic!("an environment delete is refused: {deleted:?}") };
     assert!(message.contains("flotilla convoy explain"), "{message}");
-    let report = daemon.old_store_report().expect("recorded");
-    let lifecycle = report.split("stage lifecycle:").nth(1).unwrap_or_default();
-    for kind in ["Clone", "Environment"] {
-        assert!(!lifecycle.contains(&format!("  {kind} ")), "{kind} reached the old store:\n{report}");
-    }
 }
 
 // The resource commands read a crew's checkout from the engine's launches and refuse to write it,
@@ -112,9 +87,8 @@ async fn the_resource_commands_read_clones_and_environments_from_the_engine() {
 async fn the_resource_commands_read_checkouts_from_the_engine_and_refuse_image_builds() {
     use flotilla_protocol::{CommandAction, CommandValue};
     use flotilla_resources::Checkout;
-    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
+    let daemon = TestDaemon::builder().start().await;
     daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
-    daemon.stage("lifecycle");
     daemon.wait("the coder's checkout", |_: &flotilla_resources::ResourceObject<Checkout>| true).await;
     let checkouts = daemon.list::<Checkout>().await;
     let checkout = daemon.get::<Checkout>(&checkouts[0].metadata.name).await.expect("the listed checkout reads by name");
@@ -145,11 +119,6 @@ async fn the_resource_commands_read_checkouts_from_the_engine_and_refuse_image_b
     refused(daemon.execute(get).await, "flotilla image check");
     refused(daemon.execute(document("ImageBuild", "any", serde_json::json!({}))).await, "flotilla image check");
     refused(daemon.execute(delete("ImageBuild", "any")).await, "flotilla image check");
-    let report = daemon.old_store_report().expect("recorded");
-    let lifecycle = report.split("stage lifecycle:").nth(1).unwrap_or_default();
-    for kind in ["Checkout", "ImageBuild"] {
-        assert!(!lifecycle.contains(&format!("  {kind} ")), "{kind} reached the old store:\n{report}");
-    }
 }
 
 // No registered kind falls through to the old store by the generic resource verbs: each is served
@@ -157,11 +126,10 @@ async fn the_resource_commands_read_checkouts_from_the_engine_and_refuse_image_b
 #[tokio::test(start_paused = true)]
 async fn every_registered_kind_is_served_by_the_engine_or_refused() {
     use flotilla_protocol::CommandAction;
-    let daemon = TestDaemon::builder().old_store(OldStoreMode::Unavailable).start().await;
+    let daemon = TestDaemon::builder().start().await;
     for registered in flotilla_store::REGISTERED_RESOURCE_KINDS {
         let (kind, plural) = (registered.kind.to_owned(), registered.plural.to_owned());
         let name = format!("no-fall-through-{plural}");
-        daemon.stage(&kind);
         let actions = [
             CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: plural.clone(), include_replicas: true },
             CommandAction::QueryResourceGet { namespace: "flotilla".into(), kind: kind.clone(), name: name.clone() },
@@ -182,7 +150,6 @@ async fn every_registered_kind_is_served_by_the_engine_or_refused() {
         for action in actions {
             // Served or refused, either is an answer; reaching the old store is not.
             daemon.execute(action).await;
-            daemon.assert_old_store_untouched();
         }
     }
 }
@@ -193,7 +160,7 @@ async fn every_registered_kind_is_served_by_the_engine_or_refused() {
 async fn the_resource_commands_refuse_writes_through_another_namespace() {
     use flotilla_protocol::{CommandAction, CommandValue};
     use flotilla_resources::AccessDelivery;
-    let daemon = TestDaemon::builder().old_store(OldStoreMode::Unavailable).start().await;
+    let daemon = TestDaemon::builder().start().await;
     let refused = |value: CommandValue| match value {
         CommandValue::Error { message } => assert!(message.contains("AccessDelivery is served in namespace flotilla"), "{message}"),
         other => panic!("not refused: {other:?}"),
@@ -233,9 +200,8 @@ async fn the_resource_commands_refuse_writes_through_another_namespace() {
 async fn the_resource_commands_read_messages_from_the_engine() {
     use flotilla_protocol::{CommandAction, CommandValue};
     use flotilla_resources::Message;
-    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
+    let daemon = TestDaemon::builder().start().await;
     daemon.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
-    daemon.stage("messages");
     daemon.wait("a message for the dispatched crew", |_: &flotilla_resources::ResourceObject<Message>| true).await;
     let listed = daemon.list::<Message>().await;
     let name = listed[0].metadata.name.clone();
@@ -246,9 +212,6 @@ async fn the_resource_commands_read_messages_from_the_engine() {
         .await;
     let CommandValue::Error { message } = deleted else { panic!("a message delete is refused: {deleted:?}") };
     assert!(message.contains("flotilla message acknowledge"), "{message}");
-    let report = daemon.old_store_report().expect("recorded");
-    let messages = report.split("stage messages:").nth(1).unwrap_or_default();
-    assert!(!messages.contains("  Message "), "Message reached the old store:\n{report}");
 }
 
 // A home's messages reach a peer by following its log: listed there through the resource
@@ -256,14 +219,12 @@ async fn the_resource_commands_read_messages_from_the_engine() {
 #[tokio::test(start_paused = true)]
 async fn messages_reach_a_peer_by_log_following() {
     let (a, b) = tokio::join!(
-        TestDaemon::builder().settings("host_name = \"engine-a\"\n").old_store(OldStoreMode::Recording).start(),
-        TestDaemon::builder().settings("host_name = \"engine-b\"\n").old_store(OldStoreMode::Recording).start()
+        TestDaemon::builder().settings("host_name = \"engine-a\"\n").start(),
+        TestDaemon::builder().settings("host_name = \"engine-b\"\n").start()
     );
     a.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
     a.wait("a message at its home", |_: &flotilla_resources::ResourceObject<flotilla_resources::Message>| true).await;
     let sent = message_names(&a).await;
-    a.stage("peered");
-    b.stage("peered");
     let _peering = TestDaemon::peer(&a, &b).await;
     for name in &sent {
         b.wait("the message at the peer", |message: &flotilla_resources::ResourceObject<flotilla_resources::Message>| {
@@ -282,11 +243,6 @@ async fn messages_reach_a_peer_by_log_following() {
         .find(|(_, receiver)| receiver.starts_with("host:") && receiver.contains("/role:"))
         .unwrap_or_else(|| panic!("a message to a host role: {at_a:?}"));
     assert_eq!(at_b.get(host_role.0), Some(host_role.1), "the host role's message at the peer");
-    for daemon in [&a, &b] {
-        let report = daemon.old_store_report().expect("recorded");
-        let peered = report.split("stage peered:").nth(1).unwrap_or_default();
-        assert!(!peered.contains("  Message "), "Message reached the old store:\n{report}");
-    }
 }
 
 /// The names of the Messages `daemon` lists.
@@ -297,7 +253,6 @@ async fn message_names(daemon: &TestDaemon) -> std::collections::BTreeSet<String
 // Each stage waits for a state its record reached, read from the kind's log: the dummy fleet
 // moves records on between two reads, so the current state may already be past it.
 async fn delivered_convoy(daemon: &TestDaemon) {
-    daemon.stage("admission");
     // A coder and its supervisor: their needs differ, so each has a vessel.
     daemon.request_convoy(CrewMix::CoderSupervisor, DUMMY_FULFILMENT_KIND).await;
     // Admission: the convoy is Open, holding its crews' promises.
@@ -312,25 +267,20 @@ async fn delivered_convoy(daemon: &TestDaemon) {
 
     // Placement and provisioning: a vessel per crew, each Realised, with its
     // environment, the coder's checkout and both terminal sessions.
-    daemon.stage("vessels");
     let of_convoy = |rows: Vec<Row>| rows.into_iter().filter(names("convoy", &launch)).collect::<Vec<_>>();
     daemon.wait_reached("a vessel Realised", "vessel", "Realised", names("convoy", &launch)).await;
     let vessels: Vec<String> = of_convoy(daemon.rows("vessel", "").await).iter().map(|row| text(row, "resource.name").to_owned()).collect();
     assert_eq!(vessels.len(), 2, "a vessel per crew: {vessels:?}");
-    daemon.stage("environments");
     for vessel in &vessels {
         daemon.wait_reached("its environment Realised", "environment", "Realised", names("holder", vessel)).await;
     }
-    daemon.stage("checkout");
     daemon.wait_reached("the coder's checkout Realised", "checkout", "Realised", names("holder", &launch)).await;
-    daemon.stage("terminal sessions");
     for vessel in &vessels {
         daemon.wait_reached("its terminal session Realised", "terminal_session", "Realised", names("holder", vessel)).await;
     }
 
     // Crew turns and messages: each crew's session takes its turns, and the coder's
     // review request and the supervisor's answer settle in their inboxes.
-    daemon.stage("crew turns and messages");
     daemon.wait_row("a live agent session", "agent_session", "", |_| true).await;
     daemon
         .wait_reached("a settled message in the convoy's inboxes", "message", "Settled", |row| {
@@ -339,7 +289,6 @@ async fn delivered_convoy(daemon: &TestDaemon) {
         .await;
 
     // The change request: the dummy forge's, observed on the engine, keeps the coder's promise.
-    daemon.stage("change request");
     daemon
         .wait_row("the coder's change request submitted", "convoy_promises_submissions", "", |row| text(row, "resource.name") == launch)
         .await;
@@ -348,11 +297,9 @@ async fn delivered_convoy(daemon: &TestDaemon) {
         .await;
 
     // Landing: every promise kept, the convoy is Delivered.
-    daemon.stage("landing");
     daemon.wait_reached("Delivered", "convoy", "Delivered", |row| text(row, "resource.name") == launch).await;
 
     // Teardown: everything held for the convoy ends Gone, and the vendor's backings are destroyed.
-    daemon.stage("teardown");
     for vessel in &vessels {
         daemon.wait_reached("the vessel Gone", "vessel", "Gone", |row| text(row, "resource.name") == vessel).await;
         daemon.wait_reached("its environment Gone", "environment", "Gone", names("holder", vessel)).await;
@@ -382,8 +329,7 @@ async fn delivered_convoy(daemon: &TestDaemon) {
 #[tokio::test(start_paused = true)]
 async fn the_resource_commands_read_vessels_from_the_engine_and_refuse_writes() {
     use flotilla_protocol::{CommandAction, CommandValue};
-    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
-    daemon.stage("vessels");
+    let daemon = TestDaemon::builder().start().await;
     let listed = daemon
         .execute(CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: "vessels".into(), include_replicas: true })
         .await;
@@ -400,9 +346,6 @@ async fn the_resource_commands_read_vessels_from_the_engine_and_refuse_writes() 
         CommandValue::Error { message } => assert!(message.contains("flotilla convoy explain"), "{message}"),
         other => panic!("not refused: {other:?}"),
     }
-    let report = daemon.old_store_report().expect("recorded");
-    let vessels = report.split("stage vessels:").nth(1).unwrap_or_default();
-    assert!(!vessels.contains("  Vessel "), "Vessel reached the old store:\n{report}");
 }
 
 // A home's vessel and terminal session launches reach a peer by following its log: listed there
@@ -411,15 +354,13 @@ async fn the_resource_commands_read_vessels_from_the_engine_and_refuse_writes() 
 async fn vessels_and_terminal_sessions_reach_a_peer_by_log_following() {
     use flotilla_resources::{TerminalSession, Vessel};
     let (a, b) = tokio::join!(
-        TestDaemon::builder().settings("host_name = \"engine-a\"\n").old_store(OldStoreMode::Recording).start(),
-        TestDaemon::builder().settings("host_name = \"engine-b\"\n").old_store(OldStoreMode::Recording).start()
+        TestDaemon::builder().settings("host_name = \"engine-a\"\n").start(),
+        TestDaemon::builder().settings("host_name = \"engine-b\"\n").start()
     );
     a.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
     a.wait("a vessel at its home", |_: &flotilla_resources::ResourceObject<Vessel>| true).await;
     a.wait("a terminal session at its home", |_: &flotilla_resources::ResourceObject<TerminalSession>| true).await;
     let (vessels, sessions) = (names_of(a.list::<Vessel>().await), names_of(a.list::<TerminalSession>().await));
-    a.stage("peered");
-    b.stage("peered");
     let _peering = TestDaemon::peer(&a, &b).await;
     for name in &vessels {
         b.wait("the vessel at the peer", |vessel: &flotilla_resources::ResourceObject<Vessel>| vessel.metadata.name == *name).await;
@@ -427,11 +368,6 @@ async fn vessels_and_terminal_sessions_reach_a_peer_by_log_following() {
     for name in &sessions {
         b.wait("the session at the peer", |session: &flotilla_resources::ResourceObject<TerminalSession>| session.metadata.name == *name)
             .await;
-    }
-    for daemon in [&a, &b] {
-        let report = daemon.old_store_report().expect("recorded");
-        let peered = report.split("stage peered:").nth(1).unwrap_or_default();
-        assert!(!peered.contains("  Vessel ") && !peered.contains("  TerminalSession "), "reached the old store:\n{report}");
     }
 }
 

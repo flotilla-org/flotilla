@@ -270,13 +270,6 @@ pub(super) async fn crew_daemon_with_process_runner(config: Arc<ConfigStore>) ->
     (daemon, pool)
 }
 
-pub(super) fn sqlite_max_event_rowid(path: &Path) -> u64 {
-    let connection = rusqlite::Connection::open(path).expect("open SQLite store for idle inspection");
-    connection
-        .query_row("SELECT COALESCE(MAX(rowid), 0) FROM resource_events", [], |row| row.get(0))
-        .expect("read maximum resource event rowid")
-}
-
 pub(super) async fn wait_until<F, Fut>(condition: F)
 where
     F: FnMut() -> Fut,

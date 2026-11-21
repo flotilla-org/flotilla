@@ -168,7 +168,6 @@ fn host_status_commits_only_observation_changes(tc: hegel::TestCase) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
         run_steps(flotilla_store_testkit::memory_backend(), &steps).await;
-        run_steps(flotilla_store_testkit::sqlite_backend().expect("sqlite backend"), &steps).await;
     });
 }
 
@@ -195,11 +194,6 @@ async fn assert_host_stream_keeps_one_event(backend: ResourceBackend) {
 #[tokio::test]
 async fn in_memory_host_stream_keeps_one_event() {
     assert_host_stream_keeps_one_event(flotilla_store_testkit::memory_backend()).await;
-}
-
-#[tokio::test]
-async fn sqlite_host_stream_keeps_one_event() {
-    assert_host_stream_keeps_one_event(flotilla_store_testkit::sqlite_backend().expect("sqlite backend")).await;
 }
 
 // Behaviour: probe tasks compare fulfilment maps without observation times, so

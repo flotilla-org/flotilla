@@ -1,7 +1,6 @@
 use super::*;
 use flotilla_resources::ResumeIntent;
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 
 #[test]
 fn reconciler_row_identity_ignores_regenerated_freshness_instant() {
@@ -311,11 +310,6 @@ async fn in_memory_leaf_subscription_contract() {
 }
 
 #[tokio::test]
-async fn sqlite_leaf_subscription_contract() {
-    assert_leaf_subscription_contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("open sqlite"))).await;
-}
-
-#[tokio::test]
 async fn diagnostics_retain_the_last_firing_for_an_armed_reconciler_row() {
     let (backend, home) = engine_backend().await;
     let (event_tx, _) = broadcast::channel(4);
@@ -468,12 +462,6 @@ fn leaf_object_routing_counts_only_addressed_rows(tc: hegel::TestCase) {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
         routing_count_contract(ResourceBackend::new(InMemoryBackend::default()), &changes).await;
     });
-}
-
-// Run the same counted routing contract against the real SQLite adapter.
-#[tokio::test]
-async fn sqlite_leaf_object_routing_counts_only_addressed_rows() {
-    routing_count_contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")), &[63, 0, 1, 1, 32]).await;
 }
 
 async fn routing_count_contract(backend: ResourceBackend, changes: &[usize]) {

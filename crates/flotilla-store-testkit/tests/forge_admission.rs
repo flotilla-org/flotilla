@@ -1,5 +1,4 @@
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use std::collections::BTreeSet;
 
 use flotilla_protocol::NodeId;
@@ -134,5 +133,4 @@ async fn admission_contract(backend: ResourceBackend) {
 #[tokio::test]
 async fn authoritative_admission_contract() {
     admission_contract(ResourceBackend::new(InMemoryBackend::default())).await;
-    admission_contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))).await;
 }

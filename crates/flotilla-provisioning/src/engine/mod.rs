@@ -1,12 +1,10 @@
 //! The engine's provisioning kinds, their only path: each kind's records, lifecycle homes,
-//! controller and actuator, and the import of old records into them (#3629).
+//! controller and actuator (#3629).
 //!
 //! In progress, suspect and next attempt are judgements, never stored.
 
 pub mod access_deliveries;
-pub mod access_delivery_import;
 pub mod account;
-pub mod artifact_import;
 pub mod artifacts;
 pub mod checkout_actuator;
 pub mod checkouts;
@@ -14,30 +12,23 @@ pub mod clone_actuator;
 pub mod clones;
 pub mod controller;
 pub mod decided;
-pub mod definition_import;
 pub mod definitions;
 pub mod environment_actuator;
 pub mod environments;
-pub mod forge_observation_import;
-pub mod host_import;
+pub mod host_observation;
 pub mod hosts;
 pub mod image_build_actuator;
 pub mod image_builds;
-pub mod import;
 pub mod kinds;
 pub mod launch_log;
 pub mod log_cursor;
 pub mod manifest_root;
-pub mod manifest_root_import;
 pub mod observations;
-pub mod placement_import;
 pub mod plain_records;
-pub mod project_import;
 pub mod projects;
 pub(crate) mod provenance;
 pub mod reads;
 pub mod repositories;
-pub mod repository_import;
 pub mod resume;
 pub mod standing_roles;
 pub mod terminal_actuator;

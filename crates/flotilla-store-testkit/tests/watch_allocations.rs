@@ -1,6 +1,5 @@
 //! Allocation workload for #2507. Run with --nocapture to compare revisions.
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
@@ -61,9 +60,7 @@ async fn measured<F: std::future::Future>(label: &str, operation: F) -> (F::Outp
 // the backend is dropped. Measure just delivery of a 16 KiB/64-label object.
 #[tokio::test(flavor = "current_thread")]
 async fn delivered_watch_allocation_workload() {
-    let directory = tempfile::tempdir().expect("sqlite directory");
-    let sqlite = SqliteBackend::open(directory.path().join("watch.db")).expect("sqlite");
-    for (name, backend) in [("memory", ResourceBackend::new(InMemoryBackend::default())), ("sqlite", ResourceBackend::new(sqlite))] {
+    for (name, backend) in [("memory", ResourceBackend::new(InMemoryBackend::default()))] {
         let labels: BTreeMap<_, _> = (0..64).map(|index| (format!("label-{index}"), "x".repeat(64))).collect();
         let meta = InputMeta::builder().name("payload".into()).labels(labels).build();
         let spec = ConvoySpec::builder().workflow_ref("w".repeat(16 * 1024)).project_ref("allocation".into()).build();

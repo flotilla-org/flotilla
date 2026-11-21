@@ -10,7 +10,6 @@ mod charter_delegation;
 pub mod cli;
 mod dispatch_reconciler;
 pub mod dummy_fleet;
-pub mod engine_import;
 mod environment_tools;
 mod event_relay;
 mod fulfilment_probe;

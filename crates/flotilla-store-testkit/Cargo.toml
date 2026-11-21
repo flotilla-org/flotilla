@@ -10,7 +10,6 @@ default = []
 skip-no-sandbox-tests = []
 
 [dependencies]
-flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-protocol = { path = "../flotilla-protocol" }
@@ -31,7 +30,6 @@ workspace = true
 [dev-dependencies]
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 tracing.workspace = true
-rusqlite = { version = "0.37", features = ["bundled", "functions"] }
 serde_yml = "0.0.12"
 hegeltest = "=0.48.1"
 rstest.workspace = true

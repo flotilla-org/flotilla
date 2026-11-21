@@ -75,13 +75,6 @@ mod in_memory;
 #[cfg(test)]
 mod test_store;
 
-#[cfg(test)]
-#[allow(dead_code)]
-#[path = "../../flotilla-store-sqlite/src/sqlite.rs"]
-mod sqlite;
-#[cfg(test)]
-use flotilla_resources::digest;
-
 mod serialized_watch;
 pub use serialized_watch::*;
 

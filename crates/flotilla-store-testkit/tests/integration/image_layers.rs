@@ -1,5 +1,4 @@
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
@@ -59,7 +58,6 @@ fn previous_generation_decodes_but_new_writes_use_current_shape() {
 // inert for resolution, and identity survives the stored round trip.
 #[rstest]
 #[case::memory(ResourceBackend::new(InMemoryBackend::default()))]
-#[case::sqlite(ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")))]
 #[tokio::test]
 async fn layer_definition_contract(#[case] backend: ResourceBackend) {
     let layers = backend.definitions::<ImageLayer>("flotilla");

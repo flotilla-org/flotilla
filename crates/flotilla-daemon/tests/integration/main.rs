@@ -5,7 +5,6 @@ mod convoy_create_cli;
 mod crew_skills;
 mod dummy_fleet;
 mod dummy_fleet_writes;
-mod engine_import;
 mod engine_only;
 mod operator_commands;
 mod overlay_replication;

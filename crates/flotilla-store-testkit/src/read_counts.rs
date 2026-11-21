@@ -348,7 +348,6 @@ macro_rules! observed_backend {
     };
 }
 observed_backend!(flotilla_store_memory::InMemoryBackend);
-observed_backend!(flotilla_store_sqlite::SqliteBackend);
 
 #[cfg(test)]
 mod tests {

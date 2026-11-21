@@ -12,22 +12,15 @@ use flotilla_protocol::{
     HostSummary,
 };
 use flotilla_provisioning::{
-    engine::{
-        host_import::{import_host, import_hosts, rehearse_hosts, HostCopies, HostCopy, Imported},
-        import::ImportReport,
-    },
+    engine::host_observation::observation,
     stored::{
         self,
         host::{self as host_kinds, Class, Readiness, Value},
     },
 };
-use flotilla_resources::{
-    ConditionValue, Host, HostCondition, HostConnection, HostSpec, HostStatus, ImageBuildCapacity, ImageBuildReservation, ObjectMeta,
-    ResourceObject,
-};
+use flotilla_resources::{ConditionValue, Host, HostCondition, HostConnection, HostSpec, HostStatus, ObjectMeta, ResourceObject};
 use flotilla_schema::{render_view, KindCode, Timestamp};
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
-use hegel::generators as gs;
 use schema_support::{check, plan};
 use serde_json::json;
 
@@ -89,10 +82,6 @@ fn object(name: &str, spec: HostSpec, status: Option<HostStatus>) -> ResourceObj
     ResourceObject { metadata, spec, status }
 }
 
-fn copy(object: ResourceObject<Host>, namespace: &str, home: &str) -> HostCopy {
-    HostCopy { namespace: namespace.into(), object, home: home.into() }
-}
-
 fn ssh(owner: &str) -> HostSpec {
     HostSpec {
         display_name: "b1".into(),
@@ -136,85 +125,18 @@ fn corpus() -> Vec<ResourceObject<Host>> {
         .collect()
 }
 
-fn records(imported: Imported) -> (host_kinds::HostRecord, Option<host_kinds::HostObservation>, Vec<(&'static str, &'static str)>) {
-    match imported {
-        Imported::Records { host, observation, dropped } => (*host, observation.map(|observation| *observation), dropped),
-        Imported::Dropped(reason) => panic!("dropped: {reason}"),
-    }
+/// The record and observation a Host's status maps to.
+fn observed(spec: HostSpec, status: HostStatus) -> (host_kinds::HostRecord, Option<host_kinds::HostObservation>) {
+    let observation = observation(&spec, &status).expect("maps");
+    (host_kinds::HostRecord::new(&spec), Some(observation))
 }
 
-// Behaviour (ADR 0047, stored data rule): every Host spec reads back as it was, but for
-// `expected_concurrent_rust_crews` and an SSH host's destination, which are not carried and read
-// as their defaults.
-#[hegel::test]
-fn every_host_spec_reads_back_but_the_crew_sizing(tc: hegel::TestCase) {
-    let connection = if tc.draw(gs::booleans()) {
-        HostConnection::Daemon
-    } else {
-        HostConnection::SshHost { owning_daemon: tc.draw(gs::text().max_size(8)), destination: tc.draw(gs::text().max_size(8)) }
-    };
-    let image_build_capacity = match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
-        0 => None,
-        1 => Some(ImageBuildCapacity::None),
-        _ => Some(ImageBuildCapacity::Builder {
-            architecture: tc.draw(gs::sampled_from(vec!["amd64".to_owned(), "arm64".to_owned()])),
-            slots: tc.draw(gs::integers::<u32>()),
-            reservation: ImageBuildReservation {
-                cpu: tc.draw(gs::integers::<u32>()),
-                disk_bytes: tc.draw(gs::integers::<u64>().max_value(i64::MAX as u64)),
-            },
-        }),
-    };
-    let spec = HostSpec {
-        display_name: tc.draw(gs::text().max_size(8)),
-        connection,
-        expected_concurrent_rust_crews: tc.draw(gs::integers::<u32>()),
-        image_build_capacity,
-        max_vessels: tc.draw(gs::optional(gs::integers::<u32>())),
-        single_tenant: tc.draw(gs::booleans()),
-    };
-    let connection = match &spec.connection {
-        HostConnection::SshHost { owning_daemon, .. } => {
-            HostConnection::SshHost { owning_daemon: owning_daemon.clone(), destination: String::new() }
-        }
-        HostConnection::Daemon => HostConnection::Daemon,
-    };
-    assert_eq!(host_kinds::HostRecord::new(&spec).spec(), HostSpec { expected_concurrent_rust_crews: 4, connection, ..spec.clone() });
-    let owner = match &spec.connection {
-        HostConnection::SshHost { owning_daemon, .. } => owning_daemon.clone(),
-        HostConnection::Daemon => "kiwi".to_owned(),
-    };
-    let copies =
-        HostCopies { copies: vec![copy(object("kiwi", spec, None), "flotilla", "alpha")], homes: [("alpha".into(), owner)].into() };
-    let mut report = ImportReport::default();
-    rehearse_hosts(&copies, &mut report);
-    assert!(report.refused.is_empty(), "{report:?}");
-    assert_eq!(report.imported, [(("Host", "spec"), 1)].into(), "a Host with no status has no observation");
-}
-
-// Behaviour (#3824 layer 4c): the corpus's Hosts import at their own homes, each with its
-// observation, and what is not carried is counted.
+// Behaviour (#3824 layer 4c): a corpus Host's status maps to its observation.
 #[test]
-fn the_corpus_imports_at_each_hosts_own_home() {
+fn the_corpus_status_maps_to_an_observation() {
     let corpus = corpus();
     assert!(!corpus.is_empty());
-    let copies = HostCopies {
-        homes: corpus.iter().map(|host| (format!("home-{}", host.metadata.name), host.metadata.name.clone())).collect(),
-        copies: corpus.iter().map(|host| copy(host.clone(), "flotilla", &format!("home-{}", host.metadata.name))).collect(),
-    };
-    let mut report = ImportReport::default();
-    rehearse_hosts(&copies, &mut report);
-    assert!(report.refused.is_empty(), "{report:?}");
-    assert_eq!(report.imported, [(("Host", "spec"), corpus.len()), (("HostObservation", "observed"), corpus.len())].into());
-    for reason in [
-        "terminal pools, read only for display",
-        "heartbeat time and readiness, a judgement",
-        "metrics",
-        "the disk figures, carried only as the free-space floor flag",
-    ] {
-        assert!(report.dropped.keys().any(|(_, dropped)| *dropped == reason), "{reason}: {report:?}");
-    }
-    let (_, observation, _) = records(import_host(&corpus[2], &corpus[2].metadata.name).expect("imports"));
+    let (_, observation) = observed(corpus[2].spec.clone(), corpus[2].status.clone().expect("a status"));
     let observation = observation.expect("observed");
     assert_eq!(observation.agent_adapters, BTreeSet::from(["claude-code".to_owned(), "codex".to_owned()]));
     assert_eq!(observation.agent_adapter_baseline, observation.agent_adapters);
@@ -270,18 +192,7 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
             .expect("facts"),
             ..HostStatus::default()
         };
-        let (_, observation, dropped) = records(import_host(&object("kiwi", HostSpec::default(), Some(status)), "kiwi").expect("imports"));
-        for reason in [
-            "each fact's observation time, a judgement",
-            "free vessel slots, a judgement",
-            "model facts, which nothing keeps",
-            "image identity and presence, which nothing reads",
-            "each condition's observation time, a judgement",
-            "diagnostic conditions, which belong in metrics",
-            "provider implementation names, which nothing reads",
-        ] {
-            assert!(dropped.contains(&("HostObservation", reason)), "{reason}: {dropped:?}");
-        }
+        let (_, observation) = observed(HostSpec::default(), status);
         let observation = observation.expect("observed");
         assert_eq!(observation.below_free_space_floor, below, "{free:?} {floor:?}");
         assert_eq!(observation.architecture.as_deref(), Some("arm64"));
@@ -305,27 +216,25 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
     }
 }
 
-/// The imported crew-pool flag of the kind `host-direct` holding `slots`, and whether the slot
-/// count was counted as a dropped judgement.
-fn pool_missing(spec: HostSpec, slots: Option<u32>) -> (bool, bool) {
+/// The crew-pool flag of the kind `host-direct` holding `slots`.
+fn pool_missing(spec: HostSpec, slots: Option<u32>) -> bool {
     let status = HostStatus {
         fulfilment_facts: serde_json::from_value(json!({"host-direct": {
             "gui_session_logged_in": false, "observed_at": "2026-10-29T00:00:00Z", "free_vessel_slots": slots}}))
         .expect("facts"),
         ..HostStatus::default()
     };
-    let (_, observation, dropped) = records(import_host(&object("kiwi", spec, Some(status)), "kiwi").expect("imports"));
-    let counted = dropped.contains(&("HostObservation", "free vessel slots, a judgement"));
-    (observation.expect("observed").facts["host-direct"].crew_pool_missing, counted)
+    let (_, observation) = observed(spec, status);
+    observation.expect("observed").facts["host-direct"].crew_pool_missing
 }
 
 // Behaviour (#3824 layer 4c): on a host without a vessel cap, no free slots means the kind's crew
 // pool is missing, and that fact is kept; any other slot count is a judgement and is dropped.
 #[test]
 fn a_kind_without_its_crew_pool_stays_full() {
-    assert_eq!(pool_missing(HostSpec::default(), Some(0)), (true, false));
-    assert_eq!(pool_missing(HostSpec::default(), Some(3)), (false, true));
-    assert_eq!(pool_missing(HostSpec::default(), None), (false, false));
+    assert!(pool_missing(HostSpec::default(), Some(0)));
+    assert!(!pool_missing(HostSpec::default(), Some(3)));
+    assert!(!pool_missing(HostSpec::default(), None));
 }
 
 // Behaviour (#3824 layer 4c): a capped host that is full, its pool present, also has no free
@@ -333,50 +242,8 @@ fn a_kind_without_its_crew_pool_stays_full() {
 #[test]
 fn a_full_host_with_its_crew_pool_is_not_missing_it() {
     let capped = HostSpec { max_vessels: Some(2), ..HostSpec::default() };
-    assert_eq!(pool_missing(capped, Some(0)), (false, true));
-    assert_eq!(pool_missing(ssh("kiwi"), Some(0)), (false, true));
-}
-
-// Behaviour (#3824 layer 4c, owner's answer 1): a Host imports only at its home, a daemon's own at
-// that daemon and an SSH host's at its owning daemon. A copy elsewhere is a stray and a deleted copy
-// is gone: both are dropped before the namespace check, so neither is refused for its namespaces, and
-// a deleted copy needs no known home. Any other copy at a home whose own host is not known is refused.
-// The crew sizing and the SSH destination are counted only where they were set.
-#[test]
-fn a_host_imports_only_at_its_home() {
-    let status = HostStatus { capabilities: BTreeMap::from([("owning_daemon".to_owned(), json!("udder"))]), ..HostStatus::default() };
-    let mut deleted = object("kiwi", HostSpec::default(), None);
-    deleted.metadata.deletion_timestamp = Some(Utc::now());
-    let sized = HostSpec { expected_concurrent_rust_crews: 8, ..HostSpec::default() };
-    let copies = HostCopies {
-        copies: vec![
-            copy(object("udder", sized, None), "flotilla", "udder-node"),
-            copy(object("b1", ssh("udder"), Some(status)), "flotilla", "udder-node"),
-            copy(object("b1", ssh("udder"), None), "flotilla", "feta-node"),
-            copy(object("b1", ssh("udder"), None), "other", "feta-node"),
-            copy(object("udder", HostSpec::default(), None), "flotilla", "feta-node"),
-            copy(object("udder", HostSpec::default(), None), "other", "feta-node"),
-            copy(object("feta", HostSpec::default(), None), "flotilla", "feta-node"),
-            copy(deleted, "flotilla", "kiwi-node"),
-            copy(object("kiwi", HostSpec::default(), None), "flotilla", "kiwi-node"),
-        ],
-        homes: [("udder-node".into(), "udder".into()), ("feta-node".into(), "feta".into())].into(),
-    };
-    let mut report = ImportReport::default();
-    rehearse_hosts(&copies, &mut report);
-    assert_eq!(report.imported, [(("Host", "spec"), 3), (("HostObservation", "observed"), 1)].into(), "{report:?}");
-    assert_eq!(
-        report.dropped.iter().filter(|((kind, _), _)| *kind == "Host").map(|((_, reason), count)| (*reason, *count)).collect::<Vec<_>>(),
-        [
-            ("a copy of an SSH host another daemon owns", 2),
-            ("a copy of another daemon's Host", 2),
-            ("deleted", 1),
-            ("expected_concurrent_rust_crews, which nothing reads", 1),
-            ("the SSH destination, which its owning daemon's profile holds", 1)
-        ]
-    );
-    let refused: Vec<_> = report.refused.iter().map(|refusal| refusal.record.as_str()).collect();
-    assert_eq!(refused, ["kiwi"], "{report:?}");
+    assert!(!pool_missing(capped, Some(0)));
+    assert!(!pool_missing(ssh("kiwi"), Some(0)));
 }
 
 // Behaviour (ADR 0047): an SSH host's markers are dropped as the connection carries them; a
@@ -393,9 +260,8 @@ fn a_previous_generations_ssh_host_and_missing_baseline_import() {
         agent_adapter_baseline: None,
         ..HostStatus::default()
     };
-    let (host, observation, dropped) = records(import_host(&object("b1", ssh("udder"), Some(status)), "udder").expect("imports"));
+    let (host, observation) = observed(ssh("udder"), status);
     assert!(matches!(host.connection, host_kinds::Connection::SshHost { ref owning_daemon, .. } if owning_daemon == "udder"));
-    assert!(dropped.contains(&("HostObservation", "the SSH capability markers, which the connection carries")), "{dropped:?}");
     let observation = observation.expect("observed");
     assert_eq!(observation.agent_adapter_baseline, BTreeSet::from(["claude-code".to_owned()]));
 }
@@ -415,9 +281,8 @@ fn the_frozen_fleets_pre_4001_ssh_host_imports() {
         .expect("capabilities"),
         ..HostStatus::default()
     };
-    let (host, _, dropped) = records(import_host(&object("b1", spec, Some(status)), "udder").expect("imports"));
+    let (host, _) = observed(spec, status);
     assert!(matches!(host.connection, host_kinds::Connection::SshHost { ref owning_daemon, .. } if owning_daemon == "udder"));
-    assert!(dropped.contains(&("HostObservation", "the SSH capability markers, which the connection carries")), "{dropped:?}");
 }
 
 // Behaviour (#3824 layer 4c): nothing is dropped silently. An unknown capability key, a capability
@@ -431,7 +296,7 @@ fn a_status_the_engine_cannot_hold_is_refused() {
         ..HostStatus::default()
     };
     let cases = [
-        ("unknown", HostSpec::default(), with(json!({"gpu": true}), vec![]), "capability `gpu` has no import mapping"),
+        ("unknown", HostSpec::default(), with(json!({"gpu": true}), vec![]), "capability `gpu` is neither carried nor ignored"),
         ("adapters", HostSpec::default(), with(json!({"agent_adapters": "claude"}), vec![]), "`agent_adapters` capability does not decode"),
         (
             "providers",
@@ -448,21 +313,9 @@ fn a_status_the_engine_cannot_hold_is_refused() {
         ("owner", ssh("udder"), with(json!({"owning_daemon": "feta"}), vec![]), "names `feta`, and its connection `udder`"),
     ];
     for (name, spec, status, reason) in cases {
-        let own = if matches!(spec.connection, HostConnection::Daemon) { name } else { "udder" };
-        let error = import_host(&object(name, spec, Some(status)), own).expect_err(name);
+        let error = observation(&spec, &status).expect_err(name);
         assert!(error.contains(reason), "{name}: {error}");
     }
-    let copies = HostCopies {
-        copies: vec![
-            copy(object("udder", HostSpec::default(), None), "flotilla", "udder-node"),
-            copy(object("udder", HostSpec::default(), None), "other", "udder-node"),
-        ],
-        homes: [("udder-node".into(), "udder".into())].into(),
-    };
-    let mut report = ImportReport::default();
-    rehearse_hosts(&copies, &mut report);
-    assert_eq!(report.refused.len(), 2, "{report:?}");
-    assert!(report.refused.iter().all(|refusal| refusal.reason.contains("no namespaces")), "{report:?}");
 }
 
 // Behaviour (ADR 0058): every environment class has its stored class, by name.
@@ -477,53 +330,6 @@ fn every_environment_class_is_stored() {
     ] {
         assert_eq!(Class::new(class), Ok(stored));
     }
-}
-
-/// A rehearsal whose HostObservation writes are refused.
-struct RefusingObservations(flotilla_engine_store::Rehearsal);
-
-impl flotilla_engine_store::ImportTarget for RefusingObservations {
-    fn imports(&self, home: &str) -> bool {
-        self.0.imports(home)
-    }
-
-    fn write_named_with<K: flotilla_schema::Kind + PartialEq>(
-        &mut self,
-        home: &str,
-        change: &flotilla_schema::NewChange,
-        version: u64,
-        make: impl FnOnce(u64) -> (String, K),
-    ) -> Result<(String, K), String> {
-        if K::KIND == "HostObservation" {
-            return Err("refused".to_owned());
-        }
-        self.0.write_named_with(home, change, version, make)
-    }
-
-    fn holds<K: flotilla_schema::Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
-        self.0.holds::<K>(name, home)
-    }
-}
-
-// Behaviour (#3824 layer 4d): a Host whose observation write is refused is refused with it and
-// counted as neither imported, so the cut-over import, which puts no store in place after a
-// refusal, never serves a Host without its observation.
-#[test]
-fn a_refused_observation_write_refuses_its_host() {
-    let status = HostStatus { daemon_generation: Some("g7".into()), ..HostStatus::default() };
-    let copies = HostCopies {
-        copies: vec![copy(object("kiwi", HostSpec::default(), Some(status)), "flotilla", "kiwi-node")],
-        homes: [("kiwi-node".into(), "kiwi".into())].into(),
-    };
-    let mut target =
-        RefusingObservations(flotilla_engine_store::Rehearsal::open(host_kinds::registry().expect("registry")).expect("rehearsal"));
-    let mut report = ImportReport::default();
-    import_hosts(&copies, &mut target, &mut report);
-    assert_eq!(
-        report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect::<Vec<_>>(),
-        [("HostObservation", "kiwi")]
-    );
-    assert!(report.imported.is_empty(), "{report:?}");
 }
 
 /// The host kinds as the build before #3108's free-space ruling rendered them: the free-space

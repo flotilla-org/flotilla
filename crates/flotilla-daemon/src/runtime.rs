@@ -1019,15 +1019,9 @@ mod decided_kinds_tests {
 }
 
 /// The decided store's opener (#3108), for the composition root to pass to
-/// [`InProcessDaemon::new_composed`]. Once the daemon's identity is resolved it fills the store
-/// from the old one at its first start ([`crate::engine_import::first_start`]), before this
-/// daemon serves or connects to a peer, so an importing host neither sends nor receives records;
-/// then it opens the store ([`flotilla_core::in_process::decided::open`]).
+/// [`InProcessDaemon::new_composed`]: it opens the store ([`flotilla_core::in_process::decided::open`]).
 pub fn engine_opener(config: &ConfigStore) -> flotilla_core::in_process::EngineOpener {
-    flotilla_core::in_process::decided::opener_with(
-        config.state_dir().as_path(),
-        Box::new(|state_dir, home, own_host| crate::engine_import::first_start(state_dir, home, Some(own_host)).map(|_| ())),
-    )
+    flotilla_core::in_process::decided::opener(config.state_dir().as_path())
 }
 
 /// The archive shipper over the decided store (#3939), uploading to every configured fleet blob

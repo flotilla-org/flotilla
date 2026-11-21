@@ -136,55 +136,6 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     ),
 ];
 
-/// A kind retired from [`REGISTERED_RESOURCE_KINDS`] whose rows a previous generation may still
-/// hold. For one generation (ADR 0047) the stored decoder accepts and drops them, so a host still
-/// holding rows validates, and the import drops them, or converts them where its plan says so,
-/// rather than refusing an unknown kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetiredResourceKind {
-    pub kind: &'static str,
-    pub plural: &'static str,
-    pub api_version: &'static str,
-}
-
-pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
-    // Retired by #3943 (shipped in r887); remove one roll later, once the corpus is refreshed (#4014).
-    // The stored-corpus test reads each entry's r355 file, so retiring r355 forces this removal.
-    RetiredResourceKind { kind: "Usage", plural: "usages", api_version: "flotilla.work/v1" },
-    // Remove one roll after it ships, once the corpus is refreshed.
-    RetiredResourceKind { kind: "CrewImageBaseline", plural: "crewimagebaselines", api_version: "flotilla.work/v1" },
-    // Remove one roll after this generation ships, once the corpus is refreshed.
-    RetiredResourceKind { kind: "DispatchObservation", plural: "dispatchobservations", api_version: "flotilla.work/v1" },
-    RetiredResourceKind { kind: "DispatchHold", plural: "dispatchholds", api_version: "flotilla.work/v1" },
-    RetiredResourceKind { kind: "DispatchDeployment", plural: "dispatchdeployments", api_version: "flotilla.work/v1" },
-    // The cut-over import converts its rows into FulfilmentKinds; remove one roll after this generation ships.
-    RetiredResourceKind { kind: "PlacementPolicy", plural: "placementpolicies", api_version: "flotilla.work/v1" },
-    // Remove one roll after this generation ships, once the corpus is refreshed.
-    RetiredResourceKind { kind: "ForgeRead", plural: "forgereads", api_version: "flotilla.work/v1" },
-    RetiredResourceKind { kind: "ForgeReadHeartbeat", plural: "forgereadheartbeats", api_version: "flotilla.work/v1" },
-    // Deleted by #3108 (its writers became warnings); remove one roll after this generation ships.
-    RetiredResourceKind { kind: "Event", plural: "events", api_version: "flotilla.work/v1" },
-    // Deleted by #3108 with its salience boost (#3824 layer 8); remove one roll after this generation ships.
-    RetiredResourceKind { kind: "Regard", plural: "regards", api_version: "flotilla.work/v1" },
-    // Retired by #3108: attentions are Messages on the engine and nothing writes a Demand. The
-    // cut-over import converts open demands into attentions; remove one roll after this generation ships.
-    RetiredResourceKind { kind: "Demand", plural: "demands", api_version: "flotilla.work/v1" },
-];
-
-/// What a stored document decoded as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoredRecord {
-    /// A registered kind, both persisted halves decoded by its typed representation.
-    Current,
-    /// A retired kind: accepted and dropped, never typed.
-    Retired(&'static RetiredResourceKind),
-}
-
-/// The retired kind listed under `plural`, if any.
-pub fn retired_resource_kind(plural: &str) -> Option<&'static RetiredResourceKind> {
-    RETIRED_RESOURCE_KINDS.iter().find(|retired| retired.plural == plural)
-}
-
 const fn kind<T: Resource>(resource: RegisteredResource, aliases: &'static [&'static str]) -> RegisteredResourceKind {
     RegisteredResourceKind {
         kind: T::API_PATHS.kind,
@@ -701,23 +652,10 @@ pub fn validate_resource_document(document: &Value) -> Result<(), ResourceError>
 }
 
 /// Decode both persisted halves of a resource without applying current write validation.
-/// The stored-record corpus uses this to enforce N→N+1 read compatibility.
-/// A retired kind's document decodes as [`StoredRecord::Retired`] once its apiVersion and spec are
-/// present and its status, if any, is an object. The body is deliberately not typed: it is dropped.
-pub fn decode_stored_resource_document(document: &Value) -> Result<StoredRecord, ResourceError> {
+pub fn decode_stored_resource_document(document: &Value) -> Result<(), ResourceError> {
     let kind = document.get("kind").and_then(Value::as_str).ok_or_else(|| ResourceError::decode("kind: missing or non-string"))?;
     let version =
         document.get("apiVersion").and_then(Value::as_str).ok_or_else(|| ResourceError::decode("apiVersion: missing or non-string"))?;
-    if let Some(retired) = RETIRED_RESOURCE_KINDS.iter().find(|retired| retired.kind == kind) {
-        if version != retired.api_version {
-            return Err(ResourceError::decode(format!("apiVersion: expected {}, got {version}", retired.api_version)));
-        }
-        document.get("spec").ok_or_else(|| ResourceError::decode("spec: missing"))?;
-        if document.get("status").is_some_and(|status| !status.is_null() && !status.is_object()) {
-            return Err(ResourceError::decode("status: expected an object"));
-        }
-        return Ok(StoredRecord::Retired(retired));
-    }
     let registered = lookup_resource_kind(kind)?;
     let expected = dispatch_resource_kind!(registered.resource, api_version_typed());
     if version != expected {
@@ -728,7 +666,7 @@ pub fn decode_stored_resource_document(document: &Value) -> Result<StoredRecord,
     if let Some(status) = document.get("status").filter(|status| !status.is_null()) {
         dispatch_resource_kind!(registered.resource, decode_typed_status(status))?;
     }
-    Ok(StoredRecord::Current)
+    Ok(())
 }
 
 // New authoring must not use the deserialize-only compatibility default.

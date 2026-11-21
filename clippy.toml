@@ -94,7 +94,6 @@ absolute-paths-allowed-crates = [
     "flotilla_state_machines",
     "flotilla_store",
     "flotilla_store_memory",
-    "flotilla_store_sqlite",
     "flotilla_store_testkit",
     "flotilla_test_support",
     "flotilla_transport",

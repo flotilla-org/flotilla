@@ -3,7 +3,7 @@
 use flotilla_protocol::NodeId;
 use flotilla_resources::{Convoy, InputMeta, ReadWatchEvent, WatchEvent, WatchStart};
 use flotilla_store::{ResourceBackend, StoreExt, WatchView};
-use flotilla_store_testkit::{fixtures::contract::*, memory_backend, sqlite_backend, ReadCountsBackendExt, ZeroReadGuard};
+use flotilla_store_testkit::{fixtures::contract::*, memory_backend, ReadCountsBackendExt, ZeroReadGuard};
 use futures::{Stream, StreamExt};
 use std::time::Duration;
 
@@ -14,7 +14,6 @@ async fn next<S: Stream + Unpin>(stream: &mut S) -> S::Item {
 fn backend(adapter: &str) -> ResourceBackend {
     match adapter {
         "memory" => memory_backend(),
-        "sqlite" => sqlite_backend().expect("SQLite adapter"),
         _ => unreachable!(),
     }
     .with_local_root(NodeId::new("self"))
@@ -25,8 +24,6 @@ fn backend(adapter: &str) -> ResourceBackend {
 #[rstest::rstest]
 #[case("memory", 1)]
 #[case("memory", 8)]
-#[case("sqlite", 1)]
-#[case("sqlite", 8)]
 #[tokio::test]
 async fn local_watch_delivery_reads_zero(#[case] adapter: &str, #[case] clients: usize) {
     let writer = backend(adapter);
@@ -70,7 +67,6 @@ async fn local_watch_delivery_reads_zero(#[case] adapter: &str, #[case] clients:
 // do addressed gets today, so that public path is an active expected failure.
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 async fn replica_watch_delivery_reads_zero(#[case] adapter: &str) {
     replica_delivery(adapter, "peer").await;
@@ -78,7 +74,6 @@ async fn replica_watch_delivery_reads_zero(#[case] adapter: &str) {
 
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 #[should_panic(expected = "zero durable-store read budget exceeded")]
 async fn self_origin_replica_watch_zero_reads_pending_3120(#[case] adapter: &str) {
@@ -124,7 +119,6 @@ async fn replica_delivery(adapter: &str, origin: &str) {
 // without re-reading storage. Empty and populated snapshots are both covered.
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 async fn warm_view_subscriptions_read_zero(#[case] adapter: &str) {
     let writer = backend(adapter);
@@ -152,7 +146,6 @@ async fn warm_view_subscriptions_read_zero(#[case] adapter: &str) {
 // through durable gets today. Keep this separate from raw replica delivery.
 #[rstest::rstest]
 #[case("memory")]
-#[case("sqlite")]
 #[tokio::test]
 #[should_panic(expected = "zero durable-store read budget exceeded")]
 async fn merged_definition_delivery_zero_reads_pending_3120(#[case] adapter: &str) {

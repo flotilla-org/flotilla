@@ -333,11 +333,7 @@ fn current_position_tracks_mutation_sequences(tc: hegel::TestCase) {
     let operations: Vec<_> = (0..count).map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(2))).collect();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        for backend in [
-            ResourceBackend::new(InMemoryBackend::default()),
-            ResourceBackend::new(InMemoryBackend::observed()),
-            ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open_in_memory().expect("sqlite")),
-        ] {
+        for backend in [ResourceBackend::new(InMemoryBackend::default()), ResourceBackend::new(InMemoryBackend::observed())] {
             let resolver = backend.using::<Convoy>("flotilla");
             for operation in std::iter::once(3).chain(operations.iter().copied()) {
                 match operation {

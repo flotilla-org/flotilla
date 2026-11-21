@@ -20,16 +20,6 @@
 //! - the engine's tables, through [`TestDaemon::rows`], as an operator reads
 //!   them over the main socket.
 //!
-//! `.old_store(OldStoreMode::Unavailable)` composes the daemon with no old
-//! resource store ([`super::old_store`]): every access to it is refused and
-//! recorded, and the scenario fails at its next step with where each access came
-//! from. `OldStoreMode::Recording` serves the accesses and only records them, so
-//! one run lists what a scenario still reads and writes there.
-//!
-//! `.import(..)` puts an old store and its daemon's host id in the state
-//! directory, so the first start imports it into the engine store as a host of
-//! the frozen fleet does at the cut-over; the daemon then reads what it
-//! imported and is not seeded with the dummy catalog.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -76,9 +66,6 @@ use flotilla_transport::traffic::Tracked;
 use futures::{FutureExt, StreamExt};
 use tokio::sync::{mpsc, watch, Notify};
 
-pub use super::old_store::OldStoreMode;
-use super::old_store::{OldStore, OldStoreAccesses};
-
 /// The namespace every test daemon provisions in.
 pub const NAMESPACE: &str = "flotilla";
 /// Long runners' turns unless `.agent(..)` sets `long_runner_turns`.
@@ -94,12 +81,6 @@ struct Composition {
     host: HostName,
     clock: Arc<dyn Clock>,
     backend: ResourceBackend,
-    /// The same store with no engine ports installed: what the old store itself holds.
-    old: ResourceBackend,
-    /// The old store's accesses, when they are recorded.
-    old_store: Option<Arc<OldStoreAccesses>>,
-    /// Whether an access fails the scenario.
-    old_store_refused: bool,
     resync: Duration,
     forges: Option<ForgeTransport>,
 }
@@ -109,13 +90,6 @@ struct Composition {
 pub struct ForgeTransport {
     pub http: Arc<dyn HttpClient>,
     pub commands: Arc<dyn CommandRunner>,
-}
-
-/// An old store a daemon's first start imports: the store's file, and the host id of the daemon
-/// that wrote it, so its own Host imports as this daemon's.
-pub struct OldStoreImport {
-    pub store: std::path::PathBuf,
-    pub host_id: Option<String>,
 }
 
 pub struct TestDaemon {
@@ -162,12 +136,6 @@ impl TestDaemon {
         /// as on a host with `gh` and forge credentials. The dummy fleet makes
         /// them read-only, as it does on such a host.
         forges: Option<ForgeTransport>,
-        /// The old resource store: available (the default), or unavailable or
-        /// recording.
-        #[builder(default)]
-        old_store: OldStoreMode,
-        /// An old store the first start imports; the daemon is then not seeded.
-        import: Option<OldStoreImport>,
     ) -> Self {
         assert_virtual_time();
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -177,27 +145,11 @@ impl TestDaemon {
             .expect("daemon.toml");
         let config = Arc::new(ConfigStore::with_base(config_dir.clone()));
         let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
-        let seeded = import.is_none();
-        if let Some(import) = &import {
-            place_import(import, config.state_dir().as_path(), daemon_config.machine_id.as_deref().expect("a machine id"));
-        }
-        let mode = old_store;
-        let old_store = (mode != OldStoreMode::Available).then(|| Arc::new(OldStoreAccesses::default()));
-        let store: Arc<dyn flotilla_store::Store> = match (&old_store, mode) {
-            (Some(accesses), OldStoreMode::Unavailable) => Arc::new(OldStore::unavailable(Arc::clone(accesses))),
-            (Some(accesses), _) => {
-                Arc::new(OldStore::recording(Arc::clone(accesses), Arc::new(InMemoryBackend::default()) as Arc<dyn flotilla_store::Store>))
-            }
-            (None, _) => Arc::new(InMemoryBackend::default()),
-        };
         let composition = Composition {
             host: HostName::new(daemon_config.host_name.as_deref().expect("a host name")),
             // The wall clock as the runtime measures it: the test's virtual time.
             clock: Arc::new(SystemClock),
-            backend: ResourceBackend::from_arc(Arc::clone(&store)),
-            old: ResourceBackend::from_arc(store),
-            old_store,
-            old_store_refused: mode == OldStoreMode::Unavailable,
+            backend: ResourceBackend::from_arc(Arc::new(InMemoryBackend::default()) as Arc<dyn flotilla_store::Store>),
             resync,
             forges,
         };
@@ -206,12 +158,10 @@ impl TestDaemon {
             .expect("dummy fleet state")
             .expect("dummy fleet configured");
         fleet.resume();
-        let (daemon, runtime, front_door) = untouched(composition.refused(), compose(&composition, config, discovery, &dir)).await;
+        let (daemon, runtime, front_door) = compose(&composition, config, discovery, &dir).await;
         let operator = Operator::connect(&daemon).await;
         let started = Self { daemon, fleet, runtime: Some(runtime), front_door, operator, composition, dispatched: AtomicU64::new(0), dir };
-        if seeded {
-            started.seed().await;
-        }
+        started.seed().await;
         started
     }
 }
@@ -228,23 +178,6 @@ fn assert_virtual_time() {
         flavor == tokio::runtime::RuntimeFlavor::CurrentThread && paused,
         "a TestDaemon runs on virtual time: start its test with #[tokio::test(start_paused = true)]"
     );
-}
-
-/// Puts `import`'s old store, with its write-ahead log, where the first start reads it in
-/// `state_dir`, and its daemon's host id where the daemon resolves its own for `machine_id`.
-fn place_import(import: &OldStoreImport, state_dir: &std::path::Path, machine_id: &str) {
-    for suffix in ["", "-wal"] {
-        let from = std::path::PathBuf::from(format!("{}{suffix}", import.store.display()));
-        if suffix.is_empty() || from.exists() {
-            let to = state_dir.join(format!("{}{suffix}", flotilla_daemon::engine_import::OLD_STORE));
-            std::fs::copy(&from, &to).unwrap_or_else(|error| panic!("copy {}: {error}", from.display()));
-        }
-    }
-    if let Some(host_id) = &import.host_id {
-        let identity = state_dir.join(machine_id);
-        std::fs::create_dir_all(&identity).expect("identity dir");
-        std::fs::write(identity.join("host-id"), format!("{host_id}\n")).expect("host-id");
-    }
 }
 
 /// `daemon.toml`: `settings`, with the harness's host name unless it names
@@ -329,14 +262,9 @@ async fn compose(
         hook_endpoint: Some(hooks),
         ..harness_options(composition.resync)
     };
-    let runtime = match DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await {
-        Ok(runtime) => runtime,
-        // A start refused by the unavailable old store reports where each access came from.
-        Err(error) => match composition.refused().filter(|accesses| !accesses.accesses().is_empty()) {
-            Some(accesses) => panic!("{}\nruntime: {error}", accesses.report()),
-            None => panic!("runtime: {error:?}"),
-        },
-    };
+    let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options)
+        .await
+        .unwrap_or_else(|error| panic!("runtime: {error:?}"));
     front_door.install_blob_store(Arc::clone(&runtime.blob_store)).expect("install the blob store");
     (daemon, runtime, shutdown)
 }
@@ -405,7 +333,7 @@ impl TestDaemon {
             .expect("dummy fleet configured");
         assert_eq!(fleet.snapshot(), ended, "a graceful stop leaves every change the fleet recorded in its state file");
         fleet.resume();
-        let (daemon, runtime, front_door) = untouched(composition.refused(), compose(&composition, config, discovery, &dir)).await;
+        let (daemon, runtime, front_door) = compose(&composition, config, discovery, &dir).await;
         assert_eq!(daemon.node_id(), &node, "restart preserves the daemon's identity");
         let operator = Operator::connect(&daemon).await;
         Self { daemon, fleet, runtime: Some(runtime), front_door, operator, composition, dispatched, dir }
@@ -415,14 +343,12 @@ impl TestDaemon {
     /// CLI's commands do. A refusal or failure is a [`CommandValue::Error`].
     pub async fn execute(&self, action: CommandAction) -> CommandValue {
         let value = self.operator.execute(action, None).await;
-        self.assert_old_store_untouched();
         value
     }
 
     /// Deliver a harness hook event, as `flotilla hook` does from inside a crew's terminal.
     pub async fn agent_hook(&self, event: flotilla_protocol::AgentHookEvent) {
         self.operator.client.send_agent_hook(event).await.expect("the daemon accepts the hook event");
-        self.assert_old_store_untouched();
     }
 
     /// [`TestDaemon::execute`] in `repository`, as the CLI sends a command
@@ -453,7 +379,6 @@ impl TestDaemon {
     pub async fn get<T: Resource>(&self, name: &str) -> Option<ResourceObject<T>> {
         let request = ResourceGetRequest::builder().kind(T::API_PATHS.kind.into()).name(name.into()).namespace(NAMESPACE.into()).build();
         let read = self.operator.resources.get(request).await;
-        self.assert_old_store_untouched();
         match read {
             Ok(read) => read.records.into_iter().find_map(|record| record.object).map(decode),
             Err(message) if message.contains("not found") => None,
@@ -467,7 +392,6 @@ impl TestDaemon {
         let request =
             ResourceListRequest::builder().kind(T::API_PATHS.kind.into()).namespace(NAMESPACE.into()).include_replicas(true).build();
         let read = self.operator.resources.list(request).await;
-        self.assert_old_store_untouched();
         let read = read.unwrap_or_else(|message| panic!("list {}: {message}", T::API_PATHS.kind));
         read.records.into_iter().filter_map(|record| record.object).map(decode).collect()
     }
@@ -475,14 +399,6 @@ impl TestDaemon {
     /// The operator's resource client, as `flotilla watch` uses it.
     pub fn resources(&self) -> &ResourceClient {
         &self.operator.resources
-    }
-
-    /// Every `T` the old store itself holds. The resource commands refuse a
-    /// kind the engine serves through a port of its own, so a scenario that
-    /// checks nothing reached the old store reads it here.
-    pub async fn old_store_list<T: Resource>(&self) -> Vec<ResourceObject<T>> {
-        let listed = self.composition.old.using::<T>(NAMESPACE).list().await;
-        listed.unwrap_or_else(|error| panic!("old store list {}: {error}", T::API_PATHS.kind)).items
     }
 
     /// Create or update the `T` named `name`, as `flotilla apply` does.
@@ -646,7 +562,6 @@ impl TestDaemon {
             }));
         }
         let (status, body) = local_get(&self.daemon, &target).await;
-        self.assert_old_store_untouched();
         assert_eq!(status, 200, "GET {target}: {}", String::from_utf8_lossy(&body));
         let mut rows = Vec::new();
         for line in body.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
@@ -742,18 +657,6 @@ impl TestDaemon {
         ChangesBuilder { daemon: self }
     }
 
-    /// The report of the import the first start made, when it made one.
-    pub fn import_report(&self) -> Option<serde_json::Value> {
-        let state_dir = self.dir.path().join("config");
-        let report = std::fs::read_dir(&state_dir)
-            .expect("state dir")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("import-")))
-            .max()?;
-        Some(serde_json::from_slice(&std::fs::read(&report).expect("import report")).expect("import report json"))
-    }
-
     /// Each engine kind's root table, as the tables API lists them.
     pub async fn engine_tables(&self) -> std::collections::BTreeMap<String, String> {
         let (status, body) = local_get_as(&self.daemon, "/tables", "application/json").await;
@@ -770,37 +673,6 @@ impl TestDaemon {
             }
         }
         kinds
-    }
-
-    /// Fails with every access, when the old store is unavailable and
-    /// something reached it.
-    pub fn assert_old_store_untouched(&self) {
-        if let Some(accesses) = self.composition.refused() {
-            if !accesses.accesses().is_empty() {
-                panic!("{}", accesses.report());
-            }
-        }
-    }
-
-    /// Names the scenario's stage, which each later old-store access records.
-    pub fn stage(&self, stage: &str) {
-        if let Some(accesses) = &self.composition.old_store {
-            accesses.stage(stage);
-        }
-    }
-
-    /// The kinds the old store was accessed for so far, when its accesses are recorded.
-    pub fn old_store_kinds(&self) -> std::collections::BTreeSet<&'static str> {
-        self.composition
-            .old_store
-            .as_ref()
-            .map(|accesses| accesses.accesses().iter().map(|access| access.kind).collect())
-            .unwrap_or_default()
-    }
-
-    /// The old store's accesses so far, when they are recorded.
-    pub fn old_store_report(&self) -> Option<String> {
-        self.composition.old_store.as_ref().map(|accesses| accesses.report())
     }
 
     /// The environment vendors: what a test does as the vendor is all the
@@ -868,7 +740,7 @@ impl StoppedDaemon {
         let config = Arc::new(ConfigStore::with_base(dir.path().join("config")));
         let mut discovery = discovery(&dir, composition.forges.as_ref());
         fleet.install(&mut discovery);
-        let (daemon, runtime, front_door) = untouched(composition.refused(), compose(&composition, config, discovery, &dir)).await;
+        let (daemon, runtime, front_door) = compose(&composition, config, discovery, &dir).await;
         assert_eq!(daemon.node_id(), &node, "restart preserves the daemon's identity");
         let operator = Operator::connect(&daemon).await;
         TestDaemon { daemon, fleet, runtime: Some(runtime), front_door, operator, composition, dispatched, dir }
@@ -1147,28 +1019,6 @@ impl Operator {
         })
         .await
         .unwrap_or_else(|_| panic!("command {id} never finished"))
-    }
-}
-
-impl Composition {
-    /// The accesses that fail the scenario: the old store's, when it is unavailable.
-    fn refused(&self) -> Option<&OldStoreAccesses> {
-        self.old_store.as_deref().filter(|_| self.old_store_refused)
-    }
-}
-
-/// Runs `step`, failing with the old store's accesses as soon as there is one.
-async fn untouched<T>(old_store: Option<&OldStoreAccesses>, step: impl std::future::Future<Output = T>) -> T {
-    let Some(accesses) = old_store else { return step.await };
-    tokio::select! {
-        biased;
-        () = accesses.first_access() => panic!("{}", accesses.report()),
-        done = step => {
-            if !accesses.accesses().is_empty() {
-                panic!("{}", accesses.report());
-            }
-            done
-        }
     }
 }
 

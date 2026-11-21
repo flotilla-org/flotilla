@@ -77,7 +77,6 @@ members = [
     "crates/flotilla-verbs",
     "crates/flotilla-store",
     "crates/flotilla-store-memory",
-    "crates/flotilla-store-sqlite",
     "crates/flotilla-review-bundle-object-store",
     "crates/flotilla-store-testkit",
     "crates/flotilla-test-support",
@@ -204,7 +203,6 @@ flotilla-daemon = { path = "crates/flotilla-daemon" }
 [dev-dependencies]
 flotilla-daemon-testkit = { path = "crates/flotilla-daemon-testkit" }
 flotilla-discovery-testkit = { path = "crates/flotilla-discovery-testkit" }
-flotilla-store-sqlite = { path = "crates/flotilla-store-sqlite" }
 tokio = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }
 flotilla-core = { path = "crates/flotilla-core" }

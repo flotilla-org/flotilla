@@ -42,7 +42,6 @@ flotilla-dummy-fleet = { path = "../flotilla-dummy-fleet" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-provisioning = { path = "../flotilla-provisioning" }
 flotilla-review-bundle-object-store = { path = "../flotilla-review-bundle-object-store" }
-flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-store-memory = { path = "../flotilla-store-memory" }
 rigging-tls = { workspace = true }
 rigging-http-serve = { workspace = true }

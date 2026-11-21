@@ -29,7 +29,7 @@ hegeltest = { workspace = true }
 workspace = true
 
 # Keep native library features stable across build and test commands. The anchors of
-# flotilla-store-sqlite, less async: this crate does not reach tokio.
+# the engine store's schema layer, less async: this crate does not reach tokio.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }
 flotilla-build-features-base = { path = "../flotilla-build-features-base" }

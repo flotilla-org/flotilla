@@ -5,7 +5,6 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 
 async fn contract(backend: ResourceBackend) {
     let roots = backend.using::<ManifestRoot>("flotilla");
@@ -48,9 +47,4 @@ async fn contract(backend: ResourceBackend) {
 #[tokio::test]
 async fn in_memory_contract() {
     contract(ResourceBackend::new(InMemoryBackend::default())).await;
-}
-
-#[tokio::test]
-async fn sqlite_contract() {
-    contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))).await;
 }

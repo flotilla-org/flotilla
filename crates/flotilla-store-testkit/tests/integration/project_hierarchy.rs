@@ -1,6 +1,5 @@
 use flotilla_store::ProjectHierarchyStoreExt;
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use std::collections::BTreeMap;
 
 use flotilla_protocol::NodeId;
@@ -51,12 +50,9 @@ fn generated_parent_chains(tc: hegel::TestCase) {
 // preserving the previous definition. They permit explicit and implicit parents.
 #[tokio::test]
 async fn apply_refuses_invalid_hierarchy_with_reasons() {
-    for (backend, manifest) in [
-        (ResourceBackend::new(InMemoryBackend::default()), false),
-        (ResourceBackend::new(InMemoryBackend::default()), true),
-        (ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")), false),
-        (ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")), true),
-    ] {
+    for (backend, manifest) in
+        [(ResourceBackend::new(InMemoryBackend::default()), false), (ResourceBackend::new(InMemoryBackend::default()), true)]
+    {
         let apply =
             |kind: &str, name: &str, spec| json!({"apiVersion":"flotilla.work/v1", "kind":kind,"metadata":{"name":name},"spec":spec});
         async fn submit(
@@ -166,9 +162,7 @@ fn generated_invalid_parent_chains(tc: hegel::TestCase) {
 // namespace validation repeats under each embedded store's lock/transaction.
 #[tokio::test]
 async fn concurrent_reparenting_preserves_acyclicity() {
-    for backend in
-        [ResourceBackend::new(InMemoryBackend::default()), ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))]
-    {
+    for backend in [ResourceBackend::new(InMemoryBackend::default())] {
         let projects = backend.definitions::<Project>("flotilla");
         let a = InputMeta::builder().name("a".into()).build();
         let b = InputMeta::builder().name("b".into()).build();
@@ -186,9 +180,7 @@ async fn concurrent_reparenting_preserves_acyclicity() {
 // across kinds. Whichever wins, the resulting fleet cannot have a parent.
 #[tokio::test]
 async fn designation_and_parent_writes_share_admission() {
-    for backend in
-        [ResourceBackend::new(InMemoryBackend::default()), ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))]
-    {
+    for backend in [ResourceBackend::new(InMemoryBackend::default())] {
         let projects = backend.definitions::<Project>("flotilla");
         let fleets = backend.definitions::<FleetDesignation>("flotilla");
         let a = InputMeta::builder().name("a".into()).build();
@@ -209,7 +201,7 @@ async fn designation_and_parent_writes_share_admission() {
 // reparenting one member repairs the graph. Exercise both embedded stores.
 #[tokio::test]
 async fn federated_invalid_graph_can_be_inspected_and_repaired() {
-    for target in [ResourceBackend::new(InMemoryBackend::default()), ResourceBackend::new(SqliteBackend::open_in_memory().unwrap())] {
+    for target in [ResourceBackend::new(InMemoryBackend::default())] {
         let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("source"));
         let target = target.with_local_root(NodeId::new("target"));
         let a = InputMeta::builder().name("a".into()).build();
@@ -252,7 +244,7 @@ async fn federated_invalid_graph_can_be_inspected_and_repaired() {
 // edges follow the new designation, and removal returns to the bootstrap forest.
 #[tokio::test]
 async fn designation_reassignment_and_deletion() {
-    for backend in [ResourceBackend::new(InMemoryBackend::default()), ResourceBackend::new(SqliteBackend::open_in_memory().unwrap())] {
+    for backend in [ResourceBackend::new(InMemoryBackend::default())] {
         let projects = backend.definitions::<Project>("test");
         for name in ["old", "new", "child"] {
             projects.apply(&InputMeta::builder().name(name.into()).build(), &project(None)).await.unwrap();
@@ -274,7 +266,7 @@ async fn designation_reassignment_and_deletion() {
 // must be admitted without requiring every other broken chain to be fixed first.
 #[tokio::test]
 async fn apply_repairs_independent_invalid_edges_incrementally() {
-    for backend in [ResourceBackend::new(InMemoryBackend::default()), ResourceBackend::new(SqliteBackend::open_in_memory().unwrap())] {
+    for backend in [ResourceBackend::new(InMemoryBackend::default())] {
         let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("source"));
         for name in ["parent-a", "parent-b"] {
             source.definitions::<Project>("test").apply(&InputMeta::builder().name(name.into()).build(), &project(None)).await.unwrap();

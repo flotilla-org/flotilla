@@ -258,7 +258,7 @@ class BuildGraphContract(unittest.TestCase):
         # Explicit finite generator: every schema crate, each forbidden family named by #3320,
         # normal and build edges, direct and through an otherwise-allowed crate.
         for schema in SCHEMA_CRATES:
-            for target in ("flotilla-resources", "flotilla-store", "flotilla-store-sqlite", "flotilla-store-memory",
+            for target in ("flotilla-resources", "flotilla-store", "flotilla-store-memory",
                            "flotilla-core", "flotilla-daemon",
                            "flotilla-executor", "flotilla-protocol"):
                 for kind in ("normal", "build"):
@@ -571,7 +571,7 @@ class BuildGraphContract(unittest.TestCase):
         self.assertEqual(AGENT_CONNECTOR, "flotilla-agent-connector")
         self.assertEqual(layer(AGENT_CONNECTOR), "base")
         # Finite generator: every forbidden crate named by the contract, direct and transitive, normal and build edges.
-        for target in ("flotilla-resources", "flotilla-store", "flotilla-store-memory", "flotilla-store-sqlite",
+        for target in ("flotilla-resources", "flotilla-store", "flotilla-store-memory",
                        "flotilla-engine-store", "flotilla-schema-sqlite"):
             self.assertIn(target, AGENT_CONNECTOR_FORBIDDEN)
             for kind in ("normal", "build"):

@@ -32,7 +32,7 @@ fn error_message(value: &CommandValue) -> &str {
 
 // A need that names the platform matrix belongs to a workflow's roles or a Project's role needs;
 // an ad hoc one on the start command is refused before anything is placed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn an_ad_hoc_matrix_need_is_refused_before_placement() {
     let fleet = TestDaemon::builder().start().await;
     let mut intent = start_of("ad-hoc-matrix", CrewMix::Coder);
@@ -44,7 +44,7 @@ async fn an_ad_hoc_matrix_need_is_refused_before_placement() {
 
 // A repository declared as a fork refuses a workflow with no review inside the crew, until its
 // record explicitly allows reviewless workflows; a workflow that reviews in its crew is admitted.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_fork_stance_repository_refuses_reviewless_dispatch_and_admits_a_reviewed_one() {
     let fleet = TestDaemon::builder().start().await;
     let forge = catalog::forge(&fleet.get::<flotilla_resources::Forge>(catalog::DUMMY_FORGE_ID).await.expect("dummy forge").spec.https_url);
@@ -82,7 +82,7 @@ async fn a_fork_stance_repository_refuses_reviewless_dispatch_and_admits_a_revie
 
 // A start that waits to attach to its work learns at once that the work failed, rather than
 // waiting out the attach timeout.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn a_start_reports_failed_work_without_waiting_for_the_attach_timeout() {
     let fleet = TestDaemon::builder().environment("failure_rate = 1.0").start().await;
     let mut intent = start_of("bootstrap-failure", CrewMix::Coder);
@@ -94,7 +94,7 @@ async fn a_start_reports_failed_work_without_waiting_for_the_attach_timeout() {
 }
 
 // A landed convoy has nothing left to end: deleting it succeeds and the convoy is kept, landed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn deleting_a_landed_convoy_succeeds_and_keeps_it_landed() {
     let fleet = TestDaemon::builder().start().await;
     let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
@@ -106,7 +106,7 @@ async fn deleting_a_landed_convoy_succeeds_and_keeps_it_landed() {
 }
 
 // An operator removes a wrong declared remote from a repository without deleting its record.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn an_operator_removes_a_wrong_repository_remote_and_the_record_remains() {
     let fleet = TestDaemon::builder().start().await;
     let stable = "https://github.com/flotilla-org/flotilla";
@@ -125,7 +125,7 @@ async fn an_operator_removes_a_wrong_repository_remote_and_the_record_remains() 
 }
 
 // A delete of a name this home does not hold, or no longer holds, is NotFound.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn deleting_a_name_this_home_does_not_hold_is_not_found() {
     let fleet = TestDaemon::builder().start().await;
     let spec = flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
@@ -150,7 +150,7 @@ async fn deleting_a_name_this_home_does_not_hold_is_not_found() {
 
 // An operator completes a crew that submitted nothing: the convoy lands as the operator's verdict
 // keeps each of the crew's promises with nothing submitted.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn an_operators_forced_completion_settles_a_crew_that_submitted_nothing() {
     let fleet = TestDaemon::builder().agent("stall_rate = 1.0").start().await;
     let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;

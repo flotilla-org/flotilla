@@ -1,5 +1,4 @@
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use std::collections::BTreeSet;
 
 use flotilla_resources::{FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta};
@@ -24,13 +23,6 @@ async fn contract(backend: ResourceBackend) {
 #[tokio::test]
 async fn in_memory_contract() {
     contract(ResourceBackend::new(InMemoryBackend::default())).await;
-}
-
-#[tokio::test]
-async fn sqlite_contract() {
-    let dir = tempfile::tempdir().expect("temp directory");
-    let backend = SqliteBackend::open(dir.path().join("resources.db")).expect("sqlite backend");
-    contract(ResourceBackend::new(backend)).await;
 }
 
 #[test]

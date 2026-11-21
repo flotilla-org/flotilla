@@ -24,7 +24,6 @@ flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
-flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-transport = { path = "../flotilla-transport" }
 tokio = { workspace = true }
