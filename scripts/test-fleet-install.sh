@@ -687,6 +687,11 @@ grep -Fq 'preserving flotillad dev mode' "$test_root/linux-dev-mode-install.out"
 if grep -Eq -- '^--user (enable|restart) flotillad\.service$' "$test_root/systemctl.log"; then
   fail 'Linux install enabled or restarted the fleet unit while dev mode was active'
 fi
+# Tender has its own disabled flag: flotillad's dev mode neither stops it nor leaves it down.
+grep -Fxq -- '--user restart tender.service' "$test_root/systemctl.log" \
+  || fail 'Linux dev-mode install did not restart tender'
+grep -Fq 'tender answers identity' "$test_root/linux-dev-mode-install.out" \
+  || fail 'Linux dev-mode install did not confirm tender health'
 
 status="$(run_installer status 2>"$test_root/status.err")"
 grep -Fq "current: $generation_one (peer protocol 20)" <<<"$status" || fail 'status omitted current manifest protocol'
@@ -1246,9 +1251,13 @@ grep -Fxq 'fleet-install: flotilla table runs flotilla-table of build 2222222222
   || fail 'Darwin install did not check the sibling through the stable launcher'
 grep -Fq 'preserving flotillad dev mode' "$test_root/darwin-dev-mode-install.out" \
   || fail 'Darwin install did not report preserved dev mode'
-if grep -Eq '^(enable|bootstrap|kickstart) ' "$test_root/launchctl.log"; then
+if grep -E '^(enable|bootstrap|kickstart) ' "$test_root/launchctl.log" | grep -Fv 'work.flotilla.tender' | grep -q .; then
   fail 'Darwin install restarted the fleet agent while dev mode was active'
 fi
+grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.tender\\|releases/$generation_two$" "$test_root/launchctl.log" \
+  || fail 'Darwin dev-mode install did not restart tender'
+grep -Fq 'tender answers identity' "$test_root/darwin-dev-mode-install.out" \
+  || fail 'Darwin dev-mode install did not confirm tender health'
 
 darwin_previous_target="releases/$generation_one"
 : >"$test_root/launchctl.log"

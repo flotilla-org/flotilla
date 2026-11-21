@@ -574,17 +574,18 @@ prepare_linux_daemon_service() {
 
 restart_linux_daemon_service() {
   [[ "$PLATFORM" == linux-* ]] || return 0
+  command -v systemctl >/dev/null || die 'cannot restart flotillad.service: systemctl is not available'
+  # Tender is restarted with the generation, withdrawing its API publications: its epoch
+  # changes and publishers publish again. It has its own disabled flag, so flotillad's dev
+  # mode does not keep it from restarting. A generation without it leaves the service alone.
+  if ((!TENDER_SERVICE_DISABLED)) && generation_ships_tender; then
+    systemctl --user restart tender.service
+  fi
   if ((DAEMON_SERVICE_DISABLED)); then
     printf 'fleet-install: preserving flotillad dev mode; systemd user unit remains disabled\n'
     return 0
   fi
-  command -v systemctl >/dev/null || die 'cannot restart flotillad.service: systemctl is not available'
   systemctl --user restart flotillad.service
-  # Tender is restarted with the generation, withdrawing its API publications: its epoch
-  # changes and publishers publish again. A generation without it leaves the service alone.
-  if ((!TENDER_SERVICE_DISABLED)) && generation_ships_tender; then
-    systemctl --user restart tender.service
-  fi
 }
 
 write_launchd_agent() {
@@ -730,6 +731,9 @@ restart_darwin_daemon_service() {
   [[ "$PLATFORM" == darwin-* ]] || return 0
   refresh_darwin_tcc_payload || return 1
   if ((DAEMON_SERVICE_DISABLED)); then
+    # Tender has its own disabled flag; flotillad's dev mode only keeps flotillad down.
+    command -v launchctl >/dev/null || die "cannot restart $TENDER_LAUNCH_AGENT_LABEL: launchctl is not available"
+    restart_darwin_tender_service
     printf 'fleet-install: preserving flotillad dev mode; launchd agent remains disabled\n'
     return 0
   fi
