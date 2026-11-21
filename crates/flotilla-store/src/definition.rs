@@ -1166,30 +1166,35 @@ impl<T: Resource> EngineWatch<T> {
         .boxed()
     }
 
-    /// The events of the batches after the last taken.
+    /// The events of the batches after the last taken, each batch's names as it read them, in
+    /// order: a launch a later batch read gone is still read as an earlier one read it. A fresh
+    /// listing, or batches no longer held, compare every record as the feed holds it now.
     fn take(&mut self) {
         let EngineWatch { feed, serial, seen, position, pending, resolver, home, .. } = self;
         let state = feed.state();
         if state.serial == *serial {
             return;
         }
-        let mut names = BTreeSet::new();
-        let mut whole = false;
-        match state.after(*serial) {
-            None => whole = true,
-            Some(batches) => {
-                for batch in batches {
-                    match batch {
-                        crate::engine_feed::Batch::Changed(changed) => names.extend(changed.iter().cloned()),
-                        crate::engine_feed::Batch::Relisted => whole = true,
-                        crate::engine_feed::Batch::Failed(error) => pending.push_back(Err(ResourceError::other(error.clone()))),
+        let mut events = Vec::new();
+        let mut whole = true;
+        if let Some(batches) = state.after(*serial) {
+            whole = false;
+            for batch in batches {
+                match batch {
+                    crate::engine_feed::Batch::Changed { names, read } => events.extend(resolver.diff_names(home, read, names, seen)),
+                    // The listing is held only as the feed holds it now, which holds every
+                    // batch after it.
+                    crate::engine_feed::Batch::Relisted => {
+                        whole = true;
+                        break;
                     }
+                    crate::engine_feed::Batch::Failed(error) => pending.push_back(Err(ResourceError::other(error.clone()))),
                 }
             }
         }
         let events = match whole {
-            true => resolver.diff(home, &state.records, seen),
-            false => Ok(resolver.diff_names(home, &state.records, &names, seen)),
+            true => resolver.diff(home, &state.records, seen).map(|whole| events.into_iter().chain(whole).collect()),
+            false => Ok(events),
         };
         *serial = state.serial;
         match events {
