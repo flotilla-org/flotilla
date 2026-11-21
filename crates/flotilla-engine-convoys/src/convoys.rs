@@ -125,6 +125,12 @@ impl Convoys {
         locked(&self.home).newest_launch(of, None).cloned()
     }
 
+    /// The names of the launches homed here that are open, from the home's memory: a controller's
+    /// start set.
+    pub fn open_launches(&self) -> Vec<String> {
+        locked(&self.home).resources().filter(|convoy| convoy.label() == ConvoyLabel::Open).map(|convoy| convoy.name().to_owned()).collect()
+    }
+
     /// The launch named `name` (`<of>#<n>`) homed here, whether or not it is the newest.
     pub fn launch(&self, name: &str) -> Option<Resource<Convoy>> {
         locked(&self.home).get(name).cloned()

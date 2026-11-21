@@ -312,6 +312,18 @@ impl WorkQueueSender {
         self.every.notify_one();
     }
 
+    /// Takes `name` off the queue for a consumer that drains the receiver itself: a later send of
+    /// it queues it again.
+    pub fn take(&self, name: &str) {
+        self.progress.lock().expect("controller work queue lock poisoned").queued.remove(name);
+    }
+
+    /// Resolves when a watch asks for every resource ([`WorkQueueSender::send_every`]); requests
+    /// made meanwhile coalesce into one.
+    pub async fn every_requested(&self) {
+        self.every.notified().await
+    }
+
     fn start(&self, name: &str) -> Duration {
         let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
         let wait = progress.queued.remove(name).map_or(Duration::ZERO, |at| at.elapsed());

@@ -46,27 +46,28 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::ControlFlow,
     sync::Arc,
 };
 
 use async_trait::async_trait;
-use flotilla_engine_store::follow::Followed;
 use flotilla_resources::Clock;
-use flotilla_schema::{
-    reads::{carry, inherit},
-    Identity, KindCode, Timestamp,
-};
+use flotilla_schema::{reads::carry, Identity, KindCode, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState, VanishCause},
     Cause, Outcome, Resource,
 };
-use tokio::{sync::mpsc, task::JoinSet};
+use futures::StreamExt;
+use tokio::sync::mpsc;
 use tracing::{debug, info_span, warn, Instrument};
+
+mod runner;
+
+pub use runner::{Policy, Runner, Trigger};
 
 use super::{
     reads::{judge, Judgement},
-    watch::EngineWatch,
     EngineError, Lifecycles, Step,
 };
 
@@ -226,24 +227,6 @@ pub trait Actuator<K: LifecycleKind>: Send + Sync + 'static {
     }
 }
 
-/// Why a resource is looked at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Trigger {
-    /// Its holdings were just requested and read: it is judged on them.
-    Held,
-    /// The resource itself changed, or a flight of it finished.
-    Own,
-    /// A record it depends on changed: a failed attempt may run again.
-    Dependency,
-    /// The time its provider named for another try came.
-    Retry,
-    /// The controller started: the backing is observed.
-    Start,
-    /// A host probe saw the backing change, or a person ruled on it: a realised one is observed
-    /// again, and a failed attempt, a failed release among them, runs again.
-    Recheck,
-}
-
 /// What to do with one resource now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Action {
@@ -323,14 +306,6 @@ fn act(state: &LifecycleState, judgement: &Judgement, found: &Found, trigger: Tr
         },
         LifecycleState::Realised { .. } if matches!(trigger, Trigger::Start | Trigger::Recheck) => Action::Observe,
         _ => Action::Nothing,
-    }
-}
-
-/// Sleeps `wait`, or forever without one.
-async fn sleep(wait: Option<std::time::Duration>) {
-    match wait {
-        Some(wait) => tokio::time::sleep(wait).await,
-        None => std::future::pending().await,
     }
 }
 
@@ -430,25 +405,22 @@ impl std::fmt::Display for ControllerError {
 
 impl std::error::Error for ControllerError {}
 
-/// Kind `K`'s controller at this home.
+/// Kind `K`'s controller at this home: the lifecycle policy on the shared [`Runner`].
 pub struct Controller<K: LifecycleKind, A: Actuator<K>> {
+    runner: Runner<Done>,
+    policy: LifecyclePolicy<K, A>,
+}
+
+/// The lifecycle kinds' decisions: realise what is requested, observe what is realised, release
+/// what its holder ended.
+struct LifecyclePolicy<K: LifecycleKind, A: Actuator<K>> {
     records: Arc<dyn ControlledRecords<K>>,
     actuator: Arc<A>,
-    clock: Arc<dyn Clock>,
-    watch: EngineWatch,
-    code: KindCode,
-    /// Each live resource's dependencies, and the reverse.
-    depends: BTreeMap<String, Vec<Identity>>,
-    dependents: BTreeMap<Identity, BTreeSet<String>>,
     /// Whether each resource's provider was last read usable.
     usable: BTreeMap<String, bool>,
-    flights: JoinSet<(String, Done)>,
-    in_flight: BTreeSet<String>,
     /// The resources whose last release failed: tried again only on a dependency's change or at
     /// their provider's time.
     release_failed: BTreeSet<String>,
-    /// When each failed resource is tried again, as its provider named and the backoff allows.
-    retries: BTreeMap<String, Timestamp>,
     /// What each resource of a holding kind held at its last [`Actuator::holdings`].
     holdings: BTreeMap<String, Holdings>,
     /// The resources whose holdings are being read, and those of them a record changed for
@@ -473,6 +445,14 @@ impl From<String> for Recheck {
     fn from(name: String) -> Self {
         Recheck { name, ruled_release: false }
     }
+}
+
+/// What reaches a lifecycle controller from outside the log.
+enum LifecycleWake {
+    Backing(BackingEvent),
+    /// The provider's pushed facts ended: so does the run.
+    BackingClosed,
+    Recheck(Recheck),
 }
 
 impl<K, A> Controller<K, A>
@@ -503,25 +483,19 @@ where
         clock: Arc<dyn Clock>,
         service: Arc<Service>,
     ) -> Result<Self, StoreError> {
-        let code = records.code();
-        let watch = EngineWatch::start(service, std::iter::once(code).chain(actuator.followed()))?;
+        let runner = Runner::start(records.code(), records.home().to_owned(), actuator.followed(), clock, service)?;
         Ok(Self {
-            records,
-            actuator,
-            clock,
-            watch,
-            code,
-            depends: BTreeMap::new(),
-            dependents: BTreeMap::new(),
-            usable: BTreeMap::new(),
-            flights: JoinSet::new(),
-            in_flight: BTreeSet::new(),
-            release_failed: BTreeSet::new(),
-            retries: BTreeMap::new(),
-            holdings: BTreeMap::new(),
-            holding: BTreeSet::new(),
-            stale_holdings: BTreeSet::new(),
-            ruled: None,
+            runner,
+            policy: LifecyclePolicy {
+                records,
+                actuator,
+                usable: BTreeMap::new(),
+                release_failed: BTreeSet::new(),
+                holdings: BTreeMap::new(),
+                holding: BTreeSet::new(),
+                stale_holdings: BTreeSet::new(),
+                ruled: None,
+            },
         })
     }
 
@@ -536,144 +510,97 @@ where
     /// trying again each retrying one: a host probe that saw its backing change without knowing
     /// what it now is, or saw what a failed attempt lacked arrive.
     ///
-    /// A start set that cannot be read ends the run with the error. Going on with none would
-    /// never look at a resource that does not change again, such as one whose holder ended while
-    /// the controller was away, and would hide the missing read.
-    pub async fn run_with<R: Into<Recheck> + Send>(
-        mut self,
+    /// A start set that cannot be read ends the run with the error.
+    pub async fn run_with<R: Into<Recheck> + Send + 'static>(
+        self,
         mut backing: mpsc::Receiver<BackingEvent>,
         mut rechecks: mpsc::Receiver<R>,
     ) -> Result<(), ControllerError> {
-        let mut rechecking = true;
-        let start = self
-            .records
-            .live()
-            .map_err(|error| ControllerError::Unreadable { kind: K::NAME, error })?
-            .into_iter()
-            .map(|name| (name, Trigger::Start))
-            .collect();
-        self.evaluate(start).await;
-        loop {
-            let retry =
-                self.retries.values().min().and_then(|at| at.to_datetime()).map(|at| (at - self.clock.now()).to_std().unwrap_or_default());
-            tokio::select! {
-                () = sleep(retry) => {
-                    let now = Timestamp::from_datetime(&self.clock.now());
-                    let due: Vec<String> = self.retries.iter().filter(|(_, at)| **at <= now).map(|(name, _)| name.clone()).collect();
-                    for name in &due {
-                        self.retries.remove(name);
-                    }
-                    self.evaluate(due.into_iter().map(|name| (name, Trigger::Retry)).collect()).await;
-                }
-                // Cancel-safe: an unconsumed wake stays for the next turn.
-                () = self.watch.woken() => {
-                    match self.watch.pass(|_, followed| Ok(followed)).await {
-                        Ok(followed) => {
-                            let touched = self.touched(followed);
-                            self.evaluate(touched).await;
-                        }
-                        // Tried again at the next commit.
-                        Err(error) => warn!(kind = K::NAME, %error, "controller log pass failed"),
-                    }
-                }
-                Some(joined) = self.flights.join_next(), if !self.flights.is_empty() => match joined {
-                    Ok((name, done)) => {
-                        self.in_flight.remove(&name);
-                        let trigger = if matches!(done, Done::Held(Ok(_))) { Trigger::Held } else { Trigger::Own };
-                        // A holding this call named first was not followed while it ran, and one
-                        // that was may have changed meanwhile: either way its holdings are read
-                        // once more.
-                        self.holding.remove(&name);
-                        let stale = self.stale_holdings.remove(&name);
-                        let unseen = match &done {
-                            Done::Held(Ok(holdings)) | Done::Observed(_, Some(holdings)) => {
-                                let before = self.holdings.get(&name);
-                                stale || holdings.held.iter().any(|held| before.is_none_or(|before| !before.held.iter().any(|seen| seen.fact == held.fact)))
-                            }
-                            _ => false,
-                        };
-                        let trigger = if self.finish(&name, done).await { Trigger::Recheck } else { trigger };
-                        self.evaluate(BTreeMap::from([(name.clone(), trigger)])).await;
-                        if unseen {
-                            self.evaluate(BTreeMap::from([(name, Trigger::Dependency)])).await;
-                        }
-                    }
-                    Err(error) => warn!(kind = K::NAME, %error, "controller flight did not finish"),
-                },
-                event = backing.recv() => match event {
-                    Some(event) => {
-                        let trigger = if self.finish(&event.name, Done::Observed(Ok(event.observed), None)).await {
-                            Trigger::Recheck
-                        } else {
-                            Trigger::Own
-                        };
-                        self.evaluate(BTreeMap::from([(event.name, trigger)])).await;
-                    }
-                    None => return Ok(()),
-                },
-                recheck = rechecks.recv(), if rechecking => match recheck.map(Into::into) {
-                    Some(Recheck { name, ruled_release }) => {
-                        self.ruled = ruled_release.then(|| name.clone());
-                        self.evaluate(BTreeMap::from([(name, Trigger::Recheck)])).await;
-                        self.ruled = None;
-                    }
-                    None => rechecking = false,
-                },
-            }
-        }
+        let backing = futures::stream::poll_fn(move |cx| backing.poll_recv(cx))
+            .map(LifecycleWake::Backing)
+            .chain(futures::stream::once(std::future::ready(LifecycleWake::BackingClosed)));
+        let rechecks = futures::stream::poll_fn(move |cx| rechecks.poll_recv(cx)).map(|recheck| LifecycleWake::Recheck(recheck.into()));
+        self.runner.run(self.policy, futures::stream::select(backing, rechecks)).await
+    }
+}
+
+#[async_trait]
+impl<K, A> Policy for LifecyclePolicy<K, A>
+where
+    K: LifecycleKind,
+    K::Request: Clone + Send + Sync + 'static,
+    A: Actuator<K>,
+{
+    type Done = Done;
+    type Wake = LifecycleWake;
+
+    fn kind(&self) -> &'static str {
+        K::NAME
     }
 
-    /// The resources a pass's changes touch, and why.
-    fn touched(&self, followed: Vec<Followed>) -> BTreeMap<String, Trigger> {
-        let home = self.records.home().to_owned();
-        let mut touched = BTreeMap::new();
-        let mut touch = |name: &str, trigger: Trigger| {
-            let held = touched.entry(name.to_owned()).or_insert(trigger);
-            *held = (*held).max(trigger);
-        };
-        for followed in followed {
-            match followed {
-                Followed::Changed(identity) if identity.kind == self.code && identity.home == home => touch(&identity.name, Trigger::Own),
-                Followed::Changed(identity) => {
-                    // A launch (`<of>#<n>`) also touches what depends on `<of>`: its newest launch.
-                    let of = Identity { name: super::launched(&identity.name).to_owned(), ..identity.clone() };
-                    let launch_of = (of != identity).then_some(&of);
-                    for name in [Some(&identity), launch_of].into_iter().flatten().filter_map(|key| self.dependents.get(key)).flatten() {
-                        touch(name, Trigger::Dependency);
-                    }
-                }
-                Followed::Rescan(rescanned) if rescanned == home => match self.records.live() {
-                    Ok(live) => {
-                        for name in live {
-                            touch(&name, Trigger::Own);
-                        }
-                    }
-                    Err(error) => warn!(kind = K::NAME, %error, "the live resources could not be read at a rescan"),
-                },
-                Followed::Rescan(rescanned) => {
-                    for (_, names) in self.dependents.iter().filter(|(identity, _)| identity.home == rescanned) {
-                        for name in names {
-                            touch(name, Trigger::Dependency);
-                        }
-                    }
-                }
-            }
-        }
-        touched
+    fn live(&self) -> Result<Vec<String>, String> {
+        self.records.live()
     }
 
     /// Decides and acts for each touched resource, in a span of its kind.
-    async fn evaluate(&mut self, touched: BTreeMap<String, Trigger>) {
+    async fn evaluate(&mut self, runner: &mut Runner<Done>, touched: BTreeMap<String, Trigger>) {
         let span = info_span!("engine_controller.evaluate", kind = K::NAME, touched = touched.len());
-        self.evaluate_touched(touched).instrument(span).await
+        self.evaluate_touched(runner, touched).instrument(span).await
     }
 
-    async fn evaluate_touched(&mut self, touched: BTreeMap<String, Trigger>) {
+    async fn landed(&mut self, runner: &mut Runner<Done>, name: String, done: Done) {
+        let trigger = if matches!(done, Done::Held(Ok(_))) { Trigger::Held } else { Trigger::Own };
+        // A holding this call named first was not followed while it ran, and one that was may
+        // have changed meanwhile: either way its holdings are read once more.
+        self.holding.remove(&name);
+        let stale = self.stale_holdings.remove(&name);
+        let unseen = match &done {
+            Done::Held(Ok(holdings)) | Done::Observed(_, Some(holdings)) => {
+                let before = self.holdings.get(&name);
+                stale || holdings.held.iter().any(|held| before.is_none_or(|before| !before.held.iter().any(|seen| seen.fact == held.fact)))
+            }
+            _ => false,
+        };
+        let trigger = if self.finish(runner, &name, done).await { Trigger::Recheck } else { trigger };
+        self.evaluate(runner, BTreeMap::from([(name.clone(), trigger)])).await;
+        if unseen {
+            self.evaluate(runner, BTreeMap::from([(name, Trigger::Dependency)])).await;
+        }
+    }
+
+    async fn woken(&mut self, runner: &mut Runner<Done>, wake: LifecycleWake) -> ControlFlow<()> {
+        match wake {
+            LifecycleWake::Backing(event) => {
+                let trigger = if self.finish(runner, &event.name, Done::Observed(Ok(event.observed), None)).await {
+                    Trigger::Recheck
+                } else {
+                    Trigger::Own
+                };
+                self.evaluate(runner, BTreeMap::from([(event.name, trigger)])).await;
+            }
+            LifecycleWake::BackingClosed => return ControlFlow::Break(()),
+            LifecycleWake::Recheck(Recheck { name, ruled_release }) => {
+                self.ruled = ruled_release.then(|| name.clone());
+                self.evaluate(runner, BTreeMap::from([(name, Trigger::Recheck)])).await;
+                self.ruled = None;
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+impl<K, A> LifecyclePolicy<K, A>
+where
+    K: LifecycleKind,
+    K::Request: Clone + Send + Sync + 'static,
+    A: Actuator<K>,
+{
+    async fn evaluate_touched(&mut self, runner: &mut Runner<Done>, touched: BTreeMap<String, Trigger>) {
         let mut held = Vec::new();
         for (name, trigger) in touched {
             match self.records.get(&name) {
                 Ok(Some(resource)) if resource.state().live() => held.push((name, trigger, resource)),
-                Ok(_) => self.forget(&name),
+                Ok(_) => self.forget(runner, &name),
                 // Read again at the next event touching it.
                 Err(error) => warn!(kind = K::NAME, name, %error, "controller read failed"),
             }
@@ -683,8 +610,8 @@ where
         }
         let actuator = Arc::clone(&self.actuator);
         let requests: Vec<(String, K::Request)> = held.iter().map(|(name, _, resource)| (name.clone(), resource.spec().clone())).collect();
-        let found = self
-            .watch
+        let found = runner
+            .watch()
             .read(move |read| {
                 requests
                     .iter()
@@ -720,10 +647,10 @@ where
                 found.usability.extend(holdings.held.iter().cloned());
                 found.holdings_complete = holdings.complete;
             }
-            self.remember(&name, resource.spec(), &found);
+            self.remember(runner, &name, resource.spec(), &found);
             let usable_now = found.usable();
             let usable_again = self.usable.insert(name.clone(), usable_now) == Some(false) && usable_now;
-            if self.in_flight.contains(&name) {
+            if runner.flying(&name) {
                 if self.holding.contains(&name) && trigger == Trigger::Dependency {
                     self.stale_holdings.insert(name);
                 }
@@ -738,7 +665,7 @@ where
                 trigger
             };
             if matches!(state, LifecycleState::Requested { .. }) && K::launch(resource.spec()).is_some() {
-                self.end_predecessor(&name).await;
+                self.end_predecessor(runner, &name).await;
             }
             let judgement = judge::<K>(state);
             let release_failed = self.release_failed.contains(&name);
@@ -747,20 +674,20 @@ where
             if self.actuator.holds() && trigger != Trigger::Held {
                 let unwaited = Found { usability: Vec::new(), holdings_complete: true, ..found.clone() };
                 if act(state, &judgement, &unwaited, trigger, usable_again, release_failed) == Action::Realise {
-                    self.perform(&name, resource.spec().clone(), Action::Hold).await;
+                    self.perform(runner, &name, resource.spec().clone(), Action::Hold).await;
                     continue;
                 }
             }
             let action = act(state, &judgement, &found, trigger, usable_again, release_failed);
-            self.perform(&name, resource.spec().clone(), action).await;
+            self.perform(runner, &name, resource.spec().clone(), action).await;
         }
     }
 
     /// A successor launch `name` is requested: its predecessor, if still realised, is gone.
-    async fn end_predecessor(&self, name: &str) {
+    async fn end_predecessor(&self, runner: &Runner<Done>, name: &str) {
         let records = Arc::clone(&self.records);
         let owned = name.to_owned();
-        let at = Timestamp::from_datetime(&self.clock.now());
+        let at = runner.now();
         let written = tokio::task::spawn_blocking(carry(move || records.finish_launch_request(&owned, at)))
             .await
             .unwrap_or_else(|error| Err(EngineError::Failed(format!("lifecycle write did not finish: {error}"))));
@@ -769,26 +696,20 @@ where
         }
     }
 
-    async fn perform(&mut self, name: &str, request: K::Request, action: Action) {
+    async fn perform(&mut self, runner: &mut Runner<Done>, name: &str, request: K::Request, action: Action) {
         debug!(kind = K::NAME, name, ?action, "controller action");
         let actuator = Arc::clone(&self.actuator);
         let owned = name.to_owned();
         match action {
             Action::Nothing => return,
             Action::GiveUp { cause, retryable } => {
-                self.write(name, Step::Attempted(Outcome::Failed { cause, retryable })).await;
+                self.write(runner, name, Step::Attempted(Outcome::Failed { cause, retryable })).await;
                 return;
             }
             Action::Hold => {
                 self.holding.insert(owned.clone());
                 let span = info_span!("engine_controller.holdings", kind = K::NAME, name);
-                self.flights.spawn(inherit(
-                    async move {
-                        let done = Done::Held(actuator.holdings(&owned, &request).await);
-                        (owned, done)
-                    }
-                    .instrument(span),
-                ));
+                runner.spawn(name, async move { Done::Held(actuator.holdings(&owned, &request).await) }.instrument(span));
             }
             Action::Observe => {
                 // A holding kind's observation reads what it holds too, so that one adopted at
@@ -798,46 +719,40 @@ where
                     self.holding.insert(owned.clone());
                 }
                 let span = info_span!("engine_controller.observe", kind = K::NAME, name);
-                self.flights.spawn(inherit(
+                runner.spawn(
+                    name,
                     async move {
                         let (holdings, observed) = if holds {
                             actuator.observe_holding(&owned, &request).await
                         } else {
                             (None, actuator.observe(&owned, &request).await)
                         };
-                        let done = Done::Observed(observed, holdings);
-                        (owned, done)
+                        Done::Observed(observed, holdings)
                     }
                     .instrument(span),
-                ));
+                );
             }
             Action::Realise => {
                 let span = info_span!("engine_controller.realise", kind = K::NAME, name);
-                self.flights.spawn(inherit(
-                    async move {
-                        let done = Done::Realised(actuator.realise(&owned, &request).await);
-                        (owned, done)
-                    }
-                    .instrument(span),
-                ));
+                runner.spawn(name, async move { Done::Realised(actuator.realise(&owned, &request).await) }.instrument(span));
             }
             Action::Release { identity } => {
                 let ruled = self.ruled.as_deref() == Some(name);
                 let span = info_span!("engine_controller.release", kind = K::NAME, name);
-                self.flights.spawn(inherit(
+                runner.spawn(
+                    name,
                     async move {
                         let released = if ruled {
                             actuator.release_ruled(&owned, &request, identity.as_deref()).await
                         } else {
                             actuator.release(&owned, &request, identity.as_deref()).await
                         };
-                        (owned, Done::Released(released))
+                        Done::Released(released)
                     }
                     .instrument(span),
-                ));
+                );
             }
         }
-        self.in_flight.insert(name.to_owned());
     }
 
     /// Records what a flight, or a pushed backing fact, found. True when the resource is to be
@@ -845,7 +760,7 @@ where
     /// once realised; or a realised resource whose backing it found gone or broken after its holder
     /// ended, whose release owns the ending, so the finding ends nothing and the release is tried
     /// again.
-    async fn finish(&mut self, name: &str, done: Done) -> bool {
+    async fn finish(&mut self, runner: &mut Runner<Done>, name: &str, done: Done) -> bool {
         let resource = match self.records.get(name) {
             Ok(Some(resource)) => resource,
             Ok(None) => return false,
@@ -857,7 +772,7 @@ where
         let state = resource.state().clone();
         let mut again = false;
         // A new try ran: what it found decides any later one.
-        let scheduled = if matches!(done, Done::Observed(..) | Done::Held(Ok(_))) { None } else { self.retries.remove(name) };
+        let scheduled = if matches!(done, Done::Observed(..) | Done::Held(Ok(_))) { None } else { runner.unschedule(name) };
         if let Done::Observed(_, Some(holdings)) = &done {
             self.holdings.insert(name.to_owned(), holdings.clone());
         }
@@ -865,11 +780,11 @@ where
             (Done::Held(Ok(holdings)), _) => {
                 self.holdings.insert(name.to_owned(), holdings);
             }
-            (Done::Held(Err(failure)), LifecycleState::Requested { .. }) => self.failed(name, &state, failure, scheduled).await,
+            (Done::Held(Err(failure)), LifecycleState::Requested { .. }) => self.failed(runner, name, &state, failure, scheduled).await,
             // A realised resource's holdings read again: its observation, not this read, ends it.
             (Done::Held(Err(failure)), _) => warn!(kind = K::NAME, name, cause = ?failure.cause, "holdings could not be read"),
             (Done::Realised(Ok(identity)), _) => {
-                let refused = self.write(name, Step::Realised { identity: identity.clone() }).await;
+                let refused = self.write(runner, name, Step::Realised { identity: identity.clone() }).await;
                 if refused.is_none() && self.actuator.holds() {
                     again = self
                         .records
@@ -884,22 +799,18 @@ where
                         let request = resource.spec().clone();
                         let actuator = Arc::clone(&self.actuator);
                         let owned = name.to_owned();
-                        self.in_flight.insert(owned.clone());
-                        self.flights.spawn(inherit(async move {
-                            let done = Done::Released(actuator.release(&owned, &request, Some(&identity)).await);
-                            (owned, done)
-                        }));
+                        runner.spawn(name, async move { Done::Released(actuator.release(&owned, &request, Some(&identity)).await) });
                     }
                 }
             }
-            (Done::Realised(Err(failure)), _) => self.failed(name, &state, failure, scheduled).await,
+            (Done::Realised(Err(failure)), _) => self.failed(runner, name, &state, failure, scheduled).await,
             (Done::Released(Ok(())), state) if state.live() => {
                 self.release_failed.remove(name);
-                self.write(name, Step::Released).await;
+                self.write(runner, name, Step::Released).await;
             }
             (Done::Released(Err(failure)), LifecycleState::Requested { .. }) => {
                 self.release_failed.insert(name.to_owned());
-                self.failed(name, &state, failure, scheduled).await;
+                self.failed(runner, name, &state, failure, scheduled).await;
             }
             (Done::Released(Err(failure)), _) => {
                 // A realised resource has no failed-teardown edge yet, so the failure is not
@@ -909,17 +820,17 @@ where
                 self.release_failed.insert(name.to_owned());
                 warn!(kind = K::NAME, name, cause = ?failure.cause, "release failed");
                 if let Some(retry_at) = failure.retry_at.filter(|_| failure.retryable) {
-                    self.retries.insert(name.to_owned(), retry_at);
+                    runner.retry_at(name, retry_at);
                 }
             }
             (Done::Observed(Ok(Backing::Present { identity }), _), LifecycleState::Requested { .. }) => {
-                self.write(name, Step::Realised { identity }).await;
+                self.write(runner, name, Step::Realised { identity }).await;
             }
             (Done::Observed(Ok(Backing::Absent { reason }), _), LifecycleState::Realised { .. }) => {
-                again = self.vanish(name, resource.spec(), VanishCause::Lost { reason }).await;
+                again = self.vanish(runner, name, resource.spec(), VanishCause::Lost { reason }).await;
             }
             (Done::Observed(Ok(Backing::Failed { reason }), _), LifecycleState::Realised { .. }) => {
-                again = self.vanish(name, resource.spec(), VanishCause::Failed { reason }).await;
+                again = self.vanish(runner, name, resource.spec(), VanishCause::Failed { reason }).await;
             }
             (Done::Observed(Err(cause), _), _) => warn!(kind = K::NAME, name, ?cause, "observation failed"),
             _ => {}
@@ -932,16 +843,16 @@ where
     /// releasing it does, not a loss. Read from the store, not from what this controller holds in
     /// memory, so a failed release try does not hand the ending back to the next finding. True
     /// when the ending was left to the release.
-    async fn vanish(&self, name: &str, request: &K::Request, cause: VanishCause) -> bool {
+    async fn vanish(&self, runner: &Runner<Done>, name: &str, request: &K::Request, cause: VanishCause) -> bool {
         let actuator = Arc::clone(&self.actuator);
         let (owned, request) = (name.to_owned(), request.clone());
-        match self.watch.read(move |read| Ok(actuator.holder(read, &owned, &request)?.ended)).await {
+        match runner.watch().read(move |read| Ok(actuator.holder(read, &owned, &request)?.ended)).await {
             Ok(true) => {
                 debug!(kind = K::NAME, name, ?cause, "backing gone after its holder ended: the release ends it");
                 true
             }
             Ok(false) => {
-                self.write(name, Step::Vanished { cause }).await;
+                self.write(runner, name, Step::Vanished { cause }).await;
                 false
             }
             // Judged again at its next observation.
@@ -956,18 +867,25 @@ where
     /// made before the pending retry was due, as a wake makes, is not counted and leaves that
     /// retry where it was (`scheduled`): the failure limit counts the kind's retry schedule, not
     /// how often something woke the resource.
-    async fn failed(&mut self, name: &str, state: &LifecycleState, failure: ProviderFailure, scheduled: Option<Timestamp>) {
+    async fn failed(
+        &mut self,
+        runner: &mut Runner<Done>,
+        name: &str,
+        state: &LifecycleState,
+        failure: ProviderFailure,
+        scheduled: Option<Timestamp>,
+    ) {
         let retry_at = failure.retry_at.filter(|_| failure.retryable);
         let (cause, retryable) = (failure.cause, failure.retryable);
-        let now = Timestamp::from_datetime(&self.clock.now());
+        let now = runner.now();
         match judge::<K>(state) {
             Judgement::Retrying { next, .. } if now < next => {
-                self.write(name, Step::FailedEarly { cause, retryable }).await;
-                self.schedule(name, retry_at.or(scheduled));
+                self.write(runner, name, Step::FailedEarly { cause, retryable }).await;
+                self.schedule(runner, name, retry_at.or(scheduled));
             }
             _ => {
-                self.write(name, Step::Attempted(Outcome::Failed { cause, retryable })).await;
-                self.schedule(name, retry_at);
+                self.write(runner, name, Step::Attempted(Outcome::Failed { cause, retryable })).await;
+                self.schedule(runner, name, retry_at);
             }
         }
     }
@@ -975,21 +893,21 @@ where
     /// Tries `name` again at `retry_at`, no sooner than its kind's backoff after the failure just
     /// recorded, while its failure limit allows another try. A failure that is not counted, such
     /// as a realised resource's failed release, is never retried on time.
-    fn schedule(&mut self, name: &str, retry_at: Option<Timestamp>) {
+    fn schedule(&mut self, runner: &mut Runner<Done>, name: &str, retry_at: Option<Timestamp>) {
         let Some(retry_at) = retry_at else { return };
         if let Ok(Some(Judgement::Retrying { next, .. })) =
             self.records.get(name).map(|resource| resource.map(|resource| judge::<K>(resource.state())))
         {
-            self.retries.insert(name.to_owned(), retry_at.max(next));
+            runner.retry_at(name, retry_at.max(next));
         }
     }
 
     /// Applies `step` to `name` on a blocking thread: the home's write takes the store's lock.
     /// The engine's refusal, if it did not take the step; it is logged here.
-    async fn write(&self, name: &str, step: Step) -> Option<EngineError> {
+    async fn write(&self, runner: &Runner<Done>, name: &str, step: Step) -> Option<EngineError> {
         let records = Arc::clone(&self.records);
         let owned = name.to_owned();
-        let at = Timestamp::from_datetime(&self.clock.now());
+        let at = runner.now();
         let written = tokio::task::spawn_blocking(carry(move || records.step(&owned, &step, at)))
             .await
             .unwrap_or_else(|error| Err(EngineError::Failed(format!("lifecycle write did not finish: {error}"))));
@@ -998,40 +916,21 @@ where
         Some(error)
     }
 
-    fn remember(&mut self, name: &str, request: &K::Request, found: &Found) {
+    fn remember(&mut self, runner: &mut Runner<Done>, name: &str, request: &K::Request, found: &Found) {
         let mut depends = self.actuator.dependencies(request);
         depends.extend(found.usability.iter().map(|usability| usability.fact.clone()));
         depends.extend(found.blockers.iter().cloned());
         depends.extend(found.release_waits.iter().cloned());
         depends.extend(found.holders.iter().cloned());
-        if self.depends.get(name) == Some(&depends) {
-            return;
-        }
-        self.unlink(name);
-        for identity in &depends {
-            self.dependents.entry(identity.clone()).or_default().insert(name.to_owned());
-        }
-        self.depends.insert(name.to_owned(), depends);
+        runner.link(name, depends);
     }
 
-    fn forget(&mut self, name: &str) {
+    fn forget(&mut self, runner: &mut Runner<Done>, name: &str) {
         self.usable.remove(name);
         self.holdings.remove(name);
         self.stale_holdings.remove(name);
         self.release_failed.remove(name);
-        self.retries.remove(name);
-        self.unlink(name);
-    }
-
-    fn unlink(&mut self, name: &str) {
-        for identity in self.depends.remove(name).unwrap_or_default() {
-            if let Some(names) = self.dependents.get_mut(&identity) {
-                names.remove(name);
-                if names.is_empty() {
-                    self.dependents.remove(&identity);
-                }
-            }
-        }
+        runner.forget(name);
     }
 }
 
