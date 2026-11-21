@@ -57,6 +57,8 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
     flotilla_store_testkit::fixtures::project_on_repository(&backend, NAMESPACE, NAMESPACE, &inspection.spec, "main").await;
 
     let mut rx = daemon.subscribe();
+    // Subscribed before the create, so the landing of the checkout cannot be missed.
+    let mut held_changes = daemon.lifecycle_reads().checkouts().expect("checkouts").changes();
     let create_id = daemon
         .execute(
             Command::builder()
@@ -83,6 +85,17 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         let observed = daemon.discovered_checkouts().all().len();
         (held, observed)
     };
+    // The first convoy's own checkout is held asynchronously, after its create returns; the
+    // baseline is taken once its record has landed, so only a duplicate's write can move the count.
+    loop {
+        if checkout_count().await.0 == 1 {
+            break;
+        }
+        match held_changes.recv().await {
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(closed) => panic!("the checkout changes ended before the first convoy's checkout landed: {closed}"),
+        }
+    }
     let checkout_count_before = checkout_count().await;
     let duplicate_id = daemon
         .execute(
