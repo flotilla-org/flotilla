@@ -1,6 +1,6 @@
 use super::*;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_complete() {
     let temp = TempDir::new().expect("tempdir");
     let repo_default_dir = temp.path().join("flotilla-repos");

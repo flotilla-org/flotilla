@@ -111,7 +111,7 @@ async fn bad_ssh_host_does_not_block_daemon_startup_or_other_hosts() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
     // The host's home holds each vessel's cleat runtime, a socket directory (SUN_LEN).
     let temp = flotilla_test_support::TestSocketDir::new();

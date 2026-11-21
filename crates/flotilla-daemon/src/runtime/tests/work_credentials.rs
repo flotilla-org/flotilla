@@ -7,7 +7,7 @@ use flotilla_resources::vessel_records::VesselStep;
 use flotilla_resources::ResumeIntent;
 use tokio_util::task::AbortOnDropHandle;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delivery() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -265,7 +265,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
 
 // A grant whose declaration is missing fails its environment's delivery; the declaration
 // arriving is the event that delivers it, with no request and no timer.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_missing_credential_declaration_is_delivered_once_it_arrives() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -547,7 +547,7 @@ impl KeyedDelivery {
 
 // d10 (#3108): crew handoffs waited up to 89 s in one queue behind other environments'
 // credential deliveries. A handoff's delivery for its own environment waits for nothing else.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_handoffs_credential_delivery_does_not_wait_behind_other_environments() {
     const STUCK: usize = 8;
     let fixture = KeyedDelivery::new("credential-keyed-handoff").await;

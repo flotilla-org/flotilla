@@ -329,7 +329,9 @@ async fn daemon_forgejo_credential_mapping_waits_for_forge_replication() {
 // #2577: source-addressed requests can use declarations made at another home. Exercise
 // config removal/correction and declaration arrival/deletion
 // in generated order, checking the invariant after every step.
-#[hegel::test]
+// Each case starts a daemon on virtual time; hegel charges that whole scenario to generation
+// time on the wall clock, which is not a generation-cost oracle. Keep the other health checks.
+#[hegel::test(suppress_health_check = [hegel::HealthCheck::TooSlow])]
 fn daemon_forgejo_credential_mapping_sequences(tc: hegel::TestCase) {
     use hegel::generators as gs;
     // Empty map, typo, valid key, declaration present/absent, duplicate ops.
@@ -393,7 +395,7 @@ async fn agent_environment_is_staged_at_the_runner_writable_config_base() {
 // Acceptance (#3964): a Docker crew's access layer runs on the real launch path before
 // its harness starts. Its frozen skills are fetched on the controller and pushed into the
 // home its binding delivers into (#3663), and the harness launches with exactly that home.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
