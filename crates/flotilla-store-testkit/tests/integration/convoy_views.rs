@@ -353,6 +353,12 @@ impl TerminalRecords for Terminals {
         let home = home.unwrap_or(HERE);
         Ok(self.records().into_iter().find(|record| record.name == name && record.home == home))
     }
+    fn named(&self, name: &str) -> Result<Vec<TerminalRecord>, String> {
+        let newest = flotilla_resources::terminal_records::newest_launches(
+            self.records().into_iter().filter(|record| record.name == name || record.session_name() == name),
+        );
+        Ok(newest.into_values().collect())
+    }
     fn at(&self, home: &str) -> Result<Vec<TerminalRecord>, String> {
         Ok(self.records().into_iter().filter(|record| record.home == home).collect())
     }

@@ -685,6 +685,26 @@ pub trait ConvoyRecords: Send + Sync {
         listing.unreadable.retain(|launch| launch.project == project && launch.launch_of == of);
         Ok(listing)
     }
+    /// Every home's launches in `project`, ended or not, that have not retired, read through the
+    /// leading column of the kind's `by_launch` index; one that cannot be read is listed as
+    /// unreadable. The default filters [`ConvoyRecords::every`], for a port that keeps no index.
+    fn of_project(&self, project: &str) -> Result<ConvoyListing, String> {
+        let mut listing = self.every()?;
+        listing.records.retain(|record| record.project == project);
+        listing.unreadable.retain(|launch| launch.project == project);
+        Ok(listing)
+    }
+    /// Every home's launches holding a link of `subject`, an unlinked one included, that have not
+    /// retired, read through the kind's `by_subject` index; one that cannot be read is listed as
+    /// unreadable. The default filters [`ConvoyRecords::every`], for a port that keeps no index.
+    fn linked_to(&self, subject: &flotilla_address::Address) -> Result<ConvoyListing, String> {
+        let subject = crate::address::subject_for(subject)?;
+        let mut listing = self.every()?;
+        listing
+            .records
+            .retain(|record| record.subjects.iter().any(|linked| linked.subject == subject) || record.unlinked.contains(&subject));
+        Ok(listing)
+    }
     /// Every home's launches in `project` that have not ended, read through the kind's
     /// `open_by_project` index; one that cannot be read is listed as unreadable. The default
     /// filters [`ConvoyRecords::every`], for a port that keeps no index.

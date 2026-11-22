@@ -69,15 +69,23 @@ fn followed_kinds() -> [KindCode; 2] {
 impl EngineConvoyRecords {
     /// The port at `home` over `service`, with the home's notes in `memory`, which its writers
     /// share, and the store's open AwaitingReply records in `stalls`.
+    /// Whether the store holds an open launch without a stored role is read here, at startup, so
+    /// no role read pays for the scan (ADR 0047 N->N+1; remove with the `Option` on the spec's
+    /// role).
     pub fn new(home: &str, service: Arc<Service>, memory: Arc<ConvoyMemory>, stalls: Arc<OpenAwaiting>) -> Self {
-        Self {
+        let records = Self {
             home: home.to_owned(),
             service,
             memory,
             stalls,
             changes: tokio::sync::broadcast::channel(CHANGES).0,
             unstored_roles: Arc::default(),
+        };
+        // One that cannot be read now is read at the first role read.
+        if let Err(error) = records.read("unstored roles", |read| records.unstored_roles(read)) {
+            tracing::debug!(%error, "whether open launches lack a stored role is read at the first role read");
         }
+        records
     }
 
     /// Follows the convoys' records and the stall records about their seats in the store's log,
@@ -236,6 +244,15 @@ impl ConvoyRecords for EngineConvoyRecords {
     fn open_in(&self, project: &str) -> Result<ConvoyListing, String> {
         let address = Address::project(project).map_err(|error| format!("project `{project}`: {error}"))?;
         self.read(&format!("open launches in {project}"), |read| Self::paged(read, &self.stalls, &ConvoySpec::open_by_project(&address)))
+    }
+
+    fn of_project(&self, project: &str) -> Result<ConvoyListing, String> {
+        let address = Address::project(project).map_err(|error| format!("project `{project}`: {error}"))?;
+        self.read(&format!("launches in {project}"), |read| Self::paged(read, &self.stalls, &ConvoySpec::of_project(&address)))
+    }
+
+    fn linked_to(&self, subject: &Address) -> Result<ConvoyListing, String> {
+        self.read(&format!("launches linked to {subject}"), |read| Self::paged(read, &self.stalls, &ConvoySpec::linked_to(subject)))
     }
 
     fn launches_of(&self, of: &str, project: &str) -> Result<ConvoyListing, String> {

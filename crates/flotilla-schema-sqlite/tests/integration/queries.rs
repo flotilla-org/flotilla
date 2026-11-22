@@ -430,6 +430,55 @@ fn other_fixture_indexes_match_the_model(tc: TestCase) {
     }
 }
 
+// Behaviour (DESIGN queries): an index read by a leading part of its `eq` columns (a project's
+// launches, every state, through `by_launch`) and an unordered index on a nested table (the
+// convoys linking a subject, through `convoy_subjects`' `by_subject`) select as declared; the
+// nested one names each owning convoy once, however many of its rows match.
+#[hegel::test(test_cases = 40)]
+fn index_prefixes_and_nested_indexes_select_their_resources(tc: TestCase) {
+    use flotilla_schema::Records;
+    use flotilla_state_machines::machines::convoy::{LinkSource, SubjectLink};
+    let mut store = store();
+    let mut convoys = BTreeMap::new();
+    let pick = |names: &[&str]| tc.draw(gs::sampled_from(names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>()));
+    let mut write = store.write().expect("write");
+    for n in 0..tc.draw(gs::integers::<usize>().max_value(8)) {
+        let convoy = convoy::generate(&tc, Pick::Draw);
+        let mut subjects = Records::new();
+        for version in 0..tc.draw(gs::integers::<u64>().max_value(3)) {
+            let link = SubjectLink { subject: project(&pick(&["s0", "s1"])), source: LinkSource::Relay, unlinked: tc.draw(gs::booleans()) };
+            subjects.append(version, link).expect("room");
+        }
+        let spec = ConvoySpec { project: project(&pick(&["p0", "p1"])), launch_of: pick(&["a", "b"]), subjects, ..convoy.spec().clone() };
+        let convoy = convoy.clone().with_spec(spec);
+        convoys.insert(write.insert(&format!("c{n}"), &convoy, &origin()).expect("insert").id, convoy);
+    }
+    write.commit().expect("commit");
+    let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
+    let sorted = |mut ids: Vec<ResourceId>| {
+        ids.sort();
+        ids
+    };
+    for project in ["p0", "p1", "p2"] {
+        let project = self::project(project);
+        let want = expected(&convoys, |c: &Resource<Convoy>| c.spec().project == project, |_| ());
+        let read = collect(&mut store, &ConvoySpec::of_project(&project), limit);
+        assert_eq!(sorted(read.clone()), want, "a project's launches, every state");
+        // Ordered as the index orders them, by name launched first (an interned name by its local
+        // id, not its text): each name's launches together.
+        let names: Vec<&str> = read.iter().map(|id| convoys[id].spec().launch_of.as_str()).collect();
+        let mut runs = names.clone();
+        runs.dedup();
+        assert_eq!(runs.len(), runs.iter().collect::<std::collections::BTreeSet<_>>().len(), "each name's launches together");
+    }
+    for subject in ["s0", "s1", "s2"] {
+        let subject = project(subject);
+        let want = expected(&convoys, |c: &Resource<Convoy>| c.spec().subjects.iter().any(|row| row.record.subject == subject), |_| ());
+        let read = collect(&mut store, &ConvoySpec::linked_to(&subject), limit);
+        assert_eq!(read, want, "each convoy linking the subject once, by id");
+    }
+}
+
 fn insert_messages(store: &mut Store, count: usize, value: impl Fn(usize) -> Resource<Message>) {
     let mut write = store.write().expect("write");
     for n in 0..count {

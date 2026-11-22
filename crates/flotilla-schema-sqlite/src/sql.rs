@@ -112,6 +112,9 @@ pub(crate) struct IndexSql {
     /// Home-scoped keys below an exclusive integer order bound, highest first; only single
     /// integer orders.
     pub integer_keys_before: Option<String>,
+    /// The index read by a leading part of its `eq` columns: entry `k - 1` takes the first `k`, its
+    /// remaining `eq` columns leading its order. Only on a root index of two or more `eq` columns.
+    pub prefixes: Vec<IndexSql>,
 }
 
 /// Interned columns read back as their strings through `strings`' primary key.
@@ -151,14 +154,10 @@ impl KindSql {
                     (field.name.clone(), format!("SELECT \"version\", {label} FROM {root} WHERE \"id\" = ?1"))
                 })
                 .collect(),
-            // Root indexes page resources; an index on a nested table (an edge log's) serves history
-            // reads, which have no query API yet.
-            indexes: set
-                .indexes
-                .iter()
-                .filter(|index| index.table == set.tables[0].name)
-                .map(|index| (index.name.clone(), IndexSql::render(&set.tables[0], index)))
-                .collect(),
+            // Root indexes page resources. An unordered index on a nested table pages the
+            // resources owning a matching row, each once; an ordered one (an edge log's) serves
+            // history reads, which have no query API yet.
+            indexes: index_sql(set),
             scan: format!(
                 "SELECT i.\"id\" FROM \"resource_identity\" AS i CROSS JOIN {root} AS r ON r.\"id\" = i.\"id\" \
                  WHERE i.\"home\" = ?1 AND i.\"kind\" = ?2 AND i.\"id\" > ?3 ORDER BY i.\"id\" LIMIT ?4"
@@ -208,6 +207,12 @@ impl KindSql {
             if let Some(sql) = &index.integer_keys_before {
                 out.push((format!("index {} integer keys before", index.object), sql.clone()));
             }
+            for (k, prefix) in index.prefixes.iter().enumerate() {
+                for (page, sql) in [("first", &prefix.first), ("after", &prefix.after), ("last", &prefix.last), ("before", &prefix.before)]
+                {
+                    out.push((format!("index {} prefix {} {page}", index.object, k + 1), sql.clone()));
+                }
+            }
         }
         out.push((format!("{root} scan"), self.scan.clone()));
         out
@@ -216,53 +221,77 @@ impl KindSql {
 
 impl IndexSql {
     fn render(root: &Table, index: &Index) -> IndexSql {
-        let table = quote_ident(&root.name);
-        let order: Vec<String> = index.order.iter().map(|name| quote_ident(name)).collect();
+        let mut sql = IndexSql::render_keys(root, "\"id\"", false, index, &index.eq, &index.order);
+        if index.eq.len() >= 2 {
+            sql.prefixes = (1..index.eq.len())
+                .map(|k| {
+                    let order: Vec<String> = index.eq[k..].iter().chain(&index.order).cloned().collect();
+                    IndexSql::render_keys(root, "\"id\"", false, index, &index.eq[..k], &order)
+                })
+                .collect();
+        }
+        sql
+    }
+
+    /// An unordered index on nested `table`: pages the resources owning a matching row, by
+    /// `owner`, their id in that table, each once.
+    fn render_owners(table: &Table, owner: &str, index: &Index) -> IndexSql {
+        IndexSql::render_keys(table, &quote_ident(owner), true, index, &index.eq, &[])
+    }
+
+    /// `index` read over `table` by its `eq` columns, ordered by `order`, then by `id`, the
+    /// resource's id there; `distinct` reads each resource once.
+    fn render_keys(table: &Table, id: &str, distinct: bool, index: &Index, eq: &[String], order: &[String]) -> IndexSql {
+        let name = quote_ident(&table.name);
+        let order_names = order;
+        let order: Vec<String> = order.iter().map(|name| quote_ident(name)).collect();
         let mut terms: Vec<String> = index.predicate_sql().into_iter().collect();
-        terms.extend(index.eq.iter().enumerate().map(|(n, name)| format!("{} = ?{}", quote_ident(name), n + 1)));
-        let next = index.eq.len() + 1;
+        terms.extend(eq.iter().enumerate().map(|(n, name)| format!("{} = ?{}", quote_ident(name), n + 1)));
+        let next = eq.len() + 1;
         let mut first = terms.clone();
-        if index.eq.is_empty() {
+        if eq.is_empty() {
             // With no equality prefix, a bare ORDER BY would walk the index from its start, which
             // SQLite plans as a SCAN. A lower bound below every value of the column's storage class
             // makes it a range SEARCH of the same rows.
-            let column = root.columns.iter().find(|column| column.name == index.order[0]).expect("validated index column");
+            let column = table.columns.iter().find(|column| column.name == order_names[0]).expect("validated index column");
             first.push(format!("{} >= {}", order[0], lowest(&column.ty)));
         }
         // Beyond a cursor on `order..., id`, so rows tied on the order continue by id.
         let beyond = |bound: &str| {
             let mut terms = terms.clone();
             if order.is_empty() {
-                terms.push(format!("\"id\" {bound} ?{next}"));
+                terms.push(format!("{id} {bound} ?{next}"));
             } else {
                 let cursor = placeholders(next, order.len() + 1);
-                terms.push(format!("({}, \"id\") {bound} ({cursor})", order.join(", ")));
+                terms.push(format!("({}, {id}) {bound} ({cursor})", order.join(", ")));
             }
             terms
         };
         let (after, before) = (beyond(">"), beyond("<"));
         let by = |direction: &str| {
             let mut by: Vec<String> = order.iter().map(|column| format!("{column}{direction}")).collect();
-            by.push(format!("\"id\"{direction}"));
+            by.push(format!("{id}{direction}"));
             by.join(", ")
         };
         let limit = |params: usize| format!("ORDER BY {} LIMIT ?{params}", by(""));
         let limit_down = |params: usize| format!("ORDER BY {} LIMIT ?{params}", by(" DESC"));
-        let select = format!("SELECT \"id\"{} FROM {table} WHERE", prefixed(&order));
-        let integer =
-            index.order.len() == 1 && root.columns.iter().any(|column| column.name == index.order[0] && column.ty == ColumnType::Integer);
+        let select = format!("SELECT {}{id}{} FROM {name} WHERE", if distinct { "DISTINCT " } else { "" }, prefixed(&order));
+        let integer = !distinct
+            && eq.len() == index.eq.len()
+            && order_names.len() == 1
+            && table.columns.iter().any(|column| column.name == order_names[0] && column.ty == ColumnType::Integer);
         // Keys of one home beyond an exclusive bound on the single integer order, walked in
         // `direction` through the index itself, so the bound and the order are one range search.
         let home_keys = |first: &[String], bound: &str, direction: &str| {
             let mut bounds = first.to_vec();
             bounds.push(format!("{} {bound} ?{next}", order[0]));
             bounds.push(format!(
-                "EXISTS (SELECT 1 FROM \"resource_identity\" AS ri WHERE ri.\"id\" = {table}.\"id\" AND ri.\"home\" = ?{})",
+                "EXISTS (SELECT 1 FROM \"resource_identity\" AS ri WHERE ri.\"id\" = {name}.\"id\" AND ri.\"home\" = ?{})",
                 next + 1
             ));
             let by = [order[0].as_str(), "\"id\""].map(|column| format!("{column}{direction}")).join(", ");
             format!(
-                "SELECT \"id\", {} FROM {table} INDEXED BY {} WHERE {} ORDER BY {by} LIMIT ?{}",
+                "SELECT \"id\", {} FROM {name} INDEXED BY {} WHERE {} ORDER BY {by} LIMIT ?{}",
                 order[0],
                 quote_ident(&index.object_name()),
                 bounds.join(" AND "),
@@ -270,10 +299,9 @@ impl IndexSql {
             )
         };
         IndexSql {
-            eq_columns: index
-                .eq
+            eq_columns: eq
                 .iter()
-                .map(|name| root.columns.iter().find(|column| &column.name == name).expect("validated eq column").clone())
+                .map(|name| table.columns.iter().find(|column| &column.name == name).expect("validated eq column").clone())
                 .collect(),
             integer_keys: integer.then(|| home_keys(&first, ">", "")),
             integer_keys_before: integer.then(|| home_keys(&first, "<", " DESC")),
@@ -283,8 +311,36 @@ impl IndexSql {
             after: format!("{select} {} {}", after.join(" AND "), limit(next + order.len() + 1)),
             last: format!("{select} {} {}", first.join(" AND "), limit_down(next)),
             before: format!("{select} {} {}", before.join(" AND "), limit_down(next + order.len() + 1)),
+            prefixes: Vec::new(),
         }
     }
+
+    /// The statements reading this index by `eq` values: all its `eq` columns, or a leading part
+    /// of them. `None` for any other count.
+    pub(crate) fn by(&self, eq: usize) -> Option<&IndexSql> {
+        if eq == self.eq_columns.len() {
+            Some(self)
+        } else {
+            eq.checked_sub(1).and_then(|k| self.prefixes.get(k))
+        }
+    }
+}
+
+/// Each queryable index of `set` by its declared name: a root index, else an unordered nested
+/// one whose name no root index takes and that is not unique within its owner.
+fn index_sql(set: &TableSet) -> BTreeMap<String, IndexSql> {
+    let mut indexes: BTreeMap<String, IndexSql> = set
+        .indexes
+        .iter()
+        .filter(|index| index.table == set.tables[0].name)
+        .map(|index| (index.name.clone(), IndexSql::render(&set.tables[0], index)))
+        .collect();
+    for index in set.indexes.iter().filter(|index| index.table != set.tables[0].name && index.order.is_empty() && !index.unique) {
+        if let Some(table) = set.tables.iter().find(|table| table.name == index.table) {
+            indexes.entry(index.name.clone()).or_insert_with(|| IndexSql::render_owners(table, set.parent_key_column(), index));
+        }
+    }
+    indexes
 }
 
 /// A literal at or below every value a STRICT column of this type holds. Exhaustive, so a new

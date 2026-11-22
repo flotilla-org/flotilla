@@ -344,6 +344,22 @@ impl<'de> Deserialize<'de> for AdmissionBytes {
     }
 }
 
+impl ConvoySpec {
+    /// Every launch in `project` at every home, ended or not: the leading column of `by_launch`,
+    /// ordered by name launched, then launch.
+    pub fn of_project(project: &Address) -> flotilla_schema::IndexQuery<ConvoySpec> {
+        let values = || Ok(vec![flotilla_schema::key_value::<Address>(project)?]);
+        flotilla_schema::IndexQuery::new(<Self as flotilla_schema::KindSpec>::CODE, "by_launch", values())
+    }
+
+    /// The convoys holding a link of `subject`, an unlinked one included: through
+    /// [`SubjectLink`]'s `by_subject` index, each convoy once.
+    pub fn linked_to(subject: &Address) -> flotilla_schema::IndexQuery<ConvoySpec> {
+        let values = || Ok(vec![flotilla_schema::key_value::<Address>(subject)?]);
+        flotilla_schema::IndexQuery::new(<Self as flotilla_schema::KindSpec>::CODE, "by_subject", values())
+    }
+}
+
 /// What admission fixes, and the records edges change. It declares the
 /// stored Convoy (kind code `cv`), indexed for a project's open convoys and
 /// for a name's launches. Subjects, seats and promises are records in the

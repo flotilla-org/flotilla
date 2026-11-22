@@ -2858,6 +2858,7 @@ name = "flotilla-engine-convoys-testkit"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flotilla-address",
  "flotilla-engine-convoys",
  "flotilla-engine-messages",
  "flotilla-engine-messages-testkit",

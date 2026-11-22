@@ -282,6 +282,16 @@ impl ConvoyRecords for CountedConvoys {
         self.records.open_in(project)
     }
 
+    fn of_project(&self, project: &str) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.of_project(project)
+    }
+
+    fn linked_to(&self, subject: &flotilla_address::Address) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.linked_to(subject)
+    }
+
     fn changes(&self) -> tokio::sync::broadcast::Receiver<ConvoyChange> {
         self.records.changes()
     }
@@ -375,6 +385,11 @@ impl TerminalRecords for CountedTerminals {
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<TerminalRecord>, String> {
         Meter::count(&self.meter.terminals);
         self.port().get(name, home)
+    }
+
+    fn named(&self, name: &str) -> Result<Vec<TerminalRecord>, String> {
+        Meter::count(&self.meter.terminals);
+        self.port().named(name)
     }
 
     fn at(&self, home: &str) -> Result<Vec<TerminalRecord>, String> {
