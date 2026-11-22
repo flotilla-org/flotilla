@@ -60,14 +60,15 @@ impl VesselRequestsPolicy {
         Ok(self.reads.vessels()?.get(name, None)?.map(|record| (record.convoy, record.convoy_home)))
     }
 
-    /// The refused convoys checkout `identity` names: the one holding it, or every one when it
+    /// The refused convoys checkout `identity` names: the one holding it; every one when it is
+    /// held by none any more (a ruling released it, so which held it is no longer read) or
     /// cannot be read.
     fn holding(&self, identity: &Identity) -> Vec<ConvoyKey> {
         let holder = self.reads.checkouts().and_then(|checkouts| checkouts.get(&identity.name, Some(&identity.home)));
         match holder {
             Ok(Some(record)) => match record.holder {
                 Some(CheckoutHolder::Convoy(convoy)) => self.refused.iter().filter(|(name, _)| *name == convoy).cloned().collect(),
-                None => Vec::new(),
+                None => self.refused.iter().cloned().collect(),
             },
             Ok(None) => self.refused.iter().cloned().collect(),
             Err(error) => {

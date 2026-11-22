@@ -783,7 +783,9 @@ async fn a_message_commit_wakes_the_convoys_holding_delivery_without_listing_mes
     let (sender, mut queue) = WorkQueueSender::channel();
     let before = read(&reads);
     let hosts = Arc::new(HeldHosts::default());
-    let watches = ConvoyReconciler::secondary_watches(&backend, NAMESPACE, hosts, Arc::clone(&path), messages)
+    // The session launches a convoy's wake follows: none changes here.
+    let sessions = flotilla_provisioning_testkit::EngineBackend::open("home");
+    let watches = ConvoyReconciler::secondary_watches(&backend, NAMESPACE, hosts, Arc::clone(&path), messages, sessions.reads())
         .into_iter()
         .map(|wake| tokio::spawn(attributed(Arc::clone(&reads), wake.spawn(backend.clone(), NAMESPACE.into(), sender.clone()))))
         .collect::<Vec<_>>();

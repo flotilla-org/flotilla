@@ -18,14 +18,13 @@ use flotilla_resources::convoy::reconcile::*;
 use flotilla_resources::host_records::{HostChange, HostRecords};
 use flotilla_resources::*;
 use flotilla_store::{
-    controller::{LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
+    controller::{ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
     load_metrics::carry,
     occupancy::host_occupancy,
     DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    marker::PhantomData,
     sync::Arc,
 };
 /// The principal this controller acts as on the engine.
@@ -128,8 +127,8 @@ impl ConvoyReconciler {
         self
     }
 
-    /// What wakes a convoy besides its engine records: its sessions (a turn's delivery holds its
-    /// landing), the evidence its promises are observed from, and, for a convoy its home notes as
+    /// What wakes a convoy besides its engine records: its sessions' launches (a turn's delivery
+    /// holds its landing), the evidence its promises are observed from, and, for a convoy its home notes as
     /// waiting, what it waits on: capacity on a host (changes of that Host, or of a Vessel,
     /// Environment or Convoy on it) or a crew turn's delivery (commits to `messages`).
     pub fn secondary_watches(
@@ -138,6 +137,7 @@ impl ConvoyReconciler {
         hosts: Arc<dyn HostRecords>,
         engine: EngineConvoyPath,
         messages: crate::ports::MessagePath,
+        reads: Arc<dyn lifecycle_reads::LifecycleReads>,
     ) -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
         vec![
             Box::new(HostCapacityWake { hosts, engine: Arc::clone(&engine) }),
@@ -163,7 +163,7 @@ impl ConvoyReconciler {
                 engine,
                 waiting: flotilla_resources::convoy_records::ConvoyNotes::holds_delivery,
             }),
-            Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
+            Box::new(TerminalConvoyWake { reads }),
         ]
     }
 
@@ -818,6 +818,73 @@ impl<W: Resource> SecondaryWatch for EvidenceWake<W> {
                         return Err(error);
                     }
                     None => return Ok(()),
+                }
+            }
+        })
+    }
+}
+
+/// Wakes a convoy when one of its crews' session launches changes: a commit of the launch, read
+/// from the engine's terminal records and mapped through the vessel it is held for. What its
+/// agent does in the session commits no launch, so it wakes nothing here. A home's records read
+/// afresh wake every convoy.
+#[derive(Clone)]
+pub struct TerminalConvoyWake {
+    pub reads: Arc<dyn lifecycle_reads::LifecycleReads>,
+}
+
+impl TerminalConvoyWake {
+    /// The convoy session launch `name` at `home` is held for, if it is a crew's.
+    fn convoy_of(&self, name: &str, home: &str) -> Result<Option<String>, String> {
+        let Some(terminal) = self.reads.terminals()?.get(name, Some(home))? else { return Ok(None) };
+        let Some(vessel) = terminal.vessel else { return Ok(None) };
+        let vessels = self.reads.vessels()?;
+        let record = match vessels.get(&vessel, Some(home))? {
+            Some(record) => Some(record),
+            None => vessels.find(&vessel)?,
+        };
+        Ok(record.map(|record| record.convoy))
+    }
+}
+
+impl SecondaryWatch for TerminalConvoyWake {
+    type Primary = Convoy;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: flotilla_store::ResourceBackend,
+        _namespace: String,
+        sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        use flotilla_resources::terminal_records::TerminalChange;
+        Box::pin(async move {
+            let mut changes = self.reads.terminals().map_err(ResourceError::other)?.changes();
+            loop {
+                match changes.recv().await {
+                    Ok(TerminalChange::Changed { name, home }) => {
+                        let wake = self.clone();
+                        let convoy = tokio::task::spawn_blocking(carry(move || wake.convoy_of(&name, &home)))
+                            .await
+                            .map_err(|error| ResourceError::other(error.to_string()))?;
+                        match convoy {
+                            Ok(Some(convoy)) => {
+                                if sender.send(convoy).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "a changed session launch's convoy could not be read; every convoy is woken");
+                                sender.send_every();
+                            }
+                        }
+                    }
+                    Ok(TerminalChange::Rescanned) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => sender.send_every(),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
         })

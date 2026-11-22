@@ -1309,7 +1309,7 @@ fn convoy_controller(
     };
     // The daemon's wakes: an evidence change (a change request observed merged) wakes the convoy
     // whose promise it settles, as well as the leaf rows' wakes.
-    let mut secondaries = ConvoyReconciler::secondary_watches(backend, "flotilla", hosts, home.path(), home.message_path());
+    let mut secondaries = ConvoyReconciler::secondary_watches(backend, "flotilla", hosts, home.path(), home.message_path(), home.reads());
     secondaries.push(table.reconciler_wake_watch());
     secondaries.push(Box::new(crate::convoy::EngineConvoyWake { engine: home.path() }));
     tokio::spawn(ControllerLoop { primary: backend.using::<Convoy>("flotilla"), secondaries, reconciler, backend: backend.clone() }.run())

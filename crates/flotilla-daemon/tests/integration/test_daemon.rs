@@ -539,11 +539,9 @@ async fn a_ruling_on_a_held_checkout_releases_the_landed_convoys_vessel() {
     fleet.wait_row("its vessel's environment, kept", "environment", "", of_convoy(&name, "Realised")).await;
     assert_eq!(fleet.counts().environments_destroyed, 0, "the vessel is kept while its checkout is held: {:?}", fleet.counts());
     fleet.execute(CommandAction::CheckoutArchive { checkout: launch }).await;
-    fleet
-        .wait_row("its vessel's environment destroyed", "environment", "", |row| {
-            !of_convoy(&name, "Realised")(row) && fleet.counts().environments_destroyed == 1
-        })
-        .await;
+    // Its work's vessels are released, each environment destroyed: one of them shows Gone.
+    fleet.wait_row("its vessel's environment destroyed", "environment", "", of_convoy(&name, "Gone")).await;
+    assert!(fleet.counts().environments_destroyed >= 1, "{:?}", fleet.counts());
 }
 
 // Fleet health counts a capped host's free vessel slots from the vessels the engine holds there:
