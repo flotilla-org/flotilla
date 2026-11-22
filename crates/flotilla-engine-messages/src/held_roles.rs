@@ -3,8 +3,10 @@
 //!
 //! Role routing ([`RoleBindings::route`]) decides a session's holding from its own convoy's
 //! records: the convoy, the sessions and vessels of its seats, and a standing role's generations,
-//! which are launches of the same convoy. So a change to one of those records reroutes only the
-//! sessions here of that convoy, and a pass with nothing changed routes nothing. Watches of the
+//! which are launches of the same convoy. So a change to a convoy or vessel record reroutes only
+//! the sessions here of that convoy, a change to a session only the sessions here in its role in
+//! that convoy (the only ones competing for what it holds: its seat's other launches and the
+//! standing role's other generations), and a pass with nothing changed routes nothing. Watches of the
 //! records report each change ([`RoutingChanges::touched`], through [`RoutingInput`]); the view
 //! takes them at the next refresh.
 //!
@@ -21,7 +23,7 @@ use std::{
 use flotilla_resources::{
     Convoy, ConvoyEnsure, ConvoySpec, CrewDefaults, CrewSessionStatus, FleetDesignation, Project, ReadWatchEvent, Resource,
     ResourceProvenance, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselSpec, WorkflowSnapshot, CONVOY_LABEL,
-    ROLE_ADDRESS_ANNOTATION,
+    ROLE_ADDRESS_ANNOTATION, ROLE_LABEL,
 };
 use tracing::{info_span, Instrument};
 
@@ -45,7 +47,14 @@ pub enum Touched {
     /// and whether it claims an adopted role. Where its view is carried, `facts` holds the copy's
     /// key and what routing reads of it (`None` once it is gone): the change touches nothing while
     /// that is as the last change reported it.
-    Session { name: String, convoy: Option<String>, here: bool, claims: bool, facts: Option<(RecordKey, Option<Box<RoutingFacts>>)> },
+    Session {
+        name: String,
+        convoy: Option<String>,
+        role: Option<String>,
+        here: bool,
+        claims: bool,
+        facts: Option<(RecordKey, Option<Box<RoutingFacts>>)>,
+    },
     /// The declarations that validate adopted claims: every session is routed again while any
     /// session here claims a role.
     Claims,
@@ -126,14 +135,15 @@ fn group(convoy: &str) -> String {
 
 impl RoutingInput for TerminalSession {
     fn touched(event: &ReadWatchEvent<Self>) -> Touched {
-        let (here, convoy, claims) = match (object(event), event) {
+        let (here, convoy, role, claims) = match (object(event), event) {
             (Some(read), _) => (
                 matches!(read.provenance, ResourceProvenance::Local),
                 read.object.metadata.labels.get(CONVOY_LABEL).cloned(),
+                read.object.metadata.labels.get(ROLE_LABEL).cloned(),
                 read.object.metadata.annotations.contains_key(ROLE_ADDRESS_ANNOTATION),
             ),
             (None, ReadWatchEvent::DeletedByName { tombstone, provenance }) => {
-                (matches!(provenance, ResourceProvenance::Local), None, tombstone.annotations.contains_key(ROLE_ADDRESS_ANNOTATION))
+                (matches!(provenance, ResourceProvenance::Local), None, None, tombstone.annotations.contains_key(ROLE_ADDRESS_ANNOTATION))
             }
             (None, _) => return Touched::Everything,
         };
@@ -164,7 +174,7 @@ impl RoutingInput for TerminalSession {
                 Some((("TerminalSession", tombstone.name.clone(), home), None))
             }
         };
-        Touched::Session { name: name(event).to_owned(), convoy, here, claims, facts }
+        Touched::Session { name: name(event).to_owned(), convoy, role, here, claims, facts }
     }
 }
 
@@ -243,6 +253,9 @@ impl RoutingInput for CrewDefaults {
     }
 }
 
+/// A convoy group and a role in it: the sessions competing for what one of them holds.
+type Seat = (String, Option<String>);
+
 /// The changes not yet taken.
 #[derive(Debug, Default)]
 struct Dirty {
@@ -250,8 +263,11 @@ struct Dirty {
     claims: bool,
     /// Convoys whose sessions here are routed again, by their group.
     convoys: BTreeSet<String>,
-    /// Sessions here routed again, each with its convoy's group when the change named one.
-    sessions: BTreeMap<String, Option<String>>,
+    /// Sessions here routed again, each with its convoy's group and its role when the change
+    /// named a convoy.
+    sessions: BTreeMap<String, Option<Seat>>,
+    /// Roles in convoys whose sessions here are routed again: another home's session changed.
+    seats: BTreeSet<Seat>,
 }
 
 impl Dirty {
@@ -259,6 +275,7 @@ impl Dirty {
         self.all |= other.all;
         self.claims |= other.claims;
         self.convoys.extend(other.convoys);
+        self.seats.extend(other.seats);
         for (session, convoy) in other.sessions {
             let held = self.sessions.entry(session).or_default();
             if convoy.is_some() {
@@ -312,7 +329,7 @@ impl RoutingChanges {
                 }
                 Touched::Convoy(convoy)
             }
-            Touched::Session { name, convoy, here, claims, facts: Some((record, facts)) } => {
+            Touched::Session { name, convoy, role, here, claims, facts: Some((record, facts)) } => {
                 let mut seen = self.seen();
                 match facts {
                     // As routing last read it: the change touches no holding.
@@ -320,7 +337,7 @@ impl RoutingChanges {
                     Some(facts) => drop(seen.insert(record, facts)),
                     None => drop(seen.remove(&record)),
                 }
-                Touched::Session { name, convoy, here, claims, facts: None }
+                Touched::Session { name, convoy, role, here, claims, facts: None }
             }
             Touched::Everything => {
                 // Every session is routed from what is held then: each record's next change is
@@ -338,19 +355,16 @@ impl RoutingChanges {
                 Touched::Convoy(convoy) | Touched::Record { convoy, .. } => {
                     dirty.convoys.insert(group(&convoy));
                 }
-                Touched::Session { name, convoy, here, claims, .. } => {
-                    let convoy = convoy.map(|convoy| group(&convoy));
+                Touched::Session { name, convoy, role, here, claims, .. } => {
+                    let seat = convoy.map(|convoy| (group(&convoy), role));
                     if claims {
                         dirty.all = true;
                     }
-                    if let Some(convoy) = &convoy {
-                        dirty.convoys.insert(convoy.clone());
-                    }
-                    if here {
-                        dirty.sessions.insert(name, convoy);
-                    } else if convoy.is_none() {
+                    match (here, seat) {
+                        (true, seat) => drop(dirty.sessions.insert(name, seat)),
+                        (false, Some(seat)) => drop(dirty.seats.insert(seat)),
                         // Another home's session deleted by name: whichever convoy it seated.
-                        dirty.all = true;
+                        (false, None) => dirty.all = true,
                     }
                 }
                 Touched::Claims => dirty.claims = true,
@@ -401,10 +415,10 @@ pub struct HeldRoles {
     roles: Option<FleetRoles>,
     /// The holders, by session name.
     holders: BTreeMap<String, RoleHolder>,
-    /// Each convoy group's running crew sessions here, holders or not.
-    members: BTreeMap<String, BTreeSet<String>>,
-    /// Each such session's convoy group.
-    member_of: BTreeMap<String, String>,
+    /// Each convoy group's running crew sessions here, holders or not, by their role.
+    members: BTreeMap<String, BTreeMap<Option<String>, BTreeSet<String>>>,
+    /// Each such session's convoy group and role.
+    member_of: BTreeMap<String, Seat>,
     /// The sessions here that claim an adopted role: routed with every convoy, since a claim
     /// shadows a standing role's generation.
     claimants: BTreeSet<String>,
@@ -459,18 +473,21 @@ impl HeldRoles {
             };
         }
         let mut sessions = BTreeSet::new();
-        for (session, convoy) in &taken.sessions {
+        for (session, seat) in &taken.sessions {
             sessions.insert(session.clone());
-            // Its former convoy, whose other sessions may hold what it held.
+            // Its former seat, whose other sessions may hold what it held.
             if let Some(former) = self.member_of.get(session) {
-                sessions.extend(self.members.get(former).into_iter().flatten().cloned());
+                sessions.extend(self.seated(former));
             }
-            if let Some(convoy) = convoy {
-                sessions.extend(self.members.get(convoy).into_iter().flatten().cloned());
+            if let Some(seat) = seat {
+                sessions.extend(self.seated(seat));
             }
         }
+        for seat in &taken.seats {
+            sessions.extend(self.seated(seat));
+        }
         for convoy in &taken.convoys {
-            sessions.extend(self.members.get(convoy).into_iter().flatten().cloned());
+            sessions.extend(self.members.get(convoy).into_iter().flat_map(BTreeMap::values).flatten().cloned());
         }
         if sessions.is_empty() {
             return Ok(Refreshed::default());
@@ -492,10 +509,15 @@ impl HeldRoles {
             if let Some(holder) = self.holders.remove(session) {
                 before.insert(session.clone(), holder);
             }
-            if let Some(convoy) = self.member_of.remove(session) {
-                if let Some(members) = self.members.get_mut(&convoy) {
-                    members.remove(session);
-                    if members.is_empty() {
+            if let Some((convoy, role)) = self.member_of.remove(session) {
+                if let Some(roles) = self.members.get_mut(&convoy) {
+                    if let Some(members) = roles.get_mut(&role) {
+                        members.remove(session);
+                        if members.is_empty() {
+                            roles.remove(&role);
+                        }
+                    }
+                    if roles.is_empty() {
                         self.members.remove(&convoy);
                     }
                 }
@@ -510,8 +532,8 @@ impl HeldRoles {
     fn apply(&mut self, mut before: BTreeMap<String, RoleHolder>, routed: crate::ports::Routed) -> Refreshed {
         for candidate in routed.candidates {
             let convoy = group(&candidate.convoy);
-            self.members.entry(convoy.clone()).or_default().insert(candidate.session.clone());
-            self.member_of.insert(candidate.session.clone(), convoy);
+            self.members.entry(convoy.clone()).or_default().entry(candidate.role.clone()).or_default().insert(candidate.session.clone());
+            self.member_of.insert(candidate.session.clone(), (convoy, candidate.role));
             if candidate.claims {
                 self.claimants.insert(candidate.session);
             }
@@ -533,6 +555,11 @@ impl HeldRoles {
         Refreshed { changed, routed: true }
     }
 
+    /// The sessions here in `seat`.
+    fn seated(&self, (convoy, role): &Seat) -> impl Iterator<Item = String> + '_ {
+        self.members.get(convoy).and_then(|roles| roles.get(role)).into_iter().flatten().cloned()
+    }
+
     /// Forgets session `name`'s holding and routes it again at the next refresh: its reader could
     /// not take the holding up.
     pub fn retry(&mut self, name: &str) {
@@ -551,8 +578,8 @@ mod tests {
     use super::*;
     use crate::ports::{Routed, RoutedSession};
 
-    /// Routing over fixed running sessions, by name: their convoy and whether they claim a role.
-    /// It records which sessions each route asked for (`None` for every one).
+    /// Routing over fixed running sessions, by name (`<convoy>-<role>`): their convoy and whether
+    /// they claim a role. It records which sessions each route asked for (`None` for every one).
     #[derive(Default)]
     struct Sessions {
         running: Mutex<BTreeMap<String, (String, bool)>>,
@@ -577,7 +604,12 @@ mod tests {
             let candidates = running
                 .iter()
                 .filter(|(name, _)| sessions.is_none_or(|sessions| sessions.contains(*name)))
-                .map(|(name, (convoy, claims))| RoutedSession { session: name.clone(), convoy: convoy.clone(), claims: *claims })
+                .map(|(name, (convoy, claims))| RoutedSession {
+                    session: name.clone(),
+                    convoy: convoy.clone(),
+                    role: name.split_once('-').map(|(_, role)| role.to_owned()),
+                    claims: *claims,
+                })
                 .collect();
             Ok(Routed { holders: Vec::new(), candidates })
         }
@@ -588,12 +620,14 @@ mod tests {
     }
 
     fn session(name: &str, convoy: &str) -> Touched {
-        Touched::Session { name: name.into(), convoy: Some(convoy.into()), here: true, claims: false, facts: None }
+        let role = name.split_once('-').map(|(_, role)| role.to_owned());
+        Touched::Session { name: name.into(), convoy: Some(convoy.into()), role, here: true, claims: false, facts: None }
     }
 
-    // A refresh routes only the sessions of the convoys a change touched, a standing role's
-    // generations together, and nothing when nothing changed; what any holding may turn on
-    // routes every session.
+    // A refresh routes only the sessions of the convoys a change to a convoy touched, a standing
+    // role's generations together; for a change to a session, only the sessions of its role in
+    // its convoy; and nothing when nothing changed. What any holding may turn on routes every
+    // session.
     #[tokio::test]
     async fn a_refresh_routes_only_what_changes_touched() {
         let bindings = Sessions::default();
@@ -614,10 +648,11 @@ mod tests {
         held.refresh(&bindings, &roles).await.expect("refresh");
         assert_eq!(bindings.routes(), vec![names(&["a-coder", "a-reviewer"])]);
 
-        // Another home's session of a convoy reroutes that convoy's sessions here.
+        // Another home's session of a role in a convoy reroutes that role's sessions here.
         changes.touched(Touched::Session {
             name: "b-elsewhere".into(),
             convoy: Some("beta#1".into()),
+            role: Some("coder".into()),
             here: false,
             claims: false,
             facts: None,
@@ -625,9 +660,13 @@ mod tests {
         held.refresh(&bindings, &roles).await.expect("refresh");
         assert_eq!(bindings.routes(), vec![names(&["b-coder"])]);
 
-        // A session starting here joins its convoy's.
+        // A session starting here routes its role's sessions in its convoy, not the convoy's other
+        // roles; then a change to the convoy routes it with them.
         bindings.run("b-reviewer", "beta#1", false);
         changes.touched(session("b-reviewer", "beta#1"));
+        held.refresh(&bindings, &roles).await.expect("refresh");
+        assert_eq!(bindings.routes(), vec![names(&["b-reviewer"])]);
+        changes.touched(Touched::Convoy("beta#1".into()));
         held.refresh(&bindings, &roles).await.expect("refresh");
         assert_eq!(bindings.routes(), vec![names(&["b-coder", "b-reviewer"])]);
 
@@ -638,7 +677,7 @@ mod tests {
 
         // A claim reroutes every session; the claimant is routed with every convoy after it.
         bindings.run("adopted", "", true);
-        changes.touched(Touched::Session { name: "adopted".into(), convoy: None, here: true, claims: true, facts: None });
+        changes.touched(Touched::Session { name: "adopted".into(), convoy: None, role: None, here: true, claims: true, facts: None });
         held.refresh(&bindings, &roles).await.expect("refresh");
         assert_eq!(bindings.routes(), vec![None]);
         changes.touched(Touched::Convoy("beta#1".into()));
@@ -741,7 +780,7 @@ mod tests {
                 name: name.into(),
                 namespace: "flotilla".into(),
                 resource_version: "1".into(),
-                labels: BTreeMap::from([(CONVOY_LABEL.to_owned(), convoy.to_owned())]),
+                labels: BTreeMap::from([(CONVOY_LABEL.to_owned(), convoy.to_owned()), (ROLE_LABEL.to_owned(), "coder".to_owned())]),
                 annotations: BTreeMap::new(),
                 owner_references: Vec::new(),
                 finalizers: Vec::new(),
@@ -767,8 +806,9 @@ mod tests {
     }
 
     // A session change routing does not read (here its status message, as its agent's turns
-    // change it) routes nothing; one to what it reads (its phase) and its leaving route its
-    // convoy's sessions (d15: a session's every change routed its whole convoy).
+    // change it) routes nothing; one to what it reads (its phase) and its leaving route the
+    // sessions of its role in its convoy, not the convoy's other roles (d15: a session's every
+    // change routed its whole convoy; c6: so did every routed one).
     #[tokio::test]
     async fn a_session_change_routes_only_when_routing_reads_it() {
         let bindings = Sessions::default();
@@ -783,7 +823,7 @@ mod tests {
         let touched = |phase, message| TerminalSession::touched(&session_event("a-coder", "alpha#1", phase, message));
         changes.touched(touched(TerminalSessionPhase::Running, None));
         held.refresh(&bindings, &roles).await.expect("refresh");
-        assert_eq!(bindings.routes(), vec![names(&["a-coder", "a-reviewer"])], "the first change seen of a session routes");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder"])], "the first change seen of a session routes");
 
         changes.touched(touched(TerminalSessionPhase::Running, Some("working")));
         changes.touched(touched(TerminalSessionPhase::Running, Some("idle")));
@@ -792,18 +832,18 @@ mod tests {
 
         changes.touched(touched(TerminalSessionPhase::Stopped, Some("idle")));
         held.refresh(&bindings, &roles).await.expect("refresh");
-        assert_eq!(bindings.routes(), vec![names(&["a-coder", "a-reviewer"])], "its phase is read");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder"])], "its phase is read");
 
         let ReadWatchEvent::Modified(read) = session_event("a-coder", "alpha#1", TerminalSessionPhase::Stopped, None) else {
             unreachable!()
         };
         changes.touched(TerminalSession::touched(&ReadWatchEvent::Deleted(read)));
         held.refresh(&bindings, &roles).await.expect("refresh");
-        assert_eq!(bindings.routes(), vec![names(&["a-coder", "a-reviewer"])], "its leaving routes");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder"])], "its leaving routes");
 
         changes.touched(touched(TerminalSessionPhase::Stopped, None));
         held.refresh(&bindings, &roles).await.expect("refresh");
-        assert_eq!(bindings.routes(), vec![names(&["a-coder", "a-reviewer"])], "a session seen again after it left routes");
+        assert_eq!(bindings.routes(), vec![names(&["a-coder"])], "a session seen again after it left routes");
     }
 
     // A watch that stopped leaves no change to follow for its kind: every refresh routes every
