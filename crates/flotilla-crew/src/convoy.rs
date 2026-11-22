@@ -1048,8 +1048,9 @@ impl Reconciler for ConvoyReconciler {
             }
             _ => BTreeMap::new(),
         };
-        // One observation a pass: the engine's edge wakes the next.
-        if let Some(ConvoyStatusPatch::ObservePromise { vessel, role, operation }) = flotilla_resources::convoy::promises::next_observation(
+        // Every observation due, each its own edge made against the record as it then is: an
+        // observation a pass would wake a pass per edge.
+        for observation in flotilla_resources::convoy::promises::due_observations(
             status,
             &obj.metadata.name,
             &change_requests,
@@ -1058,6 +1059,7 @@ impl Reconciler for ConvoyReconciler {
             now,
             self.change_request_stale_after,
         ) {
+            let ConvoyStatusPatch::ObservePromise { vessel, role, operation } = observation else { continue };
             if let Err(error) = engine.promise(obj, &vessel, &role, &operation, Actor::Observer).await {
                 tracing::info!(convoy = %obj.metadata.name, %vessel, %role, %error, "the engine refused an observed promise edge");
             }
