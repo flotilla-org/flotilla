@@ -88,7 +88,8 @@ impl DispatchMetrics {
 
 #[async_trait]
 pub(crate) trait DispatchIssueSource: Send + Sync {
-    async fn collect_boards(&self, projects: &[ResourceObject<Project>]) -> Result<ProjectBoards, String>;
+    /// The boards of `projects`, observing `running`, the issues their live convoys run.
+    async fn collect_boards(&self, projects: &[ResourceObject<Project>], running: BTreeSet<IssueRef>) -> Result<ProjectBoards, String>;
     async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String>;
     async fn dispatch_facts(&self, reference: &IssueRef) -> Result<DispatchIssueFacts, String>;
 }
@@ -105,8 +106,8 @@ impl DaemonDispatchIssueSource {
 
 #[async_trait]
 impl DispatchIssueSource for DaemonDispatchIssueSource {
-    async fn collect_boards(&self, projects: &[ResourceObject<Project>]) -> Result<ProjectBoards, String> {
-        let snapshot = self.daemon.collect_dispatch_board_inputs(projects).await?;
+    async fn collect_boards(&self, projects: &[ResourceObject<Project>], running: BTreeSet<IssueRef>) -> Result<ProjectBoards, String> {
+        let snapshot = self.daemon.collect_dispatch_board_inputs(projects, running).await?;
         let mut queries = BTreeMap::new();
         let mut providers = BTreeMap::new();
         let mut result = BTreeMap::new();
@@ -270,7 +271,16 @@ impl DispatchReconciler {
             .filter(|project| project.spec.dispatch_policy.as_ref().is_some_and(|policy| policy.enabled))
             .cloned()
             .collect::<Vec<_>>();
-        let boards = self.issues.collect_boards(&enabled).await.unwrap_or_else(|error| {
+        // The issues the enabled Projects' live convoys run, from the convoys this reconciler
+        // follows rather than a listing per pass.
+        let running = flotilla_projections::dispatch_board::running_issues(
+            enabled
+                .iter()
+                .flat_map(|project| project_convoys.get(&project.metadata.name).into_iter().flatten())
+                .filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
+                .map(AsRef::as_ref),
+        );
+        let boards = self.issues.collect_boards(&enabled, running).await.unwrap_or_else(|error| {
             enabled
                 .iter()
                 .map(|project| (project.metadata.name.clone(), Err(format!("dispatch source inventory unavailable: {error}"))))
@@ -705,7 +715,7 @@ mod tests {
 
     #[async_trait]
     impl DispatchIssueSource for FakeIssues {
-        async fn collect_boards(&self, projects: &[ResourceObject<Project>]) -> Result<ProjectBoards, String> {
+        async fn collect_boards(&self, projects: &[ResourceObject<Project>], _: BTreeSet<IssueRef>) -> Result<ProjectBoards, String> {
             if *self.failing_collection.lock().expect("collection failure") {
                 return Err("injected source inventory outage".into());
             }

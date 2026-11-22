@@ -185,6 +185,17 @@ pub type DispatchBoardInputs = BTreeMap<
     Result<(Vec<flotilla_resources::ResolvedIssueSourceBinding>, Vec<(u64, Arc<flotilla_protocol::DispatchBoardRepository>)>), String>,
 >;
 
+/// The issues the live `convoys` with active crews run.
+pub fn running_issues<'a>(
+    convoys: impl IntoIterator<Item = &'a ResourceObject<flotilla_resources::Convoy>>,
+) -> BTreeSet<flotilla_protocol::IssueRef> {
+    convoys
+        .into_iter()
+        .filter(|convoy| active_crew_count(convoy.status.as_ref()) > 0)
+        .flat_map(|convoy| convoy.spec.issues.iter().map(|issue| issue.reference.clone()))
+        .collect()
+}
+
 /// Indexed live inventory: retained terminal history never enters accounting reads.
 pub fn live_project_convoys_query(projects: impl IntoIterator<Item = String>) -> flotilla_store::StoreQuery {
     use flotilla_store::StoreQuery;
@@ -220,7 +231,8 @@ impl DispatchBoard<'_> {
         let projects = self.backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         let projects =
             projects.into_iter().filter(|project| project_filter.is_none_or(|name| name == project.metadata.name)).collect::<Vec<_>>();
-        let snapshot = self.collect_dispatch_board_inputs(&projects).await?;
+        let running = self.running_issues(&projects).await?;
+        let snapshot = self.collect_dispatch_board_inputs(&projects, running).await?;
         if project_filter.is_none() && snapshot.values().all(Result::is_ok) {
             let sources = snapshot
                 .values()
@@ -255,31 +267,37 @@ impl DispatchBoard<'_> {
             Err(errors.join("; "))
         }
     }
+    /// The issues `projects`' live convoys with active crews run, read from the store. Running
+    /// tickets need current fields for tier-specific crew accounting, even after their ready label
+    /// is removed. Fail closed on store failure: missing live tickets would omit their Priority
+    /// fields from fallback observations and bias tier occupancy.
+    pub async fn running_issues(&self, projects: &[ResourceObject<Project>]) -> Result<BTreeSet<flotilla_protocol::IssueRef>, String> {
+        let live = self
+            .backend
+            .query_declared::<flotilla_resources::Convoy>(
+                &self.namespace,
+                &live_project_convoys_query(projects.iter().map(|project| project.metadata.name.clone())),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(running_issues(live.items.iter().map(|record| &record.object)))
+    }
+
+    /// The boards and issue-source bindings of `projects`, with `running`, the issues their live
+    /// convoys run ([`running_issues`]), observed whatever their labels.
     #[tracing::instrument(name = "dispatch_board", skip_all)]
-    pub async fn collect_dispatch_board_inputs(&self, projects: &[ResourceObject<Project>]) -> Result<DispatchBoardInputs, String> {
+    pub async fn collect_dispatch_board_inputs(
+        &self,
+        projects: &[ResourceObject<Project>],
+        running: BTreeSet<flotilla_protocol::IssueRef>,
+    ) -> Result<DispatchBoardInputs, String> {
         let namespace = self.namespace.clone();
         let inventory = self.backend.including_replicas::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;
         let inventory = inventory.items.into_iter().map(|record| (record.object.metadata.name.clone(), Ok(record.object))).collect();
         let mut bindings_by_project = BTreeMap::new();
         let mut sources = std::collections::BTreeSet::new();
-        let mut mission_issues = std::collections::BTreeSet::new();
-        // Running tickets need current fields for tier-specific crew accounting,
-        // even after their ready label is removed. Do not fetch inactive backlog.
-        // Fail closed on store failure: missing live tickets would omit their
-        // Priority fields from fallback observations and bias tier occupancy.
-        let live = self
-            .backend
-            .query_declared::<flotilla_resources::Convoy>(
-                &namespace,
-                &live_project_convoys_query(projects.iter().map(|project| project.metadata.name.clone())),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        for record in live.items {
-            if active_crew_count(record.object.status.as_ref()) > 0 {
-                mission_issues.extend(record.object.spec.issues.into_iter().map(|issue| issue.reference));
-            }
-        }
+        // Running tickets are observed whatever their labels; inactive backlog is not fetched.
+        let mut mission_issues = running;
 
         for project in projects {
             if let Some(policy) = &project.spec.dispatch_policy {

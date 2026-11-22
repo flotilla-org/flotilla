@@ -157,7 +157,8 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
     }];
     projects.create(&test_meta("broken"), &broken).await.expect("broken binding");
     let inventory = projects.list().await.expect("projects").items;
-    let inputs = daemon.collect_dispatch_board_inputs(&inventory).await.expect("pass inputs");
+    let running = daemon.running_dispatch_issues(&inventory).await.expect("running issues");
+    let inputs = daemon.collect_dispatch_board_inputs(&inventory, running).await.expect("pass inputs");
     assert!(inputs["cold"].is_err());
     assert!(inputs["broken"].is_err());
     let shared = &inputs["large"].as_ref().expect("large scope").1[0].1;

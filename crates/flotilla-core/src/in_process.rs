@@ -4531,9 +4531,22 @@ impl InProcessDaemon {
     ) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
         self.dispatch_board_projection().await.dispatch_board_repositories_internal(project_filter).await
     }
+    /// The boards and bindings of `projects`, observing `running`, the issues their live convoys
+    /// run, whatever their labels.
     #[tracing::instrument(name = "dispatch_board", skip_all)]
-    pub async fn collect_dispatch_board_inputs(&self, projects: &[ResourceObject<Project>]) -> Result<DispatchBoardInputs, String> {
-        self.dispatch_board_projection().await.collect_dispatch_board_inputs(projects).await
+    pub async fn collect_dispatch_board_inputs(
+        &self,
+        projects: &[ResourceObject<Project>],
+        running: std::collections::BTreeSet<flotilla_protocol::IssueRef>,
+    ) -> Result<DispatchBoardInputs, String> {
+        self.dispatch_board_projection().await.collect_dispatch_board_inputs(projects, running).await
+    }
+    /// The issues `projects`' live convoys with active crews run, read from the store.
+    pub async fn running_dispatch_issues(
+        &self,
+        projects: &[ResourceObject<Project>],
+    ) -> Result<std::collections::BTreeSet<flotilla_protocol::IssueRef>, String> {
+        self.dispatch_board_projection().await.running_issues(projects).await
     }
     async fn dispatch_board_projection(&self) -> flotilla_projections::dispatch_board::DispatchBoard<'_> {
         flotilla_projections::dispatch_board::DispatchBoard {
@@ -6055,7 +6068,8 @@ impl InProcessDaemon {
         // This reads the shared immutable board snapshot, scheduling background
         // warming when cold/stale; it never waits for HTTP. Explanation rebuilds
         // one project's mission graph and reads only its live convoy subset.
-        let inputs = self.collect_dispatch_board_inputs(std::slice::from_ref(project)).await?;
+        let running = self.running_dispatch_issues(std::slice::from_ref(project)).await?;
+        let inputs = self.collect_dispatch_board_inputs(std::slice::from_ref(project), running).await?;
         let (_, snapshots) = inputs.get(project_name).ok_or("project board unavailable")?.as_ref().map_err(Clone::clone)?;
         let board = MissionBoard::new(&snapshots.iter().map(|(_, board)| board.as_ref().clone()).collect::<Vec<_>>())?;
         let convoys = self
