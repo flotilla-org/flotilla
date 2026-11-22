@@ -196,6 +196,74 @@ async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
     (names, vessels.launches_read() - before.0, keyed_gets(&convoys, &engine) - before.1)
 }
 
+// Behaviour: a convoy change that leaves what its vessels' plans read where it was, such as a
+// subject linked, rechecks none of them; one that moves it, such as the convoy failing, rechecks
+// its vessel. Each vessel was planned again at every change of its convoy.
+#[tokio::test]
+async fn a_convoy_change_rechecks_its_vessels_only_when_what_they_plan_on_moves() {
+    let store = OtherHome::open("home");
+    let engine = EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
+    let mut launched = Vec::new();
+    for name in ["warm", "linked", "failed"] {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
+        let launch = convoys.launch(convoy(NAMESPACE, name, spec.clone(), single_agent("coder"))).await;
+        let vessel = engine.vessels.request(&launch, "work", "host");
+        launched.push((convoy(NAMESPACE, &launch, spec, single_agent("coder")), vessel));
+    }
+    let accounts: Arc<dyn AccountRecords> = Arc::new(OldStoreAccounts::new(backend.clone()));
+    let wake = ConvoyVesselWake::new(&backend, NAMESPACE, Arc::clone(convoys.reads()), convoys.path(), accounts);
+    let (sender, mut queued) = tokio::sync::mpsc::channel(256);
+    let waking = tokio::spawn(wake.recheck(NAMESPACE.to_owned(), sender));
+
+    // The wake's watches open after it is spawned: the first convoy's brief is published until it
+    // is heard.
+    let (warm, warm_vessel) = &launched[0];
+    let heard = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            publish_brief(&backend, &warm.metadata.name, "coder").await;
+            if let Ok(Some(name)) = tokio::time::timeout(Duration::from_millis(50), queued.recv()).await {
+                return name;
+            }
+        }
+    })
+    .await
+    .expect("the wake hears a brief");
+    assert_eq!(&heard, warm_vessel);
+
+    let (linked, linked_vessel) = &launched[1];
+    let subject = |id: &str| flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "org/repo".into() },
+        id: id.into(),
+    };
+    let link = |id: &'static str| {
+        let path = convoys.path();
+        let subject = subject(id);
+        async move { path.link(linked, &subject, flotilla_resources::SubjectDiscoverySource::Operator, "alice").await.expect("link") }
+    };
+    // The wake's first sight of the convoy rechecks its vessel: it knows nothing the plan read.
+    link("5").await;
+    tokio::time::timeout(Duration::from_secs(5), async { while queued.recv().await.expect("open queue") != *linked_vessel {} })
+        .await
+        .expect("the first sight rechecks");
+    link("6").await;
+    let (failed, failed_vessel) = &launched[2];
+    convoys.path().fail(failed, "operator", "failed").await.expect("fail the convoy");
+    // Each wake before the failure's is queued before it.
+    let mut before = Vec::new();
+    loop {
+        let name = tokio::time::timeout(Duration::from_secs(5), queued.recv()).await.expect("the failure rechecks").expect("open queue");
+        if &name == failed_vessel {
+            break;
+        }
+        before.push(name);
+    }
+    waking.abort();
+    assert!(!before.contains(linked_vessel), "a linked subject moves nothing its vessel plans on: {before:?}");
+}
+
 /// The convoys queued, and the convoy views converted and keyed gets made, when a checkout held
 /// for one convoy is requested, with `others` other convoys launched.
 async fn queued_by_one_checkout(others: usize) -> (Vec<String>, u64, KeyedGets) {

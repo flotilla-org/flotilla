@@ -1333,11 +1333,56 @@ fn legible_waiting_for(mut waiting_for: String, placement_decision: Option<&Plac
 
 /// What woke [`ConvoyVesselWake`].
 enum ConvoyWoken {
-    /// Something of convoy `0` changed, or a brief artifact of it replicated: its vessels plan,
-    /// and seat their crews, again.
+    /// A brief artifact of convoy `0` replicated, or one of its crews' account bindings changed:
+    /// its vessels plan, and seat their crews, again.
     Convoy(String),
+    /// Convoy `0` changed, as read then: its vessels plan again if what their plans read of it
+    /// did; none when it was deleted.
+    Changed(String, Option<Box<PlanningFacts>>),
+    /// Convoy `0`'s engine record changed: read to judge as [`ConvoyWoken::Changed`].
+    Engine(String),
     /// What changed is unknown: every vessel plans again.
     Every,
+}
+
+/// What a vessel's plan reads of its convoy to decide what to do next: its spec, its phase, its
+/// workflow snapshot's arrival, its placement, and each work's and crew's phase. A change of
+/// anything else, such as a promise, a stall reading or a note, gives no vessel plan anything
+/// new; a brief written when a crew starts reads the convoy as it is then.
+#[derive(Debug, PartialEq)]
+struct PlanningFacts {
+    spec: flotilla_resources::ConvoySpec,
+    labels: BTreeMap<String, String>,
+    annotations: BTreeMap<String, String>,
+    phase: Option<flotilla_resources::ConvoyPhase>,
+    snapshot: bool,
+    placement: Option<PlacementDecision>,
+    work: BTreeMap<String, flotilla_resources::WorkPhase>,
+    crew_work: BTreeMap<String, BTreeMap<String, flotilla_resources::CrewWorkPhase>>,
+}
+
+impl PlanningFacts {
+    fn of(convoy: &ResourceObject<Convoy>) -> Box<Self> {
+        let status = convoy.status.as_ref();
+        Box::new(PlanningFacts {
+            spec: convoy.spec.clone(),
+            labels: convoy.metadata.labels.clone(),
+            annotations: convoy.metadata.annotations.clone(),
+            phase: status.map(|status| status.phase),
+            snapshot: status.is_some_and(|status| status.workflow_snapshot.is_some()),
+            placement: status.and_then(|status| status.placement_decision.clone()),
+            work: status.map(|status| status.work.iter().map(|(work, state)| (work.clone(), state.phase)).collect()).unwrap_or_default(),
+            crew_work: status
+                .map(|status| {
+                    status
+                        .crew_work
+                        .iter()
+                        .map(|(work, crews)| (work.clone(), crews.iter().map(|(role, state)| (role.clone(), state.phase)).collect()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
 }
 
 /// Wakes a convoy's vessel launches at this home when what their planning reads beside the
@@ -1380,10 +1425,12 @@ impl ConvoyVesselWake {
             .watch()
             .await?
             .map(|event| match event {
-                Ok(ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) | ReadWatchEvent::Deleted(read)) => {
-                    ConvoyWoken::Convoy(read.object.metadata.name)
+                Ok(ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read)) => {
+                    let facts = PlanningFacts::of(&read.object);
+                    ConvoyWoken::Changed(read.object.metadata.name, Some(facts))
                 }
-                Ok(ReadWatchEvent::DeletedByName { tombstone, .. }) => ConvoyWoken::Convoy(tombstone.name),
+                Ok(ReadWatchEvent::Deleted(read)) => ConvoyWoken::Changed(read.object.metadata.name, None),
+                Ok(ReadWatchEvent::DeletedByName { tombstone, .. }) => ConvoyWoken::Changed(tombstone.name, None),
                 Err(error) => {
                     warn!(%error, "the vessels' convoy watch failed");
                     ConvoyWoken::Every
@@ -1426,7 +1473,7 @@ impl ConvoyVesselWake {
             .boxed();
         let engine = futures::stream::unfold(self.engine.changes(), |mut changes| async move {
             match changes.recv().await {
-                Ok(name) => Some((ConvoyWoken::Convoy(name), changes)),
+                Ok(name) => Some((ConvoyWoken::Engine(name), changes)),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((ConvoyWoken::Every, changes)),
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
             }
@@ -1439,7 +1486,7 @@ impl ConvoyVesselWake {
     async fn launches(&self, woken: &ConvoyWoken) -> Result<Vec<String>, String> {
         let reads = Arc::clone(&self.reads);
         let woken = match woken {
-            ConvoyWoken::Convoy(convoy) => Some(convoy.clone()),
+            ConvoyWoken::Convoy(convoy) | ConvoyWoken::Changed(convoy, _) | ConvoyWoken::Engine(convoy) => Some(convoy.clone()),
             ConvoyWoken::Every => None,
         };
         tokio::task::spawn_blocking(carry(move || {
@@ -1456,9 +1503,28 @@ impl ConvoyVesselWake {
         .map(|records: Vec<VesselRecord>| records.into_iter().map(|record| record.name).collect())
     }
 
+    /// Whether convoy `name`'s change gives its vessels' plans anything new: what they read of it
+    /// moved since it last did. `facts` is the convoy as the change read it, none once deleted.
+    fn moved(seen: &mut BTreeMap<String, Box<PlanningFacts>>, name: &str, facts: Option<Box<PlanningFacts>>) -> bool {
+        match facts {
+            Some(facts) if seen.get(name) == Some(&facts) => false,
+            Some(facts) => {
+                seen.insert(name.to_owned(), facts);
+                true
+            }
+            None => {
+                seen.remove(name);
+                true
+            }
+        }
+    }
+
     /// Names to the Vessel controller each launch to plan again, until it stops listening.
     pub async fn recheck(self, namespace: String, rechecks: tokio::sync::mpsc::Sender<String>) {
         use futures::StreamExt;
+
+        // What each convoy's vessels last planned on, as the wakes read it.
+        let mut seen: BTreeMap<String, Box<PlanningFacts>> = BTreeMap::new();
 
         let mut woken = match self.woken(&namespace).await {
             Ok(woken) => woken,
@@ -1468,6 +1534,31 @@ impl ConvoyVesselWake {
             }
         };
         while let Some(woken) = woken.next().await {
+            let (woken, moved) = match woken {
+                ConvoyWoken::Changed(name, facts) => {
+                    let moved = Self::moved(&mut seen, &name, facts);
+                    (ConvoyWoken::Convoy(name), moved)
+                }
+                ConvoyWoken::Engine(name) => {
+                    let moved = match self.convoys.get(&name).await {
+                        Ok(read) => Self::moved(&mut seen, &name, Some(PlanningFacts::of(&read.object))),
+                        Err(ResourceError::NotFound { .. }) => Self::moved(&mut seen, &name, None),
+                        Err(error) => {
+                            warn!(%error, convoy = name, "the vessels' convoy could not be read; its vessels plan again");
+                            true
+                        }
+                    };
+                    (ConvoyWoken::Convoy(name), moved)
+                }
+                ConvoyWoken::Every => {
+                    seen.clear();
+                    (ConvoyWoken::Every, true)
+                }
+                woken @ ConvoyWoken::Convoy(_) => (woken, true),
+            };
+            if !moved {
+                continue;
+            }
             match self.launches(&woken).await {
                 Ok(launches) => {
                     for launch in launches {
