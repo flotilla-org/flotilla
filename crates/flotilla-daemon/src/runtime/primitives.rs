@@ -331,6 +331,10 @@ impl MessageDelivery {
         // its receipt before rebind unbinds and ends that session (#3894).
         let collected = self.collect_turns(false).instrument(info_span!("message_delivery.collect_turns")).await;
         self.confirm_held_turns().instrument(info_span!("message_delivery.confirm_held_turns")).await;
+        // A message admitted to an inbox whose holder is known has its turn started now, before
+        // routing reads what changed: only a holder new since the last pass waits on routing.
+        self.open.refresh_off_thread(&self.primitives).instrument(info_span!("message_delivery.follow_open")).await?;
+        self.start_turns().await?;
         let changed = self.holders(now).instrument(info_span!("message_delivery.holders")).await?;
         let person = self.primitives.register_person(now).instrument(info_span!("message_delivery.register_person")).await?;
         let mut consumers: BTreeSet<_> = self
@@ -350,7 +354,8 @@ impl MessageDelivery {
             let span = info_span!("message_delivery.rebind", holders = self.holders.len());
             self.rebind(consumers, now).instrument(span).await?;
         }
-        // The pending messages here, as of now: only their inboxes' holders have a turn to start.
+        // The pending messages here, as of now: the holders routing found since, or whose turn
+        // settled, have a turn to start.
         self.open.refresh_off_thread(&self.primitives).instrument(info_span!("message_delivery.follow_open")).await?;
         self.start_turns().await?;
         let report = self.primitives.sweep(&self.namespace, now, &mut self.open).instrument(info_span!("message_delivery.sweep")).await?;
