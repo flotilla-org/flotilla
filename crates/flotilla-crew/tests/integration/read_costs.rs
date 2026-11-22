@@ -908,7 +908,9 @@ async fn held_before_and_after_ending(convoys: usize, watched: bool) -> (HeldWor
     // The second convoy's launches ended and were never released.
     let (_, vessel, session) = &crewed.launches[1];
     let lost = crewed.engine.terminals.record(session);
-    assert!(views.1.get(lost.session_name()).await.is_ok(), "a session that ended is read by name");
+    // Nothing holds it once its vessel and convoy ended: it retired, and reads as absent by name
+    // as from the listing (#4421).
+    assert!(views.1.get(lost.session_name()).await.is_err(), "a retired session reads as absent by name");
     assert!(views.2.get(vessel).await.is_ok(), "a Vessel launch that ended is read by name");
     (running, ended)
 }
