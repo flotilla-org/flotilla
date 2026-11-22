@@ -422,6 +422,67 @@ impl Dirt {
     }
 }
 
+/// What a cover selects that the records read by key or index: a session by name, or the sessions
+/// of a seat, a convoy's works' vessels' sessions narrowed by work and role.
+#[derive(Clone, Debug, PartialEq)]
+enum Selection {
+    Named(String),
+    Seat { convoy: String, work: Option<String>, role: Option<String> },
+}
+
+/// The sessions `cover` may select, as names and seats; `None` when it selects by anything else
+/// in some alternative, and the listing's index answers it. A selection may hold more than the
+/// cover: the reader filters what is read by the whole query.
+fn selection(cover: &IndexCover) -> Option<Vec<Selection>> {
+    use flotilla_resources::labels::{CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
+    /// One key's single value among `parts`, where some part is exactly that key.
+    fn single(parts: &[&IndexCover], key: &str) -> Option<String> {
+        parts.iter().find_map(|part| match part {
+            IndexCover::AnyKey(keys) if keys.len() == 1 => {
+                keys.iter().next().filter(|(held, _)| held == key).map(|(_, value)| value.clone())
+            }
+            _ => None,
+        })
+    }
+    match cover {
+        IndexCover::AnyKey(keys) => {
+            let names: Option<Vec<Selection>> = keys
+                .iter()
+                .map(|(key, value)| match key.as_str() {
+                    "field:metadata.name" => Some(Selection::Named(value.clone())),
+                    key if key == format!("label:{CONVOY_LABEL}") => {
+                        Some(Selection::Seat { convoy: value.clone(), work: None, role: None })
+                    }
+                    _ => None,
+                })
+                .collect();
+            names
+        }
+        IndexCover::All(parts) => {
+            let parts: Vec<&IndexCover> = parts.iter().collect();
+            if let Some(name) = single(&parts, "field:metadata.name") {
+                return Some(vec![Selection::Named(name)]);
+            }
+            if let Some(convoy) = single(&parts, &format!("label:{CONVOY_LABEL}")) {
+                return Some(vec![Selection::Seat {
+                    convoy,
+                    work: single(&parts, &format!("label:{VESSEL_LABEL}")),
+                    role: single(&parts, &format!("label:{ROLE_LABEL}")),
+                }]);
+            }
+            // Otherwise the first part that selects alone drives.
+            parts.into_iter().find_map(selection)
+        }
+        IndexCover::Any(parts) => {
+            let mut union = Vec::new();
+            for part in parts {
+                union.extend(selection(part)?);
+            }
+            Some(union)
+        }
+    }
+}
+
 impl TerminalViews {
     pub fn new(namespace: &str, reads: Arc<dyn LifecycleReads>) -> Self {
         let changed = Arc::<Mutex<UnloggedJournal>>::default();
@@ -438,13 +499,8 @@ impl TerminalViews {
     /// Each session's newest launch at every home, as the engine port lists it: this home's
     /// local, other homes' replicas of their home. A released launch is listed no more.
     async fn listed(&self) -> Result<Vec<Record<TerminalSession>>, ResourceError> {
-        self.listed_where(|_| true).await
-    }
-
-    /// The listed records `keep` selects: only those are copied out of the listing.
-    async fn listed_where(&self, keep: impl Fn(&Record<TerminalSession>) -> bool) -> Result<Vec<Record<TerminalSession>>, ResourceError> {
         let published = self.passed().await?;
-        Ok(listed_in(&published, keep))
+        Ok(listed_in(&published, |_| true))
     }
 
     /// The views `cover` selects, from the listing's index, this home's alone when `local`: only
@@ -815,24 +871,97 @@ impl TerminalViews {
         self.reads.terminals()
     }
 
-    /// This home's launch `record`, composed afresh, as the engine port hands it out: at the
-    /// listing's version for its launch, or the next where the listing has not read it again.
-    async fn here_record(&self, record: TerminalRecord) -> Result<Option<Record<TerminalSession>>, String> {
-        let launch = record.name.clone();
-        let session = (record.home.clone(), record.session_name().to_owned());
-        let composed = self.compose(vec![record]).instrument(info_span!("terminal_views.compose"));
-        let Some(view) = composed.await.map_err(|error| error.to_string())?.pop() else { return Ok(None) };
-        let mut view = crate::held_listing::view_record(view.object, session.0.clone(), 0);
+    /// `records`, launches read by key at any home, composed afresh as the engine port hands them
+    /// out: each at the listing's version for its launch, or the next where the listing has not
+    /// read it again. A released launch, and one that ended and that the held joins no longer
+    /// hold, reads as absent, as from a listing: nothing composes from it (#4421).
+    async fn keyed_records(&self, records: Vec<TerminalRecord>) -> Result<Vec<Record<TerminalSession>>, String> {
+        let records: Vec<TerminalRecord> = records.into_iter().filter(|record| record.reading != LifecycleReading::Released).collect();
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records = if records.iter().any(TerminalRecord::ended) {
+            self.blocking(move |reads| {
+                reads.joins()?.read(reads, |joins| {
+                    records
+                        .into_iter()
+                        .filter(|record| !record.ended() || joins.terminal(&record.name, &record.home).is_some())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .instrument(info_span!("terminal_views.evicted"))
+            .await
+            .map_err(|error| error.to_string())?
+        } else {
+            records
+        };
+        let launches: Vec<(Session, String)> =
+            records.iter().map(|record| ((record.home.clone(), record.session_name().to_owned()), record.name.clone())).collect();
+        let composed = self.compose(records).instrument(info_span!("terminal_views.compose")).await.map_err(|error| error.to_string())?;
         // The listing as last published, as one read made now would take it; the listing itself
         // before the first is.
-        view.version = match self.last_published() {
-            Some(published) => version(&published.shown, &session, &launch, &view, published.position)?,
-            None => {
-                let listing = self.listing.lock().instrument(info_span!("terminal_views.lock_wait", by = "version")).await;
-                version(&listing.shown, &session, &launch, &view, listing.position())?
-            }
+        let published = self.last_published();
+        let unpublished = match published {
+            Some(_) => None,
+            None => Some(self.listing.lock().instrument(info_span!("terminal_views.lock_wait", by = "version")).await),
         };
-        Ok(Some(view))
+        let mut views = Vec::with_capacity(composed.len());
+        for (view, (session, launch)) in composed.into_iter().zip(launches) {
+            let mut view = crate::held_listing::view_record(view.object, session.0.clone(), 0);
+            view.version = match (&published, &unpublished) {
+                (Some(published), _) => version(&published.shown, &session, &launch, &view, published.position)?,
+                (None, Some(listing)) => version(&listing.shown, &session, &launch, &view, listing.position())?,
+                (None, None) => 0,
+            };
+            views.push(view);
+        }
+        Ok(views)
+    }
+
+    /// Every home's newest launch of session `name`, read by key at each, as the port hands them
+    /// out.
+    async fn named_records(&self, name: &str) -> Result<Vec<Record<TerminalSession>>, String> {
+        let owned = name.to_owned();
+        let records = self
+            .blocking(move |reads| reads.terminals()?.named(&owned))
+            .instrument(info_span!("terminal_views.record"))
+            .await
+            .map_err(|error| error.to_string())?;
+        self.keyed_records(records).await
+    }
+
+    /// The launches `selection` names, read by key and through the record indexes, this home's
+    /// alone when `local`: the newest launch of each session.
+    async fn selected_records(&self, selection: Vec<Selection>, local: bool) -> Result<Vec<Record<TerminalSession>>, String> {
+        let records = self
+            .blocking(move |reads| {
+                let terminals = reads.terminals()?;
+                let mut records = Vec::new();
+                for part in selection {
+                    match part {
+                        Selection::Named(name) => records.extend(terminals.named(&name)?),
+                        Selection::Seat { convoy, work, role } => {
+                            for vessel in reads.vessels()?.of_convoy(&convoy)? {
+                                if work.as_ref().is_some_and(|work| vessel.work() != work) {
+                                    continue;
+                                }
+                                records.extend(
+                                    terminals
+                                        .of_vessel(&vessel.name)?
+                                        .into_iter()
+                                        .filter(|record| role.as_ref().is_none_or(|role| record.role == *role)),
+                                );
+                            }
+                        }
+                    }
+                }
+                let here = terminals.home().to_owned();
+                Ok(newest_launches(records).into_values().filter(|record| !local || record.home == here).collect::<Vec<_>>())
+            })
+            .instrument(info_span!("terminal_views.selected"))
+            .await
+            .map_err(|error| error.to_string())?;
+        self.keyed_records(records).await
     }
 
     async fn engine_sources(&self) -> Result<Vec<Record<TerminalSession>>, String> {
@@ -871,9 +1000,10 @@ impl KindRecords<TerminalSession> for TerminalViews {
         self.terminals().map(|terminals| terminals.home().to_owned()).unwrap_or_default()
     }
 
-    /// This home's newest launch of `name`, read afresh so a home reads its own writes, else
-    /// another home's as listed. A released launch reads as absent, as from a listing, and so does
-    /// one that ended and that the held joins no longer hold: nothing composes from it (#4421).
+    /// This home's newest launch of `name`, else another home's: the lexically first home's, as a
+    /// listing chooses. Each home's is read by key, so a home reads its own writes. A released
+    /// launch reads as absent, as from a listing, and so does one that ended and that the held
+    /// joins no longer hold: nothing composes from it (#4421).
     async fn get(&self, name: &str) -> Result<Option<Record<TerminalSession>>, String> {
         let here = self.home();
         // While the listing holds every commit counted, this home's session is read from it: its
@@ -883,23 +1013,8 @@ impl KindRecords<TerminalSession> for TerminalViews {
                 return Ok(entry.view.clone());
             }
         }
-        let owned = name.to_owned();
-        let record = self
-            .blocking(move |reads| {
-                let Some(record) = reads.terminals()?.get(&owned, None)? else { return Ok(None) };
-                let evicted = record.ended() && reads.joins()?.read(reads, |joins| joins.terminal(&record.name, &record.home).is_none())?;
-                Ok(Some((record, evicted)))
-            })
-            .instrument(info_span!("terminal_views.record"));
-        let record = record.await.map_err(|error| error.to_string())?;
-        if let Some((record, evicted)) = record.filter(|(record, _)| record.home == here) {
-            if evicted || record.reading == LifecycleReading::Released {
-                return Ok(None);
-            }
-            return self.here_record(record).await;
-        }
-        let named = self.listed_where(|object| object.name == name && object.home != here).await.map_err(|error| error.to_string())?;
-        Ok(named.into_iter().min_by(|a, b| a.home.cmp(&b.home)))
+        let copies = self.named_records(name).await?;
+        Ok(copies.into_iter().min_by(|a, b| (a.home != here, &a.home).cmp(&(b.home != here, &b.home))))
     }
 
     /// Each session's newest launch, this home's where it holds one, else the lexically first
@@ -954,26 +1069,22 @@ impl KindRecords<TerminalSession> for TerminalViews {
         since.await.map_err(|error| error.to_string())
     }
 
-    /// Every home's listed copy of `name`, and this home's newest launch of it however it ended.
+    /// Every home's newest launch of `name`, read by key at each.
     async fn copies(&self, name: &str) -> Result<Vec<Record<TerminalSession>>, String> {
-        let here = self.home();
-        let mut copies = self.sources_named(name).await?;
-        if !copies.iter().any(|object| object.home == here) {
-            let owned = name.to_owned();
-            let record = self.blocking(move |reads| reads.terminals()?.get(&owned, None)).await.map_err(|error| error.to_string())?;
-            if let Some(record) = record {
-                copies.extend(self.here_record(record).await?);
-            }
-        }
-        Ok(copies)
+        self.named_records(name).await
     }
 
-    /// Every home's listed copy of `name`: a released launch is listed no more.
+    /// Every home's newest launch of `name` a listing holds: a released launch is listed no more.
     async fn sources_named(&self, name: &str) -> Result<Vec<Record<TerminalSession>>, String> {
-        self.listed_where(|object| object.name == name).await.map_err(|error| error.to_string())
+        self.named_records(name).await
     }
 
+    /// The sessions `cover` selects by name or by seat (convoy, and its work and role), read by
+    /// key and through the record indexes; any other cover is answered from the listing's index.
     async fn covered(&self, cover: &IndexCover, local: bool) -> Option<Result<Vec<Record<TerminalSession>>, String>> {
+        if let Some(selection) = selection(cover) {
+            return Some(self.selected_records(selection, local).await);
+        }
         Some(self.covered_views(cover, local).await.map_err(|error| error.to_string()))
     }
 

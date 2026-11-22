@@ -107,20 +107,34 @@ fn a_session_never_requested_here_cannot_be_renewed() {
 
 // Behaviour (#3108): the old store's TerminalSession reads are served from the launches. Each
 // session reads as its newest launch, with the engine's identity, phase and ending reason, and
-// its writes are refused: sessions are requested and renewed through the terminal port.
+// its writes are refused: sessions are requested and renewed through the terminal port. Its
+// live Vessel launch holds an ended session for its resume; once the vessel ends too, nothing
+// holds it and it retires: absent from the listing and from a read by name (#4421).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn old_store_reads_see_each_sessions_newest_launch() {
     use std::sync::Arc;
 
-    use flotilla_resources::{TerminalSession, TerminalSessionPhase};
+    use flotilla_provisioning::engine::reads::{LifecycleReadPort, StoreReads};
+    use flotilla_provisioning_testkit::VesselsFixture;
+    use flotilla_resources::{terminal_records::TerminalRecords, vessel_records::VesselRecords, TerminalSession, TerminalSessionPhase};
     use flotilla_store::{ResourceBackend, TerminalViews};
 
     let fixture = TerminalsFixture::default();
+    let vessels = VesselsFixture::over(&fixture.home, Arc::clone(&fixture.store));
+    let vessel = vessels.request("c1", "v1", "host-a");
+    let reads = Arc::new(
+        LifecycleReadPort::new(StoreReads::new(Arc::clone(&fixture.store)), fixture.home.clone())
+            .with_terminals(Arc::clone(&fixture.terminals) as Arc<dyn TerminalRecords>)
+            .with_vessels(Arc::clone(&vessels.vessels) as Arc<dyn VesselRecords>),
+    );
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    backend.install_engine_records(Arc::new(TerminalViews::new("flotilla", fixture.reads.clone())));
+    backend.install_engine_records(Arc::new(TerminalViews::new("flotilla", reads)));
     backend.serve_engine_in("flotilla");
     let sessions = backend.using::<TerminalSession>("flotilla");
-    let request = TerminalsFixture::agent("v1", "lead", "env-a");
+    let request = flotilla_resources::terminal_records::TerminalLaunchRequest {
+        vessel: Some(vessel.clone()),
+        ..TerminalsFixture::agent("v1", "lead", "env-a")
+    };
     let read = || async { sessions.get(&request.session).await.expect("session").status.expect("status") };
 
     let first = fixture.request(&request);
@@ -140,10 +154,12 @@ async fn old_store_reads_see_each_sessions_newest_launch() {
     assert_eq!(failed.phase, TerminalSessionPhase::Failed);
     assert!(failed.message.expect("reason").contains("engine ending reason"));
 
-    // Nothing holds the failed launch (its vessel doesn't exist), so the listing drops it while
-    // a read by name still finds it in the store.
+    assert_eq!(sessions.list().await.expect("list").items.len(), 1, "its live vessel holds the ended session");
+
+    // The vessel ends: nothing holds the failed launch, so it retires.
+    vessels.step(&vessel, flotilla_resources::vessel_records::VesselStep::Failed { cause: "no capacity".into(), retryable: false });
     assert!(sessions.list().await.expect("list").items.is_empty(), "an unheld ended session leaves the listing");
-    assert_eq!(read().await.phase, TerminalSessionPhase::Failed, "the store still reads it by name");
+    assert!(sessions.get(&request.session).await.is_err(), "and reads by name as absent");
     assert!(sessions.delete(&request.session).await.is_err(), "a session ends with its holder; it is not deleted");
 }
 

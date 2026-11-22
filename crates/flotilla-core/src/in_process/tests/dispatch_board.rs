@@ -14,7 +14,7 @@ use crate::testkits::discovery::{fake_discovery_with_provider_set, FakeDiscovery
 
 // Tracker boundary: deliberately suspend native forge observations so the board
 // scenario can prove interactive reads never wait for remote work.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
     use flotilla_resources::{DispatchQueueEntry, ProjectStatus};
     let temp = tempfile::tempdir().expect("config");

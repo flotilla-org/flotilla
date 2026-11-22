@@ -6067,11 +6067,8 @@ impl InProcessDaemon {
         };
         // This reads the shared immutable board snapshot, scheduling background
         // warming when cold/stale; it never waits for HTTP. Explanation rebuilds
-        // one project's mission graph and reads only its live convoy subset.
-        let running = self.running_dispatch_issues(std::slice::from_ref(project)).await?;
-        let inputs = self.collect_dispatch_board_inputs(std::slice::from_ref(project), running).await?;
-        let (_, snapshots) = inputs.get(project_name).ok_or("project board unavailable")?.as_ref().map_err(Clone::clone)?;
-        let board = MissionBoard::new(&snapshots.iter().map(|(_, board)| board.as_ref().clone()).collect::<Vec<_>>())?;
+        // one project's mission graph and reads only its live convoy subset, once:
+        // the board's running issues and the occupancy both come from it.
         let convoys = self
             .resource_backend
             .query_declared::<ResourceConvoy>(
@@ -6080,6 +6077,10 @@ impl InProcessDaemon {
             )
             .await
             .map_err(|e| e.to_string())?;
+        let running = flotilla_projections::dispatch_board::running_issues(convoys.items.iter().map(|source| &source.object));
+        let inputs = self.collect_dispatch_board_inputs(std::slice::from_ref(project), running).await?;
+        let (_, snapshots) = inputs.get(project_name).ok_or("project board unavailable")?.as_ref().map_err(Clone::clone)?;
+        let board = MissionBoard::new(&snapshots.iter().map(|(_, board)| board.as_ref().clone()).collect::<Vec<_>>())?;
         let occupancy = MissionOccupancy::collect(&board, policy, convoys.items.iter().map(|source| &source.object))?;
         convoy
             .spec

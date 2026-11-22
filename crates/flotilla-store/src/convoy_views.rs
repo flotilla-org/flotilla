@@ -94,6 +94,7 @@ impl ConvoyViews {
             listing.extend(match source {
                 Source::Named(name) => convoys.named(name, None)?,
                 Source::OpenIn(project) => convoys.open_in(project)?,
+                Source::InProject(project) => convoys.of_project(project)?,
                 Source::Launches(project, of) => convoys.launches_of(of, project)?,
                 Source::OpenRole(project, role) => convoys.open_of_role(project, role)?,
             });
@@ -258,6 +259,9 @@ enum Source {
     Named(String),
     /// Every home's open launch in the project, through the `open_by_project` index.
     OpenIn(String),
+    /// Every home's launch in the project that has not retired, ended or not, through the leading
+    /// column of the `by_launch` index.
+    InProject(String),
     /// Every home's launch of a name in a project that has not retired, through the `by_launch`
     /// index.
     Launches(String, String),
@@ -280,7 +284,7 @@ enum Term {
 #[derive(Clone, Debug)]
 enum Part {
     Named(String),
-    /// Every launch in the project, ended or not: no index reads these.
+    /// Every launch in the project, ended or not.
     Project(String),
     /// The project's open launches.
     OpenIn(String),
@@ -294,11 +298,12 @@ enum Part {
     OpenRole(String, String),
 }
 
-/// The index keys of the project and launch-of labels, as the store's query index names them.
+/// The index keys of the project, launch-of and role labels, as the store's query index names them.
 static PROJECT_KEY: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("label:{}", flotilla_resources::labels::PROJECT_LABEL));
 static LAUNCH_OF_KEY: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("label:{}", flotilla_resources::labels::LAUNCH_OF_LABEL));
+static ROLE_KEY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!("label:{}", flotilla_resources::labels::ROLE_LABEL));
 
 /// The phases of a launch that has not ended.
 const LIVE_PHASES: [&str; 5] = ["Pending", "Active", "Interrupted", "Landing", "Anchored"];
@@ -314,7 +319,8 @@ fn sources_of(cover: &IndexCover) -> Option<BTreeSet<Source>> {
                 Part::OpenIn(project) => Some(Source::OpenIn(project)),
                 Part::Launches(project, of) => Some(Source::Launches(project, of)),
                 Part::OpenRole(project, role) => Some(Source::OpenRole(project, role)),
-                Part::Project(_) | Part::LaunchOf(_) | Part::Role(_) => None,
+                Part::Project(project) => Some(Source::InProject(project)),
+                Part::LaunchOf(_) | Part::Role(_) => None,
             })
             .collect(),
         Term::Live | Term::Unknown => None,
@@ -330,10 +336,15 @@ fn term(cover: &IndexCover) -> Term {
                 key if key == PROJECT_KEY.as_str() => Some(Some(Part::Project(value.clone()))),
                 key if key == LAUNCH_OF_KEY.as_str() => Some(Some(Part::LaunchOf(value.clone()))),
                 "field:spec.role" => Some(Some(Part::Role(value.clone()))),
+                key if key == ROLE_KEY.as_str() => Some(Some(Part::Role(value.clone()))),
                 "field:status.phase" if LIVE_PHASES.contains(&value.as_str()) => Some(None),
                 "missing:status.phase" => Some(None),
                 _ => None,
             };
+            // No key selects no launch.
+            if keys.is_empty() {
+                return Term::Sources(Vec::new());
+            }
             let parts: Option<Vec<Option<Part>>> = keys.iter().map(part).collect();
             match parts {
                 Some(parts) if !parts.is_empty() && parts.iter().all(Option::is_some) => {
@@ -525,9 +536,10 @@ impl KindRecords<Convoy> for ConvoyViews {
         self.copies_of(name, false).await
     }
 
-    /// The launches `cover` selects, where it selects by name or by the projects whose live
-    /// launches it reads: those are read by key and through the `open_by_project` index, and only
-    /// they are composed. `None` for any other cover, which a reader answers from every launch.
+    /// The launches `cover` selects, where it selects by name, by project, by a name's launches
+    /// in a project or by a role's open launches in one: those are read by key and through the
+    /// kind's indexes, and only they are composed. `None` for any other cover, which a reader
+    /// answers from every launch.
     async fn covered(&self, cover: &IndexCover, local: bool) -> Option<Result<Vec<Record<Convoy>>, String>> {
         let sources = sources_of(cover)?;
         Some(self.blocking(move |views| views.covering(&sources, local)).await.map(|composed| composed.into_iter().map(record).collect()))
