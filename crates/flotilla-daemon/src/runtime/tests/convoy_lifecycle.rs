@@ -181,7 +181,7 @@ async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout
     let admitted = backend.clone().using::<Convoy>(NAMESPACE).get(&convoy).await.expect("admitted convoy");
     flotilla_engine_convoys_testkit::land(&daemon.convoy_engine_path(), &admitted).await;
     let host = daemon.local_host_id().expect("local host");
-    let launch = engine.vessels.request(&convoy, "implement", host.as_str());
+    let launch = engine.vessels.request(&convoy, "work", host.as_str());
 
     // The checkout authority's `OwnerTerminal` cascade already collected
     // the managed checkout: the engine holds no checkout for this convoy.

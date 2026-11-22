@@ -21,6 +21,7 @@ pub(crate) mod ssh_host_vessels;
 mod state;
 mod tasks;
 mod terminal;
+mod vessel_requests_controller;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 pub(crate) use terminal::{DELIVERY_CONFIRMATION_POLL, DELIVERY_CONFIRMATION_STABLE_FOR};
 
@@ -842,6 +843,9 @@ fn spawn_controller_loops(
                 CanonicalHostId::resolved(state.local_host_ref.clone()),
                 state.ssh_host_refs(),
             ),
+            state.daemon.lifecycle_reads(),
+            state.daemon.clock_for_scenarios(),
+            state.daemon.decided_store(),
             supervision.clone(),
             runtime_health.clone(),
         ),
@@ -1250,6 +1254,8 @@ fn spawn_convoy_controller(
     use flotilla_provisioning::engine::controller::Runner;
     let daemon = Arc::clone(&state.daemon);
     let lifecycle_status_reads = daemon.lifecycle_reads();
+    // Its passes' and its wake watches' reads count for the Convoy controller.
+    let reads = Arc::clone(&state.controller_metrics.for_kind(Convoy::API_PATHS.kind).reads);
     tokio::spawn(async move {
         tasks::supervise_controller(Convoy::API_PATHS.kind, supervision, runtime_health, move || {
             let daemon = Arc::clone(&daemon);
@@ -1288,15 +1294,15 @@ fn spawn_convoy_controller(
                 backend.clone().using::<Convoy>(&namespace_string).with_lifecycle_status_reads(Arc::clone(&lifecycle_status_reads));
             let home = Arc::clone(daemon.engine_convoys());
             let policy = convoy_controller::ConvoyPolicy::new(reconciler, convoys, Arc::clone(&home));
-            let wakes = convoy_controller::wakes(secondaries, backend.clone(), namespace_string.clone());
+            let wakes = convoy_controller::wakes(secondaries, backend.clone(), namespace_string.clone(), Arc::clone(&reads));
             let (clock, service) = (daemon.clock_for_scenarios(), daemon.decided_store());
-            async move {
+            attributed(Arc::clone(&reads), async move {
                 let code =
                     <flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy> as flotilla_schema::Kind>::CODE;
                 let runner = Runner::start(code, home.home().to_owned(), [], clock, service)
                     .map_err(|error| ResourceError::other(error.to_string()))?;
                 runner.run(policy, wakes).await.map_err(|error| ResourceError::other(error.to_string()))
-            }
+            })
         })
         .await;
     })

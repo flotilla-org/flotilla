@@ -1,19 +1,13 @@
 //! [`ConvoyWorks`] read from the engine's convoy launches, this home's and those replicated here
-//! (#3108, #4412): each launch is composed by its key, and the changes come from the launches'
-//! records as they are written or replicated.
+//! (#3108, #4412): each launch is composed by its key.
 
 use std::sync::Arc;
 
 use flotilla_protocol::CanonicalHostId;
-use flotilla_resources::{
-    convoy_compose::compose, convoy_records::ConvoyChange, lifecycle_reads::LifecycleReads, Convoy, ReadResourceObject, ResourceObject,
-    ResourceProvenance, WorkPhase,
-};
+use flotilla_resources::{convoy_compose::compose, lifecycle_reads::LifecycleReads, Convoy, ResourceObject, WorkPhase};
 use flotilla_store::load_metrics::carry;
-use futures::{stream::BoxStream, StreamExt};
-use tokio::sync::broadcast::error::RecvError;
 
-use super::{ConvoyStanding, ConvoyTouched, ConvoyWorks, ConvoyWorksRead, WorkNeedingVessel};
+use super::{ConvoyKey, ConvoyStanding, ConvoyWorks, ConvoyWorksRead, WorkNeedingVessel};
 
 /// The engine's convoy launches in one namespace, read through `reads`.
 #[derive(Clone)]
@@ -66,14 +60,6 @@ fn works(name: &str, convoy_home: &str, convoy: &ResourceObject<Convoy>) -> Vec<
         .collect()
 }
 
-/// The home of a composed launch read at `here`.
-fn home_of(view: &ReadResourceObject<Convoy>, here: &str) -> String {
-    match &view.provenance {
-        ResourceProvenance::Local => here.to_owned(),
-        ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
-    }
-}
-
 /// Whether a work in `phase` runs on a vessel.
 fn needs_vessel(phase: WorkPhase) -> bool {
     matches!(phase, WorkPhase::Ready | WorkPhase::Launching | WorkPhase::Running | WorkPhase::Stalled | WorkPhase::Interrupted)
@@ -94,20 +80,10 @@ fn placed_host(convoy: &ResourceObject<Convoy>, work: &str) -> Option<Option<Can
 
 #[async_trait::async_trait]
 impl ConvoyWorks for EngineConvoyWorks {
-    /// Every live launch at every home, each composed by its key: read at the first pass and after
-    /// missed changes alone.
-    async fn works_needing_vessel(&self) -> Result<Vec<WorkNeedingVessel>, String> {
-        self.blocking(|reads, namespace| {
-            let convoys = reads.convoys()?;
-            let here = convoys.home().to_owned();
-            let mut needing = Vec::new();
-            for record in convoys.every()?.records.into_iter().filter(|record| record.ended.is_none()) {
-                let Some(view) = compose(reads, namespace, &record.name, Some(&record.home))? else { continue };
-                needing.extend(works(&view.object.metadata.name, &home_of(&view, &here), &view.object));
-            }
-            Ok(needing)
-        })
-        .await
+    /// Every live launch at every home: read at the start and after missed changes alone.
+    fn live(&self) -> Result<Vec<ConvoyKey>, String> {
+        let convoys = self.reads.convoys()?;
+        Ok(convoys.every()?.records.into_iter().filter(|record| record.ended.is_none()).map(|record| (record.name, record.home)).collect())
     }
 
     async fn convoy(&self, convoy: &str, convoy_home: &str) -> Result<Option<ConvoyWorksRead>, String> {
@@ -125,18 +101,5 @@ impl ConvoyWorks for EngineConvoyWorks {
 
     async fn standing(&self, convoy: &str, convoy_home: &str) -> Result<ConvoyStanding, String> {
         Ok(self.read(convoy, convoy_home).await?.map_or(ConvoyStanding::Gone, |object| standing(&object)))
-    }
-
-    async fn changes(&self) -> Result<BoxStream<'static, ConvoyTouched>, String> {
-        let changes = self.reads.convoys()?.changes();
-        Ok(futures::stream::unfold(changes, |mut changes| async move {
-            let touched = match changes.recv().await {
-                Ok(ConvoyChange::Changed { name, home }) => ConvoyTouched::Convoy { convoy: name, convoy_home: home },
-                Ok(ConvoyChange::Rescanned) | Err(RecvError::Lagged(_)) => ConvoyTouched::Every,
-                Err(RecvError::Closed) => return None,
-            };
-            Some((touched, changes))
-        })
-        .boxed())
     }
 }

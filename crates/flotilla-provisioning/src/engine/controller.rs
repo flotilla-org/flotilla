@@ -64,7 +64,7 @@ use tracing::{debug, info_span, warn, Instrument};
 
 mod runner;
 
-pub use runner::{Policy, Runner, Trigger};
+pub use runner::{homed_here, Policy, Runner, Trigger};
 
 use super::{
     reads::{judge, Judgement},
@@ -533,6 +533,7 @@ where
 {
     type Done = Done;
     type Wake = LifecycleWake;
+    type Name = String;
 
     fn kind(&self) -> &'static str {
         K::NAME
@@ -540,6 +541,10 @@ where
 
     fn live(&self) -> Result<Vec<String>, String> {
         self.records.live()
+    }
+
+    fn own(&self, identity: &Identity, home: &str) -> Option<String> {
+        homed_here(identity, home)
     }
 
     /// Decides and acts for each touched resource, in a span of its kind.
@@ -701,10 +706,9 @@ where
         let actuator = Arc::clone(&self.actuator);
         let owned = name.to_owned();
         match action {
-            Action::Nothing => return,
+            Action::Nothing => {}
             Action::GiveUp { cause, retryable } => {
                 self.write(runner, name, Step::Attempted(Outcome::Failed { cause, retryable })).await;
-                return;
             }
             Action::Hold => {
                 self.holding.insert(owned.clone());

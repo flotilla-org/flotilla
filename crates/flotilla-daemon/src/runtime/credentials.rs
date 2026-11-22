@@ -14,7 +14,7 @@ use flotilla_credentials::{compose_agent_environment, AgentMaterialRegistry, Cre
 use flotilla_crew::ports::WorkCredentialReconciler;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::attentions::{Attention, Attentions, Sender, Subject};
-use flotilla_resources::{Convoy, RepositoryTrust, Vessel};
+use flotilla_resources::{Convoy, RepositoryTrust, ResourceError, Vessel};
 use flotilla_store::ResourceBackend;
 use tracing::{info, warn};
 
@@ -172,9 +172,35 @@ pub(super) async fn reconcile_credential_refresh_attention_in(
         .map(|open| (open.subject, told(&open.reason)))
         .collect();
     let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?;
-    let convoys =
-        backend.query_declared::<Convoy>(namespace, &flotilla_store::live_convoys_query()).await.map_err(|error| error.to_string())?;
-    let convoys = convoys.items.into_iter().map(|source| (source.object.metadata.name.clone(), source.object)).collect::<BTreeMap<_, _>>();
+    // Only a convoy with a vessel whose environment a credential failed in, or with an attention
+    // open, has one to raise or clear: each is read by its name, and a terminal one is passed over.
+    let failed: BTreeSet<&str> = errors.iter().map(|error| error.environment_ref.as_str()).collect();
+    let mut named: BTreeSet<String> = vessels
+        .items
+        .iter()
+        .filter(|vessel| {
+            vessel
+                .status
+                .as_ref()
+                .and_then(|status| status.environment_ref.as_deref())
+                .is_some_and(|environment| failed.contains(environment))
+        })
+        .map(|vessel| vessel.spec.convoy_ref.clone())
+        .collect();
+    named.extend(open.keys().filter_map(|subject| match subject {
+        Subject::Vessel { convoy, .. } => Some(convoy.clone()),
+        _ => None,
+    }));
+    let mut convoys = BTreeMap::new();
+    for name in named {
+        match backend.using::<Convoy>(namespace).get(&name).await {
+            Ok(convoy) if !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) => {
+                convoys.insert(name, convoy);
+            }
+            Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
     // Every vessel that holds a credential, with its failing ones: why, and whether persistent enough to tell a person.
     let mut held: BTreeMap<(String, String), BTreeMap<String, (String, bool)>> = BTreeMap::new();
     // When each vessel's credentials began failing: the episode its attention tells.

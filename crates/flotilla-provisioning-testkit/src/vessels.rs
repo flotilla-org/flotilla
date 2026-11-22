@@ -52,7 +52,7 @@ impl VesselsFixture {
     }
 
     /// A fixture over `service`'s store and home, reading every home it holds.
-    pub fn over_service(service: &Arc<flotilla_schema_sqlite::stream::Service>) -> Self {
+    pub fn over_service(service: &Arc<Service>) -> Self {
         let homes = Arc::clone(service);
         Self::over_homes(service.home(), service.store(), move || homes.homes())
     }
@@ -111,42 +111,5 @@ impl VesselsFixture {
     /// Poisons the store's lock, so every read through it fails.
     pub fn poison(&self) {
         crate::poison_store(Arc::clone(&self.store));
-    }
-}
-
-/// One home's vessels and checkouts on a decided store of their own, their changes followed from
-/// its log, so a reader can wait on [`VesselRecords::changes`] and the checkouts' changes. The
-/// vessels' readings serve both. Following stops when this is dropped.
-pub struct FollowedVessels {
-    pub fixture: VesselsFixture,
-    pub checkouts: crate::CheckoutFixture,
-    followers: [tokio::task::JoinHandle<()>; 2],
-    _directory: tempfile::TempDir,
-}
-
-impl FollowedVessels {
-    /// Vessels homed at `home`, followed.
-    pub fn at(home: &str) -> Self {
-        let directory = tempfile::tempdir().expect("directory");
-        let registry = flotilla_provisioning::stored::decided_registry().expect("registry");
-        let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), home, registry).expect("store"));
-        let mut fixture = VesselsFixture::over_service(&service);
-        let checkouts = crate::CheckoutFixture::over(home, service.store());
-        fixture.reads = Arc::new(
-            LifecycleReadPort::new(StoreReads::new(service.store()), home.to_owned())
-                .with_vessels(Arc::clone(&fixture.vessels) as Arc<dyn VesselRecords>)
-                .with_checkouts(Arc::clone(&checkouts.checkouts) as _),
-        );
-        let followers = [
-            fixture.vessels.follow(Arc::clone(&service)).expect("follow the vessels"),
-            checkouts.checkouts.follow(service).expect("follow the checkouts"),
-        ];
-        Self { fixture, checkouts, followers, _directory: directory }
-    }
-}
-
-impl Drop for FollowedVessels {
-    fn drop(&mut self) {
-        self.followers.iter().for_each(tokio::task::JoinHandle::abort);
     }
 }

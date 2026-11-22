@@ -816,6 +816,16 @@ impl ConvoyMemory {
         changed.record([name.to_owned()]);
     }
 
+    /// The launches with a crew member's follow-up pending, read from the notes alone.
+    pub fn pending_follow_ups(&self) -> Vec<String> {
+        let notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+        notes
+            .iter()
+            .filter(|(_, notes)| notes.crew.values().flat_map(BTreeMap::values).any(|crew| crew.pending_follow_up.is_some()))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// The notes on launch `name`; empty when none are held.
     pub fn get(&self, name: &str) -> ConvoyNotes {
         self.notes.lock().unwrap_or_else(PoisonError::into_inner).get(name).cloned().unwrap_or_default()

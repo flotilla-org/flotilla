@@ -14,10 +14,13 @@
 //!
 //! The policy decides what to do for the resources a wake touches, and records what its flights
 //! found. The lifecycle kinds' policy is [`super::Controller`]'s; a kind with its own decisions,
-//! such as the Convoy controller, plugs in its own.
+//! such as the Convoy controller, plugs in its own. A policy names what it decides for: a
+//! resource of its kind homed here, or something else a commit names, such as the convoy, at any
+//! home, whose vessels this home requests.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
     future::Future,
     ops::ControlFlow,
     sync::Arc,
@@ -59,39 +62,54 @@ pub trait Policy: Send + 'static {
     type Done: Send + 'static;
     /// A wake from outside the log.
     type Wake: Send + 'static;
+    /// What it decides for: a resource's name, for a policy of a kind homed here.
+    type Name: Clone + Ord + Debug + Send + Sync + 'static;
 
     /// The kind's name, for spans and logs.
     fn kind(&self) -> &'static str;
 
-    /// The resources live here: the start set, read again at a rescan of this home.
-    fn live(&self) -> Result<Vec<String>, String>;
+    /// What it decides for live now: the start set, read again at a rescan of this home.
+    fn live(&self) -> Result<Vec<Self::Name>, String>;
 
-    /// Decides and acts for each touched resource.
-    async fn evaluate(&mut self, runner: &mut Runner<Self::Done>, touched: BTreeMap<String, Trigger>);
+    /// What a commit of `identity`, of the runner's kind, names; `home` is the runner's.
+    fn own(&self, identity: &Identity, home: &str) -> Option<Self::Name>;
+
+    /// What else a change the runner follows names, beyond its own kind's and its dependents.
+    fn touches(&self, _followed: &Followed) -> Vec<Self::Name> {
+        Vec::new()
+    }
+
+    /// Decides and acts for each touched name.
+    async fn evaluate(&mut self, runner: &mut Runner<Self::Done, Self::Name>, touched: BTreeMap<Self::Name, Trigger>);
 
     /// Records what a flight of `name` found; the runner no longer counts it in flight.
-    async fn landed(&mut self, runner: &mut Runner<Self::Done>, name: String, done: Self::Done);
+    async fn landed(&mut self, runner: &mut Runner<Self::Done, Self::Name>, name: Self::Name, done: Self::Done);
 
     /// Acts on a wake from outside the log; `Break` ends the run.
-    async fn woken(&mut self, runner: &mut Runner<Self::Done>, wake: Self::Wake) -> ControlFlow<()>;
+    async fn woken(&mut self, runner: &mut Runner<Self::Done, Self::Name>, wake: Self::Wake) -> ControlFlow<()>;
 }
 
-/// The shared state of one kind's controller at this home.
-pub struct Runner<D> {
+/// What a commit of `identity` names for a policy of resources homed at `home`: their name.
+pub fn homed_here(identity: &Identity, home: &str) -> Option<String> {
+    (identity.home == home).then(|| identity.name.clone())
+}
+
+/// The shared state of one kind's controller at this home, deciding for `N`s.
+pub struct Runner<D, N = String> {
     watch: EngineWatch,
     clock: Arc<dyn Clock>,
     code: KindCode,
     home: String,
     /// Each live resource's dependencies, and the reverse.
-    depends: BTreeMap<String, Vec<Identity>>,
-    dependents: BTreeMap<Identity, BTreeSet<String>>,
-    flights: JoinSet<(String, D)>,
-    in_flight: BTreeSet<String>,
+    depends: BTreeMap<N, Vec<Identity>>,
+    dependents: BTreeMap<Identity, BTreeSet<N>>,
+    flights: JoinSet<(N, D)>,
+    in_flight: BTreeSet<N>,
     /// When each resource is tried again.
-    retries: BTreeMap<String, Timestamp>,
+    retries: BTreeMap<N, Timestamp>,
 }
 
-impl<D: Send + 'static> Runner<D> {
+impl<D: Send + 'static, N: Clone + Ord + Debug + Send + Sync + 'static> Runner<D, N> {
     /// Follows kind `code` homed at `home`, and the `followed` kinds at every home, from now.
     pub fn start(
         code: KindCode,
@@ -129,29 +147,38 @@ impl<D: Send + 'static> Runner<D> {
     }
 
     /// Runs `flight` for `name`; what it finds is handed to [`Policy::landed`].
-    pub fn spawn(&mut self, name: &str, flight: impl Future<Output = D> + Send + 'static) {
+    pub fn spawn<Q: ToOwned<Owned = N> + ?Sized>(&mut self, name: &Q, flight: impl Future<Output = D> + Send + 'static) {
         let owned = name.to_owned();
+        self.in_flight.insert(owned.clone());
         self.flights.spawn(inherit(async move { (owned, flight.await) }));
-        self.in_flight.insert(name.to_owned());
     }
 
     /// Whether a flight of `name` is running.
-    pub fn flying(&self, name: &str) -> bool {
+    pub fn flying<Q: Ord + ?Sized>(&self, name: &Q) -> bool
+    where
+        N: std::borrow::Borrow<Q>,
+    {
         self.in_flight.contains(name)
     }
 
     /// Tries `name` again at `at`, replacing any earlier time.
-    pub fn retry_at(&mut self, name: &str, at: Timestamp) {
+    pub fn retry_at<Q: ToOwned<Owned = N> + ?Sized>(&mut self, name: &Q, at: Timestamp) {
         self.retries.insert(name.to_owned(), at);
     }
 
     /// Takes back `name`'s next try, returning when it was due.
-    pub fn unschedule(&mut self, name: &str) -> Option<Timestamp> {
+    pub fn unschedule<Q: Ord + ?Sized>(&mut self, name: &Q) -> Option<Timestamp>
+    where
+        N: std::borrow::Borrow<Q>,
+    {
         self.retries.remove(name)
     }
 
     /// Records the records `name` depends on now, whose commits touch it.
-    pub fn link(&mut self, name: &str, depends: Vec<Identity>) {
+    pub fn link<Q: Ord + ToOwned<Owned = N> + ?Sized>(&mut self, name: &Q, depends: Vec<Identity>)
+    where
+        N: std::borrow::Borrow<Q>,
+    {
         if self.depends.get(name) == Some(&depends) {
             return;
         }
@@ -163,12 +190,18 @@ impl<D: Send + 'static> Runner<D> {
     }
 
     /// Forgets `name`: what it depends on and its next try.
-    pub fn forget(&mut self, name: &str) {
+    pub fn forget<Q: Ord + ?Sized>(&mut self, name: &Q)
+    where
+        N: std::borrow::Borrow<Q>,
+    {
         self.retries.remove(name);
         self.unlink(name);
     }
 
-    fn unlink(&mut self, name: &str) {
+    fn unlink<Q: Ord + ?Sized>(&mut self, name: &Q)
+    where
+        N: std::borrow::Borrow<Q>,
+    {
         for identity in self.depends.remove(name).unwrap_or_default() {
             if let Some(names) = self.dependents.get_mut(&identity) {
                 names.remove(name);
@@ -182,7 +215,7 @@ impl<D: Send + 'static> Runner<D> {
     /// Runs `policy` until a wake breaks or `wakes` ends, or ends at once if the start set cannot
     /// be read: going on with none would never look at a resource that does not change again,
     /// and would hide the missing read.
-    pub async fn run<P: Policy<Done = D>>(
+    pub async fn run<P: Policy<Done = D, Name = N>>(
         mut self,
         mut policy: P,
         wakes: impl Stream<Item = P::Wake> + Send,
@@ -197,7 +230,7 @@ impl<D: Send + 'static> Runner<D> {
             tokio::select! {
                 () = sleep(retry) => {
                     let now = self.now();
-                    let due: Vec<String> = self.retries.iter().filter(|(_, at)| **at <= now).map(|(name, _)| name.clone()).collect();
+                    let due: Vec<N> = self.retries.iter().filter(|(_, at)| **at <= now).map(|(name, _)| name.clone()).collect();
                     for name in &due {
                         self.retries.remove(name);
                     }
@@ -234,18 +267,22 @@ impl<D: Send + 'static> Runner<D> {
     }
 
     /// The resources a pass's changes touch, and why.
-    fn touched<P: Policy>(&self, followed: Vec<Followed>, policy: &P) -> BTreeMap<String, Trigger> {
+    fn touched<P: Policy<Name = N>>(&self, followed: Vec<Followed>, policy: &P) -> BTreeMap<N, Trigger> {
         let mut touched = BTreeMap::new();
-        let mut touch = |name: &str, trigger: Trigger| {
-            let held = touched.entry(name.to_owned()).or_insert(trigger);
+        let mut touch = |name: &N, trigger: Trigger| {
+            let held = touched.entry(name.clone()).or_insert(trigger);
             *held = (*held).max(trigger);
         };
         for followed in followed {
+            for name in policy.touches(&followed) {
+                touch(&name, Trigger::Dependency);
+            }
             match followed {
-                Followed::Changed(identity) if identity.kind == self.code && identity.home == self.home => {
-                    touch(&identity.name, Trigger::Own)
-                }
                 Followed::Changed(identity) => {
+                    if let Some(name) = (identity.kind == self.code).then(|| policy.own(&identity, &self.home)).flatten() {
+                        touch(&name, Trigger::Own);
+                        continue;
+                    }
                     // A launch (`<of>#<n>`) also touches what depends on `<of>`: its newest launch.
                     let of = Identity { name: super::super::launched(&identity.name).to_owned(), ..identity.clone() };
                     let launch_of = (of != identity).then_some(&of);

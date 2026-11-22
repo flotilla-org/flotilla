@@ -522,6 +522,30 @@ async fn a_held_dirty_landed_checkout_stays_held_across_a_restart() {
     }
 }
 
+// A landed convoy whose checkout is dirty keeps its vessel: the release gate refuses while the
+// checkout's removal waits on a person. The person's ruling archives the checkout, and that
+// checkout's change judges the release again, so the vessel's environment is destroyed.
+#[tokio::test(start_paused = true)]
+async fn a_ruling_on_a_held_checkout_releases_the_landed_convoys_vessel() {
+    let fleet = TestDaemon::builder().vcs("dirty_rate = 1.0").start().await;
+    let name = fleet.dispatch(CrewMix::LongRunner, DUMMY_FULFILMENT_KIND).await;
+    fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
+    let checkout = fleet
+        .wait_row("the convoy's checkout landed and dirty", "checkout_integration", "", |row| {
+            row.get("landed") == Some(&serde_json::Value::Bool(true)) && row.get("clean") == Some(&serde_json::Value::Bool(false))
+        })
+        .await;
+    let launch = text(&checkout, "resource.name").to_owned();
+    fleet.wait_row("its vessel's environment, kept", "environment", "", of_convoy(&name, "Realised")).await;
+    assert_eq!(fleet.counts().environments_destroyed, 0, "the vessel is kept while its checkout is held: {:?}", fleet.counts());
+    fleet.execute(CommandAction::CheckoutArchive { checkout: launch }).await;
+    fleet
+        .wait_row("its vessel's environment destroyed", "environment", "", |row| {
+            !of_convoy(&name, "Realised")(row) && fleet.counts().environments_destroyed == 1
+        })
+        .await;
+}
+
 // Fleet health counts a capped host's free vessel slots from the vessels the engine holds there:
 // `flotilla fleet check`, `fleet spread` and the plain `flotilla fleet` dashboard all ask it.
 #[tokio::test(start_paused = true)]

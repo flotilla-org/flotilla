@@ -11,8 +11,13 @@
 //! - at the time its last pass asked to look again, and after a failed pass at a backoff that
 //!   doubles from a second to a minute.
 //!
+//! Each pass's span names its cause: the first wake since its last pass began, a watch by its
+//! type's name.
+//!
 //! A convoy is read by its key for each pass, and at most one pass of it runs at a time: a wake
-//! during a pass passes it once more when it ends.
+//! during a pass passes it once more when it ends. At most [`PASSES`] passes run at once; the
+//! rest wait their turn, in name order, so a burst of convoys does not crowd the store out from
+//! under message delivery.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,9 +29,10 @@ use std::{
 use async_trait::async_trait;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_engine_convoys::convoys::Convoys;
-use flotilla_provisioning::engine::controller::{Policy, Runner, Trigger};
+use flotilla_provisioning::engine::controller::{homed_here, Policy, Runner, Trigger};
 use flotilla_resources::{Convoy, ResourceError};
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Identity, Timestamp};
+use flotilla_store::load_metrics::{attributed, CallerReads};
 use flotilla_store::{
     controller::{Reconciler, SecondaryWatch, WorkQueueSender},
     ResourceBackend, TypedResolver,
@@ -36,11 +42,14 @@ use tracing::{info_span, warn, Instrument};
 
 /// What reaches the Convoy controller from outside the log.
 pub(super) enum ConvoyWake {
-    /// A watch named a convoy.
-    Named(String),
-    /// A watch asked for every convoy.
-    Every,
+    /// A watch, named here, named a convoy.
+    Named(String, &'static str),
+    /// A watch, named here, asked for every convoy.
+    Every(&'static str),
 }
+
+/// How many convoy passes run at once.
+const PASSES: usize = 4;
 
 /// What one pass found: when to look again without a change, or the pass's error; none when the
 /// convoy is no longer held.
@@ -54,17 +63,34 @@ pub(super) struct ConvoyPolicy {
     failures: BTreeMap<String, u32>,
     /// The convoys woken while a pass of them ran: passed once more when it ends.
     again: BTreeSet<String>,
+    /// The convoys woken while [`PASSES`] passes ran: passed as passes end.
+    waiting: BTreeSet<String>,
+    /// How many passes run.
+    running: usize,
+    /// Why each convoy is to be passed: the first cause since its last pass began.
+    causes: BTreeMap<String, &'static str>,
 }
 
 impl ConvoyPolicy {
     pub(super) fn new(reconciler: ConvoyReconciler, convoys: TypedResolver<Convoy>, home: Arc<Convoys>) -> Self {
-        Self { reconciler: Arc::new(reconciler), convoys, home, failures: BTreeMap::new(), again: BTreeSet::new() }
+        Self {
+            reconciler: Arc::new(reconciler),
+            convoys,
+            home,
+            failures: BTreeMap::new(),
+            again: BTreeSet::new(),
+            waiting: BTreeSet::new(),
+            running: 0,
+            causes: BTreeMap::new(),
+        }
     }
 
-    fn pass(&self, runner: &mut Runner<Pass>, name: &str) {
+    fn pass(&mut self, runner: &mut Runner<Pass>, name: &str) {
+        self.running += 1;
         let (reconciler, convoys, owned) = (Arc::clone(&self.reconciler), self.convoys.clone(), name.to_owned());
         let clock = Arc::clone(runner.clock());
-        let span = info_span!("engine_controller.pass", kind = "Convoy", name);
+        let cause = self.causes.remove(name).unwrap_or("unknown");
+        let span = info_span!("engine_controller.pass", kind = "Convoy", name, cause);
         runner.spawn(
             name,
             async move {
@@ -81,6 +107,57 @@ impl ConvoyPolicy {
     }
 }
 
+impl ConvoyPolicy {
+    /// Passes each of `names` now, once its running pass ends, or when a pass is free.
+    fn wake(&mut self, runner: &mut Runner<Pass>, names: impl IntoIterator<Item = String>) {
+        for name in names {
+            if runner.flying(&name) {
+                self.again.insert(name);
+            } else if self.running >= PASSES {
+                self.waiting.insert(name);
+            } else {
+                self.waiting.remove(&name);
+                runner.unschedule(&name);
+                self.pass(runner, &name);
+            }
+        }
+    }
+}
+
+/// A runner trigger as a pass's cause.
+fn trigger_cause(trigger: Trigger) -> &'static str {
+    match trigger {
+        Trigger::Held => "held",
+        Trigger::Own => "own commit",
+        Trigger::Dependency => "dependency",
+        Trigger::Retry => "retry",
+        Trigger::Start => "start",
+        Trigger::Recheck => "recheck",
+    }
+}
+
+/// A watch's type name without its paths: `CapacityWake<Vessel>`.
+fn short(name: &'static str) -> &'static str {
+    let mut out = String::new();
+    let mut ident = String::new();
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ':' && chars.peek() == Some(&':') {
+            chars.next();
+            ident.clear();
+        } else if c.is_alphanumeric() || c == '_' {
+            ident.push(c);
+        } else {
+            out.push_str(&ident);
+            ident.clear();
+            out.push(c);
+        }
+    }
+    out.push_str(&ident);
+    // A handful of watches, named once each as the controller starts.
+    Box::leak(out.into_boxed_str())
+}
+
 /// The wait before passing a convoy again after `failures` failed passes in a row.
 fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1).saturating_mul(1_u32 << failures.saturating_sub(1).min(6)).min(Duration::from_secs(60))
@@ -95,6 +172,7 @@ fn later(runner: &Runner<Pass>, after: Duration) -> Timestamp {
 impl Policy for ConvoyPolicy {
     type Done = Pass;
     type Wake = ConvoyWake;
+    type Name = String;
 
     fn kind(&self) -> &'static str {
         "Convoy"
@@ -104,18 +182,19 @@ impl Policy for ConvoyPolicy {
         Ok(self.home.open_launches())
     }
 
+    fn own(&self, identity: &Identity, home: &str) -> Option<String> {
+        homed_here(identity, home)
+    }
+
     async fn evaluate(&mut self, runner: &mut Runner<Pass>, touched: BTreeMap<String, Trigger>) {
-        for name in touched.into_keys() {
-            if runner.flying(&name) {
-                self.again.insert(name);
-            } else {
-                runner.unschedule(&name);
-                self.pass(runner, &name);
-            }
+        for (name, trigger) in &touched {
+            self.causes.entry(name.clone()).or_insert(trigger_cause(*trigger));
         }
+        self.wake(runner, touched.into_keys());
     }
 
     async fn landed(&mut self, runner: &mut Runner<Pass>, name: String, pass: Pass) {
+        self.running -= 1;
         match pass {
             Ok(None) => {
                 self.failures.remove(&name);
@@ -137,57 +216,66 @@ impl Policy for ConvoyPolicy {
             }
         }
         if self.again.remove(&name) {
-            self.evaluate(runner, BTreeMap::from([(name, Trigger::Own)])).await;
+            self.waiting.insert(name);
+        }
+        // The next waiting convoy not already in flight takes the freed pass.
+        if let Some(next) = self.waiting.iter().find(|waiting| !runner.flying(waiting.as_str())).cloned() {
+            self.wake(runner, [next]);
         }
     }
 
     async fn woken(&mut self, runner: &mut Runner<Pass>, wake: ConvoyWake) -> ControlFlow<()> {
-        let touched = match wake {
-            ConvoyWake::Named(name) => vec![name],
-            ConvoyWake::Every => self.home.open_launches(),
+        let (touched, cause) = match wake {
+            ConvoyWake::Named(name, watch) => (vec![name], watch),
+            ConvoyWake::Every(watch) => (self.home.open_launches(), watch),
         };
-        self.evaluate(runner, touched.into_iter().map(|name| (name, Trigger::Own)).collect()).await;
+        for name in &touched {
+            self.causes.entry(name.clone()).or_insert(cause);
+        }
+        self.wake(runner, touched);
         ControlFlow::Continue(())
     }
 }
 
-/// The wakes `watches` send, each watch run again a second after it ends.
+/// The wakes `watches` send, each named by its watch, each watch run again a second after it
+/// ends.
 pub(super) fn wakes(
     watches: Vec<Box<dyn SecondaryWatch<Primary = Convoy>>>,
     backend: ResourceBackend,
     namespace: String,
+    reads: Arc<CallerReads>,
 ) -> BoxStream<'static, ConvoyWake> {
-    let (sender, names) = WorkQueueSender::channel();
-    let mut running = Running(Vec::new());
-    for watch in watches {
-        let (backend, namespace, sender) = (backend.clone(), namespace.clone(), sender.clone());
-        running.0.push(tokio::spawn(async move {
+    let streams = watches.into_iter().map(|watch| {
+        let source = short(watch.name());
+        let (sender, names) = WorkQueueSender::channel();
+        let (backend, namespace, restart) = (backend.clone(), namespace.clone(), sender.clone());
+        // A watch's reads count for the controller it wakes.
+        let running = Running(vec![tokio::spawn(attributed(Arc::clone(&reads), async move {
             loop {
-                if let Err(error) = watch.clone_box().spawn(backend.clone(), namespace.clone(), sender.clone()).await {
-                    warn!(%error, "a convoy wake watch ended; it starts again");
+                if let Err(error) = watch.clone_box().spawn(backend.clone(), namespace.clone(), restart.clone()).await {
+                    warn!(%error, watch = source, "a convoy wake watch ended; it starts again");
                 }
                 // The changes it missed meanwhile ask for every convoy.
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                sender.send_every();
+                restart.send_every();
             }
-        }));
-    }
-    let taker = sender.clone();
-    // The watches run while the stream is held.
-    let named =
-        futures::stream::unfold(
-            (names, running),
-            |(mut names, running)| async move { names.recv().await.map(|name| (name, (names, running))) },
-        )
+        }))]);
+        let taker = sender.clone();
+        // The watch runs while the stream is held.
+        let named = futures::stream::unfold((names, running), |(mut names, running)| async move {
+            names.recv().await.map(|name| (name, (names, running)))
+        })
         .map(move |name| {
             taker.take(&name);
-            ConvoyWake::Named(name)
+            ConvoyWake::Named(name, source)
         });
-    let every = futures::stream::unfold(sender, |sender| async move {
-        sender.every_requested().await;
-        Some((ConvoyWake::Every, sender))
+        let every = futures::stream::unfold(sender, move |sender| async move {
+            sender.every_requested().await;
+            Some((ConvoyWake::Every(source), sender))
+        });
+        futures::stream::select(named, every).boxed()
     });
-    futures::stream::select(named, every).boxed()
+    futures::stream::select_all(streams).boxed()
 }
 
 /// The wake watches' tasks, stopped with the stream that holds them.

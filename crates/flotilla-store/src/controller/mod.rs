@@ -184,6 +184,11 @@ pub trait SecondaryWatch: Send + Sync {
 
     fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>>;
 
+    /// What the watch is, as a controller tells which watch woke a resource: its type's name.
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn spawn(
         self: Box<Self>,
         backend: ResourceBackend,

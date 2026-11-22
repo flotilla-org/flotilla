@@ -198,6 +198,9 @@ impl ConvoyViews {
     }
 }
 
+/// What was written to the log since a position, and each home's sequence it was read through.
+type WrittenThrough = (Written, BTreeMap<String, u64>);
+
 /// What was written to the log since a position, by kind.
 struct Written {
     convoys: BTreeSet<(String, String)>,
@@ -209,7 +212,7 @@ impl LogCursors {
     /// The launches, Vessel launches and sessions written since each home's sequence in `at`, and
     /// each home's sequence all three were read through; `Err` holds why the log no longer holds
     /// them.
-    fn written_since(&self, at: &BTreeMap<String, u64>) -> Result<Result<(Written, BTreeMap<String, u64>), String>, String> {
+    fn written_since(&self, at: &BTreeMap<String, u64>) -> Result<Result<WrittenThrough, String>, String> {
         let mut throughs = Vec::with_capacity(3);
         let mut written = Vec::with_capacity(3);
         for since in [self.convoys.since(at)?, self.vessels.since(at)?, self.terminals.since(at)?] {

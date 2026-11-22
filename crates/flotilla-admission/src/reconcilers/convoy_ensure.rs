@@ -263,7 +263,7 @@ impl EnsureReconciler {
         let attentions = self.resource_backend.attentions();
         // Every host reads the role from every home's generations and its admitting home's values;
         // an end not folded in yet reads as folded.
-        let newest = newest_generation(&self.resource_backend, namespace, &ensure, true).await?;
+        let newest = newest_generation(&self.resource_backend, namespace, ensure, true).await?;
         let mut values = self.standing_roles.get(&ensure.metadata.name).await?.unwrap_or_default();
         if let Some(end) = newest.as_ref().map(generation_end).transpose()?.flatten() {
             values = standing::fold(&values, &end);
