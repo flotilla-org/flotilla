@@ -441,6 +441,16 @@ impl TerminalRecords for EngineTerminals {
         self.records(&format!("of vessel {vessel}"), |read| indexed(read, &TerminalSessionRequest::by_holder(&Holder::vessel(vessel))))
     }
 
+    fn of_vessels(&self, vessels: &[String]) -> Result<Vec<TerminalRecord>, String> {
+        self.records(&format!("of {} vessels", vessels.len()), |read| {
+            let mut views = Vec::new();
+            for vessel in vessels {
+                views.extend(indexed(read, &TerminalSessionRequest::by_holder(&Holder::vessel(vessel)))?);
+            }
+            Ok(views)
+        })
+    }
+
     fn of_environment(&self, environment: &str, home: &str) -> Result<Vec<TerminalRecord>, String> {
         self.records(&format!("in environment {environment}"), |read| {
             indexed(read, &TerminalSessionRequest::by_environment(&Ref::new(environment.to_owned(), home)))

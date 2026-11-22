@@ -54,11 +54,17 @@ pub(crate) struct Meter {
     terminals: AtomicU64,
     /// Convoy listings, `at` a home or at `every` home.
     convoy_listings: AtomicU64,
+    /// Reads of the sessions held for vessels, one vessel or several at once.
+    held_session_reads: AtomicU64,
 }
 
 impl Meter {
     pub(crate) fn convoy_listings(&self) -> u64 {
         self.convoy_listings.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn held_session_reads(&self) -> u64 {
+        self.held_session_reads.load(Ordering::Relaxed)
     }
 
     pub(crate) fn gets(&self) -> KeyedGets {
@@ -184,9 +190,9 @@ impl VesselRecords for CountedVessels {
         self.port().newest(convoy, convoy_home, launch_of, home)
     }
 
-    fn newest_at_each_home(&self, convoy: &str, convoy_home: &str, launch_of: &str) -> Result<Vec<VesselRecord>, String> {
+    fn newest_of_each(&self, convoy: &str, launches: &[(String, String)]) -> Result<Vec<VesselRecord>, String> {
         Meter::count(&self.meter.vessels);
-        self.port().newest_at_each_home(convoy, convoy_home, launch_of)
+        self.port().newest_of_each(convoy, launches)
     }
 
     fn at(&self, home: &str) -> Result<Vec<VesselRecord>, String> {
@@ -410,7 +416,13 @@ impl TerminalRecords for CountedTerminals {
     }
 
     fn of_vessel(&self, vessel: &str) -> Result<Vec<TerminalRecord>, String> {
+        Meter::count(&self.meter.held_session_reads);
         self.port().of_vessel(vessel)
+    }
+
+    fn of_vessels(&self, vessels: &[String]) -> Result<Vec<TerminalRecord>, String> {
+        Meter::count(&self.meter.held_session_reads);
+        self.port().of_vessels(vessels)
     }
 
     fn of_environment(&self, environment: &str, home: &str) -> Result<Vec<TerminalRecord>, String> {

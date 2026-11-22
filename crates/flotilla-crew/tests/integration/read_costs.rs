@@ -14,7 +14,7 @@ use flotilla_crew::{
     crew_capabilities::{refresh_cards, CapabilityCardTracker, CardScope},
     reconcilers::vessel::ConvoyVesselWake,
 };
-use flotilla_engine_convoys_testkit::{convoy, single_agent, EngineConvoysHome, KeyedGets};
+use flotilla_engine_convoys_testkit::{agent, convoy, single_agent, EngineConvoysHome, KeyedGets};
 use flotilla_provisioning::engine::checkouts::CheckoutConvoyWake;
 use flotilla_provisioning_testkit::{EngineFixture, OtherHome, TerminalsFixture};
 use flotilla_resources::{
@@ -25,7 +25,7 @@ use flotilla_resources::{
     terminal_records::TerminalLaunchFacts,
     vessel_records::{environment_vessels, EnvironmentVessel},
     Artifact, ArtifactSpec, CheckoutSpec, Convoy, ConvoySpec, EnvironmentSpec, HostDirectEnvironmentSpec, ObservedCheckoutSpec,
-    RepositoryKey, ResourceError, ResourceObject, SystemClock,
+    RepositoryKey, ResourceError, ResourceObject, SystemClock, VesselRequirement,
 };
 use flotilla_store::{
     controller::{ControllerLoop, ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
@@ -995,4 +995,36 @@ async fn ended_work_leaves_the_views_at_any_size() {
         let none = || HeldWork { joins: (0, 0), sessions: 0, vessels: 0 };
         assert_eq!((small, large), (none(), none()), "nothing ended is held, watched: {watched}");
     }
+}
+
+// Behaviour: a convoy is composed with one read of its works' newest launches and one of their
+// sessions, however many works it has.
+#[tokio::test]
+async fn a_convoy_is_composed_with_one_read_of_its_works_and_one_of_their_sessions() {
+    let store = OtherHome::open("home");
+    let engine = EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
+    let host_direct = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+        ..Default::default()
+    };
+    engine.environments.request("env", &host_direct, None);
+    let works = ["work", "review", "docs"];
+    let mut status = single_agent("coder");
+    status.workflow_snapshot.as_mut().expect("a frozen workflow").vessels =
+        works.iter().map(|work| VesselRequirement::builder().name((*work).to_owned()).crew(vec![agent("coder")]).build()).collect();
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
+    let launch = convoys.launch(convoy(NAMESPACE, "three-works", spec, status)).await;
+    for work in works {
+        let vessel = engine.vessels.request(&launch, work, "host");
+        let session = engine.terminals.request(&TerminalsFixture::agent(&vessel, "coder", "env"));
+        engine.terminals.ready(&session, &format!("{session}-runtime"), &TerminalLaunchFacts::default());
+    }
+
+    let before = (convoys.keyed_gets(), convoys.held_session_reads());
+    backend.clone().using::<Convoy>(NAMESPACE).get(&launch).await.expect("the convoy's view");
+    let gets = convoys.keyed_gets() - before.0;
+    assert_eq!(gets.vessels, 1, "the three works' newest launches are read together: {gets:?}");
+    assert_eq!(convoys.held_session_reads() - before.1, 1, "the three launches' sessions are read together");
 }

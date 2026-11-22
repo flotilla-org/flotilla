@@ -68,6 +68,12 @@ impl EngineConvoysHome {
         self.meter.convoy_listings()
     }
 
+    /// The reads of vessels' held sessions made through [`Self::reads`] so far, one vessel or
+    /// several at once, for read-cost tests.
+    pub fn held_session_reads(&self) -> u64 {
+        self.meter.held_session_reads()
+    }
+
     /// The lifecycle reads the views compose with, with this home's convoys added.
     pub fn reads(&self) -> &Arc<dyn LifecycleReads> {
         &self.reads

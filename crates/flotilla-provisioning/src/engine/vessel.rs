@@ -467,20 +467,22 @@ impl VesselRecords for EngineVessels {
         Ok(records)
     }
 
-    fn newest_at_each_home(&self, convoy: &str, convoy_home: &str, launch_of: &str) -> Result<Vec<VesselRecord>, String> {
+    fn newest_of_each(&self, convoy: &str, launches: &[(String, String)]) -> Result<Vec<VesselRecord>, String> {
         let homes = (self.homes)();
-        let query = VesselSpec::by_launch(&ConvoyId::new(convoy, convoy_home), &launch_of.to_owned());
         self.reads
             .read(|read| {
                 let mut records = Vec::new();
-                for home in &homes {
-                    if let Some((id, _)) = read.integer_index_keys_before(&query, home, i64::MAX, 1)?.first() {
-                        records.extend(view::<VesselKind>(read, *id)?.map(record));
+                for (convoy_home, launch_of) in launches {
+                    let query = VesselSpec::by_launch(&ConvoyId::new(convoy, convoy_home), launch_of);
+                    for home in &homes {
+                        if let Some((id, _)) = read.integer_index_keys_before(&query, home, i64::MAX, 1)?.first() {
+                            records.extend(view::<VesselKind>(read, *id)?.map(record));
+                        }
                     }
                 }
                 Ok(records)
             })
-            .map_err(|error| format!("engine Vessel {launch_of} of convoy {convoy}@{convoy_home} at each home: {error}"))
+            .map_err(|error| format!("engine Vessels of convoy {convoy} at each home: {error}"))
     }
 
     fn newest(&self, convoy: &str, convoy_home: &str, launch_of: &str, home: Option<&str>) -> Result<Option<VesselRecord>, String> {

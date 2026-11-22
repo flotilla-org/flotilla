@@ -69,26 +69,35 @@ pub fn compose_listing(reads: &dyn LifecycleReads, namespace: &str, listing: Con
         by_name.entry(record.name.as_str()).or_default().push(record);
     }
     for (name, records) in by_name {
-        // Each work's newest launch at each home, read by key: only the newest is joined.
-        let mut launches = Vec::new();
+        // Each work's newest launch at each home, read by key in one read: only the newest is joined.
         let homes: BTreeSet<&str> = records.iter().map(|record| record.home.as_str()).collect();
         let works: BTreeSet<&str> =
             records.iter().flat_map(|record| record.admission.workflow_snapshot.vessels.iter().map(|work| work.name.as_str())).collect();
-        for home in homes {
-            for work in &works {
-                let launch_of = crate::vessel_resource_name(crate::convoy::launch_of(name), work);
-                launches.extend(vessels.newest_at_each_home(name, home, &launch_of)?);
-            }
-        }
-        let mut sessions = BTreeMap::new();
+        let wanted: Vec<(String, String)> = homes
+            .iter()
+            .flat_map(|home| works.iter().map(|work| (home.to_string(), crate::vessel_resource_name(crate::convoy::launch_of(name), work))))
+            .collect();
+        let launches = vessels.newest_of_each(name, &wanted)?;
+        let mut joined_vessels = BTreeSet::new();
         for record in &records {
             for work in &record.admission.workflow_snapshot.vessels {
                 let newest = launches
                     .iter()
                     .filter(|vessel| vessel.convoy_home == record.home && vessel.work() == work.name)
                     .max_by_key(|vessel| (vessel.requested_at, vessel.launch_number()));
-                if let Some(vessel) = newest.filter(|vessel| !sessions.contains_key(&vessel.name)) {
-                    sessions.insert(vessel.name.clone(), terminals.of_vessel(&vessel.name)?);
+                if let Some(vessel) = newest {
+                    joined_vessels.insert(vessel.name.clone());
+                }
+            }
+        }
+        // The joined launches' sessions, in one read.
+        let joined_vessels: Vec<String> = joined_vessels.into_iter().collect();
+        let mut sessions: BTreeMap<String, Vec<TerminalRecord>> =
+            joined_vessels.iter().map(|vessel| (vessel.clone(), Vec::new())).collect();
+        if !joined_vessels.is_empty() {
+            for session in terminals.of_vessels(&joined_vessels)? {
+                if let Some(held) = session.vessel.as_ref().and_then(|vessel| sessions.get_mut(vessel)) {
+                    held.push(session);
                 }
             }
         }
