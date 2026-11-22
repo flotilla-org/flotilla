@@ -184,6 +184,11 @@ impl VesselRecords for CountedVessels {
         self.port().newest(convoy, convoy_home, launch_of, home)
     }
 
+    fn newest_at_each_home(&self, convoy: &str, convoy_home: &str, launch_of: &str) -> Result<Vec<VesselRecord>, String> {
+        Meter::count(&self.meter.vessels);
+        self.port().newest_at_each_home(convoy, convoy_home, launch_of)
+    }
+
     fn at(&self, home: &str) -> Result<Vec<VesselRecord>, String> {
         self.port().at(home)
     }

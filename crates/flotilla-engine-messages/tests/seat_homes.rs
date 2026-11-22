@@ -186,6 +186,11 @@ impl VesselRecords for Counted {
         self.reads.vessels()?.newest(convoy, convoy_home, launch_of, home)
     }
 
+    fn newest_at_each_home(&self, convoy: &str, convoy_home: &str, launch_of: &str) -> Result<Vec<VesselRecord>, String> {
+        self.newest.fetch_add(1, Ordering::Relaxed);
+        self.reads.vessels()?.newest_at_each_home(convoy, convoy_home, launch_of)
+    }
+
     fn at(&self, home: &str) -> Result<Vec<VesselRecord>, String> {
         self.whole.fetch_add(1, Ordering::Relaxed);
         self.reads.vessels()?.at(home)

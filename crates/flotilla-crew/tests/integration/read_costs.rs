@@ -268,8 +268,8 @@ async fn a_checkout_queues_only_its_holders_convoy() {
     assert_eq!(large_read, small_read, "the cost does not grow with the other convoys");
     assert_eq!(
         small_gets,
-        KeyedGets { convoys: 2, ..KeyedGets::default() },
-        "the holder's view is composed from its record, read again for its works' launches"
+        KeyedGets { vessels: 1, convoys: 1, ..KeyedGets::default() },
+        "the holder's view is composed from its record and its work's newest launch, each read by key"
     );
     assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
 }
@@ -396,13 +396,13 @@ async fn an_environments_cards_are_refreshed_without_the_others() {
         "only the shared environment's two launches are read through its index, and again as their convoys are composed"
     );
     assert_eq!(large_terminals, small_terminals, "the cost does not grow with the other environments' sessions");
-    assert_eq!(small_vessels, 2, "each card's vessel is read by key; each convoy composed reads its work's launches through their index");
+    assert_eq!(small_vessels, 0, "each card's vessel, and each composed convoy's work's newest launch, is read by key");
     assert_eq!(large_vessels, small_vessels, "the vessel launches read do not grow with the other convoys");
     assert_eq!(
         small_gets,
-        KeyedGets { vessels: 2, convoys: 4, environments: 2, terminals: 2 },
+        KeyedGets { vessels: 4, convoys: 2, environments: 2, terminals: 2 },
         "each card gets its session's newest launch, its vessel and its environment once; its convoy's view is composed from its \
-         record, read again for its works' launches"
+         record and its work's newest launch, each read by key"
     );
     assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
 }
@@ -419,16 +419,13 @@ async fn a_convoys_cards_are_refreshed_without_the_others() {
         "only the convoy's one session launch is read through its vessel's index, by the card and by its convoy's composition"
     );
     assert_eq!(large_terminals, small_terminals, "the cost does not grow with the other convoys' sessions");
-    assert_eq!(
-        small_vessels, 2,
-        "only the convoy's one vessel launch is read through its work's launch index, by the card and by its composition"
-    );
+    assert_eq!(small_vessels, 1, "only the convoy's one vessel launch is read through its work's launch index, by the card");
     assert_eq!(large_vessels, small_vessels, "the vessel launches read do not grow with the other convoys");
     assert_eq!(
         small_gets,
-        KeyedGets { vessels: 0, convoys: 3, environments: 1, terminals: 1 },
-        "the convoy is got once for its works and twice as its view is composed; the card gets its session's newest launch and \
-         its environment once, and reuses the vessel its index read"
+        KeyedGets { vessels: 1, convoys: 2, environments: 1, terminals: 1 },
+        "the convoy is got once for its works and once as its view is composed, with its work's newest launch by key; the card \
+         gets its session's newest launch and its environment once, and reuses the vessel its index read"
     );
     assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
 }
@@ -574,12 +571,12 @@ async fn a_controller_pass_counts_its_reads_by_kind_and_shape() {
         let store = pass.reads.get("Convoy").copied().unwrap_or_default();
         assert_eq!(
             (store.keyed, store.index, store.whole_kind),
-            (2 * n, 0, 0),
-            "the port composes each convoy got from its record, read again for its works' launches: {pass:#?}"
+            (n, 0, 0),
+            "the port composes each convoy got from its record, read once: {pass:#?}"
         );
         assert_eq!(store.converted, n, "each convoy got is converted once: {pass:#?}");
         let vessels = pass.reads.get("Vessel").copied().unwrap_or_default();
-        assert_eq!((vessels.keyed, vessels.index, vessels.whole_kind), (0, n, 0), "each work's launches by their index: {pass:#?}");
+        assert_eq!((vessels.keyed, vessels.index, vessels.whole_kind), (0, n, 0), "each work's newest launch through its index: {pass:#?}");
         let watch = pass.watch_reads.get("Convoy port").copied().unwrap_or_default();
         assert!(watch.whole_kind > 0, "the watch lists the kind: {pass:#?}");
         assert_eq!((watch.keyed, watch.rows), (0, watch.whole_kind * n), "each listing returns every convoy: {pass:#?}");
@@ -794,7 +791,9 @@ async fn a_change_is_read_once_for_both_views() {
     let exited = listed.items.iter().find(|session| session.metadata.name == crewed.target.1).expect("the target's session");
     assert!(exited.status.as_ref().is_some_and(|status| status.stopped_at.is_some()), "the views show the change: {exited:?}");
     let gets = crewed.convoys.keyed_gets() - before;
-    assert_eq!((gets.terminals, gets.vessels), (1, 0), "the change is read once, its vessel not at all: {gets:?}");
+    // The convoy listing composes each of the five convoys afresh, each with its work's newest
+    // launch read by key; the session view reads the changed launch once.
+    assert_eq!((gets.terminals, gets.vessels), (1, 5), "the change is read once, each convoy's vessel by key: {gets:?}");
 }
 
 // Behaviour: the held joins hold live work, not history. Once half the convoys end and their

@@ -69,10 +69,28 @@ pub fn compose_listing(reads: &dyn LifecycleReads, namespace: &str, listing: Con
         by_name.entry(record.name.as_str()).or_default().push(record);
     }
     for (name, records) in by_name {
-        let launches = vessels.of_convoy(name)?;
+        // Each work's newest launch at each home, read by key: only the newest is joined.
+        let mut launches = Vec::new();
+        let homes: BTreeSet<&str> = records.iter().map(|record| record.home.as_str()).collect();
+        let works: BTreeSet<&str> =
+            records.iter().flat_map(|record| record.admission.workflow_snapshot.vessels.iter().map(|work| work.name.as_str())).collect();
+        for home in homes {
+            for work in &works {
+                let launch_of = crate::vessel_resource_name(crate::convoy::launch_of(name), work);
+                launches.extend(vessels.newest_at_each_home(name, home, &launch_of)?);
+            }
+        }
         let mut sessions = BTreeMap::new();
-        for launch in &launches {
-            sessions.insert(launch.name.clone(), terminals.of_vessel(&launch.name)?);
+        for record in &records {
+            for work in &record.admission.workflow_snapshot.vessels {
+                let newest = launches
+                    .iter()
+                    .filter(|vessel| vessel.convoy_home == record.home && vessel.work() == work.name)
+                    .max_by_key(|vessel| (vessel.requested_at, vessel.launch_number()));
+                if let Some(vessel) = newest.filter(|vessel| !sessions.contains_key(&vessel.name)) {
+                    sessions.insert(vessel.name.clone(), terminals.of_vessel(&vessel.name)?);
+                }
+            }
         }
         composed.extend(records.into_iter().map(|record| {
             let notes = (record.home == here).then(|| convoys.memory().get(&record.name));

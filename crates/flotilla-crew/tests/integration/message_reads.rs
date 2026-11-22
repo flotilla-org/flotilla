@@ -290,8 +290,9 @@ async fn holders_read_beside_ended(ended: usize) -> Cost {
 #[tokio::test]
 async fn role_holders_read_only_this_homes_live_launches() {
     let cost = assert_flat_reads([0, 32], holders_read_beside_ended).await;
-    // The running launch, then its vessel's sessions when its seat is read.
-    assert_eq!(cost.terminal_launches, 2, "only the running launch is read: {cost:#?}");
+    // The running launch; then its vessel's sessions, once when its seat is read and once when
+    // its convoy is composed on the read by name (no held view composes it ahead).
+    assert_eq!(cost.terminal_launches, 3, "only the running launch and its vessel's sessions are read: {cost:#?}");
 }
 
 /// What raising a credential refresh about the crew's vessel read, with `others` other convoys'
