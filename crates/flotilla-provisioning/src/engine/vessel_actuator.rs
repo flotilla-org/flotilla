@@ -9,9 +9,8 @@
 //! holding to be realised spends no try.
 //!
 //! Once realised, its plan seats its crews, and their terminal sessions are its holdings: a
-//! session's commit that moves its lifecycle (requested, running, ended, launched again) observes
-//! it again, which seats the next crew or breaks a launch whose crew cannot be seated. A commit
-//! that leaves every holding where the last plan found it, such as a session's turn, plans nothing.
+//! session's commit observes it again, which seats the next crew or breaks a launch whose crew
+//! cannot be seated.
 //!
 //! The launch's holder is its convoy, read by the vessel requester, which releases the launch;
 //! what it holds ends with it through their own holders. Nothing is torn down here.
@@ -21,22 +20,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_resources::vessel_planning::{Held, HeldKind, VesselPlan, VesselPlanner};
 use flotilla_schema::{Identity, Kind, KindCode};
-use flotilla_schema_sqlite::{Read, ResourceId, StoreError};
+use flotilla_schema_sqlite::{Read, StoreError};
 use flotilla_state_machines::{
     machines::{
-        lifecycle::{Lifecycle, LifecycleKind},
+        lifecycle::Lifecycle,
         vessel::{VesselKind, VesselSpec},
     },
     Cause, CauseCategory, Resource,
 };
 
-use super::{
-    controller::{Actuator, Backing, Holding, Holdings, Mark, ProviderFailure, Usability},
-    launched,
-};
-use crate::stored::{
-    checkout::CheckoutKind, clone::CloneKind, environment::EnvironmentKind, terminal_session::TerminalSessionKind, Launches,
-};
+use super::controller::{Actuator, Backing, Holding, Holdings, ProviderFailure, Usability};
+use crate::stored::{checkout::CheckoutKind, clone::CloneKind, environment::EnvironmentKind, terminal_session::TerminalSessionKind};
 
 const ENVIRONMENT: KindCode = <Resource<Lifecycle<EnvironmentKind>> as Kind>::CODE;
 const CLONE: KindCode = <Resource<Lifecycle<CloneKind>> as Kind>::CODE;
@@ -67,42 +61,6 @@ fn usability(held: &Held) -> Usability {
         HeldKind::Terminal => TERMINAL_SESSION,
     };
     Usability { fact: Identity { kind, name: held.launch.clone(), home: held.home.clone() }, usable: held.ready }
-}
-
-/// Where resource `name` at `home` stands, read by key.
-fn keyed_mark<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<Mark>, StoreError>
-where
-    K: LifecycleKind,
-    Resource<Lifecycle<K>>: Kind,
-{
-    match read.resolve(Resource::<Lifecycle<K>>::CODE, name, home)? {
-        Some(id) => loaded_mark::<K>(read, id),
-        None => Ok(None),
-    }
-}
-
-/// Where held record `name` stands: a launch (`<of>#<n>`) as itself, a name held across its
-/// launches, such as a crew session, as its newest launch at `home`.
-fn launch_mark<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<Mark>, StoreError>
-where
-    K: Launches,
-    Resource<Lifecycle<K>>: Kind,
-{
-    if launched(name) != name {
-        return keyed_mark::<K>(read, name, home);
-    }
-    match read.integer_index_keys_before(&K::by_launch(name), home, i64::MAX, 1)?.first() {
-        Some((id, _)) => loaded_mark::<K>(read, *id),
-        None => Ok(None),
-    }
-}
-
-fn loaded_mark<K>(read: &mut Read<'_>, id: ResourceId) -> Result<Option<Mark>, StoreError>
-where
-    K: LifecycleKind,
-    Resource<Lifecycle<K>>: Kind,
-{
-    Ok(read.load::<Resource<Lifecycle<K>>>(id)?.map(|loaded| Mark { launch: loaded.value.name().to_owned(), label: loaded.value.label() }))
 }
 
 /// A plan that failed, as one try's failure, as the planner's step recorded it before.
@@ -193,17 +151,5 @@ impl Actuator<VesselKind> for VesselActuator {
     /// before it realised, as a contained environment's mounts need its checkouts.
     async fn holdings(&self, name: &str, _: &VesselSpec) -> Result<Holdings, ProviderFailure> {
         held(&self.plan(name).await?)
-    }
-
-    /// One keyed read of the held record, or of a held session's newest launch.
-    fn mark(&self, read: &mut Read<'_>, fact: &Identity) -> Result<Option<Mark>, StoreError> {
-        let (name, home) = (fact.name.as_str(), fact.home.as_str());
-        match fact.kind {
-            kind if kind == ENVIRONMENT => keyed_mark::<EnvironmentKind>(read, name, home),
-            kind if kind == CLONE => launch_mark::<CloneKind>(read, name, home),
-            kind if kind == CHECKOUT => launch_mark::<CheckoutKind>(read, name, home),
-            kind if kind == TERMINAL_SESSION => launch_mark::<TerminalSessionKind>(read, name, home),
-            _ => Ok(None),
-        }
     }
 }

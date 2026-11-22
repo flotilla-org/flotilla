@@ -7,7 +7,6 @@
 //! `fact-<key>` reports the provider usable while Realised, and a live `served-<key>` holds its
 //! release back. An environment given holdings holds `hold-<key>-<i>` records, each requested only
 //! once the one before it is realised, as a vessel's later holdings need its earlier ones' facts.
-//! A marking actuator marks its holdings and names no input or holder, as the Vessel kind's does.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -26,12 +25,12 @@ use flotilla_schema_sqlite::{
 use flotilla_state_machines::{
     edge_event,
     machines::lifecycle::{Lifecycle, LifecycleEdgeKind, LifecycleState},
-    Cause, CauseCategory, Edge, Outcome, Resource, StateValue,
+    Cause, CauseCategory, Edge, Resource,
 };
 use flotilla_store_testkit::VirtualClock;
 use tokio::sync::{mpsc, Notify};
 
-use super::{Actuator, Backing, BackingEvent, Controller, Holding, Holdings, Mark, ProviderFailure, Usability};
+use super::{Actuator, Backing, BackingEvent, Controller, Holding, Holdings, ProviderFailure, Usability};
 use crate::{
     engine::{environment_actuator::latest_state_of, LifecycleHome, Lifecycles, Step},
     stored::{
@@ -114,12 +113,6 @@ struct Script {
     reads: usize,
     /// `reads` at the latest try at realising: a later read is the look the try's end leads to.
     reads_at_try: usize,
-    /// Whether it marks its holdings and names no input or holder of its own.
-    marking: bool,
-    /// How many times each key's holdings were planned, alone or with an observation.
-    planned: BTreeMap<String, usize>,
-    /// How many times a backing was observed.
-    observed: usize,
 }
 
 #[derive(Default)]
@@ -145,9 +138,7 @@ impl Scripted {
 #[async_trait]
 impl Actuator<EnvironmentKind> for Scripted {
     async fn observe(&self, _: &str, request: &EnvironmentRequest) -> Result<Backing, Cause> {
-        let mut script = self.script();
-        script.observed += 1;
-        Ok(match script.present.get(&key(request)) {
+        Ok(match self.script().present.get(&key(request)) {
             Some(identity) => Backing::Present { identity: identity.clone() },
             None => Backing::Absent { reason: None },
         })
@@ -191,9 +182,6 @@ impl Actuator<EnvironmentKind> for Scripted {
     }
 
     fn dependencies(&self, request: &EnvironmentRequest) -> Vec<Identity> {
-        if self.script().marking {
-            return Vec::new();
-        }
         let key = key(request);
         vec![record(&format!("input-{key}")), record(&format!("holder-{key}"))]
     }
@@ -229,8 +217,7 @@ impl Actuator<EnvironmentKind> for Scripted {
         // The script is not held across the store's writes: the controller's reads ask it for
         // usability while they hold the store.
         let (count, records) = {
-            let mut script = self.script();
-            *script.planned.entry(key.clone()).or_default() += 1;
+            let script = self.script();
             if let Some(failure) = script.unplannable.get(&key) {
                 return Err(failure.clone());
             }
@@ -252,13 +239,6 @@ impl Actuator<EnvironmentKind> for Scripted {
             }
         }
         Ok(Holdings { held, complete: true })
-    }
-
-    fn mark(&self, read: &mut Read<'_>, fact: &Identity) -> Result<Option<Mark>, StoreError> {
-        if !self.script().marking {
-            return Ok(None);
-        }
-        Ok(latest_state_of::<ImageBuildKind>(read, &fact.name, HOME)?.map(|state| Mark { launch: fact.name.clone(), label: state.label() }))
     }
 }
 
@@ -354,13 +334,6 @@ impl World {
         }
     }
 
-    /// Requests `other`, which holds nothing, and waits for it to be realised. The controller looks
-    /// at one resource at a time, so each flight its looks before began has run by then.
-    async fn flown(&self, other: &str) {
-        self.request(other);
-        self.until("another resource realised", |world| world.state(other).realised()).await;
-    }
-
     fn state(&self, name: &str) -> LifecycleState {
         self.environments.get(name).expect("held").state().clone()
     }
@@ -422,43 +395,6 @@ async fn waiting_for_holdings_spends_no_tries() {
     }
     world.until("a realised", |world| world.state("a").realised()).await;
     assert_eq!(world.actuator.script().realised, ["a"], "tried once, when everything it holds is realised");
-}
-
-// A holding kind woken only through what it holds plans again when a holding's lifecycle moves,
-// not at a commit that leaves every holding where its last plan found it: a vessel was planned
-// again at each of its crew sessions' turns. A holding its plan requests is not planned again
-// for, as it stands where the plan left it.
-#[tokio::test]
-async fn a_holding_written_without_moving_plans_nothing() {
-    let mut world = World::open();
-    {
-        let mut script = world.actuator.script();
-        script.marking = true;
-        script.holdings.insert("a".into(), 2);
-    }
-    let planned = |world: &World| world.actuator.script().planned.get("a").copied().unwrap_or_default();
-    world.start();
-    world.request("a");
-    world.until("the first holding requested", |world| world.records.newest_launch("hold-a-0").is_some()).await;
-    world.flown("b").await;
-    assert_eq!(planned(&world), 1, "the holding its plan requested is not planned again for");
-
-    // A failed try at the holding leaves it requested.
-    let reads = world.actuator.script().reads;
-    world
-        .record_step("hold-a-0", Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "slow"), retryable: true }));
-    world.until("a looked at again", |world| world.actuator.script().reads > reads).await;
-    world.flown("c").await;
-    assert_eq!(planned(&world), 1, "a holding written without moving plans nothing");
-
-    world.record_step("hold-a-0", Step::Realised { identity: "hold-a-0".into() });
-    world.until("the second holding requested", |world| world.records.newest_launch("hold-a-1").is_some()).await;
-    assert_eq!(planned(&world), 2, "a holding realised plans it again");
-    world.actuator.script().present.insert("a".into(), "id-a".into());
-    world.record_step("hold-a-1", Step::Realised { identity: "hold-a-1".into() });
-    world.until("a realised", |world| world.state("a").realised()).await;
-    let tries = world.actuator.script().realised.iter().filter(|key| *key == "a").count();
-    assert_eq!(tries, 1, "tried once, when everything it holds is realised");
 }
 
 // A holding kind whose holdings cannot be planned fails as its planning says: a planning error
