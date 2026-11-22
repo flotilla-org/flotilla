@@ -962,7 +962,8 @@ const DISPATCH_RETRY: RetryBackoff = RetryBackoff { initial: Duration::from_secs
 pub(super) fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: String) -> JoinHandle<()> {
     let issues = Arc::new(DaemonDispatchIssueSource::new(Arc::clone(&daemon))) as Arc<dyn DispatchIssueSource>;
     let backend = daemon.resource_backend();
-    let reconciler = DispatchReconciler::new(backend.clone(), namespace.clone(), issues);
+    let reads = daemon.lifecycle_reads();
+    let reconciler = DispatchReconciler::new(backend.clone(), namespace.clone(), issues, Arc::clone(&reads));
     tokio::spawn(attributed(caller("DispatchReconciler"), async move {
         let mut boards = daemon.dispatch_board_changes();
         let mut enrol = true;
@@ -973,7 +974,26 @@ pub(super) fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, names
             // whether it changes the board sources.
             let mut watches = SelectAll::new();
             let mut subscribed = true;
-            for (kind, sources) in [("Project", true), ("Repository", true), ("WorkflowTemplate", false), ("Convoy", false)] {
+            // A convoy's change is its record's, heard from the engine's log by name: what its
+            // vessels and sessions do moves no queue.
+            match reads.convoys() {
+                Ok(convoys) => watches.push(
+                    futures::stream::unfold(convoys.changes(), |mut changes| async move {
+                        let event =
+                            changes.recv().await.map(|_| false).map_err(|error| ResourceError::other(format!("convoy changes: {error}")));
+                        Some((event, changes))
+                    })
+                    .boxed(),
+                ),
+                Err(error) => {
+                    warn!(%error, %namespace, "could not follow convoy changes; resubscribing");
+                    watch_failures = watch_failures.saturating_add(1);
+                    tokio::time::sleep(DISPATCH_RETRY.delay(watch_failures)).await;
+                    enrol = true;
+                    continue;
+                }
+            }
+            for (kind, sources) in [("Project", true), ("Repository", true), ("WorkflowTemplate", false)] {
                 match watch_resource_kind_including_replicas(&backend, &namespace, kind).await {
                     Ok(watch) => watches.push(
                         watch
