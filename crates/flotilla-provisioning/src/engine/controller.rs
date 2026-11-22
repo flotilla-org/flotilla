@@ -23,7 +23,8 @@
 //!   one deadline for the kind, never an interval;
 //! - a commit of a record it holds ([`Actuator::holdings`]): a kind that holds others, such as a
 //!   vessel its environment and checkouts, requests them and waits for each to be realised; once
-//!   it is realised, such a commit observes it again. Its realisation observes it once, so that
+//!   it is realised, such a commit observes it again. A commit that leaves each holding's
+//!   [`Mark`] where its last plan found it plans nothing. Its realisation observes it once, so that
 //!   what it holds as a realised resource, such as a vessel's crew sessions, is requested.
 //!
 //! Waiting is not a try: a request waits on its usability facts and its holdings without
@@ -55,7 +56,7 @@ use flotilla_resources::Clock;
 use flotilla_schema::{reads::carry, Identity, KindCode, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{
-    machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState, VanishCause},
+    machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleLabel, LifecycleState, VanishCause},
     Cause, Outcome, Resource,
 };
 use futures::StreamExt;
@@ -115,6 +116,24 @@ pub struct Usability {
     /// The record that reports it; its commits wake the resource.
     pub fact: Identity,
     pub usable: bool,
+}
+
+/// Where one record a resource holds stands, as its controller reads it from the store: the
+/// launch it reads (a record held by its name, such as a crew session, reads its newest launch)
+/// and that launch's lifecycle state. A holding kind's resource is planned again on a holding's
+/// commit only when a holding's mark moved since its last plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mark {
+    pub launch: String,
+    pub label: LifecycleLabel,
+}
+
+impl Mark {
+    /// Whether a plan that found the holding `usable` could have read it at this mark: realised
+    /// if usable, otherwise still requested. A holding ended or replaced since is a change.
+    fn agrees(&self, usable: bool) -> bool {
+        self.label == if usable { LifecycleLabel::Realised } else { LifecycleLabel::Requested }
+    }
 }
 
 /// A resource's holders as its controller reads them. A resource may be held by more than one,
@@ -214,6 +233,11 @@ pub trait Actuator<K: LifecycleKind>: Send + Sync + 'static {
     /// is not retryable, a missing input that may yet arrive is.
     async fn holdings(&self, _name: &str, _request: &K::Request) -> Result<Holdings, ProviderFailure> {
         Ok(Holdings::none())
+    }
+    /// Where held record `fact` stands now, one keyed read; none when this kind cannot say, and
+    /// then each commit of a holding plans its holder again.
+    fn mark(&self, _read: &mut Read<'_>, _fact: &Identity) -> Result<Option<Mark>, StoreError> {
+        Ok(None)
     }
     /// One observation of a holding kind: its holdings, as [`Actuator::holdings`] reads them, and its
     /// backing, as [`Actuator::observe`] does. A kind that reads both from one source overrides it to
@@ -427,6 +451,13 @@ struct LifecyclePolicy<K: LifecycleKind, A: Actuator<K>> {
     /// meanwhile: what that read finds may be stale, so it is read again.
     holding: BTreeSet<String>,
     stale_holdings: BTreeSet<String>,
+    /// The resources whose holdings the observation that just landed read: judged on those,
+    /// not read again.
+    fresh_holdings: BTreeSet<String>,
+    /// Where each holding of a holding kind's resource stood when its last plan began, or for a
+    /// holding that plan named first, when it landed agreeing with what the plan found. Never
+    /// later than what that plan read, so a moved mark is never missed.
+    marks: BTreeMap<String, BTreeMap<Identity, Mark>>,
     /// The resource a recheck carrying a person's release ruling is evaluating, for that pass only.
     ruled: Option<String>,
 }
@@ -494,6 +525,8 @@ where
                 holdings: BTreeMap::new(),
                 holding: BTreeSet::new(),
                 stale_holdings: BTreeSet::new(),
+                fresh_holdings: BTreeSet::new(),
+                marks: BTreeMap::new(),
                 ruled: None,
             },
         })
@@ -556,18 +589,29 @@ where
     async fn landed(&mut self, runner: &mut Runner<Done>, name: String, done: Done) {
         let trigger = if matches!(done, Done::Held(Ok(_))) { Trigger::Held } else { Trigger::Own };
         // A holding this call named first was not followed while it ran, and one that was may
-        // have changed meanwhile: either way its holdings are read once more.
+        // have changed meanwhile: either way it is looked at once more, unless each one it named
+        // first still stands where the call found it.
         self.holding.remove(&name);
         let stale = self.stale_holdings.remove(&name);
-        let unseen = match &done {
+        let named_first: Vec<Usability> = match &done {
             Done::Held(Ok(holdings)) | Done::Observed(_, Some(holdings)) => {
                 let before = self.holdings.get(&name);
-                stale || holdings.held.iter().any(|held| before.is_none_or(|before| !before.held.iter().any(|seen| seen.fact == held.fact)))
+                holdings
+                    .held
+                    .iter()
+                    .filter(|held| before.is_none_or(|before| !before.held.iter().any(|seen| seen.fact == held.fact)))
+                    .cloned()
+                    .collect()
             }
-            _ => false,
+            _ => Vec::new(),
         };
+        if matches!(done, Done::Observed(_, Some(_))) {
+            self.fresh_holdings.insert(name.clone());
+        }
         let trigger = if self.finish(runner, &name, done).await { Trigger::Recheck } else { trigger };
+        let unseen = !self.marked_as_found(runner, &name, named_first).await || stale;
         self.evaluate(runner, BTreeMap::from([(name.clone(), trigger)])).await;
+        self.fresh_holdings.remove(&name);
         if unseen {
             self.evaluate(runner, BTreeMap::from([(name, Trigger::Dependency)])).await;
         }
@@ -614,29 +658,39 @@ where
             return;
         }
         let actuator = Arc::clone(&self.actuator);
-        let requests: Vec<(String, K::Request)> = held.iter().map(|(name, _, resource)| (name.clone(), resource.spec().clone())).collect();
+        // Each resource with its holdings' records, whose marks are read with it.
+        let requests: Vec<(String, K::Request, Vec<Identity>)> = held
+            .iter()
+            .map(|(name, _, resource)| {
+                let facts = self.holdings.get(name).map(|holdings| holdings.held.iter().map(|held| held.fact.clone()).collect());
+                (name.clone(), resource.spec().clone(), facts.unwrap_or_default())
+            })
+            .collect();
         let found = runner
             .watch()
             .read(move |read| {
                 requests
                     .iter()
-                    .map(|(name, request)| {
+                    .map(|(name, request, facts)| {
                         let Holding { ended: holder_ended, records: holders } = actuator.holder(read, name, request)?;
                         let (blockers, release_waits) = if holder_ended {
                             (actuator.release_blockers(read, name, request)?, actuator.release_waits(read, name, request)?)
                         } else {
                             (Vec::new(), Vec::new())
                         };
-                        Ok(Found {
+                        let marks =
+                            facts.iter().map(|fact| Ok((fact.clone(), actuator.mark(read, fact)?))).collect::<Result<_, StoreError>>()?;
+                        let found = Found {
                             holder_ended,
                             holders,
                             usability: actuator.usability(read, request)?,
                             holdings_complete: true,
                             blockers,
                             release_waits,
-                        })
+                        };
+                        Ok((found, marks))
                     })
-                    .collect::<Result<Vec<_>, StoreError>>()
+                    .collect::<Result<Vec<(Found, BTreeMap<Identity, Option<Mark>>)>, StoreError>>()
             })
             .await;
         let found = match found {
@@ -647,7 +701,15 @@ where
                 return;
             }
         };
-        for ((name, trigger, resource), mut found) in held.into_iter().zip(found) {
+        for ((name, trigger, resource), (mut found, marks)) in held.into_iter().zip(found) {
+            // Woken through nothing but what it holds: its inputs, holders, usability facts and
+            // release waits name no record.
+            let woken_by_holdings = found.holders.is_empty()
+                && found.usability.is_empty()
+                && found.blockers.is_empty()
+                && found.release_waits.is_empty()
+                && !found.holder_ended
+                && self.actuator.dependencies(resource.spec()).is_empty();
             if let Some(holdings) = self.holdings.get(&name) {
                 found.usability.extend(holdings.held.iter().cloned());
                 found.holdings_complete = holdings.complete;
@@ -661,8 +723,13 @@ where
                 }
                 continue;
             }
+            // A commit of a holding that left every holding where its last plan found it, such as
+            // a crew session's turn, gives the plan nothing new.
+            if self.actuator.holds() && trigger == Trigger::Dependency && woken_by_holdings && self.unmoved(&name, &marks) {
+                continue;
+            }
             let state = resource.state();
-            // A holding of a realised resource changed: it is observed again, as a lost
+            // A holding of a realised resource moved: it is observed again, as a lost
             // environment ends the vessel running in it.
             let trigger = if self.actuator.holds() && trigger == Trigger::Dependency && matches!(state, LifecycleState::Realised { .. }) {
                 Trigger::Recheck
@@ -675,15 +742,19 @@ where
             let judgement = judge::<K>(state);
             let release_failed = self.release_failed.contains(&name);
             // A holding kind requests and reads its holdings before any try it would make were
-            // it usable, then is judged on them.
-            if self.actuator.holds() && trigger != Trigger::Held {
+            // it usable, then is judged on them; on those its observation just read, if it did.
+            if self.actuator.holds() && trigger != Trigger::Held && !self.fresh_holdings.contains(&name) {
                 let unwaited = Found { usability: Vec::new(), holdings_complete: true, ..found.clone() };
                 if act(state, &judgement, &unwaited, trigger, usable_again, release_failed) == Action::Realise {
+                    self.mark_planned(&name, marks);
                     self.perform(runner, &name, resource.spec().clone(), Action::Hold).await;
                     continue;
                 }
             }
             let action = act(state, &judgement, &found, trigger, usable_again, release_failed);
+            if matches!(action, Action::Observe | Action::Realise) {
+                self.mark_planned(&name, marks);
+            }
             self.perform(runner, &name, resource.spec().clone(), action).await;
         }
     }
@@ -929,10 +1000,54 @@ where
         runner.link(name, depends);
     }
 
+    /// Marks each holding `name`'s call named first where it stands now, if every one stands
+    /// where the call found it; true then, or when it named none. A holding it found realised
+    /// must still be; one it found unrealised must still be requested, as an ended or replaced
+    /// one may have moved in between. The marks of what it no longer holds are dropped.
+    async fn marked_as_found(&mut self, runner: &Runner<Done>, name: &str, named_first: Vec<Usability>) -> bool {
+        let held: BTreeSet<Identity> =
+            self.holdings.get(name).map(|holdings| holdings.held.iter().map(|held| held.fact.clone()).collect()).unwrap_or_default();
+        if let Some(marks) = self.marks.get_mut(name) {
+            marks.retain(|fact, _| held.contains(fact));
+        }
+        if named_first.is_empty() {
+            return true;
+        }
+        let actuator = Arc::clone(&self.actuator);
+        let facts: Vec<Identity> = named_first.iter().map(|held| held.fact.clone()).collect();
+        let read = runner.watch().read(move |read| facts.iter().map(|fact| actuator.mark(read, fact)).collect::<Result<Vec<_>, _>>()).await;
+        let Ok(found) = read else { return false };
+        let mut agreed = Vec::new();
+        for (held, mark) in named_first.into_iter().zip(found) {
+            match mark {
+                Some(mark) if mark.agrees(held.usable) => agreed.push((held.fact, mark)),
+                _ => return false,
+            }
+        }
+        self.marks.entry(name.to_owned()).or_default().extend(agreed);
+        true
+    }
+
+    /// Whether every holding of `name` stands where its last plan found it: `marks` read now,
+    /// each one known and equal to the mark kept. A holding this kind cannot mark has moved.
+    fn unmoved(&self, name: &str, marks: &BTreeMap<Identity, Option<Mark>>) -> bool {
+        let (Some(_), Some(kept)) = (self.holdings.get(name), self.marks.get(name)) else { return false };
+        marks.iter().all(|(fact, mark)| mark.is_some() && kept.get(fact) == mark.as_ref())
+    }
+
+    /// A plan of `name` begins: its holdings' marks read before it are kept, no later than what
+    /// it will read.
+    fn mark_planned(&mut self, name: &str, marks: BTreeMap<Identity, Option<Mark>>) {
+        let marks = marks.into_iter().filter_map(|(fact, mark)| Some((fact, mark?))).collect();
+        self.marks.insert(name.to_owned(), marks);
+    }
+
     fn forget(&mut self, runner: &mut Runner<Done>, name: &str) {
         self.usable.remove(name);
         self.holdings.remove(name);
         self.stale_holdings.remove(name);
+        self.fresh_holdings.remove(name);
+        self.marks.remove(name);
         self.release_failed.remove(name);
         runner.forget(name);
     }

@@ -203,7 +203,9 @@ async fn a_lost_environment_ends_its_realised_vessel() {
 }
 
 // Behaviour: a vessel realised before its controller started, as across a restart, is adopted
-// and follows what it holds: its environment's loss still ends it.
+// and follows what it holds: its environment's loss still ends it. It is planned once at start;
+// a loss while that plan runs moves its holding from where the plan found it, so it is looked
+// at again.
 #[tokio::test]
 async fn a_vessel_adopted_at_start_follows_its_holdings() {
     let mut world = World::new();
@@ -213,7 +215,7 @@ async fn a_vessel_adopted_at_start_follows_its_holdings() {
     world.vessels.ready(&launch, "env-a");
     world.planner.set(&launch, VesselPlan::Ready { environment: "env-a".into(), held: vec![held] });
     world.run();
-    world.until("holdings read", |world| world.planner.planned(&launch) >= 2).await;
+    world.until("planned at start", |world| world.planner.planned(&launch) >= 1).await;
 
     world.planner.set(&launch, VesselPlan::Lost { reason: "environment env-a was lost".into() });
     world.environments.lose("env-a", "cgroup_oom");
