@@ -398,7 +398,7 @@ impl TerminalPool for DummyTerminalPool {
     fn attach_args(
         &self,
         session_name: &str,
-        _command: &str,
+        _command: Option<&str>,
         _cwd: &ExecutionEnvironmentPath,
         _env: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String> {

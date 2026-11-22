@@ -74,7 +74,7 @@ impl TerminalPool for DeliveryProbePool {
     fn attach_args(
         &self,
         _session_name: &str,
-        _command: &str,
+        _command: Option<&str>,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
@@ -157,7 +157,7 @@ impl TerminalPool for HooklessComposerPool {
     fn attach_args(
         &self,
         _: &str,
-        _: &str,
+        _: Option<&str>,
         _: &ExecutionEnvironmentPath,
         _: &TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
@@ -210,7 +210,7 @@ impl TerminalPool for KeyedPool {
     fn attach_args(
         &self,
         _: &str,
-        _: &str,
+        _: Option<&str>,
         _: &ExecutionEnvironmentPath,
         _: &TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
@@ -268,7 +268,7 @@ impl TerminalPool for AttachableToolPool {
     fn attach_args(
         &self,
         name: &str,
-        command: &str,
+        command: Option<&str>,
         cwd: &ExecutionEnvironmentPath,
         env: &TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {

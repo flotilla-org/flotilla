@@ -74,7 +74,9 @@ impl TerminalSessionIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalSessionAttachTarget<'a> {
     pub session_id: &'a str,
-    pub launch_command: &'a str,
+    /// The command the session was launched with, when this daemon recorded it. Agent launches
+    /// are recorded only in memory, so a restart loses it; a pool that attaches by name needs none.
+    pub launch_command: Option<&'a str>,
 }
 
 pub fn terminal_session_attach_target(session: &ResourceObject<TerminalSession>) -> Result<TerminalSessionAttachTarget<'_>, String> {
@@ -95,8 +97,6 @@ pub fn terminal_session_attach_target_with_stale_status(
         TerminalSessionSource::Tool { command } => Some(command.as_str()),
         TerminalSessionSource::Agent { .. } => None,
     });
-    let launch_command =
-        launch_command.ok_or_else(|| format!("agent terminal session {} has no recorded launch command", session.metadata.name))?;
     Ok(TerminalSessionAttachTarget { session_id, launch_command })
 }
 

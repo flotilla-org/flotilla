@@ -169,7 +169,7 @@ pub trait TerminalPool: Send + Sync {
     fn attach_args(
         &self,
         session_name: &str,
-        command: &str,
+        command: Option<&str>,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String>;
@@ -186,7 +186,7 @@ pub trait TerminalPool: Send + Sync {
     fn attach_args_for_mode(
         &self,
         session_name: &str,
-        command: &str,
+        command: Option<&str>,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
         mode: AttachMode,
@@ -206,7 +206,7 @@ pub trait TerminalPool: Send + Sync {
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
     ) -> Result<String, String> {
-        let args = self.attach_args(session_name, command, cwd, env_vars)?;
+        let args = self.attach_args(session_name, Some(command), cwd, env_vars)?;
         Ok(flotilla_protocol::arg::flatten(&args, 0))
     }
 
