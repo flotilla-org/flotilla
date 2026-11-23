@@ -73,6 +73,34 @@ fn a_realised_launch_reads_back_with_its_facts_through_each_index() {
     assert!(fixture.reads.terminals().expect("served").get(&other, None).expect("read").is_some());
 }
 
+// Behaviour (#4438): an agent's launch declares the AgentSession it is a terminal of, named as
+// the launch at the launch's home, once its create numbers it; its read view names it, and every
+// launch of a session declares its own. A tool's launch is no one's terminal and declares none.
+#[test]
+fn an_agents_launch_declares_its_session_and_a_tools_none() {
+    use flotilla_resources::terminal_records::{agent_session_of, TerminalLaunchSource};
+
+    let fixture = TerminalsFixture::default();
+    let request = TerminalsFixture::agent("v1", "lead", "env-a");
+    let first = fixture.request(&request);
+    assert_eq!(fixture.record(&first).agent_session.as_deref(), Some(first.as_str()));
+    fixture.release(&first);
+    let second = fixture.request(&request);
+    let record = fixture.record(&second);
+    assert_eq!(record.agent_session.as_deref(), Some(second.as_str()), "each launch declares its own session");
+    assert_eq!(record.crew_id(), Some(second.as_str()));
+    let view = record.read_view("flotilla", None, None, None);
+    assert_eq!(agent_session_of(&view), Some(second.as_str()));
+
+    let tool = flotilla_resources::terminal_records::TerminalLaunchRequest {
+        session: "terminal-v1-shell".into(),
+        source: TerminalLaunchSource::Tool { command: "bash".into() },
+        ..request
+    };
+    let shell = fixture.record(&fixture.request(&tool));
+    assert_eq!((shell.agent_session.as_deref(), shell.crew_id()), (None, None));
+}
+
 #[test]
 fn a_renewal_starts_the_next_launch_only_once_the_newest_ended() {
     let fixture = TerminalsFixture::default();

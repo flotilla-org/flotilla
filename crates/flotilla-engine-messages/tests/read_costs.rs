@@ -53,7 +53,19 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     let home = EngineMessagesHome::open("home-a", NAMESPACE, &backend);
     let primitives = home.primitives();
     let inbox: Address = "project:flotilla/role:coder".parse().expect("inbox");
-    let session = primitives.register("session-coder", Timestamp::from_datetime(&chrono::Utc::now())).await.expect("register");
+    let session = primitives
+        .register(
+            "session-coder",
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Timestamp::from_datetime(&chrono::Utc::now()),
+        )
+        .await
+        .expect("register");
     primitives.inbox().bind(inbox.clone(), session.clone()).await.expect("bind");
 
     for n in 0..SETTLED {

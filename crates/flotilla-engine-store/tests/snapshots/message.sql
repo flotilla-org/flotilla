@@ -131,6 +131,12 @@ FROM "awaiting_reply";
 CREATE TABLE "agent_session" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
+  "convoy" INTEGER REFERENCES "resource_identity" ("id"),
+  "vessel" INTEGER REFERENCES "resource_identity" ("id"),
+  "role" INTEGER REFERENCES "strings" ("id"),
+  "conversation_transport" TEXT,
+  "conversation_endpoint" TEXT,
+  "conversation_thread" TEXT,
   "state" TEXT NOT NULL CHECK ("state" IN ('en', 'li')),
   "state_since" INTEGER NOT NULL,
   "channel" TEXT CHECK ("channel" IN ('at', 'de')),
@@ -138,6 +144,11 @@ CREATE TABLE "agent_session" (
   "activity_since" INTEGER,
   "activity_cause" TEXT,
   "reason" TEXT CHECK ("reason" IN ('co', 'lo')),
+  CHECK (CASE WHEN "conversation_transport" IS NOT NULL
+      THEN "conversation_endpoint" IS NOT NULL
+      ELSE "conversation_endpoint" IS NULL
+      AND "conversation_thread" IS NULL
+      END),
   CHECK (CASE WHEN "state" = 'li'
       THEN "channel" IS NOT NULL
       AND "reason" IS NULL
@@ -147,6 +158,8 @@ CREATE TABLE "agent_session" (
       AND "channel" IS NULL
       END)
 ) STRICT;
+CREATE INDEX "agent_session_by_convoy" ON "agent_session" ("convoy") WHERE "convoy" IS NOT NULL;
+CREATE INDEX "agent_session_by_vessel" ON "agent_session" ("vessel") WHERE "vessel" IS NOT NULL;
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('as', 'state', 'en', 'Ended'),
   ('as', 'state', 'li', 'Live'),
@@ -168,6 +181,12 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
 CREATE VIEW "agent_session_view" AS SELECT
   "agent_session"."id",
   "agent_session"."version",
+  "agent_session"."convoy",
+  "agent_session"."vessel",
+  (SELECT "s" FROM "strings" WHERE "id" = "agent_session"."role") AS "role",
+  "agent_session"."conversation_transport",
+  "agent_session"."conversation_endpoint",
+  "agent_session"."conversation_thread",
   (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'state' AND "code" = "agent_session"."state") AS "state",
   "agent_session"."state_since",
   (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'channel' AND "code" = "agent_session"."channel") AS "channel",

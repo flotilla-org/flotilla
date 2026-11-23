@@ -27,6 +27,27 @@ pub(super) async fn list(service: &Arc<Service>) -> Result<Vec<Value>, String> {
     .await
 }
 
+/// The engine tables whose rows are facets (#4438): each facet a table's description declares,
+/// with the reference column naming the subject it is a facet of, or none where the row is a
+/// facet of the subject it is itself.
+pub(super) async fn facets(service: &Arc<Service>) -> Result<Vec<Value>, String> {
+    blocking(service, |store| {
+        let mut facets = Vec::new();
+        for table in store.kinds().iter().flat_map(|set| &set.tables) {
+            for facet in &table.facets {
+                facets.push(json!({"table": table.name, "recipe": facet.recipe, "shows": facet.shows}));
+            }
+            for column in &table.columns {
+                if let Some(flotilla_schema::Link::FacetOf(facet)) = &column.link {
+                    facets.push(json!({"table": table.name, "recipe": facet.recipe, "shows": facet.shows, "of": column.name}));
+                }
+            }
+        }
+        Ok(facets)
+    })
+    .await
+}
+
 pub(super) fn home(namespace: &str, local: &str) -> String {
     if namespace == "default" {
         local.into()

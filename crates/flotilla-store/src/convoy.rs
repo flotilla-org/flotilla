@@ -387,12 +387,18 @@ pub async fn resolve_convoy_record(backend: &crate::ResourceBackend, namespace: 
 
 /// Registers the convoy subject table (#4355): `convoys` rows, each addressed as
 /// [`ConvoyName`] selects it ([`ConvoyIdentity::address`]), so a row's address resolves to that
-/// row's convoy.
+/// row's convoy, and opened by attaching to it (#4438).
 pub fn register_subjects(registry: &mut flotilla_verbs::VerbRegistry) -> Result<(), flotilla_verbs::Duplicate> {
     registry.register_subject(flotilla_verbs::SubjectTable {
         kind: flotilla_address::Kind::Convoy,
         table: <flotilla_resources::Convoy as flotilla_resources::Resource>::API_PATHS.plural,
         address: |document| ConvoyIdentity::of_document(document)?.address(),
+        // `flotilla attach` takes a convoy's record name.
+        commands: &[flotilla_verbs::CommandTemplate {
+            name: "attach",
+            shows: "terminal",
+            argv: &["flotilla", "attach", "{metadata.name}"],
+        }],
     })
 }
 

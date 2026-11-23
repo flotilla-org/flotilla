@@ -109,6 +109,58 @@ pub struct Table {
     pub aliases: Vec<(String, String)>,
     /// What each row is about, when its rows are subjects of one address kind (#4199).
     pub subject: Option<Subject>,
+    /// The facets each row is of itself (#4438): a way to open the subject the row is, from the
+    /// row's own columns, such as an agent session's conversation.
+    pub facets: Vec<Facet>,
+    /// The command facets of each row's subject (#4438): templates no row holds, filled from the
+    /// row's fields.
+    pub commands: Vec<Command>,
+}
+
+/// A facet (#4438): one way to open a subject, by a recipe describing an endpoint, and what
+/// opening it shows. The recipe's fields are the facet table's columns that carry roles named
+/// after them; its `state` role says whether the facet is reachable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Facet {
+    /// The recipe: `cleat-session`, `agent-session`, `url`, … An open vocabulary.
+    pub recipe: String,
+    /// What opening it shows: `terminal`, `conversation`, `page`, …
+    pub shows: String,
+}
+
+/// A command facet of a subject table's rows (#4438): an argv template whose `{field}`
+/// placeholders name the row's fields, such as `["flotilla", "attach", "{address}"]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    pub name: String,
+    pub shows: String,
+    pub argv: Vec<String>,
+}
+
+/// How a reference column relates its row to the row it names, for a surface building a tree
+/// and its opens (#4438). A surface follows the key; nothing links back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Link {
+    /// The row named is this row's parent subject.
+    Parent,
+    /// This row is a facet of the subject the row named is, when the cell is set: the link is
+    /// per row, so a row whose cell is empty is no one's facet.
+    FacetOf(Facet),
+}
+
+/// What a kind's owner declares about its root table's columns for surfaces (#4438), applied
+/// by [`TableSet::describe`]. Storage reads none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Described {
+    /// The column takes `role`: a card's `title` or `badge`, or a recipe field such as
+    /// `session-id`, `pool`, `transport`, `endpoint` or `thread`.
+    Role { column: &'static str, role: &'static str },
+    /// The column names the row's parent subject: a reference by its key, an address by itself.
+    Parent { column: &'static str },
+    /// The reference column names the subject this row is a facet of, by `recipe`, showing `shows`.
+    FacetOf { column: &'static str, recipe: &'static str, shows: &'static str },
+    /// Every row is a facet of the subject it is itself, by `recipe`, showing `shows`.
+    Facet { recipe: &'static str, shows: &'static str },
 }
 
 /// The subject of a table's rows (#4182 ruling 1): the ADR 0066 address kind of each row's
@@ -207,6 +259,8 @@ pub struct ColumnDef {
     pub address: bool,
     /// Open semantic properties. Structural roles live in `roles` as an array of strings.
     pub properties: std::collections::BTreeMap<String, serde_json::Value>,
+    /// How a reference column relates its row to the row it names (#4438).
+    pub link: Option<Link>,
 }
 
 impl ColumnDef {
@@ -219,7 +273,16 @@ impl ColumnDef {
     }
 
     pub fn new(name: impl Into<String>, ty: ColumnType, nullable: bool) -> Self {
-        Self { name: name.into(), ty, nullable, categories: Vec::new(), reference: None, address: false, properties: Default::default() }
+        Self {
+            name: name.into(),
+            ty,
+            nullable,
+            categories: Vec::new(),
+            reference: None,
+            address: false,
+            properties: Default::default(),
+            link: None,
+        }
     }
 
     pub fn add_role(&mut self, role: &str) {
@@ -361,6 +424,46 @@ pub enum DescriptorError {
 }
 
 impl TableSet {
+    /// Applies `marks` to the root table (#4438).
+    ///
+    /// # Panics
+    /// A mark naming a column the root table does not have, a parent that is neither a reference
+    /// nor an address, or a facet-of mark on a column that is no reference: a declaration error
+    /// in the kind, found by building its table set.
+    pub fn describe(&mut self, marks: &[Described]) {
+        let root = &mut self.tables[0];
+        let kind = &self.kind;
+        for mark in marks {
+            let column = |root: &mut Table, name: &str| -> usize {
+                root.columns.iter().position(|column| column.name == name).unwrap_or_else(|| panic!("{kind} describes no column `{name}`"))
+            };
+            match *mark {
+                Described::Role { column: name, role } => {
+                    let at = column(root, name);
+                    root.columns[at].add_role(role);
+                }
+                Described::Parent { column: name } => {
+                    let at = column(root, name);
+                    let column = &mut root.columns[at];
+                    if column.reference.is_some() {
+                        column.link = Some(Link::Parent);
+                    } else if column.address {
+                        column.add_role("parent");
+                    } else {
+                        panic!("{kind}'s parent `{name}` is neither a reference nor an address");
+                    }
+                }
+                Described::FacetOf { column: name, recipe, shows } => {
+                    let at = column(root, name);
+                    let column = &mut root.columns[at];
+                    assert!(column.reference.is_some(), "{kind}'s facet-of `{name}` is no reference");
+                    column.link = Some(Link::FacetOf(Facet { recipe: recipe.to_owned(), shows: shows.to_owned() }));
+                }
+                Described::Facet { recipe, shows } => root.facets.push(Facet { recipe: recipe.to_owned(), shows: shows.to_owned() }),
+            }
+        }
+    }
+
     /// The column the backend adds to every table below the root, holding the resource's row id:
     /// named after the root table, so `convoy_promises.convoy` and `message_references.message`
     /// read as what they reference (ADR 0064 Records).

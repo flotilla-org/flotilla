@@ -44,7 +44,19 @@ async fn a_message_reads_its_admission_time_after_it_is_delivered() {
     let home = EngineMessagesHome::open_with_clock("home-a", NAMESPACE, &backend, Arc::clone(&clock) as Arc<dyn Clock>);
     let primitives = home.primitives();
     let inbox: Address = "project:flotilla/role:coder".parse().expect("inbox");
-    let session = primitives.register("session-coder", Timestamp::from_datetime(&at(1_000))).await.expect("register");
+    let session = primitives
+        .register(
+            "session-coder",
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Timestamp::from_datetime(&at(1_000)),
+        )
+        .await
+        .expect("register");
     primitives.inbox().bind(inbox.clone(), session.clone()).await.expect("bind");
 
     let intent = flotilla_engine_messages_testkit::intent("system:turn-rules", CODER, MessageRelation::System, "review the plan");

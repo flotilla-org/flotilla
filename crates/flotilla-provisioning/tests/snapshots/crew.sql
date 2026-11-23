@@ -101,6 +101,7 @@ CREATE TABLE "terminal_session" (
   "source_adapter" TEXT,
   "source_model" TEXT,
   "source_brief" BLOB REFERENCES "objects" ("hash"),
+  "agent_session" INTEGER REFERENCES "resource_identity" ("id"),
   "state" TEXT NOT NULL CHECK ("state" IN ('go', 'gu', 'rl', 'rq')),
   "state_since" INTEGER NOT NULL,
   "failures" INTEGER,
@@ -193,6 +194,7 @@ CREATE TABLE "terminal_session_env" (
   PRIMARY KEY ("terminal_session", "key"),
   FOREIGN KEY ("terminal_session") REFERENCES "terminal_session" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
+CREATE INDEX "terminal_session_by_agent_session" ON "terminal_session" ("agent_session") WHERE "agent_session" IS NOT NULL;
 CREATE INDEX "terminal_session_by_environment" ON "terminal_session" ("environment");
 CREATE INDEX "terminal_session_by_holder" ON "terminal_session" ("holder") WHERE "holder" IS NOT NULL;
 CREATE INDEX "terminal_session_by_launch" ON "terminal_session" ("launch_of", "launch");
@@ -242,6 +244,7 @@ CREATE VIEW "terminal_session_view" AS SELECT
   "terminal_session"."source_adapter",
   "terminal_session"."source_model",
   "terminal_session"."source_brief",
+  "terminal_session"."agent_session",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ts' AND "field" = 'state' AND "code" = "terminal_session"."state") AS "state",
   "terminal_session"."state_since",
   "terminal_session"."failures",

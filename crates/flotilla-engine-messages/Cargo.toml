@@ -17,6 +17,7 @@ flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-tracing = { path = "../flotilla-tracing" }
+flotilla-verbs = { path = "../flotilla-verbs" }
 async-trait = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures = { workspace = true }

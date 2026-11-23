@@ -117,7 +117,7 @@ mod tests {
     // refused and the first is kept.
     #[test]
     fn a_subject_kind_is_registered_once() {
-        let table = |table| SubjectTable { kind: Kind::Convoy, table, address: |_| None };
+        let table = |table| SubjectTable { kind: Kind::Convoy, table, address: |_| None, commands: &[] };
         let mut registry = VerbRegistry::new();
         registry.register_subject(table("convoys")).unwrap();
         assert_eq!(registry.register_subject(table("other")), Err(Duplicate::Subject(Kind::Convoy)));

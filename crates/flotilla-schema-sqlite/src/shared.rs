@@ -697,6 +697,7 @@ mod tests {
             reference: None,
             address: false,
             properties: Default::default(),
+            link: None,
         };
         let sql =
             format!("CREATE TABLE \"t\" (\n  {},\n  \"done\" INTEGER CHECK (\"done\" IN (0, 1))\n) STRICT", crate::ddl::column(&column));

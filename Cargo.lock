@@ -2893,6 +2893,7 @@ dependencies = [
  "flotilla-store-memory",
  "flotilla-store-testkit",
  "flotilla-tracing",
+ "flotilla-verbs",
  "futures",
  "hegeltest",
  "serde_json",

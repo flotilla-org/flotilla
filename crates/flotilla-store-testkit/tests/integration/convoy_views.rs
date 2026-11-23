@@ -134,6 +134,7 @@ fn session(vessel: &str, role: &str, reading: LifecycleReading) -> TerminalRecor
         since: at(111),
         reading,
         facts: None,
+        agent_session: None,
     }
 }
 

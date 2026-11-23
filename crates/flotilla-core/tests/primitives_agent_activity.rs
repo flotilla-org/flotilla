@@ -38,12 +38,55 @@ fn a_screen_read_records_activity_on_a_session_no_hook_has_reported() {
     let dir = tempfile::tempdir().expect("tempdir");
     let primitives = primitives(&dir);
     let sessions = primitives.sessions();
-    assert!(sessions.observe_screen("codex", Activity::Working, at(0)).unwrap());
+    assert!(sessions
+        .observe_screen(
+            "codex",
+            || Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                flotilla_schema::Ref::new("convoy", "home"),
+                "coder"
+            )),
+            Activity::Working,
+            at(0)
+        )
+        .unwrap());
     assert_eq!(current(&primitives, "codex"), Some((Activity::Working, SCREEN_CAUSE.to_owned())));
-    assert!(sessions.observe_screen("codex", Activity::NeedsInput, at(1)).unwrap());
-    assert!(sessions.observe_screen("codex", Activity::Idle, at(2)).unwrap());
+    assert!(sessions
+        .observe_screen(
+            "codex",
+            || Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                flotilla_schema::Ref::new("convoy", "home"),
+                "coder"
+            )),
+            Activity::NeedsInput,
+            at(1)
+        )
+        .unwrap());
+    assert!(sessions
+        .observe_screen(
+            "codex",
+            || Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                flotilla_schema::Ref::new("convoy", "home"),
+                "coder"
+            )),
+            Activity::Idle,
+            at(2)
+        )
+        .unwrap());
     assert_eq!(current(&primitives, "codex"), Some((Activity::Idle, SCREEN_CAUSE.to_owned())));
-    assert!(!sessions.observe_screen("codex", Activity::Idle, at(3)).unwrap(), "an unchanged reading writes nothing");
+    assert!(
+        !sessions
+            .observe_screen(
+                "codex",
+                || Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder"
+                )),
+                Activity::Idle,
+                at(3)
+            )
+            .unwrap(),
+        "an unchanged reading writes nothing"
+    );
 }
 
 #[test]
@@ -53,22 +96,111 @@ fn a_fresh_hook_stands_over_a_disagreeing_screen_read_except_input_and_renewed_w
     let sessions = primitives.sessions();
     let stands = HOOK_STANDS_FOR.as_secs() as i64;
 
-    sessions.observe("agent", Activity::Working, "PreToolUse".into(), at(0)).unwrap();
-    assert!(!sessions.observe_screen("agent", Activity::Idle, at(1)).unwrap());
+    sessions
+        .observe(
+            "agent",
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Working,
+            "PreToolUse".into(),
+            at(0),
+        )
+        .unwrap();
+    assert!(!sessions
+        .observe_screen(
+            "agent",
+            || Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                flotilla_schema::Ref::new("convoy", "home"),
+                "coder"
+            )),
+            Activity::Idle,
+            at(1)
+        )
+        .unwrap());
     assert_eq!(current(&primitives, "agent"), Some((Activity::Working, "PreToolUse".to_owned())));
     // A permission prompt on screen is the agent waiting on a person, whatever the hook said.
-    assert!(sessions.observe_screen("agent", Activity::NeedsInput, at(2)).unwrap());
+    assert!(sessions
+        .observe_screen(
+            "agent",
+            || Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                flotilla_schema::Ref::new("convoy", "home"),
+                "coder"
+            )),
+            Activity::NeedsInput,
+            at(2)
+        )
+        .unwrap());
     assert_eq!(current(&primitives, "agent"), Some((Activity::NeedsInput, SCREEN_CAUSE.to_owned())));
 
     // An idle agent the screen shows working again is working.
-    sessions.observe("other", Activity::Idle, "Stop".into(), at(10)).unwrap();
-    assert!(sessions.observe_screen("other", Activity::Working, at(11)).unwrap());
+    sessions
+        .observe(
+            "other",
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            "Stop".into(),
+            at(10),
+        )
+        .unwrap();
+    assert!(sessions
+        .observe_screen(
+            "other",
+            || Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                flotilla_schema::Ref::new("convoy", "home"),
+                "coder"
+            )),
+            Activity::Working,
+            at(11)
+        )
+        .unwrap());
     assert_eq!(current(&primitives, "other"), Some((Activity::Working, SCREEN_CAUSE.to_owned())));
 
     // Once the hook's run is older than it stands for, the screen's reading is recorded.
-    sessions.observe("late", Activity::Working, "UserPromptSubmit".into(), at(0)).unwrap();
-    assert!(!sessions.observe_screen("late", Activity::Idle, at(stands - 1)).unwrap());
-    assert!(sessions.observe_screen("late", Activity::Idle, at(stands)).unwrap());
+    sessions
+        .observe(
+            "late",
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Working,
+            "UserPromptSubmit".into(),
+            at(0),
+        )
+        .unwrap();
+    assert!(!sessions
+        .observe_screen(
+            "late",
+            || Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                flotilla_schema::Ref::new("convoy", "home"),
+                "coder"
+            )),
+            Activity::Idle,
+            at(stands - 1)
+        )
+        .unwrap());
+    assert!(sessions
+        .observe_screen(
+            "late",
+            || Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                flotilla_schema::Ref::new("convoy", "home"),
+                "coder"
+            )),
+            Activity::Idle,
+            at(stands)
+        )
+        .unwrap());
     assert_eq!(current(&primitives, "late"), Some((Activity::Idle, SCREEN_CAUSE.to_owned())));
 }
 
@@ -109,7 +241,20 @@ async fn another_homes_session_is_current_until_its_home_falls_silent() {
         }
     }
 
-    writer.sessions().observe_screen("agent", Activity::Working, at(0)).expect("observe");
+    writer
+        .sessions()
+        .observe_screen(
+            "agent",
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Working,
+            at(0),
+        )
+        .expect("observe");
     flotilla_provisioning_testkit::replicate_home_at(&there, "home-b", &here, start);
     until_heard(&mut changes).await;
     let view = reads.read("agent", Some("home-b")).expect("read").expect("held");

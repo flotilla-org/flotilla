@@ -532,9 +532,23 @@ One durable agent conversation: harness and model, the harness's thread or
 conversation id, its transcript and agent home, its grants, and its **Park
 Depth** (`live`, `parked`, `archived`). It outlives any single **Process**;
 reviving it resumes the same conversation on a new process. It fills roles
-through **Role Bindings** (ADR 0059).
+through **Role Bindings** (ADR 0059). It works for one role of one **Convoy**, its
+parent wherever it is shown, even where that convoy is little more than an
+accounting label, and may run on a **Vessel**, where routing to it starts. It is
+the subject a person opens; its terminal and its conversation are its **Facets**
+(#4438).
 _Avoid_: Holder (retired), session (bare: cloud agents, cleat and zellij all
 claim it), TerminalSession, agent (the abstract notion).
+
+**Facet**:
+One way to open a subject: a recipe naming an endpoint (`cleat-session`,
+`agent-session`, `url`, a command) and what opening it shows (`terminal`,
+`conversation`, `page`). A facet is described in the table its facts already
+live in, never stored or computed on its own: a terminal launch is a facet of
+the AgentSession it declares, an AgentSession's conversation a facet of the
+session itself, and a command a template on the subject's table. Opening a
+facet never starts anything; starting and resuming are verbs (#4438).
+_Avoid_: form (retired for agents), view, pane.
 
 **Role Binding**:
 The record that an **AgentSession** fills a **Role Address**, from when until

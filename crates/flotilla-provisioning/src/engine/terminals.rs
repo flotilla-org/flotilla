@@ -56,6 +56,7 @@ pub fn request_of(request: &TerminalLaunchRequest, home: &str) -> Result<Termina
                 brief: Frozen::new(brief.clone()).map_err(|error| format!("freeze the brief: {error}"))?,
             },
         },
+        agent_session: None,
     })
 }
 
@@ -88,6 +89,7 @@ pub fn request_of_old(obj: &flotilla_resources::ResourceObject<OldTerminalSessio
         cwd: spec.cwd.clone(),
         env: spec.env.clone(),
         source,
+        agent_session: None,
     })
 }
 
@@ -200,6 +202,7 @@ fn record_with(view: View<TerminalSessionKind>, facts: Option<FactsView>) -> Ter
         since: time(view.since),
         reading: view.judgement.reading(),
         facts,
+        agent_session: request.agent_session.as_ref().map(|session| session.name.clone()),
         name: view.name,
         home: view.home,
     }

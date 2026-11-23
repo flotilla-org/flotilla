@@ -622,7 +622,14 @@ async fn primitive_diagrams_describe_declared_and_observed_transitions() {
     let mut world = MemoryAgentSessionWorld::default();
     let observed = flotilla_state_machines::Ref::new("end");
     world.ends.put(&observed, EndReason::Completed);
-    sessions.create("session", (), &world, flotilla_schema::Timestamp(1)).unwrap();
+    sessions
+        .create(
+            "session",
+            flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(flotilla_schema::Ref::new("convoy", "home"), "coder"),
+            &world,
+            flotilla_schema::Timestamp(1),
+        )
+        .unwrap();
     sessions.apply("session", End { reason: EndReason::Completed, observed }, &world, flotilla_schema::Timestamp(2)).unwrap();
     let router = HttpRouter::builder()
         .backend(engine_home_backend())
@@ -646,7 +653,17 @@ async fn primitive_diagrams_describe_declared_and_observed_transitions() {
             stream.next().await.unwrap().unwrap();
         }
         let name = if cbor { "new-cbor" } else { "new-json" };
-        sessions.create(name, (), &world, flotilla_schema::Timestamp(3)).unwrap();
+        sessions
+            .create(
+                name,
+                flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ),
+                &world,
+                flotilla_schema::Timestamp(3),
+            )
+            .unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await.unwrap().unwrap().unwrap();
         assert!(matches!(&decode(&event,cbor)[0],Message::Upsert{row,..} if row["resource.name"]==name));
     }
@@ -684,9 +701,23 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
     let mut world = MemoryAgentSessionWorld::default();
     let observed = flotilla_state_machines::Ref::new("end");
     world.ends.put(&observed, EndReason::Completed);
-    sessions.create("ended", (), &world, flotilla_schema::Timestamp(1)).unwrap();
+    sessions
+        .create(
+            "ended",
+            flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(flotilla_schema::Ref::new("convoy", "home"), "coder"),
+            &world,
+            flotilla_schema::Timestamp(1),
+        )
+        .unwrap();
     sessions.apply("ended", End { reason: EndReason::Completed, observed }, &world, flotilla_schema::Timestamp(2)).unwrap();
-    sessions.create("live", (), &world, flotilla_schema::Timestamp(3)).unwrap();
+    sessions
+        .create(
+            "live",
+            flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(flotilla_schema::Ref::new("convoy", "home"), "coder"),
+            &world,
+            flotilla_schema::Timestamp(3),
+        )
+        .unwrap();
     // A daemon composed over the store, serving every resource table from its engine.
     let (_daemon_dir, daemon) = daemon_with_decided_store("home", Arc::clone(&service)).await;
     engine(&daemon);
@@ -727,8 +758,8 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
                 "{table}.{name} whereOperators: {field}"
             );
             if field["type"] == "address" {
-                // A stored address is interned; a resource row's subject address is derived (#4199).
-                if stored.is_some() {
+                // A stored address is interned; a subject row's address is derived (#4199, #4438).
+                if stored.is_some() && schema["subject"]["field"] != name {
                     assert_eq!(column.map(|column| &column.ty), Some(&ColumnType::Interned(ADDRESS_DOMAIN)), "{table}.{name}");
                 }
                 addresses.push(format!("{table}.{name}"));
@@ -1250,4 +1281,79 @@ fn tables_doc_lists_the_where_operators_of_the_code() {
         }
     }
     assert_eq!(covered.len(), 8, "every filterable type is listed");
+}
+
+// Behaviour (#4438): a surface finds its subjects and facets from the tables alone. The listing
+// names the session subject table and every facet table: a terminal launch, a facet of the
+// session its `agent_session` names, and a session, a facet of itself as a conversation. A
+// session's description names its subject, its convoy as its parent and its own facet's fields;
+// a terminal launch's names the session it is a terminal of and the cleat session's fields; the
+// home holding either row is the host their endpoints are on.
+#[tokio::test]
+async fn the_listing_and_descriptions_say_what_a_surface_opens() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(
+            &directory.path().join("surface.db"),
+            "home",
+            crate::runtime::decided_registry().unwrap(),
+        )
+        .unwrap(),
+    );
+    let router = HttpRouter::builder()
+        .backend(engine_home_backend())
+        .table_store(service)
+        .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
+        .build()
+        .into_router();
+    let listed = json(&router, "/tables").await;
+    let subjects = listed["subjects"].as_array().unwrap();
+    assert!(subjects.contains(&serde_json::json!({"table": "agent_session", "kind": "session"})), "{subjects:?}");
+    let facets = listed["facets"].as_array().unwrap();
+    for facet in [
+        serde_json::json!({"table": "terminal_session", "recipe": "cleat-session", "shows": "terminal", "of": "agent_session"}),
+        serde_json::json!({"table": "agent_session", "recipe": "agent-session", "shows": "conversation"}),
+    ] {
+        assert!(facets.contains(&facet), "{facet} in {facets:?}");
+    }
+
+    let field = |schema: &serde_json::Value, name: &str| {
+        schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == name).unwrap_or_else(|| panic!("{name}")).clone()
+    };
+    let key = |schema: &serde_json::Value, column: &str| {
+        schema["foreignKeys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["fields"].as_array().unwrap().last() == Some(&serde_json::json!(column)))
+            .unwrap_or_else(|| panic!("{column}"))
+            .clone()
+    };
+    let session = json(&router, "/tables/agent_session").await;
+    assert_eq!(session["subject"], serde_json::json!({"kind": "session", "field": "address"}));
+    assert_eq!(key(&session, "convoy")["relation"], "parent");
+    assert_eq!(key(&session, "convoy")["reference"]["resource"], "convoy");
+    assert!(key(&session, "vessel").get("relation").is_none(), "a vessel is reached by key, never a level");
+    assert_eq!(session["facets"], serde_json::json!([{"recipe": "agent-session", "shows": "conversation"}]));
+    for (name, role) in [
+        ("resource.home", "host"),
+        ("role", "title"),
+        ("state", "state"),
+        ("state_since", "since"),
+        ("activity", "badge"),
+        ("conversation_transport", "transport"),
+        ("conversation_endpoint", "endpoint"),
+        ("conversation_thread", "thread"),
+    ] {
+        assert!(field(&session, name)["roles"].as_array().unwrap().contains(&serde_json::json!(role)), "{name} is {role}");
+    }
+
+    let terminal = json(&router, "/tables/terminal_session").await;
+    assert_eq!(key(&terminal, "agent_session")["relation"], "facet-of");
+    assert_eq!(key(&terminal, "agent_session")["facet"], serde_json::json!({"recipe": "cleat-session", "shows": "terminal"}));
+    assert_eq!(key(&terminal, "agent_session")["reference"]["resource"], "agent_session");
+    for (name, role) in [("resource.home", "host"), ("identity", "session-id"), ("pool", "pool"), ("state", "state")] {
+        assert!(field(&terminal, name)["roles"].as_array().unwrap().contains(&serde_json::json!(role)), "{name} is {role}");
+    }
+    assert!(terminal.get("subject").is_none() && terminal.get("facets").is_none());
 }

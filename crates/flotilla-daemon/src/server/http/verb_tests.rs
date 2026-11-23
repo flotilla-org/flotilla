@@ -602,6 +602,7 @@ fn sessions_of_coder() -> flotilla_verbs::SubjectTable {
         kind: Kind::Session,
         table: "agent_session",
         address: |row| CODER.parse::<Address>().ok()?.child(Kind::Session, row["resource.name"].as_str()?).ok(),
+        commands: &[],
     }
 }
 
@@ -624,7 +625,17 @@ async fn an_engine_kinds_row_address_acts_on_that_rows_record() {
         Home::<AgentSession, flotilla_engine_store::StoreLog>::with_log("home", flotilla_engine_store::StoreLog::new(service.store()))
             .unwrap();
     for (name, at) in [("s-1", 1), ("s-2", 2), ("s-3", 3)] {
-        sessions.create(name, (), &MemoryAgentSessionWorld::default(), flotilla_schema::Timestamp(at)).unwrap();
+        sessions
+            .create(
+                name,
+                flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ),
+                &MemoryAgentSessionWorld::default(),
+                flotilla_schema::Timestamp(at),
+            )
+            .unwrap();
     }
     let mut registry = VerbRegistry::new();
     registry.register_subject(sessions_of_coder()).unwrap();

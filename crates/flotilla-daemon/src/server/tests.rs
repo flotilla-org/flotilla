@@ -1189,6 +1189,12 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                     .sessions()
                     .observe_screen(
                         &name,
+                        || {
+                            Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                                flotilla_schema::Ref::new("convoy", "home"),
+                                "coder",
+                            ))
+                        },
                         flotilla_state_machines::machines::agent_session::Activity::Working,
                         flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()),
                     )
@@ -5983,7 +5989,19 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
     let service = daemon.decided_store();
     let home = daemon.node_id().as_str().to_owned();
     let primitives = daemon.message_primitives();
-    primitives.sessions().ensure("other-session", flotilla_schema::Timestamp(0)).unwrap();
+    primitives
+        .sessions()
+        .ensure(
+            "other-session",
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            flotilla_schema::Timestamp(0),
+        )
+        .unwrap();
     let other = primitives.sessions().get("other-session").unwrap();
     for harness_name in ["claude-code", "codex"] {
         for http in [false, true] {
@@ -5999,6 +6017,20 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
                 pool: "test".into(),
             };
             let launch = run_session(&daemon, &name, &spec, &Default::default());
+            // The launch's session, as its registration creates it from the launch's vessel.
+            primitives
+                .sessions()
+                .ensure(
+                    &launch,
+                    || {
+                        Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                            flotilla_schema::Ref::new("convoy", "home"),
+                            "coder",
+                        ))
+                    },
+                    flotilla_schema::Timestamp(0),
+                )
+                .unwrap();
             let router = HttpRouter::for_daemon(
                 Arc::clone(&daemon),
                 Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))),
@@ -6120,7 +6152,19 @@ async fn agent_activity_store_failure_preserves_legacy_attention() {
         Resource,
     };
     let (_tmp, daemon, primitives, launch) = activity_failure_test_daemon().await;
-    primitives.sessions().ensure(&launch, Timestamp(0)).unwrap();
+    primitives
+        .sessions()
+        .ensure(
+            &launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Timestamp(0),
+        )
+        .unwrap();
     primitives
         .service()
         .with_store(|store| {
@@ -6132,7 +6176,19 @@ async fn agent_activity_store_failure_preserves_legacy_attention() {
         })
         .unwrap();
     assert!(
-        primitives.sessions().observe(&launch, Activity::Working, "UserPromptSubmit".into(), Timestamp(2)).is_err(),
+        primitives
+            .sessions()
+            .observe(
+                &launch,
+                || Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder"
+                )),
+                Activity::Working,
+                "UserPromptSubmit".into(),
+                Timestamp(2)
+            )
+            .is_err(),
         "the store write really fails"
     );
     for harness in [AgentHarness::ClaudeCode, AgentHarness::Codex] {
@@ -6163,7 +6219,21 @@ async fn agent_activity_duplicates_skip_the_writer() {
     use flotilla_schema::Timestamp;
     use flotilla_state_machines::machines::agent_session::Activity;
     let (_tmp, daemon, primitives, launch) = activity_failure_test_daemon().await;
-    primitives.sessions().observe(&launch, Activity::Working, "UserPromptSubmit".into(), Timestamp(1)).unwrap();
+    primitives
+        .sessions()
+        .observe(
+            &launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Working,
+            "UserPromptSubmit".into(),
+            Timestamp(1),
+        )
+        .unwrap();
     let before = primitives.sessions().get(&launch).unwrap();
     let mut event = AgentHookEvent::builder()
         .attachable_id(AttachableId::new("candidate"))

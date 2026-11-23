@@ -1047,6 +1047,12 @@ pub struct Convoy;
 
 impl Machine for Convoy {
     const NAME: &'static str = "Convoy";
+    /// A convoy's parent is its project, by address; it is titled by what it is a launch of: a
+    /// standing role's name, or its own.
+    const DESCRIBED: &'static [flotilla_schema::Described] = &[
+        flotilla_schema::Described::Parent { column: "project" },
+        flotilla_schema::Described::Role { column: "launch_of", role: "title" },
+    ];
     type Request = ConvoyRequest;
     type Spec = ConvoySpec;
     type State = ConvoyState;

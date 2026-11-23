@@ -256,12 +256,29 @@ async fn held_turn_confirmed(adapter: &str, evidence: Evidence) -> bool {
     let agents = Arc::clone(crew.primitives.sessions());
     // Before the turn, the agent is Idle on its screen, or already Working.
     match evidence {
-        Evidence::PromptSubmit => {
-            agents.observe(&crew.launch, Activity::Working, "UserPromptSubmit".into(), EngineCrew::at(flotilla_resources::clock::now()))
-        }
-        Evidence::Working | Evidence::CodexIdle => {
-            agents.observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(flotilla_resources::clock::now()))
-        }
+        Evidence::PromptSubmit => agents.observe(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Working,
+            "UserPromptSubmit".into(),
+            EngineCrew::at(flotilla_resources::clock::now()),
+        ),
+        Evidence::Working | Evidence::CodexIdle => agents.observe_screen(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            EngineCrew::at(flotilla_resources::clock::now()),
+        ),
     }
     .expect("activity before the turn");
     let mut delivery = crew.delivery();
@@ -277,12 +294,35 @@ async fn held_turn_confirmed(adapter: &str, evidence: Evidence) -> bool {
     let after = flotilla_resources::clock::now() + chrono::Duration::milliseconds(1);
     match evidence {
         Evidence::Working => {
-            agents.observe_screen(&crew.launch, Activity::Working, EngineCrew::at(after)).expect("working");
+            agents
+                .observe_screen(
+                    &crew.launch,
+                    || {
+                        Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                            flotilla_schema::Ref::new("convoy", "home"),
+                            "coder",
+                        ))
+                    },
+                    Activity::Working,
+                    EngineCrew::at(after),
+                )
+                .expect("working");
         }
         Evidence::PromptSubmit => crew.daemon.crew_progress().prompt_submit("agent", after),
         Evidence::CodexIdle => {
             // The notify hook's Idle matches the screen's and is refused; this daemon saw the hook.
-            assert!(!agents.observe(&crew.launch, Activity::Idle, "agent-turn-complete".into(), EngineCrew::at(after)).expect("idle hook"));
+            assert!(!agents
+                .observe(
+                    &crew.launch,
+                    || Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                        flotilla_schema::Ref::new("convoy", "home"),
+                        "coder"
+                    )),
+                    Activity::Idle,
+                    "agent-turn-complete".into(),
+                    EngineCrew::at(after)
+                )
+                .expect("idle hook"));
             crew.daemon.crew_progress().hook("agent", after);
         }
     }
@@ -302,7 +342,19 @@ async fn a_sessions_pending_messages_are_typed_as_one_turn() {
     let pool = lossy_pool();
     let crew = engine_crew("claude-code", pool.clone()).await;
     let agents = Arc::clone(crew.primitives.sessions());
-    agents.observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(flotilla_resources::clock::now())).expect("idle before the turn");
+    agents
+        .observe_screen(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            EngineCrew::at(flotilla_resources::clock::now()),
+        )
+        .expect("idle before the turn");
     let mut delivery = crew.delivery();
     let sent = [
         ("first", "system:turn-rules", MessageRelation::System, "Complete this turn."),
@@ -325,6 +377,12 @@ async fn a_sessions_pending_messages_are_typed_as_one_turn() {
     agents
         .observe_screen(
             &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
             Activity::Working,
             EngineCrew::at(flotilla_resources::clock::now() + chrono::Duration::milliseconds(1)),
         )
@@ -342,7 +400,17 @@ async fn read_typing_turns(count: usize) -> (u64, u64) {
     let crew = engine_crew("claude-code", pool.clone()).await;
     crew.primitives
         .sessions()
-        .observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(flotilla_resources::clock::now()))
+        .observe_screen(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            EngineCrew::at(flotilla_resources::clock::now()),
+        )
         .expect("idle before the turn");
     let mut delivery = crew.delivery();
     for index in 0..count {
@@ -454,7 +522,17 @@ async fn holders_follow_changes_to_the_sessions() {
     let (later, first) = launch_crew(&crew.daemon, &crew.profile, "claude-code", "later", "later-agent").await;
     crew.primitives
         .sessions()
-        .observe_screen(&first, Activity::Idle, EngineCrew::at(flotilla_resources::clock::now()))
+        .observe_screen(
+            &first,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            EngineCrew::at(flotilla_resources::clock::now()),
+        )
         .expect("idle before the turn");
     received(&crew, &mut delivery, &pool, &later, "later-agent", "to-first").await;
 
@@ -477,7 +555,17 @@ async fn holders_follow_changes_to_the_sessions() {
     run_crew_session(&crew.daemon, "claude-code", &second, "later-agent");
     crew.primitives
         .sessions()
-        .observe_screen(&second, Activity::Idle, EngineCrew::at(flotilla_resources::clock::now()))
+        .observe_screen(
+            &second,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            EngineCrew::at(flotilla_resources::clock::now()),
+        )
         .expect("idle before the turn");
     received(&crew, &mut delivery, &pool, &later, "later-agent", "to-second").await;
     let receiver = agents.read(&second, None).expect("read").expect("the second launch's AgentSession");
@@ -591,7 +679,19 @@ async fn a_confirmed_turn_whose_receipt_is_refused_is_not_retyped() {
     let pool = lossy_pool();
     let crew = engine_crew("claude-code", pool.clone()).await;
     let agents = Arc::clone(crew.primitives.sessions());
-    agents.observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(flotilla_resources::clock::now())).expect("idle before the turn");
+    agents
+        .observe_screen(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            EngineCrew::at(flotilla_resources::clock::now()),
+        )
+        .expect("idle before the turn");
     let mut delivery = crew.delivery();
     crew.send("refused-receipt", "system:turn-rules", MessageRelation::System, "wake").await;
     passes(&mut delivery, 20).await;
@@ -625,7 +725,17 @@ async fn a_confirmed_turn_whose_message_ended_is_not_retried() {
     let crew = engine_crew("claude-code", pool.clone()).await;
     crew.primitives
         .sessions()
-        .observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(flotilla_resources::clock::now()))
+        .observe_screen(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            EngineCrew::at(flotilla_resources::clock::now()),
+        )
         .expect("idle before the turn");
     let mut delivery = crew.delivery();
     crew.send("ended-turn", "system:turn-rules", MessageRelation::System, "wake").await;
@@ -665,7 +775,17 @@ async fn an_operator_turn_supersedes_the_sessions_held_system_turns() {
     let crew = engine_crew("claude-code", pool.clone()).await;
     crew.primitives
         .sessions()
-        .observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(flotilla_resources::clock::now()))
+        .observe_screen(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            EngineCrew::at(flotilla_resources::clock::now()),
+        )
         .expect("idle before the turn");
     let mut delivery = crew.delivery();
     crew.send("rule-turn", "system:turn-rules", MessageRelation::System, "Complete this turn.").await;
@@ -689,7 +809,17 @@ async fn native_codex_hooks_confirm_a_held_turn_only_once_the_agent_takes_it_up(
         let crew = engine_crew("codex", pool.clone()).await;
         crew.primitives
             .sessions()
-            .observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(flotilla_resources::clock::now()))
+            .observe_screen(
+                &crew.launch,
+                || {
+                    Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                        flotilla_schema::Ref::new("convoy", "home"),
+                        "coder",
+                    ))
+                },
+                Activity::Idle,
+                EngineCrew::at(flotilla_resources::clock::now()),
+            )
             .expect("idle before the turn");
         let mut delivery = crew.delivery();
         crew.send("held-turn", "system:turn-rules", MessageRelation::System, "wake").await;
@@ -836,7 +966,17 @@ async fn message_delivery_runs_on_events_not_a_timer() {
     let crew = engine_crew("claude-code", pool.clone()).await;
     crew.primitives
         .sessions()
-        .observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(flotilla_resources::clock::now()))
+        .observe_screen(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            EngineCrew::at(flotilla_resources::clock::now()),
+        )
         .expect("idle before the turn");
     let metrics = Arc::new(ControllerLoadMetrics::default());
     let task = tokio::spawn(crew.delivery().run(Arc::clone(&metrics)));
@@ -903,7 +1043,18 @@ async fn a_turn_its_agent_finished_before_a_restart_is_received_after_it() {
     let crew = engine_crew("claude-code", pool.clone()).await;
     let agents = Arc::clone(crew.primitives.sessions());
     agents
-        .observe(&crew.launch, Activity::Idle, "Stop".into(), EngineCrew::at(flotilla_resources::clock::now()))
+        .observe(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            "Stop".into(),
+            EngineCrew::at(flotilla_resources::clock::now()),
+        )
         .expect("idle before the turn");
     crew.send("restart-turn", "system:turn-rules", MessageRelation::System, "wake").await;
     // One pass types the turn; the daemon stops before any pass collects it.
@@ -918,9 +1069,33 @@ async fn a_turn_its_agent_finished_before_a_restart_is_received_after_it() {
     // The agent takes the turn up and finishes it, as its hooks record.
     let typed = flotilla_resources::clock::now();
     agents
-        .observe(&crew.launch, Activity::Working, "UserPromptSubmit".into(), EngineCrew::at(typed + chrono::Duration::seconds(1)))
+        .observe(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Working,
+            "UserPromptSubmit".into(),
+            EngineCrew::at(typed + chrono::Duration::seconds(1)),
+        )
         .expect("working");
-    agents.observe(&crew.launch, Activity::Idle, "Stop".into(), EngineCrew::at(typed + chrono::Duration::seconds(2))).expect("idle");
+    agents
+        .observe(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            "Stop".into(),
+            EngineCrew::at(typed + chrono::Duration::seconds(2)),
+        )
+        .expect("idle");
 
     let mut restarted = crew.restarted_delivery();
     passes(&mut restarted, 20).await;
@@ -939,7 +1114,17 @@ async fn a_graceful_stop_records_the_receipt_of_a_turn_in_flight() {
     let crew = engine_crew("codex", pool.clone()).await;
     crew.primitives
         .sessions()
-        .observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(flotilla_resources::clock::now()))
+        .observe_screen(
+            &crew.launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            EngineCrew::at(flotilla_resources::clock::now()),
+        )
         .expect("idle before the turn");
     let task = tokio::spawn(crew.delivery().run(Arc::new(ControllerLoadMetrics::default())));
     crew.send("stop-turn", "system:turn-rules", MessageRelation::System, "wake").await;

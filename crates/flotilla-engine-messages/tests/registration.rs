@@ -21,23 +21,72 @@ fn a_registered_session_registers_again_without_the_blocking_pool() {
         let home = EngineMessagesHome::open("home-a", NAMESPACE, &backend);
         let primitives = home.primitives();
         let now = || Timestamp::from_datetime(&chrono::Utc::now());
-        let first = primitives.register("session-a", now()).await.expect("register");
+        let first = primitives
+            .register(
+                "session-a",
+                || {
+                    Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                        flotilla_schema::Ref::new("convoy", "home"),
+                        "coder",
+                    ))
+                },
+                now(),
+            )
+            .await
+            .expect("register");
 
         let (release, held) = std::sync::mpsc::channel::<()>();
         let occupant = tokio::task::spawn_blocking(move || held.recv());
 
-        let again = tokio::time::timeout(Duration::from_secs(10), primitives.register("session-a", now()))
-            .await
-            .expect("a registered session registers again while the blocking pool is busy")
-            .expect("register again");
+        let again = tokio::time::timeout(
+            Duration::from_secs(10),
+            primitives.register(
+                "session-a",
+                || {
+                    Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                        flotilla_schema::Ref::new("convoy", "home"),
+                        "coder",
+                    ))
+                },
+                now(),
+            ),
+        )
+        .await
+        .expect("a registered session registers again while the blocking pool is busy")
+        .expect("register again");
         assert_eq!(again, first, "the same consumer");
 
-        let new = tokio::time::timeout(Duration::from_millis(200), primitives.register("session-b", now())).await;
+        let new = tokio::time::timeout(
+            Duration::from_millis(200),
+            primitives.register(
+                "session-b",
+                || {
+                    Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                        flotilla_schema::Ref::new("convoy", "home"),
+                        "coder",
+                    ))
+                },
+                now(),
+            ),
+        )
+        .await;
         assert!(new.is_err(), "a new session waits for the blocking pool to write its record");
 
         release.send(()).expect("release the blocking thread");
         occupant.await.expect("occupant").expect("released");
-        let registered = primitives.register("session-b", now()).await.expect("register a new session");
+        let registered = primitives
+            .register(
+                "session-b",
+                || {
+                    Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                        flotilla_schema::Ref::new("convoy", "home"),
+                        "coder",
+                    ))
+                },
+                now(),
+            )
+            .await
+            .expect("register a new session");
         assert_eq!(registered, primitives.consumer("session-b"));
     });
 }

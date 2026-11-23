@@ -96,7 +96,16 @@ impl Table {
                     } else {
                         (vec![format!("{}.home", column.name), column.name.clone()], vec!["resource.home", "resource.name"])
                     };
-                    json!({"fields":fields,"reference":{"resource":target,"fields":keys}})
+                    let mut key = json!({"fields":fields,"reference":{"resource":target,"fields":keys}});
+                    match &column.link {
+                        Some(crate::Link::Parent) => key["relation"] = json!("parent"),
+                        Some(crate::Link::FacetOf(facet)) => {
+                            key["relation"] = json!("facet-of");
+                            key["facet"] = json!({"recipe": facet.recipe, "shows": facet.shows});
+                        }
+                        None => {}
+                    }
+                    key
                 })
             })
             .collect();
@@ -104,6 +113,13 @@ impl Table {
             json!({"fields":fields,"primaryKey":this.key.iter().map(|column| &column.name).collect::<Vec<_>>(),"foreignKeys":foreign_keys});
         if let Some(subject) = &this.subject {
             schema["subject"] = json!({"kind": subject.kind.as_str(), "field": subject.field});
+        }
+        if !this.facets.is_empty() {
+            schema["facets"] = this.facets.iter().map(|facet| json!({"recipe": facet.recipe, "shows": facet.shows})).collect();
+        }
+        if !this.commands.is_empty() {
+            schema["commands"] =
+                this.commands.iter().map(|command| json!({"name": command.name, "shows": command.shows, "argv": command.argv})).collect();
         }
         schema
     }
@@ -195,6 +211,77 @@ mod tests {
         assert!(sample(None).get("subject").is_none());
         assert!(std::panic::catch_unwind(|| sample(Some("name"))).is_err(), "a text key is no address");
     }
+    // #4438: what a kind declares for surfaces reaches its description. A parent reference and a
+    // facet-of reference mark their foreign keys, the facet with its recipe and what it shows; a
+    // parent address takes the `parent` role; roles join the column's; a facet of the row itself
+    // and a command template are the schema's. A plain reference is no link, and a table that
+    // declares none has neither `facets` nor `commands`.
+    #[test]
+    fn declared_links_facets_and_commands_reach_the_description() {
+        let mut layout = Layout::description("sample");
+        layout.key(|layout| layout.column("name", ColumnType::Text, true));
+        for reference in ["convoy", "session", "vessel"] {
+            layout.column(reference, ColumnType::Ref, false);
+            layout.reference(reference);
+        }
+        layout.column("project", ColumnType::Interned(crate::ADDRESS_DOMAIN), true);
+        layout.address();
+        layout.column("pool", ColumnType::Text, true);
+        let mut set = layout.finish();
+        let plain = set.tables[0].frictionless();
+        assert!(plain.get("facets").is_none() && plain.get("commands").is_none());
+        set.describe(&[
+            crate::Described::Parent { column: "convoy" },
+            crate::Described::FacetOf { column: "session", recipe: "cleat-session", shows: "terminal" },
+            crate::Described::Parent { column: "project" },
+            crate::Described::Role { column: "pool", role: "pool" },
+            crate::Described::Facet { recipe: "agent-session", shows: "conversation" },
+        ]);
+        let mut table = set.tables.remove(0);
+        table.commands.push(crate::Command {
+            name: "attach".into(),
+            shows: "terminal".into(),
+            argv: vec!["flotilla".into(), "{name}".into()],
+        });
+        let schema = table.frictionless();
+        let key = |column: &str| {
+            schema["foreignKeys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|key| key["fields"].as_array().unwrap().contains(&json!(column)))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(key("convoy")["relation"], "parent");
+        assert_eq!(key("session")["relation"], "facet-of");
+        assert_eq!(key("session")["facet"], json!({"recipe": "cleat-session", "shows": "terminal"}));
+        assert!(key("vessel").get("relation").is_none() && key("vessel").get("facet").is_none());
+        let roles = |name: &str| schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == name).unwrap()["roles"].clone();
+        assert_eq!(roles("project"), json!(["parent"]));
+        assert_eq!(roles("pool"), json!(["pool"]));
+        assert_eq!(schema["facets"], json!([{"recipe": "agent-session", "shows": "conversation"}]));
+        assert_eq!(schema["commands"], json!([{"name": "attach", "shows": "terminal", "argv": ["flotilla", "{name}"]}]));
+    }
+
+    // #4438: a declaration naming no column of the table, a parent that is neither a reference nor
+    // an address, or a facet-of mark on no reference is the kind's error, found when its table set
+    // is built.
+    #[test]
+    fn a_declaration_the_table_cannot_carry_is_refused() {
+        for mark in [
+            crate::Described::Role { column: "missing", role: "title" },
+            crate::Described::Parent { column: "pool" },
+            crate::Described::FacetOf { column: "pool", recipe: "url", shows: "page" },
+        ] {
+            let mut layout = Layout::description("sample");
+            layout.key(|layout| layout.column("name", ColumnType::Text, true));
+            layout.column("pool", ColumnType::Text, true);
+            let mut set = layout.finish();
+            assert!(std::panic::catch_unwind(move || set.describe(&[mark])).is_err(), "{mark:?}");
+        }
+    }
+
     // ADR 0067: field types come from the descriptor, independent of source. Generate
     // every native type and both nullabilities; semantic extensions survive rendering.
     #[hegel::test]

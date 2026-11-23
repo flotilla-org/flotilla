@@ -39,6 +39,12 @@ pub struct VesselKind;
 impl LifecycleKind for VesselKind {
     const NAME: &'static str = "Vessel";
     type Request = VesselSpec;
+    /// A vessel is no level of a surface's tree: it is reached by key, for routing and for the
+    /// badges of what runs on it.
+    const DESCRIBED: &'static [flotilla_schema::Described] = &[
+        flotilla_schema::Described::Role { column: "host", role: "badge" },
+        flotilla_schema::Described::Role { column: "class", role: "badge" },
+    ];
     fn launch(request: &VesselSpec) -> Option<(&str, u64)> {
         Some((&request.launch_of, request.launch))
     }

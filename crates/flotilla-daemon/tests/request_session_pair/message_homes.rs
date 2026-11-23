@@ -201,7 +201,19 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     assert!(homed(&engine_a, &receiver, &request).await.is_none(), "the sender's home authors nothing");
 
     // B delivers it to the crew's AgentSession, receipt first.
-    let consumer = engine_b.register(&launch, Timestamp(1)).await.expect("consumer");
+    let consumer = engine_b
+        .register(
+            &launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Timestamp(1),
+        )
+        .await
+        .expect("consumer");
     let inbox_b = engine_b.inbox();
     inbox_b.bind(sent.spec().inbox.clone(), consumer.clone()).await.expect("bind");
     use futures::StreamExt;

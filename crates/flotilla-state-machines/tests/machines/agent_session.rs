@@ -15,7 +15,13 @@ fn at(micros: i64) -> Timestamp {
 
 fn home() -> Home<AgentSession> {
     let mut home = Home::<AgentSession>::new("kiwi").expect("valid declaration");
-    home.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("created");
+    home.create(
+        "s",
+        flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(flotilla_schema::Ref::new("convoy", "home"), "coder"),
+        &MemoryAgentSessionWorld::default(),
+        Timestamp(0),
+    )
+    .expect("created");
     home
 }
 
@@ -111,7 +117,16 @@ fn a_receipt_is_a_receive_edge_about_its_message() {
 fn create_makes_a_live_detached_session_once() {
     let mut h = home();
     assert_eq!(*state(&h), live(Channel::Detached));
-    assert_eq!(h.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(0)).err(), Some(WriteError::Exists("s".into())));
+    assert_eq!(
+        h.create(
+            "s",
+            flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(flotilla_schema::Ref::new("convoy", "home"), "coder"),
+            &MemoryAgentSessionWorld::default(),
+            Timestamp(0)
+        )
+        .err(),
+        Some(WriteError::Exists("s".into()))
+    );
     assert_eq!(h.apply("other", attach(), &channel(Some(true)), at(1)).err(), Some(WriteError::Unknown("other".into())));
 }
 

@@ -79,7 +79,13 @@ pub struct SessionPort<L: Log<AgentSession>> {
 impl<L: Log<AgentSession>> SessionPort<L> {
     pub fn new(name: &str, log: L) -> Self {
         let mut home = Home::with_log("test", log).expect("session declaration");
-        home.create(name, (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("create consumer");
+        home.create(
+            name,
+            flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(flotilla_schema::Ref::new("convoy", "home"), "coder"),
+            &MemoryAgentSessionWorld::default(),
+            Timestamp(0),
+        )
+        .expect("create consumer");
         Self { home, name: name.into() }
     }
     pub fn resource(&self) -> &Resource<AgentSession> {

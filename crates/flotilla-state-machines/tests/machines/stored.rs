@@ -160,7 +160,14 @@ fn resources_survive_the_codec() {
     assert_eq!((message.spec(), message.since()), (&spec, Timestamp(1)));
 
     let mut sessions = Home::<AgentSession>::new("home").expect("valid");
-    sessions.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(2)).expect("created");
+    sessions
+        .create(
+            "s",
+            flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(flotilla_schema::Ref::new("convoy", "home"), "coder"),
+            &MemoryAgentSessionWorld::default(),
+            Timestamp(2),
+        )
+        .expect("created");
     round_trip(&sessions, "s");
 
     let mut convoys = Home::<Convoy>::new("home").expect("valid");

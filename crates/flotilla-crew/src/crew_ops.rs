@@ -910,7 +910,7 @@ impl CrewService {
                 };
                 let crew = session.and_then(|session| session.status.as_ref()).and_then(|status| status.crew.as_ref());
                 let agent = session.and_then(|session| {
-                    let launch = flotilla_resources::terminal_records::launch_of(session)?;
+                    let launch = flotilla_resources::terminal_records::agent_session_of(session)?;
                     match self.lifecycle_reads.agent_sessions().and_then(|reads| reads.read(launch, origin)) {
                         Ok(agent) => agent,
                         Err(error) => {
