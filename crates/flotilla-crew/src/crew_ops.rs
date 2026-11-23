@@ -305,17 +305,6 @@ fn crew_brief_repo_roots(
     roots
 }
 
-// Pending follow-ups on terminal convoys are ignored (#3430),
-// including when a name is selected. No name means all live convoys in the namespace.
-fn convoy_names_query(name: Option<&str>, include_replicas: bool) -> StoreQuery {
-    let mut query = flotilla_store::live_convoys_query();
-    query.include_replicas = include_replicas;
-    if let Some(name) = name {
-        query.fields.insert("metadata.name".into(), name.into());
-    }
-    query
-}
-
 fn crew_change_request_query(
     convoy: &ResourceObject<ResourceConvoy>,
     forges: &[flotilla_resources::ForgeSpec],
@@ -3250,23 +3239,31 @@ impl CrewService {
     }
     async fn reconcile_pending_supervisor_turns_selected(&self, namespace: &str, name: Option<&str>) -> Result<(), String> {
         let convoys = self.resource_backend.using::<ResourceConvoy>(namespace);
-        let mut candidates = convoys.query_declared(&convoy_names_query(name, false)).await.map_err(|error| error.to_string())?.items;
-        // Only a convoy listed with a follow-up pending has one to continue: one that gains one
-        // after this read is a notes change, which wakes the next pass.
-        candidates.retain(|source| {
-            source
-                .object
-                .status
-                .iter()
-                .flat_map(|status| status.crew_work.values())
-                .flat_map(|crew| crew.values())
-                .any(|state| state.pending_follow_up.is_some())
+        // A follow-up is a note of this home's: only a launch noted with one has one to continue,
+        // and one noted after this read is a notes change, which wakes the next pass. Follow-ups
+        // on terminal convoys are ignored (#3430), including when a name is selected.
+        let noted = self.lifecycle_reads.convoys()?.memory().pending_follow_ups();
+        let mut candidates = Vec::new();
+        for launch in noted.into_iter().filter(|launch| name.is_none_or(|name| name == launch)) {
+            match convoys.get(&launch).await {
+                Ok(convoy) => candidates.push(convoy),
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        candidates.retain(|convoy| {
+            convoy.status.as_ref().is_some_and(|status| !status.phase.is_terminal())
+                && convoy
+                    .status
+                    .iter()
+                    .flat_map(|status| status.crew_work.values())
+                    .flat_map(|crew| crew.values())
+                    .any(|state| state.pending_follow_up.is_some())
         });
         tracing::Span::current().record("pending", candidates.len());
         // Each follow-up is read in its seat's inbox: the crew member it was sent to.
         let mut references = BTreeMap::<String, Vec<(String, String)>>::new();
-        for source in &candidates {
-            let convoy = &source.object;
+        for convoy in &candidates {
             let project = convoy.spec.project_ref.as_str();
             for (vessel, crew) in convoy.status.iter().flat_map(|status| &status.crew_work) {
                 for (role, state) in crew {
@@ -3284,8 +3281,7 @@ impl CrewService {
             }
         }
         // Reconciliation owns every queued continuation; interactive callers select one convoy.
-        for source in candidates {
-            let candidate = source.object;
+        for candidate in candidates {
             let lock = self.convoy_message_lock(namespace, &candidate.metadata.name).await;
             let _guard = lock.lock().await;
             let current = convoys.get(&candidate.metadata.name).await.map_err(|error| error.to_string())?;

@@ -1768,8 +1768,6 @@ mod tests {
                 }
             }
             let (launch, crew) = target.expect("the target");
-            // The views are filled once, at their first read, as a running daemon's already are.
-            fixture.home.convoys.settled().await;
             fixture.backend.using::<flotilla_resources::TerminalSession>("flotilla").list().await.expect("the session views");
             let mut costs = Vec::new();
             for (project, crew, convoy) in
@@ -1848,8 +1846,6 @@ mod tests {
                     )
                     .await;
             }
-            // The views are filled once, at their first read, as a running daemon's already are.
-            fixture.home.convoys.settled().await;
             fixture.backend.using::<flotilla_resources::TerminalSession>("flotilla").list().await.expect("the session views");
             let (explanation, reads) = measure(fixture.projections().explain_convoy("flotilla", "guide@flotilla")).await;
             let explanation = explanation.expect("explain");

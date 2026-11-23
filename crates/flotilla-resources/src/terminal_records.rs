@@ -361,6 +361,9 @@ pub trait TerminalRecords: Send + Sync {
     /// `name` held at `home`, or at this home when `None`. A launch name (`<session>#<n>`) reads
     /// that launch; a session's name reads its newest launch there.
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<TerminalRecord>, String>;
+    /// Session (or launch) `name` at each home holding it, read by key at each: a session's name
+    /// reads its newest launch there.
+    fn named(&self, name: &str) -> Result<Vec<TerminalRecord>, String>;
     /// Every launch held at `home`, ended or not.
     fn at(&self, home: &str) -> Result<Vec<TerminalRecord>, String>;
     /// This home's launches that have not ended: requested or running. Its cost follows them,
@@ -370,6 +373,14 @@ pub trait TerminalRecords: Send + Sync {
     fn every(&self) -> Result<Vec<TerminalRecord>, String>;
     /// Every launch held for `vessel`, across homes.
     fn of_vessel(&self, vessel: &str) -> Result<Vec<TerminalRecord>, String>;
+    /// Every launch held for each of `vessels`, across homes, in one read.
+    fn of_vessels(&self, vessels: &[String]) -> Result<Vec<TerminalRecord>, String> {
+        let mut records = Vec::new();
+        for vessel in vessels {
+            records.extend(self.of_vessel(vessel)?);
+        }
+        Ok(records)
+    }
     /// Every launch that runs in environment `environment` at `home`.
     fn of_environment(&self, environment: &str, home: &str) -> Result<Vec<TerminalRecord>, String>;
     /// The launch that serves `request` at this home: the session's newest launch when that has

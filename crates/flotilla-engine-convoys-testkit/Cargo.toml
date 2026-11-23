@@ -7,6 +7,7 @@ publish = false
 description = "Dev-only: the engine Convoy path at a home over a decided store, served as the backend's Convoy, and launches admitted on it"
 
 [dependencies]
+flotilla-address = { path = "../flotilla-address" }
 flotilla-engine-convoys = { path = "../flotilla-engine-convoys" }
 flotilla-engine-store = { path = "../flotilla-engine-store" }
 flotilla-engine-messages = { path = "../flotilla-engine-messages" }

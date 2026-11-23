@@ -1274,40 +1274,9 @@ impl ReadProjections<'_> {
         let typed = flotilla_store::ConvoyName::parse(name);
         let project = typed.placed(self.backend, namespace).await?;
         let convoy_name = flotilla_store::ConvoyName { project: project.as_deref(), name: typed.name };
-        let selected_query = convoy_name.query();
-        let mut linked = Vec::new();
-        for target in ["spec.subjects.*.subject", "status.subjects.*.subject"] {
-            for source in ["spec.subjects.*.subject", "status.subjects.*.subject"] {
-                linked.push(StoreQuery::related(target, source, selected_query.clone()));
-            }
-        }
-        // The live generations of the standing role a candidate was ensured from, so the receiver
-        // evidence can tell whether it is that role's current generation.
-        let ensured_from = format!("metadata.annotations.\"{}\"", flotilla_resources::ENSURED_FROM_ANNOTATION);
-        let mut generations = flotilla_store::live_convoys_query();
-        generations.field_matches_query = StoreQuery::related(&ensured_from, &ensured_from, selected_query.clone()).field_matches_query;
-        // Select candidate identities, their roles' live generations and linked landed evidence in
-        // one indexed operation; `ConvoyName::select` owns the role, record and ambiguity rules.
-        let mut convoy_sources = self
-            .backend
-            .query_declared::<ResourceConvoy>(
-                namespace,
-                &StoreQuery {
-                    any_of: Some(vec![
-                        selected_query,
-                        generations,
-                        StoreQuery {
-                            fields: BTreeMap::from([("status.phase".into(), "Landed".into())]),
-                            any_of: (!linked.is_empty()).then_some(linked),
-                            ..Default::default()
-                        },
-                    ]),
-                    include_replicas: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        // The candidate identities: the role's live holders through its index, or every holder
+        // where none is live; `ConvoyName::select` owns the role, record and ambiguity rules.
+        let mut convoy_sources = flotilla_resources::ReadResourceList { items: convoy_name.candidates(self.backend, namespace).await? };
         // A retired record leaves the indexed selection; it still reads by name.
         if convoy_name.select(&convoy_sources.items)?.is_none() {
             let named = self
@@ -1322,7 +1291,27 @@ impl ReadProjections<'_> {
         if convoy_name.select(&convoy_sources.items)?.is_none() {
             convoy_sources.items.extend(convoy_name.newest_launch(self.backend, namespace).await?);
         }
-        let convoy_source = convoy_name.select(&convoy_sources.items)?.ok_or_else(|| format!("no convoy matches `{convoy_name}`"))?;
+        let convoy_source = convoy_name.select(&convoy_sources.items)?.ok_or_else(|| format!("no convoy matches `{convoy_name}`"))?.clone();
+        // The live generations of the standing role the convoy was ensured from, read through the
+        // launch index by the role's project and launch name, so the receiver evidence can tell
+        // whether it is that role's current generation.
+        let labels = &convoy_source.object.metadata.labels;
+        if let (Some(ensure), Some(project), Some(launch_of)) = (
+            convoy_source.object.metadata.annotations.get(flotilla_resources::ENSURED_FROM_ANNOTATION),
+            labels.get(flotilla_resources::labels::PROJECT_LABEL),
+            labels.get(flotilla_resources::labels::LAUNCH_OF_LABEL),
+        ) {
+            let mut generations = flotilla_store::live_convoys_query();
+            generations.fields =
+                BTreeMap::from([(format!("metadata.annotations.\"{}\"", flotilla_resources::ENSURED_FROM_ANNOTATION), ensure.clone())]);
+            generations.labels = BTreeMap::from([
+                (flotilla_resources::labels::PROJECT_LABEL.to_owned(), project.clone()),
+                (flotilla_resources::labels::LAUNCH_OF_LABEL.to_owned(), launch_of.clone()),
+            ]);
+            let read = self.backend.query_declared::<ResourceConvoy>(namespace, &generations).await.map_err(|error| error.to_string())?;
+            convoy_sources.items.extend(read.items);
+        }
+        let convoy_source = &convoy_source;
         // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8),
         // with what its log records of them.
         let convoy = flotilla_resources::convoy::engine::recorded_read(self.convoy_engine, convoy_source)?;
@@ -1496,11 +1485,39 @@ impl ReadProjections<'_> {
             .values()
             .filter_map(|(object, _)| Some((spec_record_name(&object.spec, &forges)?, object.clone())))
             .collect::<BTreeMap<_, _>>();
-        // Match the shared catalog: any linked landed convoy makes a merged
-        // request closed, even when the convoy being explained is still live.
+        // Match the shared catalog: any landed convoy that declared or linked a subject makes a
+        // merged request closed, even when the convoy being explained is still live. Convoys that
+        // linked one are read through the subject index; those that declared one, which only
+        // their admission holds, through the project's launches that ended.
+        let convoys = self.lifecycles.convoys()?;
+        let mut linked_names = BTreeSet::new();
+        for row in &subjects {
+            let Ok(address) = flotilla_resources::address::subject_address(&row.subject, &forges) else { continue };
+            linked_names.extend(convoys.linked_to(&address)?.records.into_iter().map(|record| record.name));
+        }
+        if !subjects.is_empty() {
+            let declared = convoys.of_project(&convoy.spec.project_ref)?.records.into_iter().filter(|record| {
+                record.ended.is_some()
+                    && record.admission.subjects.iter().any(|declared| {
+                        subjects.iter().any(|row| flotilla_resources::address::same_subject(&declared.subject, &row.subject, &forges))
+                    })
+            });
+            linked_names.extend(declared.map(|record| record.name));
+        }
+        let linked = match linked_names.is_empty() {
+            true => Vec::new(),
+            false => {
+                self.backend
+                    .query_declared::<ResourceConvoy>(namespace, &StoreQuery::names(linked_names, true))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .items
+            }
+        };
         let landed_subjects = convoy_sources
             .items
             .iter()
+            .chain(&linked)
             .filter(|source| source.object.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Landed))
             .flat_map(|source| convoy_subject_rows(&source.object, &reference_context))
             .map(|row| row.subject)

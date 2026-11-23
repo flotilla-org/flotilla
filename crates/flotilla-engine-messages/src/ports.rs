@@ -56,6 +56,9 @@ pub struct RoutedSession {
     pub session: String,
     /// The convoy it is crew of: routing it again needs that convoy's records.
     pub convoy: String,
+    /// The role it is crew in, when its view names one: only sessions of the same role in the
+    /// same convoy compete for what it holds.
+    pub role: Option<String>,
     /// Whether it claims an adopted role.
     pub claims: bool,
 }
@@ -191,6 +194,7 @@ impl RoleBindings for RoleRouting {
             routed.candidates.push(RoutedSession {
                 session: terminal.metadata.name.clone(),
                 convoy: context.convoy.clone(),
+                role: terminal.metadata.labels.get(ROLE_LABEL).cloned(),
                 claims: terminal.metadata.annotations.contains_key(ROLE_ADDRESS_ANNOTATION),
             });
             let held = observed.convoy(keyed, namespace, &context.convoy).await?;

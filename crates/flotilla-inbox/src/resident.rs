@@ -101,7 +101,7 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Rec
             MessageBody::Request(RequestBody::CheckoutInspection { remote: _ }) => 0,
             MessageBody::Request(RequestBody::ChangeRequestBranch { branch }) => branch.capacity(),
             MessageBody::Request(RequestBody::Convoy(request)) => {
-                let ConvoyRequest { launch_of, workflow_ref, admission, project, promises, duties, seats, priority: _, kinds } =
+                let ConvoyRequest { launch_of, role, workflow_ref, admission, project, promises, duties, seats, priority: _, kinds } =
                     request.as_ref();
                 let nodes = |len: usize, slot: usize| if len == 0 { 0 } else { len.saturating_mul(2).max(11) * slot + (len / 5 + 1) * 96 };
                 let seat = |seat: &SeatName| seat.role.capacity() + seat.seat.capacity();
@@ -111,6 +111,7 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Rec
                 };
                 size_of::<ConvoyRequest>()
                     + launch_of.capacity()
+                    + role.capacity()
                     + workflow_ref.capacity()
                     + heap_address(project)
                     + nodes(promises.len(), size_of::<(PromiseId, AdmittedPromise)>())

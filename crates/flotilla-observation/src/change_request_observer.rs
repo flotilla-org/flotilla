@@ -12,6 +12,7 @@ use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     address::{stored_spelling_names, subject_address},
     checkout_records::{CheckoutChange, CheckoutHolder, Launches},
+    convoy_records::ConvoyChange,
     convoy_subject_rows,
     lifecycle_reads::LifecycleReads,
     merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestReviewObservation,
@@ -89,6 +90,17 @@ pub struct ConvoyDemands {
     /// Each ended convoy, by launch, found holding no checkout still to be released. Nothing is
     /// held for an ended convoy again, so it is not read again.
     released: HashSet<String>,
+    /// What each convoy that has not retired wants, by launch: read again only when it changes,
+    /// or when what resolves its change requests does.
+    wants: HashMap<String, ConvoyWants>,
+}
+
+/// What one convoy wants observed: its change requests' addresses and the branches whose change
+/// request is to be found.
+#[derive(Debug, Default)]
+struct ConvoyWants {
+    addresses: Vec<Address>,
+    branches: Vec<(Address, String)>,
 }
 
 impl ConvoyDemands {
@@ -100,8 +112,11 @@ impl ConvoyDemands {
 
 /// What woke the convoy demand watch.
 enum DemandEvent {
-    /// A convoy, or what resolves its change requests, changed.
+    /// What resolves the convoys' change requests changed, or the convoys moved unseen: every
+    /// convoy is read again.
     Convoys,
+    /// Convoy launch `name`, or a record about it, was written: it alone is read again.
+    Convoy(String),
     /// A checkout changed: an ended convoy may have had its last checkout released.
     Checkout(CheckoutChange),
 }
@@ -230,7 +245,17 @@ impl ChangeRequestRefresher {
                 streams.push(checkout_events(changes));
             }
             let mut subscription_error = None;
-            for kind in ["Convoy", "Project", "Repository", "Host", "Forge"] {
+            // A convoy's change is its engine record's, heard from the log by name: what its
+            // vessels and sessions do changes nothing it wants.
+            match self.inner.lifecycle.get().map(|reads| reads.convoys().map(|convoys| convoys.changes())) {
+                Some(Ok(changes)) => streams.push(convoy_events(changes)),
+                Some(Err(error)) => subscription_error = Some(ResourceError::other(error)),
+                None => subscription_error = Some(ResourceError::other("the change request observer has no lifecycle reads installed")),
+            }
+            for kind in ["Project", "Repository", "Host", "Forge"] {
+                if subscription_error.is_some() {
+                    break;
+                }
                 match watch_resource_kind_including_replicas(&self.inner.backend, namespace, kind).await {
                     Ok(watch) => streams.push(
                         watch
@@ -254,29 +279,38 @@ impl ChangeRequestRefresher {
                 // A fresh subscription may have missed anything: every holding convoy's checkouts
                 // are read again, and every convoy is listed.
                 let mut convoys_changed = true;
+                let mut changed = BTreeSet::new();
                 let mut checkout_changes = vec![CheckoutChange::Rescanned];
                 'reconcile: loop {
                     // A convoy whose last checkout was released wants its change requests no more.
                     if !checkout_changes.is_empty() && self.recheck_holding(&mut demands, &checkout_changes).await {
                         convoys_changed = true;
                     }
-                    if convoys_changed {
-                        if let Err(error) = self.reconcile_convoy_demands(namespace, &mut demands).await {
-                            tracing::warn!(%error, "change request convoy demand reconciliation failed");
-                            break;
-                        }
+                    let reconciled = if convoys_changed {
+                        self.reconcile_convoy_demands(namespace, &mut demands).await
+                    } else if !changed.is_empty() {
+                        self.reconcile_changed_convoys(namespace, &mut demands, &changed).await
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(error) = reconciled {
+                        tracing::warn!(%error, "change request convoy demand reconciliation failed");
+                        break;
                     }
                     retry_delay = Duration::from_secs(1);
                     convoys_changed = false;
+                    changed.clear();
                     checkout_changes.clear();
                     match events.next().await {
                         Some(Ok(event)) => {
-                            absorb(event, &demands, &mut convoys_changed, &mut checkout_changes);
+                            absorb(event, &demands, &mut convoys_changed, &mut changed, &mut checkout_changes);
                             // Collapse bursts into one re-list without delaying isolated
                             // changes. Bound the drain so a busy source cannot starve it.
                             for _ in 0..64 {
                                 match events.next().now_or_never() {
-                                    Some(Some(Ok(event))) => absorb(event, &demands, &mut convoys_changed, &mut checkout_changes),
+                                    Some(Some(Ok(event))) => {
+                                        absorb(event, &demands, &mut convoys_changed, &mut changed, &mut checkout_changes)
+                                    }
                                     Some(Some(Err(error))) => {
                                         tracing::warn!(%error, "change request convoy demand watch failed; relisting");
                                         break 'reconcile;
@@ -389,6 +423,8 @@ impl ChangeRequestRefresher {
         }
     }
 
+    /// Reads every convoy that has not retired again and what it wants, then demands what they
+    /// want together.
     async fn reconcile_convoy_demands(&self, namespace: &str, demands: &mut ConvoyDemands) -> Result<(), String> {
         let cleanup_result = self.release_unlinked_history(namespace).await;
         if let Err(error) = &cleanup_result {
@@ -401,17 +437,6 @@ impl ChangeRequestRefresher {
             .await
             .map_err(|error| error.to_string())?;
         let forges = self.forges(namespace).await?;
-        let mut wanted = HashSet::new();
-        let mut owners = HashMap::new();
-        let mut branches = HashSet::new();
-        for copy in &convoys.items {
-            branches.extend(unproduced_branches(&copy.object, &forges));
-        }
-        self.reconcile_branch_probes(namespace, branches).await?;
-        let mut addresses = Vec::new();
-        for copy in convoys.items {
-            addresses.extend(change_request_subjects(&copy.object, &forges));
-        }
         // A landed convoy can hold only the engine's checkouts; without them it holds nothing, and
         // the old store's retained landed convoys are not read.
         let ended_query = match self.inner.lifecycle.get() {
@@ -419,29 +444,90 @@ impl ChangeRequestRefresher {
             None => flotilla_store::abandoned_convoys_query(),
         };
         let ended = self.inner.backend.query_declared::<Convoy>(namespace, &ended_query).await.map_err(|error| error.to_string())?;
-        let mut still_held = HashSet::new();
-        for copy in ended.items {
-            let convoy = copy.object.metadata.name.clone();
-            // An abandoned convoy still held is observed for the change requests its Submitted pr
-            // promises name, until each resolves (#3108 ruling 1): the resolution releases the demand.
-            if let Some(status) = copy.object.status.as_ref().filter(|status| status.phase != ConvoyPhase::Landed) {
-                for address in flotilla_resources::convoy::promises::ended_submissions(status, &forges) {
-                    addresses.push((convoy.clone(), address));
-                }
-            }
-            // Any ended convoy is observed for its change requests while it holds a checkout still
-            // to be released: that release is judged against them.
-            let subjects = change_request_subjects(&copy.object, &forges);
-            if !subjects.is_empty() && self.holds_unreleased(demands, &convoy).await {
-                addresses.extend(subjects);
-            }
-            still_held.insert(convoy);
+        let mut wants = HashMap::new();
+        for copy in convoys.items.into_iter().chain(ended.items) {
+            let convoy = copy.object;
+            wants.insert(convoy.metadata.name.clone(), self.convoy_wants(demands, &convoy, &forges).await);
         }
         // A convoy no longer listed has retired.
-        demands.holding.retain(|convoy, _| still_held.contains(convoy));
-        demands.released.retain(|convoy| still_held.contains(convoy));
+        demands.holding.retain(|convoy, _| wants.contains_key(convoy));
+        demands.released.retain(|convoy| wants.contains_key(convoy));
+        demands.wants = wants;
+        self.demand_wanted(namespace, demands).await?;
+        // Complete independent demand updates before retrying failed cleanup.
+        cleanup_result
+    }
+
+    /// Reads convoys `changed` again, by name, and what each wants now, then demands what every
+    /// convoy wants together. A convoy no longer found has retired.
+    async fn reconcile_changed_convoys(
+        &self,
+        namespace: &str,
+        demands: &mut ConvoyDemands,
+        changed: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        let forges = self.forges(namespace).await?;
+        let convoys = self.inner.backend.including_replicas::<Convoy>(namespace);
+        let mut cleanup_result = Ok(());
+        for name in changed {
+            let convoy = match convoys.get(name).await {
+                Ok(read) => read.object,
+                Err(ResourceError::NotFound { .. }) => {
+                    demands.wants.remove(name);
+                    demands.holding.remove(name);
+                    demands.released.remove(name);
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            if let Err(error) = self.release_unlinked_by(namespace, &convoy, &forges).await {
+                tracing::warn!(convoy = %name, %error, "release unlinked change request history failed");
+                cleanup_result = Err(error);
+            }
+            let wants = self.convoy_wants(demands, &convoy, &forges).await;
+            demands.wants.insert(name.clone(), wants);
+        }
+        self.demand_wanted(namespace, demands).await?;
+        cleanup_result
+    }
+
+    /// What `convoy` wants observed. A live convoy wants its change requests and the branches it
+    /// has produced none on yet. An ended one wants the change requests its Submitted pr promises
+    /// name while it is abandoned and held, and its change requests while it holds a checkout
+    /// still to be released: that release is judged against them.
+    async fn convoy_wants(&self, demands: &mut ConvoyDemands, convoy: &ResourceObject<Convoy>, forges: &[ForgeSpec]) -> ConvoyWants {
+        let name = convoy.metadata.name.clone();
+        let subjects = || change_request_subjects(convoy, forges).into_iter().map(|(_, address)| address).collect::<Vec<_>>();
+        let Some(status) = convoy.status.as_ref().filter(|status| status.phase.is_terminal()) else {
+            return ConvoyWants { addresses: subjects(), branches: unproduced_branches(convoy, forges) };
+        };
+        let mut addresses = Vec::new();
+        // An abandoned convoy still held is observed for the change requests its Submitted pr
+        // promises name, until each resolves (#3108 ruling 1): the resolution releases the demand.
+        if status.phase != ConvoyPhase::Landed {
+            addresses.extend(flotilla_resources::convoy::promises::ended_submissions(status, forges));
+        }
+        let held = subjects();
+        if !held.is_empty() && self.holds_unreleased(demands, &name).await {
+            addresses.extend(held);
+        }
+        ConvoyWants { addresses, branches: Vec::new() }
+    }
+
+    /// Demands every change request the convoys want that this observer owns, releases the
+    /// demands no convoy wants any more, and schedules the wanted branches.
+    async fn demand_wanted(&self, namespace: &str, demands: &mut ConvoyDemands) -> Result<(), String> {
+        let branches = demands.wants.values().flat_map(|wants| wants.branches.iter().cloned()).collect::<HashSet<_>>();
+        self.reconcile_branch_probes(namespace, branches).await?;
+        let mut wanted = HashSet::new();
+        let mut owners = HashMap::new();
+        let addresses = demands
+            .wants
+            .iter()
+            .flat_map(|(convoy, wants)| wants.addresses.iter().map(move |address| (convoy, address)))
+            .collect::<Vec<_>>();
         for (convoy, address) in addresses {
-            let subject = match ChangeRequestKey::new(namespace, address) {
+            let subject = match ChangeRequestKey::new(namespace, address.clone()) {
                 Ok(subject) => subject,
                 Err(error) => {
                     tracing::debug!(%convoy, %error, "convoy change request subject has no observation key");
@@ -475,8 +561,7 @@ impl ChangeRequestRefresher {
                 self.release(id).await;
             }
         }
-        // Complete independent demand updates before retrying failed cleanup.
-        cleanup_result
+        Ok(())
     }
 
     /// Schedules each wanted branch whose repository this observer observes, a new one due at once,
@@ -526,12 +611,51 @@ impl ChangeRequestRefresher {
         }
         let forges = self.forges(namespace).await?;
         let convoys = self.inner.backend.including_replicas::<Convoy>(namespace).list().await.map_err(|e| e.to_string())?;
+        let convoys = convoys.items.into_iter().map(|copy| copy.object).collect::<Vec<_>>();
+        self.release_unlinked_records(namespace, inventory.items, &convoys, &forges).await
+    }
+
+    /// Releases the history `convoy` unlinked: only the records it names and has since unlinked
+    /// are read, and a convoy that unlinked no change request reads nothing.
+    async fn release_unlinked_by(&self, namespace: &str, convoy: &ResourceObject<Convoy>, forges: &[ForgeSpec]) -> Result<(), String> {
+        let unlinked = convoy
+            .status
+            .as_ref()
+            .is_some_and(|status| status.unlinked_subjects.iter().any(|unlinked| unlinked.kind == ConvoySubjectKind::ChangeRequest));
+        if !unlinked {
+            return Ok(());
+        }
+        let records = self.inner.backend.using::<ChangeRequest>(namespace).list().await.map_err(|error| error.to_string())?;
+        let named = records
+            .items
+            .into_iter()
+            .filter(|record| {
+                record
+                    .spec
+                    .subject_of
+                    .iter()
+                    .any(|entry| entry.namespace == convoy.metadata.namespace && entry.convoy == convoy.metadata.name)
+            })
+            .collect();
+        self.release_unlinked_records(namespace, named, std::slice::from_ref(convoy), forges).await
+    }
+
+    /// Drops from each of `inventory`'s histories the entries of `convoys` that unlinked its
+    /// change request, deleting a record left with no history that nothing demands.
+    async fn release_unlinked_records(
+        &self,
+        namespace: &str,
+        inventory: Vec<ResourceObject<ChangeRequest>>,
+        convoys: &[ResourceObject<Convoy>],
+        forges: &[ForgeSpec],
+    ) -> Result<(), String> {
+        let records = self.inner.backend.using::<ChangeRequest>(namespace);
         let mut cleanup_error = None;
-        for record in inventory.items {
+        for record in inventory {
             if record.spec.subject_of.is_empty() {
                 continue;
             }
-            let subject = match record.spec.address(&forges).and_then(|address| ChangeRequestKey::new(namespace, address)) {
+            let subject = match record.spec.address(forges).and_then(|address| ChangeRequestKey::new(namespace, address)) {
                 Ok(subject) => subject,
                 Err(error) => {
                     tracing::debug!(record = %record.metadata.name, %error, "change request history has no address; unlink not processed");
@@ -549,14 +673,13 @@ impl ChangeRequestRefresher {
                     };
                     let mut spec = current.spec.clone();
                     spec.subject_of.retain(|entry| {
-                        !convoys.items.iter().any(|copy| {
-                            let convoy = &copy.object;
+                        !convoys.iter().any(|convoy| {
                             convoy.metadata.namespace == entry.namespace
                                 && convoy.metadata.name == entry.convoy
                                 && convoy.status.as_ref().is_some_and(|status| {
                                     status.unlinked_subjects.iter().any(|unlinked| {
                                         unlinked.kind == ConvoySubjectKind::ChangeRequest
-                                            && subject_address(unlinked, &forges).is_ok_and(|address| &address == subject.address())
+                                            && subject_address(unlinked, forges).is_ok_and(|address| &address == subject.address())
                                     })
                                 })
                         })
@@ -1330,9 +1453,18 @@ fn change_request_subjects(convoy: &ResourceObject<Convoy>, forges: &[ForgeSpec]
 
 /// Takes `event` into the next pass: a convoy change lists the convoys again, and a checkout
 /// change is kept only while an ended convoy holds checkouts to be released.
-fn absorb(event: DemandEvent, demands: &ConvoyDemands, convoys_changed: &mut bool, checkout_changes: &mut Vec<CheckoutChange>) {
+fn absorb(
+    event: DemandEvent,
+    demands: &ConvoyDemands,
+    convoys_changed: &mut bool,
+    changed: &mut BTreeSet<String>,
+    checkout_changes: &mut Vec<CheckoutChange>,
+) {
     match event {
         DemandEvent::Convoys => *convoys_changed = true,
+        DemandEvent::Convoy(name) => {
+            changed.insert(name);
+        }
         DemandEvent::Checkout(change) => {
             if !demands.holding.is_empty() {
                 checkout_changes.push(change);
@@ -1353,6 +1485,22 @@ fn checkout_events(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
         };
         Some((Ok(DemandEvent::Checkout(change)), changes))
+    })
+    .boxed()
+}
+
+/// The convoys' changes as demand events: a launch's by its name, a rescan or a follower that
+/// fell behind as every convoy's.
+fn convoy_events(
+    changes: tokio::sync::broadcast::Receiver<ConvoyChange>,
+) -> futures::stream::BoxStream<'static, Result<DemandEvent, ResourceError>> {
+    futures::stream::unfold(changes, |mut changes| async move {
+        let event = match changes.recv().await {
+            Ok(ConvoyChange::Changed { name, .. }) => DemandEvent::Convoy(name),
+            Ok(ConvoyChange::Rescanned) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => DemandEvent::Convoys,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        };
+        Some((Ok(event), changes))
     })
     .boxed()
 }
@@ -1532,6 +1680,37 @@ mod tests {
         assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&10));
     }
 
+    // A convoy's change reads that convoy alone, by name, and leaves what the others want.
+    #[tokio::test]
+    async fn a_changed_convoy_is_read_alone() {
+        use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+        flotilla_store_testkit::fixtures::seed_convoy_history()
+            .backend(&backend)
+            .namespace("flotilla")
+            .landed(300)
+            .active(10)
+            .call()
+            .await
+            .expect("convoy history");
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "node".into(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let mut demands = ConvoyDemands::default();
+        refresher.reconcile_convoy_demands("flotilla", &mut demands).await.expect("reconcile");
+        let wanting = demands.wants.len();
+        let changed = demands.wants.keys().next().expect("a live convoy").clone();
+
+        let (result, reads) =
+            measure_reads(refresher.reconcile_changed_convoys("flotilla", &mut demands, &BTreeSet::from([changed]))).await;
+        result.expect("reconcile");
+        assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&1));
+        assert_eq!(demands.wants.len(), wanting);
+    }
+
     // #3108 ruling 1: an abandoned convoy that something still holds is observed only for the
     // change request its Submitted pr promise names, until the promise resolves; the resolution
     // releases the demand. A landed convoy, which delivered with nothing open, demands nothing.
@@ -1584,7 +1763,7 @@ mod tests {
         let mut status = convoy.status.expect("status");
         status.promises.get_mut("work").expect("work").insert("coder".into(), vec![promise(42, PromiseState::Kept)]);
         convoys.update_status("abandoned", &convoy.metadata.resource_version, &status).await.expect("kept");
-        refresher.reconcile_convoy_demands("ops", &mut demands).await.expect("reconcile");
+        refresher.reconcile_changed_convoys("ops", &mut demands, &BTreeSet::from(["abandoned".to_owned()])).await.expect("reconcile");
         assert!(demands.demanded().is_empty(), "the merge released the demand: {demands:?}");
         for (_, refresh) in refresher.inner.active.lock().await.drain() {
             refresh.task.abort();

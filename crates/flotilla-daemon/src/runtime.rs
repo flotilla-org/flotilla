@@ -4,6 +4,7 @@ mod access_layer;
 mod account_access;
 pub(crate) mod archive;
 mod checkouts;
+mod convoy_controller;
 mod credential_delivery;
 mod credentials;
 mod discovery;
@@ -20,6 +21,7 @@ pub(crate) mod ssh_host_vessels;
 mod state;
 mod tasks;
 mod terminal;
+mod vessel_requests_controller;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 pub(crate) use terminal::{DELIVERY_CONFIRMATION_POLL, DELIVERY_CONFIRMATION_STABLE_FOR};
 
@@ -28,7 +30,7 @@ use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::{codex_central_auth_path, AgentMaterialRegistry, CodexCentralRefresher, CredentialStore};
 use flotilla_crew::convoy::ConvoyReconciler;
-use flotilla_crew::reconcilers::vessel::{ConvoyVesselWake, CrewSeats, VesselPlanning};
+use flotilla_crew::reconcilers::vessel::{ConvoyVesselWake, VesselPlanning};
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
@@ -178,8 +180,6 @@ impl DaemonRuntime {
         // Message path the daemon opened over it.
         let (provisioning, lifecycle_followers) = open_provisioning_lifecycles(&daemon).await?;
         daemon.require_lifecycle_reads_installed()?;
-        // The Convoy views read every launch once, here, before any request reads them.
-        phase("compose_convoy_views", daemon.convoy_views()?.opened()).await;
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
         let forge_default_branches = crate::dummy_fleet::dummy_forge_default_branches(daemon_config.dummy_fleet.as_ref());
@@ -834,8 +834,8 @@ fn spawn_controller_loops(
     let mut controllers = vec![
         spawn_vessel_requests(
             flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
-                std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(
-                    backend.clone(),
+                std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+                    state.daemon.lifecycle_reads(),
                     namespace_string.clone(),
                 )),
                 state.daemon.lifecycle_reads(),
@@ -843,6 +843,9 @@ fn spawn_controller_loops(
                 CanonicalHostId::resolved(state.local_host_ref.clone()),
                 state.ssh_host_refs(),
             ),
+            state.daemon.lifecycle_reads(),
+            state.daemon.clock_for_scenarios(),
+            state.daemon.decided_store(),
             supervision.clone(),
             runtime_health.clone(),
         ),
@@ -861,63 +864,7 @@ fn spawn_controller_loops(
                 (RepositoryReconciler::secondary_watches(discovered.clone(), decided.clone()), reconciler)
             }
         }),
-        controller!(Vessel, {
-            let state = Arc::clone(&state);
-            move |backend: ResourceBackend, namespace_string: String| {
-                // A ready vessel's crews are seated as it, its sessions, its convoy, its crews'
-                // bindings and their briefs change; the Vessel controller writes its edges.
-                let mut secondaries = CrewSeats::secondary_watches();
-                secondaries.push(Box::new(ConvoyVesselWake::new(
-                    &backend,
-                    &namespace_string,
-                    state.daemon.lifecycle_reads(),
-                    state.daemon.convoy_engine_path(),
-                    state.daemon.account_records(),
-                )));
-                let planning = Arc::new(vessel_planning(&state, &backend, &namespace_string));
-                (secondaries, CrewSeats::new(planning).with_rechecks(state.vessel_rechecks.clone()))
-            }
-        }),
-        controller!(Convoy, {
-            let daemon = Arc::clone(&state.daemon);
-            move |backend: ResourceBackend, namespace_string: String| {
-                let daemon = Arc::clone(&daemon);
-                let mut secondaries = ConvoyReconciler::secondary_watches(
-                    &backend,
-                    &namespace_string,
-                    daemon.host_records(),
-                    daemon.convoy_engine_path(),
-                    daemon.crew_message_path(),
-                );
-                secondaries.push(daemon.reconciler_wake_watch());
-                secondaries.push(daemon.convoy_wake_watch());
-                secondaries.push(Box::new(flotilla_crew::convoy::EngineConvoyWake { engine: daemon.convoy_engine_path() }));
-                // A convoy's checkouts are the engine's: their changes wake the convoy holding them.
-                let service = daemon.decided_store();
-                secondaries.push(Box::new(flotilla_provisioning::engine::checkouts::CheckoutConvoyWake::new(Arc::clone(&service))));
-                // A convoy reads its vessels' phases from the engine, so their records wake it.
-                secondaries.push(Box::new(flotilla_provisioning::engine::vessel::VesselConvoyWake::new(service)));
-                (
-                    secondaries,
-                    ConvoyReconciler::new(
-                        daemon.lifecycle_reads(),
-                        daemon.host_records(),
-                        daemon.convoy_engine_path(),
-                        daemon.crew_message_path(),
-                    )
-                    .with_occupancy(backend.clone(), &namespace_string)
-                    .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))
-                    .with_forges(backend.definitions::<Forge>(&namespace_string))
-                    .with_change_requests(
-                        backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
-                        daemon.change_request_stale_after(),
-                    )
-                    .with_artifacts(backend.including_replicas::<flotilla_resources::Artifact>(&namespace_string))
-                    .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
-                    .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), &namespace_string)),
-                )
-            }
-        }),
+        spawn_convoy_controller(&state, backend.clone(), namespace_string.clone(), supervision.clone(), runtime_health.clone()),
     ];
     controllers.extend(spawn_environment_controller(&state, provisioning));
     controllers.extend(spawn_clone_controller(&state, provisioning));
@@ -1292,8 +1239,76 @@ fn vessel_planning(state: &Arc<ControllerRuntimeState>, backend: &ResourceBacken
 }
 
 /// The Vessel controller (#3108): the single writer of this home's vessel launches, realising each
-/// in its environment once what its planner requests for it is realised. Its holdings' commits
-/// wake it; its convoy's, its crews' bindings' and its seats' changes are told as rechecks.
+/// in its environment once what its planner requests for it is realised, then seating its crews.
+/// Its holdings' commits, its crews' sessions among them, wake it; its convoy's, its crews'
+/// bindings' and their briefs' changes are told as rechecks.
+/// The Convoy controller (#4412): the convoy reconciler's passes on the engine's shared runner,
+/// woken by its own records and its wake watches, never by a listing or a resync tick.
+fn spawn_convoy_controller(
+    state: &Arc<ControllerRuntimeState>,
+    backend: ResourceBackend,
+    namespace_string: String,
+    supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
+) -> JoinHandle<()> {
+    use flotilla_provisioning::engine::controller::Runner;
+    let daemon = Arc::clone(&state.daemon);
+    let lifecycle_status_reads = daemon.lifecycle_reads();
+    // Its passes' and its wake watches' reads count for the Convoy controller.
+    let reads = Arc::clone(&state.controller_metrics.for_kind(Convoy::API_PATHS.kind).reads);
+    tokio::spawn(async move {
+        tasks::supervise_controller(Convoy::API_PATHS.kind, supervision, runtime_health, move || {
+            let daemon = Arc::clone(&daemon);
+            let mut secondaries = ConvoyReconciler::secondary_watches(
+                &backend,
+                &namespace_string,
+                daemon.host_records(),
+                daemon.convoy_engine_path(),
+                daemon.crew_message_path(),
+            );
+            secondaries.push(daemon.reconciler_wake_watch());
+            secondaries.push(daemon.convoy_wake_watch());
+            // A convoy's checkouts are the engine's: their changes wake the convoy holding them.
+            let service = daemon.decided_store();
+            secondaries.push(Box::new(flotilla_provisioning::engine::checkouts::CheckoutConvoyWake::new(service)));
+            let reconciler = ConvoyReconciler::new(
+                daemon.lifecycle_reads(),
+                daemon.host_records(),
+                daemon.convoy_engine_path(),
+                daemon.crew_message_path(),
+            )
+            .with_occupancy(backend.clone(), &namespace_string)
+            .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))
+            .with_forges(backend.definitions::<Forge>(&namespace_string))
+            .with_change_requests(
+                backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
+                daemon.change_request_stale_after(),
+            )
+            .with_artifacts(backend.including_replicas::<flotilla_resources::Artifact>(&namespace_string))
+            .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
+            .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), &namespace_string));
+            let convoys =
+                backend.clone().using::<Convoy>(&namespace_string).with_lifecycle_status_reads(Arc::clone(&lifecycle_status_reads));
+            let home = Arc::clone(daemon.engine_convoys());
+            let policy = convoy_controller::ConvoyPolicy::new(reconciler, convoys, Arc::clone(&home), daemon.lifecycle_reads())
+                .map_err(ResourceError::other);
+            let wakes = convoy_controller::wakes(secondaries, backend.clone(), namespace_string.clone(), Arc::clone(&reads));
+            let (clock, service) = (daemon.clock_for_scenarios(), daemon.decided_store());
+            attributed(Arc::clone(&reads), async move {
+                let policy = policy?;
+                let code =
+                    <flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy> as flotilla_schema::Kind>::CODE;
+                // A convoy reads its vessels' phases and its sessions' launches from the engine, so
+                // their commits in the same log pass it (`ConvoyPolicy::touches`).
+                let runner = Runner::start(code, home.home().to_owned(), policy.followed(), clock, service)
+                    .map_err(|error| ResourceError::other(error.to_string()))?;
+                runner.run(policy, wakes).await.map_err(|error| ResourceError::other(error.to_string()))
+            })
+        })
+        .await;
+    })
+}
+
 fn spawn_vessel_controller(
     state: &Arc<ControllerRuntimeState>,
     engine: &ProvisioningLifecycles,
@@ -1370,7 +1385,6 @@ impl flotilla_provisioning::engine::environment_actuator::LaunchEnvironment for 
 pub(crate) async fn open_engine_reads(daemon: &Arc<InProcessDaemon>) -> Result<Vec<JoinHandle<()>>, String> {
     let (_, followers) = open_provisioning_lifecycles(daemon).await?;
     daemon.require_lifecycle_reads_installed()?;
-    daemon.convoy_views()?.opened().await;
     Ok(followers)
 }
 

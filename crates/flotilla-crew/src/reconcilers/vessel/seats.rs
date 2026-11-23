@@ -3,26 +3,22 @@
 //! Working; a session its pool lost starts its next launch, and an exited agent's next launch
 //! starts when its work resumes. Crews start in order, each once the one before it runs.
 //!
-//! The Vessel controller writes the vessel's edges; this writes only terminal requests. A crew
-//! that cannot be seated breaks the vessel at its next plan, which the seats ask for.
+//! Seating runs in the vessel's plan once it is realised, and writes only terminal requests: the
+//! Vessel controller writes the vessel's edges. Each crew session is a holding of the realised
+//! vessel, so its commits plan the vessel again. A crew that cannot be seated breaks the vessel.
 
-use std::{marker::PhantomData, path::PathBuf, sync::Arc};
-
-use chrono::{DateTime, Utc};
+use std::path::PathBuf;
 
 use flotilla_agent::adapter::{append_convoy_work_context, build_convoy_crew_brief_with_options, CrewAssignment, CrewBriefMember};
-use flotilla_protocol::LifecycleReading;
 use flotilla_resources::{
     address::artifact_slot_record_name,
-    terminal_records::{TerminalLaunchRequest, TerminalLaunchSource},
-    vessel_records::engine_vessel,
-    CrewSource, CrewWorkPhase, ResourceError, ResourceObject, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, Vessel,
-    WorkPhase, BRIEF_ARTIFACTS_ANNOTATION, VESSEL_REF_LABEL,
+    terminal_records::{launched, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecord},
+    vessel_planning::{Held, HeldKind},
+    CrewSource, CrewWorkPhase, ResourceError, ResourceObject, TerminalSessionIdentity, TerminalSessionPhase, Vessel, WorkPhase,
+    BRIEF_ARTIFACTS_ANNOTATION,
 };
-use flotilla_store::controller::{LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch};
-use tracing::debug;
 
-use super::{legible_waiting_for, PlannedPatch, Seating, VesselPlanning};
+use super::{legible_waiting_for, Seating, VesselPlanning};
 
 /// What seating a vessel's crews found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,10 +37,23 @@ impl Seating {
     }
 }
 
+/// Crew session `record` as a holding of its vessel: the session, so that each of its launches
+/// is followed.
+fn held_terminal(record: &TerminalRecord) -> Held {
+    Held { kind: HeldKind::Terminal, launch: launched(&record.name).to_owned(), home: record.home.clone(), ready: record.is_running() }
+}
+
 impl VesselPlanning {
     /// Seats `obj`'s crews with `seating`: what the first crew not yet running waits for, starting
-    /// its session when `act`, else only reading what it would do.
-    pub(super) async fn seat(&self, obj: &ResourceObject<Vessel>, seating: &Seating, act: bool) -> Result<Seated, ResourceError> {
+    /// its session when `act`, else only reading what it would do. When `act`, each session it
+    /// found or started is added to `held`.
+    pub(super) async fn seat(
+        &self,
+        obj: &ResourceObject<Vessel>,
+        seating: &Seating,
+        act: bool,
+        held: &mut Vec<Held>,
+    ) -> Result<Seated, ResourceError> {
         let (convoy, requirement, vessel_index) = (&seating.convoy, &seating.requirement, seating.vessel_index);
         let starts_active = |index: usize, process: &flotilla_resources::CrewSpec| {
             requirement.starts_eagerly(index)
@@ -68,7 +77,10 @@ impl VesselPlanning {
                 .build();
             let terminal_name = identity.name();
             match self.terminal_session(&terminal_name) {
-                Ok(existing) => {
+                Ok((record, existing)) => {
+                    if act {
+                        held.push(held_terminal(&record));
+                    }
                     let phase = existing.status.as_ref().map(|status| status.phase);
                     if phase == Some(TerminalSessionPhase::Failed) {
                         let message = existing
@@ -252,6 +264,10 @@ impl VesselPlanning {
                             source,
                         })
                         .map_err(ResourceError::other)?;
+                    // Followed from its request: its commits plan the vessel again.
+                    if let Some(record) = self.terminals()?.get(&terminal_name, None).map_err(ResourceError::other)? {
+                        held.push(held_terminal(&record));
+                    }
                     return Ok(seating.waiting(format!("terminal session {terminal_name} to become running")));
                 }
                 Err(err) => return Err(err),
@@ -259,71 +275,5 @@ impl VesselPlanning {
         }
 
         Ok(Seated::All)
-    }
-}
-
-/// The crews of this home's ready vessels, seated as their vessel, its terminal sessions, its
-/// convoy, its crews' bindings and their briefs change. A vessel one of whose crews cannot be
-/// seated is planned again, which breaks it.
-pub struct CrewSeats {
-    planning: Arc<VesselPlanning>,
-    rechecks: Option<tokio::sync::mpsc::Sender<String>>,
-}
-
-impl CrewSeats {
-    pub fn new(planning: Arc<VesselPlanning>) -> Self {
-        Self { planning, rechecks: None }
-    }
-
-    /// Where a vessel to plan again is named: its controller's rechecks.
-    pub fn with_rechecks(mut self, rechecks: tokio::sync::mpsc::Sender<String>) -> Self {
-        self.rechecks = Some(rechecks);
-        self
-    }
-
-    /// What the crew seats follow beside the vessels: their terminal sessions.
-    pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = Vessel>>> {
-        vec![Box::new(LabelMappedWatch::<TerminalSession, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData })]
-    }
-}
-
-impl Reconciler for CrewSeats {
-    type Resource = Vessel;
-    type Prepared = ();
-
-    async fn prepare(&self, obj: &ResourceObject<Vessel>) -> Result<(), ResourceError> {
-        let planning = &self.planning;
-        // Only this home's ready launches are seated: each home seats its own.
-        let ready = engine_vessel(planning.lifecycle_reads.as_ref(), obj, None)
-            .map_err(ResourceError::other)?
-            .is_some_and(|record| matches!(record.reading, LifecycleReading::Ready { .. }));
-        if !ready {
-            return Ok(());
-        }
-        // One that is no longer ready as planned is its controller's: what changed wakes it.
-        let PlannedPatch::Ready { seating, .. } = planning.prepare_plan(obj).await?.patch else { return Ok(()) };
-        match planning.seat(obj, &seating, true).await? {
-            Seated::All => {}
-            Seated::Waiting(reason) => debug!(vessel = %obj.metadata.name, %reason, "crew waiting"),
-            Seated::Failed(cause) => {
-                debug!(vessel = %obj.metadata.name, %cause, "a crew cannot be seated; planning its vessel again");
-                if let Some(rechecks) = &self.rechecks {
-                    let _ = rechecks.send(obj.metadata.name.clone()).await;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn reconcile(&self, _obj: &ResourceObject<Vessel>, _prepared: &(), _now: DateTime<Utc>) -> ReconcileOutcome<Vessel> {
-        ReconcileOutcome::with_actuations(None, Vec::new())
-    }
-
-    async fn run_finalizer(&self, _obj: &ResourceObject<Vessel>) -> Result<(), ResourceError> {
-        Ok(())
-    }
-
-    fn finalizer_name(&self) -> Option<&'static str> {
-        None
     }
 }

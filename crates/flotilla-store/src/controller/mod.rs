@@ -184,6 +184,11 @@ pub trait SecondaryWatch: Send + Sync {
 
     fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>>;
 
+    /// What the watch is, as a controller tells which watch woke a resource: its type's name.
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn spawn(
         self: Box<Self>,
         backend: ResourceBackend,
@@ -310,6 +315,18 @@ impl WorkQueueSender {
     /// Requests made before the controller lists coalesce into one listing.
     pub fn send_every(&self) {
         self.every.notify_one();
+    }
+
+    /// Takes `name` off the queue for a consumer that drains the receiver itself: a later send of
+    /// it queues it again.
+    pub fn take(&self, name: &str) {
+        self.progress.lock().expect("controller work queue lock poisoned").queued.remove(name);
+    }
+
+    /// Resolves when a watch asks for every resource ([`WorkQueueSender::send_every`]); requests
+    /// made meanwhile coalesce into one.
+    pub async fn every_requested(&self) {
+        self.every.notified().await
     }
 
     fn start(&self, name: &str) -> Duration {

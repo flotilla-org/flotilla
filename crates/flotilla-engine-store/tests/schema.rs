@@ -139,6 +139,7 @@ fn a_store_whose_link_sources_predate_branch_is_widened_at_open() {
         .create(
             name,
             ConvoyRequest {
+                role: String::new(),
                 launch_of: name.into(),
                 workflow_ref: "w".into(),
                 admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),

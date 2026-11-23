@@ -18,14 +18,13 @@ use flotilla_resources::convoy::reconcile::*;
 use flotilla_resources::host_records::{HostChange, HostRecords};
 use flotilla_resources::*;
 use flotilla_store::{
-    controller::{LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
+    controller::{ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
     load_metrics::carry,
     occupancy::host_occupancy,
     DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    marker::PhantomData,
     sync::Arc,
 };
 /// The principal this controller acts as on the engine.
@@ -128,8 +127,9 @@ impl ConvoyReconciler {
         self
     }
 
-    /// What wakes a convoy besides its engine records: its sessions (a turn's delivery holds its
-    /// landing), the evidence its promises are observed from, and, for a convoy its home notes as
+    /// What wakes a convoy besides its engine records and its sessions' launches (those the
+    /// controller follows in the engine's log, [`session_launch_convoy`]): the evidence its
+    /// promises are observed from, and, for a convoy its home notes as
     /// waiting, what it waits on: capacity on a host (changes of that Host, or of a Vessel,
     /// Environment or Convoy on it) or a crew turn's delivery (commits to `messages`).
     pub fn secondary_watches(
@@ -163,7 +163,6 @@ impl ConvoyReconciler {
                 engine,
                 waiting: flotilla_resources::convoy_records::ConvoyNotes::holds_delivery,
             }),
-            Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
         ]
     }
 
@@ -824,6 +823,26 @@ impl<W: Resource> SecondaryWatch for EvidenceWake<W> {
     }
 }
 
+/// The convoy, homed at `here`, that session launch `name` at `home` is held for, if it is a
+/// crew's: mapped through the vessel the launch is held for. A commit of the launch wakes that
+/// convoy (a turn's delivery holds its landing); what its agent does in the session commits no
+/// launch, so it wakes nothing.
+pub fn session_launch_convoy(
+    reads: &dyn lifecycle_reads::LifecycleReads,
+    name: &str,
+    home: &str,
+    here: &str,
+) -> Result<Option<String>, String> {
+    let Some(terminal) = reads.terminals()?.get(name, Some(home))? else { return Ok(None) };
+    let Some(vessel) = terminal.vessel else { return Ok(None) };
+    let vessels = reads.vessels()?;
+    let record = match vessels.get(&vessel, Some(home))? {
+        Some(record) => Some(record),
+        None => vessels.find(&vessel)?,
+    };
+    Ok(record.filter(|record| record.convoy_home == here).map(|record| record.convoy))
+}
+
 /// Wakes the convoy reconciler for each convoy whose engine record changed
 /// (#3587 layer 8): with the engine deciding, an engine edge writes no old
 /// record, so the reconciler's own watch would not see it.
@@ -981,8 +1000,9 @@ impl Reconciler for ConvoyReconciler {
             }
             _ => BTreeMap::new(),
         };
-        // One observation a pass: the engine's edge wakes the next.
-        if let Some(ConvoyStatusPatch::ObservePromise { vessel, role, operation }) = flotilla_resources::convoy::promises::next_observation(
+        // Every observation due, each its own edge made against the record as it then is: an
+        // observation a pass would wake a pass per edge.
+        for observation in flotilla_resources::convoy::promises::due_observations(
             status,
             &obj.metadata.name,
             &change_requests,
@@ -991,6 +1011,7 @@ impl Reconciler for ConvoyReconciler {
             now,
             self.change_request_stale_after,
         ) {
+            let ConvoyStatusPatch::ObservePromise { vessel, role, operation } = observation else { continue };
             if let Err(error) = engine.promise(obj, &vessel, &role, &operation, Actor::Observer).await {
                 tracing::info!(convoy = %obj.metadata.name, %vessel, %role, %error, "the engine refused an observed promise edge");
             }

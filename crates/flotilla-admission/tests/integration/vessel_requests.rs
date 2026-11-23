@@ -2,18 +2,13 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::Utc;
 use flotilla_admission::reconcilers::vessel_requests::{
-    ConvoyStanding, ConvoyTouched, ConvoyWorks, ConvoyWorksRead, VesselReleaseGate, VesselRequests, WorkNeedingVessel,
+    ConvoyKey, ConvoyStanding, ConvoyWorks, ConvoyWorksRead, VesselReleaseGate, VesselRequests, WorkNeedingVessel,
 };
 use flotilla_engine_convoys_testkit::EngineHome;
 use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
-use flotilla_provisioning_testkit::{FollowedVessels, VesselsFixture};
-use flotilla_resources::{
-    checkout_records::CheckoutHolder,
-    vessel_records::{VesselChange, VesselLaunchRequest, VesselRecords},
-    CheckoutSpec, ConvoyPhase, ConvoySpec, ConvoyStatus, ObservedCheckoutSpec, RepositoryKey, WorkPhase, WorkState, WorkflowSnapshot,
-};
+use flotilla_provisioning_testkit::VesselsFixture;
+use flotilla_resources::{vessel_records::VesselRecords, ConvoyPhase, ConvoySpec, ConvoyStatus, WorkPhase, WorkState, WorkflowSnapshot};
 use flotilla_store::load_metrics::{measure, KindReadCounts};
-use futures::StreamExt;
 use std::collections::BTreeSet;
 
 const NAMESPACE: &str = "flotilla";
@@ -87,7 +82,10 @@ async fn a_placed_work_is_launched_at_the_home_that_serves_its_host() {
 
     let kiwi_vessels = VesselsFixture::at("kiwi");
     let kiwi_requests = VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(kiwi.backend().clone(), NAMESPACE)),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+            Arc::clone(kiwi.convoys.reads()),
+            NAMESPACE,
+        )),
         kiwi_vessels.reads.clone(),
         sanctioned(),
         CanonicalHostId::resolved("kiwi-host"),
@@ -97,7 +95,10 @@ async fn a_placed_work_is_launched_at_the_home_that_serves_its_host() {
 
     let feta_vessels = VesselsFixture::at("feta");
     let feta_requests = VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(feta.backend().clone(), NAMESPACE)),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+            Arc::clone(feta.convoys.reads()),
+            NAMESPACE,
+        )),
         feta_vessels.reads.clone(),
         sanctioned(),
         CanonicalHostId::resolved("feta-host"),
@@ -124,7 +125,10 @@ async fn a_daemon_launches_the_works_placed_on_its_ssh_hosts() {
 
     let vessels = VesselsFixture::at("owner");
     let requests = VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(owner.backend().clone(), NAMESPACE)),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+            Arc::clone(owner.convoys.reads()),
+            NAMESPACE,
+        )),
         vessels.reads.clone(),
         sanctioned(),
         CanonicalHostId::resolved("owner-host"),
@@ -145,7 +149,10 @@ async fn an_unplaced_local_work_runs_here_until_its_convoy_is_reclaimed() {
     let vessels = VesselsFixture::at("home");
     let requests = |gate: bool| {
         VesselRequests::new(
-            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(home.backend().clone(), NAMESPACE)),
+            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+                Arc::clone(home.convoys.reads()),
+                NAMESPACE,
+            )),
             Arc::clone(&vessels.reads),
             Arc::new(Gate(gate)),
             CanonicalHostId::resolved("home-host"),
@@ -168,29 +175,21 @@ async fn an_unplaced_local_work_runs_here_until_its_convoy_is_reclaimed() {
 
 /// Convoys as the port reports them, held in memory: the works needing a vessel, and where each
 /// convoy stands (one not standing is gone, and its works are not read). Each convoy has the one
-/// work `work`. Its changes are those sent on `touches`.
+/// work `work`; the live ones are those with works and those standing live.
 #[derive(Default)]
 struct HeldWorks {
     works: std::sync::Mutex<Vec<WorkNeedingVessel>>,
     standing: std::sync::Mutex<BTreeMap<(String, String), ConvoyStanding>>,
-    touches: std::sync::Mutex<Option<futures::channel::mpsc::UnboundedReceiver<ConvoyTouched>>>,
-    /// How many times every convoy's works were read.
-    every_read: std::sync::atomic::AtomicUsize,
-}
-
-impl HeldWorks {
-    /// Works `held` whose changes `touch` sends.
-    fn touched() -> (Arc<Self>, futures::channel::mpsc::UnboundedSender<ConvoyTouched>) {
-        let (touch, touches) = futures::channel::mpsc::unbounded();
-        (Arc::new(Self { touches: std::sync::Mutex::new(Some(touches)), ..Self::default() }), touch)
-    }
 }
 
 #[async_trait::async_trait]
 impl ConvoyWorks for HeldWorks {
-    async fn works_needing_vessel(&self) -> Result<Vec<WorkNeedingVessel>, String> {
-        self.every_read.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(self.works.lock().expect("works").clone())
+    fn live(&self) -> Result<Vec<ConvoyKey>, String> {
+        let mut live: std::collections::BTreeSet<ConvoyKey> =
+            self.works.lock().expect("works").iter().map(|work| (work.convoy.clone(), work.convoy_home.clone())).collect();
+        let standing = self.standing.lock().expect("standing");
+        live.extend(standing.iter().filter(|(_, standing)| **standing == ConvoyStanding::Live).map(|(key, _)| key.clone()));
+        Ok(live.into_iter().collect())
     }
 
     async fn convoy(&self, convoy: &str, convoy_home: &str) -> Result<Option<ConvoyWorksRead>, String> {
@@ -208,13 +207,6 @@ impl ConvoyWorks for HeldWorks {
             .get(&(convoy.to_owned(), convoy_home.to_owned()))
             .copied()
             .unwrap_or(ConvoyStanding::Gone))
-    }
-
-    async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ConvoyTouched>, String> {
-        Ok(match self.touches.lock().expect("touches").take() {
-            Some(touches) => touches.boxed(),
-            None => futures::stream::pending().boxed(),
-        })
     }
 }
 
@@ -252,6 +244,7 @@ async fn the_requester_follows_its_convoys_through_the_port() {
     };
     *held.works.lock().expect("works") = vec![work("c#3"), work("gone#1")];
     held.standing.lock().expect("standing").insert(("c#3".into(), "kiwi".into()), ConvoyStanding::Live);
+    held.standing.lock().expect("standing").insert(("gone#1".into(), "kiwi".into()), ConvoyStanding::Live);
     let vessels = VesselsFixture::at("home");
     let requests = |gate: Arc<dyn VesselReleaseGate>| {
         VesselRequests::new(held.clone(), Arc::clone(&vessels.reads), gate, CanonicalHostId::resolved("home-host"), [])
@@ -264,6 +257,7 @@ async fn the_requester_follows_its_convoys_through_the_port() {
 
     // Neither work needs a vessel now: the live convoy's launch is kept, the gone one's released.
     held.works.lock().expect("works").clear();
+    held.standing.lock().expect("standing").remove(&("gone#1".to_owned(), "kiwi".to_owned()));
     let pass = requests(Arc::new(Unasked)).sync_once(Utc::now()).await.expect("pass");
     assert_eq!(pass.released, vec![requested[1].clone()]);
     assert_eq!(vessels.vessels.get(&requested[0], None).expect("read").expect("launch").reading, LifecycleReading::InProgress);
@@ -332,125 +326,4 @@ async fn a_convoy_pass_reads_as_much_with_twenty_convoys_as_with_two() {
     let (two, twenty) = (cost(2).await, cost(20).await);
     assert_eq!(twenty.whole_kind, 0, "{twenty:?}");
     assert_eq!(two, twenty);
-}
-
-// A convoy's change wakes a pass over that convoy alone: its new work is launched without every
-// convoy's works being read again.
-#[tokio::test]
-async fn a_convoy_change_wakes_a_pass_over_that_convoy_alone() {
-    let (held, touch) = HeldWorks::touched();
-    *held.works.lock().expect("works") = vec![placed("first#1")];
-    held.standing.lock().expect("standing").insert(("first#1".into(), "kiwi".into()), ConvoyStanding::Live);
-    let followed = FollowedVessels::at("home");
-    let vessels = &followed.fixture;
-    let mut launched = vessels.vessels.changes();
-    let requests =
-        VesselRequests::new(held.clone(), Arc::clone(&vessels.reads), Arc::new(Unasked), CanonicalHostId::resolved("home-host"), []);
-    let mut running = tokio::spawn(async move { requests.run().await });
-    // The first pass reads every convoy and launches the first convoy's work.
-    launched_for(&mut launched, &mut running, vessels, "first#1").await;
-
-    held.works.lock().expect("works").push(placed("second#1"));
-    held.standing.lock().expect("standing").insert(("second#1".into(), "kiwi".into()), ConvoyStanding::Live);
-    touch.unbounded_send(ConvoyTouched::Convoy { convoy: "second#1".into(), convoy_home: "kiwi".into() }).expect("touch");
-    launched_for(&mut launched, &mut running, vessels, "second#1").await;
-    assert_eq!(held.every_read.load(std::sync::atomic::Ordering::Relaxed), 1, "only the first pass reads every convoy");
-    running.abort();
-}
-
-/// Waits for a launch of `convoy` here to change, while the requester runs.
-async fn launched_for(
-    changes: &mut tokio::sync::broadcast::Receiver<VesselChange>,
-    running: &mut tokio::task::JoinHandle<Result<(), flotilla_resources::ResourceError>>,
-    vessels: &VesselsFixture,
-    convoy: &str,
-) {
-    let launched = async {
-        loop {
-            tokio::select! {
-                change = changes.recv() => {
-                    if let VesselChange::Changed { name, .. } = change.expect("vessel changes") {
-                        if vessels.vessels.get(&name, None).expect("read").is_some_and(|launch| launch.convoy == convoy) {
-                            return;
-                        }
-                    }
-                }
-                stopped = &mut *running => panic!("the requester stopped: {stopped:?}"),
-            }
-        }
-    };
-    // A bound, not a wait: a requester that never launches the work fails here.
-    tokio::time::timeout(std::time::Duration::from_secs(30), launched).await.unwrap_or_else(|_| panic!("a launch of {convoy}"));
-}
-
-/// A gate that refuses until opened, and tells whether it was open each time it is asked.
-struct Switch {
-    open: std::sync::atomic::AtomicBool,
-    asked: futures::channel::mpsc::UnboundedSender<bool>,
-}
-
-#[async_trait::async_trait]
-impl VesselReleaseGate for Switch {
-    async fn may_release(&self, convoy: &str, _convoy_home: &str) -> Result<(), String> {
-        let open = self.open.load(std::sync::atomic::Ordering::SeqCst);
-        drop(self.asked.unbounded_send(open));
-        if open {
-            Ok(())
-        } else {
-            Err(format!("convoy {convoy} has unlanded work"))
-        }
-    }
-}
-
-// An ended convoy whose release the gate refused is judged again when a checkout held for it
-// changes, and its launch is released once the gate sanctions it.
-#[tokio::test]
-async fn a_checkout_change_judges_a_refused_release_again() {
-    let followed = FollowedVessels::at("home");
-    let vessels = &followed.fixture;
-    let convoy = followed.checkouts.ensure_convoy("c");
-    let mut changes = vessels.vessels.changes();
-    let launch = vessels.request_for(&VesselLaunchRequest {
-        convoy: convoy.clone(),
-        convoy_home: "kiwi".into(),
-        work: "work".into(),
-        host: "home-host".into(),
-    });
-    // The launch's own change is told before the requester follows the changes.
-    while !matches!(changes.recv().await.expect("vessel changes"), VesselChange::Changed { name, .. } if name == launch) {}
-    let (held, _touch) = HeldWorks::touched();
-    held.standing.lock().expect("standing").insert((convoy.clone(), "kiwi".into()), ConvoyStanding::Ended);
-    let (asked, mut answers) = futures::channel::mpsc::unbounded();
-    let gate = Arc::new(Switch { open: false.into(), asked });
-    let requests = VesselRequests::new(held, Arc::clone(&vessels.reads), gate.clone(), CanonicalHostId::resolved("home-host"), []);
-    let mut running = tokio::spawn(async move { requests.run().await });
-    let asked = tokio::time::timeout(std::time::Duration::from_secs(30), answers.next()).await.expect("the first pass asks the gate");
-    assert_eq!(asked, Some(false), "the first pass asks the gate, which refuses");
-
-    gate.open.store(true, std::sync::atomic::Ordering::SeqCst);
-    let checkout = CheckoutSpec::Observed(ObservedCheckoutSpec {
-        r#ref: "main".into(),
-        path: "/work/main".into(),
-        repo_ref: RepositoryKey("github.com/o/r".into()),
-        host_ref: "home".into(),
-        is_main: false,
-    });
-    followed.checkouts.request("main", &checkout, Some(&CheckoutHolder::Convoy(convoy)));
-    let released = async {
-        loop {
-            tokio::select! {
-                change = changes.recv() => {
-                    if matches!(change.expect("vessel changes"), VesselChange::Changed { ref name, .. } if *name == launch)
-                        && vessels.vessels.get(&launch, None).expect("read").expect("launch").reading == LifecycleReading::Released
-                    {
-                        break;
-                    }
-                }
-                stopped = &mut running => panic!("the requester stopped: {stopped:?}"),
-            }
-        }
-    };
-    // A bound, not a wait: a requester that never judges the release again fails here.
-    tokio::time::timeout(std::time::Duration::from_secs(30), released).await.expect("the launch is released after the checkout change");
-    running.abort();
 }

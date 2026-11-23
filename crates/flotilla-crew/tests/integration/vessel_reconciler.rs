@@ -11,8 +11,8 @@ use common::{
     create_ready_clone, create_ready_docker_environment, create_ready_host_direct_environment, meta, DockerKindFixture,
     ReadyCheckoutFixture,
 };
+use flotilla_crew::reconcilers::vessel::VesselPlanning;
 use flotilla_crew::reconcilers::vessel::WorktreeMetadataResolver;
-use flotilla_crew::reconcilers::vessel::{CrewSeats, VesselPlanning};
 use flotilla_protocol::LifecycleReading;
 use flotilla_protocol::{CanonicalHostId, IssueRef, IssueSource, IssueState, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
@@ -24,10 +24,7 @@ use flotilla_resources::{
     VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use flotilla_resources::{ResourceObject, BRIEF_ARTIFACTS_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION};
-use flotilla_store::{
-    controller::{ControllerLoop, Reconciler},
-    ensure_repository, patch_resource_annotation, ResourceBackend, VesselViews,
-};
+use flotilla_store::{ensure_repository, patch_resource_annotation, ResourceBackend, VesselViews};
 use flotilla_vcs::vcs::WorktreeMetadata;
 use rstest::rstest;
 use tokio::time::Duration;
@@ -141,18 +138,16 @@ fn requested_checkouts(engine: &EngineFixture) -> BTreeMap<String, CheckoutRecor
     latest_launches(engine.checkouts.checkouts.here().expect("checkouts read"))
 }
 
-/// The vessel planner under test and its crew seats, reading the engine's records from `engine`.
+/// The vessel planner under test, reading the engine's records from `engine`.
 struct TestVessels<'a> {
     planning: Arc<VesselPlanning>,
-    seats: CrewSeats,
-    backend: ResourceBackend,
     engine: &'a EngineFixture,
 }
 
 impl TestVessels<'_> {
     /// One pass over `vessel` as its home runs it: its plan, the edge its Vessel controller writes
-    /// for that plan (whose writing the provisioning tests cover), and, once it is ready, its crews
-    /// seated.
+    /// for that plan (whose writing the provisioning tests cover), and, once it is ready, the plan
+    /// its realisation observes, which seats its crews.
     async fn prepare(&self, vessel: &ResourceObject<Vessel>) -> Result<VesselPlan, String> {
         let launch = &vessel.metadata.name;
         let plan = self.planning.plan(launch).await?;
@@ -169,21 +164,21 @@ impl TestVessels<'_> {
             self.engine.vessels.step(launch, step);
         }
         if matches!(reading(self.engine, launch), LifecycleReading::Ready { .. }) {
-            let current = read_vessel(&self.backend, self.engine, launch).await;
-            self.seats.prepare(&current).await.map_err(|error| error.to_string())?;
+            // A crew that cannot be seated breaks it at its next pass, as its observation would.
+            self.planning.plan(launch).await?;
         }
         Ok(plan)
     }
 }
 
-/// The planner and seats under test, reading the engine's records from `engine`.
+/// The planner under test, reading the engine's records from `engine`.
 fn test_vessel_reconciler<'a>(backend: ResourceBackend, namespace: &str, engine: &'a EngineFixture) -> TestVessels<'a> {
     let planning = Arc::new(
         VesselPlanning::new(backend.clone(), namespace, Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone())))
             .with_worktree_metadata(Arc::new(TestWorktreeMetadata(engine.reads())))
             .with_lifecycle_reads(engine.reads()),
     );
-    TestVessels { seats: CrewSeats::new(Arc::clone(&planning)), planning, backend, engine }
+    TestVessels { planning, engine }
 }
 
 #[tokio::test]
@@ -2520,7 +2515,7 @@ async fn a_vessel_reaches_ready_from_wakes_alone(#[case] remote: bool) {
     backend.install_engine_records(Arc::new(flotilla_store::TerminalViews::new(NAMESPACE, lease_engine.reads())));
 
     // The Vessel controller over the planner, told of its convoy's changes by the runtime's
-    // rechecks, and the crew seats with their wakes; no periodic resync within the test.
+    // rechecks; its realisation seats the crews. No periodic resync within the test.
     let accounts: Arc<dyn flotilla_resources::account_access::AccountRecords> =
         Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone()));
     let planning = Arc::new(
@@ -2547,19 +2542,8 @@ async fn a_vessel_reaches_ready_from_wakes_alone(#[case] remote: bool) {
     .expect("vessel controller");
     let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
     let running = tokio::spawn(controller.run_with(backings, recheck_events));
-    let rechecking = tokio::spawn(wake.clone().recheck(NAMESPACE.to_owned(), rechecks.clone()));
-    let mut secondaries = CrewSeats::secondary_watches();
-    secondaries.push(Box::new(wake));
-    let mut harness = common::ControllerLoopHarness::new(backend.clone());
-    harness.spawn(
-        ControllerLoop {
-            primary: backend.clone().using::<Vessel>(NAMESPACE),
-            secondaries,
-            reconciler: CrewSeats::new(planning).with_rechecks(rechecks),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
+    let rechecking = tokio::spawn(wake.recheck(NAMESPACE.to_owned(), rechecks));
+    let harness = common::ControllerLoopHarness::new(backend.clone());
 
     // The launch, as the vessel requester requests it for the placed work.
     let launch = lease_engine.vessels.request_for(&VesselLaunchRequest {

@@ -1001,9 +1001,10 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
     runtime.shutdown().await;
 }
 
-// Credential attention ignores terminal convoy history before decoding it.
+// Credential attention reads only the convoys it may raise or clear an attention for, each by
+// its name: with no vessel failing and none open, it reads no convoy, live or ended.
 #[tokio::test(start_paused = true)]
-async fn credential_attention_reads_only_live_convoys() {
+async fn credential_attention_reads_only_the_convoys_it_may_tell() {
     use flotilla_engine_convoys_testkit::{land, single_agent, EngineHome};
     let home = EngineHome::open_in("home", "flotilla");
     let backend = home.backend().clone();
@@ -1023,7 +1024,7 @@ async fn credential_attention_reads_only_live_convoys() {
         should_surface: true,
         first_failure_at: None,
     };
-    // The engine's attentions read no convoy either: only the live convoys are decoded.
+    // The engine's attentions read no convoy either.
     flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
     let reads = Arc::new(flotilla_store::load_metrics::CallerReads::default());
     attributed(
@@ -1037,11 +1038,8 @@ async fn credential_attention_reads_only_live_convoys() {
     )
     .await
     .expect("attention");
-    // The engine's convoy port returns the live launches' rows alone, and the whole operation
-    // reads no more than those.
     let counts = reads.snapshot();
-    assert_eq!(counts.get("Convoy port").map(|convoys| convoys.rows), Some(10));
-    assert_eq!(counts.values().map(|kind| kind.keyed + kind.rows).sum::<u64>(), 16, "every read the operation made: {counts:?}");
+    assert_eq!(counts.get("Convoy port").map_or(0, |convoys| convoys.keyed + convoys.rows), 0, "no convoy is read: {counts:?}");
 }
 
 /// Counts each session's card readings and delivers nothing.

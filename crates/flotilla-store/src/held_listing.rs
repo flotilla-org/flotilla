@@ -65,11 +65,6 @@ impl<Id: Ord + Clone> ViewIndex<Id> {
     pub fn covered(&self, cover: &IndexCover) -> BTreeSet<Id> {
         cover.select(&self.entries)
     }
-
-    /// How many views are indexed.
-    pub(crate) fn len(&self) -> usize {
-        self.keys.len()
-    }
 }
 
 /// The version a held view is handed out at (#3108): `held`, the version it was last handed out

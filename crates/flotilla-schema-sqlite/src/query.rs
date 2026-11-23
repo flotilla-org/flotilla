@@ -85,19 +85,16 @@ impl Ctx<'_> {
         let eq = query.eq()?;
         // Only the order width is taken here: argument lookups need `self` mutably, and the
         // statement text is borrowed from the per-kind SQL just before it runs.
-        let order = self
-            .sql(kind)?
-            .indexes
-            .get(query.index())
-            .ok_or_else(|| StoreError::UnknownIndex { kind, index: query.index().to_owned() })?
-            .order;
+        // A query of a leading part of the index's `eq` columns reads it through that prefix.
+        let unknown = || StoreError::UnknownIndex { kind, index: query.index().to_owned() };
+        let order = self.sql(kind)?.indexes.get(query.index()).and_then(|index| index.by(eq.len())).ok_or_else(unknown)?.order;
         if let Some(cursor) = after {
             if cursor.kind != kind || cursor.index != query.index() || cursor.eq != eq {
                 return Err(StoreError::CursorMismatch { index: query.index().to_owned() });
             }
         }
         let mut params = Vec::with_capacity(eq.len() + order + 2);
-        let columns = self.sql(kind)?.indexes[query.index()].eq_columns.clone();
+        let columns = self.sql(kind)?.indexes[query.index()].by(eq.len()).ok_or_else(unknown)?.eq_columns.clone();
         for (column, value) in columns.iter().zip(eq) {
             match self.lookup(kind, column, value)? {
                 Some(param) => params.push(param),
@@ -110,7 +107,7 @@ impl Ctx<'_> {
         }
         // One row beyond the limit tells whether another page follows.
         params.push(SqlValue::Integer(limit + 1));
-        let index = &self.sql(kind)?.indexes[query.index()];
+        let index = self.sql(kind)?.indexes[query.index()].by(eq.len()).ok_or_else(unknown)?;
         let statement = match (down, after.is_some()) {
             (false, false) => &index.first,
             (false, true) => &index.after,
@@ -170,7 +167,7 @@ impl Ctx<'_> {
         let eq = query.eq()?;
         let index =
             self.sql(kind)?.indexes.get(query.index()).ok_or_else(|| StoreError::UnknownIndex { kind, index: query.index().into() })?;
-        if statement(index).is_none() {
+        if statement(index).is_none() || eq.len() != index.eq_columns.len() {
             return Err(StoreError::IntegerIndex { kind, index: query.index().into() });
         }
         let columns = index.eq_columns.clone();

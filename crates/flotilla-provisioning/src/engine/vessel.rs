@@ -181,92 +181,6 @@ where
     }
 }
 
-/// Wakes a vessel's convoy when the vessel's engine record changes, at any home: the convoy reads
-/// each vessel's phase from the engine, so a record arriving from another home after the old
-/// replica must wake it again (#3108). A home first heard from, or one restored from a snapshot,
-/// names no records: each of its vessels' convoys is woken.
-#[derive(Clone)]
-pub struct VesselConvoyWake {
-    service: std::sync::Arc<flotilla_schema_sqlite::stream::Service>,
-}
-
-impl VesselConvoyWake {
-    pub fn new(service: std::sync::Arc<flotilla_schema_sqlite::stream::Service>) -> Self {
-        Self { service }
-    }
-}
-
-type VesselLifecycle = Resource<Lifecycle<VesselKind>>;
-
-impl flotilla_store::controller::SecondaryWatch for VesselConvoyWake {
-    type Primary = flotilla_resources::Convoy;
-
-    fn clone_box(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = Self::Primary>> {
-        Box::new(self.clone())
-    }
-
-    fn spawn(
-        self: Box<Self>,
-        _backend: flotilla_store::ResourceBackend,
-        _namespace: String,
-        sender: flotilla_store::controller::WorkQueueSender,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), flotilla_resources::ResourceError>> + Send>> {
-        use flotilla_engine_store::follow::Followed;
-        use flotilla_schema::Kind;
-
-        Box::pin(async move {
-            let mut watch = super::watch::EngineWatch::start(std::sync::Arc::clone(&self.service), [<VesselLifecycle as Kind>::CODE])
-                .map_err(|error| flotilla_resources::ResourceError::other(error.to_string()))?;
-            loop {
-                let woken = watch
-                    .next(|read, followed| {
-                        let mut convoys = std::collections::BTreeSet::new();
-                        for followed in followed {
-                            match followed {
-                                Followed::Changed(identity) => {
-                                    let Some(id) = read.resolve(<VesselLifecycle as Kind>::CODE, &identity.name, &identity.home)? else {
-                                        continue;
-                                    };
-                                    if let Some(loaded) = read.load::<VesselLifecycle>(id)? {
-                                        convoys.insert(loaded.value.spec().convoy.name.clone());
-                                    }
-                                }
-                                Followed::Rescan(home) => {
-                                    let mut after = None;
-                                    loop {
-                                        let page = read.scan::<VesselLifecycle>(&home, after, 64)?;
-                                        for id in page.ids {
-                                            if let Some(loaded) = read.load::<VesselLifecycle>(id)? {
-                                                convoys.insert(loaded.value.spec().convoy.name.clone());
-                                            }
-                                        }
-                                        after = page.next;
-                                        if after.is_none() {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(convoys)
-                    })
-                    .await;
-                match woken {
-                    Ok(convoys) => {
-                        for convoy in convoys {
-                            if sender.send(convoy).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    // The pass runs again at the next commit.
-                    Err(error) => tracing::warn!(%error, "the vessel convoy wake could not read the log"),
-                }
-            }
-        })
-    }
-}
-
 /// The [`VesselRecords`] port over one decided store: this home's launches through its Vessel
 /// home, the single writer of their edges, and every home's through keyed, indexed and scanned
 /// reads.
@@ -465,6 +379,24 @@ impl VesselRecords for EngineVessels {
         })?;
         records.sort_by_key(VesselRecord::launch_number);
         Ok(records)
+    }
+
+    fn newest_of_each(&self, convoy: &str, launches: &[(String, String)]) -> Result<Vec<VesselRecord>, String> {
+        let homes = (self.homes)();
+        self.reads
+            .read(|read| {
+                let mut records = Vec::new();
+                for (convoy_home, launch_of) in launches {
+                    let query = VesselSpec::by_launch(&ConvoyId::new(convoy, convoy_home), launch_of);
+                    for home in &homes {
+                        if let Some((id, _)) = read.integer_index_keys_before(&query, home, i64::MAX, 1)?.first() {
+                            records.extend(view::<VesselKind>(read, *id)?.map(record));
+                        }
+                    }
+                }
+                Ok(records)
+            })
+            .map_err(|error| format!("engine Vessels of convoy {convoy} at each home: {error}"))
     }
 
     fn newest(&self, convoy: &str, convoy_home: &str, launch_of: &str, home: Option<&str>) -> Result<Option<VesselRecord>, String> {

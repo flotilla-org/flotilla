@@ -54,11 +54,17 @@ pub(crate) struct Meter {
     terminals: AtomicU64,
     /// Convoy listings, `at` a home or at `every` home.
     convoy_listings: AtomicU64,
+    /// Reads of the sessions held for vessels, one vessel or several at once.
+    held_session_reads: AtomicU64,
 }
 
 impl Meter {
     pub(crate) fn convoy_listings(&self) -> u64 {
         self.convoy_listings.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn held_session_reads(&self) -> u64 {
+        self.held_session_reads.load(Ordering::Relaxed)
     }
 
     pub(crate) fn gets(&self) -> KeyedGets {
@@ -184,6 +190,11 @@ impl VesselRecords for CountedVessels {
         self.port().newest(convoy, convoy_home, launch_of, home)
     }
 
+    fn newest_of_each(&self, convoy: &str, launches: &[(String, String)]) -> Result<Vec<VesselRecord>, String> {
+        Meter::count(&self.meter.vessels);
+        self.port().newest_of_each(convoy, launches)
+    }
+
     fn at(&self, home: &str) -> Result<Vec<VesselRecord>, String> {
         self.port().at(home)
     }
@@ -265,6 +276,31 @@ impl ConvoyRecords for CountedConvoys {
     fn every(&self) -> Result<ConvoyListing, String> {
         Meter::count(&self.meter.convoy_listings);
         self.records.every()
+    }
+
+    fn launches_of(&self, of: &str, project: &str) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.launches_of(of, project)
+    }
+
+    fn open_of_role(&self, project: &str, role: &str) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.open_of_role(project, role)
+    }
+
+    fn open_in(&self, project: &str) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.open_in(project)
+    }
+
+    fn of_project(&self, project: &str) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.of_project(project)
+    }
+
+    fn linked_to(&self, subject: &flotilla_address::Address) -> Result<ConvoyListing, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.linked_to(subject)
     }
 
     fn changes(&self) -> tokio::sync::broadcast::Receiver<ConvoyChange> {
@@ -362,6 +398,11 @@ impl TerminalRecords for CountedTerminals {
         self.port().get(name, home)
     }
 
+    fn named(&self, name: &str) -> Result<Vec<TerminalRecord>, String> {
+        Meter::count(&self.meter.terminals);
+        self.port().named(name)
+    }
+
     fn at(&self, home: &str) -> Result<Vec<TerminalRecord>, String> {
         self.port().at(home)
     }
@@ -375,7 +416,13 @@ impl TerminalRecords for CountedTerminals {
     }
 
     fn of_vessel(&self, vessel: &str) -> Result<Vec<TerminalRecord>, String> {
+        Meter::count(&self.meter.held_session_reads);
         self.port().of_vessel(vessel)
+    }
+
+    fn of_vessels(&self, vessels: &[String]) -> Result<Vec<TerminalRecord>, String> {
+        Meter::count(&self.meter.held_session_reads);
+        self.port().of_vessels(vessels)
     }
 
     fn of_environment(&self, environment: &str, home: &str) -> Result<Vec<TerminalRecord>, String> {

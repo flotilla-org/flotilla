@@ -15,15 +15,16 @@ use flotilla_protocol::{
     DispatchIssueFacts, Issue, IssueRef, IssueState,
 };
 use flotilla_resources::{
-    pinned_workflow_ref, Clock, Convoy, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, Project, ProjectStatusPatch,
-    ReadWatchEvent, ResolvedIssueSourceBinding, ResourceError, ResourceObject, SystemClock,
+    convoy_records::ConvoyChange, lifecycle_reads::LifecycleReads, pinned_workflow_ref, Clock, Convoy, DispatchPolicy,
+    DispatchQueueAttention, DispatchQueueEntry, Project, ProjectStatusPatch, ResolvedIssueSourceBinding, ResourceError, ResourceObject,
+    SystemClock,
 };
 use flotilla_store::{
     apply_status_patch,
     load_metrics::{DispatchWait, HistogramSnapshot, LatencyHistogram},
     ResourceBackend,
 };
-use futures::{stream::BoxStream, FutureExt, StreamExt};
+use tokio::sync::broadcast::{self, error::TryRecvError};
 use tracing::{info, warn};
 
 const ISSUE_PAGE_SIZE: usize = 100;
@@ -40,7 +41,8 @@ type ProjectConvoys = BTreeMap<String, Vec<Arc<ResourceObject<Convoy>>>>;
 struct MissionState {
     boards: MissionBoardIndex,
     convoys: BTreeMap<String, Arc<ResourceObject<Convoy>>>,
-    watch: Option<BoxStream<'static, Result<ReadWatchEvent<Convoy>, ResourceError>>>,
+    /// The convoys' record changes, by launch name, followed since the inventory was listed.
+    watch: Option<broadcast::Receiver<ConvoyChange>>,
     occupancy: BTreeMap<String, Occupancy>,
     occupancy_rebuilds: usize,
     convoy_lists: usize,
@@ -86,7 +88,8 @@ impl DispatchMetrics {
 
 #[async_trait]
 pub(crate) trait DispatchIssueSource: Send + Sync {
-    async fn collect_boards(&self, projects: &[ResourceObject<Project>]) -> Result<ProjectBoards, String>;
+    /// The boards of `projects`, observing `running`, the issues their live convoys run.
+    async fn collect_boards(&self, projects: &[ResourceObject<Project>], running: BTreeSet<IssueRef>) -> Result<ProjectBoards, String>;
     async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String>;
     async fn dispatch_facts(&self, reference: &IssueRef) -> Result<DispatchIssueFacts, String>;
 }
@@ -103,8 +106,8 @@ impl DaemonDispatchIssueSource {
 
 #[async_trait]
 impl DispatchIssueSource for DaemonDispatchIssueSource {
-    async fn collect_boards(&self, projects: &[ResourceObject<Project>]) -> Result<ProjectBoards, String> {
-        let snapshot = self.daemon.collect_dispatch_board_inputs(projects).await?;
+    async fn collect_boards(&self, projects: &[ResourceObject<Project>], running: BTreeSet<IssueRef>) -> Result<ProjectBoards, String> {
+        let snapshot = self.daemon.collect_dispatch_board_inputs(projects, running).await?;
         let mut queries = BTreeMap::new();
         let mut providers = BTreeMap::new();
         let mut result = BTreeMap::new();
@@ -196,15 +199,30 @@ pub(crate) struct DispatchReconciler {
     backend: ResourceBackend,
     namespace: String,
     issues: Arc<dyn DispatchIssueSource>,
+    reads: Arc<dyn LifecycleReads>,
     clock: Arc<dyn Clock>,
     mission: tokio::sync::Mutex<MissionState>,
     metrics: Arc<DispatchMetrics>,
 }
 
 impl DispatchReconciler {
-    pub(crate) fn new(backend: ResourceBackend, namespace: impl Into<String>, issues: Arc<dyn DispatchIssueSource>) -> Self {
+    /// A reconciler for `namespace`'s Projects, following the convoys' changes through `reads`.
+    pub(crate) fn new(
+        backend: ResourceBackend,
+        namespace: impl Into<String>,
+        issues: Arc<dyn DispatchIssueSource>,
+        reads: Arc<dyn LifecycleReads>,
+    ) -> Self {
         let namespace = namespace.into();
-        Self { backend, namespace, issues, clock: Arc::new(SystemClock), mission: Default::default(), metrics: DispatchMetrics::global() }
+        Self {
+            backend,
+            namespace,
+            issues,
+            reads,
+            clock: Arc::new(SystemClock),
+            mission: Default::default(),
+            metrics: DispatchMetrics::global(),
+        }
     }
 
     #[cfg(test)]
@@ -253,7 +271,16 @@ impl DispatchReconciler {
             .filter(|project| project.spec.dispatch_policy.as_ref().is_some_and(|policy| policy.enabled))
             .cloned()
             .collect::<Vec<_>>();
-        let boards = self.issues.collect_boards(&enabled).await.unwrap_or_else(|error| {
+        // The issues the enabled Projects' live convoys run, from the convoys this reconciler
+        // follows rather than a listing per pass.
+        let running = flotilla_projections::dispatch_board::running_issues(
+            enabled
+                .iter()
+                .flat_map(|project| project_convoys.get(&project.metadata.name).into_iter().flatten())
+                .filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
+                .map(AsRef::as_ref),
+        );
+        let boards = self.issues.collect_boards(&enabled, running).await.unwrap_or_else(|error| {
             enabled
                 .iter()
                 .map(|project| (project.metadata.name.clone(), Err(format!("dispatch source inventory unavailable: {error}"))))
@@ -466,11 +493,11 @@ impl DispatchReconciler {
     }
 
     async fn refresh_convoys(&self, state: &mut MissionState) -> Result<(), String> {
+        let resolver = self.backend.including_replicas::<Convoy>(&self.namespace);
         loop {
             if state.watch.is_none() {
-                let resolver = self.backend.including_replicas::<Convoy>(&self.namespace);
-                // Subscribe before listing: racing writes appear in either or both.
-                let watch = resolver.watch().await.map_err(|e| e.to_string())?;
+                // Follow before listing: racing writes appear in either or both.
+                let watch = self.reads.convoys()?.changes();
                 let listed = resolver.list().await.map_err(|e| e.to_string())?;
                 state.convoy_lists += 1;
                 state.convoys.clear();
@@ -480,43 +507,41 @@ impl DispatchReconciler {
                 state.occupancy.clear();
                 state.watch = Some(watch);
             }
-            match state.watch.as_mut().expect("subscribed").next().now_or_never() {
-                None => return Ok(()),
-                Some(Some(Ok(event))) => {
-                    let name = match event {
-                        ReadWatchEvent::Added(record) | ReadWatchEvent::Modified(record) | ReadWatchEvent::Deleted(record) => {
-                            record.object.metadata.name
-                        }
-                        ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name,
-                    };
-                    // Re-read only the changed name to preserve local-over-replica
-                    // precedence and reveal a replica when its local copy is removed.
-                    let object = match self.backend.including_replicas::<Convoy>(&self.namespace).get(&name).await {
-                        Ok(record) => Some(record.object),
-                        Err(ResourceError::NotFound { .. }) => None,
-                        Err(error) => {
-                            state.watch = None;
-                            return Err(error.to_string());
-                        }
-                    };
-                    if state.convoys.get(&name).map(|previous| (&previous.spec, &previous.status))
-                        == object.as_ref().map(|next| (&next.spec, &next.status))
-                    {
-                        continue;
-                    }
-                    if let Some(previous) = state.convoys.remove(&name) {
-                        state.occupancy.remove(&previous.spec.project_ref);
-                    }
-                    if let Some(object) = object {
-                        state.occupancy.remove(&object.spec.project_ref);
-                        state.convoys.insert(name, Arc::new(object));
-                    }
+            let name = match state.watch.as_mut().expect("subscribed").try_recv() {
+                Err(TryRecvError::Empty) => return Ok(()),
+                Ok(ConvoyChange::Changed { name, .. }) => name,
+                // A home's records moved unseen: list them again.
+                Ok(ConvoyChange::Rescanned) => {
+                    state.watch = None;
+                    continue;
                 }
-                Some(_) => {
+                Err(TryRecvError::Lagged(_) | TryRecvError::Closed) => {
                     state.watch = None;
                     // Recover a gap from a fresh watch/list on the next pass.
                     return Err("convoy watch interrupted; retry reconciliation".into());
                 }
+            };
+            // Re-read only the changed name to preserve local-over-replica precedence and reveal a
+            // replica when its local copy is removed.
+            let object = match resolver.get(&name).await {
+                Ok(record) => Some(record.object),
+                Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => {
+                    state.watch = None;
+                    return Err(error.to_string());
+                }
+            };
+            if state.convoys.get(&name).map(|previous| (&previous.spec, &previous.status))
+                == object.as_ref().map(|next| (&next.spec, &next.status))
+            {
+                continue;
+            }
+            if let Some(previous) = state.convoys.remove(&name) {
+                state.occupancy.remove(&previous.spec.project_ref);
+            }
+            if let Some(object) = object {
+                state.occupancy.remove(&object.spec.project_ref);
+                state.convoys.insert(name, Arc::new(object));
             }
         }
     }
@@ -611,8 +636,10 @@ mod tests {
     use flotilla_resources::InputValue;
     use flotilla_resources::IssueSnapshot;
     use flotilla_resources::ProjectSpec;
+    use flotilla_resources::ReadWatchEvent;
     use flotilla_resources::RepositoryKey;
     use flotilla_store_testkit::VirtualClock;
+    use futures::StreamExt;
 
     use crate::testkits::engine::engine;
 
@@ -688,7 +715,7 @@ mod tests {
 
     #[async_trait]
     impl DispatchIssueSource for FakeIssues {
-        async fn collect_boards(&self, projects: &[ResourceObject<Project>]) -> Result<ProjectBoards, String> {
+        async fn collect_boards(&self, projects: &[ResourceObject<Project>], _: BTreeSet<IssueRef>) -> Result<ProjectBoards, String> {
             if *self.failing_collection.lock().expect("collection failure") {
                 return Err("injected source inventory outage".into());
             }
@@ -857,8 +884,13 @@ mod tests {
             failing_refs: Mutex::new(Default::default()),
         });
         let clock = Arc::new(VirtualClock::new("2026-08-04T12:00:00Z".parse().expect("clock timestamp")));
-        let reconciler = DispatchReconciler::new(backend.backend().clone(), NAMESPACE, Arc::clone(&issues) as Arc<dyn DispatchIssueSource>)
-            .with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+        let reconciler = DispatchReconciler::new(
+            backend.backend().clone(),
+            NAMESPACE,
+            Arc::clone(&issues) as Arc<dyn DispatchIssueSource>,
+            Arc::clone(backend.convoys.reads()),
+        )
+        .with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
         (backend, issues, clock, reconciler)
     }
 
@@ -922,7 +954,7 @@ mod tests {
         }
         // Inject a transport gap at the actual watch seam, then recover from
         // real in-memory resource inventory; no live fleet is involved.
-        reconciler.mission.lock().await.watch = Some(futures::stream::empty().boxed());
+        reconciler.mission.lock().await.watch = Some(broadcast::channel(1).1);
         assert_eq!(reconciler.reconcile_once().await.expect("scoped watch error").project_errors, 13);
         let unavailable = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
         assert!(unavailable.dispatch_queue_error.is_some());
@@ -960,7 +992,10 @@ mod tests {
             home.replicate_to(&other);
             let replicated = other.including_replicas::<Project>(NAMESPACE).get("widgets").await.unwrap();
             assert_eq!(replicated.object.spec, project.spec, "the home's Project replicated");
-            let pass = DispatchReconciler::new(other.backend().clone(), NAMESPACE, issues.clone()).reconcile_once().await.unwrap();
+            let pass = DispatchReconciler::new(other.backend().clone(), NAMESPACE, issues.clone(), Arc::clone(other.convoys.reads()))
+                .reconcile_once()
+                .await
+                .unwrap();
             assert_eq!(pass, ReconcilePass::default());
             assert_eq!(*issues.ready_calls.lock().unwrap(), 0);
         }
@@ -1593,6 +1628,7 @@ mod tests {
             backend.clone(),
             NAMESPACE,
             Arc::new(DaemonDispatchIssueSource::new(Arc::clone(&daemon))) as Arc<dyn DispatchIssueSource>,
+            daemon.lifecycle_reads(),
         );
         let mut changes = daemon.dispatch_board_changes();
         let queue =

@@ -11,33 +11,30 @@
 //! reclaiming what it holds, or once its convoy is gone; what is held for it ends with it. An
 //! ended convoy's launch is released, never failed.
 //!
-//! It runs at each change of a convoy, a vessel or a checkout (the evidence a reclaim waits on),
-//! and at the deadline of a replacement it is waiting to request; there is no periodic pass. A
-//! pass reads only the convoys the change names, by key: every convoy and every launch here is
-//! read at the first pass and after missed changes alone.
+//! A pass reads only the convoys it is given, each by its key. The daemon runs passes on the
+//! engine's controller runner: for the convoys a change of a convoy, of a launch here, or of a
+//! checkout an ended convoy's reclaim waits on names, and at the deadline of a replacement it is
+//! waiting to request; there is no periodic pass. Every live convoy and every launch here
+//! ([`VesselRequests::live`]) is passed at the start and after missed changes alone.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{CanonicalHostId, LifecycleReading};
 use flotilla_resources::{
-    checkout_records::{CheckoutChange, CheckoutHolder},
     lifecycle_reads::LifecycleReads,
-    vessel_records::{VesselChange, VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep},
+    vessel_records::{VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep},
     ResourceError, PROVISIONING_RETRY_BACKOFF,
 };
 use flotilla_store::load_metrics::carry;
-use futures::{stream::BoxStream, FutureExt, StreamExt};
-use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tracing::{debug, warn};
 
-mod old_convoys;
+mod engine_convoys;
 
-pub use old_convoys::OldConvoyWorks;
+pub use engine_convoys::EngineConvoyWorks;
 
 /// How many launches of a work may be lost in a row before no more are requested: a work whose
 /// every launch is lost is not chased for ever.
@@ -78,27 +75,15 @@ pub struct ConvoyWorksRead {
     pub needing: Vec<WorkNeedingVessel>,
 }
 
-/// What a convoy change names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConvoyTouched {
-    /// Convoy `convoy` homed at `convoy_home` changed.
-    Convoy { convoy: String, convoy_home: String },
-    /// Any convoy may have changed: changes were missed.
-    Every,
-}
-
 /// The convoys' side of vessel requests, read at this home from every home's convoys.
 #[async_trait::async_trait]
 pub trait ConvoyWorks: Send + Sync {
-    /// Every work of every live convoy that runs on a vessel now: Ready, Launching, Running,
-    /// Stalled or Interrupted.
-    async fn works_needing_vessel(&self) -> Result<Vec<WorkNeedingVessel>, String>;
+    /// Every live convoy, at every home: read at the start and after missed changes alone.
+    fn live(&self) -> Result<Vec<ConvoyKey>, String>;
     /// Convoy `convoy` homed at `convoy_home`, read by its key alone; none when no home holds it.
     async fn convoy(&self, convoy: &str, convoy_home: &str) -> Result<Option<ConvoyWorksRead>, String>;
     /// Where convoy `convoy` homed at `convoy_home` stands.
     async fn standing(&self, convoy: &str, convoy_home: &str) -> Result<ConvoyStanding, String>;
-    /// Each change of a convoy, local or replicated.
-    async fn changes(&self) -> Result<BoxStream<'static, ConvoyTouched>, String>;
 }
 
 /// Whether a convoy that has ended may have its vessels released: what they hold is reclaimed
@@ -155,118 +140,21 @@ impl VesselRequests {
         Self { works, reads, gate, hosts, local_host_ref }
     }
 
-    /// Runs a pass over every convoy first and after missed changes. Otherwise a pass reads only
-    /// the convoys a wake names: a convoy's own change, a change of one of its launches here, a
-    /// checkout change while the gate holds its release, or its waiting replacement falling due.
-    /// The wakes sent during a pass are taken together for the next.
-    pub async fn run(&self) -> Result<(), ResourceError> {
-        // Follow before the first pass so changes during it are not missed.
-        let mut convoy_changes = self.works.changes().await.map_err(ResourceError::other)?;
-        let vessels = self.reads.vessels().map_err(ResourceError::other)?;
-        let (here, mut vessel_changes) = (vessels.home().to_owned(), vessels.changes());
-        let mut checkout_changes = self.reads.checkouts().map_err(ResourceError::other)?.changes();
-        let mut due = BTreeMap::<ConvoyKey, DateTime<Utc>>::new();
-        let mut refused = BTreeSet::<ConvoyKey>::new();
-        // The convoys the next pass reads; every convoy when none.
-        let mut convoys: Option<BTreeSet<ConvoyKey>> = None;
-        loop {
-            let now = flotilla_resources::clock::now();
-            match convoys {
-                None => {
-                    let pass = self.sync_once(now).await?;
-                    (due, refused) = (pass.due, pass.refused);
-                }
-                Some(convoys) if convoys.is_empty() => {}
-                Some(convoys) => {
-                    let pass = self.sync_convoys(&convoys, now).await?;
-                    due.retain(|key, _| !convoys.contains(key));
-                    refused.retain(|key| !convoys.contains(key));
-                    due.extend(pass.due);
-                    refused.extend(pass.refused);
-                }
-            }
-            let mut woken = Woken::default();
-            let next = due.values().min().copied();
-            let falls_due = async move {
-                match next {
-                    Some(at) => tokio::time::sleep((at - flotilla_resources::clock::now()).to_std().unwrap_or(Duration::ZERO)).await,
-                    None => futures::future::pending().await,
-                }
-            };
-            tokio::select! {
-                change = convoy_changes.next() => woken.convoy(change)?,
-                change = vessel_changes.recv() => woken.vessel(change, &here)?,
-                change = checkout_changes.recv() => woken.checkout(change)?,
-                () = falls_due => {}
-            }
-            while let Some(change) = convoy_changes.next().now_or_never() {
-                woken.convoy(change)?;
-            }
-            while let Some(change) = ready(vessel_changes.try_recv()) {
-                woken.vessel(change, &here)?;
-            }
-            while let Some(change) = ready(checkout_changes.try_recv()) {
-                woken.checkout(change)?;
-            }
-            let now = flotilla_resources::clock::now();
-            woken.convoys.extend(due.iter().filter(|(_, at)| **at <= now).map(|(key, _)| key.clone()));
-            convoys = self.woken_convoys(woken, &refused).await?;
-        }
+    /// Every live convoy, and the convoy of each live launch here: what a pass at the start, or
+    /// after missed changes, is given.
+    pub fn live(&self) -> Result<BTreeSet<ConvoyKey>, String> {
+        let mut convoys: BTreeSet<ConvoyKey> = self.works.live()?.into_iter().collect();
+        let vessels = self.reads.vessels()?;
+        let here = vessels.home().to_owned();
+        convoys.extend(vessels.at(&here)?.into_iter().filter(|record| !record.ended()).map(|record| (record.convoy, record.convoy_home)));
+        Ok(convoys)
     }
 
-    /// The convoys `woken` names, or `None` for every convoy: a launch names its convoy, and a
-    /// checkout the convoy that holds it when the gate refused that convoy's release.
-    async fn woken_convoys(&self, woken: Woken, refused: &BTreeSet<ConvoyKey>) -> Result<Option<BTreeSet<ConvoyKey>>, ResourceError> {
-        if woken.every {
-            return Ok(None);
-        }
-        let mut convoys = woken.convoys;
-        let (launches, checkouts, every_checkout) = (woken.launches, woken.checkouts, woken.every_checkout);
-        let reads = Arc::clone(&self.reads);
-        let holders = if refused.is_empty() || (checkouts.is_empty() && !every_checkout) {
-            Some(BTreeSet::new())
-        } else if every_checkout {
-            None
-        } else {
-            let reads = Arc::clone(&reads);
-            spawn_blocking(flotilla_schema::reads::carry(move || {
-                let checkouts_here = reads.checkouts()?;
-                let mut holders = BTreeSet::new();
-                for name in checkouts {
-                    // A checkout another home holds names no holder here: every refused convoy is
-                    // judged again.
-                    match checkouts_here.get(&name, None)? {
-                        Some(record) => holders.extend(record.holder.map(|CheckoutHolder::Convoy(convoy)| convoy)),
-                        None => return Ok(None),
-                    }
-                }
-                Ok(Some(holders))
-            }))
-            .await?
-        };
-        match holders {
-            Some(holders) => convoys.extend(refused.iter().filter(|(convoy, _)| holders.contains(convoy)).cloned()),
-            None => convoys.extend(refused.iter().cloned()),
-        }
-        if !launches.is_empty() {
-            let named = spawn_blocking(flotilla_schema::reads::carry(move || {
-                let vessels = reads.vessels()?;
-                let mut convoys = BTreeSet::new();
-                for launch in launches {
-                    convoys.extend(vessels.get(&launch, None)?.map(|record| (record.convoy, record.convoy_home)));
-                }
-                Ok(convoys)
-            }))
-            .await?;
-            convoys.extend(named);
-        }
-        Ok(Some(convoys))
-    }
-
-    /// One pass over every work needing a vessel and every launch this home holds, at `now`.
+    /// One pass over every live convoy and every launch this home holds, at `now`.
     pub async fn sync_once(&self, now: DateTime<Utc>) -> Result<VesselRequestPass, ResourceError> {
-        let works = self.works.works_needing_vessel().await.map_err(ResourceError::other)?;
-        self.pass(works, |vessels, here| vessels.at(here), now).await
+        let requests = self.clone();
+        let convoys = spawn_blocking(flotilla_schema::reads::carry(move || requests.live())).await?;
+        self.sync_convoys(&convoys, now).await
     }
 
     /// One pass over the works of `convoys` and their launches this home holds, at `now`: each
@@ -388,66 +276,6 @@ impl VesselRequests {
 /// `work` on a blocking thread, its reads counted for the caller current here.
 async fn spawn_blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, ResourceError> {
     tokio::task::spawn_blocking(carry(work)).await.map_err(|error| ResourceError::other(error.to_string()))?.map_err(ResourceError::other)
-}
-
-/// A broadcast change already sent, if any; a lag or the end of the changes is one too.
-fn ready<T: Clone>(change: Result<T, TryRecvError>) -> Option<Result<T, RecvError>> {
-    match change {
-        Ok(change) => Some(Ok(change)),
-        Err(TryRecvError::Empty) => None,
-        Err(TryRecvError::Lagged(missed)) => Some(Err(RecvError::Lagged(missed))),
-        Err(TryRecvError::Closed) => Some(Err(RecvError::Closed)),
-    }
-}
-
-/// What woke the requester since its last pass.
-#[derive(Default)]
-struct Woken {
-    /// Changes were missed: every convoy is read again.
-    every: bool,
-    convoys: BTreeSet<ConvoyKey>,
-    /// Launches here that changed.
-    launches: BTreeSet<String>,
-    /// Checkout launches here that changed.
-    checkouts: BTreeSet<String>,
-    /// Checkout changes were missed.
-    every_checkout: bool,
-}
-
-impl Woken {
-    fn convoy(&mut self, change: Option<ConvoyTouched>) -> Result<(), ResourceError> {
-        match change.ok_or_else(|| ResourceError::invalid("convoy changes ended"))? {
-            ConvoyTouched::Convoy { convoy, convoy_home } => {
-                self.convoys.insert((convoy, convoy_home));
-            }
-            ConvoyTouched::Every => self.every = true,
-        }
-        Ok(())
-    }
-
-    /// A launch at another home is that home's to request and release.
-    fn vessel(&mut self, change: Result<VesselChange, RecvError>, here: &str) -> Result<(), ResourceError> {
-        match change {
-            Ok(VesselChange::Changed { name, home }) if home == here => {
-                self.launches.insert(name);
-            }
-            Ok(VesselChange::Changed { .. }) => {}
-            Ok(VesselChange::Rescanned) | Err(RecvError::Lagged(_)) => self.every = true,
-            Err(RecvError::Closed) => return Err(ResourceError::invalid("vessel changes ended")),
-        }
-        Ok(())
-    }
-
-    fn checkout(&mut self, change: Result<CheckoutChange, RecvError>) -> Result<(), ResourceError> {
-        match change {
-            Ok(CheckoutChange::Changed { name, .. }) => {
-                self.checkouts.insert(name);
-            }
-            Ok(CheckoutChange::Rescanned) | Err(RecvError::Lagged(_)) => self.every_checkout = true,
-            Err(RecvError::Closed) => return Err(ResourceError::invalid("checkout changes ended")),
-        }
-        Ok(())
-    }
 }
 
 /// A convoy's identity: its name and its home.

@@ -133,6 +133,7 @@ fn the_enumeration_covers_every_kind_and_index() {
         "index vessel_by_launch integer keys before",
         "index message_deadline first",
         "index convoy_open_by_project first",
+        "index convoy_open_by_role first",
         "index convoy_by_launch first",
         "index convoy_by_launch integer keys before",
         "index terminal_session_by_vessel after",
@@ -154,7 +155,12 @@ fn the_enumeration_covers_every_kind_and_index() {
     ] {
         assert!(labels.contains(&expected), "missing {expected}");
     }
-    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 4 * 19 + 2 * 5);
+    // Four pages for each root index, two integer-key reads for five, four pages for each of the
+    // five leading-column prefixes (convoy_by_launch two, convoy_open_by_role one,
+    // vessel_by_launch two), and four owner pages for the one unordered nested index.
+    assert!(labels.contains(&"index convoy_by_launch prefix 1 first"));
+    assert!(labels.contains(&"index convoy_subjects_by_subject first"));
+    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 4 * 20 + 2 * 5 + 4 * 5 + 4);
     assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 11);
     assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(

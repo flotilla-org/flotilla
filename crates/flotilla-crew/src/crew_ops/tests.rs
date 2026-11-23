@@ -326,7 +326,8 @@ async fn build_fixture(
             .resource_backend(backend.clone())
             .accounts(Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone())))
             .leaf_subscriptions(subscriptions)
-            .lifecycle_reads(engine.reads())
+            // As the composition root wires it: the lifecycle reads serve this home's convoys.
+            .lifecycle_reads(Arc::clone(engine.convoys.reads()))
             .vessel_seats(Arc::new(flotilla_store::EngineVesselSeats::new(engine.reads())))
             .work_credential_reconciler(RwLock::new(Some(reconciler)))
             .clock(Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>)

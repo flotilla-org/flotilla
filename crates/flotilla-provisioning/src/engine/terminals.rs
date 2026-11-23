@@ -386,6 +386,26 @@ impl TerminalRecords for EngineTerminals {
             .map_err(|error| format!("engine TerminalSession/{name}: {error}"))
     }
 
+    fn named(&self, name: &str) -> Result<Vec<TerminalRecord>, String> {
+        let homes = (self.homes)();
+        self.reads
+            .read(|read| {
+                let mut records = Vec::new();
+                for home in &homes {
+                    let view = if launched(name) != name {
+                        keyed::<TerminalSessionKind>(read, name, home)?
+                    } else {
+                        latest::<TerminalSessionKind>(read, name, home)?
+                    };
+                    if let Some(view) = view {
+                        records.push(record(read, view)?);
+                    }
+                }
+                Ok(records)
+            })
+            .map_err(|error| format!("engine TerminalSession/{name} at each home: {error}"))
+    }
+
     fn at(&self, home: &str) -> Result<Vec<TerminalRecord>, String> {
         self.scanned(&format!("at {home}"), |read| Self::scan(read, home))
     }
@@ -419,6 +439,16 @@ impl TerminalRecords for EngineTerminals {
 
     fn of_vessel(&self, vessel: &str) -> Result<Vec<TerminalRecord>, String> {
         self.records(&format!("of vessel {vessel}"), |read| indexed(read, &TerminalSessionRequest::by_holder(&Holder::vessel(vessel))))
+    }
+
+    fn of_vessels(&self, vessels: &[String]) -> Result<Vec<TerminalRecord>, String> {
+        self.records(&format!("of {} vessels", vessels.len()), |read| {
+            let mut views = Vec::new();
+            for vessel in vessels {
+                views.extend(indexed(read, &TerminalSessionRequest::by_holder(&Holder::vessel(vessel)))?);
+            }
+            Ok(views)
+        })
     }
 
     fn of_environment(&self, environment: &str, home: &str) -> Result<Vec<TerminalRecord>, String> {

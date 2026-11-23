@@ -117,6 +117,9 @@ impl<'a> ConvoyName<'a> {
     /// The indexed selection of every convoy this name may answer with: the convoys holding the
     /// role in the project, and the record of that name.
     pub fn query(&self) -> crate::StoreQuery {
+        if !self.may_name_role() {
+            return crate::StoreQuery::names([self.name.to_owned()], true);
+        }
         let mut labels = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_owned(), self.name.to_owned())]);
         if let Some(project) = self.project {
             labels.insert(flotilla_resources::PROJECT_LABEL.to_owned(), project.to_owned());
@@ -126,6 +129,46 @@ impl<'a> ConvoyName<'a> {
             include_replicas: true,
             ..Default::default()
         }
+    }
+
+    /// [`Self::query`] for a role still held live: the record of the name, and the open launches
+    /// holding the role in the project, read through the `open_by_role` index. Where these hold no
+    /// live holder, [`Self::candidates`] reads [`Self::query`].
+    pub fn live_query(&self) -> crate::StoreQuery {
+        let mut holders = self.query();
+        let live = live_convoys_query();
+        if let Some(alternatives) = holders.any_of.as_mut() {
+            alternatives[1].any_of = live.any_of;
+        }
+        holders
+    }
+
+    /// Whether this name may name a role: a launch's name (`<launch_of>#<n>`) is the record
+    /// admission named, never a role.
+    fn may_name_role(&self) -> bool {
+        flotilla_resources::convoy::launch_of(self.name) == self.name
+    }
+
+    /// The rows [`Self::select`] chooses this name's convoy from: [`Self::live_query`]'s while
+    /// they hold a live holder of the role, which [`Self::select`] prefers, else
+    /// [`Self::query`]'s, the ended holders included.
+    pub async fn candidates(
+        &self,
+        backend: &crate::ResourceBackend,
+        namespace: &str,
+    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>, String> {
+        let live =
+            backend.query_declared::<flotilla_resources::Convoy>(namespace, &self.live_query()).await.map_err(|error| error.to_string())?;
+        let identities: Vec<_> = live.items.iter().map(|row| ConvoyIdentity::of(&row.object)).collect();
+        if !self.may_name_role() || identities.iter().any(|identity| self.holds_live(identity)) {
+            return Ok(live.items);
+        }
+        Ok(backend.query_declared::<flotilla_resources::Convoy>(namespace, &self.query()).await.map_err(|error| error.to_string())?.items)
+    }
+
+    /// Whether `identity` is a live holder of this name's role in its project.
+    fn holds_live(&self, identity: &ConvoyIdentity<'_>) -> bool {
+        identity.project.filter(|project| !project.is_empty()) == self.project && identity.role == Some(self.name) && !identity.terminal
     }
 
     /// The convoy this name answers with among `rows`, which hold at least what [`Self::query`]
@@ -149,7 +192,8 @@ impl<'a> ConvoyName<'a> {
     pub fn select_indices(&self, identities: &[ConvoyIdentity<'_>]) -> Result<Vec<usize>, String> {
         let in_project = |identity: &ConvoyIdentity<'_>| identity.project.filter(|project| !project.is_empty()) == self.project;
         let holders = || identities.iter().enumerate().filter(|(_, identity)| in_project(identity) && identity.role == Some(self.name));
-        let live: Vec<usize> = holders().filter(|(_, identity)| !identity.terminal).map(|(index, _)| index).collect();
+        let live: Vec<usize> =
+            identities.iter().enumerate().filter(|(_, identity)| self.holds_live(identity)).map(|(index, _)| index).collect();
         let candidates = if !live.is_empty() {
             live
         } else {
@@ -193,6 +237,23 @@ impl<'a> ConvoyName<'a> {
         if let Some(project) = self.project {
             return Ok(Some(project.to_owned()));
         }
+        // A launch's name is placed by its record, read by name: no launch is read by its role.
+        if !self.may_name_role() {
+            let copies = backend
+                .including_replicas::<flotilla_resources::Convoy>(namespace)
+                .get_all(self.name)
+                .await
+                .map_err(|error| error.to_string())?
+                .items;
+            let projects: std::collections::BTreeSet<String> = copies
+                .iter()
+                .filter_map(|copy| ConvoyIdentity::of(&copy.object).project.filter(|project| !project.is_empty()).map(str::to_owned))
+                .collect();
+            if projects.len() > 1 {
+                return Err(flotilla_resources::convoy_records::several_projects(self.name, &projects));
+            }
+            return Ok(projects.into_iter().next());
+        }
         let rows =
             backend.query_declared::<flotilla_resources::Convoy>(namespace, &self.query()).await.map_err(|error| error.to_string())?;
         let mut projects: std::collections::BTreeSet<String> = rows
@@ -218,6 +279,9 @@ impl<'a> ConvoyName<'a> {
         backend: &crate::ResourceBackend,
         namespace: &str,
     ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>, String> {
+        if !self.may_name_role() {
+            return Ok(None);
+        }
         let mut labels = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_owned(), self.name.to_owned())]);
         if let Some(project) = self.project {
             labels.insert(flotilla_resources::PROJECT_LABEL.to_owned(), project.to_owned());
@@ -237,9 +301,8 @@ impl<'a> ConvoyName<'a> {
         backend: &crate::ResourceBackend,
         namespace: &str,
     ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>, String> {
-        let rows =
-            backend.query_declared::<flotilla_resources::Convoy>(namespace, &self.query()).await.map_err(|error| error.to_string())?;
-        if let Some(selected) = self.select(&rows.items)? {
+        let rows = self.candidates(backend, namespace).await?;
+        if let Some(selected) = self.select(&rows)? {
             return Ok(Some(selected.clone()));
         }
         let copies = backend

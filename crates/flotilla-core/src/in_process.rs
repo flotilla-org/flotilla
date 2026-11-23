@@ -757,8 +757,6 @@ pub struct InProcessDaemon {
     /// The engine's provisioning readings (#3629 layer 4), installed with the decided store's
     /// provisioning homes; none before.
     lifecycle_reads: Arc<flotilla_projections::ports::LateLifecycleReads>,
-    /// The Convoy views composed over those readings, installed with them.
-    convoy_views: std::sync::OnceLock<Arc<flotilla_store::ConvoyViews>>,
     /// The account kinds' records (#3824 layer 1): the engine's.
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     /// The Host records, the planners' Host port (#4413): the engine's.
@@ -1552,7 +1550,6 @@ impl InProcessDaemon {
             observation_records: Default::default(),
             change_stream_rounds: Default::default(),
             lifecycle_reads: Arc::clone(&lifecycle_reads),
-            convoy_views: Default::default(),
             accounts,
             manifest_roots,
             standing_roles,
@@ -2407,9 +2404,8 @@ impl InProcessDaemon {
             DEFAULT_PROVISIONING_NAMESPACE,
             Arc::clone(&reads),
         )));
-        let convoy_views = Arc::new(flotilla_store::ConvoyViews::new(DEFAULT_PROVISIONING_NAMESPACE, Arc::clone(&reads)));
-        self.convoy_views.set(Arc::clone(&convoy_views)).map_err(|_| "the Convoy views are already installed".to_owned())?;
-        self.resource_backend.install_engine_records(convoy_views);
+        self.resource_backend
+            .install_engine_records(Arc::new(flotilla_store::ConvoyViews::new(DEFAULT_PROVISIONING_NAMESPACE, Arc::clone(&reads))));
         // A port serving no checkouts holds no checkout lifetimes to follow; the follower runs on
         // the runtime composing this daemon.
         if reads.checkouts().is_ok() && tokio::runtime::Handle::try_current().is_ok() {
@@ -2476,11 +2472,6 @@ impl InProcessDaemon {
     /// The provisioning readings the views consult: the engine's once installed, none before.
     pub fn lifecycle_reads(&self) -> Arc<dyn flotilla_projections::ports::LifecycleReads> {
         self.lifecycle_reads.clone()
-    }
-
-    /// The Convoy views the resource backend serves: none until the readings are installed.
-    pub fn convoy_views(&self) -> Result<Arc<flotilla_store::ConvoyViews>, String> {
-        self.convoy_views.get().cloned().ok_or_else(|| "the Convoy views are not installed".to_owned())
     }
 
     /// Installs the Message path opened at composition (#3317) into its readers: the resource
@@ -4540,9 +4531,22 @@ impl InProcessDaemon {
     ) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
         self.dispatch_board_projection().await.dispatch_board_repositories_internal(project_filter).await
     }
+    /// The boards and bindings of `projects`, observing `running`, the issues their live convoys
+    /// run, whatever their labels.
     #[tracing::instrument(name = "dispatch_board", skip_all)]
-    pub async fn collect_dispatch_board_inputs(&self, projects: &[ResourceObject<Project>]) -> Result<DispatchBoardInputs, String> {
-        self.dispatch_board_projection().await.collect_dispatch_board_inputs(projects).await
+    pub async fn collect_dispatch_board_inputs(
+        &self,
+        projects: &[ResourceObject<Project>],
+        running: std::collections::BTreeSet<flotilla_protocol::IssueRef>,
+    ) -> Result<DispatchBoardInputs, String> {
+        self.dispatch_board_projection().await.collect_dispatch_board_inputs(projects, running).await
+    }
+    /// The issues `projects`' live convoys with active crews run, read from the store.
+    pub async fn running_dispatch_issues(
+        &self,
+        projects: &[ResourceObject<Project>],
+    ) -> Result<std::collections::BTreeSet<flotilla_protocol::IssueRef>, String> {
+        self.dispatch_board_projection().await.running_issues(projects).await
     }
     async fn dispatch_board_projection(&self) -> flotilla_projections::dispatch_board::DispatchBoard<'_> {
         flotilla_projections::dispatch_board::DispatchBoard {
@@ -6063,10 +6067,8 @@ impl InProcessDaemon {
         };
         // This reads the shared immutable board snapshot, scheduling background
         // warming when cold/stale; it never waits for HTTP. Explanation rebuilds
-        // one project's mission graph and reads only its live convoy subset.
-        let inputs = self.collect_dispatch_board_inputs(std::slice::from_ref(project)).await?;
-        let (_, snapshots) = inputs.get(project_name).ok_or("project board unavailable")?.as_ref().map_err(Clone::clone)?;
-        let board = MissionBoard::new(&snapshots.iter().map(|(_, board)| board.as_ref().clone()).collect::<Vec<_>>())?;
+        // one project's mission graph and reads only its live convoy subset, once:
+        // the board's running issues and the occupancy both come from it.
         let convoys = self
             .resource_backend
             .query_declared::<ResourceConvoy>(
@@ -6075,6 +6077,10 @@ impl InProcessDaemon {
             )
             .await
             .map_err(|e| e.to_string())?;
+        let running = flotilla_projections::dispatch_board::running_issues(convoys.items.iter().map(|source| &source.object));
+        let inputs = self.collect_dispatch_board_inputs(std::slice::from_ref(project), running).await?;
+        let (_, snapshots) = inputs.get(project_name).ok_or("project board unavailable")?.as_ref().map_err(Clone::clone)?;
+        let board = MissionBoard::new(&snapshots.iter().map(|(_, board)| board.as_ref().clone()).collect::<Vec<_>>())?;
         let occupancy = MissionOccupancy::collect(&board, policy, convoys.items.iter().map(|source| &source.object))?;
         convoy
             .spec

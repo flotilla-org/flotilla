@@ -8,6 +8,9 @@ pub const VESSEL_LABEL: &str = "flotilla.work/vessel";
 pub const VESSEL_REF_LABEL: &str = "flotilla.work/vessel-ref";
 pub const ROLE_LABEL: &str = "flotilla.work/role";
 pub const PROJECT_LABEL: &str = "flotilla.work/project";
+/// The name a convoy launch is a launch of (`<launch_of>#<n>`): with its project, read through the
+/// launch index.
+pub const LAUNCH_OF_LABEL: &str = "flotilla.work/launch-of";
 pub const GENERATION_LABEL: &str = "flotilla.work/generation";
 pub const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
 pub const VESSEL_ORDINAL_LABEL: &str = "flotilla.work/vessel-ordinal";

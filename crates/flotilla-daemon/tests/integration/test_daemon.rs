@@ -324,6 +324,24 @@ async fn a_convoy_idle_on_an_unchanged_change_request_is_not_stalled_across_a_re
     assert_unstalled(&daemon, &convoy, "idle after the restart").await;
 }
 
+// After a restart over the same store the controller's start pass reads the open convoy again and
+// notes the change request its PR names, so that request's merge, the next change after the
+// restart, wakes the convoy and it lands.
+#[tokio::test(start_paused = true)]
+async fn after_a_restart_a_later_merge_wakes_the_convoy() {
+    let daemon = TestDaemon::builder().change_request("merge_after_ms = 120000").start().await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    daemon
+        .wait("its open change request", |found: &ResourceObject<ChangeRequest>| {
+            found.status.as_ref().is_some_and(|status| status.state.value == Some(ObservedChangeRequestState::Open))
+        })
+        .await;
+    let daemon = daemon.restart().await;
+    assert_unstalled(&daemon, &convoy, "after the restart, before the merge").await;
+    daemon.wait("Landed", in_phase(&convoy, ConvoyPhase::Landed)).await;
+    assert_eq!(daemon.counts().sessions_launched, 1, "the coder was adopted, not relaunched: {:?}", daemon.counts());
+}
+
 /// `convoy` is still Active and has no stall, `when`.
 async fn assert_unstalled(daemon: &TestDaemon, convoy: &str, when: &str) {
     let found = daemon.get::<Convoy>(convoy).await.expect("the convoy");
@@ -502,6 +520,28 @@ async fn a_held_dirty_landed_checkout_stays_held_across_a_restart() {
         assert_eq!(row.get("landed"), Some(&serde_json::Value::Bool(true)), "its landing stays judged: {row:?}");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+}
+
+// A landed convoy whose checkout is dirty keeps its vessel: the release gate refuses while the
+// checkout's removal waits on a person. The person's ruling archives the checkout, and that
+// checkout's change judges the release again, so the vessel's environment is destroyed.
+#[tokio::test(start_paused = true)]
+async fn a_ruling_on_a_held_checkout_releases_the_landed_convoys_vessel() {
+    let fleet = TestDaemon::builder().vcs("dirty_rate = 1.0").start().await;
+    let name = fleet.dispatch(CrewMix::LongRunner, DUMMY_FULFILMENT_KIND).await;
+    fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
+    let checkout = fleet
+        .wait_row("the convoy's checkout landed and dirty", "checkout_integration", "", |row| {
+            row.get("landed") == Some(&serde_json::Value::Bool(true)) && row.get("clean") == Some(&serde_json::Value::Bool(false))
+        })
+        .await;
+    let launch = text(&checkout, "resource.name").to_owned();
+    fleet.wait_row("its vessel's environment, kept", "environment", "", of_convoy(&name, "Realised")).await;
+    assert_eq!(fleet.counts().environments_destroyed, 0, "the vessel is kept while its checkout is held: {:?}", fleet.counts());
+    fleet.execute(CommandAction::CheckoutArchive { checkout: launch }).await;
+    // Its work's vessels are released, each environment destroyed: one of them shows Gone.
+    fleet.wait_row("its vessel's environment destroyed", "environment", "", of_convoy(&name, "Gone")).await;
+    assert!(fleet.counts().environments_destroyed >= 1, "{:?}", fleet.counts());
 }
 
 // Fleet health counts a capped host's free vessel slots from the vessels the engine holds there:

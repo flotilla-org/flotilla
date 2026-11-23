@@ -168,7 +168,10 @@ impl UnreadableLaunch {
     /// The launch as an old Convoy object in `namespace`: its name, project and workflow, the
     /// reason under [`crate::CONVOY_UNREADABLE_ANNOTATION`], and no status.
     pub fn read_view(&self, namespace: &str) -> ResourceObject<Convoy> {
-        let mut labels = BTreeMap::from([(PROJECT_LABEL.to_owned(), self.project.clone())]);
+        let mut labels = BTreeMap::from([
+            (PROJECT_LABEL.to_owned(), self.project.clone()),
+            (crate::labels::LAUNCH_OF_LABEL.to_owned(), self.launch_of.clone()),
+        ]);
         labels.retain(|_, value| !value.is_empty());
         ResourceObject {
             metadata: ObjectMeta {
@@ -562,8 +565,11 @@ impl ConvoyRecord {
             ..ConvoyStatus::default()
         };
 
-        let mut labels =
-            BTreeMap::from([(PROJECT_LABEL.to_owned(), self.project.clone()), (ROLE_LABEL.to_owned(), self.role().to_owned())]);
+        let mut labels = BTreeMap::from([
+            (PROJECT_LABEL.to_owned(), self.project.clone()),
+            (ROLE_LABEL.to_owned(), self.role().to_owned()),
+            (crate::labels::LAUNCH_OF_LABEL.to_owned(), self.launch_of.clone()),
+        ]);
         labels.retain(|_, value| !value.is_empty());
         let document = &self.admission;
         // What admission wrote for the launch, under the annotations its readers find it by.
@@ -670,6 +676,52 @@ pub trait ConvoyRecords: Send + Sync {
     /// Every launch at every home this store holds; one that cannot be read is listed as
     /// unreadable.
     fn every(&self) -> Result<ConvoyListing, String>;
+    /// Every home's launches of `of` in `project` that have not retired, read through the kind's
+    /// `by_launch` index; one that cannot be read is listed as unreadable. The default filters
+    /// [`ConvoyRecords::every`].
+    fn launches_of(&self, of: &str, project: &str) -> Result<ConvoyListing, String> {
+        let mut listing = self.every()?;
+        listing.records.retain(|record| record.project == project && record.launch_of == of);
+        listing.unreadable.retain(|launch| launch.project == project && launch.launch_of == of);
+        Ok(listing)
+    }
+    /// Every home's launches in `project`, ended or not, that have not retired, read through the
+    /// leading column of the kind's `by_launch` index; one that cannot be read is listed as
+    /// unreadable. The default filters [`ConvoyRecords::every`], for a port that keeps no index.
+    fn of_project(&self, project: &str) -> Result<ConvoyListing, String> {
+        let mut listing = self.every()?;
+        listing.records.retain(|record| record.project == project);
+        listing.unreadable.retain(|launch| launch.project == project);
+        Ok(listing)
+    }
+    /// Every home's launches holding a link of `subject`, an unlinked one included, that have not
+    /// retired, read through the kind's `by_subject` index; one that cannot be read is listed as
+    /// unreadable. The default filters [`ConvoyRecords::every`], for a port that keeps no index.
+    fn linked_to(&self, subject: &flotilla_address::Address) -> Result<ConvoyListing, String> {
+        let subject = crate::address::subject_for(subject)?;
+        let mut listing = self.every()?;
+        listing
+            .records
+            .retain(|record| record.subjects.iter().any(|linked| linked.subject == subject) || record.unlinked.contains(&subject));
+        Ok(listing)
+    }
+    /// Every home's launches in `project` that have not ended, read through the kind's
+    /// `open_by_project` index; one that cannot be read is listed as unreadable. The default
+    /// filters [`ConvoyRecords::every`], for a port that keeps no index.
+    fn open_in(&self, project: &str) -> Result<ConvoyListing, String> {
+        let mut listing = self.every()?;
+        listing.records.retain(|record| record.project == project && record.ended.is_none());
+        listing.unreadable.retain(|launch| launch.project == project);
+        Ok(listing)
+    }
+    /// Every home's open launches of `role` in `project`, read through the kind's `open_by_role`
+    /// index; an unreadable launch in `project` is listed whatever its role. The default filters
+    /// [`ConvoyRecords::open_in`].
+    fn open_of_role(&self, project: &str, role: &str) -> Result<ConvoyListing, String> {
+        let mut listing = self.open_in(project)?;
+        listing.records.retain(|record| record.role() == role);
+        Ok(listing)
+    }
     /// The launches whose records change, as they are written or replicated here, from now on.
     fn changes(&self) -> tokio::sync::broadcast::Receiver<ConvoyChange> {
         tokio::sync::broadcast::channel(1).1
@@ -688,8 +740,9 @@ pub trait ConvoyRecords: Send + Sync {
 pub struct ConvoyMemory {
     notes: Mutex<BTreeMap<String, ConvoyNotes>>,
     changes: tokio::sync::broadcast::Sender<String>,
-    /// How many times the notes changed since this home started: told and counted together.
-    changed: Mutex<u64>,
+    /// Which launches' notes changed, and how many times, since this home started: told and
+    /// counted together.
+    changed: Mutex<crate::engine_records::UnloggedJournal>,
     /// How many launches, at any home, the convoy views last listed as unreadable.
     unreadable: AtomicU64,
     /// The evidence records each launch's last pass read: a change of one wakes only the
@@ -702,7 +755,7 @@ impl Default for ConvoyMemory {
         Self {
             notes: Mutex::default(),
             changes: tokio::sync::broadcast::channel(256).0,
-            changed: Mutex::new(0),
+            changed: Mutex::default(),
             unreadable: AtomicU64::new(0),
             evidence: Mutex::default(),
         }
@@ -760,7 +813,17 @@ impl ConvoyMemory {
     /// How many times the notes have changed since this home started. Counted after each change
     /// is in place, so a reader that reads this before the notes sees at least those changes.
     pub fn changed(&self) -> u64 {
-        *self.changed.lock().unwrap_or_else(PoisonError::into_inner)
+        self.changed.lock().unwrap_or_else(PoisonError::into_inner).count()
+    }
+
+    /// Where a reader stands that has read every note change counted so far.
+    pub fn notes_read(&self) -> crate::engine_records::UnloggedRead {
+        self.changed.lock().unwrap_or_else(PoisonError::into_inner).read()
+    }
+
+    /// The launches whose notes changed since `read`; `Err` holds why they cannot be named.
+    pub fn noted_since(&self, read: Option<&crate::engine_records::UnloggedRead>) -> Result<BTreeSet<String>, String> {
+        self.changed.lock().unwrap_or_else(PoisonError::into_inner).since(read)
     }
 
     /// Tells the subscribers and counts the change as one step: a subscriber that reads the count
@@ -770,7 +833,17 @@ impl ConvoyMemory {
         let mut changed = self.changed.lock().unwrap_or_else(PoisonError::into_inner);
         // No follower is no reason to fail: one may subscribe later.
         drop(self.changes.send(name.to_owned()));
-        *changed = changed.saturating_add(1);
+        changed.record([name.to_owned()]);
+    }
+
+    /// The launches with a crew member's follow-up pending, read from the notes alone.
+    pub fn pending_follow_ups(&self) -> Vec<String> {
+        let notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+        notes
+            .iter()
+            .filter(|(_, notes)| notes.crew.values().flat_map(BTreeMap::values).any(|crew| crew.pending_follow_up.is_some()))
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// The notes on launch `name`; empty when none are held.
@@ -882,3 +955,64 @@ impl ConvoyMemory {
 
 #[cfg(test)]
 mod tests;
+
+/// This home's launches that have not ended, held between reads (#4412 C): the first read lists
+/// this home's launches once, and each later read gets by key only the launches the log wrote
+/// since the read before. A launch that cannot be read counts as open, since nothing says it
+/// ended. A port without a log, or a log that no longer holds what was written since, is listed
+/// again.
+#[derive(Default)]
+pub struct OpenLaunches {
+    held: Option<HeldOpen>,
+}
+
+struct HeldOpen {
+    open: BTreeSet<String>,
+    cursor: Box<dyn crate::lifecycle_reads::ChangeCursor<ConvoyChange>>,
+    through: BTreeMap<String, u64>,
+}
+
+impl OpenLaunches {
+    /// The launches at `convoys`' home that have not ended, as of this read.
+    pub fn read(&mut self, convoys: &dyn ConvoyRecords) -> Result<BTreeSet<String>, String> {
+        let here = convoys.home().to_owned();
+        if let Some(held) = &mut self.held {
+            match held.cursor.since(&held.through)? {
+                crate::lifecycle_reads::CursorSince::Changed { written, through } => {
+                    let names: BTreeSet<String> = written.into_iter().filter(|(_, home)| *home == here).map(|(name, _)| name).collect();
+                    for name in names {
+                        if open(&convoys.named(&name, Some(&here))?) {
+                            held.open.insert(name);
+                        } else {
+                            held.open.remove(&name);
+                        }
+                    }
+                    held.through = through;
+                    return Ok(held.open.clone());
+                }
+                crate::lifecycle_reads::CursorSince::Expired(_) => self.held = None,
+            }
+        }
+        // The position is taken before the listing: a write between the two is read again next
+        // time, which changes nothing.
+        let cursor = convoys.cursor();
+        let through = cursor.as_ref().map(|cursor| cursor.read_through());
+        let listing = convoys.at(&here)?;
+        let open: BTreeSet<String> = listing
+            .records
+            .into_iter()
+            .filter(|record| record.ended.is_none())
+            .map(|record| record.name)
+            .chain(listing.unreadable.into_iter().map(|launch| launch.name))
+            .collect();
+        if let (Some(cursor), Some(through)) = (cursor, through) {
+            self.held = Some(HeldOpen { open: open.clone(), cursor, through });
+        }
+        Ok(open)
+    }
+}
+
+/// Whether a launch read by name has not ended: held, not ended and not retired, or unreadable.
+fn open(listing: &ConvoyListing) -> bool {
+    !listing.unreadable.is_empty() || listing.records.iter().any(|record| record.ended.is_none() && !record.retired)
+}

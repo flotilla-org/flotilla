@@ -14,6 +14,10 @@ use std::{
 
 use chrono::Utc;
 use flotilla_admission::reconcilers::vessel_requests::VesselRequests;
+use flotilla_provisioning::engine::controller::Runner;
+use flotilla_resources::lifecycle_reads::LifecycleReads;
+
+use super::vessel_requests_controller::VesselRequestsPolicy;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_provisioning::checkout_runtime::sweep_host_empty_convoy_directories;
@@ -425,14 +429,24 @@ where
 
 pub(super) fn spawn_vessel_requests(
     requests: VesselRequests,
+    reads: Arc<dyn LifecycleReads>,
+    clock: Arc<dyn flotilla_resources::Clock>,
+    service: Arc<flotilla_schema_sqlite::stream::Service>,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // The requester and the Vessel reconciler need distinct health keys, while both remain tied to the resource they manage.
         supervise_controller(Vessel::API_PATHS.plural, supervision, runtime_health, move || {
-            let requests = requests.clone();
-            attributed(caller("VesselRequests"), async move { requests.run().await })
+            let (requests, reads, clock, service) = (requests.clone(), Arc::clone(&reads), Arc::clone(&clock), Arc::clone(&service));
+            attributed(caller("VesselRequests"), async move {
+                let policy = VesselRequestsPolicy::new(requests, reads).map_err(ResourceError::other)?;
+                let code =
+                    <flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy> as flotilla_schema::Kind>::CODE;
+                let runner = Runner::start(code, policy.home().to_owned(), policy.followed(), clock, service)
+                    .map_err(|error| ResourceError::other(error.to_string()))?;
+                runner.run(policy, futures::stream::pending()).await.map_err(|error| ResourceError::other(error.to_string()))
+            })
         })
         .await;
     })
@@ -786,17 +800,26 @@ pub fn spawn_pending_supervisor_turn_task(daemon: Arc<InProcessDaemon>, namespac
     let backend = daemon.resource_backend();
     let watch_namespace = namespace.clone();
     let message_path = daemon.crew_message_path();
+    let reads = daemon.lifecycle_reads();
     spawn_pending_supervisor_turn_task_with_watches(daemon, namespace, move || {
         let backend = backend.clone();
         let namespace = watch_namespace.clone();
         let message_path = Arc::clone(&message_path);
+        let reads = Arc::clone(&reads);
         async move {
-            let convoys = backend.including_replicas::<Convoy>(&namespace).watch().await?;
+            // A follow-up is a convoy note of this home's: the notes' changes, not every convoy's.
+            let notes = reads.convoys().map_err(ResourceError::other)?.memory().subscribe();
+            let notes = futures::stream::unfold(notes, |mut notes| async move {
+                match notes.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((Ok(()), notes)),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                }
+            });
             let sessions = backend.including_replicas::<TerminalSession>(&namespace).watch().await?;
             // The Message path's commits, which list no message to hear one.
             let messages = message_path.changes()?.map(Ok);
             Ok((
-                futures::stream::select(convoys.map(|event| event.map(|_| ())), messages.map(|event| event.map(|_| ()))).boxed(),
+                futures::stream::select(notes, messages.map(|event| event.map(|_| ()))).boxed(),
                 sessions.map(|event| event.map(|_| ())).boxed(),
             ))
         }
@@ -939,7 +962,8 @@ const DISPATCH_RETRY: RetryBackoff = RetryBackoff { initial: Duration::from_secs
 pub(super) fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: String) -> JoinHandle<()> {
     let issues = Arc::new(DaemonDispatchIssueSource::new(Arc::clone(&daemon))) as Arc<dyn DispatchIssueSource>;
     let backend = daemon.resource_backend();
-    let reconciler = DispatchReconciler::new(backend.clone(), namespace.clone(), issues);
+    let reads = daemon.lifecycle_reads();
+    let reconciler = DispatchReconciler::new(backend.clone(), namespace.clone(), issues, Arc::clone(&reads));
     tokio::spawn(attributed(caller("DispatchReconciler"), async move {
         let mut boards = daemon.dispatch_board_changes();
         let mut enrol = true;
@@ -950,7 +974,31 @@ pub(super) fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, names
             // whether it changes the board sources.
             let mut watches = SelectAll::new();
             let mut subscribed = true;
-            for (kind, sources) in [("Project", true), ("Repository", true), ("WorkflowTemplate", false), ("Convoy", false)] {
+            // A convoy's change is its record's, heard from the engine's log by name: what its
+            // vessels and sessions do moves no queue.
+            match reads.convoys() {
+                Ok(convoys) => watches.push(
+                    // A lagged follower missed changes but not the next pass, which reads every queue;
+                    // only a closed log ends the follow.
+                    futures::stream::unfold(convoys.changes(), |mut changes| async move {
+                        match changes.recv().await {
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((Ok(false), changes)),
+                            Err(error @ tokio::sync::broadcast::error::RecvError::Closed) => {
+                                Some((Err(ResourceError::other(format!("convoy changes: {error}"))), changes))
+                            }
+                        }
+                    })
+                    .boxed(),
+                ),
+                Err(error) => {
+                    warn!(%error, %namespace, "could not follow convoy changes; resubscribing");
+                    watch_failures = watch_failures.saturating_add(1);
+                    tokio::time::sleep(DISPATCH_RETRY.delay(watch_failures)).await;
+                    enrol = true;
+                    continue;
+                }
+            }
+            for (kind, sources) in [("Project", true), ("Repository", true), ("WorkflowTemplate", false)] {
                 match watch_resource_kind_including_replicas(&backend, &namespace, kind).await {
                     Ok(watch) => watches.push(
                         watch

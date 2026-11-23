@@ -14,17 +14,18 @@ use flotilla_crew::{
     crew_capabilities::{refresh_cards, CapabilityCardTracker, CardScope},
     reconcilers::vessel::ConvoyVesselWake,
 };
-use flotilla_engine_convoys_testkit::{convoy, single_agent, EngineConvoysHome, KeyedGets};
+use flotilla_engine_convoys_testkit::{agent, convoy, single_agent, EngineConvoysHome, KeyedGets};
 use flotilla_provisioning::engine::checkouts::CheckoutConvoyWake;
 use flotilla_provisioning_testkit::{EngineFixture, OtherHome, TerminalsFixture};
 use flotilla_resources::{
     account_access::AccountRecords,
     address::{artifact_address, record_name},
     checkout_records::CheckoutHolder,
+    convoy_records::OpenLaunches,
     terminal_records::TerminalLaunchFacts,
     vessel_records::{environment_vessels, EnvironmentVessel},
     Artifact, ArtifactSpec, CheckoutSpec, Convoy, ConvoySpec, EnvironmentSpec, HostDirectEnvironmentSpec, ObservedCheckoutSpec,
-    RepositoryKey, ResourceError, ResourceObject, SystemClock,
+    RepositoryKey, ResourceError, ResourceObject, SystemClock, VesselRequirement,
 };
 use flotilla_store::{
     controller::{ControllerLoop, ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
@@ -62,7 +63,6 @@ async fn launches_read_by_of_convoy(others: usize) -> (u64, KeyedGets) {
     }
 
     let vessels = &engine.vessels.vessels;
-    convoys.settled().await;
     let before = (vessels.launches_read(), keyed_gets(&convoys, &engine));
     let read = convoys.reads().vessels().expect("vessels").of_convoy(&launches[0]).expect("of convoy");
     assert_eq!(read.iter().map(|launch| launch.convoy.as_str()).collect::<Vec<_>>(), [launches[0].as_str()]);
@@ -104,7 +104,6 @@ async fn launches_read_by_a_pass(others: usize) -> (u64, KeyedGets) {
     );
 
     let vessels = &engine.vessels.vessels;
-    convoys.settled().await;
     let before = (vessels.launches_read(), keyed_gets(&convoys, &engine));
     reconciler.prepare(&passed).await.expect("prepare");
     (vessels.launches_read() - before.0, keyed_gets(&convoys, &engine) - before.1)
@@ -146,7 +145,7 @@ async fn publish_brief(backend: &ResourceBackend, convoy: &str, role: &str) {
     }
 }
 
-/// The vessel launches queued, and the launches read and keyed gets made, when one convoy's brief
+/// The vessel launches rechecked, and the launches read and keyed gets made, when one convoy's brief
 /// artifact changes with `others` other convoys each holding a launch.
 async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
     let store = OtherHome::open("home");
@@ -163,8 +162,8 @@ async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
 
     let accounts: Arc<dyn AccountRecords> = Arc::new(OldStoreAccounts::new(backend.clone()));
     let wake = ConvoyVesselWake::new(&backend, NAMESPACE, Arc::clone(convoys.reads()), convoys.path(), accounts);
-    let (sender, mut queued) = WorkQueueSender::channel();
-    let waking = tokio::spawn(Box::new(wake).spawn(backend.clone(), NAMESPACE.to_owned(), sender));
+    let (sender, mut queued) = tokio::sync::mpsc::channel(256);
+    let waking = tokio::spawn(wake.recheck(NAMESPACE.to_owned(), sender));
 
     // The wake's watches open after it is spawned: the first convoy's brief is published until it
     // is heard.
@@ -180,13 +179,11 @@ async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
     .await
     .expect("the wake hears a brief");
     assert_eq!(&heard, warm_vessel);
-    // A queued name is not sent again until the controller takes it, which this test never does;
-    // the settle lets any earlier publish's wake finish its read before the count starts.
+    // The settle lets any earlier publish's wake finish its read before the count starts.
     tokio::time::sleep(Duration::from_millis(100)).await;
     while queued.try_recv().is_ok() {}
 
     let vessels = &engine.vessels.vessels;
-    convoys.settled().await;
     let before = (vessels.launches_read(), keyed_gets(&convoys, &engine));
     let (changed, _) = &launches[1];
     publish_brief(&backend, changed, "coder").await;
@@ -197,6 +194,74 @@ async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
     }
     waking.abort();
     (names, vessels.launches_read() - before.0, keyed_gets(&convoys, &engine) - before.1)
+}
+
+// Behaviour: a convoy change that leaves what its vessels' plans read where it was, such as a
+// subject linked, rechecks none of them; one that moves it, such as the convoy failing, rechecks
+// its vessel. Each vessel was planned again at every change of its convoy.
+#[tokio::test]
+async fn a_convoy_change_rechecks_its_vessels_only_when_what_they_plan_on_moves() {
+    let store = OtherHome::open("home");
+    let engine = EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
+    let mut launched = Vec::new();
+    for name in ["warm", "linked", "failed"] {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
+        let launch = convoys.launch(convoy(NAMESPACE, name, spec.clone(), single_agent("coder"))).await;
+        let vessel = engine.vessels.request(&launch, "work", "host");
+        launched.push((convoy(NAMESPACE, &launch, spec, single_agent("coder")), vessel));
+    }
+    let accounts: Arc<dyn AccountRecords> = Arc::new(OldStoreAccounts::new(backend.clone()));
+    let wake = ConvoyVesselWake::new(&backend, NAMESPACE, Arc::clone(convoys.reads()), convoys.path(), accounts);
+    let (sender, mut queued) = tokio::sync::mpsc::channel(256);
+    let waking = tokio::spawn(wake.recheck(NAMESPACE.to_owned(), sender));
+
+    // The wake's watches open after it is spawned: the first convoy's brief is published until it
+    // is heard.
+    let (warm, warm_vessel) = &launched[0];
+    let heard = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            publish_brief(&backend, &warm.metadata.name, "coder").await;
+            if let Ok(Some(name)) = tokio::time::timeout(Duration::from_millis(50), queued.recv()).await {
+                return name;
+            }
+        }
+    })
+    .await
+    .expect("the wake hears a brief");
+    assert_eq!(&heard, warm_vessel);
+
+    let (linked, linked_vessel) = &launched[1];
+    let subject = |id: &str| flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "org/repo".into() },
+        id: id.into(),
+    };
+    let link = |id: &'static str| {
+        let path = convoys.path();
+        let subject = subject(id);
+        async move { path.link(linked, &subject, flotilla_resources::SubjectDiscoverySource::Operator, "alice").await.expect("link") }
+    };
+    // The wake's first sight of the convoy rechecks its vessel: it knows nothing the plan read.
+    link("5").await;
+    tokio::time::timeout(Duration::from_secs(5), async { while queued.recv().await.expect("open queue") != *linked_vessel {} })
+        .await
+        .expect("the first sight rechecks");
+    link("6").await;
+    let (failed, failed_vessel) = &launched[2];
+    convoys.path().fail(failed, "operator", "failed").await.expect("fail the convoy");
+    // Each wake before the failure's is queued before it.
+    let mut before = Vec::new();
+    loop {
+        let name = tokio::time::timeout(Duration::from_secs(5), queued.recv()).await.expect("the failure rechecks").expect("open queue");
+        if &name == failed_vessel {
+            break;
+        }
+        before.push(name);
+    }
+    waking.abort();
+    assert!(!before.contains(linked_vessel), "a linked subject moves nothing its vessel plans on: {before:?}");
 }
 
 /// The convoys queued, and the convoy views converted and keyed gets made, when a checkout held
@@ -247,7 +312,6 @@ async fn queued_by_one_checkout(others: usize) -> (Vec<String>, u64, KeyedGets) 
     tokio::time::sleep(Duration::from_millis(100)).await;
     while queued.try_recv().is_ok() {}
 
-    convoys.settled().await;
     let before = (converted(), keyed_gets(&convoys, &engine));
     let changed = &launches[1];
     engine.checkouts.request("changed", &checkout("changed"), Some(&CheckoutHolder::Convoy(changed.clone())));
@@ -270,7 +334,11 @@ async fn a_checkout_queues_only_its_holders_convoy() {
     assert_eq!(large.len(), 1, "only the holder's convoy is queued: {large:?}");
     assert_eq!(small_read, 1, "only that convoy's view is converted");
     assert_eq!(large_read, small_read, "the cost does not grow with the other convoys");
-    assert_eq!(small_gets, KeyedGets::default(), "the holder's view is held composed: no record is got");
+    assert_eq!(
+        small_gets,
+        KeyedGets { vessels: 1, convoys: 1, ..KeyedGets::default() },
+        "the holder's view is composed from its record and its work's newest launch, each read by key"
+    );
     assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
 }
 
@@ -296,9 +364,6 @@ async fn vessels_in_one_environment(others: usize) -> (Vec<EnvironmentVessel>, u
         assert_eq!(every.len(), others + 2, "a full pass finds every vessel: {every:?}");
     }
 
-    // The convoy views' follower reads the writes above through the same port: once it has, the
-    // gets counted below are the delivery's alone.
-    convoys.settled().await;
     let launches = engine.vessels.vessels.launches_read();
     let gets = keyed_gets(&convoys, &engine);
     let (found, reads) = measure_now(|| environment_vessels(convoys.reads().as_ref(), Some(&BTreeSet::from(["shared".to_owned()]))));
@@ -375,7 +440,6 @@ async fn read_by_cards(others: usize, scope: impl FnOnce(&[String]) -> CardScope
     let accounts = OldStoreAccounts::new(backend.clone());
     let scope = scope(&launches);
 
-    convoys.settled().await;
     let before = (engine.terminals.terminals.launches_read(), engine.vessels.vessels.launches_read(), keyed_gets(&convoys, &engine));
     refresh_cards(&backend, NAMESPACE, &NothingDelivered, &tracker, Arc::clone(convoys.reads()), &accounts, &scope)
         .await
@@ -395,14 +459,18 @@ async fn an_environments_cards_are_refreshed_without_the_others() {
     let shared = |_: &[String]| CardScope { environments: BTreeSet::from(["shared".to_owned()]), ..CardScope::default() };
     let (small_terminals, small_vessels, small_gets) = read_by_cards(5, shared).await;
     let (large_terminals, large_vessels, large_gets) = read_by_cards(60, shared).await;
-    assert_eq!(small_terminals, 2, "only the shared environment's two launches are read through its index");
+    assert_eq!(
+        small_terminals, 4,
+        "only the shared environment's two launches are read through its index, and again as their convoys are composed"
+    );
     assert_eq!(large_terminals, small_terminals, "the cost does not grow with the other environments' sessions");
-    assert_eq!(small_vessels, 0, "each vessel is read by key: no vessel launch is listed, scanned or read through an index");
+    assert_eq!(small_vessels, 0, "each card's vessel, and each composed convoy's work's newest launch, is read by key");
     assert_eq!(large_vessels, small_vessels, "the vessel launches read do not grow with the other convoys");
     assert_eq!(
         small_gets,
-        KeyedGets { vessels: 2, convoys: 0, environments: 2, terminals: 2 },
-        "each card gets its session's newest launch, its vessel and its environment once; its convoy's view is held composed"
+        KeyedGets { vessels: 4, convoys: 2, environments: 2, terminals: 2 },
+        "each card gets its session's newest launch, its vessel and its environment once; its convoy's view is composed from its \
+         record and its work's newest launch, each read by key"
     );
     assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
 }
@@ -414,15 +482,18 @@ async fn a_convoys_cards_are_refreshed_without_the_others() {
     let first = |launches: &[String]| CardScope { convoys: BTreeSet::from([launches[0].clone()]), ..CardScope::default() };
     let (small_terminals, small_vessels, small_gets) = read_by_cards(5, first).await;
     let (large_terminals, large_vessels, large_gets) = read_by_cards(60, first).await;
-    assert_eq!(small_terminals, 1, "only the convoy's one session launch is read, through its vessel's index");
+    assert_eq!(
+        small_terminals, 2,
+        "only the convoy's one session launch is read through its vessel's index, by the card and by its convoy's composition"
+    );
     assert_eq!(large_terminals, small_terminals, "the cost does not grow with the other convoys' sessions");
-    assert_eq!(small_vessels, 1, "only the convoy's one vessel launch is read, through its work's launch index");
+    assert_eq!(small_vessels, 1, "only the convoy's one vessel launch is read through its work's launch index, by the card");
     assert_eq!(large_vessels, small_vessels, "the vessel launches read do not grow with the other convoys");
     assert_eq!(
         small_gets,
-        KeyedGets { vessels: 0, convoys: 1, environments: 1, terminals: 1 },
-        "the convoy is got once for its works; the card gets its session's newest launch and its environment once, and \
-         reuses the vessel its index read"
+        KeyedGets { vessels: 1, convoys: 2, environments: 1, terminals: 1 },
+        "the convoy is got once for its works and once as its view is composed, with its work's newest launch by key; the card \
+         gets its session's newest launch and its environment once, and reuses the vessel its index read"
     );
     assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
 }
@@ -464,15 +535,15 @@ async fn read_by_open_launches(others: usize) -> (usize, u64, KeyedGets) {
         launches.push(admit(n).await);
     }
     quiet(&mut sent).await;
-    let views = convoys.views();
-    assert_eq!(views.open().await.expect("first read").len(), others + 1, "the first read lists every open launch");
+    let mut open = OpenLaunches::default();
+    assert_eq!(open.read(reads).expect("first read").len(), others + 1, "the first read lists every open launch");
 
     let before = (convoys.convoy_listings(), convoys.keyed_gets());
     convoys.path().abandon(&launches[0], "operator", "ended").await.expect("end the first launch");
     let ended = &launches[0].metadata.name;
     let admitted = admit(others + 1).await.metadata.name;
     quiet(&mut sent).await;
-    let read = views.open().await.expect("read");
+    let read = open.read(reads).expect("read");
     assert!(read.contains(&admitted) && !read.contains(ended), "the end and the admission are read: {read:?}");
     (read.len(), convoys.convoy_listings() - before.0, convoys.keyed_gets() - before.1)
 }
@@ -554,7 +625,7 @@ async fn first_pass(count: usize) -> ControllerLoadSnapshot {
 
 // Behaviour: a controller's load metrics count its wakes against what queued them, and its
 // reads by kind and shape, apart from its watches' (#3108 load measurement). Its first pass gets
-// each convoy by key through the engine port, answered from the views the port holds, each
+// each convoy by key through the engine port, composed from its records by key and index, each
 // converted to the old shape; its watch lists the kind as often whatever the convoys held.
 #[tokio::test]
 async fn a_controller_pass_counts_its_reads_by_kind_and_shape() {
@@ -566,8 +637,14 @@ async fn a_controller_pass_counts_its_reads_by_kind_and_shape() {
         let port = pass.reads.get("Convoy port").copied().unwrap_or_default();
         assert_eq!((port.keyed, port.index, port.whole_kind, port.rows), (n, 0, 0, n), "each wake gets its convoy by key: {pass:#?}");
         let store = pass.reads.get("Convoy").copied().unwrap_or_default();
-        assert_eq!((store.keyed, store.index, store.whole_kind), (0, 0, 0), "the port answers from its views: {pass:#?}");
+        assert_eq!(
+            (store.keyed, store.index, store.whole_kind),
+            (n, 0, 0),
+            "the port composes each convoy got from its record, read once: {pass:#?}"
+        );
         assert_eq!(store.converted, n, "each convoy got is converted once: {pass:#?}");
+        let vessels = pass.reads.get("Vessel").copied().unwrap_or_default();
+        assert_eq!((vessels.keyed, vessels.index, vessels.whole_kind), (0, n, 0), "each work's newest launch through its index: {pass:#?}");
         let watch = pass.watch_reads.get("Convoy port").copied().unwrap_or_default();
         assert!(watch.whole_kind > 0, "the watch lists the kind: {pass:#?}");
         assert_eq!((watch.keyed, watch.rows), (0, watch.whole_kind * n), "each listing returns every convoy: {pass:#?}");
@@ -644,10 +721,8 @@ async fn scoped_query_reads(others: usize) -> Vec<flotilla_store::load_metrics::
     use flotilla_resources::{TerminalSession, CONVOY_LABEL};
     use flotilla_store::{load_metrics::measure, StoreQuery};
 
-    let CrewedConvoys { store: _store, engine: _engine, convoys, backend, target: (launch, session), .. } =
+    let CrewedConvoys { store: _store, engine: _engine, convoys: _convoys, backend, target: (launch, session), .. } =
         crewed_convoys(others, false).await;
-    // The views are filled once, at their first read, as a running daemon's already are.
-    convoys.settled().await;
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
     sessions.list().await.expect("the session views");
     let crew = sessions.get(&session).await.expect("the target's session").status.and_then(|status| status.crew).expect("its crew").id;
@@ -696,38 +771,34 @@ async fn scoped_query_reads(others: usize) -> Vec<flotilla_store::load_metrics::
     costs
 }
 
-// Behaviour: a scoped fleet listing's queries of convoys by project, by a convoy and its project's
-// convoys, and of sessions by crew and by convoy, read through the views' indexes: the rows read
-// are the scope's, whatever other convoys and sessions are held.
+// Behaviour: a scoped fleet listing's queries of sessions by crew and by convoy read through the
+// session views' indexes: the rows read are the scope's, whatever other convoys and sessions are
+// held. Its queries of convoys by project, and by a convoy and its project's convoys, give the
+// scope's convoys; a generic read of convoys composes the launches it reads (#4412 C), and may
+// scan them.
 #[tokio::test]
 async fn scoped_queries_read_the_scopes_rows() {
-    let small = scoped_query_reads(0).await;
-    for reads in &small {
-        for kind in ["Convoy port", "TerminalSession port"] {
-            let port = reads.get(kind).copied().unwrap_or_default();
-            assert_eq!(port.whole_kind, 0, "no query reads every {kind} row: {reads:#?}");
-        }
+    let (small, large) = (scoped_query_reads(0).await, scoped_query_reads(200).await);
+    for reads in small.iter().chain(&large).skip(2) {
+        let port = reads.get("TerminalSession port").copied().unwrap_or_default();
+        assert_eq!(port.whole_kind, 0, "no query reads every session row: {reads:#?}");
     }
-    assert_eq!(scoped_query_reads(200).await, small, "the reads do not grow with other convoys and sessions");
+    assert_eq!(large[2..], small[2..], "the session queries' reads do not grow with other convoys and sessions");
 }
 
-/// What a daemon's first fill of the Convoy and TerminalSession views reads with `convoys`
-/// crewed convoys held: a read port opened afresh over the same store, as at a start, the views
-/// installed over it and each read once. The Convoy views fill on their own task, which the read
-/// waits on.
+/// What a daemon's first fill of the TerminalSession views reads with `convoys` crewed convoys
+/// held: a read port opened afresh over the same store, as at a start, the views installed over
+/// it and read once.
 async fn first_fill_reads(convoys: usize, own_environments: bool) -> flotilla_store::load_metrics::ReadCounts {
     use flotilla_resources::TerminalSession;
     use flotilla_store::{load_metrics::measure, TerminalViews};
 
     let crewed = crewed_convoys(convoys - 1, own_environments).await;
-    crewed.convoys.settled().await;
     let restarted = EngineFixture::over_service(crewed.store.service());
     let started = ResourceBackend::new(InMemoryBackend::default());
     let ((), counts) = measure(async {
         let home = EngineConvoysHome::over(crewed.store.service(), NAMESPACE, &started, Arc::new(SystemClock), restarted.reads());
         started.install_engine_records(Arc::new(TerminalViews::new(NAMESPACE, Arc::clone(home.reads()))));
-        let listed = started.clone().using::<Convoy>(NAMESPACE).list().await.expect("the convoy views");
-        assert_eq!(listed.items.len(), convoys);
         let listed = started.clone().using::<TerminalSession>(NAMESPACE).list().await.expect("the session views");
         assert_eq!(listed.items.len(), convoys);
     })
@@ -740,9 +811,8 @@ fn read_calls(reads: &flotilla_store::load_metrics::ReadCounts) -> BTreeMap<Stri
     reads.iter().map(|(kind, counts)| (kind.clone(), counts.keyed + counts.index + counts.whole_kind)).collect()
 }
 
-// Behaviour: a start's first fill of the Convoy and TerminalSession views reads each Vessel and
-// session launch, and each launch's facts, once for both views: one read of each kind, joined in
-// memory, so the read calls do not grow with the convoys held while the rows read do, one each.
+// Behaviour: a start's first fill of the TerminalSession views reads each Vessel and session
+// launch, and each launch's facts, once: one read of each kind, joined in memory, so the read calls do not grow with the convoys held while the rows read do, one each.
 // The environments the sessions run in are read once too, shared or each its own.
 #[tokio::test]
 async fn a_first_fill_reads_each_joined_row_once() {
@@ -789,7 +859,9 @@ async fn a_change_is_read_once_for_both_views() {
     let exited = listed.items.iter().find(|session| session.metadata.name == crewed.target.1).expect("the target's session");
     assert!(exited.status.as_ref().is_some_and(|status| status.stopped_at.is_some()), "the views show the change: {exited:?}");
     let gets = crewed.convoys.keyed_gets() - before;
-    assert_eq!((gets.terminals, gets.vessels), (1, 0), "the change is read once, its vessel not at all: {gets:?}");
+    // The convoy listing composes each of the five convoys afresh, each with its work's newest
+    // launch read by key; the session view reads the changed launch once.
+    assert_eq!((gets.terminals, gets.vessels), (1, 5), "the change is read once, each convoy's vessel by key: {gets:?}");
 }
 
 // Behaviour: the held joins hold live work, not history. Once half the convoys end and their
@@ -903,7 +975,9 @@ async fn held_before_and_after_ending(convoys: usize, watched: bool) -> (HeldWor
     // The second convoy's launches ended and were never released.
     let (_, vessel, session) = &crewed.launches[1];
     let lost = crewed.engine.terminals.record(session);
-    assert!(views.1.get(lost.session_name()).await.is_ok(), "a session that ended is read by name");
+    // Nothing holds it once its vessel and convoy ended: it retired, and reads as absent by name
+    // as from the listing (#4421).
+    assert!(views.1.get(lost.session_name()).await.is_err(), "a retired session reads as absent by name");
     assert!(views.2.get(vessel).await.is_ok(), "a Vessel launch that ended is read by name");
     (running, ended)
 }
@@ -921,4 +995,36 @@ async fn ended_work_leaves_the_views_at_any_size() {
         let none = || HeldWork { joins: (0, 0), sessions: 0, vessels: 0 };
         assert_eq!((small, large), (none(), none()), "nothing ended is held, watched: {watched}");
     }
+}
+
+// Behaviour: a convoy is composed with one read of its works' newest launches and one of their
+// sessions, however many works it has.
+#[tokio::test]
+async fn a_convoy_is_composed_with_one_read_of_its_works_and_one_of_their_sessions() {
+    let store = OtherHome::open("home");
+    let engine = EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
+    let host_direct = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+        ..Default::default()
+    };
+    engine.environments.request("env", &host_direct, None);
+    let works = ["work", "review", "docs"];
+    let mut status = single_agent("coder");
+    status.workflow_snapshot.as_mut().expect("a frozen workflow").vessels =
+        works.iter().map(|work| VesselRequirement::builder().name((*work).to_owned()).crew(vec![agent("coder")]).build()).collect();
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
+    let launch = convoys.launch(convoy(NAMESPACE, "three-works", spec, status)).await;
+    for work in works {
+        let vessel = engine.vessels.request(&launch, work, "host");
+        let session = engine.terminals.request(&TerminalsFixture::agent(&vessel, "coder", "env"));
+        engine.terminals.ready(&session, &format!("{session}-runtime"), &TerminalLaunchFacts::default());
+    }
+
+    let before = (convoys.keyed_gets(), convoys.held_session_reads());
+    backend.clone().using::<Convoy>(NAMESPACE).get(&launch).await.expect("the convoy's view");
+    let gets = convoys.keyed_gets() - before.0;
+    assert_eq!(gets.vessels, 1, "the three works' newest launches are read together: {gets:?}");
+    assert_eq!(convoys.held_session_reads() - before.1, 1, "the three launches' sessions are read together");
 }

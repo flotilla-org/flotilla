@@ -991,12 +991,13 @@ impl ConvoyAdmission {
         let project = spec.project_ref.as_str();
         let projects = flotilla_store::read_definition_catalog::<Project>(reads, namespace).await?;
         let defaults = flotilla_store::read_definition_catalog::<CrewDefaults>(reads, namespace).await?;
+        let ensures = flotilla_store::read_definition_catalog::<ConvoyEnsure>(reads, namespace).await?;
         let fleet = reads
             .definitions::<FleetDesignation>(namespace)
             .list_names([FLEET_DESIGNATION_NAME.into()])
             .await
             .map_err(|error| error.to_string())?;
-        Ok(Some(brief_convoy_query(project, name, workflow, &projects, &defaults, &fleet)?.0))
+        Ok(Some(brief_convoy_query(project, name, workflow, &projects, &defaults, &fleet, &ensures)?.0))
     }
 
     async fn load_brief_definitions(
@@ -1027,6 +1028,9 @@ impl ConvoyAdmission {
         snapshot.insert_definitions::<Project>(flotilla_store::read_definition_catalog::<Project>(&self.backend, namespace).await?)?;
         snapshot
             .insert_definitions::<CrewDefaults>(flotilla_store::read_definition_catalog::<CrewDefaults>(&self.backend, namespace).await?)?;
+        // The standing roles whose current generations a brief shows.
+        snapshot
+            .insert_definitions::<ConvoyEnsure>(flotilla_store::read_definition_catalog::<ConvoyEnsure>(&self.backend, namespace).await?)?;
         snapshot.insert_definitions::<FleetDesignation>(
             self.backend
                 .definitions::<FleetDesignation>(namespace)
@@ -1063,12 +1067,13 @@ impl ConvoyAdmission {
         // Every graph/default layer participates in topic and cascade refusals.
         let projects = flotilla_store::read_definition_catalog::<Project>(read_source, namespace).await?;
         let defaults = flotilla_store::read_definition_catalog::<CrewDefaults>(read_source, namespace).await?;
+        let ensures = flotilla_store::read_definition_catalog::<ConvoyEnsure>(read_source, namespace).await?;
         let fleet = read_source
             .definitions::<FleetDesignation>(namespace)
             .list_names([FLEET_DESIGNATION_NAME.into()])
             .await
             .map_err(|error| error.to_string())?;
-        let (convoy_query, visible) = brief_convoy_query(&spec.project_ref, name, workflow, &projects, &defaults, &fleet)?;
+        let (convoy_query, visible) = brief_convoy_query(&spec.project_ref, name, workflow, &projects, &defaults, &fleet, &ensures)?;
         let convoys = ReadResourceList { items: evidence.convoys.to_vec() };
         let terminal_query = StoreQuery {
             any_of: Some(
@@ -1089,24 +1094,15 @@ impl ConvoyAdmission {
         };
         let terminals =
             self.backend.query_declared::<ResourceTerminalSession>(namespace, &terminal_query).await.map_err(|error| error.to_string())?;
-        let ensures = self
-            .backend
-            .query_declared::<ConvoyEnsure>(
-                namespace,
-                &StoreQuery {
-                    field_values: BTreeMap::from([("spec.project_ref".into(), visible.into_iter().collect())]),
-                    include_replicas: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        // The visible projects' ensures, from the declarations the request read.
+        let ensures: Vec<ResourceObject<ConvoyEnsure>> =
+            ensures.into_iter().filter(|ensure| visible.contains(&ensure.spec.project_ref)).collect();
         snapshot.insert_definitions::<Project>(projects)?;
         snapshot.insert_definitions::<CrewDefaults>(defaults)?;
         snapshot.insert_definitions::<FleetDesignation>(fleet)?;
         snapshot.insert::<ResourceConvoy>(convoys)?;
         snapshot.insert::<ResourceTerminalSession>(terminals)?;
-        snapshot.insert::<ConvoyEnsure>(ensures)?;
+        snapshot.insert_definitions::<ConvoyEnsure>(ensures)?;
         Ok(snapshot.finish())
     }
 
@@ -2065,6 +2061,8 @@ impl AdmissionReadContext<'_> {
         snapshot.insert_definitions::<Project>(projects)?;
         snapshot.insert_definitions::<FleetDesignation>(fleet)?;
         snapshot.insert_definitions::<CrewDefaults>(defaults)?;
+        // The standing roles whose current generations a brief shows.
+        snapshot.insert_definitions::<ConvoyEnsure>(flotilla_store::read_definition_catalog::<ConvoyEnsure>(backend, namespace).await?)?;
         snapshot.insert_definitions::<Forge>(forges)?;
         snapshot.insert_definitions::<WorkflowTemplate>(workflows)?;
         snapshot.insert_definitions::<ImageLayer>(image_layers)?;
@@ -3702,6 +3700,7 @@ fn brief_convoy_query(
     projects: &[ResourceObject<Project>],
     defaults: &[ResourceObject<flotilla_resources::CrewDefaults>],
     fleet: &[ResourceObject<flotilla_resources::FleetDesignation>],
+    ensures: &[ResourceObject<ConvoyEnsure>],
 ) -> Result<(StoreQuery, BTreeSet<String>), String> {
     let hierarchy = flotilla_resources::ProjectHierarchy::from_declared(
         projects.iter().map(|object| (object.metadata.name.clone(), object.spec.parent.clone())).collect(),
@@ -3755,26 +3754,38 @@ fn brief_convoy_query(
     } else {
         StoreQuery::names([name.into()], true)
     };
-    let convoy_query = StoreQuery {
-        any_of: Some(vec![
-            convoy_scope.clone(),
-            // The visible projects' standing roles' current generations: their live ensured convoys.
-            StoreQuery {
-                present: vec![format!("metadata.annotations.\"{}\"", flotilla_resources::ENSURED_FROM_ANNOTATION)],
-                field_values: BTreeMap::from([("spec.project_ref".into(), visible.clone().into_iter().collect())]),
-                ..flotilla_store::live_convoys_query()
-            },
-        ]),
-        include_replicas: true,
-        ..Default::default()
-    };
+    // The visible projects' standing roles' current generations: the live launches of each
+    // declared ensure's standing name, read through the `by_launch` index.
+    let mut selections = vec![convoy_scope.clone()];
+    for ensure in ensures.iter().filter(|ensure| visible.contains(&ensure.spec.project_ref)) {
+        selections.push(StoreQuery {
+            labels: BTreeMap::from([
+                (flotilla_resources::labels::PROJECT_LABEL.into(), ensure.spec.project_ref.clone()),
+                (flotilla_resources::labels::LAUNCH_OF_LABEL.into(), standing_name(&ensure.spec.project_ref, &ensure.spec.role)?),
+            ]),
+            ..flotilla_store::live_convoys_query()
+        });
+    }
+    let convoy_query = StoreQuery { any_of: Some(selections), include_replicas: true, ..Default::default() };
     Ok((convoy_query, visible))
 }
 
 /// The convoys of `role` in `project`.
+/// The launches of `role` in `project` that have not ended, at any home: a live phase, or none
+/// yet. Read through the `open_by_role` index.
 fn convoy_identity_query(project: &str, role: &str) -> flotilla_store::StoreQuery {
     flotilla_store::StoreQuery {
         fields: BTreeMap::from([("spec.role".into(), role.into()), ("spec.project_ref".into(), project.into())]),
+        any_of: Some(vec![
+            flotilla_store::StoreQuery {
+                field_values: BTreeMap::from([(
+                    "status.phase".into(),
+                    ["Pending", "Active", "Interrupted", "Landing", "Anchored"].map(String::from).into_iter().collect(),
+                )]),
+                ..Default::default()
+            },
+            flotilla_store::StoreQuery { missing_fields: BTreeSet::from(["status.phase".into()]), ..Default::default() },
+        ]),
         include_replicas: true,
         ..Default::default()
     }
@@ -3790,9 +3801,15 @@ async fn convoy_admission_inventory(
     use flotilla_store::StoreQuery;
     let mut selections = vec![convoy_identity_query(&spec.project_ref, &spec.role)];
     selections.extend(extra);
-    if let Some(ensure) = ensure {
+    if ensure.is_some() {
+        // The ensure's generations are the launches of its standing name, read through the
+        // `by_launch` index.
+        let launch_of = standing_name(&spec.project_ref, &spec.role)?;
         selections.push(StoreQuery {
-            fields: BTreeMap::from([("metadata.annotations.\"flotilla.work/ensured-from\"".into(), ensure.into())]),
+            labels: BTreeMap::from([
+                (flotilla_resources::labels::PROJECT_LABEL.into(), spec.project_ref.clone()),
+                (flotilla_resources::labels::LAUNCH_OF_LABEL.into(), launch_of),
+            ]),
             ..Default::default()
         });
     }
@@ -5171,9 +5188,6 @@ mod tests {
                 )
                 .build();
             let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).build();
-            // The views have read every launch above, as a running daemon's have: the measure
-            // waits on their follower, so it would count it catching up on the last launch.
-            fixture.engine.convoys.settled().await;
             let ((), counts) = flotilla_store::load_metrics::measure(async {
                 if reuse {
                     let snapshot = fixture.owner.load_brief_definitions("flotilla", &spec, &workflow).await.unwrap();

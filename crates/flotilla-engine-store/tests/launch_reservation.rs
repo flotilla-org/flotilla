@@ -32,6 +32,7 @@ fn project() -> Address {
 
 fn request(of: &str) -> ConvoyRequest {
     ConvoyRequest {
+        role: String::new(),
         launch_of: of.into(),
         workflow_ref: "w".into(),
         admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),

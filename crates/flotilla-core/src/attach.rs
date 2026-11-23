@@ -456,13 +456,12 @@ impl<'a> AttachResolver<'a> {
         }
         match index.resolve(self, reference, host, transient, mode).await {
             Err(AttachIndexError::NoMatch(_)) if reference.starts_with("terminal-") => {
-                // A session released with its environment is listed no more but reads by name:
-                // its environment's end says why it went.
-                let namespace = self.provisioning_namespace().await;
-                if let Ok(session) = self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).get(reference).await {
+                // A session released or retired with its environment is listed no more, but its
+                // newest launch here still names that environment, whose end says why it went.
+                let launch = self.lifecycle_reads.terminals().and_then(|terminals| terminals.get(reference, None)).ok().flatten();
+                if let Some(launch) = launch {
                     let environments = self.lifecycle_reads.environments();
-                    if let Some(environment) = environments.and_then(|environments| environments.find(&session.spec.env_ref)).ok().flatten()
-                    {
+                    if let Some(environment) = environments.and_then(|environments| environments.find(&launch.environment)).ok().flatten() {
                         live_for_attach(&environment)?;
                     }
                 }
@@ -2442,8 +2441,6 @@ mod tests {
                 );
                 daemon.message_primitives().admit(&format!("message-{n}"), &noise).await.expect("noise message");
             }
-            // The views read every write before the measurement, so their catching up is not counted.
-            daemon.convoy_views().expect("convoy views").open().await.expect("read the convoy views");
             // Only this request's reads are counted: daemon tasks reading the same store are not.
             let resolver = daemon.attach_resolver();
             let (resolved, reads) = measure(resolver.resolve_attach(reference, None, false, AttachMode::Default, None)).await;

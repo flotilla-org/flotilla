@@ -185,6 +185,7 @@ async fn remote_change_request_scenario(late_watcher: bool) {
         )
         .expect("engine observations");
         refresher.engine().install(Arc::new(records)).expect("observer on the engine");
+        refresher.install_lifecycle_reads(daemon.lifecycle_reads()).expect("lifecycle reads");
         refresher
     };
     let owner_observer = refresher(&owner, forge.clone());

@@ -263,7 +263,7 @@ impl EnsureReconciler {
         let attentions = self.resource_backend.attentions();
         // Every host reads the role from every home's generations and its admitting home's values;
         // an end not folded in yet reads as folded.
-        let newest = newest_generation(&self.resource_backend, namespace, &ensure.metadata.name, true).await?;
+        let newest = newest_generation(&self.resource_backend, namespace, ensure, true).await?;
         let mut values = self.standing_roles.get(&ensure.metadata.name).await?.unwrap_or_default();
         if let Some(end) = newest.as_ref().map(generation_end).transpose()?.flatten() {
             values = standing::fold(&values, &end);
@@ -501,9 +501,16 @@ impl EnsurePass<'_> {
         name: &str,
         scope: EnsureConvoyScope,
     ) -> Result<Vec<ReadResourceObject<ResourceConvoy>>, String> {
+        let ensure = match self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace).get(name).await {
+            Ok(ensure) => ensure,
+            Err(ResourceError::NotFound { .. }) => return Ok(Vec::new()),
+            Err(error) => return Err(error.to_string()),
+        };
         let mut query = flotilla_store::live_convoys_query();
-        // Add the ensure selector without replacing any inherited live predicates.
+        // Add the ensure selector without replacing any inherited live predicates; its generations
+        // are read through the launch index by their project and the role's launch name.
         query.fields.insert(format!("metadata.annotations.\"{ENSURED_FROM_ANNOTATION}\""), name.into());
+        query.labels = generation_labels(&ensure)?;
         query.include_replicas = matches!(scope, EnsureConvoyScope::IncludingReplicas);
         self.resource_backend
             .query_declared::<ResourceConvoy>(namespace, &query)
@@ -938,7 +945,7 @@ impl EnsurePass<'_> {
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
     ) -> Result<Option<ResourceObject<ResourceConvoy>>, String> {
-        newest_generation(self.resource_backend, namespace, &ensure.metadata.name, false).await
+        newest_generation(self.resource_backend, namespace, ensure, false).await
     }
 
     /// The role's reading, its hold attention and its running values, with the end of `newest`
@@ -1111,19 +1118,29 @@ async fn canonical_placement_host_ref(
 async fn newest_generation(
     backend: &ResourceBackend,
     namespace: &str,
-    ensure: &str,
+    ensure: &ResourceObject<ConvoyEnsure>,
     everywhere: bool,
 ) -> Result<Option<ResourceObject<ResourceConvoy>>, String> {
     backend
         .using::<ResourceConvoy>(namespace)
         .query_declared(&StoreQuery {
-            fields: BTreeMap::from([(format!("metadata.annotations.\"{ENSURED_FROM_ANNOTATION}\""), ensure.into())]),
+            fields: BTreeMap::from([(format!("metadata.annotations.\"{ENSURED_FROM_ANNOTATION}\""), ensure.metadata.name.clone())]),
+            labels: generation_labels(ensure)?,
             include_replicas: everywhere,
             ..Default::default()
         })
         .await
         .map(|rows| rows.items.into_iter().map(|source| source.object).max_by_key(|convoy| convoy.spec.generation))
         .map_err(|error| error.to_string())
+}
+
+/// The labels `ensure`'s generations hold: its project, and its role's launch name, which the
+/// launch index reads them by.
+fn generation_labels(ensure: &ResourceObject<ConvoyEnsure>) -> Result<BTreeMap<String, String>, String> {
+    Ok(BTreeMap::from([
+        (flotilla_resources::labels::PROJECT_LABEL.to_owned(), ensure.spec.project_ref.clone()),
+        (flotilla_resources::labels::LAUNCH_OF_LABEL.to_owned(), standing_name(&ensure.spec.project_ref, &ensure.spec.role)?),
+    ]))
 }
 
 /// The generation a held role's hold is on: its last counted, whose end the hold follows.
@@ -1303,7 +1320,8 @@ mod tests {
         }
     }
 
-    // Both live scopes and local generation history decode only their indexed matches.
+    // Both live scopes and local generation history read only the role's generations, through the
+    // launch index by their project and the role's launch name.
     #[tokio::test]
     async fn ensured_convoys_read_only_matching_rows() {
         use flotilla_store::load_metrics::{measure, ReadCounts};
@@ -1316,9 +1334,10 @@ mod tests {
         async fn admit_generations(home: &EngineHome) {
             for index in 0..312 {
                 let ensure = if index == 0 || index >= 310 { "wanted" } else { "other" };
+                // Named as admission names a standing role's generations.
                 let mut convoy = flotilla_engine_convoys_testkit::convoy(
                     "test",
-                    ensure,
+                    &standing_name("test", ensure).expect("standing name"),
                     ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("test".into()).role(ensure.into()).build(),
                     flotilla_engine_convoys_testkit::single_agent(ensure),
                 );
@@ -1330,6 +1349,21 @@ mod tests {
             }
         }
         let home = Arc::new(EngineHome::open_in("home", "test"));
+        for ensure in ["wanted", "other"] {
+            home.backend()
+                .using::<ConvoyEnsure>("test")
+                .create(
+                    &InputMeta::builder().name(ensure.into()).build(),
+                    &ConvoyEnsureSpec::builder()
+                        .project_ref("test".into())
+                        .role(ensure.into())
+                        .workflow_ref("workflow".into())
+                        .repositories(Vec::new())
+                        .build(),
+                )
+                .await
+                .expect("declare the role");
+        }
         admit_generations(&home).await;
         // Another home's generations, replicated here as its log arrives.
         let remote = EngineHome::open_in("remote", "test");
@@ -1347,15 +1381,17 @@ mod tests {
             .build();
         for scope in [EnsureConvoyScope::Local, EnsureConvoyScope::IncludingReplicas] {
             let (rows, reads) = measure(controller.pass(&admission).active_ensured_convoys("test", "wanted", scope)).await;
-            let expected = if matches!(scope, EnsureConvoyScope::Local) { 2 } else { 4 };
+            // The role's three generations at each home are read; the two live of them at each answer.
+            let (expected, read) = if matches!(scope, EnsureConvoyScope::Local) { (2, 3) } else { (4, 6) };
             assert_eq!(rows.expect("query").len(), expected);
-            assert_eq!(convoys_read(&reads), expected as u64);
+            assert_eq!(convoys_read(&reads), read);
         }
         let (rows, reads) =
             measure(controller.pass(&admission).active_ensured_convoys("test", "absent", EnsureConvoyScope::IncludingReplicas)).await;
         assert!(rows.expect("empty query").is_empty());
         assert_eq!(convoys_read(&reads), 0);
-        let (newest, reads) = measure(newest_generation(&backend, "test", "wanted", false)).await;
+        let wanted = backend.definitions::<ConvoyEnsure>("test").get("wanted").await.expect("the role's declaration");
+        let (newest, reads) = measure(newest_generation(&backend, "test", &wanted, false)).await;
         assert!(newest.expect("local generations").is_some());
         assert_eq!(convoys_read(&reads), 3);
     }

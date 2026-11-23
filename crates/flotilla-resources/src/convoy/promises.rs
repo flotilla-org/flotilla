@@ -656,7 +656,7 @@ pub fn discovered_submission(
     })
 }
 
-/// One status patch per pass preserves optimistic status-patch ownership.
+/// The first of [`due_observations`].
 pub fn next_observation(
     status: &ConvoyStatus,
     convoy: &str,
@@ -666,29 +666,50 @@ pub fn next_observation(
     now: DateTime<Utc>,
     stale_after: std::time::Duration,
 ) -> Option<super::ConvoyStatusPatch> {
+    due_observations(status, convoy, change_requests, artifacts, forges, now, stale_after).into_iter().next()
+}
+
+/// Every observation due on `status`, each an edge of its own: at most one per promise, and a
+/// discovered submission only for the discovery owner's seat when none of its promises has one
+/// due, since a submission names the promise it lands on. Each edit is made against the record
+/// as it then is, so one pass applies them all.
+pub fn due_observations(
+    status: &ConvoyStatus,
+    convoy: &str,
+    change_requests: &BTreeMap<String, crate::ResourceObject<crate::ChangeRequest>>,
+    artifacts: &BTreeMap<String, crate::ResourceObject<crate::Artifact>>,
+    forges: &[crate::ForgeSpec],
+    now: DateTime<Utc>,
+    stale_after: std::time::Duration,
+) -> Vec<super::ConvoyStatusPatch> {
     if status.phase.is_terminal() {
-        return None;
+        return Vec::new();
     }
     let patch = |vessel: &str, role: &str, operation| super::ConvoyStatusPatch::ObservePromise {
         vessel: vessel.into(),
         role: role.into(),
         operation,
     };
+    let mut due = Vec::new();
+    let mut seats = BTreeSet::new();
     for (vessel, crew) in &status.promises {
         for (role, promises) in crew {
             for promise in promises {
-                if let Some(operation) = ledger_submission(promise, convoy, role, artifacts, now) {
-                    return Some(patch(vessel, role, operation));
-                }
-                if let Some(operation) = observed_verdict(promise, role, change_requests, artifacts, forges, now, stale_after) {
-                    return Some(patch(vessel, role, operation));
+                let operation = ledger_submission(promise, convoy, role, artifacts, now)
+                    .or_else(|| observed_verdict(promise, role, change_requests, artifacts, forges, now, stale_after));
+                if let Some(operation) = operation {
+                    seats.insert((vessel.as_str(), role.as_str()));
+                    due.push(patch(vessel, role, operation));
                 }
             }
         }
     }
     // Every produced PR participates. Explicit submissions retain their owner;
     // branch discovery uses the workflow's PR owner when it is unambiguous.
-    let (vessel, role) = discovery_owner(status)?;
+    let Some((vessel, role)) = discovery_owner(status) else { return due };
+    if seats.contains(&(vessel, role)) {
+        return due;
+    }
     for subject in status.subjects.iter().filter(|s| {
         s.relationship == flotilla_protocol::Relationship::Produces && s.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
     }) {
@@ -706,10 +727,11 @@ pub fn next_observation(
                     }
                 }
             }
-            return Some(patch(vessel, role, operation));
+            due.push(patch(vessel, role, operation));
+            break;
         }
     }
-    None
+    due
 }
 
 /// The change requests an ended convoy's Submitted pr promises name, each its current submission's

@@ -191,6 +191,24 @@ pub trait VesselRecords: Send + Sync {
     fn newest(&self, convoy: &str, convoy_home: &str, launch_of: &str, home: Option<&str>) -> Result<Option<VesselRecord>, String> {
         Ok(self.launches(convoy, convoy_home, launch_of, home)?.pop())
     }
+    /// For each `(convoy_home, launch_of)` of convoy `convoy`, its newest launch at each home
+    /// holding one, in one read: a work replaced at another home has a launch at each.
+    fn newest_of_each(&self, convoy: &str, launches: &[(String, String)]) -> Result<Vec<VesselRecord>, String> {
+        let mut newest = BTreeMap::<(String, String, String), VesselRecord>::new();
+        for record in self.of_convoy(convoy)? {
+            if !launches.iter().any(|(convoy_home, launch_of)| record.convoy_home == *convoy_home && record.launch_of == *launch_of) {
+                continue;
+            }
+            let key = (record.convoy_home.clone(), record.launch_of.clone(), record.home.clone());
+            match newest.get(&key) {
+                Some(held) if held.launch_number() >= record.launch_number() => {}
+                _ => {
+                    newest.insert(key, record);
+                }
+            }
+        }
+        Ok(newest.into_values().collect())
+    }
     /// Every launch held at `home`, ended or not.
     fn at(&self, home: &str) -> Result<Vec<VesselRecord>, String>;
     /// Every launch at every home this store holds.

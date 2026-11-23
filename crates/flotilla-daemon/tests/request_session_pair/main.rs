@@ -1348,6 +1348,23 @@ async fn router_delivery_scenario_table_reaches_remote_convoy_authority() {
         let leader = empty_daemon_named("desk").await;
         let follower = empty_daemon_named("placement").await;
         let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("connect scenario hosts");
+        // The role `remote-ensure` declares at its home, which the desk follows: its generations
+        // are read through the launch index by the role's project and launch name.
+        use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec};
+        topology
+            .follower
+            .resource_backend()
+            .using::<ConvoyEnsure>("flotilla")
+            .create(
+                &InputMeta::builder().name("remote-ensure".into()).build(),
+                &ConvoyEnsureSpec::builder().project_ref("flotilla".into()).role("remote-work".into()).repositories(Vec::new()).build(),
+            )
+            .await
+            .expect("declared standing role");
+        eventually(Duration::from_secs(5), Duration::from_millis(10), "the desk follows the declaration", || async {
+            topology.leader.resource_backend().definitions::<ConvoyEnsure>("flotilla").get("remote-ensure").await.is_ok()
+        })
+        .await;
         // The standing role's launch at its home, ensured from `remote-ensure`; the desk reads it
         // from its replica of that home's engine.
         let mut convoy = engine_convoy("remote-work", convoy_spec("scratch", "remote-work"), ConvoyStatus::default());
@@ -2915,7 +2932,8 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
     let convoy = &convoys.items[0];
     assert_eq!(convoy.spec.dispatching_principal_ref, expected_principal, "crew caller reaches admission across the peer session");
 
-    let reads = engine(&topology.follower).reads();
+    // The daemon's lifecycle reads, which serve its convoys, as the composition root wires them.
+    let reads = topology.follower.lifecycle_reads();
     let controller = ControllerLoop {
         primary: placement.using::<Convoy>(namespace),
         secondaries: Vec::new(),
@@ -2938,18 +2956,18 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
             Err(format!("convoy {} is kept for the test", convoy))
         }
     }
-    let requests = |backend: &ResourceBackend, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>, host: &str| {
+    let requests = |reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>, host: &str| {
         flotilla_admission::reconcilers::vessel_requests::VesselRequests::new(
-            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), namespace)),
+            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(reads.clone(), namespace)),
             reads,
             Arc::new(Kept),
             flotilla_protocol::CanonicalHostId::resolved(host),
             [],
         )
     };
-    let feta_requests = requests(&placement, Arc::clone(&reads), &remote_host_id);
+    let feta_requests = requests(Arc::clone(&reads), &remote_host_id);
     let kiwi_requests =
-        requests(&dispatcher, engine(&topology.leader).reads(), &topology.leader.local_host_id().expect("kiwi host identity").to_string());
+        requests(topology.leader.lifecycle_reads(), &topology.leader.local_host_id().expect("kiwi host identity").to_string());
     let feta_vessels = &engine(&topology.follower).vessels;
     eventually(Duration::from_secs(5), Duration::from_millis(10), "feta launches its vessel", || async {
         feta_requests.sync_once(Utc::now()).await.expect("feta vessel requests");
