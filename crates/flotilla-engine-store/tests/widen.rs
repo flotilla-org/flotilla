@@ -482,7 +482,7 @@ const SESSION_BEFORE_CONVOY: &str = r#"CREATE TABLE "agent_session_before" (
 ) STRICT"#;
 
 // Behaviour (#4438, ADR 0047 N→N+1): a store whose `agent_session` table predates a session's
-// convoy, vessel, role and conversation opens under this build, which adds them: a session the
+// convoy, vessel and role opens under this build, which adds them: a session the
 // earlier build wrote reads back with none of them, and a new session is written with them all.
 #[test]
 fn a_session_table_predating_its_convoy_opens_and_keeps_its_rows() {
