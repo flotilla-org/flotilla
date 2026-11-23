@@ -1348,7 +1348,8 @@ async fn checked_cleat_endpoint(
         .as_ref()
         .and_then(|status| status.cleat_endpoint.as_ref())
         .ok_or("selected terminal has no recorded Cleat endpoint")?;
-    if recorded.session != target.session_id
+    // The endpoint names the session as cleat holds it (`TerminalRecord::cleat_endpoint`).
+    if recorded.session != flotilla_paths::name_component::encode_name_component(target.session_id)
         || !Path::new(&recorded.runtime_root).is_absolute()
         || recorded.daemon.contains('/')
         || recorded
@@ -1412,6 +1413,54 @@ mod tests {
     use crate::testkits::discovery::fake_discovery;
     use flotilla_config::ConfigStore;
     use flotilla_daemon_api::daemon::DaemonHandle;
+
+    // An engine session id carries its launch's `#`, while cleat lists the session under its encoded
+    // id. The recorded endpoint, the session id and cleat's inventory must still agree, through the
+    // real cleat pool, so a running engine session attaches.
+    #[tokio::test]
+    async fn a_running_engine_session_passes_the_cleat_endpoint_check() {
+        use flotilla_discovery_api::EnvironmentBag;
+        use flotilla_protocol::LifecycleReading;
+        use flotilla_replay_testkit::testing::MockRunner;
+        use flotilla_resources::terminal_records::{TerminalLaunchFacts, TerminalLaunchSource, TerminalRecord};
+        use flotilla_terminal::cleat::CleatTerminalPool;
+        use std::sync::Arc;
+
+        let record = TerminalRecord {
+            name: "terminal-convoy-c-work#12007-coder#12060".into(),
+            home: "feta".into(),
+            environment: "env".into(),
+            environment_home: "feta".into(),
+            vessel: None,
+            role: "coder".into(),
+            pool: "cleat".into(),
+            cwd: "/workspace".into(),
+            env: Default::default(),
+            source: TerminalLaunchSource::Tool { command: "sh".into() },
+            requested_at: chrono::DateTime::UNIX_EPOCH,
+            since: chrono::DateTime::UNIX_EPOCH,
+            reading: LifecycleReading::Ready { identity: "terminal-convoy-c-work#12007-coder".into() },
+            facts: Some(TerminalLaunchFacts {
+                endpoint: Some(("/var/lib/flotilla/cleat".into(), "default@1".into())),
+                agent: None,
+                build_jobs: None,
+            }),
+        };
+        let session = record.read_view("flotilla", None, None, None);
+        let listed = r#"[{"id":"terminal-convoy-c-work.2312007-coder","cwd":"/workspace","cmd":null,"status":"Detached"}]"#;
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(listed.into()),
+            Ok("      --strict\n      --take\n".into()),
+            Ok(r#"[{"name":"default@1","runtime_root":"/var/lib/flotilla/cleat","alive":true}]"#.into()),
+            Ok(listed.into()),
+        ]));
+        let pool = CleatTerminalPool::new(runner, "cleat", &EnvironmentBag::new());
+
+        let endpoint = checked_cleat_endpoint(&pool, &session, AttachMode::Default).await.expect("the running session attaches");
+
+        assert_eq!(endpoint.session, "terminal-convoy-c-work.2312007-coder");
+        assert_eq!((endpoint.runtime_root.as_str(), endpoint.daemon.as_str()), ("/var/lib/flotilla/cleat", "default@1"));
+    }
 
     // Attach uses the engine identity, refuses every non-ready held state, and propagates read errors.
     // Every old phase is stale; repeated reads cannot create a copy or resurrect a stale handle.
