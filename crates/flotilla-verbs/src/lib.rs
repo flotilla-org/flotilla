@@ -29,4 +29,4 @@ pub use flotilla_schema_derive::Verb;
 pub use native::{Call, Handler, NativeVerb, Params, Subject};
 pub use presentation::{Picks, Presentation};
 pub use registry::{Duplicate, Registered, VerbRegistry};
-pub use subject::{CommandTemplate, SubjectTable};
+pub use subject::SubjectTable;

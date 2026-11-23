@@ -297,14 +297,25 @@ impl AgentSessionRequest {
 
 impl Machine for AgentSession {
     const NAME: &'static str = "AgentSession";
+    /// Its convoy is its parent; its own row is its conversation, reached through its producer
+    /// on its home and reachable while it is Live.
     const DESCRIBED: &'static [Described] = &[
         Described::Parent { column: "convoy" },
-        Described::Role { column: "role", role: "title" },
+        Described::Role { column: "role", role: "caption" },
         Described::Role { column: "activity", role: "badge" },
-        Described::Facet { recipe: "agent-session", shows: "conversation" },
-        Described::Role { column: "conversation_transport", role: "transport" },
-        Described::Role { column: "conversation_endpoint", role: "endpoint" },
-        Described::Role { column: "conversation_thread", role: "thread" },
+        Described::Facet {
+            recipe: "agent-session",
+            label: "Conversation",
+            endpoint: &[
+                ("host", "resource.home"),
+                ("transport", "conversation_transport"),
+                ("endpoint", "conversation_endpoint"),
+                ("thread", "conversation_thread"),
+            ],
+            state: Some("state"),
+            reachable: &["Live"],
+            reason: Some("reason"),
+        },
     ];
     type Request = AgentSessionRequest;
     type Spec = AgentSessionSpec;

@@ -37,13 +37,21 @@ impl LifecycleKind for TerminalSessionKind {
         };
         TerminalSessionRequest { launch, agent_session, ..request }
     }
+    /// An agent's launch is a way to open its session: its cleat session in its pool on its
+    /// home, reachable while it runs, and why not once it has ended.
     const DESCRIBED: &'static [Described] = &[
-        Described::FacetOf { column: "agent_session", recipe: "cleat-session", shows: "terminal" },
-        Described::Role { column: "identity", role: "session-id" },
-        Described::Role { column: "pool", role: "pool" },
-        Described::Role { column: "role", role: "title" },
+        Described::FacetOf { column: "agent_session" },
+        Described::Role { column: "role", role: "caption" },
         Described::Role { column: "source_adapter", role: "badge" },
         Described::Role { column: "source_model", role: "badge" },
+        Described::Facet {
+            recipe: "cleat-session",
+            label: "Terminal",
+            endpoint: &[("host", "resource.home"), ("pool", "pool"), ("session", "identity")],
+            state: Some("state"),
+            reachable: &["Realised"],
+            reason: Some("ending"),
+        },
     ];
 }
 

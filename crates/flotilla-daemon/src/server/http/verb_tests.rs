@@ -602,7 +602,7 @@ fn sessions_of_coder() -> flotilla_verbs::SubjectTable {
         kind: Kind::Session,
         table: "agent_session",
         address: |row| CODER.parse::<Address>().ok()?.child(Kind::Session, row["resource.name"].as_str()?).ok(),
-        commands: &[],
+        described: &[],
     }
 }
 

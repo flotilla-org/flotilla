@@ -97,6 +97,7 @@ flotilla-drydock = { path = "../flotilla-drydock" }
 libc = { workspace = true }
 
 [dev-dependencies]
+binnacle-described = { workspace = true }
 flotilla-log-testkit = { path = "../flotilla-log-testkit" }
 flotilla-engine-convoys-testkit = { path = "../flotilla-engine-convoys-testkit" }
 flotilla-engine-messages-testkit = { path = "../flotilla-engine-messages-testkit" }

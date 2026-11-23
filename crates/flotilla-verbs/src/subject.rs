@@ -14,16 +14,7 @@ pub struct SubjectTable {
     /// The canonical address of the subject a row is about, from what the row is read from: the
     /// resource document for a resource table, the row's own fields for an engine table.
     pub address: fn(&Value) -> Option<Address>,
-    /// The command facets of the kind's subjects (#4438), which no row holds: each an argv
-    /// template whose `{field}` placeholders name the table's fields.
-    pub commands: &'static [CommandTemplate],
-}
-
-/// A command facet of a subject kind (#4438): run `argv`, its `{field}` placeholders filled from
-/// the subject's row, to open what it `shows`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CommandTemplate {
-    pub name: &'static str,
-    pub shows: &'static str,
-    pub argv: &'static [&'static str],
+    /// What the table's owner declares about it for surfaces beyond its kind's own declarations
+    /// (#4438): the command facets of its subjects, which no row holds.
+    pub described: &'static [flotilla_schema::Described],
 }

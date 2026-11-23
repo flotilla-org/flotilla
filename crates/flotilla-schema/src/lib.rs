@@ -90,7 +90,7 @@ pub use code::{code_value, decode_code};
 pub use code::{Code, CodeError, ADDRESS_DOMAIN, HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN};
 pub use codec::{DecodeError, Decoder, EncodeError, Encoder};
 pub use descriptor::{
-    ColumnDef, ColumnType, Command, Condition, Described, DescriptorError, Expansion, Facet, FieldColumns, Guard, Index, IndexProblem,
+    ColumnDef, ColumnType, Condition, Described, DescriptorError, Endpoint, Expansion, Facet, FieldColumns, Guard, Index, IndexProblem,
     Link, SchemaMode, Subject, Table, TableRole, TableSet, When, RECORD_VERSION, RESERVED_RECORD_COLUMNS, RESERVED_ROOT_COLUMNS,
     SHARED_NAMES, VIEW_SUFFIX,
 };

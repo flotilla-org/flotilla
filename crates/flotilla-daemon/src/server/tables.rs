@@ -113,19 +113,6 @@ pub(crate) fn batches(rows: Vec<Row>, sequence: u64, partial: bool, cursor: Opti
     Ok(messages)
 }
 
-/// The command facets `subject`'s owner registered, as its table describes them (#4438).
-fn commands(subject: &SubjectTable) -> Vec<flotilla_schema::Command> {
-    subject
-        .commands
-        .iter()
-        .map(|command| flotilla_schema::Command {
-            name: command.name.to_owned(),
-            shows: command.shows.to_owned(),
-            argv: command.argv.iter().map(|arg| (*arg).to_owned()).collect(),
-        })
-        .collect()
-}
-
 /// A resource kind's table, with the derived address column when its rows are `subject`'s.
 pub(crate) fn descriptor(kind: &str, subject: Option<&SubjectTable>) -> Table {
     let condition_items = json!({
@@ -710,22 +697,30 @@ impl TableSource {
         if catalog.queries.is_some() {
             kinds.extend(query::list());
         }
-        let mut facets = Vec::new();
+        let mut facets = std::collections::BTreeSet::new();
         if let Some(service) = &catalog.service {
             kinds.extend(decided::list(service).await?);
-            facets = decided::facets(service).await?;
+            facets = decided::facet_tables(service).await?;
         }
-        // The tables a surface builds its tree and opens from (#4438): those serving a subject
-        // kind, and those whose rows are facets.
-        let listed: std::collections::BTreeSet<&str> =
-            kinds.iter().flat_map(|kind| kind["tables"].as_array().into_iter().flatten()).filter_map(Value::as_str).collect();
-        let subjects: Vec<_> = catalog
-            .subjects
-            .iter()
-            .filter(|subject| listed.contains(subject.table))
-            .map(|subject| json!({"table": subject.table, "kind": subject.kind.as_str()}))
-            .collect();
-        Ok(json!({"kinds":kinds,"subjects":subjects,"facets":facets}))
+        // The tables a surface builds its tree and opens from (#4438), named on each kind as
+        // binnacle-described's listing reads them: those serving a subject, and those whose
+        // rows have facets, a subject's registered command facets among them.
+        for subject in catalog.subjects.iter().filter(|subject| !subject.described.is_empty()) {
+            facets.insert(subject.table.to_owned());
+        }
+        for kind in &mut kinds {
+            let tables: Vec<String> =
+                kind["tables"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+            let subjects: Vec<&String> = tables.iter().filter(|table| catalog.subjects.of_table(table).is_some()).collect();
+            let faceted: Vec<&String> = tables.iter().filter(|table| facets.contains(*table)).collect();
+            if !subjects.is_empty() {
+                kind["subjects"] = json!(subjects);
+            }
+            if !faceted.is_empty() {
+                kind["facets"] = json!(faceted);
+            }
+        }
+        Ok(json!({"kinds":kinds}))
     }
     pub(crate) fn open(name: String, catalog: &Catalog) -> Result<Self, Failure> {
         let subject = catalog.subjects.of_table(&name);
@@ -798,7 +793,9 @@ impl TableSource {
         match self {
             Self::Resource { name, subject, .. } => {
                 let mut table = descriptor(name, subject.as_ref());
-                table.commands = subject.as_ref().map(commands).unwrap_or_default();
+                if let Some(subject) = subject {
+                    table.describe(subject.described);
+                }
                 Ok(Description { schema: table.frictionless(), markdown: flotilla_schema::render_table_view(&table), table })
             }
             Self::Decided { service, name, subject } => {
@@ -824,8 +821,6 @@ impl TableSource {
                     for key in &mut owner {
                         key.add_role("key");
                     }
-                    // The home holding a row is the host its facets' endpoints are on (#4438).
-                    owner[0].add_role("host");
                     owner.extend(table.key);
                     table.key = owner;
                 }
@@ -837,7 +832,7 @@ impl TableSource {
                     address.properties.insert("title".into(), json!("Address"));
                     table.columns.push(address);
                     table.subject = Some(flotilla_schema::Subject { kind: subject.kind, field: ADDRESS.into() });
-                    table.commands = commands(subject);
+                    table.describe(subject.described);
                 }
                 mark_scalar_columns(&mut table);
                 Ok(Description { schema: set.frictionless(&table), table, markdown })

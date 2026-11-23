@@ -14,7 +14,7 @@ Fenced blocks tagged `list <name>` below (routes, messages, column types, `where
 
 All are `GET`. The caller must be a user (socket, bearer or session); anonymous callers get `401`, environment and hook tokens get `403`, code `unauthorized`.
 
-- `/tables` lists the kinds: `{"kinds":[{"kind","root","tables":[...]}],"subjects":[...],"facets":[...]}`. `root` is the kind's root table; `tables` are the names usable in the other two routes. Engine kinds are listed only when the daemon has its store. `subjects` and `facets` name the tables a surface builds its tree and opens from ([Subjects, parents and facets](#subjects-parents-and-facets)).
+- `/tables` lists the kinds: `{"kinds":[{"kind","root","tables":[...],"subjects":[...],"facets":[...]}]}`. `root` is the kind's root table; `tables` are the names usable in the other two routes. Engine kinds are listed only when the daemon has its store. A kind's `subjects` and `facets`, present only where it has some, name those of its tables a surface builds its tree and opens from ([Subjects, parents and facets](#subjects-parents-and-facets)).
 - `/tables/{table}` describes one table (below).
 - `/tables/{table}/rows` streams row messages.
 
@@ -139,8 +139,11 @@ Order: `[resync]` (bad cursor only), `table`, `[count]`, `[values]`…, one or m
   "primaryKey": ["…"],
   "foreignKeys": [ { "fields": ["…"], "reference": {"resource": "…", "fields": ["…"]}, "relation": "parent" } ],
   "subject": {"kind": "convoy", "field": "address"},
-  "facets": [ {"recipe": "agent-session", "shows": "conversation"} ],
-  "commands": [ {"name": "attach", "shows": "terminal", "argv": ["flotilla", "attach", "{metadata.name}"]} ]
+  "facets": [
+    {"recipe": "cleat-session", "label": "Terminal", "endpoint": {"host": "resource.home", "pool": "pool", "session": "identity"},
+     "state": "state", "reachable": ["Realised"], "reason": "ending"},
+    {"recipe": "command", "label": "Attach", "argv": ["flotilla", "attach", "{address}"]}
+  ]
 }
 ```
 
@@ -236,24 +239,24 @@ sortable
 whereOperators
 ```
 
-- `roles`: an array of strings. In use: `key` (part of the primary key), `ref` (identifies a resource), `state` (a state label), `since` (when a state was entered), `sequence` (log position), `time` (an event time), `transition-from` and `transition-to` (the states an event moved between); for surfaces ([Subjects, parents and facets](#subjects-parents-and-facets)), `title` and `badge` (a card's), `parent` (an address naming the row's parent subject), `host` (the home holding an engine row, where its facets' endpoints are), and a recipe's fields: `session-id` and `pool` (`cleat-session`), `transport`, `endpoint` and `thread` (`agent-session`).
+- `roles`: an array of strings. In use: `key` (part of the primary key), `ref` (identifies a resource), `state` (a state label), `since` (when a state was entered), `sequence` (log position), `time` (an event time), `transition-from` and `transition-to` (the states an event moved between); `caption` and `badge`, a card's ([Subjects, parents and facets](#subjects-parents-and-facets)).
 - `title`: a display name.
 - `sortable`: whether `sort` accepts the column.
 - `whereOperators`: the operators `where` accepts on the column, by its type ([Conditions](#conditions)); an empty array means it cannot be filtered.
 
 ## Subjects, parents and facets
 
-A surface (Wheelhouse, say) builds its tree, its cards and its opens from the tables alone, with no code per table (#4438). Each kind's owner declares what its columns mean where the kind is declared (`Machine::DESCRIBED`, a `flotilla_schema::Described` list), and the subject tables with `flotilla_verbs::SubjectTable`; storage reads none of it.
+A surface (Wheelhouse, say) builds its tree, its cards and its opens from the tables alone, with no code per table (#4438). The vocabulary is binnacle-described's (flotilla-org/binnacle#421): a described client reads it with no compiled-in list of tables. Each kind's owner declares what its table means where the kind is declared (`Machine::DESCRIBED`, a `flotilla_schema::Described` list), and a subject table's registration (`flotilla_verbs::SubjectTable::described`) adds its command facets; storage reads none of it.
 
-- **Subjects.** The listing's `subjects` are `{"table","kind"}`: the table serving each subject kind. Its rows are the things a surface shows and opens, each at the address in the description's `subject` field.
-- **Parents.** A foreign key whose `relation` is `parent` names the row's parent subject: a surface follows the key to place the row under it. An address column whose roles include `parent` names it by address (a convoy's `project`). Nothing links back: a surface finds a subject's children by their keys. An agent session's parent is its `convoy`; its `vessel` is a plain key, followed for routing and badges, and no level of the tree.
-- **Facets.** A facet is one way to open a subject: a recipe naming an endpoint (`cleat-session`, `agent-session`, `url`, …) and what opening it `shows` (`terminal`, `conversation`, `page`, …). Opening never starts anything. Facets are described in the tables their facts already live in, never computed into a table of their own:
-  - A foreign key whose `relation` is `facet-of` makes its row a facet of the subject the key names, by the key's `facet` recipe. The link is per row: a row whose key is empty is no one's facet. A terminal launch's `agent_session`, set for an agent's launch and empty for a tool's, makes it its session's `cleat-session` facet.
-  - The description's `facets` are facets each row is of itself: an agent session's own `agent-session` conversation, so an agent with no terminal still opens.
-  - The recipe's fields are the facet table's columns whose roles name them, `host` among them; the row's `state` role says whether the facet is reachable, with a reason where the table holds one.
-  - The listing's `facets` are `{"table","recipe","shows","of"}`, one per facet a table declares; `of` names the foreign key, and is absent for a facet of the row itself.
-  - The description's `commands` are command facets no row holds: `argv` templates whose `{field}` placeholders name the row's fields. A convoy opens by `flotilla attach {metadata.name}`.
-- **Cards.** A card shows the subject's `title`, its `state` and `since`, and the `badge` columns of its row and of the rows its keys name: a surface follows the keys and chooses which to show (a terminal launch's `source_adapter` and `source_model`, its environment's `provider`, a vessel's `host` and `class`).
+- **Subjects.** A kind's listed `subjects` are its tables whose description names a `subject`. Their rows are the things a surface shows and opens, each at its address: `convoys` and `agent_session`.
+- **Parents.** A foreign key whose `relation` is `parent` names the row's parent. A key relates a row only when all its fields are set, and where several keys share a relation the first that relates the row wins. Nothing links back: a surface finds a row's children by their keys. An agent session's parent is its `convoy`; its `vessel` is a plain key, followed for routing and badges, and no level of the tree.
+- **Facets.** A facet is one way to open a row: a recipe (`cleat-session`, `agent-session`, `command`, …) and where its fields come from. Opening never starts anything. Facets are described in the tables their facts already live in, never computed into a table of their own. A kind's listed `facets` are its tables whose description has `facets`.
+  - Each of the description's `facets` has a `recipe`, a `label`, and either an `endpoint` map, from each recipe field to the table field holding it, or a command `argv`.
+  - A row's facet opens the row its `facet-of` key names when that key is set, and otherwise the row's own subject. A terminal launch's `agent_session`, set for an agent's launch and empty for a tool's, makes its `cleat-session` (its `session` id in its `pool` on its `host`) open its agent session.
+  - `state` names the field saying whether the facet can be reached, `reachable` its values that mean it can, and `reason` the field saying why not: a terminal launch is reachable while `Realised`, and an ended one gives its `ending`.
+  - An agent session's own row is its `agent-session` conversation (`transport`, `endpoint`, `thread` on its `host`), reachable while `Live`, so an agent with no terminal still opens.
+  - A command facet's `argv` is a list of templates: `{field}` is the row's value of that field and `{address}` its subject address; one the row lacks makes the facet unavailable for that row. Convoys and agent sessions attach by `flotilla attach {address}`.
+- **Cards.** A card shows the row's `caption`, its `state` and `since`, and the `badge` fields of its row and of the rows its keys name: a surface follows the keys and chooses which to show (a session's `activity`; a terminal launch's `source_adapter` and `source_model`; its environment's `provider`; a vessel's `host` and `class`).
 
 ## Which tables exist
 

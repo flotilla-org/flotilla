@@ -27,23 +27,16 @@ pub(super) async fn list(service: &Arc<Service>) -> Result<Vec<Value>, String> {
     .await
 }
 
-/// The engine tables whose rows are facets (#4438): each facet a table's description declares,
-/// with the reference column naming the subject it is a facet of, or none where the row is a
-/// facet of the subject it is itself.
-pub(super) async fn facets(service: &Arc<Service>) -> Result<Vec<Value>, String> {
+/// The engine tables whose kinds declare facets for their rows (#4438).
+pub(super) async fn facet_tables(service: &Arc<Service>) -> Result<std::collections::BTreeSet<String>, String> {
     blocking(service, |store| {
-        let mut facets = Vec::new();
-        for table in store.kinds().iter().flat_map(|set| &set.tables) {
-            for facet in &table.facets {
-                facets.push(json!({"table": table.name, "recipe": facet.recipe, "shows": facet.shows}));
-            }
-            for column in &table.columns {
-                if let Some(flotilla_schema::Link::FacetOf(facet)) = &column.link {
-                    facets.push(json!({"table": table.name, "recipe": facet.recipe, "shows": facet.shows, "of": column.name}));
-                }
-            }
-        }
-        Ok(facets)
+        Ok(store
+            .kinds()
+            .iter()
+            .flat_map(|set| &set.tables)
+            .filter(|table| !table.facets.is_empty())
+            .map(|table| table.name.clone())
+            .collect())
     })
     .await
 }

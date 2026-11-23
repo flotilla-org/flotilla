@@ -393,12 +393,7 @@ pub fn register_subjects(registry: &mut flotilla_verbs::VerbRegistry) -> Result<
         kind: flotilla_address::Kind::Convoy,
         table: <flotilla_resources::Convoy as flotilla_resources::Resource>::API_PATHS.plural,
         address: |document| ConvoyIdentity::of_document(document)?.address(),
-        // `flotilla attach` takes a convoy's record name.
-        commands: &[flotilla_verbs::CommandTemplate {
-            name: "attach",
-            shows: "terminal",
-            argv: &["flotilla", "attach", "{metadata.name}"],
-        }],
+        described: &[flotilla_schema::Described::Command { label: "Attach", argv: &["flotilla", "attach", "{address}"] }],
     })
 }
 

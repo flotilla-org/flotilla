@@ -1283,14 +1283,36 @@ fn tables_doc_lists_the_where_operators_of_the_code() {
     assert_eq!(covered.len(), 8, "every filterable type is listed");
 }
 
-// Behaviour (#4438): a surface finds its subjects and facets from the tables alone. The listing
-// names the session subject table and every facet table: a terminal launch, a facet of the
-// session its `agent_session` names, and a session, a facet of itself as a conversation. A
-// session's description names its subject, its convoy as its parent and its own facet's fields;
-// a terminal launch's names the session it is a terminal of and the cleat session's fields; the
-// home holding either row is the host their endpoints are on.
+/// `table`'s rows as a binnacle-described client holds them, read over the tables HTTP surface.
+async fn described(router: &Router, table: &str) -> binnacle_described::DescribedSource {
+    let mut source = binnacle_described::DescribedSource::new(table, binnacle_described::Scope::new("default"));
+    source.poll_request();
+    let response = call(router, &format!("/tables/{table}/rows"), false).await;
+    assert_eq!(response.status(), StatusCode::OK, "{table}");
+    let bytes = to_bytes(response.into_body(), 8 * 1024 * 1024).await.unwrap();
+    for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+        source.receive(binnacle_described::decode_json_line(line).unwrap());
+        // As its host does: take the request the `table` makes (a watch asking for the
+        // columns' values), so the rows that follow are read.
+        while source.poll_request().is_some() {}
+    }
+    source
+}
+
+// Behaviour (#4438 acceptance): a binnacle-described client finds what a surface opens from the
+// tables alone. The listing names the session subject table and the facet tables. An agent's
+// running launch is a facet of its session and opens its cleat session at its pool and home; an
+// ended one is unreachable and says why. A session's parent is its convoy; one with no terminal
+// still opens its conversation; and its attach command renders with its address.
 #[tokio::test]
-async fn the_listing_and_descriptions_say_what_a_surface_opens() {
+async fn a_described_client_finds_subjects_parents_and_facets() {
+    use binnacle_described::{Endpoint, Listing, Opening, Relation, Wire};
+    use flotilla_schema::Ref;
+    use flotilla_state_machines::{
+        machines::agent_session::{AgentSession, AgentSessionRequest, Conversation, MemoryAgentSessionWorld},
+        Home,
+    };
+
     let directory = tempfile::tempdir().unwrap();
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(
@@ -1300,60 +1322,70 @@ async fn the_listing_and_descriptions_say_what_a_surface_opens() {
         )
         .unwrap(),
     );
+    let terminals = flotilla_provisioning_testkit::TerminalsFixture::over_service(&service);
+    let running = terminals.request(&flotilla_provisioning_testkit::TerminalsFixture::agent("v1", "coder", "env-a"));
+    terminals.ready(&running, "cleat-7", &Default::default());
+    let ended = terminals.request(&flotilla_provisioning_testkit::TerminalsFixture::agent("v1", "review", "env-a"));
+    terminals.ready(&ended, "cleat-8", &Default::default());
+    terminals.lost(&ended, "pool restarted");
+    let mut sessions =
+        Home::<AgentSession, flotilla_engine_store::StoreLog>::with_log("home", flotilla_engine_store::StoreLog::new(service.store()))
+            .unwrap();
+    let convoy = Ref::new("convoy-a#1", "home");
+    for (name, role) in [(running.as_str(), "coder"), (ended.as_str(), "review")] {
+        sessions
+            .create(name, AgentSessionRequest::of(convoy.clone(), role), &MemoryAgentSessionWorld::default(), flotilla_schema::Timestamp(1))
+            .unwrap();
+    }
+    let conversation = Conversation { transport: "local".into(), endpoint: "/run/sdk.sock".into(), thread: Some("t-1".into()) };
+    let sdk = AgentSessionRequest { conversation: Some(conversation), ..AgentSessionRequest::of(convoy.clone(), "runner") };
+    sessions.create("sdk-runner", sdk, &MemoryAgentSessionWorld::default(), flotilla_schema::Timestamp(2)).unwrap();
     let router = HttpRouter::builder()
         .backend(engine_home_backend())
         .table_store(service)
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
         .build()
         .into_router();
-    let listed = json(&router, "/tables").await;
-    let subjects = listed["subjects"].as_array().unwrap();
-    assert!(subjects.contains(&serde_json::json!({"table": "agent_session", "kind": "session"})), "{subjects:?}");
-    let facets = listed["facets"].as_array().unwrap();
-    for facet in [
-        serde_json::json!({"table": "terminal_session", "recipe": "cleat-session", "shows": "terminal", "of": "agent_session"}),
-        serde_json::json!({"table": "agent_session", "recipe": "agent-session", "shows": "conversation"}),
-    ] {
-        assert!(facets.contains(&facet), "{facet} in {facets:?}");
-    }
 
-    let field = |schema: &serde_json::Value, name: &str| {
-        schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == name).unwrap_or_else(|| panic!("{name}")).clone()
-    };
-    let key = |schema: &serde_json::Value, column: &str| {
-        schema["foreignKeys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|key| key["fields"].as_array().unwrap().last() == Some(&serde_json::json!(column)))
-            .unwrap_or_else(|| panic!("{column}"))
-            .clone()
-    };
-    let session = json(&router, "/tables/agent_session").await;
-    assert_eq!(session["subject"], serde_json::json!({"kind": "session", "field": "address"}));
-    assert_eq!(key(&session, "convoy")["relation"], "parent");
-    assert_eq!(key(&session, "convoy")["reference"]["resource"], "convoy");
-    assert!(key(&session, "vessel").get("relation").is_none(), "a vessel is reached by key, never a level");
-    assert_eq!(session["facets"], serde_json::json!([{"recipe": "agent-session", "shows": "conversation"}]));
-    for (name, role) in [
-        ("resource.home", "host"),
-        ("role", "title"),
-        ("state", "state"),
-        ("state_since", "since"),
-        ("activity", "badge"),
-        ("conversation_transport", "transport"),
-        ("conversation_endpoint", "endpoint"),
-        ("conversation_thread", "thread"),
-    ] {
-        assert!(field(&session, name)["roles"].as_array().unwrap().contains(&serde_json::json!(role)), "{name} is {role}");
-    }
+    let listing = Listing::from_json(&json(&router, "/tables").await).unwrap();
+    assert!(listing.subject_tables().any(|table| table == "agent_session"));
+    let facets: Vec<&str> = listing.facet_tables().collect();
+    assert!(facets.contains(&"terminal_session") && facets.contains(&"agent_session"), "{facets:?}");
 
-    let terminal = json(&router, "/tables/terminal_session").await;
-    assert_eq!(key(&terminal, "agent_session")["relation"], "facet-of");
-    assert_eq!(key(&terminal, "agent_session")["facet"], serde_json::json!({"recipe": "cleat-session", "shows": "terminal"}));
-    assert_eq!(key(&terminal, "agent_session")["reference"]["resource"], "agent_session");
-    for (name, role) in [("resource.home", "host"), ("identity", "session-id"), ("pool", "pool"), ("state", "state")] {
-        assert!(field(&terminal, name)["roles"].as_array().unwrap().contains(&serde_json::json!(role)), "{name} is {role}");
-    }
-    assert!(terminal.get("subject").is_none() && terminal.get("facets").is_none());
+    let launches = described(&router, "terminal_session").await;
+    let key = |source: &binnacle_described::DescribedSource, name: &str| {
+        source.row_key(&[Wire::Text("home".into()), Wire::Text(name.into())]).unwrap_or_else(|| panic!("{name}"))
+    };
+    let agent = key(&launches, &running);
+    let of = launches.row_facet_of(agent).expect("an agent's launch is a facet of its session");
+    assert_eq!((of.resource(), of.values.clone()), (Some("agent_session"), vec![&Wire::Text("home".into()), &Wire::Text(running.clone())]));
+    let terminal = launches.row_facets(agent).into_iter().find(|facet| facet.facet.recipe == "cleat-session").expect("cleat facet");
+    let Opening::Endpoint(endpoint) = &terminal.opening else { panic!("an endpoint") };
+    assert_eq!(endpoint.get("session"), Some(&&Wire::Text("cleat-7".into())));
+    assert_eq!(endpoint.get("pool"), Some(&&Wire::Text("cleat".into())));
+    assert_eq!(endpoint.get("host"), Some(&&Wire::Text("home".into())));
+    assert!(terminal.reachable);
+    let gone = launches.row_facets(key(&launches, &ended)).into_iter().find(|facet| facet.facet.recipe == "cleat-session").unwrap();
+    assert!(!gone.reachable, "an ended terminal cannot be reached");
+    assert_eq!(gone.reason, Some("Lost"));
+
+    let agents = described(&router, "agent_session").await;
+    let session = key(&agents, &running);
+    let parent = agents.row_parent(session).expect("a session's parent");
+    assert_eq!(
+        (parent.resource(), parent.values.clone()),
+        (Some("convoy"), vec![&Wire::Text("home".into()), &Wire::Text("convoy-a#1".into())])
+    );
+    assert_eq!(agents.row_related(session, &Relation::FacetOf), None);
+    let address = agents.row_subject(session).expect("a session's address").to_owned();
+    assert_eq!(address, format!("host:home/convoy:convoy-a%231/role:coder/session:{}", running.replace('#', "%23")));
+    let attach = agents.row_facets(session).into_iter().find(|facet| facet.facet.recipe == "command").expect("attach");
+    assert_eq!(attach.opening, Opening::Command(vec!["flotilla".into(), "attach".into(), address]));
+    assert!(matches!(&attach.facet.endpoint, Endpoint::Argv(_)));
+    let runner = agents.row_facets(key(&agents, "sdk-runner"));
+    let conversation = runner.iter().find(|facet| facet.facet.recipe == "agent-session").expect("a conversation with no terminal");
+    assert!(conversation.reachable && conversation.of.is_none());
+    let Opening::Endpoint(endpoint) = &conversation.opening else { panic!("an endpoint") };
+    assert_eq!(endpoint.get("endpoint"), Some(&&Wire::Text("/run/sdk.sock".into())));
+    assert_eq!(endpoint.get("thread"), Some(&&Wire::Text("t-1".into())));
 }

@@ -336,7 +336,7 @@ pub fn register_subjects(registry: &mut flotilla_verbs::VerbRegistry) -> Result<
         kind: AddressKind::Session,
         table: "agent_session",
         address: session_address,
-        commands: &[],
+        described: &[flotilla_schema::Described::Command { label: "Attach", argv: &["flotilla", "attach", "{address}"] }],
     })
 }
 

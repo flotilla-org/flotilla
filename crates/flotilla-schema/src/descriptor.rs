@@ -109,58 +109,72 @@ pub struct Table {
     pub aliases: Vec<(String, String)>,
     /// What each row is about, when its rows are subjects of one address kind (#4199).
     pub subject: Option<Subject>,
-    /// The facets each row is of itself (#4438): a way to open the subject the row is, from the
-    /// row's own columns, such as an agent session's conversation.
+    /// The ways each row opens (#4438), binnacle-described's `facets`: a row's facet opens the
+    /// row its `facet-of` key names, when that key is set, and otherwise the row's own subject.
     pub facets: Vec<Facet>,
-    /// The command facets of each row's subject (#4438): templates no row holds, filled from the
-    /// row's fields.
-    pub commands: Vec<Command>,
 }
 
-/// A facet (#4438): one way to open a subject, by a recipe describing an endpoint, and what
-/// opening it shows. The recipe's fields are the facet table's columns that carry roles named
-/// after them; its `state` role says whether the facet is reachable.
+/// One way a row opens (#4438), as binnacle-described reads a description's `facets`: a recipe
+/// (`cleat-session`, `agent-session`, `command`, … an open vocabulary) and where its fields come
+/// from, whether it can be reached and why not. Opening a facet never starts anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Facet {
-    /// The recipe: `cleat-session`, `agent-session`, `url`, … An open vocabulary.
     pub recipe: String,
-    /// What opening it shows: `terminal`, `conversation`, `page`, …
-    pub shows: String,
+    /// The name a menu shows for it.
+    pub label: Option<String>,
+    pub endpoint: Endpoint,
+    /// The field whose value says whether it can be reached; absent, the table's `state` field.
+    pub state: Option<String>,
+    /// The `state` values meaning it can be reached; absent, it always can.
+    pub reachable: Option<Vec<String>>,
+    /// The field saying why it cannot be reached.
+    pub reason: Option<String>,
 }
 
-/// A command facet of a subject table's rows (#4438): an argv template whose `{field}`
-/// placeholders name the row's fields, such as `["flotilla", "attach", "{address}"]`.
+/// Where a facet's recipe takes its fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Command {
-    pub name: String,
-    pub shows: String,
-    pub argv: Vec<String>,
+pub enum Endpoint {
+    /// Each recipe field, by the table field holding it.
+    Fields(Vec<(String, String)>),
+    /// A command line, each argument a template: `{field}` is the row's value of that field,
+    /// `{address}` its subject address.
+    Argv(Vec<String>),
 }
 
-/// How a reference column relates its row to the row it names, for a surface building a tree
-/// and its opens (#4438). A surface follows the key; nothing links back.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How a reference column relates its row to the row it names, binnacle-described's foreign-key
+/// `relation` (#4438). A key relates a row only when all its fields are set; a surface follows
+/// the key, and nothing links back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Link {
-    /// The row named is this row's parent subject.
+    /// The row named is this row's parent.
     Parent,
-    /// This row is a facet of the subject the row named is, when the cell is set: the link is
-    /// per row, so a row whose cell is empty is no one's facet.
-    FacetOf(Facet),
+    /// This row is a way to open the row named: its facets open that row.
+    FacetOf,
 }
 
-/// What a kind's owner declares about its root table's columns for surfaces (#4438), applied
-/// by [`TableSet::describe`]. Storage reads none of it.
+/// What a kind's owner, or a subject table's registration, declares about a table for surfaces
+/// (#4438), applied by [`Table::describe`]. Storage reads none of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Described {
-    /// The column takes `role`: a card's `title` or `badge`, or a recipe field such as
-    /// `session-id`, `pool`, `transport`, `endpoint` or `thread`.
+    /// The column takes `role`: a card's `caption` or `badge`.
     Role { column: &'static str, role: &'static str },
-    /// The column names the row's parent subject: a reference by its key, an address by itself.
+    /// The reference column names the row's parent.
     Parent { column: &'static str },
-    /// The reference column names the subject this row is a facet of, by `recipe`, showing `shows`.
-    FacetOf { column: &'static str, recipe: &'static str, shows: &'static str },
-    /// Every row is a facet of the subject it is itself, by `recipe`, showing `shows`.
-    Facet { recipe: &'static str, shows: &'static str },
+    /// The reference column names the row this row is a facet of.
+    FacetOf { column: &'static str },
+    /// A facet whose recipe reads its fields from the row: `endpoint` maps each recipe field to
+    /// the table field holding it. Unreachable unless `state` holds one of `reachable` (none:
+    /// always reachable), with `reason` saying why.
+    Facet {
+        recipe: &'static str,
+        label: &'static str,
+        endpoint: &'static [(&'static str, &'static str)],
+        state: Option<&'static str>,
+        reachable: &'static [&'static str],
+        reason: Option<&'static str>,
+    },
+    /// A command facet: `argv` templates filled from the row's fields and `{address}`.
+    Command { label: &'static str, argv: &'static [&'static str] },
 }
 
 /// The subject of a table's rows (#4182 ruling 1): the ADR 0066 address kind of each row's
@@ -423,45 +437,59 @@ pub enum DescriptorError {
     EdgeState { kind: String, states: usize },
 }
 
-impl TableSet {
-    /// Applies `marks` to the root table (#4438).
+impl Table {
+    /// Applies `marks` (#4438). Facet fields are not checked here: a served table adds fields
+    /// (`resource.home`, `address`) after its kind declares them.
     ///
     /// # Panics
-    /// A mark naming a column the root table does not have, a parent that is neither a reference
-    /// nor an address, or a facet-of mark on a column that is no reference: a declaration error
-    /// in the kind, found by building its table set.
+    /// A role or relation naming a column the table does not have, or a relation on a column
+    /// that is no reference: a declaration error, found by building the table.
     pub fn describe(&mut self, marks: &[Described]) {
-        let root = &mut self.tables[0];
-        let kind = &self.kind;
+        let owned = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>();
         for mark in marks {
-            let column = |root: &mut Table, name: &str| -> usize {
-                root.columns.iter().position(|column| column.name == name).unwrap_or_else(|| panic!("{kind} describes no column `{name}`"))
+            let name = &self.name;
+            let column = |columns: &mut [ColumnDef], wanted: &str| -> usize {
+                columns.iter().position(|column| column.name == wanted).unwrap_or_else(|| panic!("{name} describes no column `{wanted}`"))
+            };
+            let link = |columns: &mut [ColumnDef], wanted: &str, link: Link| {
+                let at = column(columns, wanted);
+                assert!(columns[at].reference.is_some(), "{name}'s related `{wanted}` is no reference");
+                columns[at].link = Some(link);
             };
             match *mark {
-                Described::Role { column: name, role } => {
-                    let at = column(root, name);
-                    root.columns[at].add_role(role);
+                Described::Role { column: wanted, role } => {
+                    let at = column(&mut self.columns, wanted);
+                    self.columns[at].add_role(role);
                 }
-                Described::Parent { column: name } => {
-                    let at = column(root, name);
-                    let column = &mut root.columns[at];
-                    if column.reference.is_some() {
-                        column.link = Some(Link::Parent);
-                    } else if column.address {
-                        column.add_role("parent");
-                    } else {
-                        panic!("{kind}'s parent `{name}` is neither a reference nor an address");
-                    }
-                }
-                Described::FacetOf { column: name, recipe, shows } => {
-                    let at = column(root, name);
-                    let column = &mut root.columns[at];
-                    assert!(column.reference.is_some(), "{kind}'s facet-of `{name}` is no reference");
-                    column.link = Some(Link::FacetOf(Facet { recipe: recipe.to_owned(), shows: shows.to_owned() }));
-                }
-                Described::Facet { recipe, shows } => root.facets.push(Facet { recipe: recipe.to_owned(), shows: shows.to_owned() }),
+                Described::Parent { column: wanted } => link(&mut self.columns, wanted, Link::Parent),
+                Described::FacetOf { column: wanted } => link(&mut self.columns, wanted, Link::FacetOf),
+                Described::Facet { recipe, label, endpoint, state, reachable, reason } => self.facets.push(Facet {
+                    recipe: recipe.to_owned(),
+                    label: Some(label.to_owned()),
+                    endpoint: Endpoint::Fields(
+                        endpoint.iter().map(|(field, column)| ((*field).to_owned(), (*column).to_owned())).collect(),
+                    ),
+                    state: state.map(str::to_owned),
+                    reachable: (!reachable.is_empty()).then(|| owned(reachable)),
+                    reason: reason.map(str::to_owned),
+                }),
+                Described::Command { label, argv } => self.facets.push(Facet {
+                    recipe: "command".to_owned(),
+                    label: Some(label.to_owned()),
+                    endpoint: Endpoint::Argv(owned(argv)),
+                    state: None,
+                    reachable: None,
+                    reason: None,
+                }),
             }
         }
+    }
+}
+
+impl TableSet {
+    /// Applies `marks` to the root table ([`Table::describe`]).
+    pub fn describe(&mut self, marks: &[Described]) {
+        self.tables[0].describe(marks);
     }
 
     /// The column the backend adds to every table below the root, holding the resource's row id:
