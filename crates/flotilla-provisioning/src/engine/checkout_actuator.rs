@@ -391,15 +391,22 @@ impl CheckoutRechecks {
         *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rechecks);
     }
 
+    /// Checkout launch `launch` is rechecked: a release that failed is tried again, though its
+    /// inspection is unchanged.
+    pub async fn recheck(&self, launch: &str) -> Result<(), String> {
+        self.send(Recheck { name: launch.to_owned(), ruled_release: false }).await
+    }
+
+    async fn send(&self, recheck: Recheck) -> Result<(), String> {
+        let rechecks = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let rechecks = rechecks.ok_or("no Checkout controller runs at this home")?;
+        rechecks.send(recheck).await.map_err(|_| "the Checkout controller has stopped".to_owned())
+    }
+
     /// Checkout launch `launch` is rechecked with its release ruled archived: a release held on
     /// its work is tried again, archiving it and removing it.
     pub async fn archive(&self, launch: &str) -> Result<(), String> {
-        let rechecks = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        let rechecks = rechecks.ok_or("no Checkout controller runs at this home")?;
-        rechecks
-            .send(Recheck { name: launch.to_owned(), ruled_release: true })
-            .await
-            .map_err(|_| "the Checkout controller has stopped".to_owned())
+        self.send(Recheck { name: launch.to_owned(), ruled_release: true }).await
     }
 }
 
@@ -433,6 +440,33 @@ fn unjudged_reason(launch: &str, inspection: &Inspection) -> String {
     let checkout = launched(launch);
     reason.push_str(&format!(
         "\nclean it up and run `flotilla checkout {checkout} recheck`, or rule it archived with `flotilla checkout {checkout} archive`"
+    ));
+    reason
+}
+
+/// Why a checkout's removal was refused though its inspection found nothing to hold it: what the
+/// removal reported, and what the inspection judged of its work and landing.
+fn refused_reason(launch: &str, inspection: Option<&Inspection>, error: &str) -> String {
+    let mut reason = format!("checkout {launch} ended, but its removal failed: {error}");
+    match inspection {
+        Some(inspection) => {
+            let judged = |value: Option<bool>| value.map_or("unknown", |value| if value { "yes" } else { "no" });
+            reason.push_str(&format!(
+                "\nclean: {}, pushed: {}, landed: {}",
+                judged(inspection.clean),
+                judged(inspection.pushed),
+                judged(inspection.landed)
+            ));
+            for detail in inspection.landed_details.iter().filter(|_| inspection.landed != Some(true)) {
+                reason.push_str("\n  ");
+                reason.push_str(detail);
+            }
+        }
+        None => reason.push_str("\nits work could not be inspected"),
+    }
+    let checkout = launched(launch);
+    reason.push_str(&format!(
+        "\nrun `flotilla checkout {checkout} recheck` to try again, or rule it archived with `flotilla checkout {checkout} archive`"
     ));
     reason
 }
@@ -676,14 +710,19 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
                 Ok(())
             }
             Err(error) => {
-                // A landed checkout whose work is not clean is refused its removal: a person is
-                // told, and it waits for its integration to be written again.
-                if let (CheckoutRemoval::LandedWorktree { .. }, Some(inspection), Some(CheckoutHolder::Convoy(convoy))) =
-                    (&removal, judged, &holder)
-                {
-                    if inspection.clean == Some(false) {
-                        self.holds.held(convoy, &self.home, checkout, &held_reason(name, inspection)).await;
-                    }
+                // A convoy's checkout that is not released is never held silently: a person is
+                // told why. A landed checkout whose work is not clean says so; any other refusal
+                // says what the removal reported and what its inspection judged.
+                if let Some(CheckoutHolder::Convoy(convoy)) = &holder {
+                    let reason = match judged {
+                        Some(inspection)
+                            if matches!(removal, CheckoutRemoval::LandedWorktree { .. }) && inspection.clean == Some(false) =>
+                        {
+                            held_reason(name, inspection)
+                        }
+                        _ => refused_reason(name, judged, &error),
+                    };
+                    self.holds.held(convoy, &self.home, checkout, &reason).await;
                 }
                 Err(transient(error))
             }

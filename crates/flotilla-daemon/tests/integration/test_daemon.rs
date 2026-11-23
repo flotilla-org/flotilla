@@ -544,6 +544,49 @@ async fn a_ruling_on_a_held_checkout_releases_the_landed_convoys_vessel() {
     assert!(fleet.counts().environments_destroyed >= 1, "{:?}", fleet.counts());
 }
 
+// A landed convoy whose checkout is clean and pushed, but whose landing cannot be judged and whose
+// plain removal is refused, is not held silently: a person is told what failed, and when they rule
+// it archived the checkout is archived and removed, the convoy retires and its vessel is freed.
+#[tokio::test(start_paused = true)]
+async fn a_landed_convoy_held_by_a_clean_checkout_with_unjudged_landing_tells_a_person_and_retires_once_ruled() {
+    let fleet = TestDaemon::builder()
+        .vcs("unjudged_rate = 1.0\nrefused_removal_rate = 1.0")
+        .settings("host_name = \"unjudged-landing\"\n")
+        .start()
+        .await;
+    let name = fleet.dispatch(CrewMix::LongRunner, DUMMY_FULFILMENT_KIND).await;
+    fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
+    let told = "ended, but its removal failed";
+    let needs_you = |set: &ResultSet| {
+        set.rows.as_convoys().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row.resource.name == name
+                    && row.surface_state == flotilla_protocol::result_set::SurfaceState::NeedsYou
+                    && row.message.as_deref().is_some_and(|message| message.contains(told))
+            })
+        })
+    };
+    fleet.wait_query(QueryId::Convoys { scope: None }, needs_you).await;
+    let checkout = fleet.wait_row("the convoy's checkout, clean and unjudged", "checkout_integration", "", |row| {
+        row.get("landed").is_none_or(serde_json::Value::is_null) && row.get("clean") == Some(&serde_json::Value::Bool(true))
+    });
+    let launch = text(&checkout.await, "resource.name").to_owned();
+    let checkout = flotilla_resources::checkout_records::launched(&launch).to_owned();
+
+    let ruled = fleet.execute(CommandAction::CheckoutArchive { checkout }).await;
+    assert_eq!(ruled, CommandValue::Ok);
+    fleet.wait_reached("Retired", "convoy", "Retired", |row| text(row, "resource.name") == name).await;
+    let held = fleet.rows("checkout", "").await.into_iter().filter(|row| text(row, "state") == "Realised").count();
+    assert_eq!(held, 0, "no checkout is left holding the convoy");
+    let prefix = flotilla_resources::convoy::launch_of(&name);
+    let live = fleet
+        .rows("vessel", "")
+        .await
+        .into_iter()
+        .filter(|row| text(row, "resource.name").starts_with(prefix) && text(row, "state") == "Realised");
+    assert_eq!(live.count(), 0, "its vessel is freed");
+}
+
 // Fleet health counts a capped host's free vessel slots from the vessels the engine holds there:
 // `flotilla fleet check`, `fleet spread` and the plain `flotilla fleet` dashboard all ask it.
 #[tokio::test(start_paused = true)]

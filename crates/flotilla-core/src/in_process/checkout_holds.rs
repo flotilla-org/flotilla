@@ -31,7 +31,9 @@ impl InProcessDaemon {
             CommandAction::CheckoutRecheck { .. } => {
                 let primitives = self.message_primitives();
                 let namespace = self.provisioning_namespace().await;
-                primitives.inspect_checkout(&namespace, &home, launched(&launch)).await
+                primitives.inspect_checkout(&namespace, &home, launched(&launch)).await?;
+                // An unchanged inspection writes nothing the release waits on: try it again.
+                self.checkout_rechecks.recheck(&launch).await
             }
             // The ruling travels in the recheck; nothing here keeps it.
             _ => self.checkout_rechecks.archive(&launch).await,

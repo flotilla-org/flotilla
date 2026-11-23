@@ -87,6 +87,14 @@ pub struct DummyVcsConfig {
     /// forge, unless a merged change request's head holds them.
     #[serde(default, deserialize_with = "deserialize_rate")]
     pub unpushed_rate: f64,
+    /// Probability that a checkout's commits beyond its base cannot be counted, so that its
+    /// landing cannot be judged when no change request names its branch.
+    #[serde(default, deserialize_with = "deserialize_rate")]
+    pub unjudged_rate: f64,
+    /// Probability that a checkout's plain removal is refused though it is clean, as when its
+    /// branch has moved: only forcing it, which archives it, removes it.
+    #[serde(default, deserialize_with = "deserialize_rate")]
+    pub refused_removal_rate: f64,
 }
 
 /// How dummy environments are realised.
