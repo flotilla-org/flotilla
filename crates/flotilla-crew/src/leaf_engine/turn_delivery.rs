@@ -294,6 +294,21 @@ impl LeafSubscriptionTable {
                     .map_err(|error| error.to_string())?;
                 let cr =
                     record.object.status.as_ref().ok_or_else(|| format!("change-request observation `{record_name}` has no status"))?;
+                // A firing judged an earlier observation; deliver only what the current one still
+                // satisfies, or a stale firing records a turn at a revision that never fired (checks
+                // pending). The value is judged as of its observation: freshness is judged by the row
+                // before it fires, not here.
+                let mut current = ChangeRequestLeafSubject {
+                    change_request: &record.object,
+                    now: flotilla_resources::clock::now(),
+                    stale_after: std::time::Duration::MAX,
+                };
+                if let Some(observed_at) = current.observed_at(&leaf.field_path) {
+                    current.now = observed_at;
+                }
+                if evaluate_leaf(leaf, Some(&current), None)?.result != ThreeValue::True {
+                    return Ok(());
+                }
                 let merged_settlement = is_merged_settlement_probe(leaf);
                 // Once the world is terminal, active CI/review probes cannot add
                 // competing reminders beside the explicit settlement delivery.

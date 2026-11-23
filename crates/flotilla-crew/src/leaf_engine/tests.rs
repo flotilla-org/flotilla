@@ -1494,6 +1494,10 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
                     table.fire(row.id, fire).await;
                 }
                 table.deliver_turn(row.id, launch, source, rule, &row.leaves[0]).await.expect("duplicate observation");
+            } else {
+                // A firing left from an earlier observation (a second wake still in flight) reaches
+                // delivery after this one is written, and finds nothing settled to deliver.
+                table.deliver_turn(row.id, launch, source, rule, &row.leaves[0]).await.expect("stale firing");
             }
             let status = convoys.get(launch).await.expect("convoy").status.expect("status");
             let settled = checks.is_some_and(|value| value != ObservedChecks::Pending);
