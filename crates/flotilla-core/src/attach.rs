@@ -1348,8 +1348,7 @@ async fn checked_cleat_endpoint(
         .as_ref()
         .and_then(|status| status.cleat_endpoint.as_ref())
         .ok_or("selected terminal has no recorded Cleat endpoint")?;
-    // The endpoint names the session as cleat holds it (`TerminalRecord::cleat_endpoint`).
-    if recorded.session != flotilla_paths::name_component::encode_name_component(target.session_id)
+    if recorded.session != target.session_id
         || !Path::new(&recorded.runtime_root).is_absolute()
         || recorded.daemon.contains('/')
         || recorded
@@ -1414,9 +1413,9 @@ mod tests {
     use flotilla_config::ConfigStore;
     use flotilla_daemon_api::daemon::DaemonHandle;
 
-    // An engine session id carries its launch's `#`, while cleat lists the session under its encoded
-    // id. The recorded endpoint, the session id and cleat's inventory must still agree, through the
-    // real cleat pool, so a running engine session attaches.
+    // An engine session id carries its launch's `#`, and cleat lists the session under that id as it
+    // is. The recorded endpoint, the session id and cleat's inventory must agree, through the real
+    // cleat pool, so a running engine session attaches.
     #[tokio::test]
     async fn a_running_engine_session_passes_the_cleat_endpoint_check() {
         use flotilla_discovery_api::EnvironmentBag;
@@ -1447,7 +1446,7 @@ mod tests {
             }),
         };
         let session = record.read_view("flotilla", None, None, None);
-        let listed = r#"[{"id":"terminal-convoy-c-work.2312007-coder","cwd":"/workspace","cmd":null,"status":"Detached"}]"#;
+        let listed = r#"[{"id":"terminal-convoy-c-work#12007-coder","cwd":"/workspace","cmd":null,"status":"Detached"}]"#;
         let runner = Arc::new(MockRunner::new(vec![
             Ok(listed.into()),
             Ok("      --strict\n      --take\n".into()),
@@ -1458,7 +1457,7 @@ mod tests {
 
         let endpoint = checked_cleat_endpoint(&pool, &session, AttachMode::Default).await.expect("the running session attaches");
 
-        assert_eq!(endpoint.session, "terminal-convoy-c-work.2312007-coder");
+        assert_eq!(endpoint.session, "terminal-convoy-c-work#12007-coder");
         assert_eq!((endpoint.runtime_root.as_str(), endpoint.daemon.as_str()), ("/var/lib/flotilla/cleat", "default@1"));
     }
 

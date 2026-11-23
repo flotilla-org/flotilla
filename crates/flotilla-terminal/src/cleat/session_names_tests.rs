@@ -16,21 +16,18 @@ use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 /// An engine launch's terminal session name, as `TerminalSessionIdentity::name` spells it.
 const LAUNCH_SESSION: &str = "terminal-convoy-2d327f85c7a64b039d4a2734c7900e86-work#52-coder";
 
-/// Cleat's `validate_runtime_name` (cleat crates/cleat/src/runtime.rs).
+/// Cleat's session-name rule (cleat crates/cleat/src/session_name.rs): any non-empty text
+/// without NUL.
 fn cleat_accepts(name: &str) -> Result<(), String> {
-    if !name.is_empty()
-        && name != "."
-        && name != ".."
-        && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        Ok(())
+    if name.is_empty() || name.contains('\0') {
+        Err(format!("invalid session name: {name:?}"))
     } else {
-        Err(format!("invalid filesystem-safe name: {name}"))
+        Ok(())
     }
 }
 
-/// Process boundary: a cleat that holds sessions by id and refuses, as cleat does, any id that is
-/// not a filesystem-safe name, in every operation that names a session.
+/// Process boundary: a cleat that holds sessions by name and checks, as cleat does, every name an
+/// operation gives it.
 #[derive(Default)]
 struct NameRuleCleat {
     sessions: Mutex<BTreeSet<String>>,
@@ -104,11 +101,10 @@ impl CommandRunner for NameRuleCleat {
     }
 }
 
-// A session named for an engine launch carries `#`, which cleat refuses. The pool names it to
-// cleat by its filesystem-safe encoding in every operation and lists it under its own name.
+// A session named for an engine launch carries `#`. The pool names it to cleat as it is in every
+// operation, and cleat lists it under that name.
 #[tokio::test]
-async fn a_launch_named_session_goes_through_every_operation_under_cleats_name_rule() {
-    assert!(cleat_accepts(LAUNCH_SESSION).is_err(), "the rule refuses the raw name");
+async fn a_launch_named_session_goes_through_every_operation_under_its_own_name() {
     let cleat = Arc::new(NameRuleCleat::default());
     let pool = CleatTerminalPool::new(Arc::clone(&cleat) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
     pool.launch_capability.set(super::LaunchCapability { env_clear: true, argv: true }).expect("known launch capability");
@@ -123,7 +119,7 @@ async fn a_launch_named_session_goes_through_every_operation_under_cleats_name_r
 
     assert!(matches!(pool.session_liveness(LAUNCH_SESSION).await.expect("liveness"), TerminalSessionLiveness::Running));
     let endpoint = pool.cleat_endpoint(LAUNCH_SESSION).await.expect("endpoint").expect("one daemon holds the session");
-    cleat_accepts(&endpoint.session).expect("the endpoint names cleat's id");
+    assert_eq!(endpoint.session, LAUNCH_SESSION, "the endpoint names the session as cleat holds it");
 
     pool.operator_deliver(LAUNCH_SESSION, "hello").await.expect("send");
     pool.type_without_submit(LAUNCH_SESSION, "draft").await.expect("paste");
@@ -134,17 +130,16 @@ async fn a_launch_named_session_goes_through_every_operation_under_cleats_name_r
         .attach_args_for_mode(LAUNCH_SESSION, Some("claude"), &ExecutionEnvironmentPath::new("/repo"), &Vec::new(), AttachMode::Take)
         .expect("attach args");
     let flat = flotilla_protocol::arg::flatten(&attach, 0);
-    let attached = flat.rsplit(' ').next().expect("attach names its session");
-    assert_eq!(attached, endpoint.session, "attach names the session cleat holds: {flat}");
+    // The shell must see the whole name: unquoted, `#` would start a comment.
+    assert!(flat.ends_with(&format!(" '{LAUNCH_SESSION}'")), "attach names the session, quoted: {flat}");
 
     pool.kill_session(LAUNCH_SESSION).await.expect("kill");
     assert!(matches!(pool.session_liveness(LAUNCH_SESSION).await.expect("liveness"), TerminalSessionLiveness::Absent));
     let named = cleat.named.lock().expect("named").clone();
-    assert!(named.len() >= 6 && named.iter().all(|id| *id == endpoint.session), "{named:?}");
+    assert!(named.len() >= 6 && named.iter().all(|id| id == LAUNCH_SESSION), "{named:?}");
 }
 
-// Names that never needed encoding reach cleat as they are, so sessions launched before the
-// encoding keep their ids.
+// A plain name reaches cleat as it is too.
 #[tokio::test]
 async fn a_plain_session_name_is_cleats_id_unchanged() {
     let cleat = Arc::new(NameRuleCleat::default());
