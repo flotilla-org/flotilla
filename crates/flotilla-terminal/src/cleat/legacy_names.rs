@@ -7,7 +7,8 @@
 //!
 //! This is the only place the old spelling is read. A listing reports such a session under its
 //! name ([`LegacyNames::names_listed`]); an operation on that name goes to the id cleat lists it
-//! under ([`LegacyNames::cleat_id`]).
+//! under ([`LegacyNames::cleat_id`]). The pool lists once before its first operation on a name
+//! that could be encoded, so a crew reached first after a restart is still found.
 
 use std::{
     borrow::Cow,
@@ -15,7 +16,7 @@ use std::{
     sync::Mutex,
 };
 
-use flotilla_paths::name_component::decode_name_component;
+use flotilla_paths::name_component::{decode_name_component, encode_name_component};
 
 #[derive(Default)]
 pub(super) struct LegacyNames {
@@ -58,6 +59,11 @@ impl LegacyNames {
             None => Cow::Borrowed(name),
         }
     }
+}
+
+/// Whether a crew named `name` could run under an old encoded id: the encoding changes it.
+pub(super) fn could_be_encoded(name: &str) -> bool {
+    encode_name_component(name) != name
 }
 
 /// The name `id` is the old encoding of, when it encodes anything but itself.

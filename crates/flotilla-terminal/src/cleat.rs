@@ -25,8 +25,10 @@ const RECORDING_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// the session directories cleat lists for it.
 const RECORDING_PRUNE_SCRIPT: &str = r#"pid=$(cat "$1/$2/daemon.pid" 2>/dev/null) || exit 0
 case "$pid" in *[!0-9]*|"") exit 0 ;; esac
+sessions="$1/$2/sessions/"
 shift 2
 for session in "$@"; do
+  case "$session" in "$sessions"*) ;; *) continue ;; esac
   marker="$session/.flotilla-recovered"
   [ -f "$marker" ] && [ ! -L "$marker" ] || continue
   [ -n "$(find "$marker" -prune -mtime +6 -print)" ] || continue
@@ -139,6 +141,8 @@ pub struct CleatTerminalPool {
     endpoint_cache: tokio::sync::Mutex<Option<EndpointCache>>,
     last_recording_prune: tokio::sync::Mutex<Instant>,
     legacy: legacy_names::LegacyNames,
+    /// Set by this pool's first cleat listing, from which `legacy` learns the old ids.
+    legacy_learned: tokio::sync::OnceCell<()>,
 }
 
 struct EndpointCache {
@@ -161,12 +165,33 @@ impl CleatTerminalPool {
             endpoint_cache: tokio::sync::Mutex::new(None),
             last_recording_prune: tokio::sync::Mutex::new(Instant::now()),
             legacy: legacy_names::LegacyNames::default(),
+            legacy_learned: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The id cleat holds `name` under (`legacy_names`). Before this pool's first listing, one
+    /// listing teaches it the old ids, so an operation that reaches a crew first finds it.
+    async fn cleat_id<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
+        if legacy_names::could_be_encoded(name) {
+            let learned = self
+                .legacy_learned
+                .get_or_try_init(|| async {
+                    let output = run!(self.runner, &self.binary, &["list", "--json"], Path::new("/"))?;
+                    self.named(Self::parse_list_output(&output)?);
+                    Ok::<(), String>(())
+                })
+                .await;
+            if let Err(error) = learned {
+                tracing::debug!(session = %name, %error, "cleat listing failed; naming the session as it is");
+            }
+        }
+        self.legacy.cleat_id(name)
     }
 
     /// One cleat listing, each session with the name flotilla knows it by.
     fn named(&self, sessions: Vec<SessionInfo>) -> Vec<(String, SessionInfo)> {
         let names = self.legacy.names_listed(sessions.iter().map(|session| session.id.as_str()));
+        let _ = self.legacy_learned.set(());
         names.into_iter().zip(sessions).collect()
     }
 
@@ -239,7 +264,7 @@ impl CleatTerminalPool {
         if let Some(key) = key {
             args.extend(["--key", key]);
         }
-        let session = self.legacy.cleat_id(session_name);
+        let session = self.cleat_id(session_name).await;
         args.extend(["--", &session, text]);
         let label = flotilla_provider_runtime::command_channel_label(&self.binary, &args);
         // Inspect the raw process result. Runner/spawn errors must never be
@@ -325,6 +350,7 @@ impl CleatTerminalPool {
             AttachMode::Take => args.push(Arg::Literal("--take".into())),
         }
         // A session name is any text (`work#52`, `project:p/role:r`): quote it for the shell.
+        // Attach follows a liveness listing, from which the pool has learned any legacy id.
         args.push(Arg::Quoted(self.legacy.cleat_id(session_name).into_owned()));
         args
     }
@@ -599,12 +625,12 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
-        run!(self.runner, &self.binary, &["kill", &self.legacy.cleat_id(session_name)], Path::new("/"))?;
+        run!(self.runner, &self.binary, &["kill", &self.cleat_id(session_name).await], Path::new("/"))?;
         Ok(())
     }
 
     async fn ensure_recognizer(&self, session: &str, harness: &str) -> Result<(), String> {
-        let session = &*self.legacy.cleat_id(session);
+        let session = &*self.cleat_id(session).await;
         let raw = run!(self.runner, &self.binary, &["inspect", session, "--json"], Path::new("/"))?;
         let inspection: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
         if inspection.pointer("/recognizer/id").and_then(|id| id.as_str()) == Some(harness)
@@ -617,7 +643,7 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn abandoned_draft(&self, session: &str) -> Result<Option<String>, String> {
-        let session = &*self.legacy.cleat_id(session);
+        let session = &*self.cleat_id(session).await;
         let raw = run!(self.runner, &self.binary, &["inspect", session, "--json"], Path::new("/"))?;
         let inspection: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
         // No controller history also means quiet. Cleat rechecks this predicate
@@ -639,7 +665,7 @@ impl TerminalPool for CleatTerminalPool {
     async fn clear_draft(&self, session: &str, draft: &str) -> Result<bool, String> {
         // Bind the value to its option so a draft such as --help stays text.
         let draft = format!("--draft={draft}");
-        let session = self.legacy.cleat_id(session);
+        let session = self.cleat_id(session).await;
         let args = ["clear-composer", &session, &draft, "--controller-idle", "2m"];
         let label = flotilla_provider_runtime::command_channel_label(&self.binary, &args);
         let output = self.runner.run_output(&self.binary, &args, Path::new("/"), &label).await?;
@@ -653,7 +679,7 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn capture_screen(&self, session_name: &str) -> Result<Option<String>, String> {
-        run!(self.runner, &self.binary, &["capture", &self.legacy.cleat_id(session_name)], Path::new("/")).map(Some)
+        run!(self.runner, &self.binary, &["capture", &self.cleat_id(session_name).await], Path::new("/")).map(Some)
     }
 
     async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
@@ -669,7 +695,7 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn operator_deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
-        run!(self.runner, &self.binary, &["send", "--submit", "--", &self.legacy.cleat_id(session_name), text], Path::new("/"))?;
+        run!(self.runner, &self.binary, &["send", "--submit", "--", &self.cleat_id(session_name).await, text], Path::new("/"))?;
         Ok(())
     }
 
@@ -679,7 +705,7 @@ impl TerminalPool for CleatTerminalPool {
         run!(
             self.runner,
             &self.binary,
-            &["send", "--paste", "--controller-idle", "2s", "--", &self.legacy.cleat_id(session_name), text],
+            &["send", "--paste", "--controller-idle", "2s", "--", &self.cleat_id(session_name).await, text],
             Path::new("/")
         )?;
         Ok(())
@@ -807,6 +833,11 @@ mod tests {
                 .set_modified(old)
                 .expect("age marker");
         }
+        // A listed directory outside the generation's sessions is never removed.
+        let outside = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        std::fs::write(outside.join(".flotilla-recovered"), "").expect("outside marker");
+        std::fs::File::open(outside.join(".flotilla-recovered")).expect("open marker").set_modified(old).expect("age marker");
         std::fs::write(daemon.join("daemon.pid"), std::process::id().to_string()).expect("live pid");
         let run = || {
             std::process::Command::new("sh")
@@ -816,6 +847,7 @@ mod tests {
                 .arg(temp.path())
                 .arg("work@2")
                 .args(["expired", "live", "recent"].map(|id| daemon.join("sessions").join(id)))
+                .arg(&outside)
                 .output()
                 .expect("run prune script")
         };
@@ -825,6 +857,7 @@ mod tests {
         assert!(run().status.success());
         assert!(!daemon.join("sessions/expired").exists(), "expired recovered recording is removed");
         assert!(daemon.join("sessions/recent/session.cast").exists(), "recent recording is retained");
+        assert!(outside.exists(), "a directory outside the generation's sessions is never removed");
     }
 
     #[tokio::test]

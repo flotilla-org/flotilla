@@ -202,3 +202,15 @@ async fn an_older_cleat_is_refused_a_name_it_cannot_hold() {
         .await
         .expect("a plain name still launches");
 }
+
+// After a restart the pool has listed nothing yet. Its first operation on a crew under the old
+// encoded id still reaches that id.
+#[tokio::test]
+async fn a_fresh_pool_reaches_a_crew_under_the_old_encoding_without_a_prior_listing() {
+    let cleat = Arc::new(NameRuleCleat::default());
+    cleat.sessions.lock().expect("sessions").insert(ENCODED_LAUNCH_SESSION.to_string());
+    let pool = CleatTerminalPool::new(Arc::clone(&cleat) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
+
+    pool.operator_deliver(LAUNCH_SESSION, "hello").await.expect("send reaches the crew");
+    assert_eq!(cleat.named.lock().expect("named").clone(), [ENCODED_LAUNCH_SESSION]);
+}
