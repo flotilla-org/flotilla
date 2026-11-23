@@ -1302,14 +1302,14 @@ async fn described(router: &Router, table: &str) -> binnacle_described::Describe
 // Behaviour (#4438 acceptance): a binnacle-described client finds what a surface opens from the
 // tables alone. The listing names the session subject table and the facet tables. An agent's
 // running launch is a facet of its session and opens its cleat session at its pool and home; an
-// ended one is unreachable and says why. A session's parent is its convoy; one with no terminal
-// still opens its conversation; and its attach command renders with its address.
+// ended one is unreachable and says why. A session's parent is its convoy, and its attach
+// command renders with its address.
 #[tokio::test]
 async fn a_described_client_finds_subjects_parents_and_facets() {
     use binnacle_described::{Endpoint, Listing, Opening, Relation, Wire};
     use flotilla_schema::Ref;
     use flotilla_state_machines::{
-        machines::agent_session::{AgentSession, AgentSessionRequest, Conversation, MemoryAgentSessionWorld},
+        machines::agent_session::{AgentSession, AgentSessionRequest, MemoryAgentSessionWorld},
         Home,
     };
 
@@ -1337,9 +1337,6 @@ async fn a_described_client_finds_subjects_parents_and_facets() {
             .create(name, AgentSessionRequest::of(convoy.clone(), role), &MemoryAgentSessionWorld::default(), flotilla_schema::Timestamp(1))
             .unwrap();
     }
-    let conversation = Conversation { transport: "local".into(), endpoint: "/run/sdk.sock".into(), thread: Some("t-1".into()) };
-    let sdk = AgentSessionRequest { conversation: Some(conversation), ..AgentSessionRequest::of(convoy.clone(), "runner") };
-    sessions.create("sdk-runner", sdk, &MemoryAgentSessionWorld::default(), flotilla_schema::Timestamp(2)).unwrap();
     let router = HttpRouter::builder()
         .backend(engine_home_backend())
         .table_store(service)
@@ -1382,10 +1379,4 @@ async fn a_described_client_finds_subjects_parents_and_facets() {
     let attach = agents.row_facets(session).into_iter().find(|facet| facet.facet.recipe == "command").expect("attach");
     assert_eq!(attach.opening, Opening::Command(vec!["flotilla".into(), "attach".into(), address]));
     assert!(matches!(&attach.facet.endpoint, Endpoint::Argv(_)));
-    let runner = agents.row_facets(key(&agents, "sdk-runner"));
-    let conversation = runner.iter().find(|facet| facet.facet.recipe == "agent-session").expect("a conversation with no terminal");
-    assert!(conversation.reachable && conversation.of.is_none());
-    let Opening::Endpoint(endpoint) = &conversation.opening else { panic!("an endpoint") };
-    assert_eq!(endpoint.get("endpoint"), Some(&&Wire::Text("/run/sdk.sock".into())));
-    assert_eq!(endpoint.get("thread"), Some(&&Wire::Text("t-1".into())));
 }

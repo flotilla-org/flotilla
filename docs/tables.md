@@ -254,7 +254,6 @@ A surface (Wheelhouse, say) builds its tree, its cards and its opens from the ta
   - Each of the description's `facets` has a `recipe`, a `label`, and either an `endpoint` map, from each recipe field to the table field holding it, or a command `argv`.
   - A row's facet opens the row its `facet-of` key names when that key is set, and otherwise the row's own subject. A terminal launch's `agent_session`, set for an agent's launch and empty for a tool's, makes its `cleat-session` (its `session` id in its `pool` on its `host`) open its agent session.
   - `state` names the field saying whether the facet can be reached, `reachable` its values that mean it can, and `reason` the field saying why not: a terminal launch is reachable while `Realised`, and an ended one gives its `ending`.
-  - An agent session's own row is its `agent-session` conversation (`transport`, `endpoint`, `thread` on its `host`), reachable while `Live`, so an agent with no terminal still opens.
   - A command facet's `argv` is a list of templates: `{field}` is the row's value of that field and `{address}` its subject address; one the row lacks makes the facet unavailable for that row. Convoys and agent sessions attach by `flotilla attach {address}`.
 - **Cards.** A card shows the row's `caption`, its `state` and `since`, and the `badge` fields of its row and of the rows its keys name: a surface follows the keys and chooses which to show (a session's `activity`; a terminal launch's `source_adapter` and `source_model`; its environment's `provider`; a vessel's `host` and `class`).
 

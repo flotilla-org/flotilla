@@ -4,8 +4,8 @@
 use flotilla_schema::{Edge, State, Timestamp};
 use flotilla_state_machines::{
     machines::agent_session::{
-        Activity, ActivityObservation, AgentSession, AgentSessionSpec, AgentSessionState, AgentSessionWorld, Attach, Channel, Conversation,
-        Detach, End, EndReason, MemoryAgentSessionWorld, Observe, Receive,
+        Activity, ActivityObservation, AgentSession, AgentSessionSpec, AgentSessionState, AgentSessionWorld, Attach, Channel, Detach, End,
+        EndReason, MemoryAgentSessionWorld, Observe, Receive,
     },
     Ref, Resource, Transport,
 };
@@ -14,7 +14,7 @@ use hegel::TestCase;
 use super::{
     code_enum,
     engine::{self, resource, Candidate},
-    name, reference, text, timestamp, Fixture, Pick,
+    name, reference, timestamp, Fixture, Pick,
 };
 
 /// Covering indexes span lifecycle, channel/end reason, absent/all four activities and the specs.
@@ -43,17 +43,11 @@ pub fn receive(tc: &TestCase, pick: Pick) -> Receive {
     Receive { message: name(tc), transport: code_enum(tc, pick, &[Transport::Turn, Transport::Notify, Transport::Mute]) }
 }
 
-/// A spec an earlier build wrote (empty), one placed on a vessel in a convoy, and one that also
-/// serves a conversation (#4438).
+/// A spec an earlier build wrote (empty), and one placed on a vessel in a convoy (#4438).
 pub fn spec_value(tc: &TestCase, pick: Pick) -> AgentSessionSpec {
-    let placed = || AgentSessionSpec { convoy: Some(reference(tc)), vessel: Some(reference(tc)), role: Some(name(tc)), conversation: None };
-    match pick.digit(tc, 3, 20) {
+    match pick.digit(tc, 2, 20) {
         0 => AgentSessionSpec::default(),
-        1 => placed(),
-        _ => AgentSessionSpec {
-            conversation: Some(Conversation { transport: name(tc), endpoint: text(tc), thread: Some(name(tc)) }),
-            ..placed()
-        },
+        _ => AgentSessionSpec { convoy: Some(reference(tc)), vessel: Some(reference(tc)), role: Some(name(tc)) },
     }
 }
 

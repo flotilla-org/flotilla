@@ -236,7 +236,7 @@ pub struct Observe {
 
 /// The session's name is its identity (kind code `as`). It works for one role of one convoy,
 /// its parent wherever it is shown (#4438), and may be placed on a vessel, where routing to it
-/// starts. What it is reached through as a conversation, when it can be, is on its own row.
+/// starts.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Stored)]
 #[store(
     kind = "AgentSession",
@@ -256,37 +256,21 @@ pub struct AgentSessionSpec {
     /// build created.
     #[store(intern = "rl")]
     pub role: Option<String>,
-    /// How its conversation is reached, when its producer serves one: an agent with no terminal
-    /// opens through it.
-    #[store(flatten)]
-    pub conversation: Option<Conversation>,
-}
-
-/// Where a session's conversation is served (#4438): the `agent-session` recipe's fields.
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
-pub struct Conversation {
-    /// How a viewer reaches the endpoint from the session's host: `local`, or `ssh`.
-    pub transport: String,
-    /// The producer's endpoint on that host, such as its socket's path.
-    pub endpoint: String,
-    /// The conversation's thread at the endpoint, when it serves several.
-    pub thread: Option<String>,
 }
 
 /// What a session is created with: the convoy it works for, always, the role it acts for, and
-/// the vessel it runs on and its conversation, where it has them.
+/// the vessel it runs on, where it has one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSessionRequest {
     pub convoy: ConvoyId,
     pub role: String,
     pub vessel: Option<flotilla_schema::Ref<Resource<Vessel>>>,
-    pub conversation: Option<Conversation>,
 }
 
 impl AgentSessionRequest {
-    /// A session of `role` in `convoy`, on no vessel and with no conversation.
+    /// A session of `role` in `convoy`, on no vessel.
     pub fn of(convoy: ConvoyId, role: impl Into<String>) -> Self {
-        Self { convoy, role: role.into(), vessel: None, conversation: None }
+        Self { convoy, role: role.into(), vessel: None }
     }
 
     /// The same request, running on `vessel`.
@@ -297,25 +281,11 @@ impl AgentSessionRequest {
 
 impl Machine for AgentSession {
     const NAME: &'static str = "AgentSession";
-    /// Its convoy is its parent; its own row is its conversation, reached through its producer
-    /// on its home and reachable while it is Live.
+    /// Its convoy is its parent.
     const DESCRIBED: &'static [Described] = &[
         Described::Parent { column: "convoy" },
         Described::Role { column: "role", role: "caption" },
         Described::Role { column: "activity", role: "badge" },
-        Described::Facet {
-            recipe: "agent-session",
-            label: "Conversation",
-            endpoint: &[
-                ("host", "resource.home"),
-                ("transport", "conversation_transport"),
-                ("endpoint", "conversation_endpoint"),
-                ("thread", "conversation_thread"),
-            ],
-            state: Some("state"),
-            reachable: &["Live"],
-            reason: Some("reason"),
-        },
     ];
     type Request = AgentSessionRequest;
     type Spec = AgentSessionSpec;
@@ -385,8 +355,8 @@ impl Machine for AgentSession {
         _: &mut Admission<'_, AgentSession>,
         request: AgentSessionRequest,
     ) -> Result<(AgentSessionSpec, AgentSessionState), AgentSessionRefusal> {
-        let AgentSessionRequest { convoy, role, vessel, conversation } = request;
-        Ok((AgentSessionSpec { convoy: Some(convoy), vessel, role: Some(role), conversation }, AgentSessionState::live(Channel::Detached)))
+        let AgentSessionRequest { convoy, role, vessel } = request;
+        Ok((AgentSessionSpec { convoy: Some(convoy), vessel, role: Some(role) }, AgentSessionState::live(Channel::Detached)))
     }
 }
 
