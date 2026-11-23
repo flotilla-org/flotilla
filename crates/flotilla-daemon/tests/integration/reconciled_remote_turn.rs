@@ -171,7 +171,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     let _vessels = flotilla_orchestration_testkit::run_vessels(
         &placement,
         "flotilla",
-        VesselPlanning::new(placement.clone(), "flotilla", placement_daemon.account_records())
+        VesselPlanning::new(placement.clone(), "flotilla", placement_daemon.account_records(), placement_daemon.repository_records())
             .with_lifecycle_reads(placement_daemon.lifecycle_reads())
             .with_federated_dependencies(&placement, flotilla_protocol::CanonicalHostId::resolved("placement-host")),
         Arc::clone(&crate::engine(&placement_daemon).vessels.lifecycles),

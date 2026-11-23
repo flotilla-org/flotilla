@@ -17,7 +17,8 @@ define_resource!(
         "metadata.name",
         "metadata.annotations.\"flotilla.work/verification-command-project\"",
         "spec.catalog_targets.*",
-        FORGE_SERVICE_URL_FIELD
+        FORGE_SERVICE_URL_FIELD,
+        WORKSPACE_SLUGS_FIELD
     ],
     indexed_values = indexed_values
 );
@@ -25,6 +26,16 @@ define_resource!(
 /// The declared field selecting the Repositories on a forge, by the forge's service URL as
 /// [`forge_service_url_key`] writes it.
 pub const FORGE_SERVICE_URL_FIELD: &str = "spec.forge.service_url";
+
+/// The declared field selecting the Repositories that hold a workspace slug in common: the
+/// normalized leaf and catalog slugs [`repository_workspace_slugs`] compares, a virtual
+/// projection of the identity like the catalog targets (no stored column).
+pub const WORKSPACE_SLUGS_FIELD: &str = "spec.workspace_slugs.*";
+
+/// The normalized leaf and catalog slugs workspace slug allocation compares for `spec`.
+pub fn workspace_slugs(spec: &RepositorySpec) -> BTreeSet<String> {
+    BTreeSet::from([normalize_workspace_slug(&spec.leaf_slug()), normalize_workspace_slug(&spec.catalog_slug())])
+}
 
 /// A forge service URL as [`FORGE_SERVICE_URL_FIELD`] holds it: without a trailing slash, so a
 /// Forge's `https_url` and a Repository's service URL meet whichever of them carries one.
@@ -38,6 +49,7 @@ fn indexed_values(spec: &RepositorySpec, path: &str) -> Option<Vec<String>> {
         FORGE_SERVICE_URL_FIELD => {
             Some(spec.forge().map(|forge| forge_service_url_key(&forge.service_url).to_owned()).into_iter().collect())
         }
+        WORKSPACE_SLUGS_FIELD => Some(workspace_slugs(spec).into_iter().collect()),
         _ => None,
     }
 }
@@ -927,5 +939,27 @@ mod prefixed_service_tests {
         assert_eq!(decoded, spec);
         assert_eq!(decoded.forge().expect("forge").repository, "team/repo");
         assert!(decoded.with_remotes([format!("https://lab.example{prefix}/other/repo")]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod slug_component_tests {
+    use super::{repository_workspace_slugs, workspace_slugs, RepositorySpec};
+
+    fn spec(url: &str) -> RepositorySpec {
+        RepositorySpec::remote(url).expect("remote")
+    }
+
+    // Behaviour: repositories whose leaf slugs differ as written but collide once normalized hold
+    // a workspace slug in common, so the index finds each as the other's peer.
+    #[test]
+    fn leaf_slugs_that_collide_only_once_normalized_share_an_indexed_slug() {
+        let (a, b, unrelated) =
+            (spec("https://example.com/x/foo.bar.git"), spec("https://example.com/y/foo_bar.git"), spec("https://example.com/z/other.git"));
+        assert!(!workspace_slugs(&a).is_disjoint(&workspace_slugs(&b)));
+        assert!(workspace_slugs(&a).is_disjoint(&workspace_slugs(&unrelated)));
+        let (ka, kb) = (a.key(), b.key());
+        let slugs = repository_workspace_slugs([(&ka, &a), (&kb, &b)]);
+        assert_ne!(slugs[&ka], slugs[&kb]);
     }
 }

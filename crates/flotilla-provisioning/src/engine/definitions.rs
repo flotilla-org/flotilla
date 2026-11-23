@@ -24,6 +24,7 @@ use flotilla_engine_store::{
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin},
     engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, WriteError},
+    repository::forge_service_url_key,
     ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, Resource,
     WorkflowTemplate,
 };
@@ -201,6 +202,40 @@ struct Records {
 struct Resident {
     follower: Follower,
     records: Records,
+    /// The forges as several homes' declarations resolve, by name, and the name at each service
+    /// URL: kept current as forge entries are followed, so a read never walks the declared set.
+    forges: ForgeView,
+}
+
+/// The resolved forges and the index of their service URLs.
+#[derive(Default)]
+struct ForgeView {
+    resolved: BTreeMap<String, flotilla_resources::ForgeSpec>,
+    by_service_url: BTreeMap<String, String>,
+}
+
+impl ForgeView {
+    /// The view of `held`, as seen from `home`.
+    fn of(held: &Held<Forge>, home: &str) -> Self {
+        let mut names: Vec<&String> = held.keys().map(|(name, _)| name).collect();
+        names.dedup();
+        let resolved: BTreeMap<String, flotilla_resources::ForgeSpec> =
+            names.into_iter().filter_map(|name| resolve(held, home, name).map(|record| (name.clone(), record.spec))).collect();
+        let by_service_url =
+            resolved.iter().map(|(name, spec)| (forge_service_url_key(&spec.https_url).to_owned(), name.clone())).collect();
+        Self { resolved, by_service_url }
+    }
+}
+
+/// The forges that differ from `before`: each declared or changed forge as it now reads, and each
+/// withdrawn forge as it last read.
+fn forges_changed(
+    before: &BTreeMap<String, flotilla_resources::ForgeSpec>,
+    now: &BTreeMap<String, flotilla_resources::ForgeSpec>,
+) -> Vec<flotilla_resources::ForgeSpec> {
+    let mut changed: Vec<_> = now.iter().filter(|(name, spec)| before.get(*name) != Some(spec)).map(|(_, spec)| spec.clone()).collect();
+    changed.extend(before.iter().filter(|(name, _)| !now.contains_key(*name)).map(|(_, spec)| spec.clone()));
+    changed
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -348,13 +383,13 @@ impl EngineDefinitions {
             service,
             home,
             log,
-            resident: Mutex::new(Resident { follower, records: Records::default() }),
+            resident: Mutex::new(Resident { follower, records: Records::default(), forges: ForgeView::default() }),
             clock,
         };
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
-            let Resident { follower, records } = &mut *resident;
+            let Resident { follower, records, forges } = &mut *resident;
             opened
                 .service
                 .with_store(|store| {
@@ -366,6 +401,7 @@ impl EngineDefinitions {
                     Ok(())
                 })
                 .map_err(|error| error.to_string())?;
+            *forges = ForgeView::of(&records.forges, &opened.home);
         }
         Ok(opened)
     }
@@ -378,21 +414,34 @@ impl EngineDefinitions {
         }
         let homes = self.service.homes();
         {
-            let Resident { follower, records } = &mut *resident;
+            let Resident { follower, records, forges } = &mut *resident;
+            let mut forges_followed = false;
             self.service
                 .with_store(|store| {
                     let mut read = store.read()?;
                     for followed in follower.pass(&mut read, &homes)? {
                         match followed {
-                            Followed::Changed(identity) if identity.kind == ROOT => rescan(&mut read, records, &identity.home)?,
-                            Followed::Changed(identity) => reload(&mut read, records, &identity)?,
-                            Followed::Rescan(home) => rescan(&mut read, records, &home)?,
+                            Followed::Changed(identity) if identity.kind == ROOT => {
+                                forges_followed = true;
+                                rescan(&mut read, records, &identity.home)?
+                            }
+                            Followed::Changed(identity) => {
+                                forges_followed |= identity.kind == ForgeDefinition::CODE;
+                                reload(&mut read, records, &identity)?
+                            }
+                            Followed::Rescan(home) => {
+                                forges_followed = true;
+                                rescan(&mut read, records, &home)?
+                            }
                         }
                     }
                     Ok(())
                 })
                 .map_err(|error| error.to_string())
                 .inspect_err(|_| self.commits.give_back())?;
+            if forges_followed {
+                *forges = ForgeView::of(&records.forges, &self.home);
+            }
         }
         Ok(resident)
     }
@@ -579,6 +628,43 @@ impl<R: Defined> KindRecords<R> for EngineDefinitions {
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
         self.changes.subscribe().map_err(|error| error.to_string())
+    }
+}
+
+/// The forge port, over the resident map: a forge is read by its name, or by its service URL.
+#[async_trait::async_trait]
+impl flotilla_resources::forge_records::ForgeRecords for EngineDefinitions {
+    async fn forge(&self, name: &str) -> Result<Option<flotilla_resources::ForgeSpec>, String> {
+        Ok(self.refresh()?.forges.resolved.get(name).cloned())
+    }
+
+    async fn at_service_url(&self, service_url: &str) -> Result<Option<flotilla_resources::ForgeSpec>, String> {
+        let resident = self.refresh()?;
+        let name = resident.forges.by_service_url.get(forge_service_url_key(service_url));
+        Ok(name.and_then(|name| resident.forges.resolved.get(name).cloned()))
+    }
+
+    async fn changes(&self) -> Result<BoxStream<'_, Result<flotilla_resources::ForgeSpec, String>>, String> {
+        use futures::StreamExt;
+        let ticks = self.changes.subscribe().map_err(|error| error.to_string())?;
+        let known = self.refresh()?.forges.resolved.clone();
+        Ok(futures::stream::unfold((ticks, known), move |(mut ticks, mut known)| async move {
+            loop {
+                ticks.next().await?;
+                let now = match self.refresh() {
+                    Ok(resident) => resident.forges.resolved.clone(),
+                    // The commit mark is given back, so the next tick reads again.
+                    Err(error) => return Some((futures::stream::iter(vec![Err(error)]), (ticks, known))),
+                };
+                let changed = forges_changed(&known, &now);
+                known = now;
+                if !changed.is_empty() {
+                    return Some((futures::stream::iter(changed.into_iter().map(Ok).collect::<Vec<_>>()), (ticks, known)));
+                }
+            }
+        })
+        .flatten()
+        .boxed())
     }
 }
 

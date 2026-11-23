@@ -11,7 +11,7 @@
 //!
 //! This module calls no other crew module.
 use chrono::{DateTime, Utc};
-use flotilla_protocol::Subject;
+use flotilla_protocol::{LeafAddress, Subject};
 use flotilla_resources::address::record_name;
 use flotilla_resources::convoy::engine::{deciding, note, Actor, EngineConvoyPath, EngineConvoys};
 use flotilla_resources::convoy::reconcile::*;
@@ -21,7 +21,7 @@ use flotilla_store::{
     controller::{ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
     load_metrics::carry,
     occupancy::host_occupancy,
-    DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, ResourceBackend, TypedResolver,
+    PreparedSnapshotGarbageCollector, ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,7 +35,7 @@ pub struct ConvoyReconciler {
     vessels: Option<ReplicaReadResolver<Vessel>>,
     artifacts: Option<ReplicaReadResolver<Artifact>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
-    forges: Option<DefinitionResolver<Forge>>,
+    forges: Option<Arc<dyn flotilla_resources::forge_records::ForgeRecords>>,
     /// The planners' Host port: a host by name, and its changes.
     hosts: Arc<dyn HostRecords>,
     /// The store and namespace whose live convoys and vessels count a host's vessels against its cap.
@@ -107,7 +107,7 @@ impl ConvoyReconciler {
         self
     }
 
-    pub fn with_forges(mut self, forges: DefinitionResolver<Forge>) -> Self {
+    pub fn with_forges(mut self, forges: Arc<dyn flotilla_resources::forge_records::ForgeRecords>) -> Self {
         self.forges = Some(forges);
         self
     }
@@ -428,7 +428,7 @@ impl ConvoyReconciler {
         if self.change_requests.is_none() {
             return Ok(());
         }
-        let forges = self.forge_specs().await?;
+        let forges = self.forge_specs(obj).await?;
         let names: BTreeSet<String> =
             flotilla_resources::convoy::promises::ended_submissions(status, &forges).iter().filter_map(record_name).collect();
         engine.memory().note_evidence(&obj.metadata.name, ChangeRequest::API_PATHS.kind, names.clone());
@@ -454,12 +454,33 @@ impl ConvoyReconciler {
         Ok(())
     }
 
-    /// The declared forges' specs, or none without a Forge reader.
-    async fn forge_specs(&self) -> Result<Vec<flotilla_resources::ForgeSpec>, ResourceError> {
-        Ok(match &self.forges {
-            Some(forges) => forges.list().await?.into_iter().map(|forge| forge.spec).collect(),
-            None => Vec::new(),
-        })
+    /// The specs of the forges `convoy`'s records name, each read by key: a source's `service` is a
+    /// forge's id or its service URL. None without a Forge reader. A service no forge answers to
+    /// adds none, and an address resolved through it fails as an undeclared forge.
+    async fn forge_specs(&self, convoy: &ResourceObject<Convoy>) -> Result<Vec<flotilla_resources::ForgeSpec>, ResourceError> {
+        let Some(forges) = &self.forges else { return Ok(Vec::new()) };
+        let mut services = BTreeSet::new();
+        services.extend(convoy.spec.declared_subjects().unwrap_or_default().into_iter().map(|declared| declared.subject.source.service));
+        services.extend(convoy.spec.issues.iter().map(|issue| issue.reference.source.service.clone()));
+        if let Some(status) = &convoy.status {
+            services.extend(status.subjects.iter().map(|linked| linked.subject.source.service.clone()));
+            services.extend(status.unlinked_subjects.iter().map(|subject| subject.source.service.clone()));
+            let submissions = status.promises.values().flat_map(BTreeMap::values).flatten().flat_map(|promise| &promise.submissions);
+            for submission in submissions {
+                if let Ok(LeafAddress::ChangeRequest { service, .. } | LeafAddress::Issue { service, .. }) = submission.subject().parse() {
+                    services.insert(service);
+                }
+            }
+        }
+        let mut found = BTreeMap::new();
+        for service in services {
+            for forge in [forges.forge(&service).await, forges.at_service_url(&service).await] {
+                if let Some(forge) = forge.map_err(ResourceError::other)? {
+                    found.insert(forge.forge_id.clone(), forge);
+                }
+            }
+        }
+        Ok(found.into_values().collect())
     }
 
     /// The change requests `names` names, each by its record name: every home's copy of it,
@@ -950,7 +971,7 @@ impl Reconciler for ConvoyReconciler {
         }
 
         let checkouts = self.held_checkouts(obj).await?;
-        let forges = self.forge_specs().await?;
+        let forges = self.forge_specs(obj).await?;
         let is_landing = status.phase == ConvoyPhase::Landing;
         // A checkout's inspection names the change request its branch is associated with; what
         // that request came to is the forge observation's.

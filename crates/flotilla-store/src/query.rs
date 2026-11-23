@@ -564,9 +564,12 @@ pub fn declared_field_values(value: &Value, path: &str) -> Vec<String> {
     let derived = match (value.get("kind").and_then(Value::as_str), path) {
         (Some("Convoy"), "spec.subjects.*.subject") if legacy_subjects() => derived::<flotilla_resources::Convoy>(value, path),
         (Some("Forge"), "spec.remote_hosts.*") => derived::<flotilla_resources::Forge>(value, path),
-        (Some("Repository"), "spec.catalog_targets.*" | flotilla_resources::repository::FORGE_SERVICE_URL_FIELD) => {
-            derived::<flotilla_resources::Repository>(value, path)
-        }
+        (
+            Some("Repository"),
+            "spec.catalog_targets.*"
+            | flotilla_resources::repository::FORGE_SERVICE_URL_FIELD
+            | flotilla_resources::repository::WORKSPACE_SLUGS_FIELD,
+        ) => derived::<flotilla_resources::Repository>(value, path),
         _ => None,
     };
     if let Some(values) = derived {

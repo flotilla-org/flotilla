@@ -718,3 +718,36 @@ async fn an_access_delivery_follows_its_environment_and_goes_when_it_ends() {
         .await;
     daemon.wait_gone::<AccessDelivery>("at-the-place").await;
 }
+
+// #4414: a repository whose leaf slug collides with the convoy's is found by the slug index, so
+// the convoy's shared clone is planned at the qualified slug allocation gives it, not at the bare
+// leaf the repository would have had alone.
+#[tokio::test(start_paused = true)]
+async fn a_shared_clone_is_planned_at_the_slug_its_colliding_repository_leaves_it() {
+    let daemon = TestDaemon::builder().start().await;
+    let convoys = daemon.list::<flotilla_resources::Repository>().await;
+    let own = convoys.into_iter().next().expect("the dummy fleet's repository");
+    let colliding = flotilla_resources::RepositorySpec::remote("https://elsewhere.example/other/fleet.git").expect("remote");
+    daemon.apply::<flotilla_resources::Repository>(&colliding.key().to_string(), colliding.clone()).await;
+    daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let clone = daemon.wait("the crew's clone", |_: &ResourceObject<flotilla_resources::Clone>| true).await;
+    let (own_key, colliding_key) = (own.spec.key(), colliding.key());
+    let slugs = flotilla_resources::repository_workspace_slugs([(&own_key, &own.spec), (&colliding_key, &colliding)]);
+    assert_ne!(slugs[&own_key], "fleet", "the collision qualifies the slug");
+    assert!(clone.spec.path.ends_with(&format!("/{}", slugs[&own_key])), "the clone is at {} not {}", slugs[&own_key], clone.spec.path);
+}
+
+// #4414: a convoy resolves its change request's address through the forge its repository is on,
+// read by host rather than by listing every forge; the dummy forge is declared, so the request is
+// found and the convoy lands on its merge.
+#[tokio::test(start_paused = true)]
+async fn a_convoys_change_request_evidence_finds_its_declared_forge() {
+    let daemon = TestDaemon::builder().change_request("merge_after_ms = 1000").start().await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    daemon
+        .wait("its merged change request", |found: &ResourceObject<ChangeRequest>| {
+            found.status.as_ref().is_some_and(|status| status.state.value == Some(ObservedChangeRequestState::Merged))
+        })
+        .await;
+    daemon.wait("the convoy landed on it", in_phase(&convoy, ConvoyPhase::Landed)).await;
+}

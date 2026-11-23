@@ -76,7 +76,10 @@ pub struct VesselPlanning {
     /// The account kinds' records: a crew whose binding ended waits.
     accounts: Arc<dyn AccountRecords>,
     convoys: TypedResolver<Convoy>,
+    /// The write path: a repository a convoy names that no record yet declares is created here.
     repositories: TypedResolver<Repository>,
+    /// Keyed and indexed reads of the repositories, the engine's: no pass lists the kind.
+    repository_records: Arc<dyn flotilla_resources::repository_records::RepositoryRecords>,
     kinds: TypedResolver<FulfilmentKind>,
     artifacts: ReplicaReadResolver<Artifact>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
@@ -95,13 +98,19 @@ struct EnvironmentDependency {
 }
 
 impl VesselPlanning {
-    pub fn new(backend: ResourceBackend, namespace: &str, accounts: Arc<dyn AccountRecords>) -> Self {
+    pub fn new(
+        backend: ResourceBackend,
+        namespace: &str,
+        accounts: Arc<dyn AccountRecords>,
+        repository_records: Arc<dyn flotilla_resources::repository_records::RepositoryRecords>,
+    ) -> Self {
         Self {
             backend: backend.clone(),
             lifecycle_reads: Arc::new(NoLifecycleReads),
             accounts,
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
+            repository_records,
             kinds: backend.clone().using::<FulfilmentKind>(namespace),
             artifacts: backend.including_replicas::<Artifact>(namespace),
             federated_convoys: None,
@@ -112,6 +121,16 @@ impl VesselPlanning {
             worktree_metadata: None,
             brief_templates: CrewBriefTemplateResolver::default(),
         }
+    }
+
+    /// The repositories other than `repository_key` that could share `spec`'s workspace slug, each
+    /// read from the engine's records.
+    async fn slug_peers(
+        &self,
+        spec: &RepositorySpec,
+    ) -> Result<BTreeMap<flotilla_resources::RepositoryKey, RepositorySpec>, ResourceError> {
+        let peers = self.repository_records.workspace_slug_peers(spec).await.map_err(ResourceError::other)?;
+        Ok(peers.into_iter().map(|record| (record.spec.key(), record.spec)).collect())
     }
 
     /// Why an agent crew must not start yet: its account binding is no longer open.
@@ -200,9 +219,13 @@ impl VesselPlanning {
         backend: ResourceBackend,
         namespace: &str,
         accounts: Arc<dyn AccountRecords>,
+        repository_records: Arc<dyn flotilla_resources::repository_records::RepositoryRecords>,
         config_dir: impl Into<PathBuf>,
     ) -> Self {
-        Self { brief_templates: CrewBriefTemplateResolver::with_config_dir(config_dir), ..Self::new(backend, namespace, accounts) }
+        Self {
+            brief_templates: CrewBriefTemplateResolver::with_config_dir(config_dir),
+            ..Self::new(backend, namespace, accounts, repository_records)
+        }
     }
 
     pub fn with_worktree_metadata(mut self, resolver: Arc<dyn WorktreeMetadataResolver>) -> Self {
@@ -727,13 +750,12 @@ impl VesselPlanning {
         let mut contained_branches = BTreeSet::new();
         let mut waiting_for_checkouts = Vec::new();
         let mut fork_stance = false;
-        // Slug allocation needs the repository catalog only when a shared clone
-        // is missing; read it at most once per prepare, not once per repository.
-        let repository_catalog = tokio::sync::OnceCell::new();
         for convoy_repository in convoy_repositories {
-            let repository_spec = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
-                Ok(repository) => repository.spec,
-                Err(ResourceError::NotFound { .. }) => {
+            let declared =
+                self.repository_records.repository(&convoy_repository.repo_ref.to_string()).await.map_err(ResourceError::other)?;
+            let repository_spec = match declared {
+                Some(repository) => repository.spec,
+                None => {
                     // Convoy URLs are clone transports and may use SCP-like SSH syntax.
                     // Pre-canonicalize them before constructing the identity-bearing spec.
                     let repository_spec = match canonicalize_repo_url(&convoy_repository.url).and_then(RepositorySpec::remote) {
@@ -755,7 +777,6 @@ impl VesselPlanning {
                     }
                     repository_spec
                 }
-                Err(err) => return Err(err),
             };
             if let Err(message) = repository_spec.verify_key(&convoy_repository.repo_ref) {
                 return Ok(VesselPrepared::failed(message));
@@ -778,12 +799,10 @@ impl VesselPlanning {
                         existing.spec.path
                     }
                     None => {
-                        let repository_catalog = repository_catalog.get_or_try_init(|| self.repositories.list()).await?;
-                        let keyed_repositories = repository_catalog
-                            .items
+                        let peers = self.slug_peers(&repository_spec).await?;
+                        let keyed_repositories = peers
                             .iter()
-                            .filter(|candidate| candidate.spec.key() != repository_key)
-                            .map(|candidate| (candidate.spec.key(), &candidate.spec))
+                            .map(|(key, spec)| (key.clone(), spec))
                             .chain(std::iter::once((repository_key.clone(), &repository_spec)))
                             .collect::<Vec<_>>();
                         let clone_directory_slug = repository_workspace_slugs(keyed_repositories.iter().map(|(key, spec)| (key, *spec)))
@@ -1698,6 +1717,10 @@ mod tests {
     };
 
     /// The account records a planner reads: none of these tests binds an account.
+    fn repositories(backend: &ResourceBackend, namespace: &str) -> Arc<dyn flotilla_resources::repository_records::RepositoryRecords> {
+        flotilla_provisioning_testkit::serve_repositories(backend, namespace)
+    }
+
     fn accounts(backend: &ResourceBackend) -> Arc<dyn flotilla_resources::account_access::AccountRecords> {
         Arc::new(flotilla_store_testkit::OldStoreAccounts::new(backend.clone()))
     }
@@ -1747,7 +1770,7 @@ mod tests {
             None,
         );
         let valid = WorktreeMetadata { common_dir: "/clone/.git".into(), admin_dir: "/clone/.git/worktrees/actual".into() };
-        let reconciler = VesselPlanning::new(backend.clone(), namespace, accounts(&backend))
+        let reconciler = VesselPlanning::new(backend.clone(), namespace, accounts(&backend), repositories(&backend, namespace))
             .with_lifecycle_reads(checkouts.reads.clone())
             .with_worktree_metadata(Arc::new(Metadata(Ok(valid.clone()))));
         assert!(reconciler.contained_git_mounts(&[]).await.expect("empty").is_empty());
@@ -1767,12 +1790,13 @@ mod tests {
             Ok(WorktreeMetadata { admin_dir: "/sibling".into(), ..valid.clone() }),
             Ok(WorktreeMetadata { admin_dir: "/clone/.git/worktrees/own/nested".into(), ..valid.clone() }),
         ] {
-            let refusing = VesselPlanning::new(backend.clone(), namespace, accounts(&backend))
+            let refusing = VesselPlanning::new(backend.clone(), namespace, accounts(&backend), repositories(&backend, namespace))
                 .with_lifecycle_reads(checkouts.reads.clone())
                 .with_worktree_metadata(Arc::new(Metadata(metadata)));
             assert!(refusing.contained_git_mounts(std::slice::from_ref(&own)).await.is_err(), "invalid metadata must fail closed");
         }
-        let unavailable = VesselPlanning::new(backend.clone(), namespace, accounts(&backend)).with_lifecycle_reads(checkouts.reads.clone());
+        let unavailable = VesselPlanning::new(backend.clone(), namespace, accounts(&backend), repositories(&backend, namespace))
+            .with_lifecycle_reads(checkouts.reads.clone());
         assert!(
             matches!(unavailable.contained_git_mounts(&[own]).await, Err(ResourceError::Other { .. })),
             "missing resolver must retry without guessing paths or failing the vessel"
@@ -1853,7 +1877,7 @@ mod tests {
             .replace(&kinds.list().await.expect("author kinds"), chrono::Utc::now())
             .await
             .expect("replicate kinds");
-        let reconciler = VesselPlanning::new(driver.clone(), "flotilla", accounts(&driver))
+        let reconciler = VesselPlanning::new(driver.clone(), "flotilla", accounts(&driver), repositories(&driver, "flotilla"))
             .with_federated_dependencies(&driver, flotilla_protocol::CanonicalHostId::resolved("driver-host"));
         for (name, origin) in [("local-vessel", None), ("remote-vessel", Some("convoy-origin"))] {
             let mut meta = InputMeta::builder().name(name.to_string()).build();
@@ -1928,7 +1952,7 @@ mod tests {
             host: "driver-host".into(),
         });
         driver.install_engine_records(Arc::new(flotilla_store::VesselViews::new(driver.clone(), "flotilla", vessels.reads.clone())));
-        let reconciler = VesselPlanning::new(driver.clone(), "flotilla", accounts(&driver))
+        let reconciler = VesselPlanning::new(driver.clone(), "flotilla", accounts(&driver), repositories(&driver, "flotilla"))
             .with_federated_dependencies(&driver, flotilla_protocol::CanonicalHostId::resolved("driver-host"))
             .with_lifecycle_reads(vessels.reads.clone());
         let vessel = driver.using::<Vessel>("flotilla").get(&launch).await.expect("vessel");
@@ -2205,7 +2229,7 @@ mod tests {
     #[test]
     fn missing_host_local_environment_warns_with_store_and_host_context() {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let reconciler = VesselPlanning::new(backend.clone(), "flotilla", accounts(&backend))
+        let reconciler = VesselPlanning::new(backend.clone(), "flotilla", accounts(&backend), repositories(&backend, "flotilla"))
             .with_federated_dependencies(&backend, flotilla_protocol::CanonicalHostId::resolved("feta-host"));
         let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
         let message =
@@ -2230,7 +2254,8 @@ mod tests {
         };
         let fixture = EnvironmentFixture::default();
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let reconciler = VesselPlanning::new(backend.clone(), "flotilla", accounts(&backend)).with_lifecycle_reads(fixture.reads.clone());
+        let reconciler = VesselPlanning::new(backend.clone(), "flotilla", accounts(&backend), repositories(&backend, "flotilla"))
+            .with_lifecycle_reads(fixture.reads.clone());
         let dependency = || reconciler.environment("env").map(|record| super::environment_dependency(&record.expect("held"), &[]));
         fixture.request("env", &spec, None);
         assert!(!dependency().expect("requested").ready);

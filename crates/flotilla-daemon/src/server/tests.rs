@@ -486,6 +486,8 @@ pub(super) async fn daemon_with_decided_store(
                 change_request_branches,
                 source_observers,
                 accounts,
+                forges,
+                repositories,
                 manifest_roots,
                 standing_roles,
                 hosts,
@@ -500,6 +502,8 @@ pub(super) async fn daemon_with_decided_store(
                 change_request_branches,
                 source_observers,
                 accounts,
+                forges,
+                repositories,
                 manifest_roots,
             })
         }) as futures::future::BoxFuture<'static, _>
@@ -1897,8 +1901,13 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     let vessels = flotilla_orchestration_testkit::run_vessels(
         &placed,
         "flotilla",
-        flotilla_crew::reconcilers::vessel::VesselPlanning::new(placed.clone(), "flotilla", remote_daemon.account_records())
-            .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
+        flotilla_crew::reconcilers::vessel::VesselPlanning::new(
+            placed.clone(),
+            "flotilla",
+            remote_daemon.account_records(),
+            remote_daemon.repository_records(),
+        )
+        .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
         Arc::clone(&install_engine(&remote_daemon).vessels.lifecycles),
         remote_daemon.lifecycle_reads(),
         remote_daemon.decided_store(),

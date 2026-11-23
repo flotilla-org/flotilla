@@ -59,6 +59,23 @@ struct ForgeCommands {
 }
 
 impl ForgeCommands {
+    /// `git ls-remote --symref URL HEAD` as Git answers it behind the credential helpers on its
+    /// command line: the helper the daemon's identity for URL's forge installs lets it through,
+    /// and the refusal helper stops it with the reason it wrote.
+    fn ls_remote(args: &[&str]) -> Result<String, String> {
+        let url = args.iter().position(|arg| *arg == "--symref").and_then(|at| args.get(at + 1)).ok_or("ls-remote names no URL")?;
+        let helper = args.iter().rev().filter_map(|arg| arg.strip_prefix("credential.")).find_map(|option| {
+            let (scope, helper) = option.split_once(".helper=")?;
+            (url.starts_with(scope) && !helper.is_empty()).then_some(helper)
+        });
+        match helper {
+            Some(helper) if helper.contains("quit=1") => {
+                Err(format!("could not read Username for `{url}`: the daemon's identity is refused"))
+            }
+            _ => Ok("ref: refs/heads/main\tHEAD\n".into()),
+        }
+    }
+
     fn is_write(cmd: &str, args: &[&str]) -> bool {
         match (cmd, args) {
             ("git", ["push", ..]) => true,
@@ -83,6 +100,7 @@ impl CommandRunner for ForgeCommands {
         match (cmd, args) {
             ("git", ["--version"]) => Ok("git version 2.43.0".into()),
             ("gh", ["--version"]) => Ok("gh version 2.49.0".into()),
+            ("git", args) if args.contains(&"ls-remote") => Self::ls_remote(args),
             ("gh", ["api", "--include", endpoint]) if endpoint.starts_with("repos/acme/app/pulls/") => Ok(format!(
                 "HTTP/2.0 200 OK\n\n{}",
                 serde_json::json!({"number": 7, "title": "Real work", "head": {"ref": "feature"}, "body": "Notes", "state": "open"})
@@ -187,4 +205,52 @@ async fn a_dummy_fleet_daemon_never_writes_to_the_forges_its_stores_name() {
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(outbound.writes(), Vec::<String>::new());
+}
+
+// #4414: a Repository whose forge has no daemon identity cannot learn its default branch; declaring
+// that identity wakes the Repository on its forge.
+#[tokio::test(start_paused = true)]
+async fn declaring_a_forges_daemon_identity_wakes_the_repository_on_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let token = dir.path().join("daemon-token");
+    std::fs::write(&token, format!("{LAB_TOKEN}\n")).expect("token");
+    let fake = Arc::new(FakeForge::new("https://lab.example", Arc::new(SystemClock)));
+    fake.add_forge("lab", ForgeSettings { token: LAB_TOKEN.into(), login: "daemon".into() }).expect("forge");
+    fake.seed_repository(&RepoRef::new("lab", "acme", "app"), "main").expect("repository");
+    let outbound = Arc::new(Outbound::default());
+    let forges = ForgeTransport {
+        http: Arc::new(ForgeHttp { outbound: Arc::clone(&outbound), forge: InProcessClient::new(Arc::clone(&fake)) }),
+        commands: Arc::new(ForgeCommands { outbound }),
+    };
+    let daemon = TestDaemon::builder()
+        .settings("host_name = \"rehearsal\"\n\n[credentials.forgejo]\nlab = \"lab-daemon\"\n")
+        .forges(forges)
+        // No resync within the test, so only the wake can make the Repository look again.
+        .resync(Duration::from_secs(24 * 60 * 60))
+        .start()
+        .await;
+    let lab = ForgeSpec::builder()
+        .forge_id("lab".into())
+        .kind(ForgeKind::Forgejo)
+        .hosts(BTreeSet::from(["lab.example".into()]))
+        .https_url(fake.service_url("lab"))
+        .git_ssh_host("lab.example".into())
+        .build();
+    daemon.apply::<Forge>("lab", lab.clone()).await;
+    let spec = RepositorySpec::remote(format!("{}/acme/app", lab.https_url)).expect("remote").on_forge(&lab).expect("identity");
+    let key = spec.key().to_string();
+    daemon.apply::<Repository>(&key, spec).await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let learned = |repository: &flotilla_resources::ResourceObject<Repository>| {
+        repository.metadata.name == key && repository.status.as_ref().is_some_and(|status| status.default_branch.is_some())
+    };
+    assert!(!learned(&daemon.get::<Repository>(&key).await.expect("repository")), "no identity yet");
+
+    let identity = CredentialSpecSpec::builder()
+        .consumer(CredentialConsumer::Forgejo { forge_ref: "lab".into(), username: "daemon".into() })
+        .source(CredentialSource::File { path: token.to_string_lossy().into_owned() })
+        .lifecycle(CredentialLifecycle::Static)
+        .build();
+    daemon.apply::<CredentialSpec>("lab-daemon", identity).await;
+    daemon.wait("lab's default branch", learned).await;
 }

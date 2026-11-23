@@ -38,7 +38,7 @@ use flotilla_provisioning::checkout_runtime::ChangeRequestObservations;
 use flotilla_provisioning::engine::ProvisioningLifecycles;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
-use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Repository, Resource, ResourceError, Vessel};
+use flotilla_resources::{host_direct_environment_name, Convoy, Repository, Resource, ResourceError, Vessel};
 use flotilla_store::{
     controller::ControllerLoop,
     load_metrics::{attributed, caller, inherit_or, within, Attributed},
@@ -855,13 +855,18 @@ fn spawn_controller_loops(
             let forge_default_branch_resolver = forge_default_branch_resolver.clone();
             // A repository's clones wake it as their launches change.
             let decided = state.daemon.decided_store();
+            let forges = state.daemon.forge_records();
+            let repositories = state.daemon.repository_records();
             move |_: ResourceBackend, _: String| {
                 let forge_default_branch_resolver = forge_default_branch_resolver.clone();
                 let mut reconciler = RepositoryReconciler::new(discovered.clone(), lifecycle_reads.clone());
                 if let Some(resolver) = forge_default_branch_resolver {
                     reconciler = reconciler.with_forge_default_branch_resolver(resolver);
                 }
-                (RepositoryReconciler::secondary_watches(discovered.clone(), decided.clone()), reconciler)
+                (
+                    RepositoryReconciler::secondary_watches(discovered.clone(), decided.clone(), forges.clone(), repositories.clone()),
+                    reconciler,
+                )
             }
         }),
         spawn_convoy_controller(&state, backend.clone(), namespace_string.clone(), supervision.clone(), runtime_health.clone()),
@@ -1230,6 +1235,7 @@ fn vessel_planning(state: &Arc<ControllerRuntimeState>, backend: &ResourceBacken
         backend.clone(),
         namespace,
         state.daemon.account_records(),
+        state.daemon.repository_records(),
         state.config.base_path().as_path().to_path_buf(),
     )
     .with_lifecycle_reads(state.daemon.lifecycle_reads())
@@ -1279,7 +1285,7 @@ fn spawn_convoy_controller(
             )
             .with_occupancy(backend.clone(), &namespace_string)
             .with_vessels(backend.including_replicas::<Vessel>(&namespace_string))
-            .with_forges(backend.definitions::<Forge>(&namespace_string))
+            .with_forges(daemon.forge_records())
             .with_change_requests(
                 backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
                 daemon.change_request_stale_after(),
