@@ -193,7 +193,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/cleat-environment
           key: ${{ steps.cleat-key.outputs.key }}
-      - name: Build pinned old and new cleat
+      - name: Build pinned cleat
         if: steps.filter.outputs.run == 'true' && steps.cleat-binaries.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/flotilla-org/cleat.git "$RUNNER_TEMP/cleat-source"
@@ -201,7 +201,6 @@ jobs:
       - name: Run shared fake and real launch contracts
         if: steps.filter.outputs.run == 'true'
         env:
-          FLOTILLA_TEST_CLEAT_OLD: ${{ runner.temp }}/cleat-environment/old/cleat
           FLOTILLA_TEST_CLEAT_NEW: ${{ runner.temp }}/cleat-environment/new/cleat
         run: |
           # Record the runner CPU: the contract binaries are cached across runners.

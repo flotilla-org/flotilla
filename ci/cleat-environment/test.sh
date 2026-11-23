@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Run the same provisioned checks locally and from the operator-owned workflow.
 set -euo pipefail
-: "${FLOTILLA_TEST_CLEAT_OLD:?select the pinned old cleat}"
-: "${FLOTILLA_TEST_CLEAT_NEW:?select the pinned new cleat}"
+: "${FLOTILLA_TEST_CLEAT_NEW:?select the pinned cleat}"
 unset TMPDIR
 ci/toolchain/assert.sh
 cargo clippy -p flotilla-terminal --all-targets --locked --features cleat-environment-contract -- -D warnings

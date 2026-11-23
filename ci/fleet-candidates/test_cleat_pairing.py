@@ -14,7 +14,7 @@ OLDER = "a" * 40
 def flotilla_root(directory):
     revisions = Path(directory) / cleat_pairing.REVISIONS
     revisions.parent.mkdir(parents=True)
-    revisions.write_text(f"CLEAT_OLD_REVISION={OLDER}\nCLEAT_NEW_REVISION={DECLARED}\n")
+    revisions.write_text(f"CLEAT_NEW_REVISION={DECLARED}\n")
     return directory
 
 

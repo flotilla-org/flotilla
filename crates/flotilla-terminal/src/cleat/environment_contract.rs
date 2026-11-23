@@ -41,7 +41,9 @@ impl Harness {
         if real {
             #[cfg(feature = "cleat-environment-contract")]
             {
-                let variable = if supports_clear { "FLOTILLA_TEST_CLEAT_NEW" } else { "FLOTILLA_TEST_CLEAT_OLD" };
+                // Flotilla pairs only with the cleat it pins (#4374); the old/additive cleat is the fake's alone.
+                assert!(supports_clear, "the real contract runs the pinned cleat");
+                let variable = "FLOTILLA_TEST_CLEAT_NEW";
                 let binary =
                     std::env::var(variable).unwrap_or_else(|_| panic!("{variable} must select a pinned binary; see ci/cleat-environment"));
                 assert!(Path::new(&binary).is_absolute(), "binary must be absolute");
@@ -59,13 +61,14 @@ impl Harness {
                 let version = harness.raw(&["version", "--json"]).await.expect("real version");
                 let version: serde_json::Value = serde_json::from_str(&version).expect("version JSON");
                 let pins = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../ci/cleat-environment/revisions.sh"));
-                let prefix = if supports_clear { "CLEAT_NEW_REVISION=" } else { "CLEAT_OLD_REVISION=" };
-                let revision = pins.lines().find_map(|line| line.strip_prefix(prefix)).expect("revision pin");
+                let revision = pins.lines().find_map(|line| line.strip_prefix("CLEAT_NEW_REVISION=")).expect("revision pin");
                 assert_eq!(version["client"]["git_sha"].as_str(), Some(revision), "wrong binary source revision");
                 let help = harness.raw(&["launch", "--help"]).await.expect("real help");
                 assert_eq!(help.split_whitespace().any(|word| word == "--env-clear"), supports_clear, "wrong cleat revision");
                 // #4173: the argv probe reads clap's usage line; the new pin must render it.
                 assert_eq!(super::super::LaunchCapability::from_help(&help).argv, supports_clear, "argv launch probe");
+                // #4374: the session-name probe reads the ID argument's help; the pin must render it.
+                assert!(super::super::LaunchCapability::from_help(&help).any_name, "session-name launch probe");
                 if matches!(scenario, Scenario::PollutedDaemon) {
                     // Inventory does not start an idle daemon in real Cleat. Seed a
                     // live daemon with an additive launch before the controlled client.
@@ -314,6 +317,15 @@ macro_rules! launch_cases {
             }
         )*
     };
+    (new_only $real:expr) => {
+        launch_cases!($real;
+            new_host_baseline: true, HostBaseline;
+            new_vessel: true, Vessel;
+            new_empty_vessel: true, EmptyVessel;
+            new_polluted_daemon: true, PollutedDaemon;
+            new_managed_refusal: true, ManagedRefusal;
+        );
+    };
     ($real:expr) => {
         launch_cases!($real;
             old_host_baseline: false, HostBaseline;
@@ -338,7 +350,7 @@ mod fake_launch_environment_contract {
 #[cfg(feature = "cleat-environment-contract")]
 mod real_launch_environment_contract {
     use super::*;
-    launch_cases!(true);
+    launch_cases!(new_only true);
 
     #[tokio::test]
     async fn new_declared_session_runs_without_a_login_profile() {
@@ -351,9 +363,9 @@ mod real_launch_environment_contract {
     }
 }
 
-// An engine launch's session name carries `#`, which cleat refuses as an id. Through the pinned
-// cleat, the pool launches, finds, sends to, captures and kills it by its encoded id, and lists
-// it under its own name.
+// An engine launch's session name carries `#`. Through the pinned cleat, the pool launches, finds,
+// sends to, captures and kills the session under that name, and cleat lists it so, with the
+// directory it keeps the session in.
 #[cfg(feature = "cleat-environment-contract")]
 async fn launch_named_session_contract() {
     const NAME: &str = "terminal-convoy-2d327f85c7a64b039d4a2734c7900e86-work#52-coder";
@@ -366,18 +378,20 @@ async fn launch_named_session_contract() {
         .with(EnvironmentAssertion::env_var("CLEAT_RUNTIME_DIR", &runtime))
         .with(EnvironmentAssertion::env_var("CLEAT_DAEMON", "contract"));
     let pool = CleatTerminalPool::new(harness.runner.clone(), &harness.binary, &bag);
-    let raw = harness.raw(&["launch", "--json", NAME, "--cmd", "unused"]).await.expect_err("cleat refuses the raw name");
-    assert!(raw.contains("invalid filesystem-safe name"), "{raw}");
-
     pool.ensure_session(NAME, "unused-by-first-exec-probe", &ExecutionEnvironmentPath::new("/"), &Vec::new(), &[])
         .await
-        .expect("launch under the encoded id");
+        .expect("launch under its name");
     harness.child().await;
+    let raw = harness.raw(&["list", "--json"]).await.expect("cleat list");
+    let raw: serde_json::Value = serde_json::from_str(&raw).expect("list JSON");
+    assert_eq!(raw[0]["id"].as_str(), Some(NAME), "{raw}");
+    let directory = raw[0]["directory"].as_str().map(Path::new).expect("cleat lists the session's directory");
+    assert!(directory.is_absolute() && directory.starts_with(harness.root.path()) && directory.is_dir(), "{raw}");
     let listed = pool.list_sessions().await.expect("list");
     assert_eq!(listed.iter().map(|session| session.session_name.as_str()).collect::<Vec<_>>(), [NAME]);
     assert!(matches!(pool.session_liveness(NAME).await.expect("liveness"), TerminalSessionLiveness::Running));
     let endpoint = pool.cleat_endpoint(NAME).await.expect("endpoint").expect("one daemon holds the session");
-    assert_ne!(endpoint.session, NAME);
+    assert_eq!(endpoint.session, NAME);
     pool.operator_deliver(NAME, "hello").await.expect("send");
     pool.capture_screen(NAME).await.expect("capture");
     pool.kill_session(NAME).await.expect("kill");

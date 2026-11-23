@@ -107,7 +107,7 @@ impl CommandRunner for NameRuleCleat {
 async fn a_launch_named_session_goes_through_every_operation_under_its_own_name() {
     let cleat = Arc::new(NameRuleCleat::default());
     let pool = CleatTerminalPool::new(Arc::clone(&cleat) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
-    pool.launch_capability.set(super::LaunchCapability { env_clear: true, argv: true }).expect("known launch capability");
+    pool.launch_capability.set(super::LaunchCapability { env_clear: true, argv: true, any_name: true }).expect("known launch capability");
     pool.send_key_capability.set(false).expect("known send capability");
 
     pool.ensure_session(LAUNCH_SESSION, "claude", &ExecutionEnvironmentPath::new("/repo"), &Vec::new(), &[]).await.expect("launch");
@@ -144,9 +144,61 @@ async fn a_launch_named_session_goes_through_every_operation_under_its_own_name(
 async fn a_plain_session_name_is_cleats_id_unchanged() {
     let cleat = Arc::new(NameRuleCleat::default());
     let pool = CleatTerminalPool::new(Arc::clone(&cleat) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
-    pool.launch_capability.set(super::LaunchCapability { env_clear: true, argv: true }).expect("known launch capability");
+    pool.launch_capability.set(super::LaunchCapability { env_clear: true, argv: true, any_name: true }).expect("known launch capability");
     pool.ensure_session("terminal-conv-implement-coder", "claude", &ExecutionEnvironmentPath::new("/repo"), &Vec::new(), &[])
         .await
         .expect("launch");
     assert_eq!(cleat.sessions.lock().expect("sessions").iter().collect::<Vec<_>>(), ["terminal-conv-implement-coder"]);
+}
+
+/// `LAUNCH_SESSION` as flotilla named it to cleat before #4374.
+const ENCODED_LAUNCH_SESSION: &str = "terminal-convoy-2d327f85c7a64b039d4a2734c7900e86-work.2352-coder";
+
+// A crew launched before #4374 runs under the old encoded id. Until it relaunches, the pool lists
+// it under its name, does not launch a second one, and reaches it by the id cleat holds.
+#[tokio::test]
+async fn a_crew_launched_under_the_old_encoding_is_found_until_it_relaunches() {
+    let cleat = Arc::new(NameRuleCleat::default());
+    cleat.sessions.lock().expect("sessions").insert(ENCODED_LAUNCH_SESSION.to_string());
+    let pool = CleatTerminalPool::new(Arc::clone(&cleat) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
+    pool.launch_capability.set(super::LaunchCapability { env_clear: true, argv: true, any_name: true }).expect("known launch capability");
+    pool.send_key_capability.set(false).expect("known send capability");
+
+    let listed = pool.list_sessions().await.expect("list");
+    assert_eq!(listed.iter().map(|session| session.session_name.as_str()).collect::<Vec<_>>(), [LAUNCH_SESSION]);
+    pool.ensure_session(LAUNCH_SESSION, "claude", &ExecutionEnvironmentPath::new("/repo"), &Vec::new(), &[]).await.expect("ensure");
+    assert_eq!(cleat.sessions.lock().expect("sessions").len(), 1, "no second crew");
+    assert!(matches!(pool.session_liveness(LAUNCH_SESSION).await.expect("liveness"), TerminalSessionLiveness::Running));
+    let endpoint = pool.cleat_endpoint(LAUNCH_SESSION).await.expect("endpoint").expect("one daemon holds the session");
+    assert_eq!(endpoint.session, ENCODED_LAUNCH_SESSION, "a direct attach names the id cleat holds");
+
+    pool.operator_deliver(LAUNCH_SESSION, "hello").await.expect("send");
+    assert_eq!(pool.capture_screen(LAUNCH_SESSION).await.expect("capture").as_deref(), Some("screen"));
+    let attach = pool
+        .attach_args_for_mode(LAUNCH_SESSION, Some("claude"), &ExecutionEnvironmentPath::new("/repo"), &Vec::new(), AttachMode::Take)
+        .expect("attach args");
+    let flat = flotilla_protocol::arg::flatten(&attach, 0);
+    assert!(flat.ends_with(&format!(" '{ENCODED_LAUNCH_SESSION}'")), "attach names the id cleat holds: {flat}");
+    pool.kill_session(LAUNCH_SESSION).await.expect("kill");
+    assert!(cleat.sessions.lock().expect("sessions").is_empty());
+}
+
+// A cleat older than #4374 takes only `[A-Za-z0-9._-]`. The pool refuses to launch a name it
+// cannot hold, saying to upgrade, rather than renaming the session for it.
+#[tokio::test]
+async fn an_older_cleat_is_refused_a_name_it_cannot_hold() {
+    let cleat = Arc::new(NameRuleCleat::default());
+    let pool = CleatTerminalPool::new(Arc::clone(&cleat) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
+    pool.launch_capability.set(super::LaunchCapability { env_clear: true, argv: true, any_name: false }).expect("known launch capability");
+
+    let refused = pool
+        .ensure_session(LAUNCH_SESSION, "claude", &ExecutionEnvironmentPath::new("/repo"), &Vec::new(), &[])
+        .await
+        .expect_err("an older cleat cannot hold the name");
+    assert!(refused.contains("upgrade cleat"), "{refused}");
+    assert!(cleat.sessions.lock().expect("sessions").is_empty());
+
+    pool.ensure_session("terminal-conv-implement-coder", "claude", &ExecutionEnvironmentPath::new("/repo"), &Vec::new(), &[])
+        .await
+        .expect("a plain name still launches");
 }

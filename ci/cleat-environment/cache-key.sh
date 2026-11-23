@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Both source revisions pin their own Rust/Zig/Ghostty inputs; include the
+# The source revision pins its own Rust/Zig/Ghostty inputs; include the
 # preparation scripts too, since they can override those source pins.
 # This cache is for the Linux cleat job; sha256sum is supplied by its runner.
 # Local runs without ImageOS/ImageVersion use a distinct fallback identity.

@@ -1372,7 +1372,9 @@ async fn checked_cleat_endpoint(
         seat,
     )?;
     let current = pool.cleat_endpoint(target.session_id).await?.ok_or("selected terminal has no unique live Cleat endpoint")?;
-    if current != *recorded {
+    // The pool found `current` by the session id, so it names the session as cleat holds it (an
+    // older crew's encoded id, until it relaunches). The physical daemon must be the recorded one.
+    if (&current.runtime_root, &current.daemon) != (&recorded.runtime_root, &recorded.daemon) {
         return Err("selected terminal Cleat endpoint/generation no longer matches current inventory".into());
     }
     Ok(current)
