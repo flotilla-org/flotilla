@@ -1265,15 +1265,12 @@ fn spawn_convoy_controller(
                 daemon.host_records(),
                 daemon.convoy_engine_path(),
                 daemon.crew_message_path(),
-                daemon.lifecycle_reads(),
             );
             secondaries.push(daemon.reconciler_wake_watch());
             secondaries.push(daemon.convoy_wake_watch());
             // A convoy's checkouts are the engine's: their changes wake the convoy holding them.
             let service = daemon.decided_store();
-            secondaries.push(Box::new(flotilla_provisioning::engine::checkouts::CheckoutConvoyWake::new(Arc::clone(&service))));
-            // A convoy reads its vessels' phases from the engine, so their records wake it.
-            secondaries.push(Box::new(flotilla_provisioning::engine::vessel::VesselConvoyWake::new(service)));
+            secondaries.push(Box::new(flotilla_provisioning::engine::checkouts::CheckoutConvoyWake::new(service)));
             let reconciler = ConvoyReconciler::new(
                 daemon.lifecycle_reads(),
                 daemon.host_records(),
@@ -1293,13 +1290,17 @@ fn spawn_convoy_controller(
             let convoys =
                 backend.clone().using::<Convoy>(&namespace_string).with_lifecycle_status_reads(Arc::clone(&lifecycle_status_reads));
             let home = Arc::clone(daemon.engine_convoys());
-            let policy = convoy_controller::ConvoyPolicy::new(reconciler, convoys, Arc::clone(&home));
+            let policy = convoy_controller::ConvoyPolicy::new(reconciler, convoys, Arc::clone(&home), daemon.lifecycle_reads())
+                .map_err(ResourceError::other);
             let wakes = convoy_controller::wakes(secondaries, backend.clone(), namespace_string.clone(), Arc::clone(&reads));
             let (clock, service) = (daemon.clock_for_scenarios(), daemon.decided_store());
             attributed(Arc::clone(&reads), async move {
+                let policy = policy?;
                 let code =
                     <flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy> as flotilla_schema::Kind>::CODE;
-                let runner = Runner::start(code, home.home().to_owned(), [], clock, service)
+                // A convoy reads its vessels' phases and its sessions' launches from the engine, so
+                // their commits in the same log pass it (`ConvoyPolicy::touches`).
+                let runner = Runner::start(code, home.home().to_owned(), policy.followed(), clock, service)
                     .map_err(|error| ResourceError::other(error.to_string()))?;
                 runner.run(policy, wakes).await.map_err(|error| ResourceError::other(error.to_string()))
             })

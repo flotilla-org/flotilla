@@ -6,8 +6,11 @@
 //! - at the start, and at a rescan of this home's log or a wake asking for every convoy: each
 //!   open launch homed here, read from the Convoy home's memory;
 //! - at a commit of its own record here;
-//! - when a wake names it: its vessels', checkouts' and sessions' changes, the evidence its
-//!   promises are observed from, the capacity it waits on, an operator's reconcile-now;
+//! - at a commit, followed in the same log, of one of its vessels' launches or of a session
+//!   launch held for one of its crews ([`Policy::touches`]); every open launch here when another
+//!   home's records are read afresh;
+//! - when a wake names it: its checkouts' changes, the evidence its promises are observed from,
+//!   the capacity it waits on, an operator's reconcile-now;
 //! - at the time its last pass asked to look again, and after a failed pass at a backoff that
 //!   doubles from a second to a minute.
 //!
@@ -27,11 +30,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_crew::convoy::ConvoyReconciler;
+use flotilla_crew::convoy::{session_launch_convoy, ConvoyReconciler};
 use flotilla_engine_convoys::convoys::Convoys;
+use flotilla_engine_store::follow::Followed;
 use flotilla_provisioning::engine::controller::{homed_here, Policy, Runner, Trigger};
-use flotilla_resources::{Convoy, ResourceError};
-use flotilla_schema::{Identity, Timestamp};
+use flotilla_resources::{lifecycle_reads::LifecycleReads, Convoy, ResourceError};
+use flotilla_schema::{Identity, KindCode, Timestamp};
 use flotilla_store::load_metrics::{attributed, CallerReads};
 use flotilla_store::{
     controller::{Reconciler, SecondaryWatch, WorkQueueSender},
@@ -59,6 +63,11 @@ pub(super) struct ConvoyPolicy {
     reconciler: Arc<ConvoyReconciler>,
     convoys: TypedResolver<Convoy>,
     home: Arc<Convoys>,
+    /// What a followed session or vessel launch is read through.
+    reads: Arc<dyn LifecycleReads>,
+    /// The session launches' and vessel launches' kinds, followed beside the convoys.
+    terminals: Vec<KindCode>,
+    vessels: Vec<KindCode>,
     /// Each convoy's failed passes in a row.
     failures: BTreeMap<String, u32>,
     /// The convoys woken while a pass of them ran: passed once more when it ends.
@@ -72,17 +81,41 @@ pub(super) struct ConvoyPolicy {
 }
 
 impl ConvoyPolicy {
-    pub(super) fn new(reconciler: ConvoyReconciler, convoys: TypedResolver<Convoy>, home: Arc<Convoys>) -> Self {
-        Self {
+    pub(super) fn new(
+        reconciler: ConvoyReconciler,
+        convoys: TypedResolver<Convoy>,
+        home: Arc<Convoys>,
+        reads: Arc<dyn LifecycleReads>,
+    ) -> Result<Self, String> {
+        let (terminals, vessels) = (reads.terminals()?.codes(), reads.vessels()?.codes());
+        Ok(Self {
             reconciler: Arc::new(reconciler),
             convoys,
             home,
+            reads,
+            terminals,
+            vessels,
             failures: BTreeMap::new(),
             again: BTreeSet::new(),
             waiting: BTreeSet::new(),
             running: 0,
             causes: BTreeMap::new(),
+        })
+    }
+
+    /// The kinds the runner follows beside the convoys.
+    pub(super) fn followed(&self) -> Vec<KindCode> {
+        self.terminals.iter().chain(&self.vessels).copied().collect()
+    }
+
+    /// The convoy homed here that changed launch `identity`, a session's or a vessel's, is held for.
+    fn holder(&self, identity: &Identity) -> Result<Option<String>, String> {
+        let here = self.home.home();
+        if self.terminals.contains(&identity.kind) {
+            return session_launch_convoy(self.reads.as_ref(), &identity.name, &identity.home, here);
         }
+        let vessel = self.reads.vessels()?.get(&identity.name, Some(&identity.home))?;
+        Ok(vessel.filter(|record| record.convoy_home == here).map(|record| record.convoy))
     }
 
     fn pass(&mut self, runner: &mut Runner<Pass>, name: &str) {
@@ -184,6 +217,25 @@ impl Policy for ConvoyPolicy {
 
     fn own(&self, identity: &Identity, home: &str) -> Option<String> {
         homed_here(identity, home)
+    }
+
+    fn touches(&self, followed: &Followed) -> Vec<String> {
+        match followed {
+            Followed::Changed(identity) if self.terminals.contains(&identity.kind) || self.vessels.contains(&identity.kind) => {
+                match self.holder(identity) {
+                    Ok(convoy) => convoy.into_iter().collect(),
+                    Err(error) => {
+                        warn!(launch = %identity.name, %error, "a changed launch's convoy could not be read; every convoy is passed");
+                        self.home.open_launches()
+                    }
+                }
+            }
+            Followed::Changed(_) => Vec::new(),
+            // Another home's sessions and vessels were read afresh, unseen one by one; this
+            // home's rescan already passes every open launch.
+            Followed::Rescan(home) if home != self.home.home() => self.home.open_launches(),
+            Followed::Rescan(_) => Vec::new(),
+        }
     }
 
     async fn evaluate(&mut self, runner: &mut Runner<Pass>, touched: BTreeMap<String, Trigger>) {
