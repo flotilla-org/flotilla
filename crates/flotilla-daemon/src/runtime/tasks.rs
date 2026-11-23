@@ -978,10 +978,15 @@ pub(super) fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, names
             // vessels and sessions do moves no queue.
             match reads.convoys() {
                 Ok(convoys) => watches.push(
+                    // A lagged follower missed changes but not the next pass, which reads every queue;
+                    // only a closed log ends the follow.
                     futures::stream::unfold(convoys.changes(), |mut changes| async move {
-                        let event =
-                            changes.recv().await.map(|_| false).map_err(|error| ResourceError::other(format!("convoy changes: {error}")));
-                        Some((event, changes))
+                        match changes.recv().await {
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((Ok(false), changes)),
+                            Err(error @ tokio::sync::broadcast::error::RecvError::Closed) => {
+                                Some((Err(ResourceError::other(format!("convoy changes: {error}"))), changes))
+                            }
+                        }
                     })
                     .boxed(),
                 ),
