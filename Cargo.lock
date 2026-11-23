@@ -3737,6 +3737,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-cbor",
+ "flotilla-paths",
  "flotilla-protocol",
  "flotilla-schema",
  "futures",

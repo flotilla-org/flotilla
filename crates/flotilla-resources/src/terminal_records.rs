@@ -24,6 +24,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use flotilla_paths::name_component::encode_name_component;
 use flotilla_protocol::{result_set::CleatEndpoint, LifecycleReading};
 
 pub use crate::clone_records::launched;
@@ -151,11 +152,13 @@ impl TerminalRecord {
         matches!(&self.reading, LifecycleReading::Lost { reason: Some(reason) } if reason.starts_with(PROCESS_EXITED))
     }
 
-    /// The cleat endpoint a direct attach connects to, while it runs in a cleat pool.
+    /// The cleat endpoint a direct attach connects to, while it runs in a cleat pool. Its session is
+    /// the id cleat holds it under, which the cleat pool encodes from the session id: attach compares
+    /// it with cleat's inventory, and a direct attach passes it to `cleat attach` as it is.
     pub fn cleat_endpoint(&self) -> Option<CleatEndpoint> {
         let session = self.session_id()?;
         let (runtime_root, daemon) = self.facts.as_ref()?.endpoint.clone()?;
-        Some(CleatEndpoint { runtime_root, daemon, session: session.to_owned() })
+        Some(CleatEndpoint { runtime_root, daemon, session: encode_name_component(session) })
     }
 
     /// The harness its launch resolved to.
@@ -578,6 +581,22 @@ mod tests {
             reading: LifecycleReading::InProgress,
             facts: None,
         }
+    }
+
+    // An engine session id carries its vessel launch's `#`, which a cleat id never holds. The endpoint
+    // names the session by the id cleat lists it under, or attach finds no match in the inventory.
+    #[test]
+    fn the_cleat_endpoint_names_the_session_as_cleat_does() {
+        let mut running = record("terminal-convoy-c-work#12007-coder#12060", "a");
+        running.reading = LifecycleReading::Ready { identity: "terminal-convoy-c-work#12007-coder".into() };
+        running.facts = Some(TerminalLaunchFacts {
+            endpoint: Some(("/var/lib/flotilla/cleat".into(), "default@1".into())),
+            agent: None,
+            build_jobs: None,
+        });
+        let endpoint = running.cleat_endpoint().expect("a running cleat launch has an endpoint");
+        assert_eq!(endpoint.session, "terminal-convoy-c-work.2312007-coder");
+        assert_eq!((endpoint.runtime_root.as_str(), endpoint.daemon.as_str()), ("/var/lib/flotilla/cleat", "default@1"));
     }
 
     #[test]
