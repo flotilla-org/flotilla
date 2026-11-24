@@ -14,31 +14,34 @@ use super::{
     environment::ControlledTerminalEnvironment, ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness,
     TerminalSessionTag, TerminalSize, TerminalSubmission,
 };
-use flotilla_paths::{
-    name_component::{decode_name_component, encode_name_component},
-    path_context::ExecutionEnvironmentPath,
-};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 
 const ENDPOINT_CACHE_TTL: Duration = Duration::from_secs(1);
 const RECORDING_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
-const RECORDING_PRUNE_SCRIPT: &str = r#"[ -d "$1/$2/sessions" ] || exit 0
-pid=$(cat "$1/$2/daemon.pid" 2>/dev/null) || exit 0
+/// `$1`/`$2` name the dead daemon generation, whose registered PID must still be dead; the rest are
+/// the session directories cleat lists for it.
+const RECORDING_PRUNE_SCRIPT: &str = r#"pid=$(cat "$1/$2/daemon.pid" 2>/dev/null) || exit 0
 case "$pid" in *[!0-9]*|"") exit 0 ;; esac
-for marker in "$1/$2/sessions/"*/.flotilla-recovered; do
+sessions="$1/$2/sessions/"
+shift 2
+for session in "$@"; do
+  case "$session" in "$sessions"*) ;; *) continue ;; esac
+  marker="$session/.flotilla-recovered"
   [ -f "$marker" ] && [ ! -L "$marker" ] || continue
   [ -n "$(find "$marker" -prune -mtime +6 -print)" ] || continue
   # Cleat and its runner share a PID namespace. PID reuse and EPERM both
   # conservatively retain the recording.
   if signal_error=$(kill -0 "$pid" 2>&1); then continue; fi
   case "$signal_error" in *[Pp]ermiss*|*permitted*) continue ;; esac
-  session=${marker%/.flotilla-recovered}
   rm -rf -- "$session"
 done"#;
-const RECORDING_RETAIN_SCRIPT: &str = r#"session="$1/$2/sessions/$3"
-if [ -f "$session/session.cast" ]; then touch "$session/.flotilla-recovered"; fi"#;
+/// Each argument is a session directory cleat lists.
+const RECORDING_RETAIN_SCRIPT: &str = r#"for session in "$@"; do
+  if [ -f "$session/session.cast" ]; then touch "$session/.flotilla-recovered"; fi
+done"#;
 
 #[derive(Debug, Deserialize)]
 struct SessionInfo {
@@ -51,6 +54,9 @@ struct SessionInfo {
     screen_activity: Option<ScreenActivityWire>,
     #[serde(default)]
     error: Option<String>,
+    /// Where cleat keeps the session (cleat#4374's cleat change); absent from an older cleat.
+    #[serde(default)]
+    directory: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +111,9 @@ struct LaunchCapability {
     env_clear: bool,
     /// `launch -- PROGRAM [ARG]...`, run without a shell (cleat#333).
     argv: bool,
+    /// A session name is any text without NUL (#4374). An older cleat takes only
+    /// `[A-Za-z0-9._-]`.
+    any_name: bool,
 }
 
 impl LaunchCapability {
@@ -113,7 +122,11 @@ impl LaunchCapability {
     /// checks it against the pinned binary, so a cleat that renders it otherwise
     /// fails there, not silently here.
     pub(crate) fn from_help(help: &str) -> Self {
-        Self { env_clear: help.split_whitespace().any(|word| word == "--env-clear"), argv: help.contains("[-- <PROGRAM>...]") }
+        Self {
+            env_clear: help.split_whitespace().any(|word| word == "--env-clear"),
+            argv: help.contains("[-- <PROGRAM>...]"),
+            any_name: help.contains("any text without NUL"),
+        }
     }
 }
 
@@ -127,6 +140,9 @@ pub struct CleatTerminalPool {
     send_key_capability: tokio::sync::OnceCell<bool>,
     endpoint_cache: tokio::sync::Mutex<Option<EndpointCache>>,
     last_recording_prune: tokio::sync::Mutex<Instant>,
+    legacy: legacy_names::LegacyNames,
+    /// Set by this pool's first cleat listing, from which `legacy` learns the old ids.
+    legacy_learned: tokio::sync::OnceCell<()>,
 }
 
 struct EndpointCache {
@@ -134,13 +150,6 @@ struct EndpointCache {
     /// Each session's physical daemon, and whether that daemon records send keys; `None` for a
     /// session more than one daemon reports.
     endpoints: HashMap<String, Option<(CleatEndpoint, bool)>>,
-}
-
-/// The id cleat knows a session by. Cleat takes only filesystem-safe names, and a session's
-/// name carries its vessel's launch (`work#52`), so every call that names a session encodes it
-/// and [`TerminalPool::list_sessions`] decodes it.
-fn cleat_id(session_name: &str) -> String {
-    encode_name_component(session_name)
 }
 
 impl CleatTerminalPool {
@@ -155,7 +164,35 @@ impl CleatTerminalPool {
             send_key_capability: tokio::sync::OnceCell::new(),
             endpoint_cache: tokio::sync::Mutex::new(None),
             last_recording_prune: tokio::sync::Mutex::new(Instant::now()),
+            legacy: legacy_names::LegacyNames::default(),
+            legacy_learned: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The id cleat holds `name` under (`legacy_names`). Before this pool's first listing, one
+    /// listing teaches it the old ids, so an operation that reaches a crew first finds it.
+    async fn cleat_id<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
+        if legacy_names::could_be_encoded(name) {
+            let learned = self
+                .legacy_learned
+                .get_or_try_init(|| async {
+                    let output = run!(self.runner, &self.binary, &["list", "--json"], Path::new("/"))?;
+                    self.named(Self::parse_list_output(&output)?);
+                    Ok::<(), String>(())
+                })
+                .await;
+            if let Err(error) = learned {
+                tracing::debug!(session = %name, %error, "cleat listing failed; naming the session as it is");
+            }
+        }
+        self.legacy.cleat_id(name)
+    }
+
+    /// One cleat listing, each session with the name flotilla knows it by.
+    fn named(&self, sessions: Vec<SessionInfo>) -> Vec<(String, SessionInfo)> {
+        let names = self.legacy.names_listed(sessions.iter().map(|session| session.id.as_str()));
+        let _ = self.legacy_learned.set(());
+        names.into_iter().zip(sessions).collect()
     }
 
     /// The physical daemon hosting `session_id`, and whether it records send keys.
@@ -165,7 +202,7 @@ impl CleatTerminalPool {
         let mut cache = self.endpoint_cache.lock().await;
         if let Some(snapshot) = cache.as_ref() {
             if snapshot.updated.elapsed() < ENDPOINT_CACHE_TTL {
-                return Ok(snapshot.endpoints.get(&cleat_id(session_id)).cloned().flatten());
+                return Ok(snapshot.endpoints.get(session_id).cloned().flatten());
             }
         }
         let output = run!(self.runner, &self.binary, &["daemons", "--json"], Path::new("/"))?;
@@ -174,17 +211,17 @@ impl CleatTerminalPool {
         for daemon in daemons.into_iter().filter(|daemon| daemon.alive && Path::new(&daemon.runtime_root).is_absolute()) {
             let args = ["--runtime-root", daemon.runtime_root.as_str(), "--server", daemon.name.as_str(), "list", "--json"];
             let output = run!(self.runner, &self.binary, &args, Path::new("/"))?;
-            let sessions = Self::parse_list_output(&output)?;
+            let sessions = self.named(Self::parse_list_output(&output)?);
             let keyed = daemon.build.as_ref().is_some_and(|build| build.capabilities.iter().any(|capability| capability == KEYED_SEND));
-            for session in sessions {
+            for (name, session) in sessions {
                 let endpoint =
-                    CleatEndpoint { runtime_root: daemon.runtime_root.clone(), daemon: daemon.name.clone(), session: session.id.clone() };
+                    CleatEndpoint { runtime_root: daemon.runtime_root.clone(), daemon: daemon.name.clone(), session: session.id };
                 // A duplicate session id is ambiguous even if more daemons
                 // report it later in the inventory.
-                endpoints.entry(session.id).and_modify(|existing| *existing = None).or_insert(Some((endpoint, keyed)));
+                endpoints.entry(name).and_modify(|existing| *existing = None).or_insert(Some((endpoint, keyed)));
             }
         }
-        let endpoint = endpoints.get(&cleat_id(session_id)).cloned().flatten();
+        let endpoint = endpoints.get(session_id).cloned().flatten();
         *cache = Some(EndpointCache { updated: Instant::now(), endpoints });
         Ok(endpoint)
     }
@@ -223,11 +260,11 @@ impl CleatTerminalPool {
         // Cleat owns paste encoding and Enter in the same daemon transaction.
         // End option parsing before either positional argument: raw crew text
         // can itself be an option spelling such as --help or a Markdown bullet.
-        let session = cleat_id(session_name);
         let mut args = vec!["send", "--submit", "--if", "composer[value='']", "--controller-idle", "2s"];
         if let Some(key) = key {
             args.extend(["--key", key]);
         }
+        let session = self.cleat_id(session_name).await;
         args.extend(["--", &session, text]);
         let label = flotilla_provider_runtime::command_channel_label(&self.binary, &args);
         // Inspect the raw process result. Runner/spawn errors must never be
@@ -251,22 +288,30 @@ impl CleatTerminalPool {
         }
     }
 
-    async fn dead_recording_daemons(runner: &dyn CommandRunner, binary: &str) -> Result<Vec<DaemonInfo>, String> {
+    /// Each dead daemon generation, with the sessions cleat retains for it. Listing a dead
+    /// generation starts nothing; a pre-generation (`@legacy`) daemon would be started, so it is
+    /// left alone.
+    async fn dead_recording_daemons(runner: &dyn CommandRunner, binary: &str) -> Result<Vec<(DaemonInfo, Vec<SessionInfo>)>, String> {
         let output = runner.run(binary, &["daemons", "--json"], Path::new("/"), &ChannelLabel::Default).await?;
         let daemons: Vec<DaemonInfo> = serde_json::from_str(&output).map_err(|error| format!("parse cleat daemon list: {error}"))?;
-        Ok(daemons.into_iter().filter(|daemon| !daemon.alive && valid_recording_daemon(daemon)).collect())
+        let mut dead = Vec::new();
+        for daemon in daemons.into_iter().filter(|daemon| !daemon.alive && valid_recording_daemon(daemon)) {
+            let args = ["--runtime-root", daemon.runtime_root.as_str(), "--server", daemon.name.as_str(), "list", "--json"];
+            let output = runner.run(binary, &args, Path::new("/"), &ChannelLabel::Default).await?;
+            dead.push((daemon, Self::parse_list_output(&output)?));
+        }
+        Ok(dead)
     }
 
     async fn prune_retained_recordings_with(runner: &dyn CommandRunner, binary: &str) -> Result<(), String> {
-        for daemon in Self::dead_recording_daemons(runner, binary).await? {
-            runner
-                .run(
-                    "sh",
-                    &["-c", RECORDING_PRUNE_SCRIPT, "flotilla-prune-cleat-recordings", &daemon.runtime_root, &daemon.name],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
+        for (daemon, sessions) in Self::dead_recording_daemons(runner, binary).await? {
+            let directories = sessions.iter().filter_map(retained_directory).collect::<Vec<_>>();
+            if directories.is_empty() {
+                continue;
+            }
+            let mut args = vec!["-c", RECORDING_PRUNE_SCRIPT, "flotilla-prune-cleat-recordings", &daemon.runtime_root, &daemon.name];
+            args.extend(directories);
+            runner.run("sh", &args, Path::new("/"), &ChannelLabel::Default).await?;
         }
         Ok(())
     }
@@ -304,8 +349,9 @@ impl CleatTerminalPool {
             AttachMode::Strict => args.push(Arg::Literal("--strict".into())),
             AttachMode::Take => args.push(Arg::Literal("--take".into())),
         }
-        // Encoded session ids are filesystem-safe, and so shell-safe: no quoting needed.
-        args.push(Arg::Literal(cleat_id(session_name)));
+        // A session name is any text (`work#52`, `project:p/role:r`): quote it for the shell.
+        // Attach follows a liveness listing, from which the pool has learned any legacy id.
+        args.push(Arg::Quoted(self.legacy.cleat_id(session_name).into_owned()));
         args
     }
 
@@ -342,13 +388,20 @@ impl CleatTerminalPool {
             })
             .await?;
 
+        if !capability.any_name && !older_cleat_takes(session_name) {
+            return Err(format!(
+                "cleat '{}' cannot hold session name {session_name:?}: upgrade cleat to the revision flotilla pins \
+                 (CLEAT_NEW_REVISION, flotilla#4374)",
+                self.binary
+            ));
+        }
+
         let cwd = cwd.as_path().display().to_string();
-        let session = cleat_id(session_name);
         let mut args = vec!["launch"];
         if capability.env_clear {
             args.push("--env-clear");
         }
-        args.extend(["--json", "--record", &session, "--cwd", &cwd]);
+        args.extend(["--json", "--record", session_name, "--cwd", &cwd]);
         let argv = match program {
             SessionProgram::Declared(script) if capability.argv => Some(script),
             // A cleat older than CLEAT_NEW_REVISION would run the script through `$SHELL -lc`,
@@ -409,6 +462,22 @@ fn valid_recording_daemon(daemon: &DaemonInfo) -> bool {
         && daemon.name != "."
         && daemon.name != ".."
         && !daemon.name.contains('/')
+        && daemon.name.contains('@')
+        && !daemon.name.ends_with("@legacy")
+}
+
+/// The directory of a session a dead generation retains, as cleat lists it.
+fn retained_directory(session: &SessionInfo) -> Option<&str> {
+    session.error.as_ref()?;
+    session.directory.as_deref().filter(|directory| directory.is_absolute()).and_then(Path::to_str)
+}
+
+/// Whether a cleat older than #4374 can hold `name`: its old rule.
+fn older_cleat_takes(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 #[async_trait]
@@ -417,27 +486,27 @@ impl TerminalPool for CleatTerminalPool {
         if session_id.is_empty() {
             return Err("invalid recovered cleat session id".to_string());
         }
-        // The encoded id is one path component: never `.`, `..` or containing `/`.
-        let session_id = cleat_id(session_id);
-        let session_id = session_id.as_str();
-        // The old ID may have recordings in more than one dead generation.
-        for daemon in Self::dead_recording_daemons(self.runner.as_ref(), &self.binary).await? {
-            self.runner
-                .run(
-                    "sh",
-                    &["-c", RECORDING_RETAIN_SCRIPT, "flotilla-retain-cleat-recording", &daemon.runtime_root, &daemon.name, session_id],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
+        // The session may have recordings in more than one dead generation.
+        for (_, sessions) in Self::dead_recording_daemons(self.runner.as_ref(), &self.binary).await? {
+            let directories = self
+                .named(sessions)
+                .into_iter()
+                .filter(|(name, _)| name == session_id)
+                .filter_map(|(_, session)| retained_directory(&session).map(str::to_owned))
+                .collect::<Vec<_>>();
+            if directories.is_empty() {
+                continue;
+            }
+            let mut args = vec!["-c", RECORDING_RETAIN_SCRIPT, "flotilla-retain-cleat-recording"];
+            args.extend(directories.iter().map(String::as_str));
+            self.runner.run("sh", &args, Path::new("/"), &ChannelLabel::Default).await?;
         }
         Ok(())
     }
     async fn session_liveness(&self, session_id: &str) -> Result<TerminalSessionLiveness, String> {
         let output = run!(self.runner, &self.binary, &["list", "--json"], Path::new("/"))?;
-        let sessions = Self::parse_list_output(&output)?;
-        let session_id = cleat_id(session_id);
-        Ok(match sessions.into_iter().find(|session| session.id == session_id) {
+        let sessions = self.named(Self::parse_list_output(&output)?);
+        Ok(match sessions.into_iter().find(|(name, _)| name == session_id).map(|(_, session)| session) {
             Some(SessionInfo { error: Some(reason), .. }) => TerminalSessionLiveness::Lost(reason),
             Some(_) => TerminalSessionLiveness::Running,
             None => TerminalSessionLiveness::Absent,
@@ -454,18 +523,17 @@ impl TerminalPool for CleatTerminalPool {
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
         self.prune_recordings_if_due().await;
         let output = run!(self.runner, &self.binary, &["list", "--json"], Path::new("/"))?;
-        let sessions = Self::parse_list_output(&output)?;
+        let sessions = self.named(Self::parse_list_output(&output)?);
         Ok(sessions
             .into_iter()
-            .filter(|session| session.error.is_none())
-            .map(|session| {
+            .filter(|(_, session)| session.error.is_none())
+            .map(|(name, session)| {
                 let status = match session.status {
                     SessionStatus::Attached => flotilla_protocol::TerminalStatus::Running,
                     SessionStatus::Detached => flotilla_protocol::TerminalStatus::Disconnected,
                 };
                 TerminalSession {
-                    // A session flotilla did not name keeps cleat's id.
-                    session_name: decode_name_component(&session.id).unwrap_or(session.id),
+                    session_name: name,
                     status,
                     command: session_command(session.cmd, session.argv),
                     working_directory: session.cwd.map(ExecutionEnvironmentPath::new),
@@ -557,12 +625,12 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
-        run!(self.runner, &self.binary, &["kill", &cleat_id(session_name)], Path::new("/"))?;
+        run!(self.runner, &self.binary, &["kill", &self.cleat_id(session_name).await], Path::new("/"))?;
         Ok(())
     }
 
     async fn ensure_recognizer(&self, session: &str, harness: &str) -> Result<(), String> {
-        let session = &cleat_id(session);
+        let session = &*self.cleat_id(session).await;
         let raw = run!(self.runner, &self.binary, &["inspect", session, "--json"], Path::new("/"))?;
         let inspection: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
         if inspection.pointer("/recognizer/id").and_then(|id| id.as_str()) == Some(harness)
@@ -575,7 +643,7 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn abandoned_draft(&self, session: &str) -> Result<Option<String>, String> {
-        let session = &cleat_id(session);
+        let session = &*self.cleat_id(session).await;
         let raw = run!(self.runner, &self.binary, &["inspect", session, "--json"], Path::new("/"))?;
         let inspection: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
         // No controller history also means quiet. Cleat rechecks this predicate
@@ -597,7 +665,7 @@ impl TerminalPool for CleatTerminalPool {
     async fn clear_draft(&self, session: &str, draft: &str) -> Result<bool, String> {
         // Bind the value to its option so a draft such as --help stays text.
         let draft = format!("--draft={draft}");
-        let session = cleat_id(session);
+        let session = self.cleat_id(session).await;
         let args = ["clear-composer", &session, &draft, "--controller-idle", "2m"];
         let label = flotilla_provider_runtime::command_channel_label(&self.binary, &args);
         let output = self.runner.run_output(&self.binary, &args, Path::new("/"), &label).await?;
@@ -611,7 +679,7 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn capture_screen(&self, session_name: &str) -> Result<Option<String>, String> {
-        run!(self.runner, &self.binary, &["capture", &cleat_id(session_name)], Path::new("/")).map(Some)
+        run!(self.runner, &self.binary, &["capture", &self.cleat_id(session_name).await], Path::new("/")).map(Some)
     }
 
     async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
@@ -627,7 +695,7 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn operator_deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
-        run!(self.runner, &self.binary, &["send", "--submit", "--", &cleat_id(session_name), text], Path::new("/"))?;
+        run!(self.runner, &self.binary, &["send", "--submit", "--", &self.cleat_id(session_name).await, text], Path::new("/"))?;
         Ok(())
     }
 
@@ -637,13 +705,14 @@ impl TerminalPool for CleatTerminalPool {
         run!(
             self.runner,
             &self.binary,
-            &["send", "--paste", "--controller-idle", "2s", "--", &cleat_id(session_name), text],
+            &["send", "--paste", "--controller-idle", "2s", "--", &self.cleat_id(session_name).await, text],
             Path::new("/")
         )?;
         Ok(())
     }
 }
 
+mod legacy_names;
 pub mod turnover;
 
 #[cfg(test)]
@@ -658,7 +727,8 @@ mod tests {
     // Existing command-layout tests exercise their operation after the launch
     // capability has been established. environment_tests covers the real probe.
     /// `cleat launch --help` usage at the pinned revision (cleat#333).
-    const LAUNCH_HELP: &str = "Usage: cleat launch [OPTIONS] [ID] [-- <PROGRAM>...]\n      --env <NAME=VALUE>\n      --env-clear\n";
+    const LAUNCH_HELP: &str =
+        "Usage: cleat launch [OPTIONS] [ID] [-- <PROGRAM>...]\n  [ID]  Session name: any text without NUL\n      --env <NAME=VALUE>\n      --env-clear\n";
 
     fn test_pool(runner: Arc<dyn CommandRunner>, binary: &str) -> CleatTerminalPool {
         let pool = probing_pool(runner, binary);
@@ -669,7 +739,7 @@ mod tests {
 
     fn probing_pool(runner: Arc<dyn CommandRunner>, binary: &str) -> CleatTerminalPool {
         let pool = CleatTerminalPool::new(runner, binary, &EnvironmentBag::new());
-        pool.launch_capability.set(LaunchCapability { env_clear: true, argv: true }).expect("known launch capability");
+        pool.launch_capability.set(LaunchCapability { env_clear: true, argv: true, any_name: true }).expect("known launch capability");
         pool
     }
 
@@ -701,21 +771,49 @@ mod tests {
             .collect()
     }
 
+    const DEAD_AND_LIVE_GENERATIONS: &str = r#"[
+        {"name":"work@2","runtime_root":"/state/cleat","alive":false},
+        {"name":"work@3","runtime_root":"/state/cleat","alive":true},
+        {"name":"work@legacy","runtime_root":"/state/cleat","alive":false}
+    ]"#;
+
+    /// What cleat lists for a dead generation: each retained session with its error and directory.
+    const RETAINED_IN_WORK_2: &str = r#"[
+        {"id":"crew#1","status":"Detached","error":"daemon generation is dead; session is recreatable","directory":"/state/cleat/work@2/sessions/~crew%231"},
+        {"id":"work.2352","status":"Detached","error":"daemon generation is dead; session is recreatable","directory":"/state/cleat/work@2/sessions/work.2352"}
+    ]"#;
+
+    // Only a dead generation's sessions are pruned, by the directories cleat lists for them. A
+    // pre-generation daemon is not listed, since listing it would start it.
     #[tokio::test]
-    async fn recording_prune_never_targets_a_live_daemon_generation() {
-        let inventory = r#"[
-            {"name":"work@2","runtime_root":"/state/cleat","alive":false},
-            {"name":"work@3","runtime_root":"/state/cleat","alive":true}
-        ]"#;
-        let runner = Arc::new(MockRunner::new(vec![Ok(inventory.into()), Ok(String::new())]));
+    async fn recording_prune_targets_only_the_directories_a_dead_generation_lists() {
+        let runner =
+            Arc::new(MockRunner::new(vec![Ok(DEAD_AND_LIVE_GENERATIONS.into()), Ok(RETAINED_IN_WORK_2.into()), Ok(String::new())]));
         let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         pool.prune_retained_recordings().await.expect("prune retained recordings");
         let calls = logical_calls(&runner);
-        assert_eq!(calls.len(), 2, "only the dead generation receives cleanup");
-        assert_eq!(calls[0].1, vec!["daemons", "--json"]);
-        assert_eq!(calls[1].0, "sh");
-        assert!(calls[1].1.iter().any(|arg| arg == "work@2"));
-        assert!(!calls[1].1.iter().any(|arg| arg == "work@3"));
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls[0].1, ["daemons", "--json"]);
+        assert_eq!(calls[1].1, ["--runtime-root", "/state/cleat", "--server", "work@2", "list", "--json"]);
+        assert_eq!(calls[2].0, "sh");
+        assert_eq!(
+            calls[2].1[3..],
+            ["/state/cleat", "work@2", "/state/cleat/work@2/sessions/~crew%231", "/state/cleat/work@2/sessions/work.2352"]
+        );
+    }
+
+    // A recovered session's recordings are kept by the directory cleat lists under its name, in
+    // every dead generation; a crew launched before #4374 is listed under its old encoded id.
+    #[tokio::test]
+    async fn retain_marks_the_directory_a_dead_generation_lists_under_the_session_name() {
+        let runner =
+            Arc::new(MockRunner::new(vec![Ok(DEAD_AND_LIVE_GENERATIONS.into()), Ok(RETAINED_IN_WORK_2.into()), Ok(String::new())]));
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        pool.retain_recovered_recording("work#52").await.expect("retain");
+        let calls = logical_calls(&runner);
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls[2].0, "sh");
+        assert_eq!(calls[2].1[3..], ["/state/cleat/work@2/sessions/work.2352"]);
     }
 
     #[test]
@@ -735,6 +833,11 @@ mod tests {
                 .set_modified(old)
                 .expect("age marker");
         }
+        // A listed directory outside the generation's sessions is never removed.
+        let outside = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        std::fs::write(outside.join(".flotilla-recovered"), "").expect("outside marker");
+        std::fs::File::open(outside.join(".flotilla-recovered")).expect("open marker").set_modified(old).expect("age marker");
         std::fs::write(daemon.join("daemon.pid"), std::process::id().to_string()).expect("live pid");
         let run = || {
             std::process::Command::new("sh")
@@ -743,6 +846,8 @@ mod tests {
                 .arg("flotilla-prune-cleat-recordings")
                 .arg(temp.path())
                 .arg("work@2")
+                .args(["expired", "live", "recent"].map(|id| daemon.join("sessions").join(id)))
+                .arg(&outside)
                 .output()
                 .expect("run prune script")
         };
@@ -752,6 +857,7 @@ mod tests {
         assert!(run().status.success());
         assert!(!daemon.join("sessions/expired").exists(), "expired recovered recording is removed");
         assert!(daemon.join("sessions/recent/session.cast").exists(), "recent recording is retained");
+        assert!(outside.exists(), "a directory outside the generation's sessions is never removed");
     }
 
     #[tokio::test]
@@ -1093,7 +1199,7 @@ mod tests {
         let cmd =
             pool.attach_command("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).await.expect("attach command");
 
-        assert_eq!(cmd, "cleat attach --no-create my-session");
+        assert_eq!(cmd, "cleat attach --no-create 'my-session'");
         assert!(!cmd.contains("--cmd"), "should NOT have --cmd");
     }
 
@@ -1405,7 +1511,7 @@ mod tests {
                 Arg::Literal("cleat".into()),
                 Arg::Literal("attach".into()),
                 Arg::Literal("--no-create".into()),
-                Arg::Literal("my-session".into()),
+                Arg::Quoted("my-session".into()),
             ]
         );
     }
@@ -1416,7 +1522,7 @@ mod tests {
         let args = pool.attach_args("my-session", Some("bash"), &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
-        assert_eq!(flat, "cleat attach --no-create my-session");
+        assert_eq!(flat, "cleat attach --no-create 'my-session'");
     }
 
     #[test]
@@ -1429,8 +1535,8 @@ mod tests {
             .attach_args_for_mode("my-session", Some("bash"), &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::Default)
             .expect("watch attach args");
 
-        assert_eq!(flotilla_protocol::arg::flatten(&take, 0), "cleat attach --no-create --take my-session");
-        assert_eq!(flotilla_protocol::arg::flatten(&watch, 0), "cleat attach --no-create my-session");
+        assert_eq!(flotilla_protocol::arg::flatten(&take, 0), "cleat attach --no-create --take 'my-session'");
+        assert_eq!(flotilla_protocol::arg::flatten(&watch, 0), "cleat attach --no-create 'my-session'");
     }
 
     #[tokio::test]
@@ -1483,7 +1589,7 @@ mod tests {
                 Arg::Literal("cleat".into()),
                 Arg::Literal("attach".into()),
                 Arg::Literal("--no-create".into()),
-                Arg::Literal("sess-1".into()),
+                Arg::Quoted("sess-1".into()),
             ]
         );
     }
@@ -1501,7 +1607,7 @@ mod tests {
                 Arg::Literal("cleat".into()),
                 Arg::Literal("attach".into()),
                 Arg::Literal("--no-create".into()),
-                Arg::Literal("sess".into()),
+                Arg::Quoted("sess".into()),
             ]
         );
     }
@@ -1518,7 +1624,7 @@ mod tests {
                 Arg::Literal("cleat".into()),
                 Arg::Literal("attach".into()),
                 Arg::Literal("--no-create".into()),
-                Arg::Literal("sess".into()),
+                Arg::Quoted("sess".into()),
             ]
         );
     }
@@ -1531,7 +1637,7 @@ mod tests {
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
         // No --cmd, no NestedCommand
-        assert_eq!(flat, "cleat attach --no-create sess");
+        assert_eq!(flat, "cleat attach --no-create 'sess'");
     }
 
     #[tokio::test]

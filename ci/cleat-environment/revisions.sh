@@ -1,3 +1,3 @@
-# Source pins for the old/additive and new/declared launch contracts.
-CLEAT_OLD_REVISION=00c072b207dc943f6c93fe3b6b09abaa257695a6
-CLEAT_NEW_REVISION=25f0e99ff6f0ed30aa2baf2749b0eb2d498b444f
+# The cleat flotilla pairs with, the declared launch contract's source pin, and the oldest cleat
+# a fleet may run (ci/fleet-candidates/cleat_pairing.py).
+CLEAT_NEW_REVISION=a97bdf6cd9c41a58feaa1c0017181e0f64906341
