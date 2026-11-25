@@ -151,6 +151,9 @@ impl ExportBounds for DispatchWait {
 /// summaries, and `B`'s exported buckets.
 pub struct LatencyHistogram<B: ExportBounds = NotExported> {
     buckets: Box<[AtomicU64]>,
+    /// One count per exported bound, then the records above the last: an export reads its
+    /// `+Inf` from these alone, so a record landing while it reads cannot put a bucket
+    /// above the total.
     exported: Box<[AtomicU64]>,
     sum_micros: AtomicU64,
     max_micros: AtomicU64,
@@ -161,7 +164,7 @@ impl<B: ExportBounds> Default for LatencyHistogram<B> {
     fn default() -> Self {
         Self {
             buckets: (0..BUCKETS).map(|_| AtomicU64::new(0)).collect(),
-            exported: B::MICROS.iter().map(|_| AtomicU64::new(0)).collect(),
+            exported: (0..=B::MICROS.len()).map(|_| AtomicU64::new(0)).collect(),
             sum_micros: AtomicU64::new(0),
             max_micros: AtomicU64::new(0),
             bounds: PhantomData,
@@ -179,9 +182,7 @@ impl<B: ExportBounds> LatencyHistogram<B> {
     pub fn record(&self, latency: Duration) {
         let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
         self.buckets[bucket(micros)].fetch_add(1, Ordering::Relaxed);
-        if let Some(exported) = self.exported.get(B::MICROS.partition_point(|bound| *bound < micros)) {
-            exported.fetch_add(1, Ordering::Relaxed);
-        }
+        self.exported[B::MICROS.partition_point(|bound| *bound < micros)].fetch_add(1, Ordering::Relaxed);
         self.sum_micros.fetch_add(micros, Ordering::Relaxed);
         self.max_micros.fetch_max(micros, Ordering::Relaxed);
     }
@@ -189,7 +190,13 @@ impl<B: ExportBounds> LatencyHistogram<B> {
     pub fn snapshot(&self) -> HistogramSnapshot {
         HistogramSnapshot {
             buckets: self.buckets.iter().map(|bucket| bucket.load(Ordering::Relaxed)).collect(),
-            exported: B::MICROS.iter().zip(&self.exported).map(|(bound, count)| (*bound, count.load(Ordering::Relaxed))).collect(),
+            exported: B::MICROS
+                .iter()
+                .copied()
+                .chain([u64::MAX])
+                .zip(&self.exported)
+                .map(|(bound, count)| (bound, count.load(Ordering::Relaxed)))
+                .collect(),
             sum_micros: self.sum_micros.load(Ordering::Relaxed),
             max_micros: self.max_micros.load(Ordering::Relaxed),
         }
@@ -200,7 +207,8 @@ impl<B: ExportBounds> LatencyHistogram<B> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HistogramSnapshot {
     buckets: Vec<u64>,
-    /// Exported bounds in microseconds and the records in each, not cumulative.
+    /// Exported bounds in microseconds and the records in each, not cumulative, then
+    /// `u64::MAX` and the records above the last bound.
     exported: Vec<(u64, u64)>,
     sum_micros: u64,
     max_micros: u64,
@@ -208,10 +216,10 @@ pub struct HistogramSnapshot {
 
 impl HistogramSnapshot {
     /// The exported inclusive bounds in microseconds and cumulative counts; records
-    /// above the last bound are only in [`HistogramSnapshot::count`].
+    /// above the last bound are only in [`HistogramSnapshot::exported_count`].
     pub fn cumulative_buckets(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         let mut total = 0;
-        self.exported.iter().map(move |(bound, count)| {
+        self.exported.split_last().map_or(&[][..], |(_, bounded)| bounded).iter().map(move |(bound, count)| {
             total += count;
             (*bound, total)
         })
@@ -223,6 +231,12 @@ impl HistogramSnapshot {
 
     pub fn count(&self) -> u64 {
         self.buckets.iter().sum()
+    }
+
+    /// The records the exported buckets hold, those above the last bound included: the
+    /// `+Inf` bucket and the count beside [`HistogramSnapshot::cumulative_buckets`].
+    pub fn exported_count(&self) -> u64 {
+        self.exported.iter().map(|(_, count)| count).sum()
     }
 
     /// Records made after `earlier`. Their maximum is bounded by the highest
@@ -696,6 +710,29 @@ mod tests {
         assert_eq!(phase.cumulative_buckets().last(), Some((60_000_000, 3)));
         assert_eq!(phase.count(), 4);
         assert_eq!(<LatencyHistogram>::default().snapshot().cumulative_buckets().count(), 0);
+    }
+
+    // Behaviour: a snapshot taken while records land still exports cumulative buckets that
+    // never exceed its own total.
+    #[test]
+    fn a_snapshot_beside_landing_records_exports_buckets_within_its_total() {
+        let histogram = Arc::new(LatencyHistogram::<ReconcileTime>::default());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let recorder = std::thread::spawn({
+            let (histogram, done) = (histogram.clone(), done.clone());
+            move || {
+                while !done.load(Ordering::Relaxed) {
+                    histogram.record(Duration::from_micros(500));
+                }
+            }
+        });
+        for _ in 0..100_000 {
+            let snapshot = histogram.snapshot();
+            let (_, last) = snapshot.cumulative_buckets().last().expect("exported bounds");
+            assert!(last <= snapshot.exported_count(), "a bucket holds {last} of {} records", snapshot.exported_count());
+        }
+        done.store(true, Ordering::Relaxed);
+        recorder.join().unwrap();
     }
 
     #[test]

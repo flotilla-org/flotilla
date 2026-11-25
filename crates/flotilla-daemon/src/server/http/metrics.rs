@@ -91,9 +91,9 @@ impl Exposition {
         for (upper, count) in histogram.cumulative_buckets() {
             self.sample(&format!("{name}_bucket"), &format!("{labels},le=\"{}\"", upper as f64 / 1_000_000.0), count);
         }
-        self.sample(&format!("{name}_bucket"), &format!("{labels},le=\"+Inf\""), histogram.count());
+        self.sample(&format!("{name}_bucket"), &format!("{labels},le=\"+Inf\""), histogram.exported_count());
         self.sample(&format!("{name}_sum"), labels, histogram.sum_micros() as f64 / 1_000_000.0);
-        self.sample(&format!("{name}_count"), labels, histogram.count());
+        self.sample(&format!("{name}_count"), labels, histogram.exported_count());
         self.number(&format!("{name}_max"), "gauge", labels, histogram.summary().max_micros as f64 / 1_000_000.0);
     }
     /// One caller's engine reads, by kind: callers are controller kinds and fixed task names.
