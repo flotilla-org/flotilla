@@ -312,6 +312,10 @@ async fn landing_without_armed_exit_rows_stalls() {
 async fn stale_change_request_observation_stalls_landing_convoy() {
     let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(Utc::now()));
     let (daemon, backend, _temp, watch, _engine) = super::support::stall_test_daemon_with_clock(clock.clone()).await;
+    // The test judges by hand: the daemon's own judge would sync the rows beside it from its
+    // own convoy revision, and arm the change request's observer before the test writes it.
+    // It has not run yet, so it never does.
+    watch.abort();
     let repository = flotilla_resources::RepositoryKey("repo".into());
     let spec = ConvoySpec::builder()
         .workflow_ref("test".into())
@@ -380,15 +384,15 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
         .await
         .expect("observer reads failing");
     daemon.reconcile_crew_stalls_once("flotilla").await.expect("judge inside observer grace");
-    assert!(convoys.get(&stale).await.expect("convoy").status.expect("status").stalled.is_none());
+    let stalled = convoys.get(&stale).await.expect("convoy").status.expect("status").stalled;
+    assert!(stalled.is_none(), "stalled inside observer grace: {stalled:?}");
     clock.advance(chrono::Duration::hours(1));
     daemon.reconcile_crew_stalls_once("flotilla").await.expect("judge expired observer grace");
-    let stalled = wait_for_stall(&backend, &stale, true).await.stalled.expect("stalled");
+    let stalled = convoys.get(&stale).await.expect("convoy").status.expect("status").stalled.expect("stalled");
     assert!(matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Observed { .. })));
     assert!(stalled.evidence.contains("stale"), "{}", stalled.evidence);
     assert!(stalled.evidence.contains("observer behind scheduled refresh grace"));
     assert_eq!(stalled.source, flotilla_resources::StallEvidenceSource::Observation);
-    watch.abort();
 }
 
 #[tokio::test]
