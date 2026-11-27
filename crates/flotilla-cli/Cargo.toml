@@ -41,6 +41,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+tender-types = { workspace = true }
 
 [dev-dependencies]
 flotilla-address = { path = "../flotilla-address" }

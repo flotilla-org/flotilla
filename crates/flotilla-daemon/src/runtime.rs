@@ -4,6 +4,7 @@ mod access_layer;
 mod account_access;
 pub(crate) mod archive;
 mod checkouts;
+mod cleat_publications;
 mod convoy_controller;
 mod credential_delivery;
 mod credentials;
@@ -102,6 +103,9 @@ pub struct RuntimeOptions {
     /// flotillad's hook endpoint: host-direct Claude Code crews deliver their hooks over
     /// HTTP while it has one, and keep command hooks otherwise.
     pub hook_endpoint: Option<crate::server::HookEndpoint>,
+    /// The Tender runtime directory of the account flotillad runs as, or why it has none: this
+    /// daemon publishes its vessels' Cleat daemons there (#4401). In-process runtimes publish nothing.
+    pub tender_runtime: Option<Result<PathBuf, String>>,
 }
 
 impl Default for RuntimeOptions {
@@ -116,6 +120,7 @@ impl Default for RuntimeOptions {
             startup_ready: None,
             environment_sockets: None,
             hook_endpoint: None,
+            tender_runtime: None,
             // Codex only proactively refreshes within 5 minutes of expiry; a
             // central login's access token lives far longer than that, so a
             // conservative fixed cadence comfortably inside that window
@@ -703,6 +708,10 @@ impl StartupRestoration {
         )));
         controller_tasks.push(AbortOnDropHandle::new(spawn_environment_orphan_sweep_task(Arc::clone(state))));
         controller_tasks.push(AbortOnDropHandle::new(remotes::spawn_remote_probe_task(Arc::clone(state), remotes::REMOTE_PROBE_INTERVAL)));
+        if let Some(runtime) = &options.tender_runtime {
+            let publisher = Arc::new(cleat_publications::CleatPublisher::new(runtime.clone(), runtime_health.clone()));
+            controller_tasks.push(AbortOnDropHandle::new(cleat_publications::spawn_cleat_publisher(Arc::clone(state), publisher)));
+        }
         controller_tasks.extend(
             spawn_controller_loops(
                 Arc::clone(state),

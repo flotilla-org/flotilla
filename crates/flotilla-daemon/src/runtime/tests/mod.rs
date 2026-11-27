@@ -115,6 +115,7 @@ use terminal_support::*;
 
 mod account_binding;
 mod adopted_checkouts;
+mod cleat_publications;
 mod clone_credentials;
 mod clone_reads;
 mod convoy_lifecycle;

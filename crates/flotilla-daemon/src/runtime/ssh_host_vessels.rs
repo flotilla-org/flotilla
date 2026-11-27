@@ -895,7 +895,7 @@ impl flotilla_core::in_process::SshHostVesselAccess for VesselSessions {
                 }
                 pool.preflight_attach(seat).await?;
                 let endpoint = pool.cleat_endpoint(session_id).await?.ok_or("vessel attach requires a cleat socket endpoint")?;
-                let guest = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+                let guest = endpoint.socket();
                 let socket = access.handle.agent().forward_socket(&guest).await?;
                 Ok((socket, endpoint.session))
             }

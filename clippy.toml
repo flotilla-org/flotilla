@@ -170,6 +170,8 @@ absolute-paths-allowed-crates = [
     "syn",
     "sysinfo",
     "tempfile",
+    "tender",
+    "tender_types",
     "time",
     "tokio",
     "tokio_rusqlite",

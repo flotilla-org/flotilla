@@ -133,11 +133,11 @@ pub const KEY_PRIMARY_ACTION_VEHICLE: &str = "action.primary.vehicle";
 pub const KEY_PRIMARY_ACTION_KIND: &str = "action.primary.kind";
 /// Compatibility for recipe-shape v1 (#2818): remove after the next fleet roll.
 pub const KEY_PRIMARY_ACTION_RECIPE: &str = "action.primary.recipe";
-/// Direct Cleat packet endpoint; all five facts appear or disappear together.
-pub const KEY_PRIMARY_DIRECT_TRANSPORT: &str = "action.primary.direct.transport";
-pub const KEY_PRIMARY_DIRECT_HOST: &str = "action.primary.direct.host";
-pub const KEY_PRIMARY_DIRECT_RUNTIME_ROOT: &str = "action.primary.direct.runtime_root";
-pub const KEY_PRIMARY_DIRECT_DAEMON: &str = "action.primary.direct.daemon";
+/// The Tender publication of the session's Cleat daemon (#4401); all four facts appear or
+/// disappear together. A viewer binds it at the path its identity computes.
+pub const KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE: &str = "action.primary.direct.publication.scope";
+pub const KEY_PRIMARY_DIRECT_PUBLICATION_NAME: &str = "action.primary.direct.publication.name";
+pub const KEY_PRIMARY_DIRECT_PUBLICATION_LABEL: &str = "action.primary.direct.publication.label";
 pub const KEY_PRIMARY_DIRECT_SESSION: &str = "action.primary.direct.session";
 /// Why the command recipe is the only available opening path.
 pub const KEY_PRIMARY_DIRECT_REASON: &str = "action.primary.direct.reason";

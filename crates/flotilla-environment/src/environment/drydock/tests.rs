@@ -159,6 +159,30 @@ async fn the_agent_is_driven_through_an_inward_exposure() {
     assert_eq!(adopted.env_vars().await.unwrap().get("TOKEN").map(String::as_str), Some("rotated"));
 }
 
+// A vessel's Cleat daemon is published from an inward exposure named for the daemon (#4401),
+// standing on drydock's machine: a handover's new generation repoints the same exposure, and a
+// daemon name drydock would refuse is named by its socket instead.
+#[tokio::test]
+async fn a_cleat_daemon_is_reached_through_an_exposure_named_for_it() {
+    let fixture = Fixture::new();
+    let provider = fixture.provider();
+    let prepared = provider.prepare(&spec(), &Default::default()).await.unwrap();
+    let handle = provider.provision(EnvironmentId::new("crew"), &prepared, ProvisionOpts::default()).await.unwrap();
+    let agent = handle.agent();
+    let first = Path::new("/run/cleat/default@1/socket");
+    let local = agent.cleat_socket("default", first).await.unwrap();
+    let exposure = fixture.api.inward("memory", handle.backing_id(), "cleat-default").await.unwrap();
+    assert_eq!(exposure.target, wire::InwardTarget::Unix(first.display().to_string()));
+    assert_eq!(exposure.local, wire::Local::Unix(local.display().to_string()));
+    let second = Path::new("/run/cleat/default@2/socket");
+    assert_eq!(agent.cleat_socket("default", second).await.unwrap(), local, "the same exposure, repointed");
+    let repointed = fixture.api.inward("memory", handle.backing_id(), "cleat-default").await.unwrap();
+    assert_eq!(repointed.target, wire::InwardTarget::Unix(second.display().to_string()));
+    agent.cleat_socket("crew lead", first).await.unwrap();
+    let names: Vec<String> = fixture.api.inwards.lock().unwrap().keys().map(|(_, name)| name.clone()).collect();
+    assert!(names.iter().any(|name| name.starts_with("cleat-") && name.len() == "cleat-".len() + 16), "{names:?}");
+}
+
 // #4173: the vessel environment flotilla reads is the provider's and its own
 // declarations, never the agent's pipeline defaults for the processes it starts.
 #[tokio::test]

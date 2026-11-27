@@ -1,15 +1,7 @@
-//! Platform-independent action addresses and viewer-specific direct transport reachability.
+//! Platform-independent action addresses and whether this viewer can bind Tender publications.
 //! Viewers resolve addresses on their own platform; only genuine commands carry argv.
 
-use std::collections::BTreeMap;
-
 use flotilla_protocol::{HostName, ViewAddress};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DirectTransport {
-    Local,
-    Ssh(String),
-}
 
 /// A structured action recipe. Kind is an open vocabulary; argv is present
 /// only for genuine commands. The target is also the viewer's focus-if-live key.
@@ -67,9 +59,13 @@ impl Recipe {
     }
 }
 
+/// Why a viewer that never looked for its Tender instance has none.
+const NO_TENDER: &str = "no Tender instance reachable from this viewer";
+
 pub trait RecipeMint: Send + Sync {
-    fn direct_transport(&self, _host: &HostName) -> Result<DirectTransport, String> {
-        Err("viewer has no known transport to the session host".to_owned())
+    /// Whether this viewer's own Tender instance answers: binding a publication needs it.
+    fn tender(&self) -> Result<(), String> {
+        Err(NO_TENDER.to_owned())
     }
     /// Recipe attaching a live entity — a session into a pane, or a vessel's
     /// running session into a workspace; `attach_ref` is any reference the
@@ -83,32 +79,24 @@ pub trait RecipeMint: Send + Sync {
 /// scoped focal view for an awareness-band latent.
 pub struct FlotillaRecipes {
     flotilla_bin: String,
-    local_host: Option<HostName>,
-    ssh_hosts: BTreeMap<String, String>,
+    tender: Result<(), String>,
 }
 
 impl FlotillaRecipes {
     pub fn new(flotilla_bin: impl Into<String>) -> Self {
-        Self { flotilla_bin: flotilla_bin.into(), local_host: None, ssh_hosts: BTreeMap::new() }
+        Self { flotilla_bin: flotilla_bin.into(), tender: Err(NO_TENDER.to_owned()) }
     }
 
-    pub fn with_host_routes(mut self, local_host: HostName, ssh_hosts: BTreeMap<String, String>) -> Self {
-        self.local_host = Some(local_host);
-        self.ssh_hosts = ssh_hosts;
+    /// What the viewer found of its own Tender instance.
+    pub fn with_tender(mut self, tender: Result<(), String>) -> Self {
+        self.tender = tender;
         self
     }
 }
 
 impl RecipeMint for FlotillaRecipes {
-    fn direct_transport(&self, host: &HostName) -> Result<DirectTransport, String> {
-        if self.local_host.as_ref() == Some(host) {
-            return Ok(DirectTransport::Local);
-        }
-        self.ssh_hosts
-            .get(host.as_str())
-            .cloned()
-            .map(DirectTransport::Ssh)
-            .ok_or_else(|| format!("host {} has no configured SSH reachability from this viewer", host.as_str()))
+    fn tender(&self) -> Result<(), String> {
+        self.tender.clone()
     }
 
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe> {

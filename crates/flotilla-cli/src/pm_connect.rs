@@ -29,7 +29,6 @@ use flotilla_client::{
     reconnect::{is_permanent_daemon_error, ReconnectBackoff},
     DaemonEndpoint, SshEndpoint,
 };
-use flotilla_config::{ssh_destination, ConfigStore};
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_manifest::{
     keys::{CATALOG_TTL_MS, REASSERT_INTERVAL_MS},
@@ -44,7 +43,7 @@ use flotilla_protocol::{
         AwarenessGrouping, AwarenessLimit, AwarenessNode, ConvoyRow, IndependentRow, ProjectRepositoriesRow, QueryChanges, ResultDelta,
         ResultSet, Rows, StandingRoleRow,
     },
-    DaemonEvent, HostName, QueryCursor, QueryId, ResourceRef,
+    DaemonEvent, QueryCursor, QueryId, ResourceRef,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
@@ -936,13 +935,20 @@ async fn with_parent<F: Future<Output = Result<(), String>>>(parent_alive: impl 
     }
 }
 
-// A remote daemon's configured identity cannot establish viewer locality.
-fn connector_local_host(remote: bool, configured: Option<String>, viewer: HostName) -> HostName {
-    if remote {
-        viewer
-    } else {
-        configured.map(HostName::new).unwrap_or(viewer)
-    }
+/// Whether this viewer's own Tender instance answers on its control socket: a viewer binds a
+/// vessel's Cleat publication through it (#4401), wherever the daemon it connects to runs.
+#[cfg(unix)]
+async fn viewer_tender() -> Result<(), String> {
+    let socket = tender_types::paths::control_socket(&tender_types::paths::runtime_dir_from_env()?);
+    tokio::net::UnixStream::connect(&socket)
+        .await
+        .map(drop)
+        .map_err(|error| format!("no Tender instance reachable from this viewer at {}: {error}", socket.display()))
+}
+
+#[cfg(not(unix))]
+async fn viewer_tender() -> Result<(), String> {
+    Err("no Tender instance reachable from this viewer: Tender runs on Unix only (flotilla-org/rigging#58)".to_owned())
 }
 
 /// CLI entry: resolve the sink and supervise parent/PM lifetime across dial
@@ -964,21 +970,11 @@ pub async fn run(
         .with_writer(std::io::stderr)
         .try_init();
     let sink = resolve_pm(&options, &|key| std::env::var(key).ok())?.sink();
-    let config = ConfigStore::with_base(config_dir);
-    let local_host = connector_local_host(remote.is_some(), config.load_daemon_config()?.host_name, HostName::local());
-    let hosts = config.load_hosts()?;
-    let mut ssh_hosts = BTreeMap::new();
-    let mut ambiguous = HashSet::new();
-    for remote in hosts.hosts.values() {
-        let destination = ssh_destination(&remote.hostname, remote.user.as_deref());
-        if ssh_hosts.insert(remote.expected_host_name.clone(), destination).is_some() {
-            ambiguous.insert(remote.expected_host_name.clone());
-        }
+    let tender = viewer_tender().await;
+    if let Err(reason) = &tender {
+        info!(%reason, "vessels' Cleat publications cannot be bound from this viewer");
     }
-    for host in ambiguous {
-        ssh_hosts.remove(&host);
-    }
-    let mint: Arc<dyn RecipeMint> = Arc::new(FlotillaRecipes::new(options.flotilla_bin.clone()).with_host_routes(local_host, ssh_hosts));
+    let mint: Arc<dyn RecipeMint> = Arc::new(FlotillaRecipes::new(options.flotilla_bin.clone()).with_tender(tender));
     let connector = Arc::new(Connector::default());
     let health_connector = connector.clone();
     let health_sink = sink.clone();

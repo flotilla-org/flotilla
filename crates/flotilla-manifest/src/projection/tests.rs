@@ -2,8 +2,8 @@ use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 
 use flotilla_protocol::{
-    result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessState, CrewMemberSummary},
-    HostName, IssueRef, IssueSource, RepoKey, RepositoryKey, ResourceRef,
+    result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessState, CleatEndpoint, CrewMemberSummary},
+    EnvironmentKind, HostName, IssueRef, IssueSource, RepoKey, RepositoryKey, ResourceRef,
 };
 use flotilla_resources::{
     ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
@@ -319,15 +319,35 @@ fn change_request_readiness_uses_adr_wire_values() {
     }
 }
 
-#[test]
-fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
+/// The host-path facts publications replaced (#4401); nothing writes them any more.
+const RETIRED_DIRECT_KEYS: [&str; 4] =
+    ["action.primary.direct.transport", "action.primary.direct.host", "action.primary.direct.runtime_root", "action.primary.direct.daemon"];
+
+const PUBLICATION_KEYS: [&str; 4] = [
+    KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE,
+    KEY_PRIMARY_DIRECT_PUBLICATION_NAME,
+    KEY_PRIMARY_DIRECT_PUBLICATION_LABEL,
+    KEY_PRIMARY_DIRECT_SESSION,
+];
+
+fn with_tender() -> FlotillaRecipes {
+    mint().with_tender(Ok(()))
+}
+
+/// A running vessel `coder` of convoy `remote`, placed as Vessel `convoy-remote-coder#3`, whose
+/// session cleat daemon generation `work@3` holds.
+fn placed_convoy() -> ConvoyRow {
     let reference = convoy_ref("dev", "remote");
-    let endpoint =
-        CleatEndpoint { runtime_root: "/var/lib/flotilla/cleat".to_owned(), daemon: "work@3".to_owned(), session: "session-42".to_owned() };
     let mut terminal = vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-remote-coder").call();
-    terminal.cleat_endpoint = Some(endpoint.clone());
+    terminal.vessel_resource =
+        Some(ResourceRef::new("flotilla/v1", "Vessel", "dev", "convoy-remote-coder#3").on_host(HostName::new("feta")));
+    terminal.cleat_endpoint = Some(CleatEndpoint {
+        runtime_root: "/var/lib/flotilla/cleat".to_owned(),
+        daemon: "work@3".to_owned(),
+        session: "session-42".to_owned(),
+    });
     terminal.environment_kind = Some(EnvironmentKind::Direct);
-    let convoy = ConvoyRow::builder()
+    ConvoyRow::builder()
         .home(reference.host.clone().expect("test convoy is homed"))
         .resource(reference)
         .name("remote")
@@ -335,80 +355,99 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
         .workflow_ref("implement")
         .phase(ConvoyPhase::Active)
         .message("waiting for a reviewer")
-        .vessels(vec![terminal.clone()])
-        .build();
-    let remote_mint = mint().with_host_routes(HostName::new("kiwi"), BTreeMap::from([("feta".to_owned(), "crew-alias".to_owned())]));
-    let remote = project_catalog(&catalog_input(std::slice::from_ref(&convoy)), &remote_mint);
+        .vessels(vec![terminal])
+        .build()
+}
+
+// #4401: a vessel's Cleat daemon is named by its Tender publication, `vessel/<Vessel name>` and
+// `cleat/<logical daemon>`, whatever its environment and whichever machine carries it, beside
+// the session and the recipe. No host path is written for any of them.
+#[test]
+fn a_vessels_cleat_daemon_is_named_by_its_publication_wherever_it_runs() {
     let vessel_entity = entity::vessel("kiwi", "remote", "coder").expect("valid address");
-    let patch = find_entity(&remote.reassert_patches(), &vessel_entity).clone();
-    assert_eq!(text(&patch, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --host 'feta' 'terminal-remote-coder'");
-    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_TRANSPORT), "ssh");
-    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_HOST), "crew-alias");
-    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_RUNTIME_ROOT), endpoint.runtime_root);
-    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_DAEMON), endpoint.daemon);
-    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_SESSION), endpoint.session);
-    assert_eq!(
-        text(find_entity(&remote.reassert_patches(), &entity::convoy("kiwi", "remote").expect("valid address")), KEY_SUMMARY_TEXT),
-        "waiting for a reviewer"
-    );
-
-    let local_mint = mint().with_host_routes(HostName::new("feta"), BTreeMap::new());
-    let local = project_catalog(&catalog_input(std::slice::from_ref(&convoy)), &local_mint);
-    let local_patch = find_entity(&local.reassert_patches(), &vessel_entity).clone();
-    assert_eq!(text(&local_patch, KEY_PRIMARY_DIRECT_TRANSPORT), "local");
-
-    let unreachable = project_catalog(&catalog_input(std::slice::from_ref(&convoy)), &mint());
-    let fallback = find_entity(&unreachable.reassert_patches(), &vessel_entity).clone();
-    assert!(fallback.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
-    assert!(text(&fallback, KEY_PRIMARY_DIRECT_REASON).contains("SSH reachability"));
-    assert!(!fallback.set.contains_key(KEY_PRIMARY_DIRECT_DAEMON));
-
-    // Container daemons cannot be addressed in either transport's host namespace.
-    // The kind/transport cross-product exhausts this finite projection decision.
-    for kind in [Some(EnvironmentKind::Provisioned), None] {
-        for transport in [&remote_mint, &local_mint] {
-            let mut container = convoy.clone();
-            container.vessels[0].environment_kind = kind;
-            let projected = project_catalog(&catalog_input(&[container]), transport);
-            let patches = projected.reassert_patches();
-            let patch = find_entity(&patches, &vessel_entity);
-            assert!(patch.set.contains_key(KEY_PRIMARY_DIRECT_REASON));
-            assert!(patch.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
-            for key in [
-                KEY_PRIMARY_DIRECT_TRANSPORT,
-                KEY_PRIMARY_DIRECT_HOST,
-                KEY_PRIMARY_DIRECT_RUNTIME_ROOT,
-                KEY_PRIMARY_DIRECT_DAEMON,
-                KEY_PRIMARY_DIRECT_SESSION,
-            ] {
-                assert!(!patch.set.contains_key(key), "unsafe endpoint fact {key} for {kind:?}");
+    for (kind, carried_by) in [
+        (Some(EnvironmentKind::Direct), None),
+        (Some(EnvironmentKind::Direct), Some("b1")),
+        (Some(EnvironmentKind::Provisioned), None),
+        (Some(EnvironmentKind::Provisioned), Some("b1")),
+        (None, None),
+    ] {
+        let mut convoy = placed_convoy();
+        convoy.vessels[0].environment_kind = kind;
+        convoy.vessels[0].carried_by = carried_by.map(HostName::new);
+        let catalog = project_catalog(&catalog_input(&[convoy]), &with_tender());
+        let patches = catalog.reassert_patches();
+        let patch = find_entity(&patches, &vessel_entity);
+        let case = format!("{kind:?} carried by {carried_by:?}");
+        assert_eq!(text(patch, KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE), "vessel/convoy-remote-coder#3", "{case}");
+        assert_eq!(text(patch, KEY_PRIMARY_DIRECT_PUBLICATION_NAME), "cleat/work", "{case}");
+        assert_eq!(text(patch, KEY_PRIMARY_DIRECT_PUBLICATION_LABEL), "cleat", "{case}");
+        assert_eq!(text(patch, KEY_PRIMARY_DIRECT_SESSION), "session-42", "{case}");
+        assert_eq!(text(patch, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --host 'feta' 'terminal-remote-coder'", "{case}");
+        assert!(!patch.set.contains_key(KEY_PRIMARY_DIRECT_REASON), "{case}");
+        for patch in &patches {
+            for key in RETIRED_DIRECT_KEYS {
+                assert!(
+                    !patch.set.contains_key(key) && !patch.unset.iter().any(|unset| unset == key),
+                    "{case}: {key} on {:?}",
+                    patch.target
+                );
             }
-            let withdrawal = projected.diff_patches(&remote);
-            let patch = find_entity(&withdrawal, &vessel_entity);
-            assert!(patch.unset.contains(&KEY_PRIMARY_DIRECT_DAEMON.to_owned()));
         }
     }
+}
 
-    let mut endpoint_lost = convoy.clone();
+// A viewer without a Tender instance cannot bind the publication: the reason says so, the
+// recipe stays, and none of the publication's facts are written.
+#[test]
+fn without_tender_the_reason_says_so() {
+    let vessel_entity = entity::vessel("kiwi", "remote", "coder").expect("valid address");
+    let missing = mint().with_tender(Err("no Tender instance reachable at /run/user/1000/tender/control".to_owned()));
+    for viewer in [mint(), missing] {
+        let catalog = project_catalog(&catalog_input(&[placed_convoy()]), &viewer);
+        let patch = find_entity(&catalog.reassert_patches(), &vessel_entity).clone();
+        assert!(text(&patch, KEY_PRIMARY_DIRECT_REASON).starts_with("no Tender instance reachable"), "{patch:?}");
+        assert!(patch.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+        for key in PUBLICATION_KEYS {
+            assert!(!patch.set.contains_key(key), "{key}");
+        }
+    }
+}
+
+// The publication's facts leave together, with a reason in their place, when the endpoint is
+// no longer observed or the vessel is not placed; the recipe leaves with its session.
+#[test]
+fn publication_facts_are_withdrawn_together() {
+    let vessel_entity = entity::vessel("kiwi", "remote", "coder").expect("valid address");
+    let published = project_catalog(&catalog_input(&[placed_convoy()]), &with_tender());
+
+    let mut endpoint_lost = placed_convoy();
     endpoint_lost.vessels[0].cleat_endpoint = None;
-    let command_only = project_catalog(&catalog_input(&[endpoint_lost]), &remote_mint);
-    let lost = find_entity(&command_only.diff_patches(&remote), &vessel_entity).clone();
-    assert!(lost.unset.contains(&KEY_PRIMARY_DIRECT_DAEMON.to_owned()));
-    assert!(lost.set.contains_key(KEY_PRIMARY_DIRECT_REASON));
-    assert!(!lost.unset.contains(&KEY_PRIMARY_ACTION_RECIPE.to_owned()));
+    let mut unplaced = placed_convoy();
+    unplaced.vessels[0].vessel_resource = None;
+    for (convoy, reason) in [(endpoint_lost, "no observed Cleat daemon endpoint"), (unplaced, "vessel is not placed")] {
+        let projected = project_catalog(&catalog_input(&[convoy]), &with_tender());
+        let diff = projected.diff_patches(&published);
+        let patch = find_entity(&diff, &vessel_entity);
+        for key in PUBLICATION_KEYS {
+            assert!(patch.unset.contains(&key.to_owned()), "{reason}: {key}");
+        }
+        assert!(text(patch, KEY_PRIMARY_DIRECT_REASON).starts_with(reason));
+        assert!(!patch.unset.contains(&KEY_PRIMARY_ACTION_RECIPE.to_owned()));
+    }
 
-    let mut withdrawn_convoy = convoy;
-    withdrawn_convoy.vessels[0].materialize = None;
-    withdrawn_convoy.vessels[0].cleat_endpoint = None;
-    let withdrawn = project_catalog(&catalog_input(&[withdrawn_convoy]), &remote_mint);
-    let diff = withdrawn.diff_patches(&remote);
+    let mut withdrawn = placed_convoy();
+    withdrawn.vessels[0].materialize = None;
+    withdrawn.vessels[0].cleat_endpoint = None;
+    let projected = project_catalog(&catalog_input(&[withdrawn]), &with_tender());
+    let diff = projected.diff_patches(&published);
     let withdrawal = find_entity(&diff, &vessel_entity);
-    assert!(withdrawal.unset.contains(&KEY_PRIMARY_DIRECT_DAEMON.to_owned()));
+    assert!(withdrawal.unset.contains(&KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE.to_owned()));
     assert!(withdrawal.unset.contains(&KEY_PRIMARY_ACTION_RECIPE.to_owned()));
 }
 
-// #4021: a vessel on an SSH host opens through its acting daemon's
-// recipe. The machine it runs on is information, never a direct path (#3995).
+// #4021: a vessel on an SSH host opens through its acting daemon's recipe; the machine it runs
+// on is information. Its daemon is reached directly by its publication, never by that machine.
 #[test]
 fn vessel_on_another_machine_attaches_through_its_acting_daemon_only() {
     use crate::keys::{KEY_READINESS_ATTACH_AVAILABLE, KEY_VESSEL_CARRIED_BY, KEY_VESSEL_HOST};
@@ -416,6 +455,7 @@ fn vessel_on_another_machine_attaches_through_its_acting_daemon_only() {
     let mut terminal = vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-ssh-coder").call();
     terminal.host = HostName::new("udder");
     terminal.carried_by = Some(HostName::new("b1"));
+    terminal.vessel_resource = Some(ResourceRef::new("flotilla/v1", "Vessel", "dev", "convoy-ssh-coder#1"));
     terminal.cleat_endpoint =
         Some(CleatEndpoint { runtime_root: "/run/cleat".to_owned(), daemon: "b1@1".to_owned(), session: "session-7".to_owned() });
     let convoy = ConvoyRow::builder()
@@ -427,24 +467,15 @@ fn vessel_on_another_machine_attaches_through_its_acting_daemon_only() {
         .phase(ConvoyPhase::Active)
         .vessels(vec![terminal])
         .build();
-    let routes = BTreeMap::from([("udder".to_owned(), "udder".to_owned()), ("b1".to_owned(), "b1".to_owned())]);
-    let catalog = project_catalog(&catalog_input(&[convoy]), &mint().with_host_routes(HostName::new("kiwi"), routes));
+    let catalog = project_catalog(&catalog_input(&[convoy]), &with_tender());
 
     let patches = catalog.reassert_patches();
     for target in [entity::vessel("kiwi", "ssh", "coder").expect("valid address"), entity::convoy("kiwi", "ssh").expect("valid address")] {
         let patch = find_entity(&patches, &target);
         assert_eq!(text(patch, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --host 'udder' 'terminal-ssh-coder'");
         assert_eq!(patch.set[KEY_READINESS_ATTACH_AVAILABLE].value, MetadataValue::Bool(true));
-        assert!(text(patch, KEY_PRIMARY_DIRECT_REASON).contains("runs on b1"), "{target:?}");
-        for key in [
-            KEY_PRIMARY_DIRECT_TRANSPORT,
-            KEY_PRIMARY_DIRECT_HOST,
-            KEY_PRIMARY_DIRECT_RUNTIME_ROOT,
-            KEY_PRIMARY_DIRECT_DAEMON,
-            KEY_PRIMARY_DIRECT_SESSION,
-        ] {
-            assert!(!patch.set.contains_key(key), "{target:?} publishes {key}");
-        }
+        assert_eq!(text(patch, KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE), "vessel/convoy-ssh-coder#1", "{target:?}");
+        assert_eq!(text(patch, KEY_PRIMARY_DIRECT_PUBLICATION_NAME), "cleat/b1", "{target:?}");
     }
     let vessel = find_entity(&patches, &entity::vessel("kiwi", "ssh", "coder").expect("valid address"));
     assert_eq!(text(vessel, KEY_VESSEL_HOST), "udder");

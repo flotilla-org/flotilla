@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_protocol::{
     result_set::{
-        AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, CleatEndpoint, ConvoyPhase,
+        AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, CleatPublication, ConvoyPhase,
         ConvoyRow, IndependentRow, ProjectRepositoriesRow, Readiness, ReadinessState, SessionPhase, StandingRoleHold, StandingRoleRow,
         SurfaceState, Timestamp, VesselRow, WorkPhase,
     },
-    EnvironmentKind, HostName, ReferenceContext, ViewAddress,
+    ReferenceContext, ViewAddress,
 };
 use flotilla_resources::{
     ChangeRequest, ChangeRequestStatus, Forge, ForgeSpec, Issue, Observation, ObservedChangeRequestState, ObservedChecks,
@@ -29,18 +29,18 @@ use crate::{
         KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND,
         KEY_INDEPENDENT_HOST, KEY_MEMBERSHIP_PROJECT, KEY_MEMBERSHIP_REPOSITORY_KEY, KEY_MEMBERSHIP_REPOSITORY_SLUG,
         KEY_MEMBERSHIP_SUBPATH, KEY_PRIMARY_ACTION_KEY, KEY_PRIMARY_ACTION_KIND, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE,
-        KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE, KEY_PRIMARY_DIRECT_DAEMON, KEY_PRIMARY_DIRECT_HOST,
-        KEY_PRIMARY_DIRECT_REASON, KEY_PRIMARY_DIRECT_RUNTIME_ROOT, KEY_PRIMARY_DIRECT_SESSION, KEY_PRIMARY_DIRECT_TRANSPORT,
-        KEY_PROJECT_NAME, KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS,
-        KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL,
-        KEY_VESSEL_ALTERNATIVES, KEY_VESSEL_BUILD_JOBS, KEY_VESSEL_CARRIED_BY, KEY_VESSEL_COST_CLASS, KEY_VESSEL_CPUS, KEY_VESSEL_ENV,
-        KEY_VESSEL_HOST, KEY_VESSEL_HOST_NAME, KEY_VESSEL_HOST_REF, KEY_VESSEL_IMAGE_DIGEST, KEY_VESSEL_IMAGE_REF,
-        KEY_VESSEL_IMAGE_SHORT_DIGEST, KEY_VESSEL_KIND, KEY_VESSEL_LINKER_THREADS, KEY_VESSEL_MINIMAL, KEY_VESSEL_MINIMAL_ALTERNATIVES,
-        KEY_VESSEL_NAME, KEY_VESSEL_POLICY, KEY_VESSEL_STANCE, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE,
-        SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE, KEY_PRIMARY_DIRECT_PUBLICATION_LABEL, KEY_PRIMARY_DIRECT_PUBLICATION_NAME,
+        KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE, KEY_PRIMARY_DIRECT_REASON, KEY_PRIMARY_DIRECT_SESSION, KEY_PROJECT_NAME,
+        KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE,
+        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_ALTERNATIVES,
+        KEY_VESSEL_BUILD_JOBS, KEY_VESSEL_CARRIED_BY, KEY_VESSEL_COST_CLASS, KEY_VESSEL_CPUS, KEY_VESSEL_ENV, KEY_VESSEL_HOST,
+        KEY_VESSEL_HOST_NAME, KEY_VESSEL_HOST_REF, KEY_VESSEL_IMAGE_DIGEST, KEY_VESSEL_IMAGE_REF, KEY_VESSEL_IMAGE_SHORT_DIGEST,
+        KEY_VESSEL_KIND, KEY_VESSEL_LINKER_THREADS, KEY_VESSEL_MINIMAL, KEY_VESSEL_MINIMAL_ALTERNATIVES, KEY_VESSEL_NAME,
+        KEY_VESSEL_POLICY, KEY_VESSEL_STANCE, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_ISSUE,
+        SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     legacy_recipe,
-    recipe::{DirectTransport, Recipe, RecipeMint},
+    recipe::{Recipe, RecipeMint},
     wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
 };
 
@@ -1170,10 +1170,10 @@ fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint
     }
     if let Some(recipe) = independent.attach.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &independent.host)) {
         catalog.assert_entity(entity.clone(), action_facts(&recipe, "pane"), ordinal);
-        // Independent rows have no vessel kind, so retain the host-native
-        // assumption. Container-hosted independents need their own environment
-        // evidence before they can be filtered here.
-        facts.extend(direct_facts(independent.cleat_endpoint.as_ref(), Some(EnvironmentKind::Direct), &independent.host, mint));
+        facts.push((
+            KEY_PRIMARY_DIRECT_REASON,
+            MetadataValue::text("independent session is in no vessel, so nothing publishes its Cleat daemon; use flotilla attach"),
+        ));
     }
     catalog.assert_entity(entity, facts, ordinal);
 }
@@ -1262,56 +1262,27 @@ fn action_facts(recipe: &Recipe, vehicle: &'static str) -> Vec<(String, Metadata
     facts
 }
 
-/// A vessel's direct endpoint, or why it has none. A vessel that runs on a
-/// machine other than its acting daemon publishes no direct endpoint until
-/// Tender-published vessel endpoints (#3995); viewers open it by the recipe.
+/// The Tender publication of a vessel's Cleat daemon, or why it has none. The vessel's host
+/// publishes it wherever its environment runs (#4401), so the facts follow from the vessel and
+/// its daemon; the viewer binds it through its own Tender instance.
 fn vessel_direct_facts(vessel: &VesselRow, mint: &dyn RecipeMint) -> Vec<(&'static str, MetadataValue)> {
-    if let Some(machine) = vessel.carried_by.as_ref().filter(|machine| **machine != vessel.host) {
-        return vec![(
-            KEY_PRIMARY_DIRECT_REASON,
-            MetadataValue::text(format!(
-                "vessel runs on {machine}, not on its acting daemon {}; no direct endpoint across hosts yet (#3995)",
-                vessel.host
-            )),
-        )];
-    }
-    direct_facts(vessel.cleat_endpoint.as_ref(), vessel.environment_kind, &vessel.host, mint)
-}
-
-fn direct_facts(
-    endpoint: Option<&CleatEndpoint>,
-    environment_kind: Option<EnvironmentKind>,
-    host: &HostName,
-    mint: &dyn RecipeMint,
-) -> Vec<(&'static str, MetadataValue)> {
-    let Some(endpoint) = endpoint else {
-        return vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text("no observed Cleat daemon endpoint for this session"))];
+    let reason = |reason: &str| vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text(reason))];
+    let Some(endpoint) = &vessel.cleat_endpoint else {
+        return reason("no observed Cleat daemon endpoint for this session");
     };
-    match environment_kind {
-        Some(EnvironmentKind::Provisioned) => {
-            return vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text("Cleat daemon is inside a container; use flotilla attach"))];
-        }
-        None => {
-            return vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text("Cleat daemon environment is unknown; use flotilla attach"))];
-        }
-        Some(EnvironmentKind::Direct) => {}
+    let Some(resource) = &vessel.vessel_resource else {
+        return reason("vessel is not placed, so its Cleat daemon has no publication");
+    };
+    if let Err(missing) = mint.tender() {
+        return reason(&format!("{missing}; use flotilla attach"));
     }
-    match mint.direct_transport(host) {
-        Ok(transport) => {
-            let (kind, address) = match transport {
-                DirectTransport::Local => ("local", host.as_str().to_owned()),
-                DirectTransport::Ssh(destination) => ("ssh", destination),
-            };
-            vec![
-                (KEY_PRIMARY_DIRECT_TRANSPORT, MetadataValue::text(kind)),
-                (KEY_PRIMARY_DIRECT_HOST, MetadataValue::text(address)),
-                (KEY_PRIMARY_DIRECT_RUNTIME_ROOT, MetadataValue::text(&endpoint.runtime_root)),
-                (KEY_PRIMARY_DIRECT_DAEMON, MetadataValue::text(&endpoint.daemon)),
-                (KEY_PRIMARY_DIRECT_SESSION, MetadataValue::text(&endpoint.session)),
-            ]
-        }
-        Err(reason) => vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text(reason))],
-    }
+    let CleatPublication { scope, name, label } = endpoint.publication(&resource.name);
+    vec![
+        (KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE, MetadataValue::text(scope)),
+        (KEY_PRIMARY_DIRECT_PUBLICATION_NAME, MetadataValue::text(name)),
+        (KEY_PRIMARY_DIRECT_PUBLICATION_LABEL, MetadataValue::text(label)),
+        (KEY_PRIMARY_DIRECT_SESSION, MetadataValue::text(&endpoint.session)),
+    ]
 }
 
 #[cfg(test)]
