@@ -51,7 +51,7 @@ async fn heartbeat_publishes_ambient_claude_expiry_metadata_without_material() {
     assert!(!encoded.contains("sk-ant"), "credential material leaked into host status: {encoded}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spawned_fulfilment_probe_task_publishes_facts_after_heartbeat() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"probe-task-test\"\n").expect("daemon config");

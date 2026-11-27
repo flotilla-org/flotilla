@@ -20,6 +20,8 @@ struct HostGit;
 
 impl HostGit {
     async fn git(args: &[&str], cwd: &Path) -> Result<CommandOutput, String> {
+        // The child is work the runtime cannot see: a paused clock stands still while it runs.
+        let _busy = rigging_process::busy::busy();
         let output = tokio::process::Command::new("git")
             .args(args)
             .current_dir(cwd)
@@ -181,6 +183,8 @@ async fn lab_forge() -> LabForge {
     let running = serve::start(&config, fake).await.expect("serve the fake forge");
     let origin = format!("https://localhost:{}", running.api_addr().port());
 
+    // The daemon reads its machine ID as it starts, not from the host's `/etc/machine-id`.
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"forge-identity-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let daemon =
         daemon_with_backend_and_runner(Vec::new(), Arc::clone(&config), flotilla_store_memory::engine_home_backend(), Arc::new(HostGit))
@@ -216,7 +220,7 @@ async fn lab_forge() -> LabForge {
     forge
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_managed_clone_signs_in_as_the_daemon_and_fails_without_its_identity() {
     let forge = lab_forge().await;
 
@@ -237,7 +241,7 @@ async fn the_managed_clone_signs_in_as_the_daemon_and_fails_without_its_identity
 
 // A fresh host has no checkout or clone of the repository to observe its default branch from.
 // What the Repository controller reads it from asks the forge's Git remote, as the daemon.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_fresh_host_reads_a_forge_repositorys_default_branch_from_its_remote_as_the_daemon() {
     let forge = lab_forge().await;
     let resolver = super::super::forge_default_branches(&forge.clones.state);
@@ -255,7 +259,7 @@ async fn a_fresh_host_reads_a_forge_repositorys_default_branch_from_its_remote_a
 // F1 (run 3): a forge mapped to a daemon identity that is unusable (here, its CredentialSpec is
 // not declared) refuses its Git with the reason. It never goes on without the identity, as if the
 // forge needed none. Another forge on the same host still signs in as its own identity.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unusable_daemon_identity_refuses_its_own_forges_git_with_the_reason() {
     let forge = lab_forge().await;
     let resolver = super::super::forge_default_branches(&forge.clones.state);
@@ -276,7 +280,7 @@ async fn an_unusable_daemon_identity_refuses_its_own_forges_git_with_the_reason(
     forge.running.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn settlement_observes_the_remote_ref_as_the_daemon_and_nothing_without_its_identity() {
     let forge = lab_forge().await;
     let target = forge.temp.path().join("managed/widgets");

@@ -568,7 +568,7 @@ fn assert_image_harness_environment(launch: &SshHostLaunch) {
 // onboarding, workspace trust for the checkout, and attribution suppression, so no first-run
 // dialog can appear. Its token lies on the runtime base, outside the home.
 // The host user's `~/.claude.json` and `~/.claude` are never written.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ssh_host_claude_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_ssh_host("claude-code").await;
     // #3929: the launched home is the recorded requester home, not a level below it.
@@ -659,7 +659,7 @@ fn assert_linked_under_current_vessel(runtime: &SshHostRuntime, host: &FakeHost,
 // they first landed by, before the harness starts, and each link is a use B's agent holds.
 // An unchanged relaunch on A sends nothing.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_home_relaunched_after_its_vessel_is_collected_receives_its_harness_and_skills_again() {
     let (mut runtime, host, _runtime_dir, first) = launched_claude_crew().await;
     let arrived = first.artifacts.clone();
@@ -680,7 +680,7 @@ async fn a_home_relaunched_after_its_vessel_is_collected_receives_its_harness_an
 // receives no bytes for it, but B's agent places the home's links again and holds those
 // uses. Once the other vessel retires too, its collection leaves the entries to B.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_entry_another_vessel_holds_is_linked_again_under_the_new_vessel() {
     let (mut runtime, host, _runtime_dir, first) = launched_claude_crew().await;
     let neighbour = runtime.vessel.agent.with_file_name("neighbour");
@@ -705,7 +705,7 @@ async fn an_entry_another_vessel_holds_is_linked_again_under_the_new_vessel() {
 // Acceptance (#4088): a store cleared by hand under a durable home is noticed the same way:
 // the relaunch delivers the harness and skills again, the same way, and links them.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_relaunch_after_the_store_is_cleared_by_hand_delivers_the_harness_and_skills_again() {
     let (runtime, host, _runtime_dir, first) = launched_claude_crew().await;
     runtime.agents.clear_store();
@@ -717,7 +717,7 @@ async fn a_relaunch_after_the_store_is_cleared_by_hand_delivers_the_harness_and_
 // Acceptance (#4088 contract 3): a harness that cannot be delivered again once the store
 // no longer holds it fails the launch with the need it failed at. No harness starts, and
 // the host's own `claude` is never run in its place.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_harness_that_cannot_be_delivered_again_fails_the_launch_by_name() {
     let (runtime, _host, _runtime_dir, _) = launched_claude_crew().await;
     runtime.agents.clear_store();
@@ -731,7 +731,7 @@ async fn a_harness_that_cannot_be_delivered_again_fails_the_launch_by_name() {
     assert_eq!(delivery.retry.as_ref().map(|retry| retry.need.as_str()), Some("harness"), "{delivery:?}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ssh_host_codex_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_ssh_host("codex").await;
     let home = requester_home_at(HOST_BASE, &launch.convoy, "codex");
@@ -1173,7 +1173,7 @@ async fn rebind(daemon: &InProcessDaemon, convoy: &str) {
 // Acceptance (#3907 sticky): a refresh is a new material generation of the same managed
 // credential. The place pass pushes it into the requester's home (update mode push) and
 // records the new generation; the binding does not move.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_refreshed_token_is_pushed_into_the_bound_home_without_moving_the_binding() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
@@ -1206,7 +1206,7 @@ async fn a_refreshed_token_is_pushed_into_the_bound_home_without_moving_the_bind
 // Acceptance (#3907 grant withdrawal, at the place): once the binding is revoked, the place
 // pass deletes the delivered copy, stops the harness session and removes the record; a
 // relaunch is refused with the binding's reason.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
@@ -1231,7 +1231,7 @@ async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
 
 // Acceptance (#3907 rebind, at the place): a binding reopened after the delivery (a rebind)
 // has its old copy deleted and its session stopped, so the requester starts afresh.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_rebound_requester_loses_its_old_copy_and_session() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
@@ -1251,7 +1251,7 @@ async fn a_rebound_requester_loses_its_old_copy_and_session() {
 // Acceptance (#3907 sticky): a harness restart re-reads the same binding and redelivers the
 // current generation; a record left at a replaced vessel's place, whose environment is gone,
 // is swept without touching the binding.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_restart_keeps_the_account_and_a_gone_place_is_swept() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
@@ -1277,7 +1277,7 @@ async fn a_restart_keeps_the_account_and_a_gone_place_is_swept() {
 // #4012: a provision recorded before the token moved out of the home names the old home.
 // The relaunch deletes the copy there and records the material directory, so no copy is
 // left that no record names.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_relaunch_moves_a_copy_recorded_in_the_old_home() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
@@ -1303,7 +1303,7 @@ async fn a_relaunch_moves_a_copy_recorded_in_the_old_home() {
 // Review #3910: a binding homed on another daemon whose clock runs ahead of this place is still
 // delivered from its replica, and the place pass never mistakes the fresh copy for one made
 // before the binding opened.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
@@ -1324,7 +1324,7 @@ async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
 
 // Review #3933: a withdrawal waits for a delivery of the same binding at the place to finish,
 // so it can never remove a copy a launch is still delivering.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_withdrawal_waits_for_a_delivery_in_progress() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
@@ -1352,7 +1352,7 @@ async fn a_withdrawal_waits_for_a_delivery_in_progress() {
 // #3964 contract 4: a failed delivery records, for its access, the need it failed at and
 // when the next attempt is due. A relaunch before then is refused without another attempt;
 // once due, the next delivery lands and clears the retry.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn failed_delivery_waits_for_its_retry_and_is_cleared_once_delivered() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
@@ -1409,7 +1409,7 @@ async fn a_permanent_refusal_is_recorded_and_never_retried() {
 
 // #3964: an access's status lasts as long as its place and its convoy. While both
 // remain it is kept; once the convoy is gone, the access has ended and the record goes.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn access_status_goes_with_its_convoy() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
@@ -1424,7 +1424,7 @@ async fn access_status_goes_with_its_convoy() {
 
 // #4089: retiring a convoy's access on an SSH host removes the requester's home and material
 // from the host, and again is a no-op.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn retiring_a_convoy_removes_its_requester_state_from_the_ssh_host() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
@@ -1447,7 +1447,7 @@ async fn retiring_a_convoy_removes_its_requester_state_from_the_ssh_host() {
 // #3108: not finding an access's convoy or place is no record that it ended. A delivery whose
 // convoy or place cannot be found is held: its record and the requester state on the SSH host
 // stay. Its launch's recorded end still retires it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unresolvable_convoy_or_place_holds_the_access_and_its_requester_state() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
@@ -1480,7 +1480,7 @@ async fn an_unresolvable_convoy_or_place_holds_the_access_and_its_requester_stat
 // #4037 contract 2: when the refresher rotates the central login, the next redelivery pass
 // pushes the new copy into the SSH-host crew's home through its vessel agent, and its
 // access records the copy that landed. The host's own login stays untouched.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_rotated_central_login_is_pushed_into_the_ssh_host_crew_home() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
@@ -1509,7 +1509,7 @@ async fn a_rotated_central_login_is_pushed_into_the_ssh_host_crew_home() {
 // #4037 contract 2: a push that fails leaves the crew on its earlier copy, is shown on its
 // access in `convoy explain` with when it is next attempted, and lands once due. The pass
 // answers that time, which credential delivery takes as its deadline (#3108).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_failed_login_push_is_explained_and_retried() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
@@ -1549,7 +1549,7 @@ async fn a_failed_login_push_is_explained_and_retried() {
 
 // #3108: a push failing ten times in a row is no longer retried on a deadline; the next
 // rotation tries it once more.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_exhausted_login_push_waits_for_the_next_rotation() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
@@ -1584,7 +1584,7 @@ async fn an_exhausted_login_push_waits_for_the_next_rotation() {
 
 // #3108: the refresher's rotation wakes credential delivery, which pushes the new copy; no
 // timer stands behind it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_rotation_wakes_credential_delivery_to_push_the_new_login() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));

@@ -96,7 +96,7 @@ async fn canonicalizes_display_name_kind_host_refs_to_the_host_id() {
     assert_eq!(kinds.get("a-collision").await.expect("ambiguous kind").spec.host_ref, "collision");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn startup_registration_is_idempotent_and_discovers_existing_clone() {
     let temp = TempDir::new().expect("tempdir");
     let git_repo =

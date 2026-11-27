@@ -139,7 +139,7 @@ async fn contained_claude_launch_survives_capability_context_read_failures() {
     assert_contained_claude_invocation_home(LaunchObservationRecord::MissingEnvironment).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtime() {
     let temp = TempDir::new().expect("tempdir");
     let config_path = temp.path().join("config");
@@ -607,7 +607,7 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
 // #3247: while flotillad has a hook endpoint, a host-direct Claude Code crew launches with
 // HTTP hooks to it and its terminal's hook token in the environment; without one it keeps
 // command hooks and gets no token.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listens() {
     for endpoint in [Some(crate::server::HookEndpoint::listening_at("http://127.0.0.1:7878")), None] {
         let temp = TempDir::new().expect("tempdir");

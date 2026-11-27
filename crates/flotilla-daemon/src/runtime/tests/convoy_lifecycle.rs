@@ -494,7 +494,7 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn checkout_authority_observes_replicated_landing_and_convoy_authority_settles_from_evidence() {
     let temp = TempDir::new().expect("tempdir");
     let authority_root = flotilla_protocol::NodeId::new("authority-root");
@@ -691,7 +691,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn in_memory_stage4a_flow_reaches_running_and_completes_convoy() {
     let temp = TempDir::new().expect("tempdir");
     let repo_default_dir = temp.path().join("flotilla-repos");
@@ -716,7 +716,7 @@ async fn in_memory_stage4a_flow_reaches_running_and_completes_convoy() {
     run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::Retain).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn deleting_a_live_convoy_ends_it_and_releases_its_vessel_checkout_and_sessions() {
     let temp = TempDir::new().expect("tempdir");
     let repo_default_dir = temp.path().join("flotilla-repos");
@@ -739,7 +739,7 @@ async fn deleting_a_live_convoy_ends_it_and_releases_its_vessel_checkout_and_ses
     run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::DeleteLive).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn passing_teardown_gate_removes_the_managed_worktree_path() {
     let temp = TempDir::new().expect("tempdir");
     let repo_default_dir = temp.path().join("flotilla-repos");
@@ -827,7 +827,7 @@ async fn checkout_released(
 // F5 (run 3): the checkout is held for the convoy's launch, `<name>#<n>`, and its change request
 // is found through that launch's convoy, so a merged one lands it. Its commits were never pushed,
 // so without the change request it would be archived as forced removal.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_merged_change_request_releases_its_checkout_as_landed() {
     let seen =
         checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false, false, OnHold::Nothing).await;
@@ -841,7 +841,7 @@ async fn a_merged_change_request_releases_its_checkout_as_landed() {
 // The convoy ends, its change request's observer has its chance to collect the observation, and
 // only then is the checkout released: the convoy's demand is held until the checkout it holds is
 // released, so the merged change request is still observed and the checkout is removed as landed.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_checkout_released_after_its_convoy_ended_is_still_judged_against_its_merged_change_request() {
     let seen =
         checkout_released(flotilla_resources::ObservedChangeRequestState::Merged, false, false, OnHold::Nothing, Release::AfterCollection)
@@ -855,7 +855,7 @@ async fn a_checkout_released_after_its_convoy_ended_is_still_judged_against_its_
 
 // A change request closed unmerged did not land the work: its checkout is kept as an archive,
 // never removed as landed.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_change_request_closed_unmerged_archives_its_checkout() {
     let seen =
         checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, false, false, OnHold::Nothing).await;
@@ -871,7 +871,7 @@ async fn a_change_request_closed_unmerged_archives_its_checkout() {
 // An unmerged branch pushed to origin under its own name is pushed, though it is ahead of the
 // origin/main it was made from: its clean checkout is removed as clean and pushed, keeping the
 // branch, and nothing is archived.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unmerged_pushed_clean_branch_is_removed_as_pushed_not_archived() {
     let seen =
         checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, true, false, OnHold::Nothing).await;
@@ -899,7 +899,7 @@ async fn held_landed_checkout(then: OnHold) -> ReleaseSeen {
 
 // Cleaned up and rechecked, the held checkout is released as landed: removed, nothing archived,
 // and the person's attention withdrawn.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_held_landed_checkout_cleaned_and_rechecked_is_released() {
     let seen = held_landed_checkout(OnHold::CleanAndRecheck).await;
     assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
@@ -909,7 +909,7 @@ async fn a_held_landed_checkout_cleaned_and_rechecked_is_released() {
 }
 
 // Ruled archived, the held checkout is archived and removed, and the person's attention withdrawn.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_held_landed_checkout_ruled_archived_is_archived_and_released() {
     let seen = held_landed_checkout(OnHold::Archive).await;
     assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
@@ -940,7 +940,7 @@ fn crew_provisioning_recovers_lost_session_after_in_process_daemon_restart_and_r
 // The daemon's Checkout controller judges a released checkout landed against its change request's
 // replicated observation. On a Forgejo forge that record is stored under the forge's id, which the
 // checkout's repository URL reaches only through the declared Forge.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_checkout_controller_finds_a_forgejo_change_request_landed() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"forgejo-landing-test\"\n").expect("daemon config");
