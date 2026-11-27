@@ -47,6 +47,7 @@ rigging-tls = { workspace = true }
 rigging-http-serve = { workspace = true }
 rigging-http-wire = { workspace = true }
 tender-types = { workspace = true }
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }

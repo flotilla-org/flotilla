@@ -1,20 +1,25 @@
 //! Each vessel's Cleat daemon, published through the Tender instance of the account this daemon
 //! runs as (#4401). A pass compares the daemons this home's vessels run with this instance's own
 //! `cleat` publications as Tender lists them, so a Tender restart (which withdraws every API
-//! publication under a new epoch) and a vessel that ended or left here are settled alike.
+//! publication under a new epoch) and a vessel that ended or left here are settled alike. A pass
+//! runs when a launch here changes and when Tender's control socket appears or goes.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use async_trait::async_trait;
 use flotilla_protocol::result_set::{CleatEndpoint, CLEAT_PUBLICATION_LABEL};
 use flotilla_provider_runtime::{http_channel_label, HttpClient, ReqwestHttpClient};
-use flotilla_resources::{terminal_records::TerminalRecord, ConditionValue, HostCondition};
+use flotilla_resources::{
+    terminal_records::{TerminalChange, TerminalRecord},
+    ConditionValue, HostCondition,
+};
+use flotilla_store::load_metrics::{attributed, caller};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest::{header, Method, Request, StatusCode, Url};
 use rigging_http_wire::Encoding;
 use serde::{de::DeserializeOwned, Serialize};
@@ -23,20 +28,19 @@ use tender_types::{
     paths::control_socket,
     Availability, Label, Publication, PublicationId,
 };
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{
+        broadcast::{self, error::RecvError},
+        mpsc, Mutex,
+    },
+    task::JoinHandle,
+};
 use tracing::{debug, info, warn};
 
-use super::{
-    health::RuntimeHealth,
-    state::ControllerRuntimeState,
-    tasks::{spawn_periodic_task, PeriodicTaskStart},
-};
+use super::{health::RuntimeHealth, state::ControllerRuntimeState};
 
 /// The host condition saying why nothing is published, present only while Tender is unreachable.
 pub(super) const TENDER_CONDITION_TYPE: &str = "Tender";
-const PUBLISH_INTERVAL: Duration = Duration::from_secs(5);
-/// A wedged Tender must not hold the pass.
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One Cleat daemon a vessel carried here runs, and the generation that holds its sessions.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,12 +50,6 @@ pub(super) struct CarriedDaemon {
     pub endpoint: CleatEndpoint,
     pub environment: String,
     pub vessel: String,
-}
-
-impl CarriedDaemon {
-    fn source(&self) -> (String, String, String) {
-        (self.environment.clone(), self.endpoint.runtime_root.clone(), self.endpoint.daemon.clone())
-    }
 }
 
 /// The daemons the running launches in `records` name, one per vessel and logical daemon: the
@@ -100,20 +98,13 @@ pub(super) struct CleatPublisher {
     /// The Tender runtime directory of this daemon's account, or why there is none.
     runtime: Result<PathBuf, String>,
     health: RuntimeHealth,
-    state: Mutex<PublisherState>,
-}
-
-#[derive(Default)]
-struct PublisherState {
-    epoch: Option<String>,
-    /// Each daemon generation's local socket, resolved once: drydock's exposures and the vessel
-    /// agents' forwards stand on their own, whatever Tender does.
-    sockets: BTreeMap<(String, String, String), PathBuf>,
+    /// One pass at a time: two would both publish what neither had seen published.
+    passing: Mutex<()>,
 }
 
 impl CleatPublisher {
     pub(super) fn new(runtime: Result<PathBuf, String>, health: RuntimeHealth) -> Self {
-        Self { runtime, health, state: Mutex::default() }
+        Self { runtime, health, passing: Mutex::default() }
     }
 
     /// Publish every daemon in `carried` and withdraw this instance's other Cleat publications.
@@ -123,13 +114,7 @@ impl CleatPublisher {
             Err(reason) => return self.unreachable(reason),
         };
         self.reachable();
-        let mut state = self.state.lock().await;
-        if state.epoch.as_deref() != Some(listing.epoch.as_str()) {
-            if state.epoch.is_some() {
-                info!(epoch = %listing.epoch, "Tender restarted; publishing the vessels' Cleat daemons again");
-            }
-            state.epoch = Some(listing.epoch.clone());
-        }
+        let _passing = self.passing.lock().await;
         let held = own_cleat_publications(listing.publications);
         let wanted = carried.iter().map(|daemon| &daemon.id).collect::<BTreeSet<_>>();
         for id in held.keys().filter(|id| !wanted.contains(id)) {
@@ -142,15 +127,12 @@ impl CleatPublisher {
             }
         }
         for daemon in carried {
-            let socket = match state.sockets.get(&daemon.source()) {
-                Some(socket) => socket.clone(),
-                None => match sockets.socket(daemon).await {
-                    Ok(socket) => state.sockets.entry(daemon.source()).or_insert(socket).clone(),
-                    Err(error) => {
-                        warn!(publication = %daemon.id, %error, "a vessel's Cleat daemon has no local socket to publish yet");
-                        continue;
-                    }
-                },
+            let socket = match sockets.socket(daemon).await {
+                Ok(socket) => socket,
+                Err(error) => {
+                    warn!(publication = %daemon.id, %error, "a vessel's Cleat daemon has no local socket to publish yet");
+                    continue;
+                }
             };
             match held.get(&daemon.id) {
                 Some(published) if *published == socket => continue,
@@ -177,8 +159,6 @@ impl CleatPublisher {
                 Err(error) => warn!(publication = %daemon.id, %error, "publishing a vessel's Cleat daemon failed; retrying next pass"),
             }
         }
-        let sources = carried.iter().map(CarriedDaemon::source).collect::<BTreeSet<_>>();
-        state.sockets.retain(|source, _| sources.contains(source));
     }
 
     async fn listing(&self) -> Result<(TenderControl, PublicationList), String> {
@@ -233,20 +213,93 @@ fn own_cleat_publications(entries: Vec<PublicationEntry>) -> BTreeMap<Publicatio
         .collect()
 }
 
-/// Publishes this home's vessels' Cleat daemons every [`PUBLISH_INTERVAL`].
+/// Publishes this home's vessels' Cleat daemons as their launches change and as Tender comes
+/// and goes.
 pub(super) fn spawn_cleat_publisher(state: Arc<ControllerRuntimeState>, publisher: Arc<CleatPublisher>) -> JoinHandle<()> {
-    spawn_periodic_task("cleat publications", PUBLISH_INTERVAL, PeriodicTaskStart::Immediate, move || {
-        let state = Arc::clone(&state);
-        let publisher = Arc::clone(&publisher);
-        async move {
-            let reads = state.daemon.lifecycle_reads();
-            let records = reads.terminals().and_then(|terminals| terminals.at(terminals.home()));
-            match records {
-                Ok(records) => publisher.pass(&carried(records.into_iter().filter(TerminalRecord::is_running)), &state).await,
-                Err(error) => warn!(%error, "the terminal launches here could not be read; Cleat publications wait for the next pass"),
+    tokio::spawn(attributed(caller("cleat publications"), async move {
+        let reads = state.daemon.lifecycle_reads();
+        let changes = match reads.terminals() {
+            Ok(terminals) => terminals.changes(),
+            Err(error) => return warn!(%error, "the terminal launches cannot be followed; no vessel's Cleat daemon is published"),
+        };
+        let home = reads.terminals().map(|terminals| terminals.home().to_owned()).unwrap_or_default();
+        let launches = || reads.terminals().and_then(|terminals| terminals.at(terminals.home()));
+        follow(&publisher, &home, launches, changes, &state).await
+    }))
+}
+
+/// Passes once, then again at each launch change at this home and each change to Tender's
+/// control socket, until the launches' feed closes.
+pub(super) async fn follow(
+    publisher: &CleatPublisher,
+    home: &str,
+    launches: impl Fn() -> Result<Vec<TerminalRecord>, String>,
+    mut changes: broadcast::Receiver<TerminalChange>,
+    sockets: &dyn CleatSockets,
+) {
+    let (wake, mut woken) = mpsc::unbounded_channel();
+    let mut tender = publisher.runtime.as_ref().ok().map(|runtime| TenderWatch::new(runtime.clone(), wake.clone()));
+    let home = home.to_owned();
+    let forward = tokio::spawn(async move {
+        loop {
+            match changes.recv().await {
+                Ok(TerminalChange::Changed { home: changed, .. }) if changed != home => {}
+                Ok(_) | Err(RecvError::Lagged(_)) => drop(wake.send(())),
+                Err(RecvError::Closed) => return,
             }
         }
-    })
+    });
+    loop {
+        if let Some(tender) = tender.as_mut() {
+            tender.arm();
+        }
+        match launches() {
+            Ok(records) => publisher.pass(&carried(records.into_iter().filter(TerminalRecord::is_running)), sockets).await,
+            Err(error) => warn!(%error, "the terminal launches here could not be read; Cleat publications wait for the next change"),
+        }
+        if woken.recv().await.is_none() {
+            break;
+        }
+        while woken.try_recv().is_ok() {}
+    }
+    forward.abort();
+}
+
+/// Tender's runtime directory, watched for its control socket appearing or going: a Tender that
+/// starts binds it afresh, under a new epoch. Its parent is watched while it does not exist.
+struct TenderWatch {
+    runtime: PathBuf,
+    watcher: Option<RecommendedWatcher>,
+    watching: Option<PathBuf>,
+}
+
+impl TenderWatch {
+    fn new(runtime: PathBuf, wake: mpsc::UnboundedSender<()>) -> Self {
+        let (directory, control) = (runtime.clone(), control_socket(&runtime));
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            // An error may hide a change, so it wakes a pass too.
+            if event.map_or(true, |event| event.paths.iter().any(|path| *path == directory || *path == control)) {
+                let _ = wake.send(());
+            }
+        });
+        let watcher = watcher.inspect_err(|error| warn!(%error, "not watching for Tender; only launch changes publish")).ok();
+        Self { runtime, watcher, watching: None }
+    }
+
+    fn arm(&mut self) {
+        let target = if self.runtime.is_dir() { Some(self.runtime.as_path()) } else { self.runtime.parent() };
+        let (Some(watcher), Some(target)) = (self.watcher.as_mut(), target) else { return };
+        if self.watching.as_deref() == Some(target) {
+            return;
+        }
+        if let Some(watching) = self.watching.take() {
+            let _ = watcher.unwatch(&watching);
+        }
+        match watcher.watch(target, RecursiveMode::NonRecursive) {
+            Ok(()) => self.watching = Some(target.to_path_buf()),
+            Err(error) => warn!(directory = %target.display(), %error, "not watching for Tender; only launch changes publish"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -288,7 +341,6 @@ impl TenderControl {
         let encoding = Encoding::Json;
         let url = Url::parse(&format!("http://tender{path}")).map_err(|error| ControlError::Unreachable(error.to_string()))?;
         let mut request = Request::new(method.clone(), url);
-        *request.timeout_mut() = Some(CONTROL_TIMEOUT);
         request.headers_mut().insert(header::ACCEPT, header::HeaderValue::from_static(encoding.content_type()));
         if let Some(body) = body {
             let bytes = encoding.encode(body).map_err(ControlError::Unreachable)?;

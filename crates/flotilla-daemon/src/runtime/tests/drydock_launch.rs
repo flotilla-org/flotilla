@@ -254,7 +254,7 @@ async fn a_failed_vessel_layer_discards_only_a_vessel_it_created() {
 // the vessel.
 #[tokio::test]
 async fn a_provisioned_vessels_cleat_daemon_is_published_through_its_exposure() {
-    use super::cleat_publications::{cleat_daemon, eventually_greets, launch, publication, TestTender};
+    use super::cleat_publications::{cleat_daemon, greets, launch, publication, TestTender};
     use crate::runtime::{
         cleat_publications::{carried, CleatPublisher},
         health::RuntimeHealth,
@@ -277,7 +277,7 @@ async fn a_provisioned_vessels_cleat_daemon_is_published_through_its_exposure() 
     let endpoint = entry.expect("published").endpoint.expect("its own socket");
     assert_ne!(endpoint, guest, "published from drydock's exposure, not the guest path");
     assert_eq!(endpoint.file_name().and_then(|name| name.to_str()), Some("cleat-default.sock"), "the exposure named for the daemon");
-    eventually_greets(&tender_types::paths::binding_path(&tender.paths.runtime, &publication()), b"cleat in the vessel").await;
+    greets(&tender.paths.runtime, &tender_types::paths::binding_path(&tender.paths.runtime, &publication()), b"cleat in the vessel").await;
 
     tender.stop().await;
     stand_in.handle().await.expect("provisioned handle").destroy().await.expect("destroy");

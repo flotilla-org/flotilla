@@ -2565,6 +2565,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "notify",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "percent-encoding",

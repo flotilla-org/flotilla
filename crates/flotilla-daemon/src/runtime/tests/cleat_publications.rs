@@ -10,20 +10,22 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::LifecycleReading;
 use flotilla_resources::{
-    terminal_records::{TerminalLaunchFacts, TerminalLaunchSource, TerminalRecord},
+    terminal_records::{TerminalChange, TerminalLaunchFacts, TerminalLaunchSource, TerminalRecord},
     ConditionValue,
 };
 use flotilla_test_support::TestSocketDir;
+use notify::{RecursiveMode, Watcher};
 use tender::daemon::{Daemon, Paths};
 use tender_types::{paths::binding_path, Availability, PublicationId};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    sync::{broadcast, mpsc},
     task::JoinHandle,
 };
 
 use crate::runtime::{
-    cleat_publications::{carried, CarriedDaemon, CleatPublisher, CleatSockets, TENDER_CONDITION_TYPE},
+    cleat_publications::{carried, follow, CarriedDaemon, CleatPublisher, CleatSockets, TENDER_CONDITION_TYPE},
     health::RuntimeHealth,
 };
 
@@ -34,32 +36,24 @@ const HOST_DIRECT: &str = "host-direct";
 pub(super) struct TestTender {
     pub paths: Paths,
     daemon: Option<Daemon>,
+    starts: usize,
 }
 
 impl TestTender {
     pub async fn start(root: &Path) -> Self {
-        let paths = Paths { config: root.join("config"), state: root.join("state"), runtime: root.join("run") };
+        let paths = Paths { config: root.join("config"), state: root.join("state-0"), runtime: root.join("run") };
         let daemon = Daemon::start(paths.clone()).await.expect("tender starts");
-        Self { paths, daemon: Some(daemon) }
+        Self { paths, daemon: Some(daemon), starts: 0 }
     }
 
-    /// Stop it and start it again over the same directories, as a host restarting Tender does.
+    /// Stop it and start Tender again on the same runtime directory, under a new epoch. The new
+    /// daemon has a state directory of its own: a stopped one releases its store lock only as its
+    /// aborted tasks unwind (flotilla-org/rigging#65).
     pub async fn restart(&mut self) {
         self.stop().await;
-        // The stopped daemon's aborted tasks release its store lock as they unwind.
-        for _ in 0..250 {
-            match Daemon::start(self.paths.clone()).await {
-                Ok(daemon) => {
-                    self.daemon = Some(daemon);
-                    return;
-                }
-                Err(error) if ["WouldBlock", "would block"].iter().any(|text| error.to_string().contains(text)) => {
-                    tokio::time::sleep(Duration::from_millis(20)).await
-                }
-                Err(error) => panic!("tender starts again: {error}"),
-            }
-        }
-        panic!("the stopped Tender never released its store");
+        self.starts += 1;
+        self.paths.state = self.paths.runtime.with_file_name(format!("state-{}", self.starts));
+        self.daemon = Some(Daemon::start(self.paths.clone()).await.expect("tender starts again"));
     }
 
     pub async fn stop(&mut self) {
@@ -101,17 +95,27 @@ pub(super) async fn greeting(socket: &Path) -> Option<Vec<u8>> {
     Some(read)
 }
 
-/// Waits until connecting to `socket` reads `expected`, up to ten seconds of Tender's own work.
-pub(super) async fn eventually_greets(socket: &Path, expected: &[u8]) {
+/// Waits until connecting to `socket` reads `expected`, trying again whenever anything changes in
+/// Tender's runtime directory, where it keeps its Bindings; ten seconds bound the wait.
+pub(super) async fn greets(runtime: &Path, socket: &Path, expected: &[u8]) {
+    let (changed, mut changes) = mpsc::unbounded_channel();
+    let mut watcher = notify::recommended_watcher(move |_: notify::Result<notify::Event>| {
+        let _ = changed.send(());
+    })
+    .expect("watcher");
+    watcher.watch(runtime, RecursiveMode::Recursive).expect("watch Tender's runtime directory");
     let mut last = None;
-    for _ in 0..100 {
-        last = greeting(socket).await;
-        if last.as_deref() == Some(expected) {
-            return;
+    let reached = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            last = greeting(socket).await;
+            if last.as_deref() == Some(expected) {
+                return;
+            }
+            changes.recv().await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("{} read {last:?}, not {:?}", socket.display(), String::from_utf8_lossy(expected));
+    })
+    .await;
+    assert!(reached.is_ok(), "{} read {last:?}, not {:?}", socket.display(), String::from_utf8_lossy(expected));
 }
 
 /// A running launch of vessel `VESSEL`, held by cleat daemon generation `daemon` under `root`.
@@ -178,7 +182,7 @@ async fn a_vessels_cleat_daemon_is_published_until_its_vessel_ends_here() {
     let entry = entry.expect("published");
     assert_eq!(entry.publication.label.0, "cleat");
     assert_eq!(entry.endpoint.as_deref(), Some(root.join("default@1").join("socket").as_path()));
-    eventually_greets(&binding, b"cleat default@1").await;
+    greets(&tender.paths.runtime, &binding, b"cleat default@1").await;
     assert!(tender_condition(&health).is_none(), "a reachable Tender raises no condition");
 
     tender.restart().await;
@@ -188,12 +192,12 @@ async fn a_vessels_cleat_daemon_is_published_until_its_vessel_ends_here() {
     publisher.pass(&running, &sockets).await;
     let (_, entry) = tender.listed(&id).await;
     assert_eq!(entry.expect("published again").publication.availability, Availability::Available);
-    eventually_greets(&binding, b"cleat default@1").await;
+    greets(&tender.paths.runtime, &binding, b"cleat default@1").await;
 
     publisher.pass(&[], &sockets).await;
     let (_, entry) = tender.listed(&id).await;
     assert!(entry.as_ref().is_none_or(|entry| entry.publication.availability == Availability::Withdrawn), "{entry:?}");
-    eventually_greets(&binding, b"").await;
+    greets(&tender.paths.runtime, &binding, b"").await;
     tender.stop().await;
 }
 
@@ -213,12 +217,12 @@ async fn the_newest_launch_names_the_generation_and_the_environment_names_the_so
     let binding = binding_path(&tender.paths.runtime, &publication());
 
     publisher.pass(&carried([launch(2, HOST_DIRECT, &root, "default@2"), launch(1, HOST_DIRECT, &root, "default@1")]), &sockets).await;
-    eventually_greets(&binding, b"second").await;
+    greets(&tender.paths.runtime, &binding, b"second").await;
 
     publisher.pass(&carried([launch(3, "vessel-env", &root, "default@2")]), &sockets).await;
     let (_, entry) = tender.listed(&publication()).await;
     assert_eq!(entry.expect("published").endpoint, Some(exposed));
-    eventually_greets(&binding, b"exposed").await;
+    greets(&tender.paths.runtime, &binding, b"exposed").await;
     tender.stop().await;
 }
 
@@ -248,6 +252,46 @@ async fn without_tender_the_host_says_why_and_publishes_once_it_answers() {
     let mut tender = TestTender::start(&dir.path().join("t")).await;
     publisher.pass(&running, &sockets).await;
     assert!(tender_condition(&health).is_none(), "an answering Tender clears it");
-    eventually_greets(&binding_path(&runtime, &publication()), b"cleat").await;
+    greets(&runtime, &binding_path(&runtime, &publication()), b"cleat").await;
     tender.stop().await;
+}
+
+// Nothing but events drives the publisher: a launch here changing publishes its daemon, a Tender
+// that starts afresh has it published again, and the launch ending withdraws it.
+#[tokio::test]
+async fn launch_changes_and_a_restarted_tender_drive_the_publications() {
+    let dir = TestSocketDir::new();
+    let mut tender = TestTender::start(&dir.path().join("t")).await;
+    let root = dir.path().join("cleat");
+    let _daemon = cleat_daemon(&root.join("default@1").join("socket"), b"cleat");
+    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), RuntimeHealth::default());
+    let sockets = Sockets { exposed: dir.path().join("unused") };
+    let launches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (changed, changes) = broadcast::channel(16);
+    let read = std::sync::Arc::clone(&launches);
+    let following = async move {
+        follow(&publisher, "kiwi", move || Ok(read.lock().unwrap().clone()), changes, &sockets).await;
+    };
+    let binding = binding_path(&tender.paths.runtime, &publication());
+    let change = |home: &str| TerminalChange::Changed { name: "terminal-work-coder#1".into(), home: home.into() };
+    let script = async {
+        *launches.lock().unwrap() = vec![launch(1, HOST_DIRECT, &root, "default@1")];
+        changed.send(change("elsewhere")).expect("followed");
+        changed.send(change("kiwi")).expect("followed");
+        greets(&tender.paths.runtime, &binding, b"cleat").await;
+
+        tender.restart().await;
+        greets(&tender.paths.runtime, &binding, b"cleat").await;
+        let (_, entry) = tender.listed(&publication()).await;
+        assert_eq!(entry.expect("published again").publication.availability, Availability::Available);
+
+        launches.lock().unwrap().clear();
+        changed.send(change("kiwi")).expect("followed");
+        greets(&tender.paths.runtime, &binding, b"").await;
+        tender.stop().await;
+    };
+    tokio::select! {
+        () = following => panic!("the publisher stopped following"),
+        () = script => {}
+    }
 }
