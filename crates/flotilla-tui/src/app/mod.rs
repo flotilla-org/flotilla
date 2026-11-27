@@ -576,22 +576,12 @@ impl App {
     }
 
     pub fn new(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>, config: Arc<ConfigStore>, theme: Theme) -> Self {
-        Self::construct(daemon, repos_info, config, theme, None)
+        Self::new_with_default_landing(daemon, repos_info, config, theme, None)
     }
 
     /// Construct the full TUI with an optional fresh-config landing View.
     /// Persisted `open-views.toml` entries always take precedence.
     pub fn new_with_default_landing(
-        daemon: Arc<dyn DaemonHandle>,
-        repos_info: Vec<RepoInfo>,
-        config: Arc<ConfigStore>,
-        theme: Theme,
-        landing: Option<(RepoIdentity, ViewAddress)>,
-    ) -> Self {
-        Self::construct(daemon, repos_info, config, theme, landing)
-    }
-
-    fn construct(
         daemon: Arc<dyn DaemonHandle>,
         repos_info: Vec<RepoInfo>,
         config: Arc<ConfigStore>,
@@ -708,7 +698,7 @@ impl App {
         theme: Theme,
         address: ViewAddress,
     ) -> Self {
-        let mut app = Self::construct(daemon, repos_info, config, theme, None);
+        let mut app = Self::new_with_default_landing(daemon, repos_info, config, theme, None);
         app.views = OpenViews::scoped(address);
         app.subscriptions_dirty = true;
         app.sync_active_view();
