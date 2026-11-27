@@ -31,7 +31,7 @@ use tender_types::{
 use tokio::{
     sync::{
         broadcast::{self, error::RecvError},
-        mpsc, Mutex,
+        mpsc,
     },
     task::JoinHandle,
 };
@@ -98,13 +98,11 @@ pub(super) struct CleatPublisher {
     /// The Tender runtime directory of this daemon's account, or why there is none.
     runtime: Result<PathBuf, String>,
     health: RuntimeHealth,
-    /// One pass at a time: two would both publish what neither had seen published.
-    passing: Mutex<()>,
 }
 
 impl CleatPublisher {
     pub(super) fn new(runtime: Result<PathBuf, String>, health: RuntimeHealth) -> Self {
-        Self { runtime, health, passing: Mutex::default() }
+        Self { runtime, health }
     }
 
     /// Publish every daemon in `carried` and withdraw this instance's other Cleat publications.
@@ -114,7 +112,6 @@ impl CleatPublisher {
             Err(reason) => return self.unreachable(reason),
         };
         self.reachable();
-        let _passing = self.passing.lock().await;
         let held = own_cleat_publications(listing.publications);
         let wanted = carried.iter().map(|daemon| &daemon.id).collect::<BTreeSet<_>>();
         for id in held.keys().filter(|id| !wanted.contains(id)) {
