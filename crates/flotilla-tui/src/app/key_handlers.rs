@@ -145,10 +145,6 @@ impl App {
 
     pub(super) fn execute_table_intent(&mut self, intent: TableIntent) {
         let (mut command, host) = match intent {
-            TableIntent::OpenInPm(target) => {
-                self.report_focus(vec![target.resource_ref()]);
-                return;
-            }
             TableIntent::AttachPane { reference, host } => {
                 self.proto_commands.push(self.command(CommandAction::AttachTransient {
                     reference,

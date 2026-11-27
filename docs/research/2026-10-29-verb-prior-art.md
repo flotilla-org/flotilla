@@ -357,11 +357,10 @@ Server-only facts the client cannot compute should be published as ordinary colu
 - `ActionSpec<R>` is `{id, label, key, resolve: fn(&R) -> Option<TableIntent>}` (`crates/flotilla-tui/src/table_view.rs:352-357`).
 - `TableSpec::project` runs every `resolve` for every row and keeps those that return `Some` as `AvailableAction`s on the `ProjectedRow` (`table_view.rs:368-395, 432-447`).
 - Applicability is therefore Rust code per row, as with CLIM testers, and the result is per-row lists, as with Siren.
-- Convoys have `open_pr`, `delete` and `open_in_pm` (`table_view.rs:1032-1036`). Vessels have `attach`, `force_complete` and `open_in_pm` (`:1084-1088`). Issues have `start` (`:1162-1163`).
+- Convoys have `open_pr` and `delete` (`table_view.rs:1032-1036`). Vessels have `attach` and `force_complete` (`:1084-1088`). Issues have `start` (`:1162-1163`).
 
-**`TableIntent`** is a closed enum of eight intents (`table_view.rs:413-422`): `OpenInPm`, `AttachPane`, `DeleteConvoy`, `OpenChangeRequest`, `ForceCompleteWork`, and three `StartConvoy` forms.
+**`TableIntent`** is a closed enum of seven intents (`table_view.rs:413-422`): `AttachPane`, `DeleteConvoy`, `OpenChangeRequest`, `ForceCompleteWork`, and three `StartConvoy` forms.
 - `execute_table_intent` turns each into either a local effect or a daemon `CommandAction` (`crates/flotilla-tui/src/app/key_handlers.rs:146-205`).
-  - `OpenInPm` is a local focus report.
   - `AttachPane` becomes `AttachTransient`.
   - `DeleteConvoy` and the start intents push bespoke confirm modals (`ConvoyDeleteConfirmWidget`, `DispatchConfirmWidget`).
 - The `open` versus `command` split exists, but only implicitly.

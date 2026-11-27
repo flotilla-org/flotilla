@@ -17,10 +17,7 @@ use flotilla_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase},
-    pm_open::OpenInPmTarget,
-};
+use crate::convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RowId(String);
@@ -411,7 +408,6 @@ pub struct DetailField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableIntent {
-    OpenInPm(OpenInPmTarget),
     AttachPane { reference: String, host: HostName },
     DeleteConvoy { row_id: RowId, namespace: String, name: String, host: Option<HostName> },
     OpenChangeRequest { id: String, repository_key: RepositoryKey, host: Option<HostName> },
@@ -546,7 +542,6 @@ struct VesselProjection {
     namespace: String,
     convoy: String,
     convoy_name: String,
-    origin_host: Option<HostName>,
     vessel: VesselSummary,
 }
 
@@ -653,7 +648,6 @@ fn project_at(address: &ViewAddress, data: &TableRows<'_>, now: Timestamp) -> Re
                 namespace: namespace.clone(),
                 convoy: name.clone(),
                 convoy_name: convoy.name.clone(),
-                origin_host: convoy.origin_host.clone(),
                 vessel: vessel.clone(),
             });
             let subjects = convoy_subjects_label(&convoy.subjects, false);
@@ -674,7 +668,6 @@ fn project_at(address: &ViewAddress, data: &TableRows<'_>, now: Timestamp) -> Re
                     namespace: namespace.clone(),
                     convoy: convoy.clone(),
                     convoy_name: convoy_row.name.clone(),
-                    origin_host: convoy_row.origin_host.clone(),
                     vessel: vessel_row.clone(),
                 }],
             ))
@@ -1029,10 +1022,9 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 8] = [
     },
 ];
 
-static CONVOY_ACTIONS: [ActionSpec<ConvoySummary>; 3] = [
+static CONVOY_ACTIONS: [ActionSpec<ConvoySummary>; 2] = [
     ActionSpec { id: "open_pr", label: "Open PR", key: 'p', resolve: open_convoy_change_request },
     ActionSpec { id: "delete", label: "Delete convoy", key: 'd', resolve: delete_convoy },
-    ActionSpec { id: "open_in_pm", label: "Open in PM", key: 'o', resolve: open_convoy_in_pm },
 ];
 
 static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 7] = [
@@ -1081,10 +1073,9 @@ static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 7] = [
     },
 ];
 
-static VESSEL_ACTIONS: [ActionSpec<VesselProjection>; 3] = [
+static VESSEL_ACTIONS: [ActionSpec<VesselProjection>; 2] = [
     ActionSpec { id: "attach", label: "Attach session", key: 'a', resolve: attach_vessel },
     ActionSpec { id: "force_complete", label: "Force-complete work", key: 'x', resolve: force_complete_vessel },
-    ActionSpec { id: "open_in_pm", label: "Open in PM", key: 'o', resolve: open_vessel_in_pm },
 ];
 
 static INDEPENDENT_COLUMNS: [ColumnSpec<IndependentRow>; 5] = [
@@ -1363,15 +1354,6 @@ fn open_convoy_change_request(row: &ConvoySummary) -> Option<TableIntent> {
     })
 }
 
-fn open_convoy_in_pm(row: &ConvoySummary) -> Option<TableIntent> {
-    Some(TableIntent::OpenInPm(OpenInPmTarget {
-        namespace: row.namespace.clone(),
-        convoy: row.resource_name.clone(),
-        vessel: None,
-        host: row.origin_host.clone(),
-    }))
-}
-
 fn delete_convoy(row: &ConvoySummary) -> Option<TableIntent> {
     Some(TableIntent::DeleteConvoy {
         row_id: convoy_id(row),
@@ -1515,15 +1497,6 @@ fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
 
 fn attach_vessel(row: &VesselProjection) -> Option<TableIntent> {
     Some(TableIntent::AttachPane { reference: row.vessel.materialize_ref.clone()?, host: row.vessel.host.clone()? })
-}
-
-fn open_vessel_in_pm(row: &VesselProjection) -> Option<TableIntent> {
-    Some(TableIntent::OpenInPm(OpenInPmTarget {
-        namespace: row.namespace.clone(),
-        convoy: row.convoy.clone(),
-        vessel: Some(row.vessel.name.clone()),
-        host: row.origin_host.clone().or_else(|| row.vessel.host.clone()),
-    }))
 }
 
 fn force_complete_vessel(row: &VesselProjection) -> Option<TableIntent> {
@@ -2064,13 +2037,6 @@ mod tests {
         row.origin_host = Some(HostName::new("kiwi"));
         let view = project_convoys("convoys/dev", &[&row]).expect("project table");
 
-        assert!(view.rows[0].actions.iter().any(|action| action.id == "open_in_pm" && action.label == "Open in PM" && action.key == 'o'));
-        // Focus uses the stored resource name, not the display address with a project suffix.
-        let TableIntent::OpenInPm(target) = &view.rows[0].actions.iter().find(|action| action.id == "open_in_pm").unwrap().intent else {
-            panic!("expected focus target");
-        };
-        assert_eq!(target.resource_ref(), ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "tables").on_host(HostName::new("kiwi")));
-
         assert!(view.rows[0].actions.iter().any(|action| {
             action
                 == &AvailableAction {
@@ -2134,9 +2100,9 @@ mod tests {
         let row = convoy(vec![actionable, vessel("review", &["implement"], WorkPhase::Pending)]);
         let view = project_convoys("convoy/dev/tables", &[&row]).expect("project table");
 
-        assert_eq!(view.rows[0].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["attach", "force_complete", "open_in_pm"]);
+        assert_eq!(view.rows[0].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["attach", "force_complete"]);
         assert_eq!(view.rows[0].actions[0].intent, TableIntent::AttachPane { reference: "terminal-1".into(), host: HostName::new("kiwi") });
-        assert_eq!(view.rows[1].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["open_in_pm"]);
+        assert_eq!(view.rows[1].actions.iter().map(|action| action.id).collect::<Vec<_>>(), Vec::<&str>::new());
     }
 
     #[test]

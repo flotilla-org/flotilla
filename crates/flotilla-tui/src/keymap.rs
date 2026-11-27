@@ -45,8 +45,6 @@ pub enum Action {
     OpenContextualPalette,
     Describe,
     FillSelected,
-    /// Materialize or focus the selected convoy/vessel in the connected PM.
-    OpenInPm,
 }
 
 impl Action {
@@ -106,7 +104,6 @@ impl Action {
             "open_contextual_palette" => Action::OpenContextualPalette,
             "describe" => Action::Describe,
             "fill_selected" => Action::FillSelected,
-            "open_in_pm" => Action::OpenInPm,
             _ => return None,
         };
         Some(action)
@@ -147,7 +144,6 @@ impl Action {
             Action::OpenContextualPalette => "open_contextual_palette",
             Action::Describe => "describe",
             Action::FillSelected => "fill_selected",
-            Action::OpenInPm => "open_in_pm",
         }
     }
 
@@ -184,7 +180,6 @@ impl Action {
             Action::OpenContextualPalette => "Open contextual palette (pre-filled)",
             Action::Describe => "Describe selected row",
             Action::FillSelected => "Fill selected item",
-            Action::OpenInPm => "Open in presentation manager",
         }
     }
 }
