@@ -37,14 +37,14 @@ enum ClosedWatch {
 
 // #2287 recovery: a closed notification stream must be resubscribed, and the
 // recovery scan must deliver a turn replicated while that stream was down.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn remote_turn_delivery_recovers_after_either_watch_closes() {
     for input in [ClosedWatch::Convoy, ClosedWatch::TerminalSession] {
         remote_turn_scenario(Some(input)).await;
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn modern_remote_nudge_uses_ordinary_message_admission() {
     remote_turn_scenario(None).await;
 }
