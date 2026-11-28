@@ -39,13 +39,11 @@ pub trait ProviderApi: Send + Sync {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApiError {
     /// The host answered with a protocol error.
-    Protocol {
-        kind: ProtocolErrorKind,
-        reason: String,
-        description: String,
-    },
-    NotReady,
-    ReadinessTimeout,
+    Protocol { kind: ProtocolErrorKind, reason: String, description: String },
+    /// The host is not ready, for drydock's reason.
+    NotReady(String),
+    /// The host did not become ready in time; drydock's last readiness.
+    ReadinessTimeout(String),
     /// The call failed before the host answered, or its answer was not the API's.
     Other(String),
 }
@@ -73,8 +71,8 @@ impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Protocol { description, .. } => write!(f, "drydock provider {description}"),
-            Self::NotReady => f.write_str("drydock provider not ready"),
-            Self::ReadinessTimeout => f.write_str("drydock provider readiness timed out"),
+            Self::NotReady(reason) => write!(f, "drydock provider not ready: {reason}"),
+            Self::ReadinessTimeout(reason) => write!(f, "drydock provider readiness timed out: {reason}"),
             Self::Other(description) => f.write_str(description),
         }
     }

@@ -43,8 +43,8 @@ pub fn api_error(error: drydock::client::Error) -> ApiError {
             };
             ApiError::Protocol { kind, reason, description: error.to_string() }
         }
-        Error::NotReady(_) => ApiError::NotReady,
-        Error::ReadinessTimeout(_) => ApiError::ReadinessTimeout,
+        Error::NotReady(readiness) => ApiError::NotReady(readiness.to_string()),
+        Error::ReadinessTimeout(readiness) => ApiError::ReadinessTimeout(readiness.to_string()),
         other => ApiError::Other(other.to_string()),
     }
 }

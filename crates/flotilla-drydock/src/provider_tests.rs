@@ -324,7 +324,8 @@ async fn reference_readiness_tracks_credential_delivery() {
     let provider = host.provider();
     assert!(provider.capabilities().material_modes.is_empty(), "unknown declarations cannot claim Shared");
     assert!(matches!(provider.detect_readiness().await, ProviderReadiness::MissingCredential { .. }));
-    assert!(provider.prepare(&spec(), &Default::default()).await.is_err());
+    let refusal = provider.prepare(&spec(), &Default::default()).await.err().expect("drydock refuses");
+    assert!(refusal.contains("missing credential: credential not delivered"), "drydock's own reason: {refusal}");
     host.ready().await;
     assert_eq!(provider.detect_readiness().await, ProviderReadiness::Ready);
     assert!(provider.capabilities().material_modes.contains(&MaterialMode::Pushed));
@@ -726,5 +727,6 @@ fn protocol_errors_keep_the_kinds_the_adapter_acts_on() {
     assert_eq!(kind(wire::ProtocolError::NotFound { reason: "gone".into() }), (ProtocolErrorKind::NotFound, "gone".into()));
     assert_eq!(kind(wire::ProtocolError::Refused { reason: "no".into() }), (ProtocolErrorKind::Refused, "no".into()));
     assert_eq!(kind(wire::ProtocolError::QuotaExhausted { reason: "full".into() }), (ProtocolErrorKind::Other, String::new()));
-    assert_eq!(api_error(::drydock::client::Error::NotReady(wire::Readiness::Ready)), ApiError::NotReady);
+    let missing = wire::Readiness::MissingCredential { reason: "no key".into() };
+    assert_eq!(api_error(::drydock::client::Error::NotReady(missing.clone())), ApiError::NotReady(missing.to_string()));
 }

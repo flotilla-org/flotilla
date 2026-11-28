@@ -51,7 +51,6 @@ async fn readiness_and_capabilities_follow_the_declaration() {
     assert!(provider.capabilities().material_modes.is_empty(), "unknown declarations cannot claim Shared");
     fixture.api.declaration.lock().unwrap().readiness = wire::Readiness::MissingCredential { reason: "no key".into() };
     assert!(matches!(provider.detect_readiness().await, ProviderReadiness::MissingCredential { .. }));
-    assert!(provider.prepare(&spec(), &Default::default()).await.is_err());
     fixture.api.declaration.lock().unwrap().readiness = wire::Readiness::Ready;
     assert_eq!(provider.detect_readiness().await, ProviderReadiness::Ready);
     let capabilities = provider.capabilities();
@@ -61,6 +60,16 @@ async fn readiness_and_capabilities_follow_the_declaration() {
     let absent =
         DrydockEnvironmentProvider::new(fixture.api.clone(), Arc::new(MemoryLink(fixture.agent.clone())), "other".into(), "other".into());
     assert!(matches!(absent.detect_readiness().await, ProviderReadiness::Unknown { reason } if reason.contains("absent")));
+}
+
+// Prepare asks drydock directly, with no readiness read first, and reports drydock's refusal.
+#[tokio::test]
+async fn prepare_reports_drydocks_refusal() {
+    let fixture = Fixture::new();
+    fixture.api.declaration.lock().unwrap().readiness = wire::Readiness::MissingCredential { reason: "no key".into() };
+    let error = fixture.provider().prepare(&spec(), &Default::default()).await.err().expect("drydock refuses");
+    assert_eq!(error, "drydock provider not ready: no key");
+    assert_eq!(fixture.api.prepares.lock().unwrap().len(), 1, "the refusal is drydock's, not a local check");
 }
 
 struct PullMaterial;
@@ -311,5 +320,8 @@ fn a_protocol_error_keeps_the_providers_explanation() {
         description: "internal: provider daytona operation provision; Total memory limit exceeded".into(),
     };
     assert_eq!(api_error(error), "drydock provider internal: provider daytona operation provision; Total memory limit exceeded");
-    assert_eq!(api_error(ApiError::NotReady), "drydock provider not ready");
+    assert_eq!(
+        api_error(ApiError::NotReady("missing credential: no key".into())),
+        "drydock provider not ready: missing credential: no key"
+    );
 }
