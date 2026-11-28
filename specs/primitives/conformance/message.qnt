@@ -23,6 +23,7 @@ module message_conformance {
     .union(bools.map(a => (if (env.hasCondition) bools else Set(false)).map(c =>
       { ...base, reason: M::Withdrawn, authorised: a, conditionFailed: c })).flatten())
     .union(bools.map(a => { ...base, reason: M::ConsumerUnreachable, authorised: a }))
+    .union(bools.map(r => bools.map(f => { ...base, reason: M::Failed, receipt: r, failure: f })).flatten())
   pure def events(env: M::Envelope): Set[M::Event] = bools.map(o => bools.map(r => bools.map(t => Set(1, 2).map(who =>
       M::Deliver({ observed: o, receiverMatches: r, transportMatches: t, receiver: { consumer: who, host: "consumer" } })))
       .flatten()).flatten()).flatten()

@@ -417,7 +417,7 @@ impl<L: InboxLog + 'static> EngineInbox<L> {
             for resource in page.messages {
                 Self::validate_admission(&resource)?;
                 let name = resource.name().to_owned();
-                let recover_reaction = resource.state().drop_reason() == Some(&DropReason::Undeliverable);
+                let recover_reaction = resource.state().drop_reason().is_some_and(DropReason::dead_letters);
                 let inbox = resource.spec().inbox.clone();
                 if resource.spec().admitted_seq > sequence {
                     continue;
@@ -1079,14 +1079,14 @@ impl<L: InboxLog + 'static> InboxBackend for EngineInbox<L> {
             // A retry after the Message commit but a failed reaction completes
             // the same deterministic dead letter without dropping twice.
             Self::load(state, &message)?;
-            let retry = reason == DropReason::Undeliverable
-                && state.home.get(&message).is_some_and(|resource| resource.state().drop_reason() == Some(&reason));
+            let retry =
+                reason.dead_letters() && state.home.get(&message).is_some_and(|resource| resource.state().drop_reason() == Some(&reason));
             if retry {
                 backend.dead_letter(state, &message)?;
                 return Err(Error::Message(WriteError::Refused(MessageRefusal::Ended)));
             }
             backend.apply_locked(state, &message, DropMessage { reason: reason.clone() })?;
-            if reason == DropReason::Undeliverable {
+            if reason.dead_letters() {
                 backend.dead_letter(state, &message)?;
             }
             Ok(())

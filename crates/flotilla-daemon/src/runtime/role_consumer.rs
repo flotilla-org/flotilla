@@ -113,7 +113,7 @@ async fn answer(primitives: &MessagePrimitives, item: &Pending, consumer: &Recei
         .map_err(|error| error.to_string()),
         Handled::Failed(reason) => {
             warn!(message = %item.message, %reason, "a service role could not do what a request asked; it is dropped");
-            primitives.fail_request(&item.message).await
+            primitives.fail_request(&item.message, &reason).await
         }
     };
     if let Err(error) = answered {

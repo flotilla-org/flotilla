@@ -27,6 +27,7 @@ pub fn drop_reason(v: &Value) -> DropReason {
         "Superseded" => DropReason::Superseded { by: at_address(NEWER) },
         "Withdrawn" => DropReason::Withdrawn { by: at_address(OWNER), authority: at_address(OWNER) },
         "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: at_address(OWNER), authority: at_address(OWNER) },
+        "Failed" => DropReason::Failed { detail: "the service failed".into() },
         other => panic!("drop reason {other}"),
     }
 }
@@ -38,6 +39,7 @@ pub fn reason_name(reason: &DropReason) -> &'static str {
         DropReason::Superseded { .. } => "Superseded",
         DropReason::Withdrawn { .. } => "Withdrawn",
         DropReason::ConsumerUnreachable { .. } => "ConsumerUnreachable",
+        DropReason::Failed { .. } => "Failed",
     }
 }
 

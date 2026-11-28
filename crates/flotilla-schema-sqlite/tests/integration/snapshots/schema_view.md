@@ -20,7 +20,7 @@ Kind tables only; the shared tables are in `fixtures.sql`.
 | `dossier_deliverables` | records | 9 | 2: `source` 2 | `dossier_deliverables_evidence` (records) | – |
 | `dossier_deliverables_evidence` | records | 9 | – | `dossier_deliverables_evidence_metadata` (child) | – |
 | `dossier_deliverables_evidence_metadata` | child | 5 | – | – | – |
-| `message` | root | 24 | 5: `expectation` 2, `reason` 3 | `message_references` (child) | `by_inbox` (inbox, state, admitted_seq), `delivered_by_inbox` (inbox, delivered_at), `settled_by_inbox` (inbox, state_since), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
+| `message` | root | 25 | 6: `expectation` 2, `reason` 4 | `message_references` (child) | `by_inbox` (inbox, state, admitted_seq), `delivered_by_inbox` (inbox, delivered_at), `settled_by_inbox` (inbox, state_since), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
 | `message_references` | child | 5 | – | – | – |
 | `person` | root | 4 | – | – | – |
 | `referral` | root | 24 | 12: `subject` 6, `condition_address` 6 | `referral_references` (child) | `by_session` (session, seq), `by_reply` (in_reply_to) |
@@ -42,7 +42,7 @@ States with data (one label column, then data shared by name across the labels):
 - `awaiting_reply`.`state`: label `state` and `state_since`; data columns `reason`; data tables –
 - `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `activity`, `activity_since`, `activity_cause`, `reason`; data tables –
 - `convoy`.`state`: label `state` and `state_since`; data columns `disposition`, `cause`, `reason`; data tables `convoy_retired_duties`
-- `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `delivered_at`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –
+- `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `delivered_at`, `reason`, `reason_by`, `reason_authority`, `reason_detail`, `watermark`; data tables –
 - `ticket`.`state`: label `state` and `state_since`; data columns `priority`, `owner`, `hold_by`, `hold_until`, `reason`, `closed_by`, `signature_who`, `signature_at`; data tables `ticket_assignees`, `ticket_notes`
 - `terminal_session`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `ending`, `ending_reason`, `cause_category`, `cause_detail`; data tables –
 - `vessel`.`state`: label `state` and `state_since`; data columns `failures`, `last_failure_at`, `last_failure_cause_category`, `last_failure_cause_detail`, `last_failure_retryable`, `identity`, `ending`, `ending_reason`, `cause_category`, `cause_detail`; data tables –

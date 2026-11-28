@@ -21,10 +21,10 @@ use super::{
     list, name, reference, text, timestamp, Fixture, Pick,
 };
 
-/// Covering indexes: the label is digit 0 (base 4), a drop's reason digit 1 (base 5) and whether
+/// Covering indexes: the label is digit 0 (base 4), a drop's reason digit 1 (base 6) and whether
 /// a settlement or a drop kept a receiver digit 2 (base 2), so every reason is reached with and
 /// without one; the expectation cycles in base 3.
-pub const COVERING: usize = 80;
+pub const COVERING: usize = 48;
 
 pub fn receiver(tc: &TestCase) -> Receiver {
     let kind = code_enum(tc, Pick::Draw, &[ConsumerKind::AgentSession, ConsumerKind::Service]);
@@ -88,18 +88,19 @@ pub fn expectation(tc: &TestCase, pick: Pick) -> Expectation {
 }
 
 pub fn reason(tc: &TestCase, pick: Pick) -> DropReason {
-    match pick.digit(tc, 5, 4) {
+    match pick.digit(tc, 6, 4) {
         0 => DropReason::Undeliverable,
         1 => DropReason::Expired,
         2 => DropReason::Superseded { by: address(tc) },
         3 => DropReason::Withdrawn { by: address(tc), authority: address(tc) },
+        4 => DropReason::Failed { detail: text(tc) },
         _ => DropReason::ConsumerUnreachable { by: address(tc), authority: address(tc) },
     }
 }
 
 /// A kept delivery, or none: the receiver and its receipt time travel together.
 fn delivery(tc: &TestCase, pick: Pick) -> (Option<Receiver>, Option<Timestamp>) {
-    match pick.digit(tc, 2, 20) {
+    match pick.digit(tc, 2, 24) {
         0 => (Some(receiver(tc)), Some(timestamp(tc))),
         _ => (None, None),
     }

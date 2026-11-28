@@ -14,7 +14,7 @@ Kind tables only; the shared tables are in `message.sql`.
 | `convoy_promises` | records | 12 | – | `convoy_promises_submissions` (records) | `by_label` (unique convoy, label) |
 | `convoy_promises_submissions` | records | 8 | – | – | `by_address` (address) |
 | `convoy_retired_duties` | state data | 2 | – | – | – |
-| `message` | root | 24 | 5: `expectation` 2, `reason` 3 | `message_references` (child) | `by_inbox` (inbox, state, admitted_seq), `delivered_by_inbox` (inbox, delivered_at), `settled_by_inbox` (inbox, state_since), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
+| `message` | root | 25 | 6: `expectation` 2, `reason` 4 | `message_references` (child) | `by_inbox` (inbox, state, admitted_seq), `delivered_by_inbox` (inbox, delivered_at), `settled_by_inbox` (inbox, state_since), `deadline` (deadline), `by_reply` (in_reply_to), `by_supersedes` (supersedes) |
 | `message_references` | child | 5 | – | – | – |
 | `person` | root | 4 | – | – | – |
 | `service` | root | 4 | – | – | – |
@@ -26,7 +26,7 @@ States with data (one label column, then data shared by name across the labels):
 - `awaiting_reply`.`state`: label `state` and `state_since`; data columns `reason`; data tables –
 - `agent_session`.`state`: label `state` and `state_since`; data columns `channel`, `activity`, `activity_since`, `activity_cause`, `reason`; data tables –
 - `convoy`.`state`: label `state` and `state_since`; data columns `disposition`, `cause`, `reason`; data tables `convoy_retired_duties`
-- `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `delivered_at`, `reason`, `reason_by`, `reason_authority`, `watermark`; data tables –
+- `message`.`state`: label `state` and `state_since`; data columns `receiver_kind`, `receiver_id`, `receiver_host`, `delivered_at`, `reason`, `reason_by`, `reason_authority`, `reason_detail`, `watermark`; data tables –
 
 Interned column domains:
 
