@@ -25,7 +25,7 @@ use flotilla_resources::{
     promises::SubmissionVerdict,
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
-use flotilla_schema::{Code, CodeEnum, Event, IndexQuery, Kind, KindCode, Timestamp};
+use flotilla_schema::{Code, CodeEnum, Event, Identity, IndexQuery, Kind, KindCode, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Loaded, Read, ResourceId, Snapshot, StoreError};
 use flotilla_state_machines::{
     machines::{
@@ -228,6 +228,11 @@ impl ConvoyRecords for EngineConvoyRecords {
             }
             Ok(listing)
         })
+    }
+
+    fn archived(&self, name: &str, home: &str) -> Result<bool, String> {
+        let identity = Identity { kind: <Resource<Convoy> as Kind>::CODE, name: name.to_owned(), home: home.to_owned() };
+        self.read(&format!("{name} at {home}'s archive"), |read| flotilla_engine_store::archive::archived(read, &identity))
     }
 
     fn newest(&self, of: &str, project: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {

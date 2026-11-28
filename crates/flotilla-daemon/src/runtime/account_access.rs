@@ -217,8 +217,10 @@ impl Reconciler for AccountBindingReconciler {
 }
 
 /// Reconciles one provision at its place against its binding.
-/// - A binding revoked, closed or gone: the delivered copy is deleted, the requester's harness
+/// - A binding revoked, closed or archived: the delivered copy is deleted, the requester's harness
 ///   session's process is stopped, and the record removed.
+/// - A binding not read here, and not archived, is not known to have ended: the provision is left
+///   as it is, until the binding is read.
 ///   No launch can record a delivery meanwhile: launch refuses a binding that is not open.
 /// - A binding reopened by a rebind since the delivery: the copy is deleted, the session
 ///   stopped so a fresh one starts, and the record's delivery cleared only at the version
@@ -252,10 +254,15 @@ async fn reconcile_provision(state: &Arc<ControllerRuntimeState>, namespace: &st
             cleared.delivered = None;
             accounts.update_provision(namespace, &provision, &cleared).await.map(drop)
         }
-        _ => {
+        Some(_) => {
             withdraw(state, namespace, spec, &provisioners).await?;
             accounts.delete_provision(namespace, name).await
         }
+        None if accounts.binding_archived(namespace, &spec.binding).await? => {
+            withdraw(state, namespace, spec, &provisioners).await?;
+            accounts.delete_provision(namespace, name).await
+        }
+        None => Ok(()),
     }
 }
 

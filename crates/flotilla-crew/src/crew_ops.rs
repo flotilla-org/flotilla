@@ -1740,10 +1740,12 @@ impl CrewService {
             } else {
                 vec![("Clean", inspection.clean), ("Pushed", inspection.pushed), ("Landed", inspection.landed)]
             };
-            // Judged by when it was inspected, not when it is read: an unchanged inspection is
-            // not rewritten, so its record says nothing of a checkout changed since.
+            // Judged by when its values were last confirmed, as settlement judges them: an unchanged
+            // inspection is not rewritten, so away from the checkout's home, or after a restart,
+            // when it was inspected reads as when it last changed. Its values are confirmed while
+            // its home's inspections succeed and its records are heard.
             let fresh = integration.failing_since.is_none()
-                && (answered.contains(checkout_name) || integration.inspected_within(now, LANDING_EVIDENCE_TTL));
+                && (answered.contains(checkout_name) || integration.confirmed_within(now, LANDING_EVIDENCE_TTL));
             let unjudged = required.iter().filter(|(_, judged)| judged.is_none()).map(|(label, _)| *label).collect::<Vec<_>>();
             if !fresh || !unjudged.is_empty() {
                 let stale = if fresh { unjudged } else { required.iter().map(|(label, _)| *label).collect() };
@@ -3542,10 +3544,19 @@ impl CrewService {
     /// Its vessels, checkouts and sessions are released by their controllers once it has ended,
     /// and a convoy they still hold retires as they release it.
     pub async fn reap(&self, namespace: &str, name: &str, force: bool, principal: Option<&PrincipalRef>) -> Result<(), String> {
-        self.teardown(namespace, name, force).await?;
-        self.cascade_convoy_children(namespace, name).await?;
         let convoy = self.resource_backend.clone().using::<ResourceConvoy>(namespace).get(name).await.map_err(|error| error.to_string())?;
         let ended = convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal());
+        // Forcing ends an open convoy as abandoned, which its reclaim sanctions. An ended convoy
+        // has nothing left to end: its vessels are released once its checkouts' work is safe, as
+        // the gate judges it, so that judgement answers the delete, naming what it waits on.
+        self.teardown(namespace, name, force && !ended).await.map_err(|refusal| match force && ended {
+            true => format!(
+                "convoy `{name}` has ended, so --force ends nothing more; its vessels are released once its checkouts' work is safe: \
+                 {refusal}. Rule a checkout's work archived with `flotilla checkout <name> archive` at its home"
+            ),
+            false => refusal,
+        })?;
+        self.cascade_convoy_children(namespace, name).await?;
         let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) else {
             return if ended { Ok(()) } else { Err(format!("convoy `{name}` is not held at this home")) };
         };

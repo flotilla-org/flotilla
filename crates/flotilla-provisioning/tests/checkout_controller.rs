@@ -15,8 +15,8 @@ use flotilla_provisioning::{
     checkout_runtime::{CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout},
     engine::{
         checkout_actuator::{
-            Against, BranchValidation, CheckoutActuator, CheckoutHolds, CheckoutInputs, CheckoutProvider, FreshClone, HolderInputs,
-            NamedHolderInputs,
+            Against, BranchLookupError, BranchValidation, CheckoutActuator, CheckoutHolds, CheckoutInputs, CheckoutProvider, FreshClone,
+            HolderInputs, NamedHolderInputs,
         },
         controller::Controller,
         reads::StoreReads,
@@ -208,13 +208,13 @@ impl HolderInputs for SearchedOnRelease {
 /// A forge's answers to branch validation, in order; once they run out, every branch may be made.
 #[derive(Default)]
 struct ScriptedValidation {
-    answers: Mutex<Vec<Result<Option<String>, String>>>,
+    answers: Mutex<Vec<Result<Option<String>, BranchLookupError>>>,
     asked: Mutex<Vec<String>>,
 }
 
 #[async_trait]
 impl BranchValidation for ScriptedValidation {
-    async fn validate_new_branch(&self, _: &str, branch: &str, _: bool) -> Result<Option<String>, String> {
+    async fn validate_new_branch(&self, _: &str, branch: &str, _: bool) -> Result<Option<String>, BranchLookupError> {
         self.asked.lock().expect("asked").push(branch.into());
         let mut answers = self.answers.lock().expect("answers");
         if answers.is_empty() {
@@ -608,6 +608,54 @@ async fn a_release_searches_its_convoys_branch_to_judge_landing() {
     assert!(world.ready(&launch));
 }
 
+/// A holder's inputs that do not read while `unread` is set.
+#[derive(Default)]
+struct UnreadInputs {
+    unread: std::sync::atomic::AtomicBool,
+    /// How many reads did not read.
+    refused: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl HolderInputs for UnreadInputs {
+    async fn inputs(&self, holder: Option<&CheckoutHolder>, spec: &CheckoutSpec) -> Result<CheckoutInputs, String> {
+        if self.unread.load(std::sync::atomic::Ordering::SeqCst) {
+            self.refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err("the holder's record did not read".into());
+        }
+        NamedHolderInputs.inputs(holder, spec).await
+    }
+
+    async fn associate(&self, _: Option<&CheckoutHolder>) {}
+}
+
+// Behaviour: a release whose inputs do not read judges nothing from none: it fails, naming the
+// read, and the worktree is neither removed nor held for a person. Once the inputs read, the
+// release judges the work as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_whose_inputs_do_not_read_waits_for_them() {
+    let inputs = Arc::new(UnreadInputs::default());
+    let world = World::with_inputs(
+        RecordingProvider { asked: Mutex::new(Asked { inspection: Some(inspection(true, true, false)), ..Asked::default() }) },
+        Arc::clone(&inputs) as Arc<dyn HolderInputs>,
+    );
+    world.checkouts.open_convoy("c1");
+    let launch = world.ready_worktree("c1", "feature").await;
+    inputs.unread.store(true, std::sync::atomic::Ordering::SeqCst);
+    world.checkouts.abandon_convoy("c1", "deleted");
+    world.until("a release tried", |_| inputs.refused.load(std::sync::atomic::Ordering::SeqCst) > 0).await;
+    // Time for the try to have removed it, had it gone on.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(world.ready(&launch), "kept");
+    assert!(world.provider.asked().removals.is_empty(), "nothing removed");
+    assert!(world.holds.held().is_empty(), "nor held for a person");
+
+    inputs.unread.store(false, std::sync::atomic::Ordering::SeqCst);
+    world.rechecks.send(launch.clone()).await.expect("recheck");
+    world.until("released", |world| world.released(&launch)).await;
+    assert!(matches!(world.provider.asked().removals.as_slice(), [CheckoutRemoval::Worktree { .. }]));
+}
+
 /// Convoy `c1` at home `beta`, written as `write` says after a checkout at `alpha` read it, and
 /// held at `alpha` only from a snapshot taken after that write: whether the checkout's holder has
 /// ended, judged at `alpha`.
@@ -699,13 +747,20 @@ fn world_worktree(clone: &str, branch: &str) -> CheckoutWorktreeSpec {
 }
 
 // Behaviour: a new branch the forge already has a change request from is refused as the forge
-// says; a lookup that fails refuses nothing, and leaves the checkout requested, unmade.
+// says. A lookup that fails refuses nothing: it is tried again on the kind's backoff, with no event
+// to wake it, and one that keeps failing gives up at the failure limit with its reason. A lookup
+// dropped before it was answered says nothing of the branch: it is not counted, however often it
+// happens, and the branch is made once a lookup is answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_branch_is_validated_with_the_forge_before_it_is_made() {
+    let dropped = || Err(BranchLookupError::Undelivered("the request was dropped: Undeliverable".into()));
+    let limited = || Err(BranchLookupError::Failed("rate limited".into()));
     let validation = ScriptedValidation {
         answers: Mutex::new(vec![
             Ok(Some("checkout branch taken conflicts with Open change request #7; choose a fresh branch name".into())),
-            Err("rate limited".into()),
+            limited(),
+            limited(),
+            limited(),
         ]),
         ..ScriptedValidation::default()
     };
@@ -715,9 +770,14 @@ async fn a_new_branch_is_validated_with_the_forge_before_it_is_made() {
     let taken = world.checkouts.request("taken", &world.worktree(&clone, "taken"), Some(&world.checkouts.holder("c1")));
     world.until("refused", |world| gave_up_with(world, &taken, "conflicts with Open change request #7")).await;
     let unknown = world.checkouts.request("unknown", &world.worktree(&clone, "unknown"), Some(&world.checkouts.holder("c1")));
-    world.until("tried", |world| world.validation.asked.lock().expect("asked").len() == 2).await;
-    world.until("retrying", |world| matches!(world.reading(&unknown), Some(LifecycleReading::Retrying { .. }))).await;
+    world.until("given up", |world| gave_up_with(world, &unknown, "rate limited")).await;
+    assert_eq!(world.validation.asked.lock().expect("asked").len(), 4, "the lookup is tried until the limit");
     assert!(world.provider.asked().worktrees.is_empty(), "neither was made");
+
+    *world.validation.answers.lock().expect("answers") = vec![dropped(), dropped(), dropped(), dropped()];
+    let undelivered = world.checkouts.request("undelivered", &world.worktree(&clone, "undelivered"), Some(&world.checkouts.holder("c1")));
+    world.until("made", |world| world.ready(&undelivered)).await;
+    assert_eq!(world.validation.asked.lock().expect("asked").len(), 9, "four dropped lookups, then one answered");
 }
 
 // Behaviour: a host probe's recheck observes a realised worktree again: one still there has its

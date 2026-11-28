@@ -500,6 +500,16 @@ impl Archiver {
     }
 }
 
+/// Whether `identity` was archived as this store reads it: its rows deleted by the archive, or its
+/// identity expunged, leaving the tombstone. A resource this store never held, or whose rows a
+/// replica reset cleared, was not.
+pub fn archived(read: &mut Read<'_>, identity: &Identity) -> Result<bool, StoreError> {
+    match read.resolve(identity.kind, &identity.name, &identity.home)? {
+        Some(id) => Ok(read.load_snapshot(id)?.is_none() && read.last_change(id)?.is_some_and(|change| change.writer == ARCHIVE_WRITER)),
+        None => read.expunged(identity),
+    }
+}
+
 /// The bundle of resource `id`, known as `identity`: its stored snapshot, every entry about it and
 /// those entries' changes. `None` when it holds no row.
 fn bundle_of(read: &mut Read<'_>, id: ResourceId, identity: &Identity) -> Result<Option<Bundle>, ArchiveError> {

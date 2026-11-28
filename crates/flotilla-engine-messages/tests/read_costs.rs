@@ -102,8 +102,8 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     assert!(missing.expect("by-name read").is_none(), "another inbox holds none");
     assert_eq!(cost, (0, 0), "a miss loads nothing");
 
-    let (held, cost) = measured(primitives.delivery_held_until(NAMESPACE, BUSY)).await;
-    assert!(held.expect("hold read").is_some(), "the waiting messages hold delivery");
+    let (held, cost) = measured(primitives.delivery_hold(NAMESPACE, BUSY)).await;
+    assert!(held.expect("hold read").until.is_some(), "the waiting messages hold delivery");
     assert_eq!(cost.0, 3, "a delivery hold loads only the waiting messages");
 
     let ruling = intent(BUSY, "ruling");

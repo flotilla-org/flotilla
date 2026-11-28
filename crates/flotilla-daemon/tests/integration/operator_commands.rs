@@ -184,3 +184,41 @@ async fn an_operators_forced_completion_settles_a_crew_that_submitted_nothing() 
     let status = convoy.status.expect("status");
     assert_eq!(status.crew_work["coder"]["coder"].phase, CrewWorkPhase::Done);
 }
+
+// A forced delete of an ended convoy whose checkout's work is not shown safe does what it says: the
+// convoy goes, or the delete is refused naming the checkout that needs a ruling. It never answers
+// ok while the reclaim still keeps the convoy.
+#[tokio::test(start_paused = true)]
+async fn a_forced_delete_of_an_ended_convoy_names_the_checkout_its_reclaim_waits_on() {
+    use flotilla_protocol::commands::CrewSupervisionAction;
+    use flotilla_resources::Checkout;
+    // Its crew fails, leaving work in its checkout the reclaim keeps.
+    let fleet = TestDaemon::builder().agent("fail_rate = 1.0").vcs("dirty_rate = 1.0").start().await;
+    let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let stalled =
+        |convoy: &ResourceObject<Convoy>| convoy.metadata.name == name && convoy.status.as_ref().is_some_and(|s| s.stalled.is_some());
+    fleet.wait("a supervisable stall", stalled).await;
+    let fail = CommandAction::CrewSupervise {
+        namespace: Some(NAMESPACE.into()),
+        convoy: name.clone(),
+        vessel: "coder".into(),
+        role: "coder".into(),
+        operation: CrewSupervisionAction::Fail,
+        message: "Supervisor decision.".into(),
+        actor_crew_id: None,
+    };
+    assert!(!matches!(fleet.execute(fail).await, CommandValue::Error { .. }));
+    fleet.wait("Failed", in_phase(&name, ConvoyPhase::Failed)).await;
+    let checkout = fleet
+        // A checkout is named for the launch it is held for.
+        .wait("its checkout", |checkout: &ResourceObject<Checkout>| checkout.metadata.name.contains(&format!("{name}-")))
+        .await
+        .metadata
+        .name;
+
+    let deleted = fleet.execute(CommandAction::ConvoyDelete { namespace: Some(NAMESPACE.into()), name: name.clone(), force: true }).await;
+    match &deleted {
+        CommandValue::Error { message } => assert!(message.contains(&checkout), "the refusal names {checkout}: {message}"),
+        _ => fleet.wait_gone::<Convoy>(&name).await,
+    }
+}

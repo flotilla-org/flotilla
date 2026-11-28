@@ -253,6 +253,11 @@ impl ConvoyRecords for CountedConvoys {
         self.records.named(name, home)
     }
 
+    fn archived(&self, name: &str, home: &str) -> Result<bool, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.archived(name, home)
+    }
+
     fn newest(&self, of: &str, project: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
         Meter::count(&self.meter.convoys);
         self.records.newest(of, project, home)

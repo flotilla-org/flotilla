@@ -19,14 +19,14 @@ use async_trait::async_trait;
 use flotilla_protocol::Subject;
 use flotilla_resources::{
     address::subject_address,
-    convoy::engine::{Actor, EngineConvoys, OldPromises, VerdictScope},
+    convoy::engine::{Actor, Delivery, EngineConvoys, OldPromises, SettlementEvidence, VerdictScope},
     promises::{PromiseKind as OldKind, PromiseOperation, PromiseSource as OldSource},
     Convoy as OldConvoy, Forge, ForgeSpec, ResourceObject, SubjectDiscoverySource,
 };
 use flotilla_schema::{reads::carry, Kind, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
-        AbandonCause, AddSeat, Authority, Convoy, ConvoyEdge, ConvoyLabel, ConvoyState, Declare, Deliver, FailSeat, Keep, Link, LinkSource,
+        AbandonCause, AddSeat, Authority, Convoy, ConvoyEdge, ConvoyLabel, ConvoyState, Declare, FailSeat, Keep, Link, LinkSource,
         Progress, Promise, PromiseId, Reassign, Reject, Retract, SeatName, Submit, Unlink,
     },
     Ref, Resource,
@@ -473,20 +473,26 @@ impl EngineConvoys for ConvoyEngine {
         .await
     }
 
-    async fn deliver(&self, convoy: &ResourceObject<OldConvoy>, disposition: &str) -> Result<(), String> {
-        let disposition = disposition.to_owned();
-        self.edit(convoy, move |current, _| {
-            Ok((
-                // A retired convoy has nothing left to deliver.
-                if matches!(current.label(), ConvoyLabel::Delivered | ConvoyLabel::Retired) {
-                    Vec::new()
-                } else {
-                    vec![Deliver { disposition: disposition.clone() }.into()]
-                },
-                (),
-            ))
-        })
-        .await
+    fn position(&self) -> Result<std::collections::BTreeMap<String, u64>, String> {
+        self.convoys.position()
+    }
+
+    async fn deliver(
+        &self,
+        convoy: &ResourceObject<OldConvoy>,
+        disposition: &str,
+        evidence: &SettlementEvidence,
+    ) -> Result<Delivery, String> {
+        let convoys = Arc::clone(&self.convoys);
+        let (name, now, disposition, evidence) = (self.target(convoy)?, self.now(), disposition.to_owned(), evidence.clone());
+        let delivered = tokio::task::spawn_blocking(carry(move || convoys.deliver(&name, now, &disposition, evidence)))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        if delivered == Delivery::Delivered {
+            self.changed(&convoy.metadata.name);
+        }
+        Ok(delivered)
     }
 
     fn delivered(&self, convoy: &ResourceObject<OldConvoy>) -> Option<String> {

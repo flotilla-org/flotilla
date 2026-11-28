@@ -367,7 +367,7 @@ impl Actuator<PlainLifecycle<AccessDeliverySpec>> for AccessDeliveryActuator {
                     *failures
                 };
                 let retry_at = Timestamp::from_datetime(&(self.state.daemon.clock().now() + retry_delay(failures)));
-                Err(ProviderFailure { cause: Cause::new(CauseCategory::External, error), retryable: true, retry_at: Some(retry_at) })
+                Err(ProviderFailure { retry_at: Some(retry_at), ..ProviderFailure::new(Cause::new(CauseCategory::External, error), true) })
             }
         }
     }

@@ -100,6 +100,11 @@ impl ConvoyWorks for EngineConvoyWorks {
     }
 
     async fn standing(&self, convoy: &str, convoy_home: &str) -> Result<ConvoyStanding, String> {
-        Ok(self.read(convoy, convoy_home).await?.map_or(ConvoyStanding::Gone, |object| standing(&object)))
+        if let Some(object) = self.read(convoy, convoy_home).await? {
+            return Ok(standing(&object));
+        }
+        let (convoy, convoy_home) = (convoy.to_owned(), convoy_home.to_owned());
+        let archived = self.blocking(move |reads, _| reads.convoys()?.archived(&convoy, &convoy_home)).await?;
+        Ok(if archived { ConvoyStanding::Ended } else { ConvoyStanding::Unread })
     }
 }

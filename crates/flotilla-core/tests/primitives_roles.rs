@@ -580,22 +580,22 @@ async fn an_undelivered_turn_holds_delivery_for_one_hold() {
     let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(chrono::Utc::now()));
     let primitives = primitives_at(&dir, clock.clone()).await;
     let other = "flotilla/demo/work/reviewer";
-    assert_eq!(primitives.delivery_held_until(NAMESPACE, CREW).await.expect("read"), None, "nothing admitted");
+    assert_eq!(primitives.delivery_hold(NAMESPACE, CREW).await.expect("read").until, None, "nothing admitted");
     let record = flotilla_resources::message_record_name(CREW, "system:nudge", "late");
     primitives.admit(&record, &intent("system:nudge", CREW)).await.expect("admitted");
     let admitted = flotilla_schema::Timestamp::from_datetime(&flotilla_resources::Clock::now(clock.as_ref())).to_datetime().expect("now");
     assert_eq!(
-        primitives.delivery_held_until(NAMESPACE, CREW).await.expect("read"),
+        primitives.delivery_hold(NAMESPACE, CREW).await.expect("read").until,
         Some(admitted + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR),
         "an undelivered turn holds its crew for one hold from admission"
     );
-    assert_eq!(primitives.delivery_held_until(NAMESPACE, other).await.expect("read"), None, "only its own crew");
+    assert_eq!(primitives.delivery_hold(NAMESPACE, other).await.expect("read").until, None, "only its own crew");
     clock.advance(flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR);
-    assert_eq!(primitives.delivery_held_until(NAMESPACE, CREW).await.expect("read"), None, "the hold ends after one delivery hold");
+    assert_eq!(primitives.delivery_hold(NAMESPACE, CREW).await.expect("read").until, None, "the hold ends after one delivery hold");
 
     let delivered = flotilla_resources::message_record_name(other, "system:nudge", "delivered");
     primitives.admit(&delivered, &intent("system:nudge", other)).await.expect("admitted");
-    assert!(primitives.delivery_held_until(NAMESPACE, other).await.expect("read").is_some());
+    assert!(primitives.delivery_hold(NAMESPACE, other).await.expect("read").until.is_some());
     let message = engine_message(&primitives, other, &delivered).await;
     let consumer = primitives.register("reviewer-session", flotilla_schema::Timestamp(1)).await.expect("consumer");
     let inbox = primitives.inbox();
@@ -608,5 +608,5 @@ async fn an_undelivered_turn_holds_delivery_for_one_hold() {
         )
         .await
         .expect("deliver");
-    assert_eq!(primitives.delivery_held_until(NAMESPACE, other).await.expect("read"), None, "a delivered turn no longer holds its crew");
+    assert_eq!(primitives.delivery_hold(NAMESPACE, other).await.expect("read").until, None, "a delivered turn no longer holds its crew");
 }

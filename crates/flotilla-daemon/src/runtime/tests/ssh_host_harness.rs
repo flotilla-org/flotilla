@@ -1322,6 +1322,50 @@ async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
     assert!(runtime.pool.killed.lock().await.is_empty(), "the session keeps running");
 }
 
+// A provision whose binding is homed on another daemon and not read here (its replica missing, or
+// not yet caught up) keeps its delivered copy and its session: a binding that does not read has
+// not ended. Once the binding's explicit close replicates here, the copy is withdrawn.
+#[tokio::test(start_paused = true)]
+async fn a_binding_not_read_here_keeps_its_copy_until_its_close_is() {
+    use flotilla_resources::account_access::{AccountRecords, BindingState, PendingBinding};
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "box-a-token").expect("token");
+    let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
+    let target = runtime.daemon.decided_store();
+    let other = flotilla_provisioning_testkit::other_home_for(&target, "udder-root");
+    let elsewhere = flotilla_provisioning::engine::account::EngineAccounts::open(
+        Arc::clone(other.service()),
+        Arc::new(flotilla_resources::SystemClock),
+    )
+    .expect("the binding's home");
+    let now = flotilla_schema::Timestamp::from_datetime(&flotilla_resources::clock::now());
+    // Another requester's, so it opens beside the coder's binding this home replicates there.
+    let opened = super::launch_support::pending_binding(&runtime.convoy, "relief", "claude-box-a", "box-a@example.com", now).spec;
+    elsewhere.open(NAMESPACE, vec![PendingBinding { name: "held-elsewhere".into(), spec: opened }]).await.expect("opened at its home");
+    let bindings = elsewhere.convoy_bindings(NAMESPACE, &runtime.convoy, true).await.expect("bindings at its home");
+    let binding = bindings.into_iter().find(|binding| binding.home == "udder-root").expect("held at its home");
+    let recorded = provision_record(&runtime.daemon).await.expect("provision");
+    let unread = flotilla_resources::AccountProvisionSpec {
+        binding: flotilla_schema::Ref::new(binding.name.clone(), "udder-root".to_owned()),
+        ..recorded.spec.clone()
+    };
+    runtime.daemon.account_records().update_provision(NAMESPACE, &recorded, &unread).await.expect("names the binding elsewhere");
+    let copy = format!("{}/.flotilla-oauth-token", bound_material(&runtime.convoy));
+
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+    assert_eq!(host.entry(&copy), Some(HostEntry::File("box-a-token".into())), "the copy stays");
+    assert_eq!(provision(&runtime.daemon).await, Some(unread), "the provision stays");
+    assert!(runtime.pool.killed.lock().await.is_empty(), "the session keeps running");
+
+    let closed = BindingState::Closed { reason: "requester teardown".into(), delivered_until: Some(now) };
+    elsewhere.end(NAMESPACE, &binding, closed, now).await.expect("closed at its home");
+    other.replicate_to(&target);
+    reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
+    assert_eq!(host.entry(&copy), None, "the copy is withdrawn");
+    assert_eq!(provision(&runtime.daemon).await, None, "and the provision removed");
+}
+
 // Review #3933: a withdrawal waits for a delivery of the same binding at the place to finish,
 // so it can never remove a copy a launch is still delivering.
 #[tokio::test(start_paused = true)]

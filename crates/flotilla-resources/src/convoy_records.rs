@@ -660,6 +660,12 @@ pub trait ConvoyRecords: Send + Sync {
     fn named(&self, name: &str, home: Option<&str>) -> Result<ConvoyListing, String> {
         Ok(ConvoyListing { records: self.get(name, home)?.into_iter().collect(), unreadable: Vec::new() })
     }
+    /// Whether launch `name` homed at `home` was archived: its record is gone, and its home's
+    /// archive left its tombstone. A launch never read here, or whose replica is missing, was not.
+    /// A port that keeps no archive has archived none.
+    fn archived(&self, _name: &str, _home: &str) -> Result<bool, String> {
+        Ok(false)
+    }
     /// The newest launch of `of` in `project` held at `home`, or at this home when `None`.
     fn newest(&self, of: &str, project: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String>;
     /// What holds launch `name` held at `home`, or at this home when `None`, from retiring; none

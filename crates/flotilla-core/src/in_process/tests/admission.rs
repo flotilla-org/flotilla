@@ -367,11 +367,11 @@ async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
     let spec = flotilla_resources::single_agent_workflow_spec();
     let name = prepared_snapshot_name("workflow", &serde_json::to_value(&spec).expect("serialize workflow")).expect("snapshot name");
 
-    ensure_prepared_workflow_snapshot(&home, "flotilla", &name, &spec).await.expect("author snapshot on home");
+    ensure_prepared_workflow_snapshot(&home, "flotilla", &name, "convoy#1", &spec).await.expect("author snapshot on home");
     replicate_home(&home.service, home.home(), &driver.service);
     let before = snapshot_sources::<WorkflowTemplate>(&driver, &name).await;
 
-    ensure_prepared_workflow_snapshot(&driver, "flotilla", &name, &spec).await.expect("reuse identical replicated snapshot");
+    ensure_prepared_workflow_snapshot(&driver, "flotilla", &name, "convoy#1", &spec).await.expect("reuse identical replicated snapshot");
     assert_still_the_homes_copy(&before, &snapshot_sources::<WorkflowTemplate>(&driver, &name).await);
 }
 

@@ -241,7 +241,10 @@ impl EngineHome {
         let convoy = self.view(backend, launch).await;
         let engine = self.engine();
         match phase {
-            ConvoyPhase::Landed => engine.deliver(&convoy, "claim").await,
+            ConvoyPhase::Landed => {
+                let evidence = flotilla_resources::convoy::engine::SettlementEvidence::after(engine.position().expect("position"));
+                engine.deliver(&convoy, "claim", &evidence).await.map(drop)
+            }
             ConvoyPhase::Failed => engine.fail(&convoy, "operator", "failed").await,
             ConvoyPhase::Abandoned => engine.abandon(&convoy, "operator", "abandoned").await,
             other => panic!("{other:?} is no ending"),

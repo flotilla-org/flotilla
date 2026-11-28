@@ -288,11 +288,14 @@ async fn active_teardown_refuses_unset_or_failing_inspector() {
     }
 }
 
-// R4: landing evidence is judged by when its checkout was inspected, not when it is read. The gate
-// refuses an inspection older than the evidence's lifetime; an operator's delete of an ended convoy
-// asks for such a checkout afresh, once, and reads fresh evidence as it is.
+// Landing evidence is judged by when its values were last confirmed, as settlement judges them,
+// not by when they were inspected: an inspection unchanged since it was written is not rewritten,
+// so its record's inspection time, away from its home or after a restart, is when it last changed.
+// The gate passes evidence inspected long ago and confirmed since, and refuses evidence not
+// confirmed within its lifetime; an operator's delete of an ended convoy asks for such a checkout
+// afresh, once, and reads fresh evidence as it is.
 #[tokio::test]
-async fn landing_evidence_is_as_old_as_its_inspection() {
+async fn landing_evidence_is_as_old_as_its_confirmation() {
     let (crew, backend, launch, held) = active_delete_fixture().await;
     let inspector = Arc::new(FreshDeleteInspection(0.into(), Arc::clone(&held.engine.engine.checkouts.checkouts)));
     let inspections = || inspector.0.load(std::sync::atomic::Ordering::SeqCst);
@@ -322,6 +325,12 @@ async fn landing_evidence_is_as_old_as_its_inspection() {
     crew.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkouts, false).await.expect("fresh evidence");
     crew.teardown("flotilla", &held.launch, false).await.expect("fresh evidence");
     assert_eq!(inspections(), 0, "fresh evidence is read as it is");
+
+    let mut inspected_long_ago = checkouts.clone();
+    for integration in inspected_long_ago.iter_mut().filter_map(|checkout| checkout.integration.as_mut()) {
+        integration.inspected_at -= chrono::Duration::hours(1);
+    }
+    crew.verify_convoy_teardown_gate_for_checkouts(&convoy, &inspected_long_ago, false).await.expect("evidence confirmed since");
 
     held.clock.advance(31);
     let error = crew.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkouts, false).await.expect_err("stale evidence");

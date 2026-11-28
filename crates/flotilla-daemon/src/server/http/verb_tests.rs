@@ -545,7 +545,8 @@ async fn a_convoy_rows_address_acts_on_that_rows_convoy() {
             let convoy = backend.using::<flotilla_resources::Convoy>(&namespace).get(&launch).await.expect("convoy");
             let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None };
             engine.keep_by_verdict(&convoy, &scope, "operator", "landed").await.expect("keep the work");
-            engine.deliver(&convoy, "claim").await.expect("deliver");
+            let evidence = flotilla_resources::convoy::engine::SettlementEvidence::after(engine.position().expect("position"));
+            engine.deliver(&convoy, "claim", &evidence).await.expect("deliver");
             retired = Some(launch);
         }
     }

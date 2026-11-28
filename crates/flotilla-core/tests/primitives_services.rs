@@ -111,8 +111,8 @@ async fn a_request_to_an_unbound_inspector_fails() {
     let later = Timestamp(now().0 + 1_000_000);
     let report = primitives.sweep(NAMESPACE, later, &mut open).await.expect("sweep");
     assert_eq!(report.undeliverable, 1);
-    assert!(matches!(primitives.request_answer(&message).await.expect("answer"), RequestAnswer::Failed { .. }));
-    assert!(matches!(primitives.request_answer("absent").await.expect("answer"), RequestAnswer::Failed { .. }));
+    assert!(matches!(primitives.request_answer(&message).await.expect("answer"), RequestAnswer::Dropped { .. }));
+    assert!(matches!(primitives.request_answer("absent").await.expect("answer"), RequestAnswer::Dropped { .. }));
 }
 
 // Behaviour (#3108): a sweep names when it next has work no change wakes: just past an open

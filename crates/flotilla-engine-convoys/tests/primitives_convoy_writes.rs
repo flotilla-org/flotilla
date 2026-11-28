@@ -8,13 +8,16 @@ use std::{collections::BTreeMap, sync::Arc};
 use chrono::Utc;
 use flotilla_engine_convoys::{convoy_engine::ConvoyEngine, convoy_map, convoy_records::EngineConvoyRecords, convoys::Convoys};
 use flotilla_engine_messages::awaiting::OpenAwaiting;
+use flotilla_engine_messages_testkit::{designate_fleet, intent, EngineMessagesHome};
+use flotilla_provisioning::stored::checkout::CheckoutIntegration;
 use flotilla_resources::{
-    convoy::engine::{Actor, EngineConvoys, VerdictScope},
+    convoy::engine::{Actor, Delivery, EngineConvoys, SettlementEvidence, VerdictScope},
     convoy_records::{ConvoyEnd, ConvoyRecords},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource as OldSource, PromiseState, Submission, SubmissionVerdict},
-    Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, ResourceObject,
-    SystemClock, VesselRequirement, WorkflowSnapshot,
+    Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, MessageRelation,
+    ResourceObject, SystemClock, VesselRequirement, WorkflowSnapshot,
 };
+use flotilla_schema::{NewChange, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::machines::convoy::{ConvoyLabel, Progress, SeatName};
 use flotilla_store::ResourceBackend;
@@ -52,6 +55,11 @@ fn fixture_over(home: &str, registry: flotilla_schema::KindRegistry) -> Fixture 
     let convoys = Arc::new(Convoys::open(home, &service).expect("convoys"));
     let engine = ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), Arc::new(SystemClock));
     Fixture { _dir: dir, backend, service, convoys, engine }
+}
+
+/// What settlement read when it judged a convoy landed: nothing yet, from the log as it is now.
+fn landed(fixture: &Fixture) -> SettlementEvidence {
+    SettlementEvidence::after(fixture.engine.position().expect("position"))
 }
 
 fn crew(role: &str, deliverer: bool) -> CrewSpec {
@@ -169,13 +177,83 @@ async fn a_fresh_convoy_is_admitted_with_its_seeded_promises() {
     assert!(fixture.engine.admit_reserved(&again).await.is_err(), "its reservation was taken by the first");
 }
 
+// Behaviour: delivery is written only on the evidence settlement read. A turn admitted to a crew's
+// inbox, or a checkout inspected, after settlement read them refuses it and leaves the convoy open;
+// a message to another crew and another checkout's inspection are not its evidence.
+#[tokio::test]
+async fn delivery_is_refused_when_what_settlement_read_was_written_since() {
+    let fixture = decided_fixture();
+    let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true)])])).await;
+    fixture.engine.promise(&convoy, "work", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("submitted");
+    fixture.engine.promise(&convoy, "work", "coder", &merged("template/pr"), Actor::Observer).await.expect("kept");
+    let convoy = reread(&fixture, "c").await;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    designate_fleet(&backend, NAMESPACE).await;
+    let messages = EngineMessagesHome::over(Arc::clone(&fixture.service), NAMESPACE, &backend);
+    let (crew, other) = ("fleet/c/work/coder", "fleet/other/work/coder");
+    let inbox = messages.primitives().inbox_for(NAMESPACE, crew).await.expect("inbox").to_string();
+    let judged =
+        || SettlementEvidence { checkouts: ["checkout-c#1".to_owned()].into(), inboxes: [inbox.clone()].into(), ..landed(&fixture) };
+    let turn = |record: &'static str, receiver: &'static str| {
+        let primitives = messages.primitives().clone();
+        async move {
+            let intent = intent("fleet/operator", receiver, MessageRelation::Supervisor, "one more thing");
+            primitives.admit(record, &intent).await.expect("admitted");
+        }
+    };
+
+    let evidence = judged();
+    turn("m-turn", crew).await;
+    let refused = fixture.engine.deliver(&convoy, "merged", &evidence).await.expect("judged");
+    assert!(matches!(&refused, Delivery::Moved(why) if why.contains(&inbox)), "{refused:?}");
+    assert_eq!(fixture.convoys.get("c").expect("held").label(), ConvoyLabel::Open, "the convoy stays open");
+
+    let evidence = judged();
+    inspect(&fixture, "checkout-c#2");
+    let refused = fixture.engine.deliver(&convoy, "merged", &evidence).await.expect("judged");
+    assert!(matches!(&refused, Delivery::Moved(why) if why.contains("checkout-c#2")), "another launch is held in its place: {refused:?}");
+    assert_eq!(fixture.convoys.get("c").expect("held").label(), ConvoyLabel::Open);
+
+    let evidence = judged();
+    turn("m-other", other).await;
+    inspect(&fixture, "checkout-other#1");
+    assert_eq!(fixture.engine.deliver(&convoy, "merged", &evidence).await.expect("judged"), Delivery::Delivered);
+    assert_eq!(fixture.convoys.get("c").expect("held").label(), ConvoyLabel::Delivered);
+}
+
+/// Writes an inspection of checkout launch `launch`, as its home's inspector does.
+fn inspect(fixture: &Fixture, launch: &str) {
+    let inspection = CheckoutIntegration {
+        failing_since: None,
+        head_revision: Some("abc".into()),
+        clean: Some(true),
+        pushed: Some(true),
+        landed: Some(true),
+        clean_details: None,
+        pushed_details: None,
+        landed_details: None,
+        change_request: None,
+        landed_evidence: None,
+        remote_digest: None,
+    };
+    fixture
+        .service
+        .with_store(|store| {
+            let mut write = store.write()?;
+            let change = write.open_change(&NewChange::new("checkout-inspector", Timestamp(2_000_000)))?;
+            write.insert(launch, &inspection, change)?;
+            write.commit()
+        })
+        .expect("inspected");
+}
+
 // Behaviour: the crew's submission and the forge's merge observation become the engine's Submit
 // and observed Keep; the old status follows each, and delivery is refused until nothing is open.
 #[tokio::test]
 async fn a_submitted_pr_is_kept_by_its_merge_and_the_convoy_delivers() {
     let fixture = fixture();
     let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true)])])).await;
-    let refused = fixture.engine.deliver(&convoy, "merged").await.expect_err("an open promise holds delivery");
+    let refused = fixture.engine.deliver(&convoy, "merged", &landed(&fixture)).await.expect_err("an open promise holds delivery");
     assert!(refused.contains("PromisesOutstanding"), "{refused}");
 
     fixture.engine.promise(&convoy, "work", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("submitted");
@@ -207,10 +285,10 @@ async fn a_submitted_pr_is_kept_by_its_merge_and_the_convoy_delivers() {
     fixture.engine.promise(&convoy, "work", "coder", &merged("template/pr"), Actor::Observer).await.expect("kept");
     let convoy = reread(&fixture, "c").await;
     assert_eq!(old_promise(&convoy, "work", "coder", "template/pr").state, PromiseState::Kept);
-    fixture.engine.deliver(&convoy, "merged").await.expect("delivered");
+    fixture.engine.deliver(&convoy, "merged", &landed(&fixture)).await.expect("delivered");
     assert_eq!(fixture.convoys.get("c").expect("held").label(), ConvoyLabel::Delivered);
     // The delivery records the exit entry it was given; delivering again changes nothing.
-    fixture.engine.deliver(&convoy, "closed-unmerged").await.expect("delivering again is no error");
+    fixture.engine.deliver(&convoy, "closed-unmerged", &landed(&fixture)).await.expect("delivering again is no error");
     assert_eq!(fixture.engine.delivered(&convoy).as_deref(), Some("merged"));
 }
 
@@ -361,7 +439,7 @@ async fn operator_verdicts_keep_and_retract() {
     let convoy = reread(&fixture, "c").await;
     assert_eq!(old_promise(&convoy, "a", "coder", "template/pr").state, PromiseState::Kept);
     assert_eq!(old_promise(&convoy, "b", "coder", "template/pr").state, PromiseState::Retracted);
-    fixture.engine.deliver(&convoy, "claim").await.expect("nothing open");
+    fixture.engine.deliver(&convoy, "claim", &landed(&fixture)).await.expect("nothing open");
 }
 
 // Behaviour: a convoy with no obligation is refused by name, and nothing is admitted. (A convoy

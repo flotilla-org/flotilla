@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_schema::{Identity, KindCode};
-use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
+use flotilla_schema_sqlite::{stream::Service, LogReads, StoreError};
 
 /// What one pass found.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,7 +43,7 @@ pub fn position_on(service: &Service) -> Result<BTreeMap<String, u64>, StoreErro
 }
 
 /// Each of `homes`' last sequence: where a reader reading now starts from.
-pub fn position(read: &mut Read<'_>, homes: &[String]) -> Result<BTreeMap<String, u64>, StoreError> {
+pub fn position(read: &mut impl LogReads, homes: &[String]) -> Result<BTreeMap<String, u64>, StoreError> {
     homes.iter().map(|home| Ok((home.clone(), read.last_sequence(home)?))).collect()
 }
 
@@ -52,7 +52,7 @@ pub fn position(read: &mut Read<'_>, homes: &[String]) -> Result<BTreeMap<String
 /// is read from the start of its log. Expired when a home's log does not continue from where the
 /// reader left it: caught up from a snapshot, expunged past it, or reset behind it.
 pub fn since(
-    read: &mut Read<'_>,
+    read: &mut impl LogReads,
     kinds: impl IntoIterator<Item = KindCode>,
     homes: &[String],
     at: &BTreeMap<String, u64>,
@@ -113,7 +113,7 @@ impl Follower {
 
     /// Starts every one of `homes` at its current sequence: what the caller read before this is
     /// the state it follows from.
-    pub fn start(&mut self, read: &mut Read<'_>, homes: &[String]) -> Result<(), StoreError> {
+    pub fn start(&mut self, read: &mut impl LogReads, homes: &[String]) -> Result<(), StoreError> {
         for home in homes {
             self.cursors.insert(home.clone(), read.last_sequence(home)?);
         }
@@ -128,7 +128,7 @@ impl Follower {
 
     /// The resources of the followed kinds written on any of `homes` since the last pass, in
     /// each home's order. A home not seen before is named for a rescan and followed from now.
-    pub fn pass(&mut self, read: &mut Read<'_>, homes: &[String]) -> Result<Vec<Followed>, StoreError> {
+    pub fn pass(&mut self, read: &mut impl LogReads, homes: &[String]) -> Result<Vec<Followed>, StoreError> {
         let mut followed = Vec::new();
         for home in homes {
             let last = read.last_sequence(home)?;

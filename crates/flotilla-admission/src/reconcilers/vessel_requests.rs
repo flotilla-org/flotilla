@@ -7,9 +7,10 @@
 //! a vessel, its newest launch here is kept live: a lost launch is replaced by the next, after a
 //! delay that grows with each launch lost in a row ([`PROVISIONING_RETRY_BACKOFF`]), up to
 //! [`LOST_LAUNCH_LIMIT`] in a row; a failed one is not, since a failed vessel fails its work. A
-//! live launch is released once its convoy has ended and the [`VesselReleaseGate`] sanctions
-//! reclaiming what it holds, or once its convoy is gone; what is held for it ends with it. An
-//! ended convoy's launch is released, never failed.
+//! live launch is released once its convoy has ended, or its home archived it, and the
+//! [`VesselReleaseGate`] sanctions reclaiming what it holds; what is held for it ends with it. A
+//! convoy not read here has not ended: its launches are kept. An ended convoy's launch is
+//! released, never failed.
 //!
 //! A pass reads only the convoys it is given, each by its key. The daemon runs passes on the
 //! engine's controller runner: for the convoys a change of a convoy, of a launch here, or of a
@@ -58,10 +59,12 @@ pub struct WorkNeedingVessel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvoyStanding {
     Live,
-    /// It has ended: its launches are released once their reclaim is sanctioned.
+    /// It has ended, as its record or its home's archive tombstone says: its launches are
+    /// released once their reclaim is sanctioned.
     Ended,
-    /// No home holds it: its launches are released.
-    Gone,
+    /// No record of it is read here, and no tombstone: its replica is missing or behind. Its
+    /// launches are kept, and it is judged again when it is read.
+    Unread,
 }
 
 /// One convoy as its vessels need it.
@@ -80,7 +83,7 @@ pub struct ConvoyWorksRead {
 pub trait ConvoyWorks: Send + Sync {
     /// Every live convoy, at every home: read at the start and after missed changes alone.
     fn live(&self) -> Result<Vec<ConvoyKey>, String>;
-    /// Convoy `convoy` homed at `convoy_home`, read by its key alone; none when no home holds it.
+    /// Convoy `convoy` homed at `convoy_home`, read by its key alone; none when it is not read here.
     async fn convoy(&self, convoy: &str, convoy_home: &str) -> Result<Option<ConvoyWorksRead>, String>;
     /// Where convoy `convoy` homed at `convoy_home` stands.
     async fn standing(&self, convoy: &str, convoy_home: &str) -> Result<ConvoyStanding, String>;
@@ -217,8 +220,8 @@ impl VesselRequests {
             })
             .await?;
         // A live launch no work wants is kept while its convoy is live (its work is done, or not
-        // yet placed again), released once its convoy is gone, and once it has ended when the
-        // gate sanctions the reclaim.
+        // yet placed again) or not read here, and released once its convoy has ended, by its record
+        // or its tombstone, when the gate sanctions the reclaim.
         let mut release = Vec::new();
         let mut judged = BTreeMap::<ConvoyKey, bool>::new();
         for (launch, key) in unwanted {
@@ -226,8 +229,7 @@ impl VesselRequests {
                 Some(sanctioned) => *sanctioned,
                 None => {
                     let sanctioned = match self.works.standing(&key.0, &key.1).await.map_err(ResourceError::other)? {
-                        ConvoyStanding::Live => false,
-                        ConvoyStanding::Gone => true,
+                        ConvoyStanding::Live | ConvoyStanding::Unread => false,
                         ConvoyStanding::Ended => match self.gate.may_release(&key.0, &key.1).await {
                             Ok(()) => true,
                             Err(reason) => {
@@ -310,7 +312,7 @@ fn wanted(
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Plan {
     request: Vec<VesselLaunchRequest>,
-    /// Live launches no work wants, each with its convoy: released once that has ended or is gone.
+    /// Live launches no work wants, each with its convoy: released once that has ended.
     unwanted: Vec<(String, ConvoyKey)>,
     next: Option<DateTime<Utc>>,
     /// Each convoy's earliest waiting replacement.

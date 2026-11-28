@@ -304,10 +304,13 @@ pub fn prepared_snapshot_name(kind: &str, spec: &serde_json::Value) -> Result<St
     Ok(format!("{kind}-snapshot-{suffix}"))
 }
 
+/// Write `convoy`'s workflow snapshot: a WorkflowTemplate admission writes for that Convoy, which
+/// that Convoy's release deletes.
 pub async fn ensure_prepared_workflow_snapshot(
     backend: &ResourceBackend,
     namespace: &str,
     name: &str,
+    convoy: &str,
     spec: &WorkflowTemplateSpec,
 ) -> Result<(), String> {
     let templates = backend.definitions::<WorkflowTemplate>(namespace);
@@ -318,10 +321,10 @@ pub async fn ensure_prepared_workflow_snapshot(
             .apply(
                 &InputMeta::builder()
                     .name(name.to_string())
-                    .labels(BTreeMap::from([(
-                        flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
-                        flotilla_resources::WORKFLOW_SNAPSHOT_KIND.to_string(),
-                    )]))
+                    .labels(BTreeMap::from([
+                        (flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(), flotilla_resources::WORKFLOW_SNAPSHOT_KIND.to_string()),
+                        (flotilla_resources::CONVOY_LABEL.to_string(), convoy.to_string()),
+                    ]))
                     .build(),
                 spec,
             )
@@ -372,10 +375,6 @@ pub async fn ensure_repository_and_default_project_workflow(
 ) -> Result<(), String> {
     flotilla_store::ensure_repository(&backend.clone().using::<Repository>(namespace), repository_key, repository_spec)
         .await
-        .map_err(|error| error.to_string())?;
-    flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), namespace)
-        .collect(None)
-        .await
-        .map(|_| ())
+        .map(drop)
         .map_err(|error| error.to_string())
 }

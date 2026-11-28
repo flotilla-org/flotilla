@@ -14,16 +14,19 @@ use std::{
 
 use flotilla_address::Address;
 use flotilla_engine_store::StoreLog;
-use flotilla_resources::convoy_records::ConvoyMemory;
+use flotilla_resources::{
+    convoy::engine::{Delivery, SettlementEvidence},
+    convoy_records::ConvoyMemory,
+};
 use flotilla_schema::{Kind, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
     launch_name,
-    machines::convoy::{Convoy, ConvoyEdge, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoySpec, MemoryConvoyWorld, Retire},
+    machines::convoy::{Convoy, ConvoyEdge, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoySpec, Deliver, MemoryConvoyWorld, Retire},
     Edge as _, Home, Ref, Resource, Version, WriteError,
 };
 
-use super::holds::holds;
+use super::{delivery::ConvoyLog, holds::holds};
 
 /// This home's Convoy records and the world their gates read.
 ///
@@ -37,7 +40,7 @@ use super::holds::holds;
 pub struct Convoys {
     home_name: String,
     service: Arc<Service>,
-    home: Mutex<Home<Convoy, StoreLog>>,
+    home: Mutex<Home<Convoy, ConvoyLog>>,
     world: Mutex<MemoryConvoyWorld>,
     /// What this home observes of its launches, shared with their readers.
     memory: Arc<ConvoyMemory>,
@@ -58,7 +61,8 @@ impl Convoys {
     /// Opens the Convoy home at `home` over `service`, restoring every Convoy
     /// homed here so a restart keeps its records and versions.
     pub fn open(home: &str, service: &Arc<Service>) -> Result<Self, String> {
-        let mut convoys = Home::with_log(home, StoreLog::new(service.store())).map_err(|error| format!("Convoy home: {error:?}"))?;
+        let mut convoys =
+            Home::with_log(home, ConvoyLog::new(StoreLog::new(service.store()))).map_err(|error| format!("Convoy home: {error:?}"))?;
         let stored = service
             .with_store(|store| {
                 let mut read = store.read()?;
@@ -217,6 +221,35 @@ impl Convoys {
         result
     }
 
+    /// Each home's log sequence now.
+    pub fn position(&self) -> Result<std::collections::BTreeMap<String, u64>, String> {
+        flotilla_engine_store::follow::position_on(&self.service).map_err(|error| error.to_string())
+    }
+
+    /// Delivers launch `name`, or the newest launch of `name`, as `disposition`, unless any of
+    /// `evidence` was written after the position it was read from: that is checked in the Deliver
+    /// edge's own transaction, so nothing written before the edge commits goes unseen. A convoy
+    /// already delivered or retired is left as it is.
+    pub fn deliver(&self, name: &str, now: Timestamp, disposition: &str, evidence: SettlementEvidence) -> Result<Delivery, EditError> {
+        let homes = self.service.homes();
+        let mut home = locked(&self.home);
+        let world = locked(&self.world);
+        let launch = newest_name(&home, name).ok_or_else(|| EditError::Unknown(name.to_owned()))?;
+        let current = home.get(&launch).expect("the newest launch is held");
+        if matches!(current.label(), ConvoyLabel::Delivered | ConvoyLabel::Retired) {
+            return Ok(Delivery::Delivered);
+        }
+        home.log().check_next(homes, evidence);
+        let applied = home.apply(&launch, Deliver { disposition: disposition.to_owned() }, &*world, now);
+        let moved = home.log().take_moved();
+        match (applied, moved) {
+            (Ok(_), _) => Ok(Delivery::Delivered),
+            (Err(_), Some(why)) => Ok(Delivery::Moved(why)),
+            (Err(WriteError::Refused(refusal)), None) => Err(EditError::Refused { edge: "Deliver".into(), refusal, applied: 0 }),
+            (Err(other), None) => Err(EditError::Write { error: format!("{other:?}"), applied: 0 }),
+        }
+    }
+
     /// Retires launch `name` homed here once it has ended and nothing holds it: its holds are
     /// read from the store ([`holds`]), then Retire applies under the writer lock with what was
     /// read, so the log records why it retired. A hold that appears after the read finds the
@@ -262,7 +295,7 @@ pub enum Retirement {
 
 /// The launch `name` names at `home`: itself when it is a launch held there, else the newest
 /// launch of it.
-fn newest_name(home: &Home<Convoy, StoreLog>, name: &str) -> Option<String> {
+fn newest_name(home: &Home<Convoy, ConvoyLog>, name: &str) -> Option<String> {
     if home.get(name).is_some() {
         return Some(name.to_owned());
     }

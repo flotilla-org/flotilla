@@ -66,7 +66,7 @@ pub async fn concurrent_convoy_phase_change_prevents_operator_abandonment(factor
             let engine = convoy_engine(&racing);
             let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None };
             engine.keep_by_verdict(&current, &scope, "operator", "concurrent landing won").await.expect("keep the work");
-            engine.deliver(&current, "claim").await.expect("concurrent landing");
+            engine.deliver(&current, "claim", &landed(&*engine)).await.expect("concurrent landing");
         })
         .await
         .expect("an ended convoy is left as it is");

@@ -174,7 +174,7 @@ async fn an_unplaced_local_work_runs_here_until_its_convoy_is_reclaimed() {
 }
 
 /// Convoys as the port reports them, held in memory: the works needing a vessel, and where each
-/// convoy stands (one not standing is gone, and its works are not read). Each convoy has the one
+/// convoy stands (one not standing is not read). Each convoy has the one
 /// work `work`; the live ones are those with works and those standing live.
 #[derive(Default)]
 struct HeldWorks {
@@ -196,7 +196,7 @@ impl ConvoyWorks for HeldWorks {
         let standing = self.standing(convoy, convoy_home).await?;
         let works = self.works.lock().expect("works");
         let needing = works.iter().filter(|work| work.convoy == convoy && work.convoy_home == convoy_home).cloned().collect();
-        Ok((standing != ConvoyStanding::Gone).then(|| ConvoyWorksRead { standing, works: vec!["work".into()], needing }))
+        Ok((standing != ConvoyStanding::Unread).then(|| ConvoyWorksRead { standing, works: vec!["work".into()], needing }))
     }
 
     async fn standing(&self, convoy: &str, convoy_home: &str) -> Result<ConvoyStanding, String> {
@@ -206,7 +206,7 @@ impl ConvoyWorks for HeldWorks {
             .expect("standing")
             .get(&(convoy.to_owned(), convoy_home.to_owned()))
             .copied()
-            .unwrap_or(ConvoyStanding::Gone))
+            .unwrap_or(ConvoyStanding::Unread))
     }
 }
 
@@ -226,13 +226,13 @@ struct Unasked;
 #[async_trait::async_trait]
 impl VesselReleaseGate for Unasked {
     async fn may_release(&self, convoy: &str, _convoy_home: &str) -> Result<(), String> {
-        panic!("convoy {convoy} is gone; its reclaim needs no gate")
+        panic!("convoy {convoy} is not ended; its reclaim is not judged")
     }
 }
 
 // Through the port alone: a work placed here is launched with the convoy's record name, kept while
-// its convoy is live, released without the gate once the convoy is gone, and an ended convoy's
-// launch is released, never failed, once the gate sanctions it.
+// its convoy is live or not read here, and an ended or archived convoy's launch is released, never
+// failed, once the gate sanctions it.
 #[tokio::test]
 async fn the_requester_follows_its_convoys_through_the_port() {
     let held = Arc::new(HeldWorks::default());
@@ -255,10 +255,16 @@ async fn the_requester_follows_its_convoys_through_the_port() {
     let launch = vessels.vessels.get(&requested[0], None).expect("read").expect("launch");
     assert_eq!((launch.convoy.as_str(), launch.launch_of.as_str()), ("c#3", "c-work"), "a work's launches are of the convoy's launch_of");
 
-    // Neither work needs a vessel now: the live convoy's launch is kept, the gone one's released.
+    // Neither work needs a vessel now: the live convoy's launch is kept, and so is the one whose
+    // convoy is not read here, until its tombstone says it is gone and the gate sanctions it.
     held.works.lock().expect("works").clear();
     held.standing.lock().expect("standing").remove(&("gone#1".to_owned(), "kiwi".to_owned()));
     let pass = requests(Arc::new(Unasked)).sync_once(Utc::now()).await.expect("pass");
+    assert!(pass.released.is_empty(), "{pass:?}");
+    held.standing.lock().expect("standing").insert(("gone#1".into(), "kiwi".into()), ConvoyStanding::Ended);
+    let gone = BTreeSet::from([("gone#1".to_owned(), "kiwi".to_owned())]);
+    assert!(requests(Arc::new(Gate(false))).sync_convoys(&gone, Utc::now()).await.expect("refused").released.is_empty());
+    let pass = requests(sanctioned()).sync_convoys(&gone, Utc::now()).await.expect("sanctioned");
     assert_eq!(pass.released, vec![requested[1].clone()]);
     assert_eq!(vessels.vessels.get(&requested[0], None).expect("read").expect("launch").reading, LifecycleReading::InProgress);
 
@@ -270,9 +276,9 @@ async fn the_requester_follows_its_convoys_through_the_port() {
 }
 
 // A pass over the convoys a change names does what a pass over every convoy does for them: it
-// launches a work placed here, keeps a live convoy's launch, releases a gone convoy's without the
-// gate, holds an ended convoy's while the gate refuses (naming it refused), and releases it once
-// the gate sanctions it.
+// launches a work placed here, keeps a live convoy's launch and one whose convoy is not read here,
+// holds an ended convoy's while the gate refuses (naming it refused), and releases it once the
+// gate sanctions it.
 #[tokio::test]
 async fn a_pass_over_named_convoys_follows_them_as_a_full_pass_does() {
     let held = Arc::new(HeldWorks::default());
@@ -293,8 +299,8 @@ async fn a_pass_over_named_convoys_follows_them_as_a_full_pass_does() {
     held.works.lock().expect("works").clear();
     held.standing.lock().expect("standing").remove(&("gone#1".to_owned(), "kiwi".to_owned()));
     let pass = requests(Arc::new(Unasked)).sync_convoys(&both, Utc::now()).await.expect("pass");
-    assert_eq!(pass.released, vec![requested[1].clone()]);
-    assert_eq!(vessels.vessels.get(&requested[0], None).expect("read").expect("launch").reading, LifecycleReading::InProgress);
+    assert!(pass.released.is_empty(), "{pass:?}");
+    assert_eq!(vessels.vessels.get(&requested[1], None).expect("read").expect("launch").reading, LifecycleReading::InProgress);
 
     held.standing.lock().expect("standing").insert(("c#3".into(), "kiwi".into()), ConvoyStanding::Ended);
     let refused = requests(Arc::new(Gate(false))).sync_convoys(&both, Utc::now()).await.expect("refused");
@@ -326,4 +332,45 @@ async fn a_convoy_pass_reads_as_much_with_twenty_convoys_as_with_two() {
     let (two, twenty) = (cost(2).await, cost(20).await);
     assert_eq!(twenty.whole_kind, 0, "{twenty:?}");
     assert_eq!(two, twenty);
+}
+
+// A convoy homed at kiwi and placed on feta's host is launched at feta. A feta whose replica of
+// the convoy is missing (its store restored, or read before replication caught up) keeps the live
+// launch: a convoy it cannot read has not ended. Once the convoy's end replicates there, the launch
+// is released through the gate: kept while it refuses, released once it sanctions the reclaim.
+#[tokio::test]
+async fn a_convoy_not_read_here_keeps_its_launches_until_its_end_is() {
+    let kiwi = EngineHome::open("kiwi");
+    let launched = EngineHome::open("feta");
+    let convoy = admit(&kiwi, "remote", Some("feta-host"), WorkPhase::Ready).await;
+    kiwi.replicate_to(&launched);
+    let vessels = VesselsFixture::at("feta");
+    let requests = |home: &EngineHome, gate: bool| {
+        VesselRequests::new(
+            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::EngineConvoyWorks::new(
+                Arc::clone(home.convoys.reads()),
+                NAMESPACE,
+            )),
+            Arc::clone(&vessels.reads),
+            Arc::new(Gate(gate)),
+            CanonicalHostId::resolved("feta-host"),
+            [],
+        )
+    };
+    let launch = requests(&launched, true).sync_once(Utc::now()).await.expect("pass").requested.pop().expect("requested");
+
+    let missing = EngineHome::open("feta");
+    let key = BTreeSet::from([(convoy.clone(), "kiwi".to_owned())]);
+    let pass = requests(&missing, true).sync_convoys(&key, Utc::now()).await.expect("pass");
+    assert!(pass.released.is_empty(), "{pass:?}");
+    assert_eq!(vessels.vessels.get(&launch, None).expect("read").expect("launch").reading, LifecycleReading::InProgress);
+
+    flotilla_engine_convoys_testkit::land(&kiwi.convoys.path(), &kiwi.convoy(&convoy).await).await;
+    kiwi.replicate_to(&missing);
+    let refused = requests(&missing, false).sync_convoys(&key, Utc::now()).await.expect("refused pass");
+    assert!(refused.released.is_empty());
+    assert_eq!(refused.refused, key);
+    let pass = requests(&missing, true).sync_convoys(&key, Utc::now()).await.expect("pass");
+    assert_eq!(pass.released, vec![launch.clone()]);
+    assert_eq!(vessels.vessels.get(&launch, None).expect("read").expect("launch").reading, LifecycleReading::Released);
 }

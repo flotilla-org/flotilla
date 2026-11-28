@@ -11,9 +11,10 @@
 //!
 //! This module calls no other crew module.
 use chrono::{DateTime, Utc};
+use flotilla_messaging::DeliveryHold;
 use flotilla_protocol::{LeafAddress, Subject};
 use flotilla_resources::address::record_name;
-use flotilla_resources::convoy::engine::{deciding, note, Actor, EngineConvoyPath, EngineConvoys};
+use flotilla_resources::convoy::engine::{deciding, note, Actor, Delivery, EngineConvoyPath, EngineConvoys, SettlementEvidence};
 use flotilla_resources::convoy::reconcile::*;
 use flotilla_resources::host_records::{HostChange, HostRecords};
 use flotilla_resources::*;
@@ -166,14 +167,9 @@ impl ConvoyReconciler {
         ]
     }
 
-    /// Until when a live crew session's engine turn, not yet delivered to it, holds the convoy's
-    /// delivery (#3894).
-    async fn turn_held_until(
-        &self,
-        obj: &ResourceObject<Convoy>,
-        vessel: &str,
-        role: &str,
-    ) -> Result<Option<DateTime<Utc>>, ResourceError> {
+    /// A crew's inbox, and until when a turn in it not yet delivered to the crew's live session
+    /// holds the convoy's delivery (#3894). The inbox is read whether or not a session runs.
+    async fn seat_hold(&self, obj: &ResourceObject<Convoy>, vessel: &str, role: &str) -> Result<DeliveryHold, ResourceError> {
         let messages = &self.messages;
         // The seat's sessions here, read by the launches of its work: a session runs while its
         // newest launch is ready.
@@ -197,17 +193,20 @@ impl ConvoyReconciler {
         .await
         .map_err(|error| ResourceError::other(format!("read the seat's sessions: {error}")))?
         .map_err(ResourceError::other)?;
-        if !live {
-            return Ok(None);
-        }
         let namespace = &obj.metadata.namespace;
         let receiver = crate::leaf_engine::crew_role_address(&obj.spec.project_ref, &obj.metadata.name, vessel, role);
-        messages.delivery_held_until(namespace, &receiver).await.map_err(ResourceError::other)
+        let hold = messages.delivery_hold(namespace, &receiver).await.map_err(ResourceError::other)?;
+        Ok(DeliveryHold { until: hold.until.filter(|_| live), ..hold })
     }
 
     /// Until when some crew of `obj` has a turn not yet delivered to its live session (#3894):
-    /// delivering the convoy before then would let teardown drop the turn and its receipt.
-    async fn delivery_held_until(&self, obj: &ResourceObject<Convoy>) -> Result<Option<DateTime<Utc>>, ResourceError> {
+    /// delivering the convoy before then would let teardown drop the turn and its receipt. The
+    /// crews' inboxes are recorded in `evidence`.
+    async fn delivery_held_until(
+        &self,
+        obj: &ResourceObject<Convoy>,
+        evidence: &mut SettlementEvidence,
+    ) -> Result<Option<DateTime<Utc>>, ResourceError> {
         let seats = obj
             .status
             .iter()
@@ -216,7 +215,9 @@ impl ConvoyReconciler {
             .collect::<Vec<_>>();
         let mut until = None;
         for (vessel, role) in seats {
-            until = until.max(self.turn_held_until(obj, &vessel, &role).await?);
+            let hold = self.seat_hold(obj, &vessel, &role).await?;
+            evidence.inboxes.extend(hold.inbox.map(|inbox| inbox.to_string()));
+            until = until.max(hold.until);
         }
         Ok(until)
     }
@@ -410,7 +411,7 @@ impl ConvoyReconciler {
             return Ok(());
         }
         if let Some(collector) = &self.prepared_snapshot_gc {
-            collector.collect(Some(&obj.metadata.name)).await?;
+            collector.collect(&obj.metadata.name).await?;
         }
         engine.memory().forget(&obj.metadata.name);
         Ok(())
@@ -970,9 +971,13 @@ impl Reconciler for ConvoyReconciler {
             return Ok(ConvoyPass { requeue_after: wait.until.and_then(|until| until.signed_duration_since(now).to_std().ok()) });
         }
 
+        let is_landing = status.phase == ConvoyPhase::Landing;
+        // Landing's evidence is read after this position, so its delivery can be refused if any
+        // of it is written in between.
+        let mut evidence =
+            SettlementEvidence::after(if is_landing { engine.position().map_err(ResourceError::other)? } else { BTreeMap::new() });
         let checkouts = self.held_checkouts(obj).await?;
         let forges = self.forge_specs(obj).await?;
-        let is_landing = status.phase == ConvoyPhase::Landing;
         // A checkout's inspection names the change request its branch is associated with; what
         // that request came to is the forge observation's.
         let names_change_request =
@@ -985,7 +990,8 @@ impl Reconciler for ConvoyReconciler {
             _ => BTreeSet::new(),
         };
         engine.memory().note_evidence(&obj.metadata.name, ChangeRequest::API_PATHS.kind, change_request_names.clone());
-        let change_requests = if needs_pr { self.read_change_requests(change_request_names, &forges).await? } else { BTreeMap::new() };
+        let change_requests =
+            if needs_pr { self.read_change_requests(change_request_names.clone(), &forges).await? } else { BTreeMap::new() };
         // Evidence is aged against a clock read after it is read: a change request this home
         // observes is confirmed as it is read, and must not appear to come from the future.
         let now = self.clock.now();
@@ -1053,14 +1059,21 @@ impl Reconciler for ConvoyReconciler {
             )
         });
         if let Some(disposition) = settlement.as_ref().and_then(|settlement| settlement.disposition.as_deref()) {
-            let held_until = self.delivery_held_until(obj).await?;
+            let held_until = self.delivery_held_until(obj, &mut evidence).await?;
             engine.memory().update(&obj.metadata.name, |notes| notes.delivery_held_until = held_until);
             if let Some(until) = held_until {
                 // A Message change wakes it sooner; the hold's end is its one deadline.
                 pass.requeue_after = Some(until.signed_duration_since(now).to_std().unwrap_or_default());
             } else {
-                match engine.deliver(obj, disposition).await {
-                    Ok(()) => self.note_target_mismatches(engine.as_ref(), obj, &checkouts),
+                evidence.checkouts = checkouts.values().map(|checkout| checkout.name.clone()).collect();
+                evidence.change_requests = change_request_names;
+                match engine.deliver(obj, disposition, &evidence).await {
+                    Ok(Delivery::Delivered) => self.note_target_mismatches(engine.as_ref(), obj, &checkouts),
+                    Ok(Delivery::Moved(why)) => {
+                        // Its write may not wake it: what was written is judged again now.
+                        tracing::info!(convoy = %obj.metadata.name, %why, "landing's evidence moved before delivery; it is judged again");
+                        pass.requeue_after = Some(std::time::Duration::ZERO);
+                    }
                     Err(error) => tracing::info!(convoy = %obj.metadata.name, %error, "the engine refused delivery; landing holds"),
                 }
             }

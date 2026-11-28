@@ -389,6 +389,11 @@ impl AccountRecords for EngineAccounts {
         Ok(resident.bindings.iter().find(|((_, held), _)| held == name).map(|((home, _), binding)| record(binding, home)))
     }
 
+    async fn binding_archived(&self, _namespace: &str, binding: &Ref<AccountBindingSpec>) -> Result<bool, String> {
+        let identity = Identity { kind: BINDING, name: binding.name.clone(), home: binding.home.clone() };
+        self.service.with_store(|store| flotilla_engine_store::archive::archived(&mut store.read()?, &identity)).map_err(store_error)
+    }
+
     async fn requester_binding(
         &self,
         _namespace: &str,

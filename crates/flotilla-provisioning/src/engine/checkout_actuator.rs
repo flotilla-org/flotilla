@@ -107,7 +107,25 @@ pub trait CheckoutProvider: Send + Sync + 'static {
 /// failed, tried again.
 #[async_trait]
 pub trait BranchValidation: Send + Sync + 'static {
-    async fn validate_new_branch(&self, repository: &str, branch: &str, continuing: bool) -> Result<Option<String>, String>;
+    async fn validate_new_branch(&self, repository: &str, branch: &str, continuing: bool) -> Result<Option<String>, BranchLookupError>;
+}
+
+/// Why a branch was not validated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BranchLookupError {
+    /// The lookup never reached the forge's observer, or was dropped before it answered: nothing
+    /// is learned of the branch.
+    Undelivered(String),
+    /// The lookup failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for BranchLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Undelivered(reason) | Self::Failed(reason) => f.write_str(reason),
+        }
+    }
 }
 
 /// No forge to ask: every new branch may be made.
@@ -115,7 +133,7 @@ pub struct NoBranchValidation;
 
 #[async_trait]
 impl BranchValidation for NoBranchValidation {
-    async fn validate_new_branch(&self, _: &str, _: &str, _: bool) -> Result<Option<String>, String> {
+    async fn validate_new_branch(&self, _: &str, _: &str, _: bool) -> Result<Option<String>, BranchLookupError> {
         Ok(None)
     }
 }
@@ -338,8 +356,12 @@ fn created_at(read: &mut Read<'_>, name: &str, home: &str) -> Result<u64, StoreE
     Ok(read.changes(id, 0, 1)?.first().map_or(u64::MAX, |entry| entry.home_seq))
 }
 
+fn transient_cause(message: impl Into<String>) -> Cause {
+    Cause::new(CauseCategory::Transient, message)
+}
+
 fn transient(message: impl Into<String>) -> ProviderFailure {
-    ProviderFailure::new(Cause::new(CauseCategory::Transient, message), true)
+    ProviderFailure::new(transient_cause(message), true)
 }
 
 /// A failed making of a checkout: wrong inputs and unknown failures give up, as the old
@@ -539,6 +561,22 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
         }
     }
 
+    /// The path of the clone a worktree being released was made from; none once that clone has
+    /// ended, when the worktree is released by its own path. A clone that does not read here, or
+    /// is not yet realised, is not known to have ended: the release fails, to be tried again.
+    fn release_clone_path(&self, request: &CheckoutRequest) -> Result<Option<String>, ProviderFailure> {
+        let Some(clone) = &request.clone else { return Ok(None) };
+        let found = self
+            .reads
+            .read(|read| Ok(clone_launch(read, &clone.name, &clone.home)?))
+            .map_err(|error| transient(format!("read clone {}: {error}", clone.name)))?;
+        match found {
+            Some((_, state, _)) if !state.live() => Ok(None),
+            Some(_) => self.clone_path(request),
+            None => Err(transient(format!("clone {} at {} is not read here", clone.name, clone.home))),
+        }
+    }
+
     /// Whether another launch held for the same convoy already has this repository's branch in a
     /// local clone: a late local clone shares that branch rather than making it anew.
     fn sharing_ready_branch(&self, name: &str, request: &CheckoutRequest) -> Result<bool, ProviderFailure> {
@@ -613,7 +651,14 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
         match self.validation.validate_new_branch(&request.repository, &request.branch, continuing).await {
             Ok(None) => Ok(()),
             Ok(Some(conflict)) => Err(refused(conflict)),
-            Err(error) => Err(transient(format!("validate checkout branch {}: {error}", request.branch))),
+            Err(BranchLookupError::Undelivered(error)) => {
+                Err(ProviderFailure::uncounted(transient_cause(format!("validate checkout branch {}: {error}", request.branch))))
+            }
+            // Tried again on the kind's backoff, until its failure limit.
+            Err(BranchLookupError::Failed(error)) => Err(ProviderFailure {
+                retry_at: Some(flotilla_schema::Timestamp::from_datetime(&flotilla_resources::clock::now())),
+                ..transient(format!("validate checkout branch {}: {error}", request.branch))
+            }),
         }
     }
 
@@ -674,18 +719,15 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
         if !archive {
             self.inputs.associate(holder.as_ref()).await;
         }
-        let inputs = self.inputs.inputs(holder.as_ref(), &spec_of(request)).await.unwrap_or_else(|error| {
-            warn!(checkout = name, %error, "a released checkout's inputs could not be read; it is inspected with none");
-            CheckoutInputs::default()
-        });
+        // Inputs that do not read are not none: what the work came to is judged once they read.
+        let inputs = self
+            .inputs
+            .inputs(holder.as_ref(), &spec_of(request))
+            .await
+            .map_err(|error| transient(format!("read checkout {name}'s inputs for its release: {error}")))?;
         let integration = self.inspected(name, request, &inputs).await;
         let clone_path = match &request.source {
-            Source::Worktree => match self.clone_path(request) {
-                Ok(path) => path,
-                // The clone has ended or was never held: the worktree is released by its own path.
-                Err(failure) if failure.retryable => None,
-                Err(failure) => return Err(failure),
-            },
+            Source::Worktree => self.release_clone_path(request)?,
             _ => None,
         };
         // A person's ruling archives it, as integration that could not be judged is.

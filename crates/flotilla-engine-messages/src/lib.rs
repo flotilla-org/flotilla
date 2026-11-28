@@ -386,9 +386,41 @@ pub enum RequestAnswer {
     Waiting,
     /// The service took it: its receipt is written, after the records it wrote for it.
     Answered { receiver: Receiver },
-    /// It will never be answered: dropped as undeliverable (the inbox stayed unbound), expired,
-    /// superseded or withdrawn. The gate fails, never proceeds on older evidence.
+    /// It will never be answered: dropped as undeliverable (the inbox stayed unbound, or its
+    /// service could not do it), expired, superseded or withdrawn, or gone. The gate fails, never
+    /// proceeds on older evidence.
+    Dropped { reason: String },
+    /// It was taken, and settled with no receiver.
     Failed { reason: String },
+}
+
+/// Why a request to a service was not answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unanswered {
+    /// It was dropped, or is gone: it says nothing of what it asked about.
+    Dropped(String),
+    /// Anything else.
+    Failed(String),
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dropped(reason) | Self::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for Unanswered {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
+
+impl From<&str> for Unanswered {
+    fn from(reason: &str) -> Self {
+        Self::Failed(reason.to_owned())
+    }
 }
 
 impl RequestAnswer {
@@ -396,7 +428,7 @@ impl RequestAnswer {
     pub fn of(state: &MessageState) -> RequestAnswer {
         match state {
             MessageState::Pending => RequestAnswer::Waiting,
-            MessageState::Dropped { reason, .. } => RequestAnswer::Failed { reason: format!("the request was dropped: {reason:?}") },
+            MessageState::Dropped { reason, .. } => RequestAnswer::Dropped { reason: format!("the request was dropped: {reason:?}") },
             MessageState::Awaiting { receiver, .. } | MessageState::Settled { receiver: Some(receiver), .. } => {
                 RequestAnswer::Answered { receiver: receiver.clone() }
             }
@@ -876,7 +908,7 @@ impl MessagePrimitives {
     pub async fn request_answer(&self, message: &str) -> Result<RequestAnswer, String> {
         Ok(match self.inbox.get_async(message).await.map_err(|error| error.to_string())? {
             Some(message) => RequestAnswer::of(message.state()),
-            None => RequestAnswer::Failed { reason: format!("request `{message}` is gone") },
+            None => RequestAnswer::Dropped { reason: format!("request `{message}` is gone") },
         })
     }
 
@@ -892,7 +924,7 @@ impl MessagePrimitives {
         let body = RequestBody::CheckoutInspection { remote: true };
         self.ask(namespace, roles::checkout_inspector(home)?, subject, body)
             .await
-            .map_err(|reason| format!("checkout {checkout}'s inspection at {home} failed: {reason}"))
+            .map_err(|unanswered| format!("checkout {checkout}'s inspection at {home} failed: {unanswered}"))
     }
 
     /// Asks this host's forge observer to look for a change request from `branch` of
@@ -901,13 +933,17 @@ impl MessagePrimitives {
     /// what it found is on the change requests' records, read through their `by_branch` index.
     /// While the FleetDesignation is missing or invalid the request waits for it, as message
     /// delivery does: a checkout's branch validation then goes on once it is designated.
-    pub async fn observe_branch(&self, namespace: &str, repository: &Address, branch: &str) -> Result<(), String> {
+    pub async fn observe_branch(&self, namespace: &str, repository: &Address, branch: &str) -> Result<(), Unanswered> {
         let looked_up = async {
             self.designated_roles(namespace).await?;
             let body = RequestBody::ChangeRequestBranch { branch: branch.to_owned() };
             self.ask(namespace, roles::forge_observer(&self.home)?, repository.clone(), body).await
         };
-        looked_up.await.map_err(|reason| format!("branch {branch} of {repository} could not be looked up: {reason}"))
+        let unlooked = |reason| format!("branch {branch} of {repository} could not be looked up: {reason}");
+        looked_up.await.map_err(|unanswered| match unanswered {
+            Unanswered::Dropped(reason) => Unanswered::Dropped(unlooked(reason)),
+            Unanswered::Failed(reason) => Unanswered::Failed(unlooked(reason)),
+        })
     }
 
     /// The fleet roles once the FleetDesignation is designated: while it is missing or invalid,
@@ -931,7 +967,7 @@ impl MessagePrimitives {
 
     /// Sends `body` about `subject` to the service inbox `inbox` as the teardown role, and
     /// waits for its answer on the inbox's changes only. The error is why it was not answered.
-    async fn ask(&self, namespace: &str, inbox: Address, subject: Address, body: RequestBody) -> Result<(), String> {
+    async fn ask(&self, namespace: &str, inbox: Address, subject: Address, body: RequestBody) -> Result<(), Unanswered> {
         use futures::StreamExt;
         let roles = self.roles(namespace).await?;
         let mut spec = MessageSpec::new(
@@ -947,16 +983,17 @@ impl MessagePrimitives {
         loop {
             match self.request_answer(&message).await? {
                 RequestAnswer::Answered { .. } => return Ok(()),
-                RequestAnswer::Failed { reason } => return Err(reason),
+                RequestAnswer::Dropped { reason } => return Err(Unanswered::Dropped(reason)),
+                RequestAnswer::Failed { reason } => return Err(Unanswered::Failed(reason)),
                 RequestAnswer::Waiting => {}
             }
             match watch.next().await {
                 Some(Ok(_)) => {}
-                Some(Err(error)) => return Err(format!("watch {inbox}: {error}")),
+                Some(Err(error)) => return Err(format!("watch {inbox}: {error}").into()),
                 None => {
                     return match self.request_answer(&message).await? {
                         RequestAnswer::Answered { .. } => Ok(()),
-                        _ => Err(format!("the watch of {inbox} ended before the request was answered")),
+                        _ => Err(format!("the watch of {inbox} ended before the request was answered").into()),
                     }
                 }
             }
@@ -1600,24 +1637,25 @@ impl MessagePrimitives {
         }
     }
 
-    /// Until when messages to `receiver`, an old crew address, hold its delivery: those admitted
-    /// at this home and still Pending in the receiver's inbox each hold for one delivery hold
-    /// from admission, and the latest of those ends is returned; None when none holds now. A
+    /// `receiver`'s inbox, and until when messages to it, an old crew address, hold its delivery:
+    /// those admitted at this home and still Pending in the inbox each hold for one delivery hold
+    /// from admission, and the latest of those ends is the hold's; none when none holds now. A
     /// turn still undelivered after its hold no longer holds its recipient; the stall judge
     /// reports a quiet crew.
-    pub async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    pub async fn delivery_hold(&self, namespace: &str, receiver: &str) -> Result<flotilla_messaging::DeliveryHold, String> {
         // Nothing is admitted until the fleet is designated.
-        let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(None) };
+        let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(Default::default()) };
         let inbox = roles.inbox(receiver)?;
         let hold = flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.num_microseconds().expect("a bounded hold");
         let now = self.world.now();
-        Ok(self
+        let until = self
             .pending_in(&inbox)?
             .iter()
             .map(|(_, message)| message.since().0.saturating_add(hold))
             .filter(|end| *end > now.0)
             .max()
-            .and_then(|end| flotilla_schema::Timestamp(end).to_datetime()))
+            .and_then(|end| flotilla_schema::Timestamp(end).to_datetime());
+        Ok(flotilla_messaging::DeliveryHold { inbox: Some(inbox), until })
     }
 
     /// The generic resource verbs' listing (`flotilla get message`, through [`records`]): every
@@ -2194,8 +2232,8 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: &[String], reason: &str) -> Result<Vec<String>, String> {
         MessagePrimitives::end_stalls(self, namespace, seats, stalled, reason).await
     }
-    async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
-        MessagePrimitives::delivery_held_until(self, namespace, receiver).await
+    async fn delivery_hold(&self, namespace: &str, receiver: &str) -> Result<flotilla_messaging::DeliveryHold, String> {
+        MessagePrimitives::delivery_hold(self, namespace, receiver).await
     }
     async fn delivery_wait(&self, namespace: &str) -> Result<Option<String>, String> {
         MessagePrimitives::delivery_wait(self, namespace).await

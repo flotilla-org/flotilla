@@ -846,12 +846,17 @@ impl ConvoyAdmission {
         Ok(())
     }
 
-    /// A convoy's own snapshot, at its own origin: reusing another's would let its GC race
-    /// references in flight, and its change names the one Convoy it was frozen for.
-    fn placement_snapshot_name(&self, convoy: &str, spec: &FulfilmentKindSpec) -> Result<String, String> {
+    /// A convoy's own snapshot of `kind`, at its own origin: one shared with another convoy would
+    /// be released by whichever convoy ended first, and its change names the one Convoy it was
+    /// frozen for.
+    fn snapshot_name(&self, kind: &str, convoy: &str, spec: impl serde::Serialize) -> Result<String, String> {
         let root = self.backend.local_root().map_err(|error| error.to_string())?;
         let spec = serde_json::to_value(spec).map_err(|error| error.to_string())?;
-        prepared_snapshot_name("placement", &serde_json::json!({ "origin": root, "convoy": convoy, "spec": spec }))
+        prepared_snapshot_name(kind, &serde_json::json!({ "origin": root, "convoy": convoy, "spec": spec }))
+    }
+
+    fn placement_snapshot_name(&self, convoy: &str, spec: &FulfilmentKindSpec) -> Result<String, String> {
+        self.snapshot_name("placement", convoy, spec)
     }
 
     async fn write_placement_snapshot(&self, namespace: &str, convoy: &str, spec: &FulfilmentKindSpec) -> Result<String, String> {
@@ -879,15 +884,14 @@ impl ConvoyAdmission {
             provenance,
             evidence,
         } = bundle;
-        let workflow_value = serde_json::to_value(workflow).map_err(|error| error.to_string())?;
-        let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
-        ensure_prepared_workflow_snapshot(&self.backend, namespace, &workflow_name, workflow).await?;
         let mut annotations = provenance;
-        annotations.insert(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name);
         if self.write_admission_briefs_from_inventory(namespace, name, spec, workflow, evidence, adopted_checkout).await? {
             annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
         }
         let result = async {
+            let workflow_name = self.snapshot_name("workflow", name, workflow)?;
+            ensure_prepared_workflow_snapshot(&self.backend, namespace, &workflow_name, name, workflow).await?;
+            annotations.insert(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name);
             if let Some(placement) = placement {
                 let placement_name = self.write_placement_snapshot(namespace, name, placement).await?;
                 annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_name);
@@ -910,13 +914,12 @@ impl ConvoyAdmission {
             result
         }
         .await;
-        // The placement snapshots written for a launch never admitted are its to release: no
-        // convoy's teardown will.
+        // The snapshots written for a launch never admitted are its to release: no convoy's
+        // teardown will.
         if let Err(error) = &result {
-            if let Err(release) =
-                flotilla_store::PreparedSnapshotGarbageCollector::new(self.backend.clone(), namespace).collect(Some(name)).await
+            if let Err(release) = flotilla_store::PreparedSnapshotGarbageCollector::new(self.backend.clone(), namespace).collect(name).await
             {
-                warn!(convoy = %name, %error, %release, "could not release a refused launch's placement snapshots");
+                warn!(convoy = %name, %error, %release, "could not release a refused launch's prepared snapshots");
             }
         }
         result

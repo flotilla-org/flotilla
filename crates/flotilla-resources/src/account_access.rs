@@ -411,6 +411,12 @@ pub trait AccountRecords: Send + Sync {
     ) -> Result<Option<BindingRecord>, String>;
     /// Binding `name`, from whichever home holds it.
     async fn binding(&self, namespace: &str, name: &str) -> Result<Option<BindingRecord>, String>;
+    /// Whether `binding` was archived at its home: its record is gone, and its home's archive left
+    /// its tombstone. A binding never read here, or whose replica is missing, was not. A port that
+    /// keeps no archive has archived none.
+    async fn binding_archived(&self, _namespace: &str, _binding: &Ref<AccountBindingSpec>) -> Result<bool, String> {
+        Ok(false)
+    }
     /// Every binding of a convoy's requesters, open and ended: this home's alone with `local`.
     async fn convoy_bindings(&self, namespace: &str, convoy: &str, local: bool) -> Result<Vec<BindingRecord>, String>;
     /// The convoys whose bindings here use one of `credentials`, and every convoy with a binding

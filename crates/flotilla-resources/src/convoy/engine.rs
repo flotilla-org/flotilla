@@ -13,7 +13,10 @@
 //! admitted before the engine took over, until the cut-over import) stays on the old
 //! path: [`EngineConvoys::holds`] is the one question callers ask first.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 
@@ -38,6 +41,37 @@ pub enum Actor {
 pub struct VerdictScope {
     pub vessel: String,
     pub role: Option<String>,
+}
+
+/// What a landing's settlement read before it chose to deliver: each home's log sequence before
+/// the first read, and the records and inboxes read after it. Delivery is written only if none of
+/// them has been written since.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettlementEvidence {
+    /// Each home's log sequence before the reads ([`EngineConvoys::position`]).
+    pub read_from: BTreeMap<String, u64>,
+    /// The held checkouts' launches, whose readings and inspections were judged.
+    pub checkouts: BTreeSet<String>,
+    /// The change requests' record names.
+    pub change_requests: BTreeSet<String>,
+    /// The crews' inboxes, whose undelivered messages hold delivery.
+    pub inboxes: BTreeSet<String>,
+}
+
+impl SettlementEvidence {
+    /// Evidence read after `position`, with nothing read yet.
+    pub fn after(position: BTreeMap<String, u64>) -> Self {
+        Self { read_from: position, ..Self::default() }
+    }
+}
+
+/// What [`EngineConvoys::deliver`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivery {
+    /// The convoy is delivered.
+    Delivered,
+    /// Nothing was written: what settlement read was written after it read it, as this says.
+    Moved(String),
 }
 
 /// The engine-first Convoy writer, in the old shape.
@@ -91,9 +125,14 @@ pub trait EngineConvoys: Send + Sync {
     /// An operator keeps or retracts one promise by its label, with a reason.
     async fn verdict(&self, convoy: &ResourceObject<Convoy>, label: &str, keep: bool, principal: &str, reason: &str) -> Result<(), String>;
 
+    /// Each home's log sequence now: a settlement reads its evidence after it, so the delivery it
+    /// chooses can be refused if any of it is written in between.
+    fn position(&self) -> Result<BTreeMap<String, u64>, String>;
+
     /// Landing's delivery as `disposition`, the exit-table entry settlement chose (claim, merged,
-    /// closed-unmerged or a workflow's declared name): refused while anything is open.
-    async fn deliver(&self, convoy: &ResourceObject<Convoy>, disposition: &str) -> Result<(), String>;
+    /// closed-unmerged or a workflow's declared name), on what settlement read: refused while
+    /// anything is open, and not written if any of `evidence` was written after it was read.
+    async fn deliver(&self, convoy: &ResourceObject<Convoy>, disposition: &str, evidence: &SettlementEvidence) -> Result<Delivery, String>;
 
     /// The disposition the engine delivered `convoy` with, once it has: the convoy's outcome is
     /// decided, and nothing the old path observes afterwards (a work failing as its vessels find
@@ -417,8 +456,11 @@ mod tests {
         async fn verdict(&self, _: &ResourceObject<Convoy>, _: &str, _: bool, _: &str, _: &str) -> Result<(), String> {
             Ok(())
         }
-        async fn deliver(&self, _: &ResourceObject<Convoy>, _: &str) -> Result<(), String> {
-            Ok(())
+        fn position(&self) -> Result<BTreeMap<String, u64>, String> {
+            Ok(BTreeMap::new())
+        }
+        async fn deliver(&self, _: &ResourceObject<Convoy>, _: &str, _: &SettlementEvidence) -> Result<Delivery, String> {
+            Ok(Delivery::Delivered)
         }
         fn delivered(&self, _: &ResourceObject<Convoy>) -> Option<String> {
             None
