@@ -131,12 +131,11 @@ impl Collection {
 
 #[derive(Clone, Default, Serialize, Deserialize, bon::Builder)]
 pub struct BoardState {
-    // Added for #2928. Previous-generation forge-cache records lack these fields.
-    // Defaults may be retired one roll after #2928, once caches are rewritten (ADR 0047).
+    // Added for #2928. Previous-generation forge-cache records lack this field.
+    // The default may be retired one roll after #2928, once caches are rewritten (ADR 0047).
+    // A cache written before #4478 also holds a `retry_at`, which decoding ignores.
     #[serde(default)]
     pub pending: Option<PendingBoard>,
-    #[serde(default)]
-    pub retry_at: Option<chrono::DateTime<chrono::Utc>>,
     #[builder(default)]
     pub issues: Collection,
     #[builder(default)]

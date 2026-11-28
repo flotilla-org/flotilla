@@ -5,7 +5,6 @@ use chrono::{DateTime, Utc};
 use flotilla_forge_github::gh_api_get;
 use flotilla_forge_github::gh_api_get_with_headers;
 use flotilla_forge_github::github::clamp_per_page;
-use flotilla_forge_github::github::rate_limit_error_for;
 use flotilla_forge_github::github::GhApi;
 use flotilla_forge_github::github_observation::ObservationTelemetry;
 use flotilla_forge_github::github_observation::ParsedObservationResponse;
@@ -71,9 +70,6 @@ impl GitHubIssueProvider {
     async fn poll_board(&self, source: &IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
         let mut cache = self.poll.state.lock().await;
         let existing = cache.entry(source.scope.clone()).or_insert(self.poll.load(&source.scope)?);
-        if let Some(retry_at) = existing.retry_at.filter(|at| *at > flotilla_resources::clock::now()) {
-            return Err(rate_limit_error_for("GraphQL", &retry_at.timestamp().to_string()));
-        }
         if existing.pending.is_none() {
             // Empty initial collections have no item revision to establish a
             // cursor. Start their delta window before inventory acquisition;
@@ -100,7 +96,6 @@ impl GitHubIssueProvider {
                 next.issues.items.clear();
                 next.issues.cursor = None;
             }
-            next.retry_at = None;
             let mut pending = PendingBoard::default();
             for (items, collection, jobs) in [(issues, &mut next.issues, &mut pending.issues), (pulls, &mut next.pulls, &mut pending.pulls)]
             {
@@ -145,9 +140,6 @@ impl GitHubIssueProvider {
             if pending.issues.is_empty() && pending.pulls.is_empty() {
                 break;
             }
-            if let Some(retry_at) = existing.retry_at.filter(|at| *at > flotilla_resources::clock::now()) {
-                return Err(rate_limit_error_for("GraphQL", &retry_at.timestamp().to_string()));
-            }
             let issue_count = pending.issues.len().min(BOARD_BATCH_SIZE);
             let pull_count = pending.pulls.len().min(BOARD_BATCH_SIZE - issue_count);
             let query = board_query(&source.scope, &pending.issues[..issue_count], &pending.pulls[..pull_count])?;
@@ -158,16 +150,11 @@ impl GitHubIssueProvider {
             call.finish(parsed.as_ref().ok());
             let parsed = parsed?;
             if let Some(limit) = &parsed.limit {
-                let mut next = existing.clone();
-                next.retry_at = limit.retry_at.or(Some(flotilla_resources::clock::now() + chrono::Duration::minutes(1)));
-                self.poll.save(&source.scope, &next)?;
-                *existing = next;
-                return Err(rate_limit_error_for("GraphQL", &existing.retry_at.expect("budget deadline").timestamp().to_string()));
+                return Err(limit.observation_error("GraphQL".into()).to_string());
             }
             if !parsed.success || parsed.response.status != 200 {
                 return Err(format!("GitHub board GraphQL HTTP {}: {}", parsed.response.status, parsed.stderr));
             }
-            let low_budget = parsed.low_budget();
             let document = parsed.into_document().map_err(|error| error.to_string())?;
             if document["errors"].as_array().is_some_and(|errors| !errors.is_empty()) {
                 return Err(format!("GitHub board GraphQL errors: {}", document["errors"]));
@@ -193,7 +180,6 @@ impl GitHubIssueProvider {
             }
             pending.issues.drain(..issue_count);
             pending.pulls.drain(..pull_count);
-            next.retry_at = low_budget;
             self.poll.save(&source.scope, &next)?;
             *existing = next;
         }

@@ -24,12 +24,7 @@ pub const GH_ACCOUNT_STATE: AccountState = AccountState::new("gh").homes(&["GH_C
 ]);
 
 const MAX_PER_PAGE: usize = 100;
-const MIN_REMAINING_BUDGET: u32 = 100;
 const RATE_LIMIT_PREFIX: &str = "github rate limited (budget=";
-
-fn is_issue_observation(endpoint: &str) -> bool {
-    endpoint.starts_with("repos/") && endpoint.contains("/issues?")
-}
 
 pub fn response_header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
     raw.lines().take_while(|line| !line.is_empty()).find_map(|line| {
@@ -187,7 +182,6 @@ impl GithubRateLimitKind {
 pub enum GithubRetrySource {
     RateLimitReset,
     RetryAfter,
-    SecondaryFallback,
     Unavailable,
 }
 
@@ -196,7 +190,6 @@ impl GithubRetrySource {
         match self {
             Self::RateLimitReset => "x-ratelimit-reset",
             Self::RetryAfter => "retry-after",
-            Self::SecondaryFallback => "secondary-fallback-60s",
             Self::Unavailable => "unavailable",
         }
     }
@@ -209,7 +202,6 @@ impl std::str::FromStr for GithubRetrySource {
         match value {
             "x-ratelimit-reset" => Ok(Self::RateLimitReset),
             "retry-after" => Ok(Self::RetryAfter),
-            "secondary-fallback-60s" => Ok(Self::SecondaryFallback),
             "unavailable" => Ok(Self::Unavailable),
             _ => Err(format!("unknown GitHub retry source: {value}")),
         }
@@ -319,11 +311,6 @@ pub fn github_rate_limit_from_document(
         (GithubRateLimitKind::Primary, Some(after), Some(reset)) if reset > after => (reset, GithubRetrySource::RateLimitReset),
         (_, Some(after), _) => (after, GithubRetrySource::RetryAfter),
         (GithubRateLimitKind::Primary, None, Some(reset)) => (reset, GithubRetrySource::RateLimitReset),
-        (GithubRateLimitKind::Secondary, None, _) => {
-            // GitHub documents at least a minute when no Retry-After is supplied.
-            // This is explicitly a fallback, never represented as a primary reset.
-            (received_at + chrono::Duration::minutes(1), GithubRetrySource::SecondaryFallback)
-        }
         _ => return Some(GithubRateLimit { kind, retry_at: None, retry_source: GithubRetrySource::Unavailable }),
     };
     Some(GithubRateLimit { kind, retry_at: Some(retry_at), retry_source })
@@ -344,37 +331,8 @@ fn rate_limit_error_from_response_at(raw: &str, budget: &str, received_at: DateT
         "github rate limited (budget={budget}, identity=host gh login, kind={}, retry_source={}, retry_at={})",
         limit.kind.as_str(),
         limit.retry_source,
-        limit.retry_at?.to_rfc3339(),
+        limit.retry_at.map(|at| at.to_rfc3339()).unwrap_or_else(|| "unavailable".into()),
     ))
-}
-
-/// Reserve the last 100 GraphQL points for other users of the host identity.
-/// Use headers when present, with the requested rateLimit fields as fallback.
-pub fn low_graphql_budget(raw: &str, document: &serde_json::Value) -> Option<DateTime<Utc>> {
-    let remaining = response_header(raw, "x-ratelimit-remaining")
-        .and_then(|value| value.parse::<u64>().ok())
-        .or_else(|| document["data"]["rateLimit"]["remaining"].as_u64())?;
-    if remaining >= u64::from(MIN_REMAINING_BUDGET) {
-        return None;
-    }
-    response_header(raw, "x-ratelimit-reset")
-        .and_then(|value| value.parse::<i64>().ok())
-        .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
-        .or_else(|| document["data"]["rateLimit"]["resetAt"].as_str()?.parse().ok())
-        .or_else(|| Some(Utc::now() + chrono::Duration::minutes(1)))
-}
-
-fn low_budget_from_response(raw: &str) -> Option<(DateTime<Utc>, String)> {
-    let remaining = response_header(raw, "x-ratelimit-remaining")?.parse::<u32>().ok()?;
-    if response_header(raw, "x-ratelimit-resource")? != "core" {
-        return None;
-    }
-    if remaining >= MIN_REMAINING_BUDGET {
-        return None;
-    }
-    let reset = response_header(raw, "x-ratelimit-reset")?;
-    let reset_at = Utc.timestamp_opt(reset.parse().ok()?, 0).single()?;
-    Some((reset_at, rate_limit_error_for(&format!("REST core remaining {remaining}"), reset)))
 }
 
 #[async_trait]
@@ -383,9 +341,7 @@ pub trait GhApi: Send + Sync {
     async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, String>;
     /// Admission reads preserve REST classification through repository selection.
     /// Legacy adapters report ordinary failures unless they override this seam.
-    /// Preemptive issue low-budget and cached-backoff refusals retain legacy
-    /// `Forge` diagnostics. Issue callers should keep using the String reads
-    /// until those budget seams migrate; only HTTP response failures classify here.
+    /// Only HTTP response failures classify here.
     async fn get_classified_with_headers(
         &self,
         endpoint: &str,
@@ -416,7 +372,6 @@ enum RestErrorMode {
 /// Client that wraps `gh api` with ETag-based conditional request caching.
 pub struct GhApiClient {
     cache: Mutex<HashMap<String, CacheEntry>>,
-    budget_backoff: Mutex<Option<(DateTime<Utc>, String)>>,
     runner: Arc<dyn CommandRunner>,
     persistence: Option<std::path::PathBuf>,
 }
@@ -434,7 +389,7 @@ impl GhApiClient {
     }
 
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { cache: Mutex::new(HashMap::new()), budget_backoff: Mutex::new(None), runner, persistence: None }
+        Self { cache: Mutex::new(HashMap::new()), runner, persistence: None }
     }
 }
 
@@ -471,13 +426,6 @@ impl GhApi for GhApiClient {
 
 impl GhApiClient {
     async fn fetch(&self, endpoint: &str, repo_root: &Path, error_mode: RestErrorMode) -> Result<GhApiResponse, GhApiFailure> {
-        if is_issue_observation(endpoint) {
-            if let Some((reset, message)) = self.budget_backoff.lock().expect("GitHub budget lock poisoned").as_ref() {
-                if *reset > Utc::now() {
-                    return Err(message.clone().into());
-                }
-            }
-        }
         if let Some(path) = self.cache_path(endpoint) {
             if let Ok(bytes) = std::fs::read(path) {
                 if let Ok(entry) = serde_json::from_slice::<CacheEntry>(&bytes) {
@@ -547,15 +495,6 @@ impl GhApiClient {
             cache.insert(endpoint.to_string(), entry);
         }
 
-        if parsed.status == 200 && is_issue_observation(endpoint) {
-            if let Some((reset, message)) = low_budget_from_response(&output.stdout) {
-                *self.budget_backoff.lock().expect("GitHub budget lock poisoned") = Some((reset, message.clone()));
-                // Keep the ETag and body for a conditional retry after reset, but
-                // report the exhausted budget now so the host condition is visible.
-                return Err(message.into());
-            }
-        }
-
         Ok(parsed)
     }
 }
@@ -582,23 +521,16 @@ pub fn classified_rate_error(error: String) -> ObservationError {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_replay_testkit::testing::MockRunner;
-
     use super::*;
 
     // #3039: GitHub owns diagnostic provenance; every kind/source/deadline combination
     // must survive conversion through the neutral error, including untimed limits.
-    // Finite generator: exhaust both kinds, all four sources, absent deadlines,
+    // Finite generator: exhaust both kinds, every source, absent deadlines,
     // the epoch and a modern deadline. Budget strings include empty and named quotas.
     #[test]
     fn rate_limit_provenance_round_trips_through_neutral_error() {
         for kind in [GithubRateLimitKind::Primary, GithubRateLimitKind::Secondary] {
-            for retry_source in [
-                GithubRetrySource::RateLimitReset,
-                GithubRetrySource::RetryAfter,
-                GithubRetrySource::SecondaryFallback,
-                GithubRetrySource::Unavailable,
-            ] {
+            for retry_source in [GithubRetrySource::RateLimitReset, GithubRetrySource::RetryAfter, GithubRetrySource::Unavailable] {
                 for retry_at in [None, DateTime::from_timestamp(0, 0), DateTime::from_timestamp(1893456000, 0)] {
                     for budget in ["", "GraphQL", "REST core"] {
                         let limit = GithubRateLimit { kind, retry_at, retry_source };
@@ -730,7 +662,7 @@ mod tests {
             ("HTTP/2 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"errors\":[{\"type\":\"RATE_LIMITED\",\"message\":\"API rate limit exceeded\"}]}", Some((GithubRateLimitKind::Primary, Some(3600), "x-ratelimit-reset"))),
             ("HTTP/2 200 OK\r\nX-RateLimit-Remaining: 4989\r\nX-RateLimit-Reset: 1784736000\r\nRetry-After: 10\r\n\r\n{\"errors\":[{\"type\":\"RATE_LIMITED\",\"message\":\"API rate limit exceeded\"}]}", Some((GithubRateLimitKind::Secondary, Some(10), "retry-after"))),
             ("HTTP/2 429 Too Many Requests\r\nRetry-After: Wed, 22 Jul 2026 15:01:00 GMT\r\n\r\n{\"message\":\"slow down\"}", Some((GithubRateLimitKind::Secondary, Some(60), "retry-after"))),
-            ("HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1784736000\r\nRetry-After: invalid\r\n\r\n{\"message\":\"secondary rate limit\"}", Some((GithubRateLimitKind::Secondary, Some(60), "secondary-fallback-60s"))),
+            ("HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1784736000\r\nRetry-After: invalid\r\n\r\n{\"message\":\"secondary rate limit\"}", Some((GithubRateLimitKind::Secondary, None, "unavailable"))),
             ("HTTP/2 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"data\":{\"body\":\"secondary rate limit\"}}", None),
             ("HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"message\":\"API rate limit exceeded\"}", None),
             ("HTTP/2 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"errors\":[{\"type\":\"NOT_FOUND\",\"message\":\"Could not resolve pull request\"}]}", None),
@@ -767,47 +699,6 @@ mod tests {
         assert!(error.contains("budget=REST search"));
     }
 
-    #[tokio::test]
-    async fn low_remaining_budget_stops_further_requests_until_reset() {
-        let reset = Utc::now().timestamp() + 3600;
-        let runner = Arc::new(MockRunner::new(vec![
-            Ok(format!("HTTP/2 200 OK\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: 75\r\nX-RateLimit-Reset: {reset}\r\n\r\n[]")),
-            Ok("HTTP/2 200 OK\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: 75\r\n\r\n[]".into()),
-        ]));
-        let api = GhApiClient::new(runner.clone());
-        let label = ChannelLabel::Default;
-
-        let first = api
-            .get_with_headers("repos/owner/repo/issues?state=all", Path::new("/host"), &label)
-            .await
-            .expect_err("low budget must surface");
-        api.get_with_headers("repos/owner/repo/pulls", Path::new("/host"), &label).await.expect("PR polling must continue");
-        let second =
-            api.get_with_headers("repos/owner/other/issues?state=all", Path::new("/host"), &label).await.expect_err("budget must back off");
-
-        assert!(rate_limit_reset(&first).is_some());
-        assert_eq!(first, second);
-        assert_eq!(runner.calls().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn search_rate_limit_does_not_suspend_core_issue_observation() {
-        let reset = Utc::now().timestamp() + 60;
-        let runner = Arc::new(MockRunner::new(vec![
-            Ok(format!(
-                "HTTP/2 200 OK\r\nX-RateLimit-Resource: search\r\nX-RateLimit-Remaining: 20\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{}}"
-            )),
-            Ok("HTTP/2 200 OK\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: 4800\r\n\r\n[]".into()),
-        ]));
-        let api = GhApiClient::new(runner.clone());
-        let label = ChannelLabel::Default;
-
-        api.get_with_headers("search/issues?q=bug", Path::new("/host"), &label).await.expect("search has a separate budget");
-        api.get_with_headers("repos/owner/repo/issues?state=all", Path::new("/host"), &label)
-            .await
-            .expect("core issue observation remains available");
-        assert_eq!(runner.calls().len(), 2);
-    }
     // Review finding 1: pagination and raw failure metadata share one header
     // interpretation, preserving every repeated comma-delimited Link value.
     #[hegel::test]

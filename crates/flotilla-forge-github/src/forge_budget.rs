@@ -19,7 +19,6 @@ use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::{CommandLines, CommandProcess};
 
 use crate::github::github_rate_limit;
-use crate::github::low_graphql_budget;
 use crate::github::parse_gh_api_response;
 use crate::github::response_header;
 
@@ -31,22 +30,6 @@ pub struct ForgeBudgets {
 struct BudgetState {
     rows: BTreeMap<String, ForgeBudgetRow>,
     totals: BTreeMap<String, ForgeBudgetRow>,
-    deadlines: BTreeMap<String, tokio::time::Instant>,
-}
-impl BudgetState {
-    fn expire_cooldowns(&mut self) {
-        let now = Utc::now();
-        let monotonic_now = tokio::time::Instant::now();
-        self.deadlines.retain(|key, deadline| {
-            let active = *deadline > monotonic_now && self.rows.get(key).and_then(|row| row.retry_at).is_some_and(|at| at > now);
-            if !active {
-                if let Some(row) = self.rows.get_mut(key) {
-                    row.retry_at = None;
-                }
-            }
-            active
-        });
-    }
 }
 impl ForgeBudgets {
     fn key(cmd: &str, args: &[&str]) -> Option<(&'static str, &'static str)> {
@@ -59,15 +42,6 @@ impl ForgeBudgets {
             _ => None,
         }
     }
-    fn before(&self, cmd: &str, args: &[&str]) -> Result<(), String> {
-        let Some((identity, budget)) = Self::key(cmd, args) else { return Ok(()) };
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.expire_cooldowns();
-        if let Some(reset) = state.rows.get(&format!("{identity}/{budget}")).and_then(|row| row.retry_at) {
-            return Err(format!("github rate limited (budget={budget}, identity={identity}, reset_at={})", reset.to_rfc3339()));
-        }
-        Ok(())
-    }
     #[cfg(test)]
     fn after(&self, cmd: &str, args: &[&str], raw: &str) {
         let Some((identity, budget)) = Self::key(cmd, args) else { return };
@@ -76,8 +50,7 @@ impl ForgeBudgets {
     fn after_for(&self, identity: &str, budget: &str, raw: &str) {
         let now = Utc::now();
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.expire_cooldowns();
-        let BudgetState { rows, totals, deadlines } = &mut *state;
+        let BudgetState { rows, totals } = &mut *state;
         let key = format!("{identity}/{budget}");
         let row = rows.entry(key.clone()).or_insert_with(|| ForgeBudgetRow {
             host: String::new(),
@@ -122,16 +95,9 @@ impl ForgeBudgets {
         totals.calls += 1;
         totals.reported_cost += cost.unwrap_or(0);
         totals.unreported_calls += u64::from(cost.is_none());
-        let retry_at = github_rate_limit(raw, now)
-            .map(|limit| limit.retry_at.unwrap_or(now + chrono::Duration::minutes(1)))
-            .or_else(|| (budget == "GraphQL").then(|| low_graphql_budget(raw, &document)).flatten());
-        if let Some(retry_at) = retry_at {
-            row.retry_at = Some(retry_at);
-            if let Some(reset) = row.retry_at {
-                let delay = reset.signed_duration_since(now).to_std().unwrap_or_default();
-                deadlines.insert(key, tokio::time::Instant::now() + delay);
-            }
-        }
+        // The latest response's own retry time: set only when GitHub limited the call and said
+        // when to retry, and cleared by any response that was not limited.
+        row.retry_at = github_rate_limit(raw, now).and_then(|limit| limit.retry_at);
     }
     /// Process lifetime counters; unlike fleet window rows these never reset hourly.
     pub fn counter_rows(&self, host: &str) -> Vec<ForgeBudgetRow> {
@@ -147,8 +113,7 @@ impl ForgeBudgets {
             .collect()
     }
     pub fn rows(&self, host: &str) -> Vec<ForgeBudgetRow> {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.expire_cooldowns();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .rows
             .values()
@@ -282,7 +247,6 @@ impl CommandRunner for BudgetedRunner {
         self.inner.path_exists(path).await
     }
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-        self.budgets.before(cmd, args)?;
         let attempt = BudgetAttempt::new(&self.budgets, cmd, args);
         let result = self.inner.run(cmd, args, cwd, label).await;
         attempt.finish(
@@ -292,7 +256,6 @@ impl CommandRunner for BudgetedRunner {
         result
     }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-        self.budgets.before(cmd, args)?;
         let attempt = BudgetAttempt::new(&self.budgets, cmd, args);
         let result = self.inner.run_output(cmd, args, cwd, label).await;
         attempt.finish(
@@ -312,7 +275,6 @@ impl CommandRunner for BudgetedRunner {
         label: &ChannelLabel,
         grace: Duration,
     ) -> Result<CommandOutput, String> {
-        self.budgets.before(cmd, args)?;
         let attempt = BudgetAttempt::new(&self.budgets, cmd, args);
         let result = self.inner.run_output_with_grace(cmd, args, cwd, label, grace).await;
         attempt.finish(
@@ -332,7 +294,6 @@ impl CommandRunner for BudgetedRunner {
         label: &ChannelLabel,
         timeout: Duration,
     ) -> Result<String, String> {
-        self.budgets.before(cmd, args)?;
         let attempt = BudgetAttempt::new(&self.budgets, cmd, args);
         let result = self.inner.run_with_timeout(cmd, args, cwd, label, timeout).await;
         attempt.finish(
@@ -367,25 +328,29 @@ impl CommandRunner for BudgetedRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The response comes from the gh/network boundary. Quota exhaustion must
-    // suppress subsequent commands until reset, independently for each budget.
+    // The response comes from the gh/network boundary. A budget row reports the retry time GitHub
+    // gave for its latest limited response, invents none for a limit without one, and gates no
+    // later call: the next response replaces what the row says.
     #[test]
-    fn rate_limit_cooldown_and_budget_isolation() {
+    fn retry_time_is_only_what_github_said() {
         let budgets = ForgeBudgets::default();
         let reset = Utc::now() + chrono::Duration::hours(1);
-        let raw = format!(
+        let limited = format!(
             "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {}\r\n\r\n{{\"message\":\"API rate limit exceeded\"}}",
             reset.timestamp()
         );
-        budgets.after("gh", &["api", "graphql"], &raw);
-        assert!(budgets.before("gh", &["api", "graphql"]).is_err());
-        assert!(budgets.before("gh", &["api", "repos/org/repo/issues"]).is_ok());
-        assert!(budgets.before("git", &["status"]).is_ok());
-        let rows = budgets.rows("host");
-        assert_eq!(rows[0].calls, 1);
-        assert_eq!(rows[0].retry_at.unwrap().timestamp(), reset.timestamp());
-        budgets.state.lock().unwrap().rows.values_mut().next().unwrap().retry_at = Some(Utc::now() - chrono::Duration::seconds(1));
-        assert!(budgets.before("gh", &["api", "graphql"]).is_ok());
+        budgets.after("gh", &["api", "graphql"], &limited);
+        assert_eq!(budgets.rows("host")[0].retry_at.map(|at| at.timestamp()), Some(reset.timestamp()));
+
+        budgets.after("gh", &["api", "graphql"], "{\"data\":{\"rateLimit\":{\"cost\":1,\"remaining\":4999}}}");
+        assert_eq!(budgets.rows("host")[0].retry_at, None, "a response that was not limited clears the retry time");
+
+        let untimed =
+            "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 4999\r\n\r\n{\"message\":\"You have exceeded a secondary rate limit\"}";
+        budgets.after("gh", &["api", "graphql"], untimed);
+        let row = &budgets.rows("host")[0];
+        assert_eq!(row.retry_at, None, "a limit without Retry-After has no retry time");
+        assert_eq!(row.calls, 3);
     }
     // Reported GraphQL points and calls without reported cost are distinct.
     // Generate zero-cost responses, large costs, and duplicate sequential calls.
@@ -419,38 +384,6 @@ mod tests {
         assert_eq!(total.reported_cost, cost * (count + 1));
         assert_eq!(total.unreported_calls, 1);
     }
-    // #2928: successful GraphQL responses below the reserve pause subsequent
-    // requests until reset, with accounting retained in the shared budget row.
-    // Generate both sides of the 100-point reserve and header/body precedence.
-    #[hegel::test]
-    fn graphql_low_budget_reserve(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let remaining = tc.draw(gs::integers::<u64>().min_value(98).max_value(101));
-        let headers = tc.draw(gs::booleans());
-        let budgets = ForgeBudgets::default();
-        let reset = Utc::now() + chrono::Duration::hours(1);
-        let header = if headers {
-            format!("X-RateLimit-Remaining: {remaining}\r\nX-RateLimit-Reset: {}\r\n", reset.timestamp())
-        } else {
-            String::new()
-        };
-        // Headers are authoritative when body fields disagree.
-        let body_remaining = if headers { 5000 } else { remaining };
-        let raw = format!(
-            "HTTP/2 200 OK\r\n{header}\r\n{{\"data\":{{\"rateLimit\":{{\"cost\":2,\"remaining\":{body_remaining},\"resetAt\":\"{}\"}}}}}}",
-            reset.to_rfc3339()
-        );
-        budgets.after("gh", &["api", "graphql"], &raw);
-        assert_eq!(budgets.before("gh", &["api", "graphql"]).is_err(), remaining < 100);
-        assert!(budgets.before("gh", &["api", "repos/team/repo/issues"]).is_ok());
-        let row = &budgets.rows("host")[0];
-        assert_eq!((row.calls, row.reported_cost), (1, 2));
-        assert_eq!(row.remaining, Some(remaining));
-        if remaining < 100 {
-            assert_eq!(row.retry_at.expect("reserve cooldown").timestamp(), reset.timestamp());
-        }
-    }
-
     // Cancellation accounting must survive an already poisoned diagnostics
     // mutex during unwinding, count the attempt, and leave cost unknown.
     #[tokio::test]
@@ -487,33 +420,6 @@ mod tests {
         assert_eq!(row.unreported_calls, 0);
     }
 
-    // Expired reset deadlines disappear from fleet health even without another
-    // command or hourly reset; a recovered poisoned diagnostic lock stays usable.
-    #[test]
-    fn expired_cooldown_is_removed_from_health() {
-        let budgets = ForgeBudgets::default();
-        budgets.after(
-            "gh",
-            &["api", "graphql"],
-            "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"API rate limit exceeded\"}",
-        );
-        {
-            let mut state = budgets.state.lock().unwrap();
-            let key = state.rows.keys().next().unwrap().clone();
-            state.deadlines.insert(key, tokio::time::Instant::now() - Duration::from_secs(1));
-        }
-        assert!(budgets.rows("host")[0].retry_at.is_none());
-        assert!(budgets.before("gh", &["api", "graphql"]).is_ok());
-        let state = budgets.state.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = state.lock().unwrap();
-            panic!("diagnostic writer interrupted");
-        })
-        .join();
-        assert_eq!(budgets.rows("host")[0].calls, 1);
-        budgets.after("gh", &["api", "graphql"], "{}");
-        assert_eq!(budgets.rows("host")[0].calls, 2);
-    }
     // CLI subcommands may use REST, GraphQL or both. Their observed attempts
     // must not fabricate either protocol's reported cost. Generate read/write verbs.
     #[hegel::test]

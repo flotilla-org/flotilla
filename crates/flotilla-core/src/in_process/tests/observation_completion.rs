@@ -262,18 +262,15 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
     assert_eq!(daemon.change_request_observation_source.observe(limited).await.expect_err("cached rate limit"), error);
     assert_eq!(runner.calls.lock().expect("calls").len(), 4, "rate-limited repository waits for reset");
 
+    // Nothing holds the other repository back on the identity's behalf (#4478): it asks GitHub,
+    // which answers for itself.
     let before = runner.calls.lock().expect("calls").len();
-    let first_error = daemon
-        .change_request_observation_source
-        .observe_for_completion(first)
-        .await
-        .expect_err("identity cooldown covers the other repository too");
-    assert!(first_error.to_string().contains("budget=GraphQL"));
+    daemon.change_request_observation_source.observe_for_completion(first).await.expect("the other repository is read");
+    assert_eq!(runner.calls.lock().expect("calls").len(), before + 1, "GitHub is asked");
     tokio::time::timeout(Duration::from_secs(1), daemon.change_request_observation_source.observe_for_completion(limited))
         .await
         .expect("cached second repository must not block")
         .expect_err("second repository remains rate limited");
-    assert_eq!(runner.calls.lock().expect("calls").len(), before, "no repository spends the exhausted identity budget");
 }
 
 #[tokio::test]

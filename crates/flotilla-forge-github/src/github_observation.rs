@@ -37,9 +37,6 @@ impl ParsedObservationResponse {
             .headers(headers)
             .build()
     }
-    pub fn low_budget(&self) -> Option<chrono::DateTime<Utc>> {
-        crate::github::low_graphql_budget(&self.headers, self.document.as_ref().unwrap_or(&serde_json::Value::Null))
-    }
     pub fn into_document(self) -> Result<serde_json::Value, ObservationError> {
         self.document.map_err(|error| format!("decode GitHub GraphQL observation: {error}").into())
     }
@@ -129,7 +126,6 @@ impl<'a> ObservationTelemetry<'a> {
             retry_after = ?response_header(headers, "retry-after"),
             graphql_error_types = ?error_types, graphql_error_messages = ?error_messages,
             rest_error_message = ?document["message"].as_str(),
-            reserve_retry_at = ?parsed.and_then(ParsedObservationResponse::low_budget),
             rate_limit_kind = ?limit.as_ref().map(|limit| limit.kind.as_str()),
             response_class = if let Some(limit) = &limit { limit.kind.as_str() } else if parsed.is_none() || parsed.is_some_and(|parsed| !parsed.success || parsed.response.status >= 400 || parsed.document.is_err()) || errors.is_some_and(|errors| !errors.is_empty()) { "other-error" } else { "success" },
             retry_source = ?limit.as_ref().map(|limit| limit.retry_source.as_str()),

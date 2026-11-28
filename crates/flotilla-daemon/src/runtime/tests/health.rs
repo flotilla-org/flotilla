@@ -378,9 +378,9 @@ async fn issue_budget_backoff_surfaces_a_nonblocking_host_condition() {
     let reset = (flotilla_resources::clock::now() + chrono::Duration::hours(1)).to_rfc3339();
     runtime_health.issue_polling.note(&format!("github rate limited (budget=REST search, identity=host gh login, reset_at={reset})"));
     assert!(runtime_health.conditions().await.is_empty(), "search has a separate rate limit");
-    runtime_health
-        .issue_polling
-        .note(&format!("github rate limited (budget=REST core remaining 75, identity=host gh login, reset_at={reset})"));
+    runtime_health.issue_polling.note(&format!(
+        "github rate limited (budget=REST core, identity=host gh login, kind=primary, retry_source=x-ratelimit-reset, retry_at={reset})"
+    ));
 
     let conditions = runtime_health.conditions().await;
     let condition = conditions.iter().find(|condition| condition.condition_type == "Forge/GitHubRateBudget").expect("host condition");
