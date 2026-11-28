@@ -270,9 +270,9 @@ async fn a_provisioned_vessels_cleat_daemon_is_published_through_its_exposure() 
     let guest = guest_root.join("default@1").join("socket");
     let _daemon = cleat_daemon(&guest, b"cleat in the vessel");
     let mut tender = TestTender::start(&stand_in.root().join("t")).await;
-    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), RuntimeHealth::default());
+    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), "kiwi", RuntimeHealth::default());
 
-    publisher.pass(&carried([launch(1, stand_in.env_id.as_str(), &guest_root, "default@1")]), &stand_in.state).await;
+    publisher.pass(&carried([launch(1, stand_in.env_id.as_str(), &guest_root, "default@1")], "kiwi"), &stand_in.state).await;
     let (_, entry) = tender.listed(&publication()).await;
     let endpoint = entry.expect("published").endpoint.expect("its own socket");
     assert_ne!(endpoint, guest, "published from drydock's exposure, not the guest path");

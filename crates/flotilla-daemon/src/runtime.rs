@@ -709,7 +709,11 @@ impl StartupRestoration {
         controller_tasks.push(AbortOnDropHandle::new(spawn_environment_orphan_sweep_task(Arc::clone(state))));
         controller_tasks.push(AbortOnDropHandle::new(remotes::spawn_remote_probe_task(Arc::clone(state), remotes::REMOTE_PROBE_INTERVAL)));
         if let Some(runtime) = &options.tender_runtime {
-            let publisher = Arc::new(cleat_publications::CleatPublisher::new(runtime.clone(), runtime_health.clone()));
+            let publisher = Arc::new(cleat_publications::CleatPublisher::new(
+                runtime.clone(),
+                state.daemon.host_name().as_str(),
+                runtime_health.clone(),
+            ));
             controller_tasks.push(AbortOnDropHandle::new(cleat_publications::spawn_cleat_publisher(Arc::clone(state), publisher)));
         }
         controller_tasks.extend(

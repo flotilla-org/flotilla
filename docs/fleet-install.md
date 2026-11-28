@@ -70,9 +70,12 @@ confirmed, which is why pairing is not part of the roll.
 
 flotillad publishes each vessel's Cleat daemon through the Tender instance of the account it
 runs as (#4401), which may be a service account rather than the person's own: identity
-`vessel/<Vessel resource name>` plus `cleat/<daemon>`, label `cleat`. A vessel's facts name
-that identity, and a viewer reaches the daemon at the Binding path its own instance keeps for
-it (`tender path <scope> <name>`). Only Trusted Group members are admitted, so pair the
+`vessel/<Vessel resource name>` plus `cleat/<daemon>`, label `cleat`. The daemon of a host's
+sessions in no vessel is published under that instance's own scope, `tender/<fingerprint>`
+plus `cleat/<host>/<daemon>`. A session's facts name the identity only once the viewer's own
+instance holds a reachable Binding of it (`tender bindings`); until then they give the reason,
+such as an unpaired instance. A viewer reaches the daemon at that Binding's path
+(`tender path <scope> <name>`). Only Trusted Group members are admitted, so pair the
 flotillad account's instance with the person's machines once, as above, running
 `tender trust pair` as the account flotillad runs as (for a service account, for example
 `sudo -u <account> tender trust pair …`). While flotillad finds no Tender instance it

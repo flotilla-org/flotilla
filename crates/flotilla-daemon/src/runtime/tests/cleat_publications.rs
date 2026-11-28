@@ -1,8 +1,12 @@
-//! A vessel's Cleat daemon is published through a real Tender daemon (#4401).
+//! Cleat daemons are published through a real Tender daemon (#4401).
 
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -16,11 +20,11 @@ use flotilla_resources::{
 use flotilla_test_support::TestSocketDir;
 use notify::{RecursiveMode, Watcher};
 use tender::daemon::{Daemon, Paths};
-use tender_types::{paths::binding_path, Availability, PublicationId};
+use tender_types::{paths::binding_path, Availability, PublicationId, Scope};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, watch, Notify},
     task::JoinHandle,
 };
 
@@ -30,6 +34,7 @@ use crate::runtime::{
 };
 
 const VESSEL: &str = "convoy-7-work#3";
+const HOST: &str = "kiwi";
 const HOST_DIRECT: &str = "host-direct";
 
 /// A Tender instance of its own, on a runtime directory the test owns.
@@ -64,14 +69,24 @@ impl TestTender {
 
     /// This instance's publication `id`, as its control API lists it, and the listing's epoch.
     pub async fn listed(&self, id: &PublicationId) -> (String, Option<tender_types::api::PublicationEntry>) {
+        let listing: tender_types::api::PublicationList = self.get(tender_types::api::PUBLICATIONS).await;
+        (listing.epoch, listing.publications.into_iter().find(|entry| &entry.publication.id == id))
+    }
+
+    /// This instance's own scope, `tender/<fingerprint>`.
+    pub async fn scope(&self) -> Scope {
+        let instance: tender_types::api::Instance = self.get(tender_types::api::IDENTITY).await;
+        Scope::instance(&instance.fingerprint)
+    }
+
+    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> T {
         let http = flotilla_provider_runtime::ReqwestHttpClient::local(&tender_types::paths::control_socket(&self.paths.runtime))
             .expect("control client");
-        let request = reqwest::Request::new(reqwest::Method::GET, "http://tender/v1/publications".parse().expect("url"));
+        let request = reqwest::Request::new(reqwest::Method::GET, format!("http://tender{path}").parse().expect("url"));
         let response = flotilla_provider_runtime::HttpClient::execute(&http, request, &flotilla_provider_runtime::ChannelLabel::Default)
             .await
             .expect("tender answers");
-        let listing: tender_types::api::PublicationList = serde_json::from_slice(response.body()).expect("a publication list");
-        (listing.epoch, listing.publications.into_iter().find(|entry| &entry.publication.id == id))
+        serde_json::from_slice(response.body()).expect("a control API answer")
     }
 }
 
@@ -122,9 +137,9 @@ pub(super) async fn greets(runtime: &Path, socket: &Path, expected: &[u8]) {
 pub(super) fn launch(number: u64, environment: &str, root: &Path, daemon: &str) -> TerminalRecord {
     TerminalRecord {
         name: format!("terminal-work-coder#{number}"),
-        home: "kiwi".into(),
+        home: HOST.into(),
         environment: environment.into(),
-        environment_home: "kiwi".into(),
+        environment_home: HOST.into(),
         vessel: Some(VESSEL.into()),
         role: "coder".into(),
         pool: "cleat".into(),
@@ -155,6 +170,11 @@ pub(super) fn publication() -> PublicationId {
     PublicationId::new(format!("vessel/{VESSEL}"), "cleat/default")
 }
 
+/// A launch of a session in no vessel, held like [`launch`].
+fn standalone(number: u64, root: &Path, daemon: &str) -> TerminalRecord {
+    TerminalRecord { vessel: None, ..launch(number, HOST_DIRECT, root, daemon) }
+}
+
 fn tender_condition(health: &RuntimeHealth) -> Option<flotilla_resources::HostCondition> {
     health.failures.lock().unwrap().get(TENDER_CONDITION_TYPE).cloned()
 }
@@ -170,13 +190,14 @@ async fn a_vessels_cleat_daemon_is_published_until_its_vessel_ends_here() {
     let root = dir.path().join("cleat");
     let _daemon = cleat_daemon(&root.join("default@1").join("socket"), b"cleat default@1");
     let health = RuntimeHealth::default();
-    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), health.clone());
+    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), HOST, health.clone());
     let sockets = Sockets { exposed: dir.path().join("unused") };
     let id = publication();
     let binding = binding_path(&tender.paths.runtime, &id);
 
-    let running = carried([launch(1, HOST_DIRECT, &root, "default@1")]);
-    assert_eq!(running.iter().map(|daemon| &daemon.id).collect::<Vec<_>>(), [&id]);
+    let running = carried([launch(1, HOST_DIRECT, &root, "default@1")], HOST);
+    let scope = tender.scope().await;
+    assert_eq!(running.iter().map(|daemon| daemon.id(&scope)).collect::<Vec<_>>(), [publication()]);
     publisher.pass(&running, &sockets).await;
     let (epoch, entry) = tender.listed(&id).await;
     let entry = entry.expect("published");
@@ -212,14 +233,16 @@ async fn the_newest_launch_names_the_generation_and_the_environment_names_the_so
     let _second = cleat_daemon(&root.join("default@2").join("socket"), b"second");
     let exposed = dir.path().join("exposed.sock");
     let _exposure = cleat_daemon(&exposed, b"exposed");
-    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), RuntimeHealth::default());
+    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), HOST, RuntimeHealth::default());
     let sockets = Sockets { exposed: exposed.clone() };
     let binding = binding_path(&tender.paths.runtime, &publication());
 
-    publisher.pass(&carried([launch(2, HOST_DIRECT, &root, "default@2"), launch(1, HOST_DIRECT, &root, "default@1")]), &sockets).await;
+    publisher
+        .pass(&carried([launch(2, HOST_DIRECT, &root, "default@2"), launch(1, HOST_DIRECT, &root, "default@1")], HOST), &sockets)
+        .await;
     greets(&tender.paths.runtime, &binding, b"second").await;
 
-    publisher.pass(&carried([launch(3, "vessel-env", &root, "default@2")]), &sockets).await;
+    publisher.pass(&carried([launch(3, "vessel-env", &root, "default@2")], HOST), &sockets).await;
     let (_, entry) = tender.listed(&publication()).await;
     assert_eq!(entry.expect("published").endpoint, Some(exposed));
     greets(&tender.paths.runtime, &binding, b"exposed").await;
@@ -235,9 +258,9 @@ async fn without_tender_the_host_says_why_and_publishes_once_it_answers() {
     let _daemon = cleat_daemon(&root.join("default@1").join("socket"), b"cleat");
     let health = RuntimeHealth::default();
     let runtime = dir.path().join("t").join("run");
-    let publisher = CleatPublisher::new(Ok(runtime.clone()), health.clone());
+    let publisher = CleatPublisher::new(Ok(runtime.clone()), HOST, health.clone());
     let sockets = Sockets { exposed: dir.path().join("unused") };
-    let running = carried([launch(1, HOST_DIRECT, &root, "default@1")]);
+    let running = carried([launch(1, HOST_DIRECT, &root, "default@1")], HOST);
 
     publisher.pass(&running, &sockets).await;
     let condition = tender_condition(&health).expect("an unreachable Tender is a condition");
@@ -245,7 +268,7 @@ async fn without_tender_the_host_says_why_and_publishes_once_it_answers() {
     assert!(!condition.blocks_readiness && !condition.blocks_forge_observation, "it is diagnostic: {condition:?}");
     assert!(condition.message.starts_with("no Tender instance reachable"), "{}", condition.message);
 
-    let no_directory = CleatPublisher::new(Err("XDG_RUNTIME_DIR is not this user's".into()), health.clone());
+    let no_directory = CleatPublisher::new(Err("XDG_RUNTIME_DIR is not this user's".into()), HOST, health.clone());
     no_directory.pass(&running, &sockets).await;
     assert!(tender_condition(&health).expect("still a condition").message.contains("XDG_RUNTIME_DIR"));
 
@@ -264,20 +287,21 @@ async fn launch_changes_and_a_restarted_tender_drive_the_publications() {
     let mut tender = TestTender::start(&dir.path().join("t")).await;
     let root = dir.path().join("cleat");
     let _daemon = cleat_daemon(&root.join("default@1").join("socket"), b"cleat");
-    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), RuntimeHealth::default());
+    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), HOST, RuntimeHealth::default());
     let sockets = Sockets { exposed: dir.path().join("unused") };
-    let launches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let launches = Arc::new(Mutex::new(Vec::new()));
     let (changed, changes) = broadcast::channel(16);
-    let read = std::sync::Arc::clone(&launches);
+    let (_registered, registrations) = watch::channel(());
+    let read = Arc::clone(&launches);
     let following = async move {
-        follow(&publisher, "kiwi", move || Ok(read.lock().unwrap().clone()), changes, &sockets).await;
+        follow(&publisher, HOST, move || Ok(read.lock().unwrap().clone()), changes, registrations, &sockets).await;
     };
     let binding = binding_path(&tender.paths.runtime, &publication());
     let change = |home: &str| TerminalChange::Changed { name: "terminal-work-coder#1".into(), home: home.into() };
     let script = async {
         *launches.lock().unwrap() = vec![launch(1, HOST_DIRECT, &root, "default@1")];
         changed.send(change("elsewhere")).expect("followed");
-        changed.send(change("kiwi")).expect("followed");
+        changed.send(change(HOST)).expect("followed");
         greets(&tender.paths.runtime, &binding, b"cleat").await;
 
         tender.restart().await;
@@ -286,8 +310,81 @@ async fn launch_changes_and_a_restarted_tender_drive_the_publications() {
         assert_eq!(entry.expect("published again").publication.availability, Availability::Available);
 
         launches.lock().unwrap().clear();
-        changed.send(change("kiwi")).expect("followed");
+        changed.send(change(HOST)).expect("followed");
         greets(&tender.paths.runtime, &binding, b"").await;
+        tender.stop().await;
+    };
+    tokio::select! {
+        () = following => panic!("the publisher stopped following"),
+        () = script => {}
+    }
+}
+
+// The daemon of this host's sessions in no vessel is published under this instance's own scope,
+// named for the host, beside a vessel's publication of the same daemon; the sessions ending
+// withdraws it.
+#[tokio::test]
+async fn sessions_in_no_vessel_are_published_under_the_hosts_own_scope() {
+    let dir = TestSocketDir::new();
+    let mut tender = TestTender::start(&dir.path().join("t")).await;
+    let root = dir.path().join("cleat");
+    let _daemon = cleat_daemon(&root.join("default@1").join("socket"), b"host cleat");
+    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), HOST, RuntimeHealth::default());
+    let sockets = Sockets { exposed: dir.path().join("unused") };
+    let own = PublicationId { scope: tender.scope().await, name: format!("cleat/{HOST}/default") };
+
+    publisher.pass(&carried([standalone(1, &root, "default@1"), launch(2, HOST_DIRECT, &root, "default@1")], HOST), &sockets).await;
+    greets(&tender.paths.runtime, &binding_path(&tender.paths.runtime, &own), b"host cleat").await;
+    greets(&tender.paths.runtime, &binding_path(&tender.paths.runtime, &publication()), b"host cleat").await;
+
+    publisher.pass(&carried([launch(2, HOST_DIRECT, &root, "default@1")], HOST), &sockets).await;
+    let (_, entry) = tender.listed(&own).await;
+    assert!(entry.as_ref().is_none_or(|entry| entry.publication.availability == Availability::Withdrawn), "{entry:?}");
+    let (_, entry) = tender.listed(&publication()).await;
+    assert_eq!(entry.expect("the vessel's stays").publication.availability, Availability::Available);
+    tender.stop().await;
+}
+
+/// A provisioned environment's socket, found only once its handle is registered.
+struct Registering {
+    registered: AtomicBool,
+    asked: Notify,
+}
+
+#[async_trait]
+impl CleatSockets for Registering {
+    async fn socket(&self, daemon: &CarriedDaemon) -> Result<PathBuf, String> {
+        self.asked.notify_one();
+        if self.registered.load(Ordering::SeqCst) {
+            Ok(daemon.endpoint.socket())
+        } else {
+            Err("environment handle not registered yet".into())
+        }
+    }
+}
+
+// After a restart the first pass can come before a vessel's environment handle is registered
+// again, and finds no socket for it; the registration wakes a pass that publishes it.
+#[tokio::test]
+async fn an_environment_registered_after_the_first_pass_has_its_vessel_published() {
+    let dir = TestSocketDir::new();
+    let mut tender = TestTender::start(&dir.path().join("t")).await;
+    let root = dir.path().join("cleat");
+    let _daemon = cleat_daemon(&root.join("default@1").join("socket"), b"cleat");
+    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), HOST, RuntimeHealth::default());
+    let sockets = Registering { registered: AtomicBool::new(false), asked: Notify::new() };
+    let launches = vec![launch(1, "vessel-env", &root, "default@1")];
+    let (_changed, changes) = broadcast::channel(16);
+    let (registered, registrations) = watch::channel(());
+    let following = follow(&publisher, HOST, move || Ok(launches.clone()), changes, registrations, &sockets);
+    let script = async {
+        sockets.asked.notified().await;
+        let (_, entry) = tender.listed(&publication()).await;
+        assert!(entry.is_none(), "nothing is published without a socket: {entry:?}");
+
+        sockets.registered.store(true, Ordering::SeqCst);
+        registered.send_replace(());
+        greets(&tender.paths.runtime, &binding_path(&tender.paths.runtime, &publication()), b"cleat").await;
         tender.stop().await;
     };
     tokio::select! {

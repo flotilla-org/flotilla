@@ -15,7 +15,7 @@ use flotilla_config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
 use flotilla_discovery::registry::ProviderRegistry;
-use flotilla_environment::environment::{vessel_ops::RunnerVesselAgent, VesselAgent};
+use flotilla_environment::environment::{vessel_ops::RunnerVesselAgent, EnvironmentHandle, VesselAgent};
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
@@ -66,7 +66,10 @@ pub(super) struct ControllerRuntimeState {
     pub(super) image_inventory: Option<Arc<flotilla_provisioning::image_inventory::ImageInventoryPublisher<super::ports::ProviderImageIo>>>,
     /// This host's ADR 0062 image build service, when it can build images.
     pub(super) image_build_service: Option<Arc<dyn flotilla_environment::environment::ImageBuildService>>,
+    /// Provisioned environments' handles by backing id; their subscribers wake on
+    /// `environment_registered` as each is registered.
     pub(super) provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
+    pub(super) environment_registered: tokio::sync::watch::Sender<()>,
     /// Latched after one complete post-startup local Docker adoption pass.
     /// A fresh provider listing is still required for each absence judgement. Subscribers wake
     /// when it latches.
@@ -276,6 +279,18 @@ impl ControllerRuntimeState {
         })
     }
 
+    /// Registers a provisioned environment's handle under its backing id.
+    pub(super) async fn register_provisioned_environment(&self, backing: String, handle: EnvironmentHandle) {
+        self.provisioned_environments.lock().await.insert(backing, ActiveProvisionedEnvironment { handle });
+        self.environment_registered.send_replace(());
+    }
+
+    /// Registers an adopted environment's handle, keeping one already registered for its backing.
+    pub(super) async fn adopt_provisioned_environment(&self, backing: String, handle: EnvironmentHandle) {
+        self.provisioned_environments.lock().await.entry(backing).or_insert(ActiveProvisionedEnvironment { handle });
+        self.environment_registered.send_replace(());
+    }
+
     /// The Rust linker wrapper for a session in `env_ref`, staged on an
     /// SSH host through `runner` when given (a vessel's agent, #3792).
     pub(super) async fn rustc_wrapper_for_environment(&self, env_ref: &str, runner: Option<&dyn CommandRunner>) -> Result<PathBuf, String> {
@@ -337,6 +352,7 @@ impl ControllerRuntimeState {
             image_inventory: None,
             image_build_service: None,
             provisioned_environments: Mutex::new(HashMap::new()),
+            environment_registered: tokio::sync::watch::Sender::new(()),
             local_backing_observed: tokio::sync::watch::Sender::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),

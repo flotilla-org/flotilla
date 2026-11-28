@@ -8,9 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_protocol::{
     result_set::{
-        AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, CleatPublication, ConvoyPhase,
-        ConvoyRow, IndependentRow, ProjectRepositoriesRow, Readiness, ReadinessState, SessionPhase, StandingRoleHold, StandingRoleRow,
-        SurfaceState, Timestamp, VesselRow, WorkPhase,
+        AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, CleatEndpoint, CleatPublication,
+        ConvoyPhase, ConvoyRow, IndependentRow, ProjectRepositoriesRow, Readiness, ReadinessState, SessionPhase, StandingRoleHold,
+        StandingRoleRow, SurfaceState, Timestamp, VesselRow, WorkPhase, CLEAT_PUBLICATION_LABEL,
     },
     ReferenceContext, ViewAddress,
 };
@@ -40,7 +40,7 @@ use crate::{
         SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     legacy_recipe,
-    recipe::{Recipe, RecipeMint},
+    recipe::{BindingScope, Recipe, RecipeMint},
     wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
 };
 
@@ -1170,10 +1170,7 @@ fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint
     }
     if let Some(recipe) = independent.attach.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &independent.host)) {
         catalog.assert_entity(entity.clone(), action_facts(&recipe, "pane"), ordinal);
-        facts.push((
-            KEY_PRIMARY_DIRECT_REASON,
-            MetadataValue::text("independent session is in no vessel, so nothing publishes its Cleat daemon; use flotilla attach"),
-        ));
+        facts.extend(independent_direct_facts(independent, mint));
     }
     catalog.assert_entity(entity, facts, ordinal);
 }
@@ -1273,16 +1270,31 @@ fn vessel_direct_facts(vessel: &VesselRow, mint: &dyn RecipeMint) -> Vec<(&'stat
     let Some(resource) = &vessel.vessel_resource else {
         return reason("vessel is not placed, so its Cleat daemon has no publication");
     };
-    if let Err(missing) = mint.tender() {
-        return reason(&format!("{missing}; use flotilla attach"));
+    let CleatPublication { scope, name, .. } = endpoint.publication(&resource.name);
+    publication_facts(mint.binding(BindingScope::Exact(&scope), &name), name, endpoint)
+}
+
+/// An independent session's direct endpoint: its daemon, published under its host's own
+/// Tender scope, which the viewer learns from its Binding.
+fn independent_direct_facts(independent: &IndependentRow, mint: &dyn RecipeMint) -> Vec<(&'static str, MetadataValue)> {
+    let Some(endpoint) = &independent.cleat_endpoint else {
+        return vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text("no observed Cleat daemon endpoint for this session"))];
+    };
+    let name = endpoint.host_publication_name(independent.host.as_str());
+    publication_facts(mint.binding(BindingScope::AnyInstance, &name), name, endpoint)
+}
+
+/// The publication facts for the Binding in `bound`'s scope, or why there is none.
+fn publication_facts(bound: Result<String, String>, name: String, endpoint: &CleatEndpoint) -> Vec<(&'static str, MetadataValue)> {
+    match bound {
+        Ok(scope) => vec![
+            (KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE, MetadataValue::text(scope)),
+            (KEY_PRIMARY_DIRECT_PUBLICATION_NAME, MetadataValue::text(name)),
+            (KEY_PRIMARY_DIRECT_PUBLICATION_LABEL, MetadataValue::text(CLEAT_PUBLICATION_LABEL)),
+            (KEY_PRIMARY_DIRECT_SESSION, MetadataValue::text(&endpoint.session)),
+        ],
+        Err(missing) => vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text(format!("{missing}; use flotilla attach")))],
     }
-    let CleatPublication { scope, name, label } = endpoint.publication(&resource.name);
-    vec![
-        (KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE, MetadataValue::text(scope)),
-        (KEY_PRIMARY_DIRECT_PUBLICATION_NAME, MetadataValue::text(name)),
-        (KEY_PRIMARY_DIRECT_PUBLICATION_LABEL, MetadataValue::text(label)),
-        (KEY_PRIMARY_DIRECT_SESSION, MetadataValue::text(&endpoint.session)),
-    ]
 }
 
 #[cfg(test)]

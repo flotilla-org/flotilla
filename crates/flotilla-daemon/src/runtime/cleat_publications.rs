@@ -1,8 +1,10 @@
 //! Each vessel's Cleat daemon, published through the Tender instance of the account this daemon
-//! runs as (#4401). A pass compares the daemons this home's vessels run with this instance's own
-//! `cleat` publications as Tender lists them, so a Tender restart (which withdraws every API
-//! publication under a new epoch) and a vessel that ended or left here are settled alike. A pass
-//! runs when a launch here changes and when Tender's control socket appears or goes.
+//! runs as (#4401), and each daemon of the sessions here in no vessel, under that instance's own
+//! scope. A pass compares the daemons this home's launches run with this instance's own `cleat`
+//! publications as Tender lists them, so a Tender restart (which withdraws every API publication
+//! under a new epoch) and a vessel that ended or left here are settled alike. A pass runs when a
+//! launch here changes, when an environment's handle is registered, and when Tender's control
+//! socket appears or goes.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -19,19 +21,19 @@ use flotilla_resources::{
     ConditionValue, HostCondition,
 };
 use flotilla_store::load_metrics::{attributed, caller};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest::{header, Method, Request, StatusCode, Url};
 use rigging_http_wire::Encoding;
 use serde::{de::DeserializeOwned, Serialize};
 use tender_types::{
-    api::{ErrorBody, PublicationEntry, PublicationList, PublishEndpoint, PUBLICATIONS, PUBLISH, WITHDRAW},
+    api::{ErrorBody, Instance, PublicationEntry, PublicationList, PublishEndpoint, IDENTITY, PUBLICATIONS, PUBLISH, WITHDRAW},
     paths::control_socket,
-    Availability, Label, Publication, PublicationId,
+    Availability, Label, Publication, PublicationId, Scope,
 };
 use tokio::{
     sync::{
         broadcast::{self, error::RecvError},
-        mpsc,
+        mpsc, watch,
     },
     task::JoinHandle,
 };
@@ -42,30 +44,44 @@ use super::{health::RuntimeHealth, state::ControllerRuntimeState};
 /// The host condition saying why nothing is published, present only while Tender is unreachable.
 pub(super) const TENDER_CONDITION_TYPE: &str = "Tender";
 
-/// One Cleat daemon a vessel carried here runs, and the generation that holds its sessions.
+/// One Cleat daemon a launch here runs, and the generation that holds its sessions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CarriedDaemon {
-    pub id: PublicationId,
+    /// The Vessel resource it runs for; none for sessions in no vessel, which this instance
+    /// publishes under its own scope.
+    pub vessel: Option<String>,
+    pub name: String,
     pub display: String,
     pub endpoint: CleatEndpoint,
     pub environment: String,
-    pub vessel: String,
 }
 
-/// The daemons the running launches in `records` name, one per vessel and logical daemon: the
-/// newest launch's generation, which is the one a handover moved its sessions to.
-pub(super) fn carried(records: impl IntoIterator<Item = TerminalRecord>) -> Vec<CarriedDaemon> {
-    let mut newest = BTreeMap::<PublicationId, (u64, CarriedDaemon)>::new();
+impl CarriedDaemon {
+    /// Its publication's identity, given this instance's own scope.
+    pub fn id(&self, instance: &Scope) -> PublicationId {
+        let scope = self.vessel.as_ref().map_or_else(|| instance.clone(), |vessel| Scope(self.endpoint.publication(vessel).scope));
+        PublicationId { scope, name: self.name.clone() }
+    }
+}
+
+/// The daemons the running launches at `host` in `records` name, one per vessel (or none) and
+/// logical daemon: the newest launch's generation, which is the one a handover moved its
+/// sessions to.
+pub(super) fn carried(records: impl IntoIterator<Item = TerminalRecord>, host: &str) -> Vec<CarriedDaemon> {
+    let mut newest = BTreeMap::<(Option<String>, String), (u64, CarriedDaemon)>::new();
     for record in records {
-        let (Some(vessel), Some(endpoint)) = (record.vessel.clone(), record.cleat_endpoint()) else { continue };
-        let publication = endpoint.publication(&vessel);
-        let id = PublicationId::new(publication.scope, publication.name);
+        let Some(endpoint) = record.cleat_endpoint() else { continue };
+        let (name, display) = match &record.vessel {
+            Some(vessel) => (endpoint.publication(vessel).name, format!("Cleat daemon {} of vessel {vessel}", endpoint.logical_daemon())),
+            None => (endpoint.host_publication_name(host), format!("Cleat daemon {} of {host}'s sessions", endpoint.logical_daemon())),
+        };
+        let key = (record.vessel.clone(), name.clone());
         let launch = record.launch_number();
-        if newest.get(&id).is_some_and(|(held, _)| *held >= launch) {
+        if newest.get(&key).is_some_and(|(held, _)| *held >= launch) {
             continue;
         }
-        let display = format!("Cleat daemon {} of vessel {vessel}", endpoint.logical_daemon());
-        newest.insert(id.clone(), (launch, CarriedDaemon { id, display, endpoint, environment: record.environment.clone(), vessel }));
+        let daemon = CarriedDaemon { vessel: record.vessel.clone(), name, display, endpoint, environment: record.environment.clone() };
+        newest.insert(key, (launch, daemon));
     }
     newest.into_values().map(|(_, daemon)| daemon).collect()
 }
@@ -85,9 +101,10 @@ impl CleatSockets for Arc<ControllerRuntimeState> {
         if daemon.environment == self.host_direct_environment_name {
             return Ok(guest);
         }
-        let access = match self.ssh_host.get(&daemon.environment) {
-            Some(profile) => Some(self.vessel_access(profile, &daemon.vessel).await?),
-            None => None,
+        let access = match (self.ssh_host.get(&daemon.environment), &daemon.vessel) {
+            (Some(profile), Some(vessel)) => Some(self.vessel_access(profile, vessel).await?),
+            (Some(_), None) => return Err("an SSH host's sessions are reached through their vessels".to_owned()),
+            (None, _) => None,
         };
         let agent = self.vessel_agent(&daemon.environment, access.as_deref()).await?;
         agent.cleat_socket(daemon.endpoint.logical_daemon(), &guest).await
@@ -97,53 +114,56 @@ impl CleatSockets for Arc<ControllerRuntimeState> {
 pub(super) struct CleatPublisher {
     /// The Tender runtime directory of this daemon's account, or why there is none.
     runtime: Result<PathBuf, String>,
+    /// This daemon's host, which names the daemons of its sessions in no vessel.
+    host: String,
     health: RuntimeHealth,
 }
 
 impl CleatPublisher {
-    pub(super) fn new(runtime: Result<PathBuf, String>, health: RuntimeHealth) -> Self {
-        Self { runtime, health }
+    pub(super) fn new(runtime: Result<PathBuf, String>, host: impl Into<String>, health: RuntimeHealth) -> Self {
+        Self { runtime, host: host.into(), health }
     }
 
     /// Publish every daemon in `carried` and withdraw this instance's other Cleat publications.
     pub(super) async fn pass(&self, carried: &[CarriedDaemon], sockets: &dyn CleatSockets) {
-        let (control, listing) = match self.listing().await {
+        let (control, instance, listing) = match self.listing().await {
             Ok(found) => found,
             Err(reason) => return self.unreachable(reason),
         };
         self.reachable();
-        let held = own_cleat_publications(listing.publications);
-        let wanted = carried.iter().map(|daemon| &daemon.id).collect::<BTreeSet<_>>();
+        let held = own_cleat_publications(listing.publications, &instance);
+        let carried = carried.iter().map(|daemon| (daemon.id(&instance), daemon)).collect::<Vec<_>>();
+        let wanted = carried.iter().map(|(id, _)| id).collect::<BTreeSet<_>>();
         for id in held.keys().filter(|id| !wanted.contains(id)) {
             match control.withdraw(id).await {
-                Ok(()) => info!(publication = %id, "withdrew a Cleat daemon no vessel here runs"),
+                Ok(()) => info!(publication = %id, "withdrew a Cleat daemon no launch here runs"),
                 Err(ControlError::Refused { code, .. }) if matches!(code.as_str(), "denied" | "unknown_publication" | "withdrawn") => {
                     debug!(publication = %id, %code, "a Cleat publication was already withdrawn or taken over");
                 }
                 Err(error) => warn!(publication = %id, %error, "withdrawing a Cleat publication failed; retrying next pass"),
             }
         }
-        for daemon in carried {
+        for (id, daemon) in carried {
             let socket = match sockets.socket(daemon).await {
                 Ok(socket) => socket,
                 Err(error) => {
-                    warn!(publication = %daemon.id, %error, "a vessel's Cleat daemon has no local socket to publish yet");
+                    warn!(publication = %id, %error, "a Cleat daemon has no local socket to publish yet");
                     continue;
                 }
             };
-            match held.get(&daemon.id) {
+            match held.get(&id) {
                 Some(published) if *published == socket => continue,
                 // Tender keeps a live publication's socket: a new one replaces it by withdrawal.
                 Some(_) => {
-                    if let Err(error) = control.withdraw(&daemon.id).await {
-                        warn!(publication = %daemon.id, %error, "withdrawing a Cleat daemon's earlier socket failed; retrying next pass");
+                    if let Err(error) = control.withdraw(&id).await {
+                        warn!(publication = %id, %error, "withdrawing a Cleat daemon's earlier socket failed; retrying next pass");
                         continue;
                     }
                 }
                 None => {}
             }
             let request = PublishEndpoint {
-                id: daemon.id.clone(),
+                id: id.clone(),
                 label: Label(CLEAT_PUBLICATION_LABEL.to_owned()),
                 display: daemon.display.clone(),
                 endpoint: socket,
@@ -151,18 +171,21 @@ impl CleatPublisher {
             };
             match control.publish(&request).await {
                 Ok(publication) => {
-                    info!(publication = %publication.id, availability = ?publication.availability, "published a vessel's Cleat daemon")
+                    info!(publication = %publication.id, availability = ?publication.availability, "published a Cleat daemon")
                 }
-                Err(error) => warn!(publication = %daemon.id, %error, "publishing a vessel's Cleat daemon failed; retrying next pass"),
+                Err(error) => warn!(publication = %id, %error, "publishing a Cleat daemon failed; retrying next pass"),
             }
         }
     }
 
-    async fn listing(&self) -> Result<(TenderControl, PublicationList), String> {
+    /// The control API, this instance's own scope and its publications.
+    async fn listing(&self) -> Result<(TenderControl, Scope, PublicationList), String> {
         let runtime = self.runtime.as_ref().map_err(|reason| format!("no Tender runtime directory: {reason}"))?;
         let control = TenderControl::open(runtime)?;
-        let listing = control.publications().await.map_err(|error| format!("{}: {error}", control_socket(runtime).display()))?;
-        Ok((control, listing))
+        let unreachable = |error: ControlError| format!("{}: {error}", control_socket(runtime).display());
+        let instance = control.identity().await.map_err(unreachable)?;
+        let listing = control.publications().await.map_err(unreachable)?;
+        Ok((control, Scope::instance(&instance.fingerprint), listing))
     }
 
     fn unreachable(&self, reason: String) {
@@ -195,14 +218,15 @@ impl CleatPublisher {
     }
 }
 
-/// This instance's own live publications of Cleat daemons in vessel scopes, with their sockets.
-fn own_cleat_publications(entries: Vec<PublicationEntry>) -> BTreeMap<PublicationId, PathBuf> {
+/// This instance's own live publications of Cleat daemons, in vessel scopes and its own, with
+/// their sockets.
+fn own_cleat_publications(entries: Vec<PublicationEntry>, instance: &Scope) -> BTreeMap<PublicationId, PathBuf> {
     entries
         .into_iter()
         .filter_map(|PublicationEntry { publication, endpoint }| {
             let Publication { id, label, availability, .. } = publication;
             let ours = label.0 == CLEAT_PUBLICATION_LABEL
-                && id.scope.is_vessel()
+                && (id.scope.is_vessel() || id.scope == *instance)
                 && id.name.starts_with("cleat/")
                 && availability != Availability::Withdrawn;
             ours.then_some((id, endpoint?))
@@ -210,8 +234,8 @@ fn own_cleat_publications(entries: Vec<PublicationEntry>) -> BTreeMap<Publicatio
         .collect()
 }
 
-/// Publishes this home's vessels' Cleat daemons as their launches change and as Tender comes
-/// and goes.
+/// Publishes this home's Cleat daemons as their launches change, as environments are registered
+/// and as Tender comes and goes.
 pub(super) fn spawn_cleat_publisher(state: Arc<ControllerRuntimeState>, publisher: Arc<CleatPublisher>) -> JoinHandle<()> {
     tokio::spawn(attributed(caller("cleat publications"), async move {
         let reads = state.daemon.lifecycle_reads();
@@ -221,29 +245,39 @@ pub(super) fn spawn_cleat_publisher(state: Arc<ControllerRuntimeState>, publishe
         };
         let home = reads.terminals().map(|terminals| terminals.home().to_owned()).unwrap_or_default();
         let launches = || reads.terminals().and_then(|terminals| terminals.at(terminals.home()));
-        follow(&publisher, &home, launches, changes, &state).await
+        let registered = state.environment_registered.subscribe();
+        follow(&publisher, &home, launches, changes, registered, &state).await
     }))
 }
 
-/// Passes once, then again at each launch change at this home and each change to Tender's
-/// control socket, until the launches' feed closes.
+/// Passes once, then again at each launch change at this home, each environment registered (a
+/// pass before a provisioned environment's handle is back after a restart finds no socket for its
+/// vessels) and each change to Tender's control socket, until the launches' feed closes.
 pub(super) async fn follow(
     publisher: &CleatPublisher,
     home: &str,
     launches: impl Fn() -> Result<Vec<TerminalRecord>, String>,
     mut changes: broadcast::Receiver<TerminalChange>,
+    mut registered: watch::Receiver<()>,
     sockets: &dyn CleatSockets,
 ) {
     let (wake, mut woken) = mpsc::unbounded_channel();
     let mut tender = publisher.runtime.as_ref().ok().map(|runtime| TenderWatch::new(runtime.clone(), wake.clone()));
-    let home = home.to_owned();
+    let forward_home = home.to_owned();
+    let registrations = wake.clone();
     let forward = tokio::spawn(async move {
         loop {
             match changes.recv().await {
-                Ok(TerminalChange::Changed { home: changed, .. }) if changed != home => {}
+                Ok(TerminalChange::Changed { home: changed, .. }) if changed != forward_home => {}
                 Ok(_) | Err(RecvError::Lagged(_)) => drop(wake.send(())),
                 Err(RecvError::Closed) => return,
             }
+        }
+    });
+    registered.mark_unchanged();
+    let forward_registrations = tokio::spawn(async move {
+        while registered.changed().await.is_ok() {
+            let _ = registrations.send(());
         }
     });
     loop {
@@ -251,7 +285,7 @@ pub(super) async fn follow(
             tender.arm();
         }
         match launches() {
-            Ok(records) => publisher.pass(&carried(records.into_iter().filter(TerminalRecord::is_running)), sockets).await,
+            Ok(records) => publisher.pass(&carried(records.into_iter().filter(TerminalRecord::is_running), &publisher.host), sockets).await,
             Err(error) => warn!(%error, "the terminal launches here could not be read; Cleat publications wait for the next change"),
         }
         if woken.recv().await.is_none() {
@@ -260,6 +294,7 @@ pub(super) async fn follow(
         while woken.try_recv().is_ok() {}
     }
     forward.abort();
+    forward_registrations.abort();
 }
 
 /// Tender's runtime directory, watched for its control socket appearing or going: a Tender that
@@ -274,8 +309,11 @@ impl TenderWatch {
     fn new(runtime: PathBuf, wake: mpsc::UnboundedSender<()>) -> Self {
         let (directory, control) = (runtime.clone(), control_socket(&runtime));
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            // An error may hide a change, so it wakes a pass too.
-            if event.map_or(true, |event| event.paths.iter().any(|path| *path == directory || *path == control)) {
+            // An error may hide a change, so it wakes a pass too; reading the directory changes nothing.
+            let changed = |event: notify::Event| {
+                !matches!(event.kind, EventKind::Access(_)) && event.paths.iter().any(|path| *path == directory || *path == control)
+            };
+            if event.map_or(true, changed) {
                 let _ = wake.send(());
             }
         });
@@ -320,6 +358,10 @@ struct TenderControl(ReqwestHttpClient);
 impl TenderControl {
     fn open(runtime: &Path) -> Result<Self, String> {
         ReqwestHttpClient::local(&control_socket(runtime)).map(Self)
+    }
+
+    async fn identity(&self) -> Result<Instance, ControlError> {
+        self.call(Method::GET, IDENTITY, None::<&()>).await
     }
 
     async fn publications(&self) -> Result<PublicationList, ControlError> {

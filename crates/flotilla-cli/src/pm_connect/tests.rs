@@ -2499,3 +2499,42 @@ fn issue_entity(service: &str, scope: impl AsRef<str>, number: impl AsRef<str>) 
         .expect("a resolvable service");
     flotilla_manifest::entity::issue(&address)
 }
+
+// #4401: the viewer's Bindings are what its own Tender instance lists: a publication it carries is
+// listed reachable under its identity, one whose publisher is gone is not, and a viewer whose
+// Tender does not answer says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_viewers_bindings_are_what_its_tender_instance_lists() {
+    use tender_types::{api, Label, PublicationId};
+
+    let dir = flotilla_test_support::TestSocketDir::new();
+    let runtime = dir.path().join("run");
+    assert!(viewer_bindings(&Ok(runtime.clone())).await.unwrap_err().starts_with("no Tender instance reachable from this viewer at"));
+
+    let paths = tender::daemon::Paths { config: dir.path().join("config"), state: dir.path().join("state"), runtime: runtime.clone() };
+    let tender = tender::daemon::Daemon::start(paths).await.expect("tender starts");
+    let endpoint = dir.path().join("cleat.sock");
+    let listener = tokio::net::UnixListener::bind(&endpoint).expect("cleat socket");
+    let id = PublicationId::new("vessel/convoy-7-work#3", "cleat/default");
+    let publish = api::PublishEndpoint { id: id.clone(), label: Label("cleat".into()), display: String::new(), endpoint, audience: None };
+    let control = rigging_tls::client_builder().unix_socket(tender_types::paths::control_socket(&runtime)).build().expect("control client");
+    let post = |path: &str, body: Vec<u8>| {
+        control.post(format!("http://tender{path}")).header("content-type", "application/json").body(body).send()
+    };
+    let published = post(api::PUBLISH, serde_json::to_vec(&publish).expect("json")).await.expect("tender answers");
+    assert!(published.status().is_success(), "{published:?}");
+
+    let bindings = viewer_bindings(&Ok(runtime.clone())).await.expect("listed");
+    let binding = bindings.iter().find(|binding| binding.scope == id.scope.0 && binding.name == id.name).expect("bound");
+    assert_eq!(binding.reachable, Ok(()));
+
+    drop(listener);
+    let withdrawn = post(api::WITHDRAW, serde_json::to_vec(&id).expect("json")).await.expect("tender answers");
+    assert!(withdrawn.status().is_success(), "{withdrawn:?}");
+    let bindings = viewer_bindings(&Ok(runtime.clone())).await.expect("listed");
+    assert!(bindings.iter().filter(|binding| binding.name == id.name).all(|binding| binding.reachable.is_err()), "{bindings:?}");
+    tender.shutdown().await;
+
+    assert!(viewer_bindings(&Err("XDG_RUNTIME_DIR is unset".into())).await.unwrap_err().ends_with("XDG_RUNTIME_DIR is unset"));
+}

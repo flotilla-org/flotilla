@@ -19,7 +19,7 @@ use crate::{
         KEY_PRIMARY_ACTION_TARGET, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE,
         KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, SEGMENT_PROJECT, SEGMENT_REPO,
     },
-    recipe::FlotillaRecipes,
+    recipe::{FlotillaRecipes, ViewerBinding, ViewerBindings},
 };
 
 fn mint() -> FlotillaRecipes {
@@ -330,8 +330,20 @@ const PUBLICATION_KEYS: [&str; 4] = [
     KEY_PRIMARY_DIRECT_SESSION,
 ];
 
+/// The scope a host's Tender instance publishes its own endpoints under, as a viewer binds it.
+const FETA_INSTANCE: &str = "tender/f3e7";
+
+fn bound(scope: &str, name: &str) -> ViewerBinding {
+    ViewerBinding { scope: scope.to_owned(), name: name.to_owned(), reachable: Ok(()) }
+}
+
+/// A viewer whose Tender instance reaches the test vessels' and feta's Cleat publications.
 fn with_tender() -> FlotillaRecipes {
-    mint().with_tender(Ok(()))
+    mint().with_bindings(ViewerBindings::new(Ok(vec![
+        bound("vessel/convoy-remote-coder#3", "cleat/work"),
+        bound("vessel/convoy-ssh-coder#1", "cleat/b1"),
+        bound(FETA_INSTANCE, "cleat/feta/default"),
+    ])))
 }
 
 /// A running vessel `coder` of convoy `remote`, placed as Vessel `convoy-remote-coder#3`, whose
@@ -397,19 +409,87 @@ fn a_vessels_cleat_daemon_is_named_by_its_publication_wherever_it_runs() {
     }
 }
 
-// A viewer without a Tender instance cannot bind the publication: the reason says so, the
-// recipe stays, and none of the publication's facts are written.
+// A viewer whose Tender instance cannot reach the publication cannot bind it: with no Tender,
+// with one not paired with the publisher's, or with a Binding whose publisher is gone, the reason
+// says so, the recipe stays, and none of the publication's facts are written.
 #[test]
-fn without_tender_the_reason_says_so() {
+fn a_viewer_that_cannot_reach_the_publication_says_why() {
     let vessel_entity = entity::vessel("kiwi", "remote", "coder").expect("valid address");
-    let missing = mint().with_tender(Err("no Tender instance reachable at /run/user/1000/tender/control".to_owned()));
-    for viewer in [mint(), missing] {
+    let viewer = |listing| mint().with_bindings(ViewerBindings::new(listing));
+    let unreachable =
+        ViewerBinding { reachable: Err("its publisher is unavailable".to_owned()), ..bound("vessel/convoy-remote-coder#3", "cleat/work") };
+    for (viewer, reason) in [
+        (mint(), "no Tender instance reachable from this viewer"),
+        (viewer(Err("no Tender instance reachable at /run/user/1000/tender/control".to_owned())), "no Tender instance reachable at"),
+        (viewer(Ok(vec![bound(FETA_INSTANCE, "cleat/feta/default")])), "this viewer's Tender instance has no Binding of vessel/"),
+        (
+            viewer(Ok(vec![unreachable])),
+            "this viewer's Tender instance cannot reach vessel/convoy-remote-coder#3:cleat/work: its publisher",
+        ),
+    ] {
         let catalog = project_catalog(&catalog_input(&[placed_convoy()]), &viewer);
         let patch = find_entity(&catalog.reassert_patches(), &vessel_entity).clone();
-        assert!(text(&patch, KEY_PRIMARY_DIRECT_REASON).starts_with("no Tender instance reachable"), "{patch:?}");
+        assert!(text(&patch, KEY_PRIMARY_DIRECT_REASON).starts_with(reason), "{patch:?}");
+        assert!(text(&patch, KEY_PRIMARY_DIRECT_REASON).ends_with("; use flotilla attach"), "{patch:?}");
         assert!(patch.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
         for key in PUBLICATION_KEYS {
-            assert!(!patch.set.contains_key(key), "{key}");
+            assert!(!patch.set.contains_key(key), "{reason}: {key}");
+        }
+    }
+}
+
+/// A live independent session `scratch` on feta, held by its daemon generation `default@2`.
+fn independent(endpoint: bool) -> IndependentRow {
+    IndependentRow::builder()
+        .resource(ResourceRef::new("flotilla/v1", "TerminalSession", "dev", "scratch").on_host(HostName::new("feta")))
+        .name("scratch")
+        .host(HostName::new("feta"))
+        .attach("scratch")
+        .maybe_cleat_endpoint(endpoint.then(|| CleatEndpoint {
+            runtime_root: "/run/cleat".to_owned(),
+            daemon: "default@2".to_owned(),
+            session: "scratch".to_owned(),
+        }))
+        .phase(SessionPhase::Running)
+        .build()
+}
+
+fn independent_patch(row: IndependentRow, viewer: &FlotillaRecipes) -> MetadataPatch {
+    let input = CatalogInput {
+        subjects: None,
+        awareness: None,
+        convoys: &[],
+        independents: &[row],
+        standing_roles: &[],
+        project_repositories: &[],
+    };
+    find_entity(&project_catalog(&input, viewer).reassert_patches(), &entity::session("feta", "scratch")).clone()
+}
+
+// A session in no vessel attaches directly too: its daemon is published under its host's own
+// Tender scope, named for the host, and the viewer takes the scope from its Binding of it.
+#[test]
+fn an_independent_session_is_named_by_its_hosts_publication() {
+    let patch = independent_patch(independent(true), &with_tender());
+    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE), FETA_INSTANCE);
+    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_PUBLICATION_NAME), "cleat/feta/default");
+    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_PUBLICATION_LABEL), "cleat");
+    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_SESSION), "scratch");
+    assert!(!patch.set.contains_key(KEY_PRIMARY_DIRECT_REASON));
+
+    let elsewhere = mint().with_bindings(ViewerBindings::new(Ok(vec![
+        bound(FETA_INSTANCE, "cleat/feta/default"),
+        bound("tender/0a9c", "cleat/feta/default"),
+    ])));
+    for (row, viewer, reason) in [
+        (independent(false), with_tender(), "no observed Cleat daemon endpoint"),
+        (independent(true), mint(), "no Tender instance reachable"),
+        (independent(true), elsewhere, "this viewer's Tender instance has Bindings of cleat/feta/default in a host's own scope from more"),
+    ] {
+        let patch = independent_patch(row, &viewer);
+        assert!(text(&patch, KEY_PRIMARY_DIRECT_REASON).starts_with(reason), "{patch:?}");
+        for key in PUBLICATION_KEYS {
+            assert!(!patch.set.contains_key(key), "{reason}: {key}");
         }
     }
 }

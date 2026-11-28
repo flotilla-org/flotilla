@@ -908,6 +908,13 @@ impl CleatEndpoint {
             label: CLEAT_PUBLICATION_LABEL.to_owned(),
         }
     }
+
+    /// The publication name of this daemon for sessions in no vessel on `host`. They are
+    /// published under that host's Tender instance scope (`tender/<fingerprint>`), which a viewer
+    /// learns from its Binding of this name, so the name carries the host.
+    pub fn host_publication_name(&self, host: &str) -> String {
+        format!("cleat/{host}/{}", self.logical_daemon())
+    }
 }
 
 /// One authoritative Project definition. Presence of this row makes an empty
@@ -1510,6 +1517,7 @@ mod tests {
             assert_eq!(publication.label, "cleat");
         }
         assert_eq!(endpoint("default@12").socket(), Path::new("/run/cleat/default@12/socket"));
+        assert_eq!(endpoint("default@12").host_publication_name("kiwi"), "cleat/kiwi/default");
     }
 
     #[test]

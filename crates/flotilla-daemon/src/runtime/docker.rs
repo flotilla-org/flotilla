@@ -25,7 +25,6 @@ use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use super::credentials::stage_agent_environment;
-use super::environments::ActiveProvisionedEnvironment;
 use super::state::ControllerRuntimeState;
 use crate::environment_tools::{EnvironmentToolContext, DOCKER_PROVIDER_KIND};
 
@@ -529,7 +528,7 @@ impl DockerControllerRuntime {
             .await);
         }
         let handle_registry_digest = handle.registry_digest().map(str::to_owned);
-        self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { handle });
+        self.state.register_provisioned_environment(container_id.clone(), handle).await;
         Ok(EnvironmentProvisioning::Local(LocalProvisioning {
             backing_id: Some(container_id),
             image_ref: Some(image_ref),

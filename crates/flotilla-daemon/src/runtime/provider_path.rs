@@ -29,7 +29,6 @@ use flotilla_resources::EnvironmentSpec;
 use sha2::Digest;
 
 use super::docker::{composed_image_pull_auth, discard_failed_environment, probe_provisioned_environment};
-use super::environments::ActiveProvisionedEnvironment;
 use super::state::ControllerRuntimeState;
 use crate::environment_tools::{EnvironmentToolContext, EnvironmentToolProviderKind, DOCKER_PROVIDER_KIND, SSH_HOST_PROVIDER_KIND};
 
@@ -140,7 +139,7 @@ pub(super) async fn provision(
             configured_limits: None,
         }),
     };
-    state.provisioned_environments.lock().await.insert(handle.backing_id().to_string(), ActiveProvisionedEnvironment { handle });
+    state.register_provisioned_environment(handle.backing_id().to_string(), handle).await;
     Ok(facts)
 }
 
