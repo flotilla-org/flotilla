@@ -608,6 +608,54 @@ async fn a_release_searches_its_convoys_branch_to_judge_landing() {
     assert!(world.ready(&launch));
 }
 
+/// A holder's inputs that do not read while `unread` is set.
+#[derive(Default)]
+struct UnreadInputs {
+    unread: std::sync::atomic::AtomicBool,
+    /// How many reads did not read.
+    refused: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl HolderInputs for UnreadInputs {
+    async fn inputs(&self, holder: Option<&CheckoutHolder>, spec: &CheckoutSpec) -> Result<CheckoutInputs, String> {
+        if self.unread.load(std::sync::atomic::Ordering::SeqCst) {
+            self.refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err("the holder's record did not read".into());
+        }
+        NamedHolderInputs.inputs(holder, spec).await
+    }
+
+    async fn associate(&self, _: Option<&CheckoutHolder>) {}
+}
+
+// Behaviour: a release whose inputs do not read judges nothing from none: it fails, naming the
+// read, and the worktree is neither removed nor held for a person. Once the inputs read, the
+// release judges the work as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_whose_inputs_do_not_read_waits_for_them() {
+    let inputs = Arc::new(UnreadInputs::default());
+    let world = World::with_inputs(
+        RecordingProvider { asked: Mutex::new(Asked { inspection: Some(inspection(true, true, false)), ..Asked::default() }) },
+        Arc::clone(&inputs) as Arc<dyn HolderInputs>,
+    );
+    world.checkouts.open_convoy("c1");
+    let launch = world.ready_worktree("c1", "feature").await;
+    inputs.unread.store(true, std::sync::atomic::Ordering::SeqCst);
+    world.checkouts.abandon_convoy("c1", "deleted");
+    world.until("a release tried", |_| inputs.refused.load(std::sync::atomic::Ordering::SeqCst) > 0).await;
+    // Time for the try to have removed it, had it gone on.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(world.ready(&launch), "kept");
+    assert!(world.provider.asked().removals.is_empty(), "nothing removed");
+    assert!(world.holds.held().is_empty(), "nor held for a person");
+
+    inputs.unread.store(false, std::sync::atomic::Ordering::SeqCst);
+    world.rechecks.send(launch.clone()).await.expect("recheck");
+    world.until("released", |world| world.released(&launch)).await;
+    assert!(matches!(world.provider.asked().removals.as_slice(), [CheckoutRemoval::Worktree { .. }]));
+}
+
 /// Convoy `c1` at home `beta`, written as `write` says after a checkout at `alpha` read it, and
 /// held at `alpha` only from a snapshot taken after that write: whether the checkout's holder has
 /// ended, judged at `alpha`.
