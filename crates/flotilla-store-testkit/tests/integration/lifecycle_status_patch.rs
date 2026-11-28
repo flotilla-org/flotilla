@@ -6,8 +6,8 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
-    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, PlacementStatus, StatusPatch, TurnDeliveryEpisode,
-    TurnDeliveryOutcome, TurnDeliveryRung, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, StatusPatch, TurnDeliveryEpisode, TurnDeliveryOutcome,
+    TurnDeliveryRung, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 
 #[test]
@@ -85,7 +85,6 @@ define_patch_kinds! {
     ConvoySetSettlementAttention => NONE,
     ConvoyRecordLandingEvent => NONE,
     ConvoyObserveTurnHookHealth => NONE,
-    ConvoyWorkLaunching => DUPLICATE,
     ConvoyWorkRunning => DUPLICATE,
     ConvoyWorkInterrupted => CONTINUATION,
     ConvoyForceWorkCompleted => DUPLICATE,
@@ -135,7 +134,6 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::Settle { .. } => PatchKind::ConvoySettle,
         ConvoyStatusPatch::SetSettlementAttention { .. } => PatchKind::ConvoySetSettlementAttention,
         ConvoyStatusPatch::ObserveTurnHookHealth { .. } => PatchKind::ConvoyObserveTurnHookHealth,
-        ConvoyStatusPatch::WorkLaunching { .. } => PatchKind::ConvoyWorkLaunching,
         ConvoyStatusPatch::WorkRunning { .. } => PatchKind::ConvoyWorkRunning,
         ConvoyStatusPatch::WorkInterrupted { .. } => PatchKind::ConvoyWorkInterrupted,
         ConvoyStatusPatch::ForceWorkCompleted { .. } => PatchKind::ConvoyForceWorkCompleted,
@@ -483,22 +481,6 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
-            },
-        },
-        LifecycleCase {
-            name: "work launch",
-            kind: PatchKind::ConvoyWorkLaunching,
-            exercise: || {
-                let mut status = active_convoy_status();
-                status.work.get_mut("implement").expect("implement work").phase = WorkPhase::Launching;
-                let before = work_timestamps(&status);
-                let patch = ConvoyStatusPatch::WorkLaunching {
-                    work: "implement".to_string(),
-                    started_at: ts(30),
-                    placement: PlacementStatus::default(),
-                };
-                apply_and_replay(&mut status, &patch);
-                (before, work_timestamps(&status))
             },
         },
         LifecycleCase {

@@ -135,7 +135,7 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
                 host_name: aggregate_daemon.host_name().clone(),
                 event_sink: aggregate_daemon.event_sink(),
                 events: aggregate_daemon.subscribe(),
-                attach: aggregate_daemon.clone(),
+                origins: aggregate_daemon.clone(),
                 change_requests: aggregate_daemon.clone(),
                 issues: aggregate_daemon.clone(),
                 lifecycles: aggregate_daemon.lifecycle_reads(),

@@ -1287,20 +1287,6 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
     ConvoyStatusPatch::AdvanceWorkToReady { ready: BTreeMap::from([("implement".to_string(), ts(11))]) }.apply(&mut status);
     assert_eq!(status.work["implement"].ready_at, Some(ts(10)));
 
-    ConvoyStatusPatch::WorkLaunching {
-        work: "implement".to_string(),
-        started_at: ts(20),
-        placement: flotilla_resources::PlacementStatus::default(),
-    }
-    .apply(&mut status);
-    ConvoyStatusPatch::WorkLaunching {
-        work: "implement".to_string(),
-        started_at: ts(21),
-        placement: flotilla_resources::PlacementStatus::default(),
-    }
-    .apply(&mut status);
-    assert_eq!(status.work["implement"].started_at, Some(ts(20)));
-
     ConvoyStatusPatch::ForceWorkCompleted { work: "implement".to_string(), finished_at: ts(30), message: Some("done".to_string()) }
         .apply(&mut status);
     ConvoyStatusPatch::ForceWorkCompleted { work: "implement".to_string(), finished_at: ts(31), message: Some("still done".to_string()) }

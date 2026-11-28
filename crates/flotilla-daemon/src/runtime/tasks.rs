@@ -1330,7 +1330,7 @@ pub(super) fn spawn_aggregator_task(
                         host_name: daemon.host_name().clone(),
                         event_sink: daemon.event_sink(),
                         events: daemon.subscribe(),
-                        attach: daemon.clone(),
+                        origins: daemon.clone(),
                         change_requests: daemon.clone(),
                         issues: daemon.clone(),
                         lifecycles: daemon.lifecycle_reads(),

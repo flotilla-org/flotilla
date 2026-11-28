@@ -2,7 +2,7 @@
 
 use flotilla_discovery::environment_manager::{EnvironmentManager, ManagedEnvironmentKind};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     str::FromStr,
     sync::Arc,
@@ -205,29 +205,6 @@ impl<'a> AttachResolver<'a> {
             return Err("attach reference is required".to_string());
         }
         self.resolve_attach(reference, host, true, AttachMode::Default, None).await
-    }
-
-    pub(super) async fn resolvable_references(&self, references: &[String]) -> Result<HashSet<String>, String> {
-        if references.is_empty() {
-            return Ok(HashSet::new());
-        }
-        let index = self.attach_candidate_index(references).await?;
-        let mut resolved = HashSet::new();
-        for reference in references {
-            if index.resolve(self, reference, None, false, AttachMode::Default).await.is_ok() {
-                resolved.insert(reference.clone());
-            }
-        }
-        Ok(resolved)
-    }
-
-    pub(super) async fn resolvable_targets(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String> {
-        let index = self.attach_candidate_index(&targets.iter().map(|(reference, _)| reference.clone()).collect::<Vec<_>>()).await?;
-        let mut resolved = Vec::with_capacity(targets.len());
-        for (reference, host) in targets {
-            resolved.push(index.resolve(self, reference, Some(host), false, AttachMode::Default).await.is_ok());
-        }
-        Ok(resolved)
     }
 
     pub(super) async fn attach_project_context(
