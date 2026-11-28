@@ -145,6 +145,7 @@ impl Sample for TerminalSessionKind {
             cwd: "/workspace".into(),
             env: [("A".to_owned(), "1".to_owned())].into(),
             source: Launch::Tool { command: "bash".into() },
+            agent_session: None,
         }
     }
 }

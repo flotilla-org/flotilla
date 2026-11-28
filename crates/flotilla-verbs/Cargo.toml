@@ -11,6 +11,7 @@ description = "Native verbs: declarations, the handler trait, presentation and t
 async-trait = { workspace = true }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-schema = { path = "../flotilla-schema" }
 flotilla-schema-derive = { path = "../flotilla-schema-derive" }
 serde = { workspace = true }
 serde_json = { workspace = true }

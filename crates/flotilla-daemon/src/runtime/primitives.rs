@@ -417,21 +417,27 @@ impl MessageDelivery {
                 }
             }
             let Some(holder) = self.routing.holders().get(name) else { continue };
-            // One AgentSession per launch, named by it (#3108).
-            let Some(launch) = flotilla_resources::terminal_records::launch_of(&holder.terminal) else {
+            // One AgentSession per launch, the one the launch declares (#3108, #4438).
+            let (Some(launch), Some(agent_session)) = (
+                flotilla_resources::terminal_records::launch_of(&holder.terminal),
+                flotilla_resources::terminal_records::agent_session_of(&holder.terminal),
+            ) else {
                 debug!(session = %holder.terminal.metadata.name, "a live session's view names no launch");
                 continue;
             };
-            let consumer = match self.primitives.register(launch, now).instrument(info_span!("message_delivery.register")).await {
-                Ok(consumer) => consumer,
-                Err(error) => {
-                    // These are routed again at the next refresh, which registers them then.
-                    for name in &changed[index..] {
-                        self.routing.retry(name);
+            let (reads, launch) = (self.state.daemon.lifecycle_reads(), launch.to_owned());
+            let request = move || flotilla_engine_messages::session_request(reads.as_ref(), &launch);
+            let consumer =
+                match self.primitives.register(agent_session, request, now).instrument(info_span!("message_delivery.register")).await {
+                    Ok(consumer) => consumer,
+                    Err(error) => {
+                        // These are routed again at the next refresh, which registers them then.
+                        for name in &changed[index..] {
+                            self.routing.retry(name);
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
-            };
+                };
             for inbox in &holder.inboxes {
                 self.inbox_holders.entry(inbox.clone()).or_default().insert(name.clone());
             }

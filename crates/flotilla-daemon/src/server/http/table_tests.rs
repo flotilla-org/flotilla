@@ -622,7 +622,14 @@ async fn primitive_diagrams_describe_declared_and_observed_transitions() {
     let mut world = MemoryAgentSessionWorld::default();
     let observed = flotilla_state_machines::Ref::new("end");
     world.ends.put(&observed, EndReason::Completed);
-    sessions.create("session", (), &world, flotilla_schema::Timestamp(1)).unwrap();
+    sessions
+        .create(
+            "session",
+            flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(flotilla_schema::Ref::new("convoy", "home"), "coder"),
+            &world,
+            flotilla_schema::Timestamp(1),
+        )
+        .unwrap();
     sessions.apply("session", End { reason: EndReason::Completed, observed }, &world, flotilla_schema::Timestamp(2)).unwrap();
     let router = HttpRouter::builder()
         .backend(engine_home_backend())
@@ -646,7 +653,17 @@ async fn primitive_diagrams_describe_declared_and_observed_transitions() {
             stream.next().await.unwrap().unwrap();
         }
         let name = if cbor { "new-cbor" } else { "new-json" };
-        sessions.create(name, (), &world, flotilla_schema::Timestamp(3)).unwrap();
+        sessions
+            .create(
+                name,
+                flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ),
+                &world,
+                flotilla_schema::Timestamp(3),
+            )
+            .unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await.unwrap().unwrap().unwrap();
         assert!(matches!(&decode(&event,cbor)[0],Message::Upsert{row,..} if row["resource.name"]==name));
     }
@@ -684,9 +701,23 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
     let mut world = MemoryAgentSessionWorld::default();
     let observed = flotilla_state_machines::Ref::new("end");
     world.ends.put(&observed, EndReason::Completed);
-    sessions.create("ended", (), &world, flotilla_schema::Timestamp(1)).unwrap();
+    sessions
+        .create(
+            "ended",
+            flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(flotilla_schema::Ref::new("convoy", "home"), "coder"),
+            &world,
+            flotilla_schema::Timestamp(1),
+        )
+        .unwrap();
     sessions.apply("ended", End { reason: EndReason::Completed, observed }, &world, flotilla_schema::Timestamp(2)).unwrap();
-    sessions.create("live", (), &world, flotilla_schema::Timestamp(3)).unwrap();
+    sessions
+        .create(
+            "live",
+            flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(flotilla_schema::Ref::new("convoy", "home"), "coder"),
+            &world,
+            flotilla_schema::Timestamp(3),
+        )
+        .unwrap();
     // A daemon composed over the store, serving every resource table from its engine.
     let (_daemon_dir, daemon) = daemon_with_decided_store("home", Arc::clone(&service)).await;
     engine(&daemon);
@@ -727,8 +758,8 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
                 "{table}.{name} whereOperators: {field}"
             );
             if field["type"] == "address" {
-                // A stored address is interned; a resource row's subject address is derived (#4199).
-                if stored.is_some() {
+                // A stored address is interned; a subject row's address is derived (#4199, #4438).
+                if stored.is_some() && schema["subject"]["field"] != name {
                     assert_eq!(column.map(|column| &column.ty), Some(&ColumnType::Interned(ADDRESS_DOMAIN)), "{table}.{name}");
                 }
                 addresses.push(format!("{table}.{name}"));
@@ -1250,4 +1281,102 @@ fn tables_doc_lists_the_where_operators_of_the_code() {
         }
     }
     assert_eq!(covered.len(), 8, "every filterable type is listed");
+}
+
+/// `table`'s rows as a binnacle-described client holds them, read over the tables HTTP surface.
+async fn described(router: &Router, table: &str) -> binnacle_described::DescribedSource {
+    let mut source = binnacle_described::DescribedSource::new(table, binnacle_described::Scope::new("default"));
+    source.poll_request();
+    let response = call(router, &format!("/tables/{table}/rows"), false).await;
+    assert_eq!(response.status(), StatusCode::OK, "{table}");
+    let bytes = to_bytes(response.into_body(), 8 * 1024 * 1024).await.unwrap();
+    for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+        source.receive(binnacle_described::decode_json_line(line).unwrap());
+        // As its host does: take the request the `table` makes (a watch asking for the
+        // columns' values), so the rows that follow are read.
+        while source.poll_request().is_some() {}
+    }
+    source
+}
+
+// Behaviour (#4438 acceptance): a binnacle-described client finds what a surface opens from the
+// tables alone. The listing names the session subject table and the facet tables. An agent's
+// running launch is a facet of its session and opens its cleat session at its pool and home; an
+// ended one is unreachable and says why. A session's parent is its convoy, and its attach
+// command renders with its address.
+#[tokio::test]
+async fn a_described_client_finds_subjects_parents_and_facets() {
+    use binnacle_described::{Endpoint, Listing, Opening, Relation, Wire};
+    use flotilla_schema::Ref;
+    use flotilla_state_machines::{
+        machines::agent_session::{AgentSession, AgentSessionRequest, MemoryAgentSessionWorld},
+        Home,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(
+            &directory.path().join("surface.db"),
+            "home",
+            crate::runtime::decided_registry().unwrap(),
+        )
+        .unwrap(),
+    );
+    let terminals = flotilla_provisioning_testkit::TerminalsFixture::over_service(&service);
+    let running = terminals.request(&flotilla_provisioning_testkit::TerminalsFixture::agent("v1", "coder", "env-a"));
+    terminals.ready(&running, "cleat-7", &Default::default());
+    let ended = terminals.request(&flotilla_provisioning_testkit::TerminalsFixture::agent("v1", "review", "env-a"));
+    terminals.ready(&ended, "cleat-8", &Default::default());
+    terminals.lost(&ended, "pool restarted");
+    let mut sessions =
+        Home::<AgentSession, flotilla_engine_store::StoreLog>::with_log("home", flotilla_engine_store::StoreLog::new(service.store()))
+            .unwrap();
+    let convoy = Ref::new("convoy-a#1", "home");
+    for (name, role) in [(running.as_str(), "coder"), (ended.as_str(), "review")] {
+        sessions
+            .create(name, AgentSessionRequest::of(convoy.clone(), role), &MemoryAgentSessionWorld::default(), flotilla_schema::Timestamp(1))
+            .unwrap();
+    }
+    let router = HttpRouter::builder()
+        .backend(engine_home_backend())
+        .table_store(service)
+        .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
+        .build()
+        .into_router();
+
+    let listing = Listing::from_json(&json(&router, "/tables").await).unwrap();
+    assert!(listing.subject_tables().any(|table| table == "agent_session"));
+    let facets: Vec<&str> = listing.facet_tables().collect();
+    assert!(facets.contains(&"terminal_session") && facets.contains(&"agent_session"), "{facets:?}");
+
+    let launches = described(&router, "terminal_session").await;
+    let key = |source: &binnacle_described::DescribedSource, name: &str| {
+        source.row_key(&[Wire::Text("home".into()), Wire::Text(name.into())]).unwrap_or_else(|| panic!("{name}"))
+    };
+    let agent = key(&launches, &running);
+    let of = launches.row_facet_of(agent).expect("an agent's launch is a facet of its session");
+    assert_eq!((of.resource(), of.values.clone()), (Some("agent_session"), vec![&Wire::Text("home".into()), &Wire::Text(running.clone())]));
+    let terminal = launches.row_facets(agent).into_iter().find(|facet| facet.facet.recipe == "cleat-session").expect("cleat facet");
+    let Opening::Endpoint(endpoint) = &terminal.opening else { panic!("an endpoint") };
+    assert_eq!(endpoint.get("session"), Some(&&Wire::Text("cleat-7".into())));
+    assert_eq!(endpoint.get("pool"), Some(&&Wire::Text("cleat".into())));
+    assert_eq!(endpoint.get("host"), Some(&&Wire::Text("home".into())));
+    assert!(terminal.reachable);
+    let gone = launches.row_facets(key(&launches, &ended)).into_iter().find(|facet| facet.facet.recipe == "cleat-session").unwrap();
+    assert!(!gone.reachable, "an ended terminal cannot be reached");
+    assert_eq!(gone.reason, Some("Lost"));
+
+    let agents = described(&router, "agent_session").await;
+    let session = key(&agents, &running);
+    let parent = agents.row_parent(session).expect("a session's parent");
+    assert_eq!(
+        (parent.resource(), parent.values.clone()),
+        (Some("convoy"), vec![&Wire::Text("home".into()), &Wire::Text("convoy-a#1".into())])
+    );
+    assert_eq!(agents.row_related(session, &Relation::FacetOf), None);
+    let address = agents.row_subject(session).expect("a session's address").to_owned();
+    assert_eq!(address, format!("host:home/convoy:convoy-a%231/role:coder/session:{}", running.replace('#', "%23")));
+    let attach = agents.row_facets(session).into_iter().find(|facet| facet.facet.recipe == "command").expect("attach");
+    assert_eq!(attach.opening, Opening::Command(vec!["flotilla".into(), "attach".into(), address]));
+    assert!(matches!(&attach.facet.endpoint, Endpoint::Argv(_)));
 }

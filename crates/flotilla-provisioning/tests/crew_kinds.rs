@@ -94,6 +94,7 @@ fn a_terminal_session_survives_the_codec() {
                 cwd: "/workspace".into(),
                 env: BTreeMap::from([("A".into(), "1".into())]),
                 source: source.clone(),
+                agent_session: None,
             };
             let resource =
                 Resource::<Lifecycle<TerminalSessionKind>>::stored("s", spec, State::new(state, Timestamp::from_micros(1)), Version(2));

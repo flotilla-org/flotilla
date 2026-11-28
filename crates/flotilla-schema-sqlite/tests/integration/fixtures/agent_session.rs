@@ -14,10 +14,10 @@ use hegel::TestCase;
 use super::{
     code_enum,
     engine::{self, resource, Candidate},
-    name, timestamp, Fixture, Pick,
+    name, reference, timestamp, Fixture, Pick,
 };
 
-/// Covering indexes span lifecycle, channel/end reason and absent/all four activities.
+/// Covering indexes span lifecycle, channel/end reason, absent/all four activities and the specs.
 pub const COVERING: usize = 64;
 
 pub fn state_value(tc: &TestCase, pick: Pick) -> AgentSessionState {
@@ -43,8 +43,16 @@ pub fn receive(tc: &TestCase, pick: Pick) -> Receive {
     Receive { message: name(tc), transport: code_enum(tc, pick, &[Transport::Turn, Transport::Notify, Transport::Mute]) }
 }
 
+/// A spec an earlier build wrote (empty), and one placed on a vessel in a convoy (#4438).
+pub fn spec_value(tc: &TestCase, pick: Pick) -> AgentSessionSpec {
+    match pick.digit(tc, 2, 20) {
+        0 => AgentSessionSpec::default(),
+        _ => AgentSessionSpec { convoy: Some(reference(tc)), vessel: Some(reference(tc)), role: Some(name(tc)) },
+    }
+}
+
 pub fn generate(tc: &TestCase, pick: Pick) -> Resource<AgentSession> {
-    resource(AgentSessionSpec::default(), State::new(state_value(tc, pick), timestamp(tc)))
+    resource(spec_value(tc, pick), State::new(state_value(tc, pick), timestamp(tc)))
 }
 
 /// A live, detached session with no history.

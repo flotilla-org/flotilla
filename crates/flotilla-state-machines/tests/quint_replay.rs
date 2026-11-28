@@ -463,7 +463,17 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
             "request" if slot_at(step.before, "::resources", 1).is_none() && slot_at(step.after, "::resources", 1).is_some() => {
                 create(&mut things, ONE, (), &MemoryLifecycleWorld::default(), &step, tally);
             }
-            "request" => create(&mut sessions, ONE, (), &MemoryAgentSessionWorld::default(), &step, tally),
+            "request" => create(
+                &mut sessions,
+                ONE,
+                flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ),
+                &MemoryAgentSessionWorld::default(),
+                &step,
+                tally,
+            ),
             op @ ("realise" | "release" | "vanish") => lifecycle_step(&mut things, ONE, op, seen, matches, "model", now, &step, tally),
             "attempt" => {
                 let outcome = match tag(step.pick("outcome")) {
@@ -1366,7 +1376,17 @@ impl<'a> MessageReplay<'a> {
         let sessions = feed.sessions().then(|| {
             let mut sessions = Home::<AgentSession>::new("consumer").expect("declaration");
             for (id, _) in entries(&trace.states[0], "::sessions") {
-                sessions.create(id.to_string(), (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("session");
+                sessions
+                    .create(
+                        id.to_string(),
+                        flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                            flotilla_schema::Ref::new("convoy", "home"),
+                            "coder",
+                        ),
+                        &MemoryAgentSessionWorld::default(),
+                        Timestamp(0),
+                    )
+                    .expect("session");
             }
             sessions
         });

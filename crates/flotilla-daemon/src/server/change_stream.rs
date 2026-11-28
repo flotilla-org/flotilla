@@ -785,6 +785,7 @@ mod tests {
                         fields: vec![],
                         field_aliases: vec![],
                         subject: None,
+                        facets: vec![],
                         aliases: vec![],
                     }],
                 })

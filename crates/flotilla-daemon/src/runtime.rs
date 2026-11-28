@@ -949,6 +949,7 @@ pub(crate) fn verb_registry(
 ) -> Result<flotilla_verbs::VerbRegistry, flotilla_verbs::Duplicate> {
     let mut registry = flotilla_verbs::VerbRegistry::new();
     flotilla_store::register_subjects(&mut registry)?;
+    flotilla_engine_messages::register_subjects(&mut registry)?;
     if let Some(daemon) = daemon {
         flotilla_projections::register_verbs(&mut registry, daemon)?;
     }

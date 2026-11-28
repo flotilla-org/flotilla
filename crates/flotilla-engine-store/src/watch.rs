@@ -286,7 +286,17 @@ mod tests {
         let sender = tokio::sync::watch::channel(0u64).0;
 
         let mut sessions = Home::<AgentSession, StoreLog>::with_log(HOME, StoreLog::new(service.store())).expect("session home");
-        sessions.create("session", (), &MemoryAgentSessionWorld::default(), Timestamp(1)).expect("session");
+        sessions
+            .create(
+                "session",
+                flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ),
+                &MemoryAgentSessionWorld::default(),
+                Timestamp(1),
+            )
+            .expect("session");
         tick(&mut watch, &sender).await.expect("pass");
         assert_eq!(*sender.borrow(), 0, "an AgentSession's entries are no Message: the pass does not tick");
 

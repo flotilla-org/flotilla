@@ -155,7 +155,19 @@ pub async fn deliver_turn(
         Err(_) => primitives.inbox_for(namespace, receiver).await.expect("the receiver's inbox"),
     };
     let (id, _) = primitives.locate_in(&address, record).expect("locate").unwrap_or_else(|| panic!("no message `{record}`"));
-    let consumer = primitives.register(session, Timestamp::from_datetime(&at)).await.expect("register the session");
+    let consumer = primitives
+        .register(
+            session,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Timestamp::from_datetime(&at),
+        )
+        .await
+        .expect("register the session");
     let inbox = primitives.inbox();
     inbox.bind(address, consumer.clone()).await.expect("bind the session");
     inbox.receive(&consumer, &id, Transport::Turn).await.expect("receipt");

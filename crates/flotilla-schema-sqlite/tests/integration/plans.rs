@@ -152,6 +152,8 @@ fn the_enumeration_covers_every_kind_and_index() {
         "ticket_notes upsert",
         "ticket_notes delete",
         "index ticket_open_by_queue first",
+        "index agent_session_by_convoy first",
+        "index agent_session_by_vessel first",
     ] {
         assert!(labels.contains(&expected), "missing {expected}");
     }
@@ -160,7 +162,7 @@ fn the_enumeration_covers_every_kind_and_index() {
     // vessel_by_launch two), and four owner pages for the one unordered nested index.
     assert!(labels.contains(&"index convoy_by_launch prefix 1 first"));
     assert!(labels.contains(&"index convoy_subjects_by_subject first"));
-    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 4 * 20 + 2 * 5 + 4 * 5 + 4);
+    assert_eq!(labels.iter().filter(|label| label.starts_with("index ")).count(), 4 * 22 + 2 * 5 + 4 * 5 + 4);
     assert_eq!(labels.iter().filter(|label| label.ends_with(" scan")).count(), 11);
     assert!(!labels.iter().any(|label| label.contains("_edges")), "no kind has an edge-log table");
     assert!(

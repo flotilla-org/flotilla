@@ -37,6 +37,8 @@ pub trait LifecycleKind: 'static {
     type Request: Clone;
     /// The kind's ADR 0047 additive column defaults, as [`Machine::STORED_DEFAULTS`].
     const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = &[];
+    /// What the kind's columns mean to a surface, as [`Machine::DESCRIBED`].
+    const DESCRIBED: &'static [flotilla_schema::Described] = &[];
     /// The policy `give_up` judges the attempts against.
     fn policy() -> AttemptPolicy {
         DEFAULT_POLICY
@@ -332,6 +334,7 @@ impl Source<Absence> for MemoryLifecycleWorld {
 impl<K: LifecycleKind> Machine for Lifecycle<K> {
     const NAME: &'static str = K::NAME;
     const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = K::STORED_DEFAULTS;
+    const DESCRIBED: &'static [flotilla_schema::Described] = K::DESCRIBED;
     type Request = K::Request;
     type Spec = K::Request;
     type State = LifecycleState;

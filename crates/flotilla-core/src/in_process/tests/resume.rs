@@ -294,7 +294,20 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     // Each hook is recorded on the launch's AgentSession too, which stall judgement reads.
     let agents = super::support::agent_sessions(&daemon);
     let hook = |session: &str, activity, cause: &str| {
-        agents.observe(session, activity, cause.into(), super::support::engine_at(clock.now())).expect("hook activity");
+        agents
+            .observe(
+                session,
+                || {
+                    Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                        flotilla_schema::Ref::new("convoy", "home"),
+                        "coder",
+                    ))
+                },
+                activity,
+                cause.into(),
+                super::support::engine_at(clock.now()),
+            )
+            .expect("hook activity");
     };
     hook(&governor_launch, Activity::Idle, "Stop");
     note(convoy_external_patches::mark_crew_stalled(

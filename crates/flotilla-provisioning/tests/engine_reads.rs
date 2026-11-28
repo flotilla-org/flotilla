@@ -220,6 +220,7 @@ fn a_session_reads_as_its_current_launch() {
         cwd: "/w".into(),
         env: Default::default(),
         source: Launch::Tool { command: "bash".into() },
+        agent_session: None,
     };
     let first = sessions.request(name, request(), Timestamp(1)).expect("first launch").name().to_owned();
     sessions.step(&first, &Step::Realised { identity: "s1".into() }, Timestamp(2)).expect("ran");

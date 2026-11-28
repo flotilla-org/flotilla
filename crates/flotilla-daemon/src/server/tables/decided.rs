@@ -27,6 +27,20 @@ pub(super) async fn list(service: &Arc<Service>) -> Result<Vec<Value>, String> {
     .await
 }
 
+/// The engine tables whose kinds declare facets for their rows (#4438).
+pub(super) async fn facet_tables(service: &Arc<Service>) -> Result<std::collections::BTreeSet<String>, String> {
+    blocking(service, |store| {
+        Ok(store
+            .kinds()
+            .iter()
+            .flat_map(|set| &set.tables)
+            .filter(|table| !table.facets.is_empty())
+            .map(|table| table.name.clone())
+            .collect())
+    })
+    .await
+}
+
 pub(super) fn home(namespace: &str, local: &str) -> String {
     if namespace == "default" {
         local.into()

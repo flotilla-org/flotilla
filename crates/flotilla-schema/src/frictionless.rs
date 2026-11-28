@@ -1,5 +1,5 @@
 //! ADR 0067's native-value Frictionless profile, rendered from the shared descriptor.
-use crate::{ColumnType, Layout, Table};
+use crate::{ColumnType, Endpoint, Facet, Layout, Table};
 use serde_json::{json, Value};
 
 impl Table {
@@ -96,7 +96,13 @@ impl Table {
                     } else {
                         (vec![format!("{}.home", column.name), column.name.clone()], vec!["resource.home", "resource.name"])
                     };
-                    json!({"fields":fields,"reference":{"resource":target,"fields":keys}})
+                    let mut key = json!({"fields":fields,"reference":{"resource":target,"fields":keys}});
+                    match column.link {
+                        Some(crate::Link::Parent) => key["relation"] = json!("parent"),
+                        Some(crate::Link::FacetOf) => key["relation"] = json!("facet-of"),
+                        None => {}
+                    }
+                    key
                 })
             })
             .collect();
@@ -105,7 +111,35 @@ impl Table {
         if let Some(subject) = &this.subject {
             schema["subject"] = json!({"kind": subject.kind.as_str(), "field": subject.field});
         }
+        if !this.facets.is_empty() {
+            schema["facets"] = this.facets.iter().map(Facet::json).collect();
+        }
         schema
+    }
+}
+
+impl Facet {
+    /// The facet as binnacle-described reads a description's `facets` (#4438).
+    fn json(&self) -> Value {
+        let mut facet = json!({"recipe": self.recipe});
+        if let Some(label) = &self.label {
+            facet["label"] = json!(label);
+        }
+        match &self.endpoint {
+            Endpoint::Fields(fields) => {
+                facet["endpoint"] = fields.iter().map(|(field, column)| (field.clone(), json!(column))).collect();
+            }
+            Endpoint::Argv(argv) => facet["argv"] = json!(argv),
+        }
+        for (name, value) in [("state", &self.state), ("reason", &self.reason)] {
+            if let Some(value) = value {
+                facet[name] = json!(value);
+            }
+        }
+        if let Some(reachable) = &self.reachable {
+            facet["reachable"] = json!(reachable);
+        }
+        facet
     }
 }
 
@@ -195,6 +229,80 @@ mod tests {
         assert!(sample(None).get("subject").is_none());
         assert!(std::panic::catch_unwind(|| sample(Some("name"))).is_err(), "a text key is no address");
     }
+    // #4438: what a kind declares for surfaces reaches its description in binnacle-described's
+    // vocabulary. Parent and facet-of references mark their foreign keys' `relation`; roles join
+    // the column's; a facet names its recipe, its endpoint fields, its reachable states and its
+    // reason; a command facet its argv templates. A plain reference relates nothing, and a table
+    // that declares no facet has no `facets`.
+    #[test]
+    fn declared_relations_and_facets_reach_the_description() {
+        let mut layout = Layout::description("sample");
+        layout.key(|layout| layout.column("name", ColumnType::Text, true));
+        for reference in ["convoy", "session", "vessel"] {
+            layout.column(reference, ColumnType::Ref, false);
+            layout.reference(reference);
+        }
+        for column in ["pool", "phase", "why"] {
+            layout.column(column, ColumnType::Text, true);
+        }
+        let mut table = layout.finish().tables.remove(0);
+        assert!(table.frictionless().get("facets").is_none());
+        table.describe(&[
+            crate::Described::Parent { column: "convoy" },
+            crate::Described::FacetOf { column: "session" },
+            crate::Described::Role { column: "pool", role: "badge" },
+            crate::Described::Facet {
+                recipe: "cleat-session",
+                label: "Terminal",
+                endpoint: &[("pool", "pool"), ("session", "name")],
+                state: Some("phase"),
+                reachable: &["Running"],
+                reason: Some("why"),
+            },
+            crate::Described::Command { label: "Attach", argv: &["flotilla", "attach", "{address}"] },
+        ]);
+        let schema = table.frictionless();
+        let key = |column: &str| {
+            schema["foreignKeys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|key| key["fields"].as_array().unwrap().contains(&json!(column)))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(key("convoy")["relation"], "parent");
+        assert_eq!(key("session")["relation"], "facet-of");
+        assert!(key("vessel").get("relation").is_none());
+        let roles = |name: &str| schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == name).unwrap()["roles"].clone();
+        assert_eq!(roles("pool"), json!(["badge"]));
+        assert_eq!(
+            schema["facets"],
+            json!([
+                {"recipe": "cleat-session", "label": "Terminal", "endpoint": {"pool": "pool", "session": "name"},
+                 "state": "phase", "reachable": ["Running"], "reason": "why"},
+                {"recipe": "command", "label": "Attach", "argv": ["flotilla", "attach", "{address}"]},
+            ])
+        );
+    }
+
+    // #4438: a role or relation naming no column of the table, or a relation on a column that is
+    // no reference, is the declaring kind's error, found when its table is built.
+    #[test]
+    fn a_declaration_the_table_cannot_carry_is_refused() {
+        for mark in [
+            crate::Described::Role { column: "missing", role: "caption" },
+            crate::Described::Parent { column: "pool" },
+            crate::Described::FacetOf { column: "pool" },
+        ] {
+            let mut layout = Layout::description("sample");
+            layout.key(|layout| layout.column("name", ColumnType::Text, true));
+            layout.column("pool", ColumnType::Text, true);
+            let mut table = layout.finish().tables.remove(0);
+            assert!(std::panic::catch_unwind(move || table.describe(&[mark])).is_err(), "{mark:?}");
+        }
+    }
+
     // ADR 0067: field types come from the descriptor, independent of source. Generate
     // every native type and both nullabilities; semantic extensions survive rendering.
     #[hegel::test]

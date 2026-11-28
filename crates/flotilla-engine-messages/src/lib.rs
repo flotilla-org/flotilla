@@ -49,7 +49,7 @@ use flotilla_schema::{
 use flotilla_schema_sqlite::{stream::Service, StoreError};
 use flotilla_state_machines::{
     machines::{
-        agent_session::{AgentSession, MemoryAgentSessionWorld, Receive},
+        agent_session::{AgentSession, AgentSessionRequest, MemoryAgentSessionWorld, Receive},
         consumer::{ConsumerKind, Receiver},
         message::{
             Deliver, DropReason, Expectation, MemoryMessageWorld, Message, MessageBody, MessageLabel, MessageRef, MessageReference,
@@ -161,9 +161,16 @@ impl Sessions {
         Ok(())
     }
 
-    /// Creates `name`'s record, Live and detached, under the home's lock.
-    fn create(&self, home: &mut Home<AgentSession, StoreLog>, name: &str, now: Timestamp) -> Result<(), String> {
-        home.create(name, (), &MemoryAgentSessionWorld::default(), now).map_err(|error| format!("AgentSession `{name}`: {error:?}"))?;
+    /// Creates `name`'s record from `request`, Live and detached, under the home's lock.
+    fn create(
+        &self,
+        home: &mut Home<AgentSession, StoreLog>,
+        name: &str,
+        request: AgentSessionRequest,
+        now: Timestamp,
+    ) -> Result<(), String> {
+        home.create(name, request, &MemoryAgentSessionWorld::default(), now)
+            .map_err(|error| format!("AgentSession `{name}`: {error:?}"))?;
         let mut live = self.live.lock().expect("live sessions");
         live.names.insert(name.to_owned());
         live.created += 1;
@@ -182,13 +189,24 @@ impl Sessions {
         self.live.lock().expect("live sessions").created
     }
 
-    /// Creates the session's record, Live and detached, unless it exists.
-    pub fn ensure(&self, name: &str, now: Timestamp) -> Result<bool, String> {
+    /// Creates the session's record, Live and detached, unless it exists: from `request`, read
+    /// only when it does not.
+    pub fn ensure(
+        &self,
+        name: &str,
+        request: impl FnOnce() -> Result<AgentSessionRequest, String>,
+        now: Timestamp,
+    ) -> Result<bool, String> {
+        if self.home.lock().expect("session home").get(name).is_some() {
+            return Ok(false);
+        }
+        // Read outside the home's lock; the create below rechecks under it.
+        let request = request()?;
         let mut home = self.home.lock().expect("session home");
         if home.get(name).is_some() {
             return Ok(false);
         }
-        self.create(&mut home, name, now)?;
+        self.create(&mut home, name, request, now)?;
         Ok(true)
     }
 
@@ -229,6 +247,7 @@ impl Sessions {
     pub fn observe(
         &self,
         name: &str,
+        request: impl FnOnce() -> Result<AgentSessionRequest, String>,
         activity: flotilla_state_machines::machines::agent_session::Activity,
         cause: String,
         now: Timestamp,
@@ -237,13 +256,12 @@ impl Sessions {
             machines::agent_session::{AgentSessionRefusal, Observe},
             WriteError,
         };
-        let mut home = self.home.lock().map_err(|_| "session home lock poisoned".to_string())?;
         // A hook may precede the delivery adapter's first consumer registration.
-        // Materialize the same minimal record here, named by the validated launch;
-        // the terminal and delivery adapter still own its lifecycle, not the hook.
-        if home.get(name).is_none() {
-            self.create(&mut home, name, now)?;
-        }
+        // Materialize the same record here, named by the validated launch, from what
+        // the launch declares; the terminal and delivery adapter still own its
+        // lifecycle, not the hook.
+        self.ensure(name, request, now)?;
+        let mut home = self.home.lock().map_err(|_| "session home lock poisoned".to_string())?;
         match home.apply(name, Observe { activity, cause }, &MemoryAgentSessionWorld::default(), now) {
             Ok(_) => Ok(true),
             Err(WriteError::Refused(AgentSessionRefusal::UnchangedActivity | AgentSessionRefusal::AlreadyEnded)) => Ok(false),
@@ -259,6 +277,7 @@ impl Sessions {
     pub fn observe_screen(
         &self,
         name: &str,
+        request: impl FnOnce() -> Result<AgentSessionRequest, String>,
         activity: flotilla_state_machines::machines::agent_session::Activity,
         now: Timestamp,
     ) -> Result<bool, String> {
@@ -274,7 +293,7 @@ impl Sessions {
                 }
             }
         }
-        self.observe(name, activity, SCREEN_CAUSE.to_owned(), now)
+        self.observe(name, request, activity, SCREEN_CAUSE.to_owned(), now)
     }
 
     /// One keyed read of a session; absence means no such record.
@@ -286,6 +305,50 @@ impl Sessions {
     pub fn get(&self, name: &str) -> Option<Resource<AgentSession>> {
         self.home.lock().expect("session home").get(name).cloned()
     }
+}
+
+/// What the AgentSession of crew launch `launch` at this home is created with (#4438): the role
+/// the launch runs, the vessel it is held for, and that vessel's convoy. A launch held for no
+/// vessel, or whose vessel is read nowhere here, has no convoy to work for, and gets no session.
+pub fn session_request(
+    reads: &dyn flotilla_resources::lifecycle_reads::LifecycleReads,
+    launch: &str,
+) -> Result<AgentSessionRequest, String> {
+    let terminals = reads.terminals()?;
+    let record = terminals.get(launch, Some(terminals.home()))?.ok_or_else(|| format!("terminal launch {launch} is not held here"))?;
+    let vessel_name = record.vessel.as_deref().ok_or_else(|| format!("terminal launch {launch} is held for no vessel"))?;
+    let vessels = reads.vessels()?;
+    let vessel = match vessels.get(vessel_name, Some(&record.home))? {
+        Some(vessel) => vessel,
+        None => vessels.find(vessel_name)?.ok_or_else(|| format!("vessel {vessel_name} of terminal launch {launch} is not read here"))?,
+    };
+    Ok(AgentSessionRequest::of(flotilla_schema::Ref::new(vessel.convoy, vessel.convoy_home), record.role)
+        .on(flotilla_schema::Ref::new(vessel.name, vessel.home)))
+}
+
+/// Registers the session subject table (#4438): `agent_session` rows, each the session of the
+/// role it acts for in the convoy it works for, that convoy named at its home:
+/// `host:<convoy home>/convoy:<convoy>/role:<role>/session:<name>`. A row's address resolves to
+/// that row, read by its name at its home; a session an earlier build created names no convoy
+/// and has none.
+pub fn register_subjects(registry: &mut flotilla_verbs::VerbRegistry) -> Result<(), flotilla_verbs::Duplicate> {
+    registry.register_subject(flotilla_verbs::SubjectTable {
+        kind: AddressKind::Session,
+        table: "agent_session",
+        address: session_address,
+        described: &[flotilla_schema::Described::Command { label: "Attach", argv: &["flotilla", "attach", "{address}"] }],
+    })
+}
+
+/// [`register_subjects`]' address of an `agent_session` row.
+fn session_address(row: &serde_json::Value) -> Option<Address> {
+    let text = |field: &str| row[field].as_str().filter(|text| !text.is_empty());
+    let (home, convoy, role, name) = (text("convoy.home")?, text("convoy")?, text("role")?, text("resource.name")?);
+    Address::root(AddressKind::Host, home)
+        .and_then(|host| host.child(AddressKind::Convoy, convoy))
+        .and_then(|convoy| convoy.child(AddressKind::Role, role))
+        .and_then(|role| role.child(AddressKind::Session, name))
+        .ok()
 }
 
 /// The inbox's consumer port for one session: `Receive` on its own record.
@@ -825,9 +888,14 @@ impl MessagePrimitives {
         Receiver { kind: ConsumerKind::AgentSession, id: session.to_owned(), host: self.home.clone() }
     }
 
-    /// Registers a crew session as a consumer: its record exists, and the
-    /// inbox writes its receipts there.
-    pub async fn register(&self, session: &str, now: Timestamp) -> Result<Receiver, String> {
+    /// Registers a crew session as a consumer: its record exists, created from
+    /// `request` when it does not, and the inbox writes its receipts there.
+    pub async fn register(
+        &self,
+        session: &str,
+        request: impl FnOnce() -> Result<AgentSessionRequest, String> + Send + 'static,
+        now: Timestamp,
+    ) -> Result<Receiver, String> {
         let consumer = self.consumer(session);
         // Registered consumers already have their record; skip the blocking hop and the
         // session home's lock, which the Message loop would otherwise take per holder per pass.
@@ -837,7 +905,7 @@ impl MessagePrimitives {
         let sessions = Arc::clone(&self.sessions);
         let name = session.to_owned();
         // A SQLite write: off the async workers.
-        tokio::task::spawn_blocking(carry(move || sessions.ensure(&name, now))).await.map_err(|error| error.to_string())??;
+        tokio::task::spawn_blocking(carry(move || sessions.ensure(&name, request, now))).await.map_err(|error| error.to_string())??;
         if self.consumers.lock().expect("consumers").insert(consumer.clone()) {
             let port =
                 SessionReceipts { sessions: Arc::clone(&self.sessions), name: session.to_owned(), scope: self.receipts.receipt_scope() };

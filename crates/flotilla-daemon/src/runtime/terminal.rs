@@ -174,14 +174,19 @@ fn screen_activity(state: TerminalAttentionState) -> Option<Activity> {
 }
 
 impl TerminalControllerRuntime {
-    /// Records the agent's screen-read activity on its AgentSession, named by
-    /// its launch. Another observer: its errors are logged and
-    /// never fail the terminal's own observation.
+    /// Records the agent's screen-read activity on its AgentSession: the one its
+    /// launch declares, which an agent's launch names as itself when its create
+    /// numbers it. Another observer: its errors are logged and never fail the
+    /// terminal's own observation.
     async fn observe_agent_screen(&self, record: &str, activity: Activity, now: chrono::DateTime<Utc>) {
         let sessions = Arc::clone(self.state.daemon.message_primitives().sessions());
-        let name = record.to_owned();
+        let (name, reads) = (record.to_owned(), self.state.daemon.lifecycle_reads());
         let now = flotilla_schema::Timestamp::from_datetime(&now);
-        match tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || sessions.observe_screen(&name, activity, now))).await {
+        let observe = move || {
+            let request = || flotilla_engine_messages::session_request(reads.as_ref(), &name);
+            sessions.observe_screen(&name, request, activity, now)
+        };
+        match tokio::task::spawn_blocking(flotilla_schema::reads::carry(observe)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => warn!(session = %record, %error, "failed to record agent session activity from its screen"),
             Err(error) => warn!(session = %record, %error, "agent session screen observation did not finish"),

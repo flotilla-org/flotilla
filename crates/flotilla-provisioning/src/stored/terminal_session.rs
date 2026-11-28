@@ -8,8 +8,9 @@
 use std::collections::BTreeMap;
 
 use flotilla_resources::TerminalBrief;
-use flotilla_schema::{Frozen, IndexQuery, Ref, Stored};
+use flotilla_schema::{Described, Frozen, IndexQuery, Ref, Stored};
 use flotilla_state_machines::{
+    machines::agent_session::AgentSession,
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
     Resource,
 };
@@ -25,9 +26,33 @@ impl LifecycleKind for TerminalSessionKind {
     fn launch(request: &TerminalSessionRequest) -> Option<(&str, u64)> {
         Some((&request.launch_of, request.launch))
     }
+    /// An agent's launch is numbered with its AgentSession, named as the launch at the launch's
+    /// home: the session it is a terminal of.
     fn numbered(request: TerminalSessionRequest, launch: u64) -> TerminalSessionRequest {
-        TerminalSessionRequest { launch, ..request }
+        let agent_session = match request.source {
+            Launch::Agent { .. } => {
+                Some(Ref::new(flotilla_state_machines::launch_name(&request.launch_of, launch), request.environment.home.clone()))
+            }
+            Launch::Tool { .. } => None,
+        };
+        TerminalSessionRequest { launch, agent_session, ..request }
     }
+    /// An agent's launch is a way to open its session: its cleat session in its pool on its
+    /// home, reachable while it runs, and why not once it has ended.
+    const DESCRIBED: &'static [Described] = &[
+        Described::FacetOf { column: "agent_session" },
+        Described::Role { column: "role", role: "caption" },
+        Described::Role { column: "source_adapter", role: "badge" },
+        Described::Role { column: "source_model", role: "badge" },
+        Described::Facet {
+            recipe: "cleat-session",
+            label: "Terminal",
+            endpoint: &[("host", "resource.home"), ("pool", "pool"), ("session", "identity")],
+            state: Some("state"),
+            reachable: &["Realised"],
+            reason: Some("ending"),
+        },
+    ];
 }
 
 impl super::Launches for TerminalSessionKind {
@@ -55,7 +80,8 @@ pub type TerminalSession = Lifecycle<TerminalSessionKind>;
     index(name = "by_environment", eq(environment)),
     index(name = "by_holder", eq(holder), when(holder is_some)),
     // A name's launches in launch order: the newest is the last.
-    index(name = "by_launch", eq(launch_of), order(launch))
+    index(name = "by_launch", eq(launch_of), order(launch)),
+    index(name = "by_agent_session", eq(agent_session), when(agent_session is_some))
 )]
 pub struct TerminalSessionRequest {
     /// The name this is a launch of (`terminal-<vessel>-<role>`), interned (domain `ln`).
@@ -81,6 +107,10 @@ pub struct TerminalSessionRequest {
     #[store(child)]
     pub env: BTreeMap<String, String>,
     pub source: Launch,
+    /// The AgentSession an agent's launch is a terminal of (#4438), set when its create numbers
+    /// it; none for a tool's, whose terminal is its own subject. A launch an earlier build
+    /// created has none (ADR 0047).
+    pub agent_session: Option<Ref<Resource<AgentSession>>>,
 }
 
 /// What the session runs.

@@ -697,8 +697,28 @@ impl TableSource {
         if catalog.queries.is_some() {
             kinds.extend(query::list());
         }
+        let mut facets = std::collections::BTreeSet::new();
         if let Some(service) = &catalog.service {
             kinds.extend(decided::list(service).await?);
+            facets = decided::facet_tables(service).await?;
+        }
+        // The tables a surface builds its tree and opens from (#4438), named on each kind as
+        // binnacle-described's listing reads them: those serving a subject, and those whose
+        // rows have facets, a subject's registered command facets among them.
+        for subject in catalog.subjects.iter().filter(|subject| !subject.described.is_empty()) {
+            facets.insert(subject.table.to_owned());
+        }
+        for kind in &mut kinds {
+            let tables: Vec<String> =
+                kind["tables"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+            let subjects: Vec<&String> = tables.iter().filter(|table| catalog.subjects.of_table(table).is_some()).collect();
+            let faceted: Vec<&String> = tables.iter().filter(|table| facets.contains(*table)).collect();
+            if !subjects.is_empty() {
+                kind["subjects"] = json!(subjects);
+            }
+            if !faceted.is_empty() {
+                kind["facets"] = json!(faceted);
+            }
         }
         Ok(json!({"kinds":kinds}))
     }
@@ -772,7 +792,10 @@ impl TableSource {
     pub(crate) fn describe_stored(&self) -> Result<Description, Failure> {
         match self {
             Self::Resource { name, subject, .. } => {
-                let table = descriptor(name, subject.as_ref());
+                let mut table = descriptor(name, subject.as_ref());
+                if let Some(subject) = subject {
+                    table.describe(subject.described);
+                }
                 Ok(Description { schema: table.frictionless(), markdown: flotilla_schema::render_table_view(&table), table })
             }
             Self::Decided { service, name, subject } => {
@@ -809,6 +832,7 @@ impl TableSource {
                     address.properties.insert("title".into(), json!("Address"));
                     table.columns.push(address);
                     table.subject = Some(flotilla_schema::Subject { kind: subject.kind, field: ADDRESS.into() });
+                    table.describe(subject.described);
                 }
                 mark_scalar_columns(&mut table);
                 Ok(Description { schema: set.frictionless(&table), table, markdown })

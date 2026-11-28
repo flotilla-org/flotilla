@@ -15,6 +15,8 @@ pub struct EnvironmentKind;
 impl LifecycleKind for EnvironmentKind {
     const NAME: &'static str = "Environment";
     type Request = EnvironmentRequest;
+    /// Its provider is a badge of what runs in it: the sandbox an agent works in.
+    const DESCRIBED: &'static [flotilla_schema::Described] = &[flotilla_schema::Described::Role { column: "provider", role: "badge" }];
 }
 
 /// The Environment machine: the shared lifecycle over its request.

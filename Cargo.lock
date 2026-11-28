@@ -267,7 +267,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "binnacle-cli"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#15bd5d7f84bb7fb620dd72ac7d807f1311b325e8"
 dependencies = [
  "binnacle-core",
  "binnacle-described",
@@ -284,12 +284,12 @@ dependencies = [
 [[package]]
 name = "binnacle-core"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#15bd5d7f84bb7fb620dd72ac7d807f1311b325e8"
 
 [[package]]
 name = "binnacle-described"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#15bd5d7f84bb7fb620dd72ac7d807f1311b325e8"
 dependencies = [
  "binnacle-core",
  "binnacle-format",
@@ -305,7 +305,7 @@ dependencies = [
 [[package]]
 name = "binnacle-described-http"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#15bd5d7f84bb7fb620dd72ac7d807f1311b325e8"
 dependencies = [
  "binnacle-described",
  "bytes",
@@ -318,7 +318,7 @@ dependencies = [
 [[package]]
 name = "binnacle-format"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#15bd5d7f84bb7fb620dd72ac7d807f1311b325e8"
 dependencies = [
  "serde_json",
  "unicode-segmentation",
@@ -327,7 +327,7 @@ dependencies = [
 [[package]]
 name = "binnacle-group"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#15bd5d7f84bb7fb620dd72ac7d807f1311b325e8"
 dependencies = [
  "binnacle-core",
  "binnacle-memory",
@@ -336,7 +336,7 @@ dependencies = [
 [[package]]
 name = "binnacle-layout"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#15bd5d7f84bb7fb620dd72ac7d807f1311b325e8"
 dependencies = [
  "binnacle-core",
  "ciborium",
@@ -348,7 +348,7 @@ dependencies = [
 [[package]]
 name = "binnacle-memory"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#15bd5d7f84bb7fb620dd72ac7d807f1311b325e8"
 dependencies = [
  "binnacle-core",
  "regex",
@@ -357,7 +357,7 @@ dependencies = [
 [[package]]
 name = "binnacle-ratatui"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#15bd5d7f84bb7fb620dd72ac7d807f1311b325e8"
 dependencies = [
  "binnacle-cli",
  "binnacle-core",
@@ -2476,6 +2476,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "binnacle-described",
  "bon",
  "bytes",
  "chrono",
@@ -2899,6 +2900,7 @@ dependencies = [
  "flotilla-store-memory",
  "flotilla-store-testkit",
  "flotilla-tracing",
+ "flotilla-verbs",
  "futures",
  "hegeltest",
  "serde_json",
@@ -4181,6 +4183,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-protocol",
+ "flotilla-schema",
  "flotilla-schema-derive",
  "serde",
  "serde_json",
@@ -6008,7 +6011,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",

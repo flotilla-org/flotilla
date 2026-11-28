@@ -5,7 +5,7 @@ Kind tables only; the shared tables are in `message.sql`.
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
 | `awaiting_reply` | root | 15 | – | – | `open_by_sender` (sender), `open_by_subject` (subject), `by_message` (message), `deadline` (deadline) |
-| `agent_session` | root | 9 | – | – | – |
+| `agent_session` | root | 12 | – | – | `by_convoy` (convoy), `by_vessel` (vessel) |
 | `convoy` | root | 15 | – | `convoy_subjects` (records), `convoy_duties` (child), `convoy_seats` (records), `convoy_promises` (records), `convoy_retired_duties` (state data) | `open_by_project` (project), `open_by_role` (project, role), `by_launch` (project, launch_of, launch) |
 | `convoy_subjects` | records | 6 | – | – | `by_subject` (subject) |
 | `convoy_duties` | child | 6 | 1: `scope` 1 | `convoy_duties_scope_promises` (child) | – |
@@ -36,6 +36,7 @@ Interned column domains:
 | `awaiting_reply` | `recipient` | `ad` |
 | `awaiting_reply` | `subject` | `ad` |
 | `awaiting_reply` | `kind` | `ak` |
+| `agent_session` | `role` | `rl` |
 | `convoy` | `launch_of` | `ln` |
 | `convoy` | `role` | `rl` |
 | `convoy` | `workflow_ref` | `wf` |

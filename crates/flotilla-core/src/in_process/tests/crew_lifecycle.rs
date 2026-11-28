@@ -99,7 +99,19 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     )
     .await;
     let agents = agent_sessions(&daemon);
-    agents.observe_screen(&launch, Activity::Idle, engine_at(idle_at)).expect("idle activity");
+    agents
+        .observe_screen(
+            &launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            engine_at(idle_at),
+        )
+        .expect("idle activity");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(convoys.get(&idle_crew).await.expect("convoy").status.expect("status").stalled.is_none());
     let status = wait_for_stall(&backend, &idle_crew, true).await;
@@ -138,7 +150,19 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
         &launch,
         TerminalAttention { state: TerminalAttentionState::Working, as_of: Utc::now(), source: TerminalAttentionSource::Screen },
     );
-    agents.observe_screen(&launch, Activity::Working, engine_at(Utc::now())).expect("working activity");
+    agents
+        .observe_screen(
+            &launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Working,
+            engine_at(Utc::now()),
+        )
+        .expect("working activity");
     assert!(wait_for_stall(&backend, &idle_crew, false).await.stalled.is_none());
     watch.abort();
 }
@@ -171,9 +195,33 @@ async fn an_agent_working_again_clears_its_stall_from_its_session_alone() {
     )
     .await;
     let agents = agent_sessions(&daemon);
-    agents.observe_screen(&launch, Activity::Idle, engine_at(idle_at)).expect("idle activity");
+    agents
+        .observe_screen(
+            &launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            engine_at(idle_at),
+        )
+        .expect("idle activity");
     assert!(wait_for_stall(&backend, &idle_crew, true).await.stalled.is_some());
-    agents.observe_screen(&launch, Activity::Working, engine_at(Utc::now())).expect("working activity");
+    agents
+        .observe_screen(
+            &launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Working,
+            engine_at(Utc::now()),
+        )
+        .expect("working activity");
     assert!(wait_for_stall(&backend, &idle_crew, false).await.stalled.is_none());
     watch.abort();
 }

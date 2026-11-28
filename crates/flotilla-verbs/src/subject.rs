@@ -14,4 +14,7 @@ pub struct SubjectTable {
     /// The canonical address of the subject a row is about, from what the row is read from: the
     /// resource document for a resource table, the row's own fields for an engine table.
     pub address: fn(&Value) -> Option<Address>,
+    /// What the table's owner declares about it for surfaces beyond its kind's own declarations
+    /// (#4438): the command facets of its subjects, which no row holds.
+    pub described: &'static [flotilla_schema::Described],
 }

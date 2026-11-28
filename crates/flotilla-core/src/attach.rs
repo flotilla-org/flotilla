@@ -1445,6 +1445,7 @@ mod tests {
                 agent: None,
                 build_jobs: None,
             }),
+            agent_session: None,
         };
         let session = record.read_view("flotilla", None, None, None);
         let listed = r#"[{"id":"terminal-convoy-c-work#12007-coder","cwd":"/workspace","cmd":null,"status":"Detached"}]"#;

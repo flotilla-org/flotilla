@@ -186,7 +186,7 @@ fn drain_feeds_messages_reports_retries_and_stops_at_a_refusal() {
     assert!(source.status().synced && reconnecting.is_none());
     assert_eq!(source.row_count(), 6);
 
-    let mut events = vec![Event::Failed { status: 404, body: br#"{"message":"unknown table"}"#.to_vec() }];
+    let mut events = vec![Event::Failed { status: Some(404), body: br#"{"message":"unknown table"}"#.to_vec() }];
     let refused = drain(&mut source, || events.pop(), |_| {}, &mut reconnecting).unwrap_err();
     assert_eq!(refused, "404 unknown table");
 

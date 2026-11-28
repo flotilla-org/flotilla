@@ -87,6 +87,9 @@ pub struct TerminalRecord {
     pub reading: LifecycleReading,
     /// What it was given when it was realised; none before.
     pub facts: Option<TerminalLaunchFacts>,
+    /// The AgentSession an agent's launch is a terminal of, at its home, as the launch declares
+    /// it (#4438); none for a tool's, and for a launch an earlier build created.
+    pub agent_session: Option<String>,
 }
 
 impl TerminalRecord {
@@ -95,9 +98,14 @@ impl TerminalRecord {
         launched(&self.name)
     }
 
-    /// Its crew's id: the launch name, for an agent's launch. Unique only within its home.
+    /// Its crew's id: the AgentSession it declares, for an agent's launch, named as the launch,
+    /// which is what a launch an earlier build created declares none for. Unique only within its
+    /// home.
     pub fn crew_id(&self) -> Option<&str> {
-        matches!(self.source, TerminalLaunchSource::Agent { .. }).then_some(self.name.as_str())
+        match self.source {
+            TerminalLaunchSource::Agent { .. } => Some(self.agent_session.as_deref().unwrap_or(&self.name)),
+            TerminalLaunchSource::Tool { .. } => None,
+        }
     }
 
     /// The pool's session id it runs under, once realised.
@@ -181,6 +189,17 @@ pub fn launch_of(session: &crate::ResourceObject<crate::TerminalSession>) -> Opt
     session.metadata.annotations.get(LAUNCH_ANNOTATION).map(String::as_str)
 }
 
+/// The read view's annotation naming the AgentSession its agent's launch declares (#4438).
+pub const AGENT_SESSION_ANNOTATION: &str = "flotilla.work/agent-session";
+
+/// The AgentSession the launch `session` shows is a terminal of, at the launch's home: the one
+/// the launch declares, else, for a launch an earlier build created, the one named as the launch
+/// (the convention the declared reference replaces). None for a view that was not read from a
+/// launch.
+pub fn agent_session_of(session: &crate::ResourceObject<crate::TerminalSession>) -> Option<&str> {
+    session.metadata.annotations.get(AGENT_SESSION_ANNOTATION).map(String::as_str).or_else(|| launch_of(session))
+}
+
 /// What a launch's holder Vessel says about it, joined in for readers of the old shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TerminalHolderView {
@@ -220,6 +239,9 @@ impl TerminalRecord {
         };
         let mut labels = BTreeMap::from([(ROLE_LABEL.to_owned(), self.role.clone())]);
         let mut annotations = BTreeMap::from([(LAUNCH_ANNOTATION.to_owned(), self.name.clone())]);
+        if let Some(agent_session) = &self.agent_session {
+            annotations.insert(AGENT_SESSION_ANNOTATION.to_owned(), agent_session.clone());
+        }
         let mut owner_references = Vec::new();
         if let Some(vessel) = &self.vessel {
             labels.insert(VESSEL_REF_LABEL.to_owned(), vessel.clone());
@@ -590,6 +612,7 @@ mod tests {
             since: DateTime::UNIX_EPOCH,
             reading: LifecycleReading::InProgress,
             facts: None,
+            agent_session: None,
         }
     }
 

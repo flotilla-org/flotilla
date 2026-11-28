@@ -33,8 +33,8 @@ pub(crate) fn observe_hook_attention(
     Ok(())
 }
 
-/// Record a hook's activity on the crew's AgentSession, named by session `session_name`'s newest
-/// launch here, only when it changes: duplicate hooks stay off the store's writer. The machine's
+/// Record a hook's activity on the crew's AgentSession, the one session `session_name`'s newest
+/// launch here declares, only when it changes: duplicate hooks stay off the store's writer. The machine's
 /// gate remains authoritative across races.
 pub(crate) async fn record_agent_activity(
     reads: Arc<dyn LifecycleReads>,
@@ -45,24 +45,30 @@ pub(crate) async fn record_agent_activity(
 ) -> Result<(), String> {
     // A hook token can outlive its launch, so the launch is read rather than assumed: an
     // observation never creates an orphan record for a session with no launch here.
-    let session = session_name.to_owned();
+    let (session, launch_reads) = (session_name.to_owned(), Arc::clone(&reads));
     // A store read: off the async workers.
     let launch = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+        let reads = launch_reads;
         let terminals = reads.terminals()?;
         terminals.get(&session, Some(terminals.home()))
     }))
     .await
     .map_err(|error| error.to_string())??
     .ok_or_else(|| format!("terminal session {session_name} has no launch here"))?;
-    if !primitives.sessions().needs_observation(&launch.name, activity)? {
+    // The AgentSession the launch declares (#4438).
+    let agent_session = launch.crew_id().unwrap_or(&launch.name).to_owned();
+    if !primitives.sessions().needs_observation(&agent_session, activity)? {
         return Ok(());
     }
     let sessions = Arc::clone(primitives.sessions());
     let cause = cause.to_owned();
     let now = flotilla_schema::Timestamp::from_datetime(&flotilla_resources::clock::now());
-    tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || sessions.observe(&launch.name, activity, cause, now)))
-        .await
-        .map_err(|error| error.to_string())??;
+    tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+        let request = || flotilla_engine_messages::session_request(reads.as_ref(), &launch.name);
+        sessions.observe(&agent_session, request, activity, cause, now)
+    }))
+    .await
+    .map_err(|error| error.to_string())??;
     Ok(())
 }
 

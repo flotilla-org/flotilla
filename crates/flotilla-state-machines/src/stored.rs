@@ -133,6 +133,7 @@ where
             let column = table.columns.iter_mut().find(|column| column.name == *name).expect("compatibility default names a column");
             column.properties.insert("previous_generation_default".into(), (*default).into());
         }
+        tables.describe(M::DESCRIBED);
         tables
     }
 

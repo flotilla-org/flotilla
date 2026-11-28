@@ -212,7 +212,20 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         observe_attention(&probe.engine, &launch, idle(clock.now()));
         let agents = super::support::agent_sessions(&daemon);
         let hook = |activity, cause: &str, at| {
-            agents.observe(&launch, activity, cause.into(), super::support::engine_at(at)).expect("hook activity");
+            agents
+                .observe(
+                    &launch,
+                    || {
+                        Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                            flotilla_schema::Ref::new("convoy", "home"),
+                            "coder",
+                        ))
+                    },
+                    activity,
+                    cause.into(),
+                    super::support::engine_at(at),
+                )
+                .expect("hook activity");
         };
         hook(Activity::Idle, "Stop", clock.now());
         let expected_rung = if limit == 0 { StallRung::Operator } else { StallRung::Nudge };
@@ -1175,7 +1188,18 @@ fn idle_coder(
         TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Hook },
     );
     super::support::agent_sessions(daemon)
-        .observe(launch, Activity::Idle, "Stop".into(), super::support::engine_at(now))
+        .observe(
+            launch,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            Activity::Idle,
+            "Stop".into(),
+            super::support::engine_at(now),
+        )
         .expect("hook activity");
 }
 

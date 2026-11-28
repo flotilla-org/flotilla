@@ -359,6 +359,20 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
     let service = daemon.decided_store();
     let primitives = daemon.message_primitives();
     let record = "codex-crew#1";
+    // The launch's session, as its registration creates it from the launch's vessel.
+    primitives
+        .sessions()
+        .ensure(
+            record,
+            || {
+                Ok(flotilla_state_machines::machines::agent_session::AgentSessionRequest::of(
+                    flotilla_schema::Ref::new("convoy", "home"),
+                    "coder",
+                ))
+            },
+            flotilla_schema::Timestamp(0),
+        )
+        .unwrap();
     let agent_activity =
         || primitives.sessions().get(record).and_then(|session| session.state().observation()).map(|observation| observation.activity);
     let target = || {

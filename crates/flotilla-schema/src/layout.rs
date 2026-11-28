@@ -87,6 +87,7 @@ impl Layout {
             field_aliases: Vec::new(),
             aliases: Vec::new(),
             subject: None,
+            facets: Vec::new(),
         };
         let mut id = ColumnDef::new("id", ColumnType::Ref, false);
         id.reference = Some("resource_identity".into());
@@ -325,6 +326,7 @@ impl Layout {
             field_aliases,
             aliases: Vec::new(),
             subject: None,
+            facets: Vec::new(),
         };
         self.set.tables.push(table);
         self.frames.push(Frame::new(self.set.tables.len() - 1));

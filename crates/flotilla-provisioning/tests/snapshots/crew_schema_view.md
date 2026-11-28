@@ -5,7 +5,7 @@ Kind tables only; the shared tables are in `crew.sql`.
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
 | `terminal_launch_facts` | root | 8 | – | – | – |
-| `terminal_session` | root | 27 | 8: `source` 6, `ending` 2 | `terminal_session_env` (child) | `by_environment` (environment), `by_holder` (holder), `by_launch` (launch_of, launch) |
+| `terminal_session` | root | 28 | 8: `source` 6, `ending` 2 | `terminal_session_env` (child) | `by_environment` (environment), `by_holder` (holder), `by_launch` (launch_of, launch), `by_agent_session` (agent_session) |
 | `terminal_session_env` | child | 3 | – | – | – |
 | `vessel` | root | 20 | 2: `ending` 2 | `vessel_shape` (child) | `live_by_host` (host), `by_launch` (convoy, launch_of, launch) |
 | `vessel_shape` | child | 3 | – | – | – |
