@@ -589,7 +589,9 @@ pub trait ProvisionedEnvironment: Send + Sync {
     fn fallback_runner(&self) -> Option<Arc<dyn CommandRunner>> {
         None
     }
-    fn fallback_shell_plan(&self, _cwd: &Path) -> Option<flotilla_protocol::ResolvedAttachPlan> {
+    /// A shell that reaches the vessel without its agent, telling the person why: `reason`, the
+    /// agent's own failure.
+    fn fallback_shell_plan(&self, _cwd: &Path, _reason: &str) -> Option<flotilla_protocol::ResolvedAttachPlan> {
         None
     }
 

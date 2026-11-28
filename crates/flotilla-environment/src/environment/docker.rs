@@ -779,13 +779,14 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
         Some(Arc::new(DockerEnvironmentRunner::new(self.container_name.clone(), self.inner.runner.clone())))
     }
 
-    fn fallback_shell_plan(&self, cwd: &Path) -> Option<flotilla_protocol::ResolvedAttachPlan> {
+    fn fallback_shell_plan(&self, cwd: &Path, reason: &str) -> Option<flotilla_protocol::ResolvedAttachPlan> {
         use flotilla_protocol::arg::Arg;
         Some(flotilla_protocol::ResolvedAttachPlan::command(vec![
             Arg::Literal("sh".into()),
             Arg::Literal("-c".into()),
-            Arg::Quoted("printf '%s\\n' 'Vessel agent unavailable; using Docker fallback runner.' >&2; exec \"$@\"".into()),
+            Arg::Quoted("printf 'Vessel agent unavailable: %s; using Docker fallback runner.\\n' \"$1\" >&2; shift; exec \"$@\"".into()),
             Arg::Literal("flotilla-fallback-shell".into()),
+            Arg::Quoted(reason.to_owned()),
             Arg::Literal("docker".into()),
             Arg::Literal("exec".into()),
             Arg::Literal("-it".into()),
@@ -1983,13 +1984,14 @@ mod runtime_path_tests {
             "container".into(),
             Vec::new(),
         );
-        let plan = handle.fallback_shell_plan(Path::new("/workspace with spaces")).unwrap();
+        let plan = handle.fallback_shell_plan(Path::new("/workspace with spaces"), "agent socket refused").unwrap();
         let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else {
             panic!("one hop");
         };
         assert!(args.contains(&Arg::Literal("-it".into())));
         assert!(args.contains(&Arg::Quoted("/workspace with spaces".into())));
         assert!(args.contains(&Arg::Quoted("container".into())));
+        assert!(args.contains(&Arg::Quoted("agent socket refused".into())), "the agent's reason is shown");
         assert!(args
             .iter()
             .any(|arg| matches!(arg, Arg::Quoted(text) if text.contains("agent unavailable") && text.contains("fallback runner"))));
