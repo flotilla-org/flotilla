@@ -1740,10 +1740,12 @@ impl CrewService {
             } else {
                 vec![("Clean", inspection.clean), ("Pushed", inspection.pushed), ("Landed", inspection.landed)]
             };
-            // Judged by when it was inspected, not when it is read: an unchanged inspection is
-            // not rewritten, so its record says nothing of a checkout changed since.
+            // Judged by when its values were last confirmed, as settlement judges them: an unchanged
+            // inspection is not rewritten, so away from the checkout's home, or after a restart,
+            // when it was inspected reads as when it last changed. Its values are confirmed while
+            // its home's inspections succeed and its records are heard.
             let fresh = integration.failing_since.is_none()
-                && (answered.contains(checkout_name) || integration.inspected_within(now, LANDING_EVIDENCE_TTL));
+                && (answered.contains(checkout_name) || integration.confirmed_within(now, LANDING_EVIDENCE_TTL));
             let unjudged = required.iter().filter(|(_, judged)| judged.is_none()).map(|(label, _)| *label).collect::<Vec<_>>();
             if !fresh || !unjudged.is_empty() {
                 let stale = if fresh { unjudged } else { required.iter().map(|(label, _)| *label).collect() };
