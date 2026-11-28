@@ -108,7 +108,6 @@ async fn a_launch_named_session_goes_through_every_operation_under_its_own_name(
     let cleat = Arc::new(NameRuleCleat::default());
     let pool = CleatTerminalPool::new(Arc::clone(&cleat) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
     pool.launch_capability.set(super::LaunchCapability { env_clear: true, argv: true, any_name: true }).expect("known launch capability");
-    pool.send_key_capability.set(false).expect("known send capability");
 
     pool.ensure_session(LAUNCH_SESSION, "claude", &ExecutionEnvironmentPath::new("/repo"), &Vec::new(), &[]).await.expect("launch");
     let listed = pool.list_sessions().await.expect("list");
@@ -162,7 +161,6 @@ async fn a_crew_launched_under_the_old_encoding_is_found_until_it_relaunches() {
     cleat.sessions.lock().expect("sessions").insert(ENCODED_LAUNCH_SESSION.to_string());
     let pool = CleatTerminalPool::new(Arc::clone(&cleat) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
     pool.launch_capability.set(super::LaunchCapability { env_clear: true, argv: true, any_name: true }).expect("known launch capability");
-    pool.send_key_capability.set(false).expect("known send capability");
 
     let listed = pool.list_sessions().await.expect("list");
     assert_eq!(listed.iter().map(|session| session.session_name.as_str()).collect::<Vec<_>>(), [LAUNCH_SESSION]);
