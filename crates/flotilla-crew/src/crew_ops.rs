@@ -3542,10 +3542,19 @@ impl CrewService {
     /// Its vessels, checkouts and sessions are released by their controllers once it has ended,
     /// and a convoy they still hold retires as they release it.
     pub async fn reap(&self, namespace: &str, name: &str, force: bool, principal: Option<&PrincipalRef>) -> Result<(), String> {
-        self.teardown(namespace, name, force).await?;
-        self.cascade_convoy_children(namespace, name).await?;
         let convoy = self.resource_backend.clone().using::<ResourceConvoy>(namespace).get(name).await.map_err(|error| error.to_string())?;
         let ended = convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal());
+        // Forcing ends an open convoy as abandoned, which its reclaim sanctions. An ended convoy
+        // has nothing left to end: its vessels are released once its checkouts' work is safe, as
+        // the gate judges it, so that judgement answers the delete, naming what it waits on.
+        self.teardown(namespace, name, force && !ended).await.map_err(|refusal| match force && ended {
+            true => format!(
+                "convoy `{name}` has ended, so --force ends nothing more; its vessels are released once its checkouts' work is safe: \
+                 {refusal}. Rule a checkout's work archived with `flotilla checkout <name> archive` at its home"
+            ),
+            false => refusal,
+        })?;
+        self.cascade_convoy_children(namespace, name).await?;
         let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) else {
             return if ended { Ok(()) } else { Err(format!("convoy `{name}` is not held at this home")) };
         };
