@@ -2945,7 +2945,7 @@ impl Aggregator {
                     && source.object.spec.vessel_name == name
                     && self.read_host(&source.provenance).as_ref() == Some(host)
             })
-            .max_by_key(|source| source.object.metadata.name.rsplit_once('#').and_then(|(_, n)| n.parse::<u64>().ok()).unwrap_or(0))
+            .max_by_key(|source| flotilla_resources::convoy::engine::split_launch(&source.object.metadata.name).map_or(0, |(_, n)| n))
     }
 
     /// Resolve the running vessel's execution kind from its observed fulfilment kind.
