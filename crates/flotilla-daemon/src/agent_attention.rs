@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use flotilla_engine_messages::session_request;
 use flotilla_resources::{
     lifecycle_reads::LifecycleReads, terminal_records::TerminalRecords, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
 };
@@ -63,9 +62,7 @@ pub(crate) async fn record_agent_activity(
     let cause = cause.to_owned();
     let now = flotilla_schema::Timestamp::from_datetime(&flotilla_resources::clock::now());
     tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
-        if sessions.get(&name).is_none() {
-            sessions.ensure(&name, session_request(reads.vessels()?, launch.vessel.as_deref(), &launch.role)?, now)?;
-        }
+        sessions.ensure_crew(&name, reads.vessels()?, launch.vessel.as_deref(), &launch.role, now)?;
         sessions.observe(&name, activity, cause, now)
     }))
     .await

@@ -189,6 +189,22 @@ impl Sessions {
         Ok(true)
     }
 
+    /// Creates crew `role`'s session aboard vessel launch `vessel` unless it exists, reading the
+    /// vessel only then ([`session_request`]).
+    pub fn ensure_crew(
+        &self,
+        name: &str,
+        vessels: &dyn VesselRecords,
+        vessel: Option<&str>,
+        role: &str,
+        now: Timestamp,
+    ) -> Result<(), String> {
+        if self.get(name).is_none() {
+            self.ensure(name, session_request(vessels, vessel, role)?, now)?;
+        }
+        Ok(())
+    }
+
     /// Ends a session whose terminal is gone, as observed.
     pub fn end(
         &self,
@@ -847,13 +863,18 @@ impl MessagePrimitives {
         Receiver { kind: ConsumerKind::AgentSession, id: session.to_owned(), host: self.home.clone() }
     }
 
+    /// Whether crew session `session` is registered as a consumer here.
+    pub fn registered(&self, session: &str) -> bool {
+        self.consumers.lock().expect("consumers").contains(&self.consumer(session))
+    }
+
     /// Registers a crew session as a consumer: its record exists, created from `request`, and the
     /// inbox writes its receipts there.
     pub async fn register(&self, session: &str, request: AgentSessionRequest, now: Timestamp) -> Result<Receiver, String> {
         let consumer = self.consumer(session);
         // Registered consumers already have their record; skip the blocking hop and the
         // session home's lock, which the Message loop would otherwise take per holder per pass.
-        if self.consumers.lock().expect("consumers").contains(&consumer) {
+        if self.registered(session) {
             return Ok(consumer);
         }
         let sessions = Arc::clone(&self.sessions);

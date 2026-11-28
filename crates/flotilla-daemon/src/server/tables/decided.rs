@@ -23,7 +23,7 @@ pub(super) async fn list(service: &Arc<Service>) -> Result<Vec<Value>, String> {
                 let facets: Vec<_> = set
                     .tables
                     .iter()
-                    .filter(|table| table.described.iter().any(|mark| matches!(mark, Described::Facet { .. } | Described::Command { .. })))
+                    .filter(|table| table.described.iter().any(|mark| matches!(mark, Described::Facet { .. })))
                     .map(|table| &table.name)
                     .collect();
                 let mut kind = json!({"kind":set.kind,"root":set.tables[0].name,"tables":names});

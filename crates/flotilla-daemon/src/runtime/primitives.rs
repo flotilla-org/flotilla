@@ -423,20 +423,37 @@ impl MessageDelivery {
                 debug!(session = %holder.terminal.metadata.name, "a live session's view declares no agent session");
                 continue;
             };
-            let reads = self.state.daemon.lifecycle_reads();
-            let vessel = holder.terminal.metadata.labels.get(VESSEL_REF_LABEL).map(String::as_str);
-            let register = async {
-                let request = session_request(reads.vessels()?, vessel, &holder.terminal.spec.role)?;
-                self.primitives.register(agent_session, request, now).await
-            };
-            let consumer = match register.instrument(info_span!("message_delivery.register")).await {
-                Ok(consumer) => consumer,
-                Err(error) => {
-                    // These are routed again at the next refresh, which registers them then.
-                    for name in &changed[index..] {
+            let consumer = if self.primitives.registered(agent_session) {
+                self.primitives.consumer(agent_session)
+            } else {
+                let reads = self.state.daemon.lifecycle_reads();
+                let vessel = holder.terminal.metadata.labels.get(VESSEL_REF_LABEL).cloned();
+                let role = holder.terminal.spec.role.clone();
+                // A store read: off the async workers.
+                let request = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+                    session_request(reads.vessels()?, vessel.as_deref(), &role)
+                }))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|request| request);
+                let request = match request {
+                    Ok(request) => request,
+                    Err(error) => {
+                        // Only this holder waits for its vessel; it is routed again at the next refresh.
+                        warn!(session = %agent_session, %error, "a held launch's AgentSession cannot be created yet");
                         self.routing.retry(name);
+                        continue;
                     }
-                    return Err(error);
+                };
+                match self.primitives.register(agent_session, request, now).instrument(info_span!("message_delivery.register")).await {
+                    Ok(consumer) => consumer,
+                    Err(error) => {
+                        // These are routed again at the next refresh, which registers them then.
+                        for name in &changed[index..] {
+                            self.routing.retry(name);
+                        }
+                        return Err(error);
+                    }
                 }
             };
             for inbox in &holder.inboxes {

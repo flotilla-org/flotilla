@@ -12,7 +12,6 @@ use flotilla_agent::{CLAUDE_CODE_HOOK_TOKEN_ENV, CLAUDE_CODE_HOOK_URL_ENV};
 use flotilla_capability_contract::SessionCapabilitySource;
 use flotilla_credentials::crew_git_identity_environment;
 use flotilla_discovery::registry::ProviderRegistry;
-use flotilla_engine_messages::session_request;
 use flotilla_environment::environment::VesselAgent;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::TerminalStatus;
@@ -184,9 +183,7 @@ impl TerminalControllerRuntime {
             (self.state.daemon.lifecycle_reads(), record.to_owned(), spec.role.clone(), spec.vessel_ref.map(str::to_owned));
         let now = flotilla_schema::Timestamp::from_datetime(&now);
         let observe = move || {
-            if sessions.get(&name).is_none() {
-                sessions.ensure(&name, session_request(reads.vessels()?, vessel.as_deref(), &role)?, now)?;
-            }
+            sessions.ensure_crew(&name, reads.vessels()?, vessel.as_deref(), &role, now)?;
             sessions.observe_screen(&name, activity, now)
         };
         match tokio::task::spawn_blocking(flotilla_schema::reads::carry(observe)).await {
