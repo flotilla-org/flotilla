@@ -151,6 +151,7 @@ fn drop_reason_of(spec: &MessageSpec, o: &Value) -> DropReason {
         "Superseded" => DropReason::Superseded { by: at(NEWER) },
         "Withdrawn" => DropReason::Withdrawn { by: at(SENDER), authority: withdrawal_authority(spec) },
         "ConsumerUnreachable" => DropReason::ConsumerUnreachable { by: at(SUPERVISOR), authority: at(SUPERVISOR) },
+        "Failed" => DropReason::Failed { detail: "the service failed".into() },
         other => panic!("drop reason {other}"),
     }
 }
@@ -207,6 +208,14 @@ fn drop_world(spec: &MessageSpec, o: &Value, now: Timestamp) -> Result<MemoryMes
         }
         "ConsumerUnreachable" => {
             world.authority.put(&Ref::new(SUPERVISOR), boolean(&o["authorised"]));
+        }
+        "Failed" => {
+            if boolean(&o["receipt"]) {
+                put_receipt(&mut world, &session(1), Transport::Turn);
+            }
+            if boolean(&o["failure"]) {
+                world.delivery_failure.put(&Ref::<DeliveryFailure>::new(NAME), ());
+            }
         }
         other => panic!("drop reason {other}"),
     }

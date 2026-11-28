@@ -83,6 +83,14 @@ impl ProviderApi for MemoryApi {
     }
     async fn prepare(&self, provider: &str, request: &PrepareRequest) -> ApiResult<Prepared> {
         self.prepares.lock().expect("prepares").push(request.clone());
+        // Drydock refuses a prepare while the instance is not ready, with its reason.
+        match &self.declaration.lock().expect("declaration").readiness {
+            Readiness::Ready => {}
+            Readiness::MissingTool { reason }
+            | Readiness::MissingCredential { reason }
+            | Readiness::VersionMismatch { reason }
+            | Readiness::Unknown { reason } => return Err(ApiError::NotReady(reason.clone())),
+        }
         Ok(Prepared {
             provider: provider.into(),
             id: format!("prepared-{}", request.image_digest.len()),

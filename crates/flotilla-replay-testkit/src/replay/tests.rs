@@ -908,12 +908,7 @@ fn classified_rest_outcomes(timestamp: i64, has_next_page: bool, total_count: u3
         Ok(GhApiResponse { status: 200, etag: Some("etag".into()), body: "[]".into(), has_next_page, total_count: Some(total_count) }),
     ];
     for kind in [GithubRateLimitKind::Primary, GithubRateLimitKind::Secondary] {
-        for retry_source in [
-            GithubRetrySource::Unavailable,
-            GithubRetrySource::RetryAfter,
-            GithubRetrySource::RateLimitReset,
-            GithubRetrySource::SecondaryFallback,
-        ] {
+        for retry_source in [GithubRetrySource::Unavailable, GithubRetrySource::RetryAfter, GithubRetrySource::RateLimitReset] {
             for retry_at in [None, Some(chrono::DateTime::from_timestamp(timestamp, 0).expect("deadline"))] {
                 outcomes.push(Err({
                     let limit = GithubRateLimit { kind, retry_at, retry_source };
@@ -1101,41 +1096,6 @@ async fn classified_rest_failure_case((status, remaining, message, deadline, ret
         assert_eq!(actual, expected_legacy);
         replay.finish();
     }
-}
-
-// #2557: preemptive issue-budget refusals have no HTTP failure response, and a
-// cached refusal makes no further subprocess call; replay retains that distinction.
-#[tokio::test]
-async fn classified_issue_budget_recording_has_no_failure_response() {
-    use flotilla_forge_github::github::GhApiClient;
-
-    use super::testing::MockRunner;
-    let reset = chrono::Utc::now().timestamp() + 3600;
-    // Substitute the gh subprocess boundary with one successful low-budget response.
-    let runner = Arc::new(MockRunner::new(vec![Ok(format!(
-        "HTTP/2 200 OK\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: 75\r\nX-RateLimit-Reset: {reset}\r\n\r\n[]"
-    ))]));
-    let temp = tempfile::tempdir().expect("tempdir");
-    let path = temp.path().join("recording.yaml");
-    let recording = Session::recording(&path, Masks::new());
-    let api = RecordingGhApi::new(recording.clone(), Arc::new(GhApiClient::new(runner.clone())));
-    let endpoint = "repos/team/one/issues?state=all";
-    let label = flotilla_provider_runtime::gh_api_channel_label("GET", endpoint);
-    let first = api.get_classified_response(endpoint, Path::new("/"), &label).await.expect_err("budget refusal");
-    let second = api.get_classified_response(endpoint, Path::new("/"), &label).await.expect_err("cached refusal");
-    assert!(first.response.is_none());
-    assert!(second.response.is_none());
-    assert_eq!(first.error, second.error);
-    assert_eq!(runner.calls().len(), 1);
-    recording.finish();
-    let replay = Session::replaying(&path, Masks::new());
-    let api = ReplayGhApi::new(replay.clone());
-    for _ in 0..2 {
-        let failure = api.get_classified_response(endpoint, Path::new("/"), &label).await.expect_err("replayed refusal");
-        assert!(failure.response.is_none());
-        assert_eq!(failure.error, first.error);
-    }
-    replay.finish();
 }
 
 // Full-output recording/replay preserves every numeric code and termination

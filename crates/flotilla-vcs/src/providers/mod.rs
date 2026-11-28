@@ -9,7 +9,6 @@ use std::path::Path;
 use async_trait::async_trait;
 use flotilla_protocol::CheckoutIntent;
 pub use provisioning::{CloneInspection, CloneProvisioner, GitCloneProvisioner};
-use tracing::warn;
 
 use crate::BranchInfo;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -80,8 +79,12 @@ pub(crate) fn parse_ahead_behind(output: &str) -> Option<AheadBehind> {
 }
 
 /// Write issue links to git config for a specific branch.
-/// Errors are logged and ignored because issue linking is best-effort metadata.
-pub async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(String, String)], runner: &dyn CommandRunner) {
+pub async fn write_branch_issue_links(
+    repo_root: &Path,
+    branch: &str,
+    issue_ids: &[(String, String)],
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
     use std::collections::HashMap;
 
     let mut by_provider: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -91,10 +94,9 @@ pub async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids:
     for (provider, ids) in by_provider {
         let key = format!("branch.{branch}.flotilla.issues.{provider}");
         let value = ids.join(",");
-        if let Err(err) = run!(runner, "git", &["config", &key, &value], repo_root) {
-            warn!(err = %err, "failed to write issue link");
-        }
+        run!(runner, "git", &["config", &key, &value], repo_root).map_err(|err| format!("failed to write issue link {key}: {err}"))?;
     }
+    Ok(())
 }
 
 async fn validate_checkout_target_with_prefix(

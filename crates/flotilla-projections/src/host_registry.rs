@@ -273,17 +273,6 @@ impl HostRegistry {
             .and_then(|state| state.summary.as_ref()?.host_name.clone())
     }
 
-    pub async fn live_routed_host_name(&self, target_node: &NodeId) -> Option<HostName> {
-        let routes = self.peers.topology_routes().read().await;
-        let route = routes.iter().find(|route| route.target.node_id == *target_node)?;
-        if !route.connected && route.fallbacks.is_empty() {
-            return None;
-        }
-        drop(routes);
-
-        self.host_name_for_node(target_node).await
-    }
-
     pub async fn replay_host_events(&self, last_seen: &HashMap<StreamKey, u64>) -> Vec<DaemonEvent> {
         let configured = self.peers.configured_peers().read().await.clone();
         let node_connectivity = self.peers.node_connectivity().read().await.clone();

@@ -440,9 +440,10 @@ CREATE TABLE "message" (
   "receiver_id" INTEGER REFERENCES "strings" ("id"),
   "receiver_host" INTEGER REFERENCES "strings" ("id"),
   "delivered_at" INTEGER,
-  "reason" TEXT CHECK ("reason" IN ('cu', 'ex', 'su', 'un', 'wi')),
+  "reason" TEXT CHECK ("reason" IN ('cu', 'ex', 'fa', 'su', 'un', 'wi')),
   "reason_by" INTEGER REFERENCES "strings" ("id"),
   "reason_authority" INTEGER REFERENCES "strings" ("id"),
+  "reason_detail" TEXT,
   "watermark" INTEGER,
   CHECK (CASE WHEN "expectation" = 'no'
       THEN "expectation_condition" IS NULL
@@ -462,22 +463,32 @@ CREATE TABLE "message" (
   CHECK (CASE WHEN "reason" = 'un'
       THEN "reason_by" IS NULL
       AND "reason_authority" IS NULL
+      AND "reason_detail" IS NULL
       END),
   CHECK (CASE WHEN "reason" = 'ex'
       THEN "reason_by" IS NULL
       AND "reason_authority" IS NULL
+      AND "reason_detail" IS NULL
       END),
   CHECK (CASE WHEN "reason" = 'su'
       THEN "reason_by" IS NOT NULL
       AND "reason_authority" IS NULL
+      AND "reason_detail" IS NULL
       END),
   CHECK (CASE WHEN "reason" = 'wi'
       THEN "reason_by" IS NOT NULL
       AND "reason_authority" IS NOT NULL
+      AND "reason_detail" IS NULL
       END),
   CHECK (CASE WHEN "reason" = 'cu'
       THEN "reason_by" IS NOT NULL
       AND "reason_authority" IS NOT NULL
+      AND "reason_detail" IS NULL
+      END),
+  CHECK (CASE WHEN "reason" = 'fa'
+      THEN "reason_detail" IS NOT NULL
+      AND "reason_by" IS NULL
+      AND "reason_authority" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'pe'
       THEN "receiver_kind" IS NULL
@@ -487,6 +498,7 @@ CREATE TABLE "message" (
       AND "reason" IS NULL
       AND "reason_by" IS NULL
       AND "reason_authority" IS NULL
+      AND "reason_detail" IS NULL
       AND "watermark" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'aw'
@@ -497,12 +509,14 @@ CREATE TABLE "message" (
       AND "reason" IS NULL
       AND "reason_by" IS NULL
       AND "reason_authority" IS NULL
+      AND "reason_detail" IS NULL
       AND "watermark" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'se'
       THEN "reason" IS NULL
       AND "reason_by" IS NULL
       AND "reason_authority" IS NULL
+      AND "reason_detail" IS NULL
       AND "watermark" IS NULL
       END),
   CHECK (CASE WHEN "state" = 'dr'
@@ -542,6 +556,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('ms', 'receiver_kind', 'sv', 'Service'),
   ('ms', 'reason', 'cu', 'ConsumerUnreachable'),
   ('ms', 'reason', 'ex', 'Expired'),
+  ('ms', 'reason', 'fa', 'Failed'),
   ('ms', 'reason', 'su', 'Superseded'),
   ('ms', 'reason', 'un', 'Undeliverable'),
   ('ms', 'reason', 'wi', 'Withdrawn'),
@@ -576,6 +591,7 @@ CREATE VIEW "message_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'ms' AND "field" = 'reason' AND "code" = "message"."reason") AS "reason",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."reason_by") AS "reason_by",
   (SELECT "s" FROM "strings" WHERE "id" = "message"."reason_authority") AS "reason_authority",
+  "message"."reason_detail",
   "message"."watermark"
 FROM "message";
 CREATE VIEW "message_references_view" AS SELECT

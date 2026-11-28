@@ -386,9 +386,9 @@ pub enum RequestAnswer {
     Waiting,
     /// The service took it: its receipt is written, after the records it wrote for it.
     Answered { receiver: Receiver },
-    /// It will never be answered: dropped as undeliverable (the inbox stayed unbound, or its
-    /// service could not do it), expired, superseded or withdrawn, or gone. The gate fails, never
-    /// proceeds on older evidence.
+    /// It will never be answered: dropped as undeliverable (the inbox stayed unbound), failed by
+    /// its service (whose own reason this is), expired, superseded or withdrawn, or gone. The gate
+    /// fails, never proceeds on older evidence.
     Dropped { reason: String },
     /// It was taken, and settled with no receiver.
     Failed { reason: String },
@@ -428,6 +428,7 @@ impl RequestAnswer {
     pub fn of(state: &MessageState) -> RequestAnswer {
         match state {
             MessageState::Pending => RequestAnswer::Waiting,
+            MessageState::Dropped { reason: DropReason::Failed { detail }, .. } => RequestAnswer::Dropped { reason: detail.clone() },
             MessageState::Dropped { reason, .. } => RequestAnswer::Dropped { reason: format!("the request was dropped: {reason:?}") },
             MessageState::Awaiting { receiver, .. } | MessageState::Settled { receiver: Some(receiver), .. } => {
                 RequestAnswer::Answered { receiver: receiver.clone() }
@@ -1000,12 +1001,13 @@ impl MessagePrimitives {
         }
     }
 
-    /// A service here could not do what request `message` asked (#3108): it publishes the
-    /// delivery failure, the evidence an undeliverable drop needs, and drops the request so its
-    /// sender's wait fails instead of reading what is not there.
-    pub async fn fail_request(&self, message: &str) -> Result<(), String> {
+    /// A service here could not do what request `message` asked, for `reason` (#3108, #4478): it
+    /// publishes the delivery failure, the evidence a failed drop needs, and drops the request
+    /// with the service's reason, so its sender's wait fails with that reason instead of reading
+    /// what is not there.
+    pub async fn fail_request(&self, message: &str, reason: &str) -> Result<(), String> {
         self.world.update(|world| world.delivery_failure.put(&flotilla_state_machines::Ref::new(message), ()));
-        self.inbox.drop(message, DropReason::Undeliverable).await.map_err(|error| error.to_string())
+        self.inbox.drop(message, DropReason::Failed { detail: reason.to_owned() }).await.map_err(|error| error.to_string())
     }
 
     /// Every person role's inbox in `namespace` (#3938): each person role

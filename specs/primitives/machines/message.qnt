@@ -8,8 +8,9 @@ module message {
   // concern, never this machine's (#3424 rulings 1 and 2).
   type Receiver = { consumer: int, host: str }
   type Delivery = { envelope: Envelope, receiver: Receiver }
-  type DropReason = Undeliverable | Expired | Superseded | Withdrawn | ConsumerUnreachable
-  pure val dropReasons = Set(Undeliverable, Expired, Superseded, Withdrawn, ConsumerUnreachable)
+  // Failed: the service a request asked could not do it; its reason text is data no rule reads.
+  type DropReason = Undeliverable | Expired | Superseded | Withdrawn | ConsumerUnreachable | Failed
+  pure val dropReasons = Set(Undeliverable, Expired, Superseded, Withdrawn, ConsumerUnreachable, Failed)
   // A drop records the evidence its reason's rule consulted: the applied
   // watermark and the binding only for an expiry, the receipt only for undeliverable.
   type Drop = { reason: DropReason, envelope: Envelope, receiver: int, watermark: int, bound: bool, receipt: bool }
@@ -71,6 +72,11 @@ module message {
               // The turn-rules role withdraws a message whose delivery condition no longer holds.
               | Withdrawn => if (o.authorised or (env.hasCondition and o.conditionFailed)) Moved(s) else Refused(Unauthorised)
               | ConsumerUnreachable => if (o.authorised) Moved(s) else Refused(Unauthorised)
+              // The service's published delivery failure, only before any receipt.
+              | Failed => match s {
+                  | Pending(_) => if (o.receipt) Refused(ReceiptConfirmed) else if (o.failure) Moved(s) else Refused(MissingEvidence)
+                  | _ => Refused(WrongState)
+                }
             }
             match refusal {
               | Refused(r) => Refused(r)

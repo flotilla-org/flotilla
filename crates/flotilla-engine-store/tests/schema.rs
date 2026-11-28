@@ -98,6 +98,38 @@ fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_widened_at_open()
     Store::open(connection, "home", registry().expect("registry")).expect("a current store opens");
 }
 
+// Behaviour (#4478 `fa`): a store created before DropReason::Failed has no `reason_detail` column
+// and the old CHECK on `message.reason`. Opening widens the table, so a service's failed request
+// drops with its reason rather than failing when it is first written.
+#[test]
+fn a_store_whose_drop_reasons_predate_failed_is_widened_at_open() {
+    use flotilla_schema_sqlite::Store;
+    let current = schema_ddl(&registry().expect("registry"), DdlMode::IfNotExists);
+    let message =
+        current.split("CREATE TABLE IF NOT EXISTS \"message\" (").nth(1).expect("message table").split("\n);").next().expect("end");
+    let failed_check = message.find("  CHECK (CASE WHEN \"reason\" = 'fa'").expect("the Failed CHECK");
+    let failed_check = &message[failed_check..failed_check + message[failed_check..].find("END),\n").expect("its end") + "END),\n".len()];
+    let previous_message = message
+        .replace(failed_check, "")
+        .replace(
+            r#""reason" TEXT CHECK ("reason" IN ('cu', 'ex', 'fa', 'su', 'un', 'wi'))"#,
+            r#""reason" TEXT CHECK ("reason" IN ('cu', 'ex', 'su', 'un', 'wi'))"#,
+        )
+        .replace("  \"reason_detail\" TEXT,\n", "")
+        .replace("\n      AND \"reason_detail\" IS NULL", "");
+    let previous = current.replace(message, &previous_message).replace("  ('ms', 'reason', 'fa', 'Failed'),\n", "");
+    assert!(!previous.contains("reason_detail") && !previous.contains("'fa', 'su'"), "the previous generation's table is reconstructed");
+    let connection = rusqlite::Connection::open_in_memory().expect("connection");
+    connection.execute_batch(&previous).expect("previous schema");
+    let store = Store::open(connection, "home", registry().expect("registry")).expect("the previous generation opens");
+    let sql: String = store
+        .into_connection()
+        .query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'message'", [], |row| row.get(0))
+        .expect("message table");
+    assert!(sql.contains(r#"CHECK ("reason" IN ('cu', 'ex', 'fa', 'su', 'un', 'wi'))"#), "widened to Failed: {sql}");
+    assert!(sql.contains(r#""reason_detail" TEXT"#), "gains the failure's reason: {sql}");
+}
+
 // Behaviour (#3108, TL-3 `br`): a decided store created before LinkSource::Branch keeps the old
 // CHECK on `convoy_subjects.source`. Opening rebuilds the table with `br` rather than letting a
 // convoy's first branch link fail later, and a Branch link is then written.

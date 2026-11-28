@@ -170,11 +170,11 @@ async fn board_deadlines_and_restarts_converge_with_bounded_bulk_calls() {
     assert_eq!(row.unreported_calls, timeouts as u64);
 }
 
-// #2928: low budget reserves other users' points; the completed batch remains
-// durable and retries (including a restarted provider) make no GraphQL calls.
-// Generate empty, both sides of batch boundaries, and both sides of quota 100.
+// #4478: the board keeps no reserve of GitHub points. Every batch is read however few points
+// remain, until GitHub itself refuses. Generate empty, both sides of batch boundaries, and
+// remaining points either side of the reserve that used to stop the read at 100.
 #[hegel::test]
-fn board_bulk_boundaries_and_low_budget(tc: hegel::TestCase) {
+fn board_bulk_boundaries_read_every_batch(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(45));
     let remaining = tc.draw(gs::integers::<u64>().min_value(98).max_value(101));
@@ -184,26 +184,18 @@ fn board_bulk_boundaries_and_low_budget(tc: hegel::TestCase) {
         let directory = tempfile::tempdir().expect("cache");
         let first = provider(forge.clone(), directory.path());
         let result = first.dispatch_board(&source()).await;
-        let expected_batches = if remaining < 100 { usize::from(count > 0) } else { count.div_ceil(BOARD_BATCH_SIZE) };
-        assert_eq!(forge.calls.load(Ordering::SeqCst), expected_batches);
+        assert_eq!(forge.calls.load(Ordering::SeqCst), count.div_ceil(BOARD_BATCH_SIZE));
         let state = first.poll.load("team/repo").expect("durable batch");
-        assert_eq!(state.issues.details.len(), if remaining < 100 { count.min(BOARD_BATCH_SIZE) } else { count });
-        assert_eq!(result.is_ok(), remaining >= 100 || count <= BOARD_BATCH_SIZE);
+        assert_eq!(state.issues.details.len(), count);
+        assert!(result.is_ok());
         // #3313: fields ride the existing paginated REST inventory. No per-ticket
         // field requests are allowed, including for a large native-detail batch.
         assert_eq!(forge.rest_calls.load(Ordering::SeqCst), count.div_ceil(100).max(1) + 1);
-        if let Ok(board) = &result {
-            assert!(first.board_includes_mission_fields());
-            for issue in &board.issues {
-                assert_eq!(issue.mission_fields.priority, Some(flotilla_protocol::Priority::High));
-                assert_eq!(issue.mission_fields.weight.map(f64::from), Some(2.5));
-            }
-        }
-
-        if count > 0 && remaining < 100 {
-            let restarted = provider(forge.clone(), directory.path());
-            assert!(restarted.dispatch_board(&source()).await.is_err());
-            assert_eq!(forge.calls.load(Ordering::SeqCst), 1);
+        let board = result.expect("board");
+        assert!(first.board_includes_mission_fields());
+        for issue in &board.issues {
+            assert_eq!(issue.mission_fields.priority, Some(flotilla_protocol::Priority::High));
+            assert_eq!(issue.mission_fields.weight.map(f64::from), Some(2.5));
         }
     });
 }
@@ -227,7 +219,7 @@ async fn board_truncated_native_window_is_not_committed() {
 }
 
 // ADR 0047: forge-cache poll state is stored data. The previous generation's
-// exact shape remains decodable; new progress fields default to no work/backoff.
+// exact shape remains decodable; new progress fields default to no work.
 #[test]
 fn board_previous_generation_stored_shape_is_decodable() {
     let old = json!({
@@ -236,7 +228,6 @@ fn board_previous_generation_stored_shape_is_decodable() {
     });
     let state: BoardState = serde_json::from_value(old).expect("previous-generation record");
     assert!(state.pending.is_none());
-    assert!(state.retry_at.is_none());
     let encoded: Value = serde_json::to_value(state).expect("new stored record");
     assert!(encoded.get("pending").is_some());
 }
@@ -385,10 +376,11 @@ async fn board_incremental_closures_resolve_cached_blockers_and_linked_prs() {
     assert!(runner.requests.lock().expect("requests").is_empty());
 }
 
-// Primary/secondary limits retain the unfinished inventory and a durable retry
-// deadline. Restarted refreshes make no requests during the cooldown.
+// Primary/secondary limits retain the unfinished inventory and report the retry time GitHub
+// gave. Nothing gates the next refresh: it asks GitHub again and resumes the pending revisions
+// without replaying the already collected REST inventory.
 #[tokio::test]
-async fn board_rate_limit_errors_back_off_across_restart() {
+async fn board_rate_limit_reports_githubs_retry_time_and_keeps_the_inventory() {
     for (remaining, message, retry_header) in [(0, "API rate limit exceeded", ""), (4000, "secondary rate limit", "Retry-After: 60\r\n")] {
         let reset = chrono::Utc::now() + chrono::Duration::hours(1);
         let raw = format!(
@@ -403,6 +395,10 @@ async fn board_rate_limit_errors_back_off_across_restart() {
             ),
             ("repos/team/repo/pulls?state=open&sort=updated&direction=desc&per_page=100&page=1".into(), rest("pulls", json!([]))),
             ("issue(number:1)".into(), raw),
+            (
+                "issue(number:1)".into(),
+                rest("recovered", json!({"data":{"rateLimit":{"cost":1,"remaining":4000},"repository":{"issue1":issue_detail(1)}}})),
+            ),
         ];
         let runner = Arc::new(ScriptForge { requests: Mutex::new(requests.into()), graphql_calls: AtomicUsize::new(0) });
         let directory = tempfile::tempdir().expect("cache");
@@ -412,8 +408,8 @@ async fn board_rate_limit_errors_back_off_across_restart() {
         };
         let first = make();
         let error = first.dispatch_board(&source()).await.expect_err("rate limited");
-        let deadline = rate_limit_reset(&error).expect("compatible rate limit diagnostic");
-        let mut state = first.poll.load("team/repo").expect("durable retry");
+        let deadline = rate_limit_reset(&error).expect("GitHub's retry time");
+        let state = first.poll.load("team/repo").expect("durable inventory");
         assert_eq!(state.pending.as_ref().expect("unfinished inventory").issues.len(), 1);
         assert!(state.issues.details.is_empty());
         if remaining == 0 {
@@ -421,21 +417,34 @@ async fn board_rate_limit_errors_back_off_across_restart() {
         } else {
             assert!(deadline < chrono::Utc::now() + chrono::Duration::minutes(2), "secondary limit uses Retry-After, not hourly reset");
         }
-        assert!(make().dispatch_board(&source()).await.is_err());
-        assert_eq!(runner.graphql_calls.load(Ordering::SeqCst), 1);
-        assert!(runner.requests.lock().expect("requests").is_empty());
-        // Simulate expiry through the durable cache API; pending revisions must
-        // resume without replaying the already collected REST inventory.
-        state.retry_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
-        first.poll.save("team/repo", &state).expect("expired retry deadline");
-        runner.requests.lock().expect("requests").push_back((
-            "issue(number:1)".into(),
-            rest("recovered", json!({"data":{"rateLimit":{"cost":1,"remaining":4000},"repository":{"issue1":issue_detail(1)}}})),
-        ));
-        assert_eq!(make().dispatch_board(&source()).await.expect("recovered after deadline").issues.len(), 1);
+        assert_eq!(make().dispatch_board(&source()).await.expect("GitHub answered the next refresh").issues.len(), 1);
         assert_eq!(runner.graphql_calls.load(Ordering::SeqCst), 2);
         assert!(runner.requests.lock().expect("requests").is_empty());
     }
+}
+
+// A limit without a retry time reports none rather than inventing one.
+#[tokio::test]
+async fn board_rate_limit_without_a_retry_time_reports_none() {
+    let raw = format!(
+        "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 4000\r\n\r\n{}",
+        json!({"errors":[{"type":"RATE_LIMITED","message":"secondary rate limit"}]})
+    );
+    let requests = vec![
+        (
+            "repos/team/repo/issues?state=open&sort=updated&direction=desc&per_page=100&page=1".into(),
+            rest("issues", json!([{"number":1,"state":"open","updated_at":"2026-10-08T00:00:00Z"}])),
+        ),
+        ("repos/team/repo/pulls?state=open&sort=updated&direction=desc&per_page=100&page=1".into(), rest("pulls", json!([]))),
+        ("issue(number:1)".into(), raw),
+    ];
+    let runner = Arc::new(ScriptForge { requests: Mutex::new(requests.into()), graphql_calls: AtomicUsize::new(0) });
+    let directory = tempfile::tempdir().expect("cache");
+    let provider = GitHubIssueProvider::new(Arc::new(GhApiClient::new(runner.clone())), runner.clone(), Path::new("/"))
+        .with_poll_directory(directory.path().into());
+    let error = provider.dispatch_board(&source()).await.expect_err("rate limited");
+    assert!(error.contains("retry_source=unavailable, retry_at=unavailable"), "{error}");
+    assert_eq!(rate_limit_reset(&error), None);
 }
 
 // An empty initial open set still establishes an incremental cursor. Restarted

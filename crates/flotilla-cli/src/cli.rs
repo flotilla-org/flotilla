@@ -1536,8 +1536,14 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
             if status.has_uncommitted {
                 parts.push("uncommitted changes".to_string());
             }
-            if let Some(warning) = &status.base_detection_warning {
-                parts.push(format!("warning: {warning}"));
+            if let Some(error) = &status.change_request_error {
+                parts.push(format!("PR unknown: {error}"));
+            }
+            if let Some(error) = &status.unpushed_commits_error {
+                parts.push(format!("unpushed commits unknown: {error}"));
+            }
+            if let Some(error) = &status.uncommitted_files_error {
+                parts.push(format!("uncommitted changes unknown: {error}"));
             }
             parts.join(", ")
         }

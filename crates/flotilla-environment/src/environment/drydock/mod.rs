@@ -260,9 +260,6 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         if !spec.image.rsplit_once("@sha256:").is_some_and(|(_, d)| d.len() == 64 && d.bytes().all(|c| c.is_ascii_hexdigit())) {
             return Err("cloud sandbox image must be pinned by sha256 digest".into());
         }
-        if !matches!(self.detect_readiness().await, ProviderReadiness::Ready) {
-            return Err("drydock provider is not ready".into());
-        }
         let image_pull = match &opts.prepared_auth {
             Some(auth) => {
                 let (username, secret) = auth.basic(&spec.image, HostImageAction::ImagePull)?;
@@ -319,6 +316,9 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         if !opts.tools.is_empty() {
             return Err("cloud sandbox tools are delivered by the vessel layer, through the agent".into());
         }
+        // The handle carries drydock's declaration (its capabilities and versions): read it for
+        // this vessel rather than lean on an earlier readiness read.
+        self.declaration().await?;
         // Preserve HTTP's creation result: label-idempotent POST may adopt a
         // live backing after a restart. Only 201 grants setup rollback.
         let request = wire::ProvisionRequest {

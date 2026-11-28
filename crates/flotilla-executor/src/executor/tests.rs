@@ -156,6 +156,31 @@ impl ChangeRequestTracker for MockChangeRequestTracker {
     }
 }
 
+/// A change-request provider whose browser and close operations fail.
+struct FailingChangeRequestTracker(&'static str);
+
+#[async_trait]
+impl ChangeRequestTracker for FailingChangeRequestTracker {
+    async fn list_change_requests(&self, _limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+        Ok(vec![])
+    }
+    async fn get_change_request(&self, _id: &str) -> Result<(String, ChangeRequest), String> {
+        Err("not implemented".to_string())
+    }
+    async fn open_in_browser(&self, _id: &str) -> Result<(), String> {
+        Err(self.0.to_string())
+    }
+    async fn close_change_request(&self, _id: &str) -> Result<(), String> {
+        Err(self.0.to_string())
+    }
+    async fn merge_change_request(&self, _id: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn list_merged_branch_names(&self, _limit: usize) -> Result<Vec<String>, String> {
+        Ok(vec![])
+    }
+}
+
 struct MergeChangeRequestTracker {
     calls: tokio::sync::Mutex<Vec<String>>,
     result: Result<(), String>,
@@ -188,15 +213,20 @@ impl ChangeRequestTracker for MergeChangeRequestTracker {
 struct MockIssueProvider {
     fetched_by_id: tokio::sync::Mutex<Vec<Vec<String>>>,
     fetched_issues: Vec<(String, Issue)>,
+    open_result: Result<(), String>,
 }
 
 impl MockIssueProvider {
     fn empty() -> Self {
-        Self { fetched_by_id: tokio::sync::Mutex::new(Vec::new()), fetched_issues: Vec::new() }
+        Self { fetched_by_id: tokio::sync::Mutex::new(Vec::new()), fetched_issues: Vec::new(), open_result: Ok(()) }
+    }
+
+    fn failing_open(message: &str) -> Self {
+        Self { open_result: Err(message.to_string()), ..Self::empty() }
     }
 
     fn with_fetched_issues(fetched_issues: Vec<(String, Issue)>) -> Self {
-        Self { fetched_by_id: tokio::sync::Mutex::new(Vec::new()), fetched_issues }
+        Self { fetched_by_id: tokio::sync::Mutex::new(Vec::new()), fetched_issues, open_result: Ok(()) }
     }
 }
 
@@ -238,7 +268,7 @@ impl IssueProvider for MockIssueProvider {
     }
 
     async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
-        Ok(())
+        self.open_result.clone()
     }
 }
 
@@ -397,15 +427,6 @@ fn assert_checkout_created_branch(result: CommandValue, expected_branch: &str) {
             assert_eq!(branch, expected_branch);
         }
         other => panic!("expected CheckoutCreated, got {:?}", other),
-    }
-}
-
-fn assert_checkout_status_branch(result: CommandValue, expected_branch: &str) {
-    match result {
-        CommandValue::CheckoutStatus(info) => {
-            assert_eq!(info.branch, expected_branch);
-        }
-        other => panic!("expected CheckoutStatus, got {:?}", other),
     }
 }
 
@@ -618,7 +639,7 @@ async fn remove_checkout_preserves_terminal_sessions() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn fetch_checkout_status_returns_checkout_status() {
+async fn fetch_checkout_status_carries_each_failed_read() {
     let registry = empty_registry();
     // fetch_checkout_status runs multiple git/gh commands concurrently via
     // tokio::join!. Provide enough error responses for all subprocess calls:
@@ -640,7 +661,16 @@ async fn fetch_checkout_status_returns_checkout_status() {
     )
     .await;
 
-    assert_checkout_status_branch(result, "feat");
+    match result {
+        CommandValue::CheckoutStatus(info) => {
+            assert_eq!(info.branch, "feat");
+            assert!(info.unpushed_commits_error.as_deref().is_some_and(|error| error.contains("could not determine base branch")));
+            assert_eq!(info.uncommitted_files_error.as_deref(), Some("err"));
+            assert_eq!(info.change_request_error.as_deref(), Some("err"));
+            assert!(!info.has_uncommitted);
+        }
+        other => panic!("expected CheckoutStatus, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -679,14 +709,25 @@ async fn fetch_checkout_status_populates_uncommitted_files() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn open_change_request_no_provider() {
+async fn open_change_request_requires_provider() {
     let registry = empty_registry();
     let runner = runner_ok();
 
     let result =
         run_build_plan_to_completion(CommandAction::OpenChangeRequest { id: "42".to_string() }, registry, empty_data(), runner).await;
 
-    assert_ok(result);
+    assert_error_contains(result, "change request provider");
+}
+
+#[tokio::test]
+async fn open_change_request_surfaces_provider_failure() {
+    let mut registry = empty_registry();
+    registry.change_requests.insert("github", desc("github"), Arc::new(FailingChangeRequestTracker("gh: HTTP 403")));
+
+    let result =
+        run_build_plan_to_completion(CommandAction::OpenChangeRequest { id: "42".to_string() }, registry, empty_data(), runner_ok()).await;
+
+    assert_error_eq(result, "gh: HTTP 403");
 }
 
 #[tokio::test]
@@ -706,14 +747,25 @@ async fn open_change_request_with_provider() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn close_change_request_no_provider() {
+async fn close_change_request_requires_provider() {
     let registry = empty_registry();
     let runner = runner_ok();
 
     let result =
         run_build_plan_to_completion(CommandAction::CloseChangeRequest { id: "42".to_string() }, registry, empty_data(), runner).await;
 
-    assert_ok(result);
+    assert_error_contains(result, "change request provider");
+}
+
+#[tokio::test]
+async fn close_change_request_surfaces_provider_failure() {
+    let mut registry = empty_registry();
+    registry.change_requests.insert("github", desc("github"), Arc::new(FailingChangeRequestTracker("gh: HTTP 403")));
+
+    let result =
+        run_build_plan_to_completion(CommandAction::CloseChangeRequest { id: "42".to_string() }, registry, empty_data(), runner_ok()).await;
+
+    assert_error_eq(result, "gh: HTTP 403");
 }
 
 #[tokio::test]
@@ -801,13 +853,23 @@ async fn merge_change_request_surfaces_provider_failure() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn open_issue_no_provider() {
+async fn open_issue_requires_provider() {
     let registry = empty_registry();
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(CommandAction::OpenIssue { id: "10".to_string() }, registry, empty_data(), runner).await;
 
-    assert_ok(result);
+    assert_error_contains(result, "issue provider");
+}
+
+#[tokio::test]
+async fn open_issue_surfaces_provider_failure() {
+    let mut registry = empty_registry();
+    registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueProvider::failing_open("gh: HTTP 404")));
+
+    let result = run_build_plan_to_completion(CommandAction::OpenIssue { id: "10".to_string() }, registry, empty_data(), runner_ok()).await;
+
+    assert_error_eq(result, "gh: HTTP 404");
 }
 
 #[tokio::test]
@@ -1506,7 +1568,7 @@ async fn write_branch_issue_links_single_provider_multiple_issues() {
     let runner = MockRunner::new(vec![Ok(String::new())]);
     let issue_ids = vec![("github".to_string(), "10".to_string()), ("github".to_string(), "20".to_string())];
 
-    write_branch_issue_links(repo_root().as_path(), "feat-x", &issue_ids, &runner).await;
+    write_branch_issue_links(repo_root().as_path(), "feat-x", &issue_ids, &runner).await.expect("issue links written");
 
     assert_eq!(runner.remaining(), 0, "single provider should consume exactly 1 response");
 }
@@ -1516,26 +1578,26 @@ async fn write_branch_issue_links_multiple_providers() {
     let runner = MockRunner::new(vec![Ok(String::new()), Ok(String::new())]);
     let issue_ids = vec![("github".to_string(), "10".to_string()), ("jira".to_string(), "PROJ-5".to_string())];
 
-    write_branch_issue_links(repo_root().as_path(), "feat-x", &issue_ids, &runner).await;
+    write_branch_issue_links(repo_root().as_path(), "feat-x", &issue_ids, &runner).await.expect("issue links written");
 
     assert_eq!(runner.remaining(), 0, "two providers should consume exactly 2 responses");
 }
 
 #[tokio::test]
-async fn write_branch_issue_links_git_error_tolerated() {
+async fn write_branch_issue_links_surfaces_git_error() {
     let runner = MockRunner::new(vec![Err("git config failed".to_string())]);
     let issue_ids = vec![("github".to_string(), "10".to_string())];
 
-    write_branch_issue_links(repo_root().as_path(), "feat-x", &issue_ids, &runner).await;
+    let error = write_branch_issue_links(repo_root().as_path(), "feat-x", &issue_ids, &runner).await.expect_err("git error is returned");
 
-    assert_eq!(runner.remaining(), 0, "should still consume the response even on error");
+    assert!(error.contains("git config failed"), "{error}");
 }
 
 #[tokio::test]
 async fn write_branch_issue_links_empty_is_noop() {
     let runner = MockRunner::new(vec![]);
 
-    write_branch_issue_links(repo_root().as_path(), "feat-x", &[], &runner).await;
+    write_branch_issue_links(repo_root().as_path(), "feat-x", &[], &runner).await.expect("no links to write");
 
     assert_eq!(runner.remaining(), 0, "empty issue_ids should make zero calls");
 }

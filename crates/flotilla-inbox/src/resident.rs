@@ -164,6 +164,7 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Rec
             DropReason::Withdrawn { by, authority } | DropReason::ConsumerUnreachable { by, authority } => {
                 bytes += heap_address(by) + heap_address(authority)
             }
+            DropReason::Failed { detail } => bytes += detail.capacity(),
             DropReason::Undeliverable | DropReason::Expired => {}
         }
     }

@@ -405,7 +405,7 @@ pub fn old_phase(resource: &Resource<Message>) -> MessagePhase {
         MessageState::Dropped { reason, .. } => match reason {
             DropReason::Expired | DropReason::Withdrawn { .. } => MessagePhase::Expired,
             DropReason::Superseded { .. } => MessagePhase::Superseded,
-            DropReason::Undeliverable | DropReason::ConsumerUnreachable { .. } => MessagePhase::DeadLettered,
+            DropReason::Undeliverable | DropReason::ConsumerUnreachable { .. } | DropReason::Failed { .. } => MessagePhase::DeadLettered,
         },
     }
 }

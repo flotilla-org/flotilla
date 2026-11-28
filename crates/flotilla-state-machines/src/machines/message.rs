@@ -282,6 +282,18 @@ pub enum DropReason {
     /// A deliberate drop of a message whose consumer stays silent.
     #[store(code = "cu")]
     ConsumerUnreachable { by: Address, authority: Address },
+    /// The service the request asked could not do it; `detail` is the service's own reason
+    /// (#4478). Its gate is Undeliverable's published delivery failure.
+    #[store(code = "fa")]
+    Failed { detail: String },
+}
+
+impl DropReason {
+    /// Whether the drop dead-letters the message to its sender's supervisor: a message that was
+    /// never taken, or a request its service failed.
+    pub fn dead_letters(&self) -> bool {
+        matches!(self, DropReason::Undeliverable | DropReason::Failed { .. })
+    }
 }
 
 states! {
@@ -795,6 +807,7 @@ fn gate_drop(h: &mut Handle<'_, Message>, drop: &DropMessage) -> Result<(), Mess
             false => Err(refusal),
         }),
         DropReason::ConsumerUnreachable { authority, .. } => authorised(h, authority),
+        DropReason::Failed { .. } => failed(h),
     }
 }
 
@@ -859,6 +872,23 @@ fn undeliverable(h: &mut Handle<'_, Message>) -> Result<(), MessageRefusal> {
     };
     if unbound_past_threshold {
         return Ok(());
+    }
+    let own = h.name().to_string();
+    if h.read(&Ref::<DeliveryFailure>::new(own)).is_some() {
+        Ok(())
+    } else {
+        Err(MessageRefusal::MissingEvidence)
+    }
+}
+
+// Spec Failed: only from Pending; any observed receipt refuses; then the service's
+// published delivery failure.
+fn failed(h: &mut Handle<'_, Message>) -> Result<(), MessageRefusal> {
+    if *h.state() != MessageState::Pending {
+        return Err(MessageRefusal::WrongState);
+    }
+    if receipts(h).is_some_and(|by_consumer| !by_consumer.is_empty()) {
+        return Err(MessageRefusal::ReceiptConfirmed);
     }
     let own = h.name().to_string();
     if h.read(&Ref::<DeliveryFailure>::new(own)).is_some() {

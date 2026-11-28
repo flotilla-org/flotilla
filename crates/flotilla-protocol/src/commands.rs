@@ -1768,7 +1768,15 @@ pub struct CheckoutStatus {
     pub has_uncommitted: bool,
     #[serde(default)]
     pub uncommitted_files: Vec<String>,
-    pub base_detection_warning: Option<String>,
+    /// Why `unpushed_commits` could not be read; when set, the list is unknown rather than empty.
+    #[serde(default)]
+    pub unpushed_commits_error: Option<String>,
+    /// Why the working tree could not be read; when set, `uncommitted_files` is unknown rather than empty.
+    #[serde(default)]
+    pub uncommitted_files_error: Option<String>,
+    /// Why the change request could not be read; when set, its status is unknown rather than absent.
+    #[serde(default)]
+    pub change_request_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -2090,7 +2098,9 @@ mod tests {
                 unpushed_commits: vec!["def456".into()],
                 has_uncommitted: true,
                 uncommitted_files: vec!["M  src/main.rs".into(), "?? TODO.txt".into()],
-                base_detection_warning: Some("warning text".into()),
+                unpushed_commits_error: Some("warning text".into()),
+                uncommitted_files_error: Some("status failed".into()),
+                change_request_error: Some("gh failed".into()),
             })),
             CommandValue::Error { message: "something failed".into() },
             CommandValue::Cancelled,
@@ -2358,7 +2368,9 @@ mod tests {
         assert!(info.unpushed_commits.is_empty());
         assert!(!info.has_uncommitted);
         assert!(info.uncommitted_files.is_empty());
-        assert!(info.base_detection_warning.is_none());
+        assert!(info.unpushed_commits_error.is_none());
+        assert!(info.uncommitted_files_error.is_none());
+        assert!(info.change_request_error.is_none());
     }
 
     #[test]
@@ -2370,7 +2382,9 @@ mod tests {
             unpushed_commits: vec!["aaa".into(), "bbb".into()],
             has_uncommitted: true,
             uncommitted_files: vec!["M  src/lib.rs".into()],
-            base_detection_warning: Some("ambiguous base".into()),
+            unpushed_commits_error: Some("ambiguous base".into()),
+            uncommitted_files_error: Some("not a work tree".into()),
+            change_request_error: Some("HTTP 502".into()),
         };
         assert_json_roundtrip(&info);
     }

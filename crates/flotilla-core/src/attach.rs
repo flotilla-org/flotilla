@@ -186,18 +186,21 @@ impl<'a> AttachResolver<'a> {
             .ok_or("environment has no live handle")?;
         let cwd = ExecutionEnvironmentPath::new(handle.capabilities().workspace_root);
         let agent = handle.agent();
-        if agent.ready().await.is_ok() {
-            let registry = self.registry_for_resource_environment(&AttachReadContext::default(), &environment, cwd.as_path()).await?;
-            let pool = registry.terminal_pools.get("cleat").map(|(_, pool)| pool.clone()).ok_or("environment has no cleat pool")?;
-            let session = format!("flotilla-shell-{}", uuid::Uuid::new_v4());
-            pool.ensure_session(&session, "exec \"${SHELL:-/bin/sh}\" -l", &cwd, &Vec::new(), &[]).await?;
-            let endpoint = pool.cleat_endpoint(&session).await?.ok_or("shell has no cleat endpoint")?;
-            let guest = endpoint.socket();
-            let socket = agent.forward_socket(&guest).await?;
-            return Ok(ResolvedAttach { plan: cleat_socket_attach_plan(&socket, &endpoint.session, mode), binding: Some(binding) });
+        // The agent's own failure is the reason the fallback shell, or the refusal, gives.
+        if let Err(reason) = agent.ready().await {
+            let plan = handle
+                .fallback_shell_plan(cwd.as_path(), &reason)
+                .ok_or_else(|| format!("vessel agent unavailable: {reason}; the environment has no fallback shell"))?;
+            return Ok(ResolvedAttach { plan, binding: Some(binding) });
         }
-        let plan = handle.fallback_shell_plan(cwd.as_path()).ok_or("agent unavailable and environment has no fallback shell")?;
-        Ok(ResolvedAttach { plan, binding: Some(binding) })
+        let registry = self.registry_for_resource_environment(&AttachReadContext::default(), &environment, cwd.as_path()).await?;
+        let pool = registry.terminal_pools.get("cleat").map(|(_, pool)| pool.clone()).ok_or("environment has no cleat pool")?;
+        let session = format!("flotilla-shell-{}", uuid::Uuid::new_v4());
+        pool.ensure_session(&session, "exec \"${SHELL:-/bin/sh}\" -l", &cwd, &Vec::new(), &[]).await?;
+        let endpoint = pool.cleat_endpoint(&session).await?.ok_or("shell has no cleat endpoint")?;
+        let guest = endpoint.socket();
+        let socket = agent.forward_socket(&guest).await?;
+        Ok(ResolvedAttach { plan: cleat_socket_attach_plan(&socket, &endpoint.session, mode), binding: Some(binding) })
     }
 
     pub(super) async fn resolve_transient(&self, reference: &str, host: Option<&HostName>) -> Result<ResolvedAttach, String> {
@@ -355,31 +358,25 @@ impl<'a> AttachResolver<'a> {
                 &right.object.metadata.name,
             ))
         });
-        let mut connectable = Vec::new();
+        // Chosen from the records: the crew's TerminalSession, not the Convoy, names the host attach
+        // routes to. Whether that host or its session answers is the attach's own to report.
+        let mut homed = Vec::new();
         for source in candidates {
             let sessions = sessions_by_convoy.get_mut(&source.object.metadata.name).expect("candidate convoy has a session");
             // A crew normally runs on one host; sorting by name keeps the choice stable if it ever does not.
             sessions.sort_by(|(left, _), (right, _)| left.metadata.name.cmp(&right.metadata.name));
-            // The crew's TerminalSession, not the Convoy, decides where attach routes.
-            let mut reachable = None;
-            for (session, provenance) in sessions {
-                reachable = match provenance {
-                    ResourceProvenance::Local => self
-                        .attach_plan_for_session(&observations.reads, &session.metadata.name, session, AttachMode::Default)
-                        .await
-                        .is_ok()
-                        .then(|| self.host_name.clone()),
-                    ResourceProvenance::Replica { origin_root, .. } => self.host_registry.live_routed_host_name(origin_root).await,
-                };
-                if reachable.is_some() {
+            let mut home = None;
+            for (_, provenance) in sessions.iter() {
+                home = self.provenance_home(provenance).await;
+                if home.is_some() {
                     break;
                 }
             }
-            if let Some(session_host) = reachable {
-                connectable.push((source, session_host));
+            if let Some(session_host) = home {
+                homed.push((source, session_host));
             }
         }
-        let candidates = connectable;
+        let candidates = homed;
         let unique_projects = candidates.iter().map(|(source, _)| &source.object.spec.project_ref).collect::<BTreeSet<_>>();
         match candidates.as_slice() {
             [] if explicit && !matching_convoy_exists => Err(format!("no live convoy matches `{reference}`")),
@@ -562,7 +559,9 @@ impl<'a> AttachResolver<'a> {
             let ResourceProvenance::Replica { origin_root, .. } = replicated.provenance else {
                 unreachable!("local durable sessions were partitioned above");
             };
-            let Some(host) = self.host_registry.live_routed_host_name(&origin_root).await else {
+            // The session's home from its host record; whether a route to it is live is the
+            // attach's to find out.
+            let Some(host) = self.host_registry.host_name_for_node(&origin_root).await else {
                 continue;
             };
             let convoy_address = session_convoy_address(&session, Some(&origin_root), &convoy_addresses);
@@ -2402,7 +2401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_role_prefers_newest_connectable_generation() {
+    async fn bare_role_prefers_newest_generation() {
         let (daemon, backend, _temp) = attach_fixture().await;
         let convoy_old = create_identity_convoy(&daemon, "convoy-old", "coder", "flotilla").await;
         let successor = ConvoySpec::builder()
@@ -2440,6 +2439,8 @@ mod tests {
         assert_eq!(newest.binding.and_then(|binding| binding.session), Some("terminal-peer".to_string()));
 
         // The peer's launch ends; the newest generation's next launch runs in a pool nothing serves.
+        // The newest generation is still the one its records name, and its attach says why it fails
+        // rather than an older generation standing in for it (#4478).
         engine.terminals.release(&peer);
         let mut unreachable = engine.terminals.record(&newer);
         engine.terminals.lost(&newer, "relaunched elsewhere");
@@ -2455,8 +2456,8 @@ mod tests {
             source: unreachable.source,
         });
         engine.terminals.ready(&relaunched, "session-terminal-new", &Default::default());
-        let fallback = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect("older reachable generation");
-        assert_eq!(fallback.binding.and_then(|binding| binding.session), Some("terminal-old".to_string()));
+        let error = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect_err("its attach fails");
+        assert!(error.contains("terminal pool missing-pool unavailable"), "{error}");
     }
 
     // #3042: role/name/prefix attach resolution shares its per-request join,

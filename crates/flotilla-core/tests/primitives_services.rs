@@ -18,7 +18,7 @@ use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
     machines::{
         consumer::ConsumerKind,
-        message::{Deliver, MessageBody, MessageSpec, Relation, RequestBody},
+        message::{Deliver, DropReason, MessageBody, MessageSpec, Relation, RequestBody},
         service::ServiceState,
     },
     Transport,
@@ -113,6 +113,28 @@ async fn a_request_to_an_unbound_inspector_fails() {
     assert_eq!(report.undeliverable, 1);
     assert!(matches!(primitives.request_answer(&message).await.expect("answer"), RequestAnswer::Dropped { .. }));
     assert!(matches!(primitives.request_answer("absent").await.expect("answer"), RequestAnswer::Dropped { .. }));
+}
+
+// Behaviour (#4478): a bound service that cannot do what a request asked drops it as Failed with
+// its own reason, and the request's gate reads the drop with that reason rather than a bare one.
+#[tokio::test]
+async fn a_failed_request_carries_the_services_reason() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let primitives = primitives(&dir).await;
+    let inspector = primitives.register_service(CHECKOUT_INSPECTOR, now()).await.expect("registered");
+    let request = inspection(&primitives, HOME).await;
+    let inbox = primitives.inbox();
+    inbox.bind(request.inbox.clone(), inspector).await.expect("bind");
+    let message = inbox.enqueue(request).await.expect("enqueued");
+
+    primitives.fail_request(&message, "git ls-remote: could not read from remote").await.expect("failed");
+
+    let dropped = inbox.get_async(&message).await.expect("read").expect("kept");
+    assert_eq!(dropped.state().drop_reason(), Some(&DropReason::Failed { detail: "git ls-remote: could not read from remote".into() }));
+    assert_eq!(
+        primitives.request_answer(&message).await.expect("answer"),
+        RequestAnswer::Dropped { reason: "git ls-remote: could not read from remote".into() }
+    );
 }
 
 // Behaviour (#3108): a sweep names when it next has work no change wakes: just past an open
