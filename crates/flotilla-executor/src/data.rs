@@ -22,7 +22,7 @@ pub async fn fetch_checkout_status(
     let repo_for_base = repo.clone();
     let branch_for_base = branch_owned.clone();
 
-    let (unpushed_result, uncommitted, pr_info) = tokio::join!(
+    let (unpushed, uncommitted, change_request) = tokio::join!(
         async {
             let base = async {
                 let upstream =
@@ -40,49 +40,56 @@ pub async fn fetch_checkout_status(
                         return Ok(remote_head.to_string());
                     }
                 }
-                Err("Could not determine base branch — unpushed commit status unknown".to_string())
+                Err(format!(
+                    "could not determine base branch (upstream: {}; origin/HEAD: {})",
+                    upstream.err().unwrap_or_else(|| "empty".to_string()),
+                    remote_head.err().unwrap_or_else(|| "empty".to_string()),
+                ))
             }
-            .await;
-
-            match base {
-                Ok(base_ref) => Ok(vcs
-                    .read_repository(&repo_for_base, RepositoryRead::CommitLog(&format!("{base_ref}..{branch_for_base}")))
-                    .await
-                    .unwrap_or_default()),
-                Err(warning) => Err(warning),
+            .await?;
+            vcs.read_repository(&repo_for_base, RepositoryRead::CommitLog(&format!("{base}..{branch_for_base}")))
+                .await
+                .map_err(|err| format!("commit log {base}..{branch_for_base} failed: {err}"))
+        },
+        async {
+            match &checkout_path {
+                Some(path) => vcs.read_repository(path, RepositoryRead::WorkingTreeChanges).await.map(Some),
+                None => Ok(None),
             }
         },
         async {
-            if let Some(path) = &checkout_path {
-                vcs.read_repository(path, RepositoryRead::WorkingTreeChanges).await.unwrap_or_default()
-            } else {
-                String::new()
-            }
-        },
-        async {
-            if let Some(ref number) = cr_id {
-                run!(runner, "gh", &["pr", "view", number, "--json", "state,mergeCommit"], &repo2).ok()
-            } else {
-                None
-            }
+            let Some(ref number) = cr_id else { return Ok(None) };
+            let json = run!(runner, "gh", &["pr", "view", number, "--json", "state,mergeCommit"], &repo2)?;
+            serde_json::from_str::<serde_json::Value>(&json)
+                .map(Some)
+                .map_err(|err| format!("gh pr view {number} returned invalid JSON: {err}"))
         },
     );
 
     let mut info = CheckoutStatus { branch: branch.to_string(), ..Default::default() };
-    match unpushed_result {
+    match unpushed {
         Ok(output) => info.unpushed_commits = output.lines().filter(|line| !line.is_empty()).map(str::to_string).collect(),
-        Err(warning) => info.base_detection_warning = Some(warning),
+        Err(error) => info.unpushed_commits_error = Some(error),
     }
-    info.uncommitted_files = uncommitted.lines().filter(|line| !line.trim().is_empty()).map(str::to_string).collect();
-    info.has_uncommitted = !info.uncommitted_files.is_empty();
-
-    if let Some(json) = pr_info.and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok()) {
-        info.change_request_status = json.get("state").and_then(serde_json::Value::as_str).map(str::to_string);
-        info.merge_commit_sha = json
-            .get("mergeCommit")
-            .and_then(|value| value.get("oid"))
-            .and_then(serde_json::Value::as_str)
-            .map(|sha| sha[..7.min(sha.len())].to_string());
+    match uncommitted {
+        Ok(Some(output)) => {
+            info.uncommitted_files = output.lines().filter(|line| !line.trim().is_empty()).map(str::to_string).collect();
+            info.has_uncommitted = !info.uncommitted_files.is_empty();
+        }
+        Ok(None) => {}
+        Err(error) => info.uncommitted_files_error = Some(error),
+    }
+    match change_request {
+        Ok(Some(json)) => {
+            info.change_request_status = json.get("state").and_then(serde_json::Value::as_str).map(str::to_string);
+            info.merge_commit_sha = json
+                .get("mergeCommit")
+                .and_then(|value| value.get("oid"))
+                .and_then(serde_json::Value::as_str)
+                .map(|sha| sha[..7.min(sha.len())].to_string());
+        }
+        Ok(None) => {}
+        Err(error) => info.change_request_error = Some(error),
     }
     info
 }

@@ -430,15 +430,6 @@ fn assert_checkout_created_branch(result: CommandValue, expected_branch: &str) {
     }
 }
 
-fn assert_checkout_status_branch(result: CommandValue, expected_branch: &str) {
-    match result {
-        CommandValue::CheckoutStatus(info) => {
-            assert_eq!(info.branch, expected_branch);
-        }
-        other => panic!("expected CheckoutStatus, got {:?}", other),
-    }
-}
-
 fn assert_checkout_removed_branch(result: CommandValue, expected_branch: &str) {
     match result {
         CommandValue::CheckoutRemoved { branch } => {
@@ -648,7 +639,7 @@ async fn remove_checkout_preserves_terminal_sessions() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn fetch_checkout_status_returns_checkout_status() {
+async fn fetch_checkout_status_carries_each_failed_read() {
     let registry = empty_registry();
     // fetch_checkout_status runs multiple git/gh commands concurrently via
     // tokio::join!. Provide enough error responses for all subprocess calls:
@@ -670,7 +661,16 @@ async fn fetch_checkout_status_returns_checkout_status() {
     )
     .await;
 
-    assert_checkout_status_branch(result, "feat");
+    match result {
+        CommandValue::CheckoutStatus(info) => {
+            assert_eq!(info.branch, "feat");
+            assert!(info.unpushed_commits_error.as_deref().is_some_and(|error| error.contains("could not determine base branch")));
+            assert_eq!(info.uncommitted_files_error.as_deref(), Some("err"));
+            assert_eq!(info.change_request_error.as_deref(), Some("err"));
+            assert!(!info.has_uncommitted);
+        }
+        other => panic!("expected CheckoutStatus, got {other:?}"),
+    }
 }
 
 #[tokio::test]
