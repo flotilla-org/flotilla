@@ -518,6 +518,22 @@ async fn a_host_direct_environment_is_realised_under_its_root() {
     assert_eq!(world.environments.live().expect("live").len(), 1);
 }
 
+// Behaviour: an environment whose vessel lease this store does not read (its replica missing or
+// behind) keeps its container: a lease that does not read has not ended. A lease's end releases it
+// (`a_vessel_s_end_releases_its_environment_after_its_checkouts`).
+#[tokio::test]
+async fn an_environment_whose_lease_is_not_read_keeps_its_container() {
+    let world = World::start(None);
+    world.environments.request("env-v1", &docker("crew@sha256:pinned", None), Some("unread#1")).expect("request");
+    world.until("env-v1 ready", |world| world.ready("env-v1")).await;
+    // Another environment realised after: the controller has passed env-v1 since.
+    let v2 = world.vessel("v2");
+    world.environments.request("env-v2", &docker("crew@sha256:pinned", None), Some(&v2)).expect("request");
+    world.until("env-v2 ready", |world| world.ready("env-v2")).await;
+    assert!(world.ready("env-v1"), "kept while its lease is not read");
+    assert!(world.provider.asked().destroyed.is_empty());
+}
+
 // Behaviour: a vessel's end releases its environment, but only once no live checkout is made in it:
 // the checkout's teardown runs there. The container is destroyed under its identity.
 #[tokio::test]

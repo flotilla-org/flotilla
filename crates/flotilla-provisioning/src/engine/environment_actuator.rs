@@ -87,6 +87,23 @@ where
     Ok(read.load::<Resource<Lifecycle<K>>>(id)?.map(|loaded| loaded.value.state().clone()))
 }
 
+/// Whether the `K` resource `name` at `home` has ended, as this store reads it: an end state it
+/// reached, or the tombstone its home's archive left. One this store does not read (never seen
+/// here, or its replica missing or behind) is not known to have ended, and has not.
+pub(crate) fn has_ended<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<bool, StoreError>
+where
+    K: flotilla_state_machines::machines::lifecycle::LifecycleKind,
+    Resource<Lifecycle<K>>: Kind,
+{
+    match state_of::<K>(read, name, home)? {
+        Some(state) => Ok(!state.live()),
+        None => flotilla_engine_store::archive::archived(
+            read,
+            &Identity { kind: Resource::<Lifecycle<K>>::CODE, name: name.to_owned(), home: home.to_owned() },
+        ),
+    }
+}
+
 impl<R> EnvironmentActuator<R> {
     pub fn new(
         runtime: Arc<R>,
@@ -289,10 +306,11 @@ where
     }
 
     fn holder(&self, read: &mut Read<'_>, _: &str, request: &EnvironmentRequest) -> Result<Holding, StoreError> {
-        // The vessel's lease is homed here, on its pinned host; its environment is requested only
-        // once the lease exists, so an absent lease has ended.
+        // The vessel's lease is homed here, on its pinned host. A lease this store does not read
+        // has not ended: its commit wakes the environment once it does.
         let Some(vessel) = vessel_of(&request.holder) else { return Ok(Holding::open()) };
-        Ok(Holding::ended(state_of::<VesselKind>(read, vessel, &self.home)?.is_none_or(|state| !state.live())))
+        let lease = Identity { kind: VESSEL, name: vessel.to_owned(), home: self.home.clone() };
+        Ok(Holding::followed(has_ended::<VesselKind>(read, vessel, &self.home)?, lease))
     }
 
     fn usability(&self, read: &mut Read<'_>, request: &EnvironmentRequest) -> Result<Vec<Usability>, StoreError> {

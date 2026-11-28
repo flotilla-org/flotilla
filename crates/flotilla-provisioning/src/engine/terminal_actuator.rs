@@ -50,7 +50,7 @@ use tracing::{debug, warn};
 
 use super::{
     controller::{Actuator, Backing, BackingEvent, Holding, ProviderFailure, Usability},
-    environment_actuator::state_of,
+    environment_actuator::{has_ended, state_of},
     environments::RecipeOf,
     launch_log::StagedFacts,
     reads::StoreReads,
@@ -296,7 +296,19 @@ impl<P: ?Sized> TerminalActuator<P> {
                 Ok(read.load::<Resource<Lifecycle<EnvironmentKind>>>(id)?.map(|loaded| loaded.value))
             })
             .map_err(|error| transient(format!("read environment {}: {error}", environment.name)))?;
-        let Some(loaded) = loaded else { return Ok(EnvironmentTeardown { ended: true, ends_processes: true }) };
+        let Some(loaded) = loaded else {
+            // An environment archived at its home took its processes with it; one this store does
+            // not read is not known to have ended, and is read again.
+            let identity = environment.identity();
+            let archived = self
+                .reads
+                .read(|read| Ok(flotilla_engine_store::archive::archived(read, &identity)?))
+                .map_err(|error| transient(format!("read environment {}: {error}", environment.name)))?;
+            return match archived {
+                true => Ok(EnvironmentTeardown { ended: true, ends_processes: true }),
+                false => Err(transient(format!("environment {} at {} is not read here", environment.name, environment.home))),
+            };
+        };
         let recipe =
             RecipeOf::of(loaded.spec().recipe.value()).map_err(|error| transient(format!("environment {}: {error}", environment.name)))?;
         Ok(EnvironmentTeardown { ended: !loaded.state().live(), ends_processes: recipe.teardown_ends_processes() })
@@ -305,11 +317,9 @@ impl<P: ?Sized> TerminalActuator<P> {
     /// Whether the vessel `request` is held for, if any, has ended.
     fn vessel_ended(&self, request: &TerminalSessionRequest) -> Result<bool, Cause> {
         let Some(vessel) = request.holder.as_ref().and_then(holder_vessel) else { return Ok(false) };
-        let state = self
-            .reads
-            .read(|read| Ok(state_of::<VesselKind>(read, vessel, &self.home)?))
-            .map_err(|error| transient(format!("read vessel {vessel}: {error}")))?;
-        Ok(state.is_none_or(|state| !state.live()))
+        self.reads
+            .read(|read| Ok(has_ended::<VesselKind>(read, vessel, &self.home)?))
+            .map_err(|error| transient(format!("read vessel {vessel}: {error}")))
     }
 }
 
@@ -426,15 +436,16 @@ where
 
     fn holder(&self, read: &mut Read<'_>, _: &str, request: &TerminalSessionRequest) -> Result<Holding, StoreError> {
         let environment = &request.environment;
-        if state_of::<EnvironmentKind>(read, &environment.name, &environment.home)?.is_none_or(|state| !state.live()) {
+        // An environment or lease this store does not read has not ended: its commit wakes the
+        // session once it does.
+        if has_ended::<EnvironmentKind>(read, &environment.name, &environment.home)? {
             return Ok(Holding::followed(true, environment.identity()));
         }
-        // A crew's vessel lease is homed here, and its sessions are requested only once the lease
-        // exists (every vessel reconciled here is leased, placed or not): an absent lease has ended.
+        // A crew's vessel lease is homed here.
         let Some(vessel) = request.holder.as_ref().and_then(holder_vessel) else {
             return Ok(Holding::followed(false, environment.identity()));
         };
-        let ended = state_of::<VesselKind>(read, vessel, &self.home)?.is_none_or(|state| !state.live());
+        let ended = has_ended::<VesselKind>(read, vessel, &self.home)?;
         Ok(Holding::followed(ended, Identity { kind: VESSEL, name: vessel.to_owned(), home: self.home.clone() }))
     }
 

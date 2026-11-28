@@ -460,6 +460,20 @@ async fn the_probe_reads_only_the_launches_that_have_not_ended() {
     assert!(world.terminals.terminals.observations().get(&running).is_some(), "the running launch is still looked at");
 }
 
+// Behaviour: a crew's session whose vessel lease this store does not read (its replica missing or
+// behind) keeps running: a lease that does not read has not ended. A lease's end releases it
+// (`an_ended_lease_releases_its_session`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_whose_lease_is_not_read_keeps_running() {
+    let world = World::start(RecordingProvider::default(), true);
+    let launch = world.terminals.request(&TerminalsFixture::agent("unread#1", "lead", ENVIRONMENT));
+    world.until("ready", |world| world.ready(&launch)).await;
+    // Another session realised after: the controller has passed this one since.
+    world.running_agent("v2").await;
+    assert!(world.ready(&launch), "running while its lease is not read");
+    assert!(world.provider.asked().killed.is_empty());
+}
+
 // Behaviour: once its vessel's lease ends, a crew's session is released: a turn already typed
 // settles, then the process is killed and its exit receipt and harness files removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
