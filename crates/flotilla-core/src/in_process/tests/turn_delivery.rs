@@ -252,7 +252,15 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         // The coder's work is kept and the convoy delivered: it lands.
         super::complete_work(&daemon, &probe.convoy, "work").await;
         let landing = convoys.get(&probe.convoy).await.expect("convoy");
-        super::convoy_engine(&daemon).deliver(&landing, "claim").await.expect("land");
+        let engine = super::convoy_engine(&daemon);
+        engine
+            .deliver(
+                &landing,
+                "claim",
+                &flotilla_resources::convoy::engine::SettlementEvidence::after(engine.position().expect("position")),
+            )
+            .await
+            .expect("land");
         assert_eq!(
             convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").phase,
             flotilla_resources::ConvoyPhase::Landed

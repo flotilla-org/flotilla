@@ -501,6 +501,57 @@ impl Store {
     }
 }
 
+/// The reads of homes' logs a follower makes: served by a read, and by a write inside its own
+/// transaction, which sees what it has written.
+pub trait LogReads {
+    /// The home this store writes as.
+    fn home(&self) -> &str;
+    /// The highest sequence of `home` this store has taken or applied; 0 when none.
+    fn last_sequence(&mut self, home: &str) -> Result<u64, StoreError>;
+    /// Minimum servable cursor of `home`, or zero for an unseen home.
+    fn resume_floor(&mut self, home: &str) -> Result<u64, StoreError>;
+    /// Up to `limit` of `home`'s entries after sequence `after`.
+    fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<Event>, StoreError>;
+    /// The sequences of `home`'s changes this store holds strictly between `after` and `before`.
+    fn change_seqs(&mut self, home: &str, after: u64, before: u64) -> Result<Vec<u64>, StoreError>;
+}
+
+impl LogReads for Read<'_> {
+    fn home(&self) -> &str {
+        Read::home(self)
+    }
+    fn last_sequence(&mut self, home: &str) -> Result<u64, StoreError> {
+        Read::last_sequence(self, home)
+    }
+    fn resume_floor(&mut self, home: &str) -> Result<u64, StoreError> {
+        Read::resume_floor(self, home)
+    }
+    fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
+        Read::changes_since(self, home, after, limit)
+    }
+    fn change_seqs(&mut self, home: &str, after: u64, before: u64) -> Result<Vec<u64>, StoreError> {
+        Read::change_seqs(self, home, after, before)
+    }
+}
+
+impl LogReads for Write<'_> {
+    fn home(&self) -> &str {
+        &self.runtime.home
+    }
+    fn last_sequence(&mut self, home: &str) -> Result<u64, StoreError> {
+        self.ctx().last_sequence(home)
+    }
+    fn resume_floor(&mut self, home: &str) -> Result<u64, StoreError> {
+        self.ctx().resume_floor(home)
+    }
+    fn changes_since(&mut self, home: &str, after: u64, limit: u32) -> Result<Vec<Event>, StoreError> {
+        self.ctx().changes_since(home, after, limit)
+    }
+    fn change_seqs(&mut self, home: &str, after: u64, before: u64) -> Result<Vec<u64>, StoreError> {
+        self.ctx().change_seqs(home, after, before)
+    }
+}
+
 pub struct Read<'s> {
     tx: Transaction<'s>,
     runtime: &'s mut Runtime,

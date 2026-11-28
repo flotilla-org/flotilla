@@ -167,7 +167,8 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     let engine_convoys = convoy_engine(&daemon);
     let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None };
     engine_convoys.keep_by_verdict(&convoy, &scope, "operator", "reviewed").await.expect("promises kept");
-    engine_convoys.deliver(&convoy, "claim").await.expect("landed convoy");
+    let evidence = flotilla_resources::convoy::engine::SettlementEvidence::after(engine_convoys.position().expect("position"));
+    engine_convoys.deliver(&convoy, "claim", &evidence).await.expect("landed convoy");
     let terminal_status = convoys.get(&two_crew).await.expect("convoy").status.expect("status");
     assert_eq!(terminal_status.phase, flotilla_resources::ConvoyPhase::Landed);
     let error = daemon.crew_handoff_internal(&requested, "reviewer", "Late handoff").await.expect_err("terminal handoff");

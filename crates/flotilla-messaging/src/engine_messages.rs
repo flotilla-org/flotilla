@@ -22,6 +22,15 @@ pub enum InboxChange {
     Rescanned,
 }
 
+/// A crew's inbox, and until when the messages in it hold the crew's convoy's delivery.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeliveryHold {
+    /// The inbox the crew's messages are admitted to; none until the fleet is designated.
+    pub inbox: Option<flotilla_address::Address>,
+    /// Until when its undelivered messages hold delivery; none when none does now.
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// What a stalled seat's supervision send is about (#3108): the stalled crew role or canonical
 /// convoy address, and the stall's evidence, which its stall record carries to every home. The
 /// evidence is none for an inferred stall, where no crew declared anything.
@@ -175,9 +184,9 @@ pub trait EngineMessages: Send + Sync {
     /// review); a seat that shares a `stalled` seat's record subject keeps its
     /// records. Returns the records withdrawn.
     async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: &[String], reason: &str) -> Result<Vec<String>, String>;
-    /// Until when messages to `receiver` (a crew role address), admitted at this home and not
-    /// yet delivered, hold its delivery; None when none does (#3894).
-    async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String>;
+    /// `receiver`'s (a crew role address) inbox, and until when messages to it, admitted at this
+    /// home and not yet delivered, hold its delivery (#3894).
+    async fn delivery_hold(&self, namespace: &str, receiver: &str) -> Result<DeliveryHold, String>;
     /// A tick for each change to the messages after this call, local or replicated, heard from
     /// the store's commits: nothing is listed to hear it.
     fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, flotilla_resources::ResourceError>;

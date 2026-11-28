@@ -169,7 +169,7 @@ async fn land_convoy(daemon: &InProcessDaemon, name: &str) {
     let engine = convoy_engine(daemon);
     let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None };
     engine.keep_by_verdict(&convoy, &scope, "operator", "landed").await.expect("keep the work");
-    engine.deliver(&convoy, "claim").await.expect("deliver");
+    engine.deliver(&convoy, "claim", &landed(&*engine)).await.expect("deliver");
 }
 
 /// Holds launch `name` of project `flotilla` as an unread message to its `role` seat does: ended,
@@ -421,6 +421,11 @@ impl StandingConvoyBackingInspector for RecordlessBacking {
 /// The engine's Convoy path at `daemon`'s home.
 fn convoy_engine(daemon: &InProcessDaemon) -> Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> {
     daemon.convoy_engine_path()
+}
+
+/// Settlement's evidence for a convoy an operator lands: none of it read, from the log as it is.
+fn landed(engine: &dyn flotilla_resources::convoy::engine::EngineConvoys) -> flotilla_resources::convoy::engine::SettlementEvidence {
+    flotilla_resources::convoy::engine::SettlementEvidence::after(engine.position().expect("position"))
 }
 
 /// Admits convoy `name` at `daemon`'s home as admission would, its one agent seat owing the

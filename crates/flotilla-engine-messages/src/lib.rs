@@ -1600,24 +1600,25 @@ impl MessagePrimitives {
         }
     }
 
-    /// Until when messages to `receiver`, an old crew address, hold its delivery: those admitted
-    /// at this home and still Pending in the receiver's inbox each hold for one delivery hold
-    /// from admission, and the latest of those ends is returned; None when none holds now. A
+    /// `receiver`'s inbox, and until when messages to it, an old crew address, hold its delivery:
+    /// those admitted at this home and still Pending in the inbox each hold for one delivery hold
+    /// from admission, and the latest of those ends is the hold's; none when none holds now. A
     /// turn still undelivered after its hold no longer holds its recipient; the stall judge
     /// reports a quiet crew.
-    pub async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    pub async fn delivery_hold(&self, namespace: &str, receiver: &str) -> Result<flotilla_messaging::DeliveryHold, String> {
         // Nothing is admitted until the fleet is designated.
-        let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(None) };
+        let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(Default::default()) };
         let inbox = roles.inbox(receiver)?;
         let hold = flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.num_microseconds().expect("a bounded hold");
         let now = self.world.now();
-        Ok(self
+        let until = self
             .pending_in(&inbox)?
             .iter()
             .map(|(_, message)| message.since().0.saturating_add(hold))
             .filter(|end| *end > now.0)
             .max()
-            .and_then(|end| flotilla_schema::Timestamp(end).to_datetime()))
+            .and_then(|end| flotilla_schema::Timestamp(end).to_datetime());
+        Ok(flotilla_messaging::DeliveryHold { inbox: Some(inbox), until })
     }
 
     /// The generic resource verbs' listing (`flotilla get message`, through [`records`]): every
@@ -2194,8 +2195,8 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: &[String], reason: &str) -> Result<Vec<String>, String> {
         MessagePrimitives::end_stalls(self, namespace, seats, stalled, reason).await
     }
-    async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
-        MessagePrimitives::delivery_held_until(self, namespace, receiver).await
+    async fn delivery_hold(&self, namespace: &str, receiver: &str) -> Result<flotilla_messaging::DeliveryHold, String> {
+        MessagePrimitives::delivery_hold(self, namespace, receiver).await
     }
     async fn delivery_wait(&self, namespace: &str) -> Result<Option<String>, String> {
         MessagePrimitives::delivery_wait(self, namespace).await

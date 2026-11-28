@@ -14,7 +14,7 @@ use flotilla_provisioning_testkit::hosts::HeldHosts;
 use flotilla_resources::{
     address::{artifact_address, record_name, stored_change_request_address},
     artifact::blob_digest_of,
-    convoy::engine::{Actor, EngineConvoyPath, EngineConvoys, OldPromises, VerdictScope},
+    convoy::engine::{Actor, Delivery, EngineConvoyPath, EngineConvoys, OldPromises, SettlementEvidence, VerdictScope},
     host_records::{HostFacts, HostRecords},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
     Artifact, ArtifactSpec, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Convoy, ConvoyPhase,
@@ -45,6 +45,12 @@ struct Recording {
     delivered: Option<String>,
     /// How many times the convoy was delivered.
     deliveries: Mutex<usize>,
+    /// The log position the engine reports.
+    position: BTreeMap<String, u64>,
+    /// The evidence each delivery was asked on.
+    evidence: Mutex<Vec<SettlementEvidence>>,
+    /// Whether the engine finds the evidence moved, and writes nothing.
+    moved: bool,
     /// The reasons the convoy was ended as failed with.
     failures: Mutex<Vec<String>>,
     memory: flotilla_resources::convoy_records::ConvoyMemory,
@@ -81,9 +87,13 @@ impl EngineConvoys for Recording {
     async fn verdict(&self, _: &ResourceObject<Convoy>, _: &str, _: bool, _: &str, _: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn deliver(&self, _: &ResourceObject<Convoy>, _: &str) -> Result<(), String> {
+    fn position(&self) -> Result<BTreeMap<String, u64>, String> {
+        Ok(self.position.clone())
+    }
+    async fn deliver(&self, _: &ResourceObject<Convoy>, _: &str, evidence: &SettlementEvidence) -> Result<Delivery, String> {
         *self.deliveries.lock().expect("deliveries") += 1;
-        Ok(())
+        self.evidence.lock().expect("evidence").push(evidence.clone());
+        Ok(if self.moved { Delivery::Moved("a turn was admitted".into()) } else { Delivery::Delivered })
     }
     fn delivered(&self, _: &ResourceObject<Convoy>) -> Option<String> {
         self.delivered.clone()
@@ -1253,6 +1263,7 @@ async fn a_convoy_failing_before_its_first_note_is_woken_by_any_change_request()
 /// undelivered turn holds delivery. The convoy reconciler asks it nothing else.
 struct Turns {
     held_until: Option<chrono::DateTime<chrono::Utc>>,
+    inbox: Option<flotilla_address::Address>,
 }
 
 #[async_trait]
@@ -1350,9 +1361,9 @@ impl flotilla_messaging::EngineMessages for Turns {
     async fn end_stalls(&self, _: &str, _: &[String], _: &[String], _: &str) -> Result<Vec<String>, String> {
         unreachable!("the convoy reconciler ends no stalls")
     }
-    async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    async fn delivery_hold(&self, namespace: &str, receiver: &str) -> Result<flotilla_messaging::DeliveryHold, String> {
         assert_eq!((namespace, receiver), (NAMESPACE, "flotilla/c/work/coder"));
-        Ok(self.held_until)
+        Ok(flotilla_messaging::DeliveryHold { inbox: self.inbox.clone(), until: self.held_until })
     }
     async fn delivery_wait(&self, _: &str) -> Result<Option<String>, String> {
         Ok(None)
@@ -1433,7 +1444,7 @@ async fn an_undelivered_turn_holds_delivery() {
             fixture.release(&launch);
         }
         let held_until = awaiting.then(|| chrono::Utc::now() + chrono::Duration::minutes(5));
-        let messages: flotilla_crew::ports::MessagePath = Arc::new(Turns { held_until });
+        let messages: flotilla_crew::ports::MessagePath = Arc::new(Turns { held_until, inbox: None });
         let engine = Arc::new(Recording { holds: true, ..Default::default() });
         let reconciler = reconciler_messaging(&backend, Arc::clone(&engine), fixture.reads.clone(), messages);
         let prepared = reconciler.prepare(&convoy).await.expect("prepare");
@@ -1449,6 +1460,36 @@ async fn an_undelivered_turn_holds_delivery() {
             assert_eq!(outcome.requeue_after, None);
             assert_eq!(noted, None);
         }
+    }
+}
+
+// Behaviour: a landing convoy is delivered on what settlement read after the engine's log
+// position, its crews' inboxes among it, so the engine can refuse delivery when any of it was written
+// since. A refused delivery is judged again at once, on what is there then.
+#[tokio::test]
+async fn delivery_is_asked_on_the_evidence_settlement_read() {
+    let inbox: flotilla_address::Address = "fleet:lab/role:coder".parse().expect("inbox");
+    for moved in [false, true] {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut convoy = ledger_convoy(&backend).await;
+        let status = convoy.status.as_mut().expect("status");
+        status.phase = ConvoyPhase::Landing;
+        status.workflow_snapshot.as_mut().expect("snapshot").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+        for promise in status.promises.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("promises") {
+            promise.state = PromiseState::Kept;
+        }
+        status.crew_work.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("coder").phase = CrewWorkPhase::Done;
+        let messages: flotilla_crew::ports::MessagePath = Arc::new(Turns { held_until: None, inbox: Some(inbox.clone()) });
+        let position = BTreeMap::from([("home-a".to_owned(), 7)]);
+        let engine = Arc::new(Recording { holds: true, position: position.clone(), moved, ..Default::default() });
+        let reads = flotilla_provisioning_testkit::EngineFixture::default().reads();
+        let reconciler = reconciler_messaging(&backend, Arc::clone(&engine), reads, messages);
+        let prepared = reconciler.prepare(&convoy).await.expect("prepare");
+        let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
+        let asked = engine.evidence.lock().expect("evidence").clone();
+        assert_eq!(asked, [SettlementEvidence { inboxes: [inbox.to_string()].into(), ..SettlementEvidence::after(position) }]);
+        let again = moved.then_some(std::time::Duration::ZERO);
+        assert_eq!(outcome.requeue_after, again, "moved {moved}");
     }
 }
 

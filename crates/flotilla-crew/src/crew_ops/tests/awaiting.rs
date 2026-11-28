@@ -198,8 +198,8 @@ impl EngineMessages for RecordingMessages {
         self.ended.lock().expect("ended").push((seats.to_vec(), stalled.to_vec()));
         Ok(Vec::new())
     }
-    async fn delivery_held_until(&self, _namespace: &str, _receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
-        Ok(None)
+    async fn delivery_hold(&self, _namespace: &str, _receiver: &str) -> Result<flotilla_messaging::DeliveryHold, String> {
+        Ok(Default::default())
     }
     async fn delivery_wait(&self, _namespace: &str) -> Result<Option<String>, String> {
         Ok(None)

@@ -12,7 +12,7 @@ pub use counted::KeyedGets;
 use counted::{Meter, WithConvoys};
 use flotilla_engine_convoys::{convoy_engine::ConvoyEngine, convoy_records::EngineConvoyRecords, convoys::Convoys};
 use flotilla_resources::{
-    convoy::engine::{engine_name, set_notes, EngineConvoyPath, VerdictScope},
+    convoy::engine::{engine_name, set_notes, EngineConvoyPath, SettlementEvidence, VerdictScope},
     lifecycle_reads::LifecycleReads,
     Clock, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, ObjectMeta, ResourceObject, Selector, VesselRequirement,
     WorkflowSnapshot,
@@ -152,7 +152,7 @@ pub async fn keep_all(path: &EngineConvoyPath, convoy: &ResourceObject<Convoy>) 
 /// [`keep_all`], then delivers launch `convoy`: it reads Landed.
 pub async fn land(path: &EngineConvoyPath, convoy: &ResourceObject<Convoy>) {
     keep_all(path, convoy).await;
-    path.deliver(convoy, "claim").await.expect("deliver the launch");
+    path.deliver(convoy, "claim", &SettlementEvidence::after(path.position().expect("position"))).await.expect("deliver the launch");
 }
 
 /// Convoy `name` in `namespace` as admission hands it to the engine: `spec`, and `status` with

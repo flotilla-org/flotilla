@@ -134,9 +134,9 @@ impl EngineMessages for CountedMessages {
         self.settled.lock().expect("settled").push(seats.to_vec());
         self.inner.end_stalls(namespace, seats, stalled, reason).await
     }
-    async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<DateTime<Utc>>, String> {
-        self.count("delivery_held_until");
-        self.inner.delivery_held_until(namespace, receiver).await
+    async fn delivery_hold(&self, namespace: &str, receiver: &str) -> Result<flotilla_messaging::DeliveryHold, String> {
+        self.count("delivery_hold");
+        self.inner.delivery_hold(namespace, receiver).await
     }
     fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, ResourceError> {
         self.inner.changes()
