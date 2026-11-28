@@ -99,8 +99,12 @@ impl ViewerBindings {
         Self(Arc::new(RwLock::new(listing)))
     }
 
-    pub fn set(&self, listing: Result<Vec<ViewerBinding>, String>) {
-        *self.0.write().expect("viewer bindings lock") = listing;
+    /// Replaces the listing, and says whether it differs from the one held.
+    pub fn set(&self, listing: Result<Vec<ViewerBinding>, String>) -> bool {
+        let mut held = self.0.write().expect("viewer bindings lock");
+        let changed = *held != listing;
+        *held = listing;
+        changed
     }
 
     /// The scope of the Binding of `name` in `scope` this viewer's Tender reaches, or why there is

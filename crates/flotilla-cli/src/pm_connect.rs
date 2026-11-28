@@ -360,6 +360,14 @@ impl ConnectorState {
         patches
     }
 
+    /// Takes the viewer's latest Bindings listing. Every session's direct facts depend on it, so a
+    /// listing that differs re-projects every node.
+    fn take_bindings(&mut self, bindings: &ViewerBindings, listing: Result<Vec<ViewerBinding>, String>) {
+        if bindings.set(listing) {
+            self.projection.invalidate_all();
+        }
+    }
+
     fn project_patches_at(
         &mut self,
         mint: &dyn RecipeMint,
@@ -527,7 +535,7 @@ async fn publish(
     full: bool,
 ) -> Result<(), SessionFailure> {
     if let Some(tender) = &connector.tender {
-        tender.bindings.set(viewer_bindings(&tender.runtime).await);
+        state.take_bindings(&tender.bindings, viewer_bindings(&tender.runtime).await);
     }
     let mode = connector.mode(sink);
     let ttl_ms = (mode == LivenessMode::Ttl).then_some(CATALOG_TTL_MS);

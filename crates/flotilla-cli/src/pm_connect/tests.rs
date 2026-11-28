@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use flotilla_config::ConfigStore;
 use flotilla_manifest::{
     entity,
-    keys::{KEY_SOURCE, KEY_STATUS_STATE, SOURCE_FLOTILLA},
+    keys::{KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE, KEY_PRIMARY_DIRECT_REASON, KEY_SOURCE, KEY_STATUS_STATE, SOURCE_FLOTILLA},
     wire::{MetadataTarget, MetadataValue},
 };
 use flotilla_protocol::{
@@ -2537,4 +2537,36 @@ async fn the_viewers_bindings_are_what_its_tender_instance_lists() {
     tender.shutdown().await;
 
     assert!(viewer_bindings(&Err("XDG_RUNTIME_DIR is unset".into())).await.unwrap_err().ends_with("XDG_RUNTIME_DIR is unset"));
+}
+
+// #4401: a session's direct facts follow the viewer's Bindings, not only its own row: a Binding
+// that appears or goes after the session was projected re-projects it on the next publish.
+#[test]
+fn a_change_in_the_viewers_bindings_reprojects_sessions_already_projected() {
+    let bindings = ViewerBindings::default();
+    let viewer = mint().with_bindings(bindings.clone());
+    let mut state = ConnectorState::default();
+    let mut row = independent_row("scratch", SessionPhase::Running);
+    row.cleat_endpoint = Some(flotilla_protocol::result_set::CleatEndpoint {
+        runtime_root: "/run/cleat".into(),
+        daemon: "default@1".into(),
+        session: "scratch".into(),
+    });
+    state.apply_event(&independents_set(1, vec![row]));
+    let session = |patches: Vec<MetadataPatch>| patches.into_iter().find(|patch| patch.target == independent_entity("scratch"));
+    let unbound = session(state.project_patches_at(&viewer, chrono::Utc::now(), None)).expect("projected");
+    assert!(unbound.set.contains_key(KEY_PRIMARY_DIRECT_REASON), "{unbound:?}");
+
+    let binding = |reachable| ViewerBinding { scope: "tender/f3e7".into(), name: "cleat/feta/default".into(), reachable };
+    state.take_bindings(&bindings, Ok(vec![binding(Ok(()))]));
+    let bound = session(state.project_patches_at(&viewer, chrono::Utc::now(), None)).expect("re-projected once bound");
+    assert_eq!(bound.set[KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE].value, MetadataValue::text("tender/f3e7"));
+
+    state.take_bindings(&bindings, Ok(vec![binding(Ok(()))]));
+    assert!(session(state.project_patches_at(&viewer, chrono::Utc::now(), None)).is_none(), "an unchanged listing re-projects nothing");
+
+    state.take_bindings(&bindings, Ok(vec![binding(Err("its publisher is unavailable".into()))]));
+    let gone = session(state.project_patches_at(&viewer, chrono::Utc::now(), None)).expect("re-projected once unavailable");
+    assert!(gone.unset.contains(&KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE.to_owned()), "{gone:?}");
+    assert!(gone.set.contains_key(KEY_PRIMARY_DIRECT_REASON), "{gone:?}");
 }
