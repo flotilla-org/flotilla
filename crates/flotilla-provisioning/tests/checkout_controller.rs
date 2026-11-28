@@ -15,8 +15,8 @@ use flotilla_provisioning::{
     checkout_runtime::{CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout},
     engine::{
         checkout_actuator::{
-            Against, BranchValidation, CheckoutActuator, CheckoutHolds, CheckoutInputs, CheckoutProvider, FreshClone, HolderInputs,
-            NamedHolderInputs,
+            Against, BranchLookupError, BranchValidation, CheckoutActuator, CheckoutHolds, CheckoutInputs, CheckoutProvider, FreshClone,
+            HolderInputs, NamedHolderInputs,
         },
         controller::Controller,
         reads::StoreReads,
@@ -208,13 +208,13 @@ impl HolderInputs for SearchedOnRelease {
 /// A forge's answers to branch validation, in order; once they run out, every branch may be made.
 #[derive(Default)]
 struct ScriptedValidation {
-    answers: Mutex<Vec<Result<Option<String>, String>>>,
+    answers: Mutex<Vec<Result<Option<String>, BranchLookupError>>>,
     asked: Mutex<Vec<String>>,
 }
 
 #[async_trait]
 impl BranchValidation for ScriptedValidation {
-    async fn validate_new_branch(&self, _: &str, branch: &str, _: bool) -> Result<Option<String>, String> {
+    async fn validate_new_branch(&self, _: &str, branch: &str, _: bool) -> Result<Option<String>, BranchLookupError> {
         self.asked.lock().expect("asked").push(branch.into());
         let mut answers = self.answers.lock().expect("answers");
         if answers.is_empty() {
@@ -699,13 +699,20 @@ fn world_worktree(clone: &str, branch: &str) -> CheckoutWorktreeSpec {
 }
 
 // Behaviour: a new branch the forge already has a change request from is refused as the forge
-// says; a lookup that fails refuses nothing, and leaves the checkout requested, unmade.
+// says. A lookup that fails refuses nothing: it is tried again on the kind's backoff, with no event
+// to wake it, and one that keeps failing gives up at the failure limit with its reason. A lookup
+// dropped before it was answered says nothing of the branch: it is not counted, however often it
+// happens, and the branch is made once a lookup is answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_branch_is_validated_with_the_forge_before_it_is_made() {
+    let dropped = || Err(BranchLookupError::Undelivered("the request was dropped: Undeliverable".into()));
+    let limited = || Err(BranchLookupError::Failed("rate limited".into()));
     let validation = ScriptedValidation {
         answers: Mutex::new(vec![
             Ok(Some("checkout branch taken conflicts with Open change request #7; choose a fresh branch name".into())),
-            Err("rate limited".into()),
+            limited(),
+            limited(),
+            limited(),
         ]),
         ..ScriptedValidation::default()
     };
@@ -715,9 +722,14 @@ async fn a_new_branch_is_validated_with_the_forge_before_it_is_made() {
     let taken = world.checkouts.request("taken", &world.worktree(&clone, "taken"), Some(&world.checkouts.holder("c1")));
     world.until("refused", |world| gave_up_with(world, &taken, "conflicts with Open change request #7")).await;
     let unknown = world.checkouts.request("unknown", &world.worktree(&clone, "unknown"), Some(&world.checkouts.holder("c1")));
-    world.until("tried", |world| world.validation.asked.lock().expect("asked").len() == 2).await;
-    world.until("retrying", |world| matches!(world.reading(&unknown), Some(LifecycleReading::Retrying { .. }))).await;
+    world.until("given up", |world| gave_up_with(world, &unknown, "rate limited")).await;
+    assert_eq!(world.validation.asked.lock().expect("asked").len(), 4, "the lookup is tried until the limit");
     assert!(world.provider.asked().worktrees.is_empty(), "neither was made");
+
+    *world.validation.answers.lock().expect("answers") = vec![dropped(), dropped(), dropped(), dropped()];
+    let undelivered = world.checkouts.request("undelivered", &world.worktree(&clone, "undelivered"), Some(&world.checkouts.holder("c1")));
+    world.until("made", |world| world.ready(&undelivered)).await;
+    assert_eq!(world.validation.asked.lock().expect("asked").len(), 9, "four dropped lookups, then one answered");
 }
 
 // Behaviour: a host probe's recheck observes a realised worktree again: one still there has its

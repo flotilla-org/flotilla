@@ -16,6 +16,7 @@ use flotilla_observation::sources::{
 };
 #[cfg(test)]
 use flotilla_protocol::PlacementDecision;
+use flotilla_provisioning::engine::checkout_actuator::BranchLookupError;
 use flotilla_resources::address::{remote_change_request_subject, same_subject};
 #[cfg(test)]
 use flotilla_resources::{CapabilityNeed, ProjectSpec};
@@ -3146,17 +3147,26 @@ impl InProcessDaemon {
         repo_ref: &RepositoryKey,
         branch: &str,
         continuing: bool,
-    ) -> Result<Option<String>, flotilla_provider_runtime::ObservationError> {
-        if !self.repository_has_network_forge(repo_ref).await? {
+    ) -> Result<Option<String>, BranchLookupError> {
+        let failed = BranchLookupError::Failed;
+        if !self.repository_has_network_forge(repo_ref).await.map_err(failed)? {
             return Ok(None);
         }
         let namespace = self.provisioning_namespace().await;
-        let (repository, _) = self.repository_address_of(&namespace, repo_ref).await?;
+        let (repository, _) = self.repository_address_of(&namespace, repo_ref).await.map_err(failed)?;
         let primitives = self.message_primitives();
-        primitives.observe_branch(&namespace, &repository, branch).await?;
+        primitives.observe_branch(&namespace, &repository, branch).await.map_err(|unanswered| match unanswered {
+            flotilla_engine_messages::Unanswered::Dropped(reason) => BranchLookupError::Undelivered(reason),
+            flotilla_engine_messages::Unanswered::Failed(reason) => BranchLookupError::Failed(reason),
+        })?;
         let (service, scope) = flotilla_resources::address::stored_service_scope(&repository)
-            .ok_or_else(|| format!("{repository} names no forge repository"))?;
-        let found = self.change_request_branches()?.on_branch(&service, &scope, branch).await?;
+            .ok_or_else(|| BranchLookupError::Failed(format!("{repository} names no forge repository")))?;
+        let found = self
+            .change_request_branches()
+            .map_err(failed)?
+            .on_branch(&service, &scope, branch)
+            .await
+            .map_err(|error| BranchLookupError::Failed(error.to_string()))?;
         // One copy per change request: this home's, which its observer has just written, before
         // another home's.
         let mut by_number = BTreeMap::<u64, flotilla_resources::engine_records::BranchChangeRequest>::new();

@@ -16,7 +16,8 @@ use flotilla_protocol::RepositoryKey;
 use flotilla_provisioning::{
     checkout_runtime::{CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout},
     engine::checkout_actuator::{
-        Against, BranchValidation, CheckoutActuator, CheckoutHolds, CheckoutInputs, CheckoutProvider, FreshClone, HolderInputs,
+        Against, BranchLookupError, BranchValidation, CheckoutActuator, CheckoutHolds, CheckoutInputs, CheckoutProvider, FreshClone,
+        HolderInputs,
     },
 };
 use flotilla_resources::{
@@ -131,8 +132,8 @@ pub(super) struct ForgeBranchValidation {
 
 #[async_trait]
 impl BranchValidation for ForgeBranchValidation {
-    async fn validate_new_branch(&self, repository: &str, branch: &str, continuing: bool) -> Result<Option<String>, String> {
-        self.daemon.validate_new_branch(&RepositoryKey(repository.to_owned()), branch, continuing).await.map_err(|error| error.to_string())
+    async fn validate_new_branch(&self, repository: &str, branch: &str, continuing: bool) -> Result<Option<String>, BranchLookupError> {
+        self.daemon.validate_new_branch(&RepositoryKey(repository.to_owned()), branch, continuing).await
     }
 }
 

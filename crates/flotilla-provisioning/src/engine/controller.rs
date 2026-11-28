@@ -93,12 +93,22 @@ pub struct ProviderFailure {
     /// reset, a credential minted again. None waits for an event. Held in memory only: a restart
     /// starts again from its observation.
     pub retry_at: Option<Timestamp>,
+    /// Whether the failure says anything about the resource, and so counts toward its failure
+    /// limit. One that does not, such as a request that never reached who could answer it, is
+    /// tried again on the kind's backoff without being counted.
+    pub counted: bool,
 }
 
 impl ProviderFailure {
     /// A failure that only an event, or nothing, could change.
     pub fn new(cause: Cause, retryable: bool) -> Self {
-        Self { cause, retryable, retry_at: None }
+        Self { cause, retryable, retry_at: None, counted: true }
+    }
+
+    /// A retryable failure that says nothing about the resource: not counted, and tried again on
+    /// the kind's backoff.
+    pub fn uncounted(cause: Cause) -> Self {
+        Self { cause, retryable: true, retry_at: None, counted: false }
     }
 }
 
@@ -882,6 +892,21 @@ where
         let retry_at = failure.retry_at.filter(|_| failure.retryable);
         let (cause, retryable) = (failure.cause, failure.retryable);
         let now = runner.now();
+        if !failure.counted {
+            // Nothing is learned of the resource: a pending counted failure takes its cause, and
+            // the next try is due on the kind's backoff from now, the tally as it was.
+            let failures = match state {
+                LifecycleState::Requested { failures, .. } => *failures,
+                _ => 0,
+            };
+            if matches!(judge::<K>(state), Judgement::Retrying { .. }) {
+                self.write(runner, name, Step::FailedEarly { cause: cause.clone(), retryable }).await;
+            }
+            warn!(kind = K::NAME, name, cause = %cause.detail, "a try failed without learning anything of it; tried again on its backoff");
+            let due = now.saturating_add(K::policy().backoff(failures.max(1)));
+            runner.retry_at(name, retry_at.map_or(due, |at| at.max(due)));
+            return;
+        }
         match judge::<K>(state) {
             Judgement::Retrying { next, .. } if now < next => {
                 self.write(runner, name, Step::FailedEarly { cause, retryable }).await;

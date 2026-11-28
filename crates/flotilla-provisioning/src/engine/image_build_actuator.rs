@@ -283,6 +283,7 @@ fn infrastructure(reason: String) -> ProviderFailure {
         retryable: true,
         // Time alone may cure it (a registry back, a credential minted): the kind's backoff decides when.
         retry_at: Some(Timestamp::from_datetime(&flotilla_resources::clock::now())),
+        counted: true,
     }
 }
 

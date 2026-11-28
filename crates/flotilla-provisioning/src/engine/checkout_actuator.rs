@@ -107,7 +107,25 @@ pub trait CheckoutProvider: Send + Sync + 'static {
 /// failed, tried again.
 #[async_trait]
 pub trait BranchValidation: Send + Sync + 'static {
-    async fn validate_new_branch(&self, repository: &str, branch: &str, continuing: bool) -> Result<Option<String>, String>;
+    async fn validate_new_branch(&self, repository: &str, branch: &str, continuing: bool) -> Result<Option<String>, BranchLookupError>;
+}
+
+/// Why a branch was not validated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BranchLookupError {
+    /// The lookup never reached the forge's observer, or was dropped before it answered: nothing
+    /// is learned of the branch.
+    Undelivered(String),
+    /// The lookup failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for BranchLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Undelivered(reason) | Self::Failed(reason) => f.write_str(reason),
+        }
+    }
 }
 
 /// No forge to ask: every new branch may be made.
@@ -115,7 +133,7 @@ pub struct NoBranchValidation;
 
 #[async_trait]
 impl BranchValidation for NoBranchValidation {
-    async fn validate_new_branch(&self, _: &str, _: &str, _: bool) -> Result<Option<String>, String> {
+    async fn validate_new_branch(&self, _: &str, _: &str, _: bool) -> Result<Option<String>, BranchLookupError> {
         Ok(None)
     }
 }
@@ -338,8 +356,12 @@ fn created_at(read: &mut Read<'_>, name: &str, home: &str) -> Result<u64, StoreE
     Ok(read.changes(id, 0, 1)?.first().map_or(u64::MAX, |entry| entry.home_seq))
 }
 
+fn transient_cause(message: impl Into<String>) -> Cause {
+    Cause::new(CauseCategory::Transient, message)
+}
+
 fn transient(message: impl Into<String>) -> ProviderFailure {
-    ProviderFailure::new(Cause::new(CauseCategory::Transient, message), true)
+    ProviderFailure::new(transient_cause(message), true)
 }
 
 /// A failed making of a checkout: wrong inputs and unknown failures give up, as the old
@@ -613,7 +635,14 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
         match self.validation.validate_new_branch(&request.repository, &request.branch, continuing).await {
             Ok(None) => Ok(()),
             Ok(Some(conflict)) => Err(refused(conflict)),
-            Err(error) => Err(transient(format!("validate checkout branch {}: {error}", request.branch))),
+            Err(BranchLookupError::Undelivered(error)) => {
+                Err(ProviderFailure::uncounted(transient_cause(format!("validate checkout branch {}: {error}", request.branch))))
+            }
+            // Tried again on the kind's backoff, until its failure limit.
+            Err(BranchLookupError::Failed(error)) => Err(ProviderFailure {
+                retry_at: Some(flotilla_schema::Timestamp::from_datetime(&flotilla_resources::clock::now())),
+                ..transient(format!("validate checkout branch {}: {error}", request.branch))
+            }),
         }
     }
 
