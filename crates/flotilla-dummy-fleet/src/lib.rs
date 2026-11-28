@@ -50,7 +50,7 @@ pub use fleet::{DummyFleet, DummyFleetSnapshot, DummyVendor};
 pub use flotilla_environment::environment::dummy::{DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV};
 pub use forge::DummyChangeRequestTracker;
 pub use state::STATE_FILE;
-pub use terminal::{DummyTerminalPool, DUMMY_TERMINAL_POOL};
+pub use terminal::{DummyTerminalPool, DUMMY_CLEAT_DAEMON, DUMMY_CLEAT_RUNTIME_ROOT, DUMMY_TERMINAL_POOL};
 pub use vcs::DummyVcs;
 
 impl DummyFleet {

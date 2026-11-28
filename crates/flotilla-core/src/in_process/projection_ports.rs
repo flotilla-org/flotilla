@@ -10,8 +10,8 @@ use flotilla_change_request::observation::ChangeRequestKey;
 use flotilla_discovery::environment_manager::EnvironmentManager;
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_projections::{
-    ports::EnvironmentSummaries, read_projections::LeafSubscriptionRead, AttachCapabilityResolver, ConvoyChangeRequestResolver,
-    IssueMaterializationResolver,
+    ports::EnvironmentSummaries, read_projections::LeafSubscriptionRead, ConvoyChangeRequestResolver, IssueMaterializationResolver,
+    OriginHostResolver,
 };
 use flotilla_protocol::{EnvironmentInfo, HostName, IssueSource, NodeId, QueryScope, RepositoryKey, ToolInventory};
 use flotilla_provider_runtime::ObservationError;
@@ -53,11 +53,7 @@ impl ConvoyChangeRequestResolver for InProcessDaemon {
 }
 
 #[async_trait]
-impl AttachCapabilityResolver for InProcessDaemon {
-    async fn resolvable_attach_targets(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String> {
-        self.resolvable_attach_targets_internal(targets).await
-    }
-
+impl OriginHostResolver for InProcessDaemon {
     async fn origin_host_names(&self, origins: &HashSet<NodeId>) -> HashMap<NodeId, HostName> {
         self.origin_host_names_internal(origins).await
     }

@@ -858,8 +858,8 @@ pub struct IndependentRow {
     pub repository_key: Option<RepositoryKey>,
     /// Host whose daemon can act on this session.
     pub host: HostName,
-    /// Session reference accepted by `flotilla attach`. `Some` is a
-    /// capability fact: the daemon can currently resolve the attachment.
+    /// Session reference accepted by `flotilla attach`, while the session runs
+    /// with an observed endpoint. Attaching says why when it cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach: Option<String>,
     /// Physical Cleat daemon endpoint for a live session, when observed.

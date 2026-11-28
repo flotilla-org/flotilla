@@ -5160,14 +5160,6 @@ impl InProcessDaemon {
         self.attach_resolver().resolve_transient(reference, host).await
     }
 
-    pub async fn resolvable_attach_references_internal(&self, references: &[String]) -> Result<HashSet<String>, String> {
-        self.attach_resolver().resolvable_references(references).await
-    }
-
-    pub async fn resolvable_attach_targets_internal(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String> {
-        self.attach_resolver().resolvable_targets(targets).await
-    }
-
     pub async fn origin_host_names_internal(&self, origins: &HashSet<NodeId>) -> HashMap<NodeId, HostName> {
         let mut hosts = HashMap::new();
         for origin in origins {

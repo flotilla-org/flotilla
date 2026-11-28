@@ -17,7 +17,7 @@ use flotilla_discovery_api::{
 };
 use flotilla_environment::environment::dummy::{dummy_draw, DUMMY_FLEET_ENV};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_protocol::{arg::Arg, TerminalStatus};
+use flotilla_protocol::{arg::Arg, result_set::CleatEndpoint, TerminalStatus};
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_terminal::{
     ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSessionTag, TerminalSubmission,
@@ -301,6 +301,11 @@ impl DummySessions {
     }
 }
 
+/// Where a dummy environment's cleat daemon keeps its runtime.
+pub const DUMMY_CLEAT_RUNTIME_ROOT: &str = "/run/cleat";
+/// The logical cleat daemon hosting a dummy environment's sessions.
+pub const DUMMY_CLEAT_DAEMON: &str = "default";
+
 pub struct DummyTerminalPool {
     fleet: Arc<DummyFleet>,
     environment: String,
@@ -346,6 +351,15 @@ impl DummyTerminalPool {
 
 #[async_trait]
 impl TerminalPool for DummyTerminalPool {
+    /// The daemon hosting a running session, as cleat names it: each environment runs one.
+    async fn cleat_endpoint(&self, session_id: &str) -> Result<Option<CleatEndpoint>, String> {
+        Ok(self.own(session_id).map(|_| CleatEndpoint {
+            runtime_root: DUMMY_CLEAT_RUNTIME_ROOT.to_owned(),
+            daemon: DUMMY_CLEAT_DAEMON.to_owned(),
+            session: session_id.to_owned(),
+        }))
+    }
+
     fn tracks_session_liveness(&self) -> bool {
         true
     }

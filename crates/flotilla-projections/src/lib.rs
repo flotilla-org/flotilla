@@ -20,7 +20,7 @@ mod aggregator;
 mod issue_materializer;
 
 use aggregator::{Aggregator, AggregatorResolvers};
-pub use aggregator::{AttachCapabilityResolver, ConvoyChangeRequestResolver};
+pub use aggregator::{ConvoyChangeRequestResolver, OriginHostResolver};
 pub use issue_materializer::{IssueMaterializationResolver, IssuePollingHealth};
 pub mod aggregator_projection;
 pub mod awareness_projection;
@@ -55,7 +55,7 @@ pub fn run(
     Box::pin(async move {
         let durable = context.durable;
         let aggregator = Aggregator::with_events(state, context.host_name, context.event_sink, context.events, context.convoy_engine)
-            .with_attach_resolver_arc(context.attach)
+            .with_origin_resolver_arc(context.origins)
             .with_lifecycle_reads(context.lifecycles)
             .with_discovered_checkouts(context.discovered, namespace)
             .with_agent_sessions(context.agent_sessions)
@@ -93,7 +93,8 @@ pub struct AggregatorContext {
     pub host_name: HostName,
     pub event_sink: Arc<dyn EventSink>,
     pub events: broadcast::Receiver<DaemonEvent>,
-    pub attach: Arc<dyn AttachCapabilityResolver>,
+    /// The host each replica origin is.
+    pub origins: Arc<dyn OriginHostResolver>,
     pub change_requests: Arc<dyn ConvoyChangeRequestResolver>,
     pub issues: Arc<dyn IssueMaterializationResolver>,
     /// The engine's provisioning readings.

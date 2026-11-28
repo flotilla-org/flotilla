@@ -31,7 +31,7 @@ use flotilla_protocol::QueryCursor;
 use flotilla_protocol::QueryScope;
 use flotilla_protocol::TerminalStatus;
 use flotilla_protocol_testkit::TestIssue;
-use flotilla_resources::terminal_records::TerminalLaunchRequest;
+use flotilla_resources::terminal_records::{TerminalLaunchFacts, TerminalLaunchRequest};
 use flotilla_resources::{
     CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, EnvironmentSpec, HostDirectEnvironmentSpec,
     InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, TerminalSessionSource,
@@ -799,11 +799,14 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         env: Default::default(),
         pool: pool.to_string(),
     };
+    // A launch in a cleat pool is realised with the daemon holding it; one with no observed
+    // endpoint offers no attach.
+    let in_cleat = TerminalLaunchFacts { endpoint: Some(("/run/cleat".to_owned(), "default".to_owned())), ..Default::default() };
     let convoy_launch = terminals.request(&TerminalLaunchRequest {
         vessel: Some(vessel.clone()),
         ..session_request("terminal-convoy-coder", &tool(&environment_name, "coder", "fake-terminals"))
     });
-    terminals.ready(&convoy_launch, "cleat-convoy-coder", &Default::default());
+    terminals.ready(&convoy_launch, "cleat-convoy-coder", &in_cleat);
     let unresolvable = terminals.request(&session_request("terminal-unresolvable", &tool("missing-environment", "observer", "fake")));
     terminals.ready(&unresolvable, "cleat-unresolvable", &Default::default());
     let options = RuntimeOptions {
@@ -824,11 +827,10 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     // A launch carries no repository: no writer ever labels an engine session with one, so the
     // independent row's repository is not asserted here (#3108).
     let yeoman = terminals.request(&session_request("terminal-yeoman", &tool(&environment_name, "yeoman", "fake-terminals")));
-    terminals.ready(&yeoman, "cleat-yeoman", &Default::default());
+    terminals.ready(&yeoman, "cleat-yeoman", &in_cleat);
 
-    // Resource rows publish before terminal capability I/O finishes. Wait for
-    // the enrichment event, then read a full snapshot: a delta only carries
-    // changed recipes and need not repeat the unresolvable session.
+    // Wait for the yeoman's attach, then read a full snapshot: a delta only carries changed
+    // rows and need not repeat the other session.
     let rows = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let ready = match rx.recv().await {
@@ -862,7 +864,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         }
     })
     .await
-    .expect("timed out waiting for independent attach capability");
+    .expect("timed out waiting for the independent session's attach");
 
     assert!(
         rows.iter().all(|row| row.name != "terminal-convoy-coder"),
@@ -870,7 +872,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     );
     // Independents and Convoys have separate delivery boundaries. Wait for the
     // coalesced convoy enrichment too, rather than assuming the independent
-    // capability event has already advanced every query family.
+    // attach event has already advanced every query family.
     let materialized_convoy = |rows: &[ConvoyRow]| {
         rows.iter()
             .find(|row| row.name == convoy_a)
@@ -903,7 +905,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         }
     })
     .await
-    .expect("timed out waiting for convoy materialization capability");
+    .expect("timed out waiting for the convoy vessel's attach");
     let vessel = convoy.vessels.iter().find(|vessel| vessel.name == "coder").expect("convoy-bound session vessel row");
     assert_eq!(vessel.materialize.as_deref(), Some("terminal-convoy-coder"));
 
