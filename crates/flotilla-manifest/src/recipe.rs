@@ -1,15 +1,9 @@
-//! Platform-independent action addresses and viewer-specific direct transport reachability.
+//! Platform-independent action addresses and whether this viewer can bind Tender publications.
 //! Viewers resolve addresses on their own platform; only genuine commands carry argv.
 
-use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 use flotilla_protocol::{HostName, ViewAddress};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DirectTransport {
-    Local,
-    Ssh(String),
-}
 
 /// A structured action recipe. Kind is an open vocabulary; argv is present
 /// only for genuine commands. The target is also the viewer's focus-if-live key.
@@ -67,9 +61,84 @@ impl Recipe {
     }
 }
 
+/// Why a viewer that never looked for its Tender instance has none.
+const NO_TENDER: &str = "no Tender instance reachable from this viewer";
+
+/// The `tender/<fingerprint>` scopes of Tender instances' own publications.
+const INSTANCE_SCOPE_PREFIX: &str = "tender/";
+
+/// Where a publication is looked for among the viewer's Bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingScope<'a> {
+    Exact(&'a str),
+    /// Some host instance's own scope, which only its Tender knows.
+    AnyInstance,
+}
+
+/// One of this viewer's Bindings, and why its Tender cannot reach the publication when it cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewerBinding {
+    pub scope: String,
+    pub name: String,
+    pub reachable: Result<(), String>,
+}
+
+/// This viewer's Bindings as its Tender instance last listed them, or why it could not list them,
+/// shared between a mint and whatever lists them.
+#[derive(Debug, Clone)]
+pub struct ViewerBindings(Arc<RwLock<Result<Vec<ViewerBinding>, String>>>);
+
+impl Default for ViewerBindings {
+    fn default() -> Self {
+        Self::new(Err(NO_TENDER.to_owned()))
+    }
+}
+
+impl ViewerBindings {
+    pub fn new(listing: Result<Vec<ViewerBinding>, String>) -> Self {
+        Self(Arc::new(RwLock::new(listing)))
+    }
+
+    /// Replaces the listing, and says whether it differs from the one held.
+    pub fn set(&self, listing: Result<Vec<ViewerBinding>, String>) -> bool {
+        let mut held = self.0.write().expect("viewer bindings lock");
+        let changed = *held != listing;
+        *held = listing;
+        changed
+    }
+
+    /// The scope of the Binding of `name` in `scope` this viewer's Tender reaches, or why there is
+    /// none to bind.
+    pub fn reach(&self, scope: BindingScope<'_>, name: &str) -> Result<String, String> {
+        let listing = self.0.read().expect("viewer bindings lock");
+        let bindings = listing.as_ref().map_err(Clone::clone)?;
+        let mut found = bindings.iter().filter(|binding| {
+            binding.name == name
+                && match scope {
+                    BindingScope::Exact(scope) => binding.scope == scope,
+                    BindingScope::AnyInstance => binding.scope.starts_with(INSTANCE_SCOPE_PREFIX),
+                }
+        });
+        let wanted = match scope {
+            BindingScope::Exact(scope) => format!("{scope}:{name}"),
+            BindingScope::AnyInstance => format!("{name} in a host's own scope"),
+        };
+        let binding = found.next().ok_or_else(|| {
+            format!("this viewer's Tender instance has no Binding of {wanted}; pair it with the publishing host's Tender instance")
+        })?;
+        if found.next().is_some() {
+            return Err(format!("this viewer's Tender instance has Bindings of {wanted} from more than one host"));
+        }
+        binding.reachable.clone().map_err(|why| format!("this viewer's Tender instance cannot reach {}:{name}: {why}", binding.scope))?;
+        Ok(binding.scope.clone())
+    }
+}
+
 pub trait RecipeMint: Send + Sync {
-    fn direct_transport(&self, _host: &HostName) -> Result<DirectTransport, String> {
-        Err("viewer has no known transport to the session host".to_owned())
+    /// The scope of this viewer's Binding of publication `name`, once its own Tender instance
+    /// reaches the publication, or why it cannot be bound.
+    fn binding(&self, _scope: BindingScope<'_>, _name: &str) -> Result<String, String> {
+        Err(NO_TENDER.to_owned())
     }
     /// Recipe attaching a live entity — a session into a pane, or a vessel's
     /// running session into a workspace; `attach_ref` is any reference the
@@ -83,32 +152,24 @@ pub trait RecipeMint: Send + Sync {
 /// scoped focal view for an awareness-band latent.
 pub struct FlotillaRecipes {
     flotilla_bin: String,
-    local_host: Option<HostName>,
-    ssh_hosts: BTreeMap<String, String>,
+    bindings: ViewerBindings,
 }
 
 impl FlotillaRecipes {
     pub fn new(flotilla_bin: impl Into<String>) -> Self {
-        Self { flotilla_bin: flotilla_bin.into(), local_host: None, ssh_hosts: BTreeMap::new() }
+        Self { flotilla_bin: flotilla_bin.into(), bindings: ViewerBindings::default() }
     }
 
-    pub fn with_host_routes(mut self, local_host: HostName, ssh_hosts: BTreeMap<String, String>) -> Self {
-        self.local_host = Some(local_host);
-        self.ssh_hosts = ssh_hosts;
+    /// The viewer's Bindings, as its Tender instance lists them.
+    pub fn with_bindings(mut self, bindings: ViewerBindings) -> Self {
+        self.bindings = bindings;
         self
     }
 }
 
 impl RecipeMint for FlotillaRecipes {
-    fn direct_transport(&self, host: &HostName) -> Result<DirectTransport, String> {
-        if self.local_host.as_ref() == Some(host) {
-            return Ok(DirectTransport::Local);
-        }
-        self.ssh_hosts
-            .get(host.as_str())
-            .cloned()
-            .map(DirectTransport::Ssh)
-            .ok_or_else(|| format!("host {} has no configured SSH reachability from this viewer", host.as_str()))
+    fn binding(&self, scope: BindingScope<'_>, name: &str) -> Result<String, String> {
+        self.bindings.reach(scope, name)
     }
 
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe> {

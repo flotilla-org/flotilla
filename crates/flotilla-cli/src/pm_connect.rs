@@ -29,13 +29,12 @@ use flotilla_client::{
     reconnect::{is_permanent_daemon_error, ReconnectBackoff},
     DaemonEndpoint, SshEndpoint,
 };
-use flotilla_config::{ssh_destination, ConfigStore};
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_manifest::{
     keys::{CATALOG_TTL_MS, REASSERT_INTERVAL_MS},
     pm::PmInstance,
     projection::Catalog,
-    recipe::{FlotillaRecipes, RecipeMint},
+    recipe::{FlotillaRecipes, RecipeMint, ViewerBinding, ViewerBindings},
     sink::{LivenessMode, PatchSink},
     wire::MetadataPatch,
 };
@@ -44,7 +43,7 @@ use flotilla_protocol::{
         AwarenessGrouping, AwarenessLimit, AwarenessNode, ConvoyRow, IndependentRow, ProjectRepositoriesRow, QueryChanges, ResultDelta,
         ResultSet, Rows, StandingRoleRow,
     },
-    DaemonEvent, HostName, QueryCursor, QueryId, ResourceRef,
+    DaemonEvent, QueryCursor, QueryId, ResourceRef,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
@@ -361,6 +360,14 @@ impl ConnectorState {
         patches
     }
 
+    /// Takes the viewer's latest Bindings listing. Every session's direct facts depend on it, so a
+    /// listing that differs re-projects every node.
+    fn take_bindings(&mut self, bindings: &ViewerBindings, listing: Result<Vec<ViewerBinding>, String>) {
+        if bindings.set(listing) {
+            self.projection.invalidate_all();
+        }
+    }
+
     fn project_patches_at(
         &mut self,
         mint: &dyn RecipeMint,
@@ -527,6 +534,9 @@ async fn publish(
     connector: &Connector,
     full: bool,
 ) -> Result<(), SessionFailure> {
+    if let Some(tender) = &connector.tender {
+        state.take_bindings(&tender.bindings, viewer_bindings(&tender.runtime).await);
+    }
     let mode = connector.mode(sink);
     let ttl_ms = (mode == LivenessMode::Ttl).then_some(CATALOG_TTL_MS);
     let changes = state.project_patches_at(mint, chrono::Utc::now(), ttl_ms);
@@ -790,9 +800,15 @@ pub async fn run_connector(
 pub struct Connector {
     catalog: Arc<Mutex<Catalog>>,
     published: std::sync::atomic::AtomicBool,
+    /// The mint's view of this viewer's Bindings, listed again before each projection.
+    tender: Option<ViewerTender>,
 }
 
 impl Connector {
+    fn listing_bindings(tender: ViewerTender) -> Self {
+        Self { tender: Some(tender), ..Self::default() }
+    }
+
     fn mode(&self, sink: &dyn PatchSink) -> LivenessMode {
         sink.liveness()
     }
@@ -936,13 +952,74 @@ async fn with_parent<F: Future<Output = Result<(), String>>>(parent_alive: impl 
     }
 }
 
-// A remote daemon's configured identity cannot establish viewer locality.
-fn connector_local_host(remote: bool, configured: Option<String>, viewer: HostName) -> HostName {
-    if remote {
-        viewer
-    } else {
-        configured.map(HostName::new).unwrap_or(viewer)
+/// A Tender instance on this machine answers its control socket at once; a projection waits for
+/// it no longer than this.
+#[cfg(unix)]
+const BINDINGS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// This viewer's Tender runtime directory, or why it has none, and the Bindings its mint reads.
+struct ViewerTender {
+    runtime: Result<PathBuf, String>,
+    bindings: ViewerBindings,
+}
+
+#[cfg(unix)]
+fn viewer_tender_runtime() -> Result<PathBuf, String> {
+    tender_types::paths::runtime_dir_from_env()
+}
+
+#[cfg(not(unix))]
+fn viewer_tender_runtime() -> Result<PathBuf, String> {
+    Err("Tender runs on Unix only (flotilla-org/rigging#58)".to_owned())
+}
+
+/// This viewer's Bindings, as its own Tender instance lists them: a viewer binds a Cleat
+/// publication through it (#4401), wherever the daemon it connects to runs, and can only once
+/// its Tender reaches the publisher's.
+#[cfg(unix)]
+async fn viewer_bindings(runtime: &Result<PathBuf, String>) -> Result<Vec<ViewerBinding>, String> {
+    use tender_types::{api, BindingState, UnavailableReason};
+
+    use crate::frontend::daemon_http::refusal_message;
+
+    let runtime = runtime.as_ref().map_err(|reason| format!("no Tender instance reachable from this viewer: {reason}"))?;
+    let socket = tender_types::paths::control_socket(runtime);
+    let unreachable = |error: reqwest::Error| format!("no Tender instance reachable from this viewer at {}: {error}", socket.display());
+    let client = rigging_tls::client_builder().unix_socket(socket.as_path()).timeout(BINDINGS_TIMEOUT).build().map_err(unreachable)?;
+    let response =
+        client.get(format!("http://tender{}", api::BINDINGS)).header("accept", "application/json").send().await.map_err(unreachable)?;
+    let status = response.status();
+    let body = response.bytes().await.map_err(unreachable)?;
+    if !status.is_success() {
+        let message = refusal_message(&body);
+        return Err(format!("this viewer's Tender instance refused to list its Bindings ({status}): {message}"));
     }
+    let entries: Vec<api::BindingEntry> =
+        serde_json::from_slice(&body).map_err(|error| format!("this viewer's Tender instance listed its Bindings unreadably: {error}"))?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| ViewerBinding {
+            scope: entry.publication.scope.0,
+            name: entry.publication.name,
+            reachable: match entry.state {
+                BindingState::Available { .. } => Ok(()),
+                BindingState::Unavailable { reason: UnavailableReason::PublisherUnavailable, .. } => {
+                    Err("its publisher is unavailable".to_owned())
+                }
+                BindingState::Unavailable { reason: UnavailableReason::Withdrawn, .. } => Err("it is withdrawn".to_owned()),
+                BindingState::Unavailable { reason: UnavailableReason::RouteUnavailable, .. } => {
+                    Err("no route reaches an instance carrying it".to_owned())
+                }
+                BindingState::Revoked => Err("its audience no longer admits this machine".to_owned()),
+            },
+        })
+        .collect())
+}
+
+#[cfg(not(unix))]
+async fn viewer_bindings(runtime: &Result<PathBuf, String>) -> Result<Vec<ViewerBinding>, String> {
+    let reason = runtime.as_ref().err().map_or("Tender runs on Unix only", String::as_str);
+    Err(format!("no Tender instance reachable from this viewer: {reason}"))
 }
 
 /// CLI entry: resolve the sink and supervise parent/PM lifetime across dial
@@ -964,22 +1041,14 @@ pub async fn run(
         .with_writer(std::io::stderr)
         .try_init();
     let sink = resolve_pm(&options, &|key| std::env::var(key).ok())?.sink();
-    let config = ConfigStore::with_base(config_dir);
-    let local_host = connector_local_host(remote.is_some(), config.load_daemon_config()?.host_name, HostName::local());
-    let hosts = config.load_hosts()?;
-    let mut ssh_hosts = BTreeMap::new();
-    let mut ambiguous = HashSet::new();
-    for remote in hosts.hosts.values() {
-        let destination = ssh_destination(&remote.hostname, remote.user.as_deref());
-        if ssh_hosts.insert(remote.expected_host_name.clone(), destination).is_some() {
-            ambiguous.insert(remote.expected_host_name.clone());
-        }
+    let runtime = viewer_tender_runtime();
+    let listing = viewer_bindings(&runtime).await;
+    if let Err(reason) = &listing {
+        info!(%reason, "Cleat publications cannot be bound from this viewer");
     }
-    for host in ambiguous {
-        ssh_hosts.remove(&host);
-    }
-    let mint: Arc<dyn RecipeMint> = Arc::new(FlotillaRecipes::new(options.flotilla_bin.clone()).with_host_routes(local_host, ssh_hosts));
-    let connector = Arc::new(Connector::default());
+    let bindings = ViewerBindings::new(listing);
+    let mint: Arc<dyn RecipeMint> = Arc::new(FlotillaRecipes::new(options.flotilla_bin.clone()).with_bindings(bindings.clone()));
+    let connector = Arc::new(Connector::listing_bindings(ViewerTender { runtime, bindings }));
     let health_connector = connector.clone();
     let health_sink = sink.clone();
     with_parent(|| parent.alive(), async {

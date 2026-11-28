@@ -22,6 +22,15 @@ impl VesselAgent for DrydockVesselAgent {
         let target = wire::InwardTarget::Unix(exposures::unix(guest));
         self.exposures.ready_inward(&exposures::path_name("cleat", guest), target).await
     }
+    /// An inward exposure named for the daemon, which drydock keeps standing whether or not
+    /// the daemon answers yet; it follows the daemon to a new generation's socket.
+    async fn cleat_socket(&self, daemon: &str, guest: &Path) -> Result<PathBuf, String> {
+        if !guest.is_absolute() {
+            return Err("guest socket path must be absolute".into());
+        }
+        let target = wire::InwardTarget::Unix(exposures::unix(guest));
+        self.exposures.inward(&exposures::cleat_name(daemon, guest), target).await.map(|(local, _)| local)
+    }
     async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String> {
         VesselAgent::push_tools(&self.runner, tools).await
     }

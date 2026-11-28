@@ -104,6 +104,7 @@ pub async fn run(
                 startup_ready: Some(server.startup_ready()),
                 environment_sockets: Some(server.environment_socket_service()),
                 hook_endpoint: Some(server.hook_endpoint()),
+                tender_runtime: Some(tender_types::paths::runtime_dir_from_env()),
                 ..RuntimeOptions::default()
             },
         )

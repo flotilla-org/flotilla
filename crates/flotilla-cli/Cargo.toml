@@ -41,6 +41,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+tender-types = { workspace = true }
 
 [dev-dependencies]
 flotilla-address = { path = "../flotilla-address" }
@@ -61,6 +62,8 @@ tempfile = { workspace = true }
 [target.'cfg(unix)'.dev-dependencies]
 flotilla-daemon-testkit = { path = "../flotilla-daemon-testkit" }
 flotilla-daemon = { path = "../flotilla-daemon" }
+flotilla-test-support = { path = "../flotilla-test-support" }
+tender = { workspace = true }
 
 [lints]
 workspace = true

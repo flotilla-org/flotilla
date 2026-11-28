@@ -192,7 +192,7 @@ impl<'a> AttachResolver<'a> {
             let session = format!("flotilla-shell-{}", uuid::Uuid::new_v4());
             pool.ensure_session(&session, "exec \"${SHELL:-/bin/sh}\" -l", &cwd, &Vec::new(), &[]).await?;
             let endpoint = pool.cleat_endpoint(&session).await?.ok_or("shell has no cleat endpoint")?;
-            let guest = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+            let guest = endpoint.socket();
             let socket = agent.forward_socket(&guest).await?;
             return Ok(ResolvedAttach { plan: cleat_socket_attach_plan(&socket, &endpoint.session, mode), binding: Some(binding) });
         }
@@ -794,7 +794,7 @@ impl<'a> AttachResolver<'a> {
             let registry = self.registry_for_resource_environment(reads, environment, cwd.as_path()).await?;
             let pool = registry.terminal_pools.get(&session.spec.pool).map(|(_, pool)| pool.clone()).ok_or("terminal pool unavailable")?;
             let endpoint = checked_cleat_endpoint(pool.as_ref(), session, seat).await?;
-            let guest = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+            let guest = endpoint.socket();
             let socket = agent.forward_socket(&guest).await?;
             Ok::<_, String>(cleat_socket_attach_plan(&socket, &endpoint.session, seat))
         }
@@ -1793,7 +1793,7 @@ mod tests {
                 client: &Path,
                 seat: AttachMode,
             ) -> Result<ResolvedAttachPlan, String> {
-                let socket = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+                let socket = endpoint.socket();
                 let ResolvedAttachPlan(actions) = cleat_socket_attach_plan(&socket, &endpoint.session, seat);
                 let [ResolvedAttachAction::Command(mut args)] = actions.try_into().expect("one terminal command");
                 args[0] = Arg::Quoted(client.to_string_lossy().into_owned());

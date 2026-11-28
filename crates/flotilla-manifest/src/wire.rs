@@ -61,10 +61,9 @@
 //! | `action.primary.target` | Canonical recipe address and focus-if-live key. |
 //! | `action.primary.argv.<n>` | Raw command arguments, zero-based and contiguous; command kinds only. |
 //! | `action.primary.recipe` | Legacy POSIX command; removed after the recipe-shape v1 fleet roll. |
-//! | `action.primary.direct.transport` | `local` or `ssh` packet transport for the same live terminal. |
-//! | `action.primary.direct.host` | Local host name or the viewer's SSH destination alias. |
-//! | `action.primary.direct.runtime_root` | Cleat runtime root on the hosting machine. |
-//! | `action.primary.direct.daemon` | Physical Cleat daemon generation, not its logical alias. |
+//! | `action.primary.direct.publication.scope` | Tender scope of the session's Cleat daemon: `vessel/<Vessel resource name>`. |
+//! | `action.primary.direct.publication.name` | Tender name within that scope: `cleat/<logical daemon>`. |
+//! | `action.primary.direct.publication.label` | The publication's protocol label, `cleat`. |
 //! | `action.primary.direct.session` | Cleat session id on that daemon. |
 //! | `action.primary.direct.reason` | Why only the command recipe is available. |
 //!

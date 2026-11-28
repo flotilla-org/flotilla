@@ -72,6 +72,17 @@ pub(super) fn path_name(prefix: &str, path: &Path) -> String {
     format!("{prefix}-{}", &format!("{:x}", sha2::Sha256::digest(path.as_os_str().as_encoded_bytes()))[..16])
 }
 
+/// `cleat-<daemon>`, or a digest of `guest` for a daemon name drydock would refuse.
+pub(super) fn cleat_name(daemon: &str, guest: &Path) -> String {
+    let name = format!("cleat-{daemon}");
+    let valid = name.len() <= 64 && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'));
+    if valid {
+        name
+    } else {
+        path_name("cleat", guest)
+    }
+}
+
 pub(super) fn unix(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }

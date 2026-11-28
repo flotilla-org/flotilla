@@ -815,7 +815,7 @@ impl super::ProviderTerminalRoute for DockerProvisionedEnvironment {
         seat: flotilla_protocol::commands::AttachMode,
     ) -> Result<flotilla_protocol::ResolvedAttachPlan, String> {
         use flotilla_protocol::{arg::Arg, commands::AttachMode, ResolvedAttachPlan};
-        let socket = Path::new(&endpoint.runtime_root).join(&endpoint.daemon).join("socket");
+        let socket = endpoint.socket();
         let mut args = vec![
             Arg::Literal("docker".into()),
             Arg::Literal("exec".into()),

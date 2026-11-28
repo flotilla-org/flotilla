@@ -353,7 +353,7 @@ pub(super) async fn reconcile_provisioned_environment(
         }
         info!(environment = %env_id, container = %container_id, "restored provisioned environment registration");
     }
-    state.provisioned_environments.lock().await.entry(container_id).or_insert(ActiveProvisionedEnvironment { handle });
+    state.adopt_provisioned_environment(container_id, handle).await;
     Ok(())
 }
 

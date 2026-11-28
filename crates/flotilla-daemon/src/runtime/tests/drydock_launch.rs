@@ -249,6 +249,41 @@ async fn a_failed_vessel_layer_discards_only_a_vessel_it_created() {
     stand_in.clean_up();
 }
 
+// #4401: a provisioned vessel's Cleat daemon is published from the inward exposure drydock keeps
+// for it on this machine, and the Binding computed from its identity reaches the daemon inside
+// the vessel.
+#[tokio::test]
+async fn a_provisioned_vessels_cleat_daemon_is_published_through_its_exposure() {
+    use super::cleat_publications::{cleat_daemon, greets, launch, publication, TestTender};
+    use crate::runtime::{
+        cleat_publications::{carried, CleatPublisher},
+        health::RuntimeHealth,
+    };
+
+    let stand_in = stand_in(None, true).await;
+    DockerControllerRuntime { state: Arc::clone(&stand_in.state) }
+        .provision_environment(stand_in.env_id.as_str(), &stand_in.spec)
+        .await
+        .expect("provision");
+    // The stand-in vessel is this host, so the daemon's guest socket is a path here.
+    let guest_root = stand_in.root().join("cleat");
+    let guest = guest_root.join("default@1").join("socket");
+    let _daemon = cleat_daemon(&guest, b"cleat in the vessel");
+    let mut tender = TestTender::start(&stand_in.root().join("t")).await;
+    let publisher = CleatPublisher::new(Ok(tender.paths.runtime.clone()), "kiwi", RuntimeHealth::default());
+
+    publisher.pass(&carried([launch(1, stand_in.env_id.as_str(), &guest_root, "default@1")], "kiwi"), &stand_in.state).await;
+    let (_, entry) = tender.listed(&publication()).await;
+    let endpoint = entry.expect("published").endpoint.expect("its own socket");
+    assert_ne!(endpoint, guest, "published from drydock's exposure, not the guest path");
+    assert_eq!(endpoint.file_name().and_then(|name| name.to_str()), Some("cleat-default.sock"), "the exposure named for the daemon");
+    greets(&tender.paths.runtime, &tender_types::paths::binding_path(&tender.paths.runtime, &publication()), b"cleat in the vessel").await;
+
+    tender.stop().await;
+    stand_in.handle().await.expect("provisioned handle").destroy().await.expect("destroy");
+    stand_in.clean_up();
+}
+
 /// The drydock stand-in, the provider instance flotilla composes for it, and
 /// a daemon holding a cloud-sandbox Environment for it with one crew frozen.
 struct StandIn {

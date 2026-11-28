@@ -11,6 +11,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
+    path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, Utc};
@@ -874,6 +875,48 @@ pub struct CleatEndpoint {
     pub session: String,
 }
 
+/// The protocol label of a Cleat daemon's Tender publication.
+pub const CLEAT_PUBLICATION_LABEL: &str = "cleat";
+
+/// The Tender identity a vessel's Cleat daemon is published under (#4401), and its label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleatPublication {
+    pub scope: String,
+    pub name: String,
+    pub label: String,
+}
+
+impl CleatEndpoint {
+    /// The daemon generation's socket, as cleat lays it out: `daemon` is the generation
+    /// `cleat daemons` reports, never its alias.
+    pub fn socket(&self) -> PathBuf {
+        Path::new(&self.runtime_root).join(&self.daemon).join("socket")
+    }
+
+    /// The daemon's name without its generation (`default` for `default@3`).
+    pub fn logical_daemon(&self) -> &str {
+        self.daemon.split_once('@').map_or(self.daemon.as_str(), |(name, _)| name)
+    }
+
+    /// The publication of this daemon for the Vessel resource named `vessel`. It is named by the
+    /// logical daemon, so a generation handover keeps the identity, and by the Vessel resource
+    /// name as it is, so a vessel that moves host keeps it too.
+    pub fn publication(&self, vessel: &str) -> CleatPublication {
+        CleatPublication {
+            scope: format!("vessel/{vessel}"),
+            name: format!("cleat/{}", self.logical_daemon()),
+            label: CLEAT_PUBLICATION_LABEL.to_owned(),
+        }
+    }
+
+    /// The publication name of this daemon for sessions in no vessel on `host`. They are
+    /// published under that host's Tender instance scope (`tender/<fingerprint>`), which a viewer
+    /// learns from its Binding of this name, so the name carries the host.
+    pub fn host_publication_name(&self, host: &str) -> String {
+        format!("cleat/{host}/{}", self.logical_daemon())
+    }
+}
+
 /// One authoritative Project definition. Presence of this row makes an empty
 /// `repositories` list known-empty; absence means the definition is unavailable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
@@ -1453,13 +1496,29 @@ pub enum AgentActivity {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use chrono::{TimeZone, Utc};
 
     use super::{
-        AwarenessGrouping, AwarenessLimit, CheckoutRow, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId, QueryScope,
-        ResultDelta, ResultSet, ResultSetState, Rows, SessionPhase,
+        AwarenessGrouping, AwarenessLimit, CheckoutRow, CleatEndpoint, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges,
+        QueryId, QueryScope, ResultDelta, ResultSet, ResultSetState, Rows, SessionPhase,
     };
     use crate::{provider_data::Issue, HostName, IssueRef, IssueSource, IssueState, LifecycleAuthority, RepositoryKey, ResourceRef};
+
+    // A daemon's publication is named by its logical name whichever generation holds it, and its
+    // socket by that generation (#4401).
+    #[test]
+    fn a_cleat_daemon_publication_outlives_its_generation() {
+        let endpoint = |daemon: &str| CleatEndpoint { runtime_root: "/run/cleat".into(), daemon: daemon.into(), session: "s".into() };
+        for daemon in ["default", "default@1", "default@12"] {
+            let publication = endpoint(daemon).publication("convoy-7-work#3");
+            assert_eq!((publication.scope.as_str(), publication.name.as_str()), ("vessel/convoy-7-work#3", "cleat/default"), "{daemon}");
+            assert_eq!(publication.label, "cleat");
+        }
+        assert_eq!(endpoint("default@12").socket(), Path::new("/run/cleat/default@12/socket"));
+        assert_eq!(endpoint("default@12").host_publication_name("kiwi"), "cleat/kiwi/default");
+    }
 
     #[test]
     fn fleet_checkout_result_set_round_trip_preserves_host_authority_and_convoy_relationship() {

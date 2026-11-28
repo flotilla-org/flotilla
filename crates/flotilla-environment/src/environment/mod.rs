@@ -299,6 +299,12 @@ pub enum EntryKind {
 pub trait VesselAgent: Send + Sync {
     async fn ready(&self) -> Result<(), String>;
     async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String>;
+    /// A standing local socket reaching the Cleat daemon `daemon` (its logical name) at `guest`,
+    /// for publishing through Tender (#4401). It may not answer yet; Tender probes it.
+    async fn cleat_socket(&self, daemon: &str, guest: &Path) -> Result<PathBuf, String> {
+        let _ = daemon;
+        self.forward_socket(guest).await
+    }
     async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String>;
     /// Serve the socket `guest` in the vessel, and loopback `tcp` there when given,
     /// carrying each connection to the controller's Unix socket `controller`: the

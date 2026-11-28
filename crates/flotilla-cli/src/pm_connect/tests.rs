@@ -5,9 +5,10 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use flotilla_config::ConfigStore;
 use flotilla_manifest::{
     entity,
-    keys::{KEY_SOURCE, KEY_STATUS_STATE, SOURCE_FLOTILLA},
+    keys::{KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE, KEY_PRIMARY_DIRECT_REASON, KEY_SOURCE, KEY_STATUS_STATE, SOURCE_FLOTILLA},
     wire::{MetadataTarget, MetadataValue},
 };
 use flotilla_protocol::{
@@ -1622,20 +1623,6 @@ async fn reconnect_loop_backs_off_transient_sessions_and_resets_after_health() {
     }
 }
 
-// A remote-daemon connector identifies the viewer using its physical hostname,
-// even if its local configuration carries the remote daemon's identity.
-#[test]
-fn remote_connector_keeps_viewer_locality() {
-    use flotilla_protocol::HostName;
-    for configured in [None, Some("kiwi".to_string()), Some("custom-local".to_string())] {
-        assert_eq!(super::connector_local_host(true, configured.clone(), HostName::new("beaufort")), HostName::new("beaufort"));
-        assert_eq!(
-            super::connector_local_host(false, configured.clone(), HostName::new("beaufort")),
-            configured.map(HostName::new).unwrap_or_else(|| HostName::new("beaufort"))
-        );
-    }
-}
-
 // #2758: resource-watch admission reaches convoy catalog facts, including
 // replica-only records and deletion of ledger/message facts while the row stays.
 #[test]
@@ -2511,4 +2498,75 @@ fn issue_entity(service: &str, scope: impl AsRef<str>, number: impl AsRef<str>) 
     let address = flotilla_resources::address::stored_issue_address(service, scope.as_ref(), number.as_ref().parse().expect("number"), &[])
         .expect("a resolvable service");
     flotilla_manifest::entity::issue(&address)
+}
+
+// #4401: the viewer's Bindings are what its own Tender instance lists: a publication it carries is
+// listed reachable under its identity, one whose publisher is gone is not, and a viewer whose
+// Tender does not answer says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_viewers_bindings_are_what_its_tender_instance_lists() {
+    use tender_types::{api, Label, PublicationId};
+
+    let dir = flotilla_test_support::TestSocketDir::new();
+    let runtime = dir.path().join("run");
+    assert!(viewer_bindings(&Ok(runtime.clone())).await.unwrap_err().starts_with("no Tender instance reachable from this viewer at"));
+
+    let paths = tender::daemon::Paths { config: dir.path().join("config"), state: dir.path().join("state"), runtime: runtime.clone() };
+    let tender = tender::daemon::Daemon::start(paths).await.expect("tender starts");
+    let endpoint = dir.path().join("cleat.sock");
+    let listener = tokio::net::UnixListener::bind(&endpoint).expect("cleat socket");
+    let id = PublicationId::new("vessel/convoy-7-work#3", "cleat/default");
+    let publish = api::PublishEndpoint { id: id.clone(), label: Label("cleat".into()), display: String::new(), endpoint, audience: None };
+    let control = rigging_tls::client_builder().unix_socket(tender_types::paths::control_socket(&runtime)).build().expect("control client");
+    let post = |path: &str, body: Vec<u8>| {
+        control.post(format!("http://tender{path}")).header("content-type", "application/json").body(body).send()
+    };
+    let published = post(api::PUBLISH, serde_json::to_vec(&publish).expect("json")).await.expect("tender answers");
+    assert!(published.status().is_success(), "{published:?}");
+
+    let bindings = viewer_bindings(&Ok(runtime.clone())).await.expect("listed");
+    let binding = bindings.iter().find(|binding| binding.scope == id.scope.0 && binding.name == id.name).expect("bound");
+    assert_eq!(binding.reachable, Ok(()));
+
+    drop(listener);
+    let withdrawn = post(api::WITHDRAW, serde_json::to_vec(&id).expect("json")).await.expect("tender answers");
+    assert!(withdrawn.status().is_success(), "{withdrawn:?}");
+    let bindings = viewer_bindings(&Ok(runtime.clone())).await.expect("listed");
+    assert!(bindings.iter().filter(|binding| binding.name == id.name).all(|binding| binding.reachable.is_err()), "{bindings:?}");
+    tender.shutdown().await;
+
+    assert!(viewer_bindings(&Err("XDG_RUNTIME_DIR is unset".into())).await.unwrap_err().ends_with("XDG_RUNTIME_DIR is unset"));
+}
+
+// #4401: a session's direct facts follow the viewer's Bindings, not only its own row: a Binding
+// that appears or goes after the session was projected re-projects it on the next publish.
+#[test]
+fn a_change_in_the_viewers_bindings_reprojects_sessions_already_projected() {
+    let bindings = ViewerBindings::default();
+    let viewer = mint().with_bindings(bindings.clone());
+    let mut state = ConnectorState::default();
+    let mut row = independent_row("scratch", SessionPhase::Running);
+    row.cleat_endpoint = Some(flotilla_protocol::result_set::CleatEndpoint {
+        runtime_root: "/run/cleat".into(),
+        daemon: "default@1".into(),
+        session: "scratch".into(),
+    });
+    state.apply_event(&independents_set(1, vec![row]));
+    let session = |patches: Vec<MetadataPatch>| patches.into_iter().find(|patch| patch.target == independent_entity("scratch"));
+    let unbound = session(state.project_patches_at(&viewer, chrono::Utc::now(), None)).expect("projected");
+    assert!(unbound.set.contains_key(KEY_PRIMARY_DIRECT_REASON), "{unbound:?}");
+
+    let binding = |reachable| ViewerBinding { scope: "tender/f3e7".into(), name: "cleat/feta/default".into(), reachable };
+    state.take_bindings(&bindings, Ok(vec![binding(Ok(()))]));
+    let bound = session(state.project_patches_at(&viewer, chrono::Utc::now(), None)).expect("re-projected once bound");
+    assert_eq!(bound.set[KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE].value, MetadataValue::text("tender/f3e7"));
+
+    state.take_bindings(&bindings, Ok(vec![binding(Ok(()))]));
+    assert!(session(state.project_patches_at(&viewer, chrono::Utc::now(), None)).is_none(), "an unchanged listing re-projects nothing");
+
+    state.take_bindings(&bindings, Ok(vec![binding(Err("its publisher is unavailable".into()))]));
+    let gone = session(state.project_patches_at(&viewer, chrono::Utc::now(), None)).expect("re-projected once unavailable");
+    assert!(gone.unset.contains(&KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE.to_owned()), "{gone:?}");
+    assert!(gone.set.contains_key(KEY_PRIMARY_DIRECT_REASON), "{gone:?}");
 }

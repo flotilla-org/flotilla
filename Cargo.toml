@@ -114,6 +114,9 @@ rigging-http-wire = { git = "https://github.com/flotilla-org/rigging", branch = 
 rigging-condition = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
 # The webhook relay's wire types (flotilla-org/flotilla.work#1).
 rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+# Tender's control API and Binding paths (#4401); the daemon itself only in tests.
+tender-types = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+tender = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
 binnacle-cli = { git = "https://github.com/flotilla-org/binnacle", branch = "main", features = ["described", "clap"] }
 binnacle-core = { git = "https://github.com/flotilla-org/binnacle", branch = "main" }
 binnacle-described = { git = "https://github.com/flotilla-org/binnacle", branch = "main" }
