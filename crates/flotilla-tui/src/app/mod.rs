@@ -19,7 +19,7 @@ use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::{DaemonHandle, QuerySubscription};
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState,
-    ProvisioningTarget, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, ResourceRef, StepStatus, ViewAddress,
+    ProvisioningTarget, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, StepStatus, ViewAddress,
 };
 use indexmap::IndexMap;
 pub use open_views::{OpenView, OpenViews, ViewTarget};
@@ -576,26 +576,12 @@ impl App {
     }
 
     pub fn new(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>, config: Arc<ConfigStore>, theme: Theme) -> Self {
-        let app = Self::new_unreported(daemon, repos_info, config, theme, None);
-        app.report_active_view_focus();
-        app
+        Self::new_with_default_landing(daemon, repos_info, config, theme, None)
     }
 
     /// Construct the full TUI with an optional fresh-config landing View.
     /// Persisted `open-views.toml` entries always take precedence.
     pub fn new_with_default_landing(
-        daemon: Arc<dyn DaemonHandle>,
-        repos_info: Vec<RepoInfo>,
-        config: Arc<ConfigStore>,
-        theme: Theme,
-        landing: Option<(RepoIdentity, ViewAddress)>,
-    ) -> Self {
-        let app = Self::new_unreported(daemon, repos_info, config, theme, landing);
-        app.report_active_view_focus();
-        app
-    }
-
-    fn new_unreported(
         daemon: Arc<dyn DaemonHandle>,
         repos_info: Vec<RepoInfo>,
         config: Arc<ConfigStore>,
@@ -712,7 +698,7 @@ impl App {
         theme: Theme,
         address: ViewAddress,
     ) -> Self {
-        let mut app = Self::new_unreported(daemon, repos_info, config, theme, None);
+        let mut app = Self::new_with_default_landing(daemon, repos_info, config, theme, None);
         app.views = OpenViews::scoped(address);
         app.subscriptions_dirty = true;
         app.sync_active_view();
@@ -888,25 +874,6 @@ impl App {
     /// Re-derive tab-dependent state after any change to the active tab.
     pub fn sync_active_view(&mut self) {
         self.screen.invalidate_page_layout();
-        self.report_active_view_focus();
-    }
-
-    fn report_active_view_focus(&self) {
-        let targets = self.views.active_address().and_then(view_regard_target).into_iter().collect();
-        self.report_focus(targets);
-    }
-
-    pub(super) fn report_focus(&self, targets: Vec<ResourceRef>) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let daemon = Arc::clone(&self.daemon);
-        let surface_id = self.session_id;
-        runtime.spawn(async move {
-            if let Err(error) = daemon.observe_focus(surface_id, targets).await {
-                tracing::warn!(%error, "failed to report TUI focus");
-            }
-        });
     }
 
     pub fn dismiss_status_item(&mut self, id: usize) {
@@ -1488,25 +1455,6 @@ impl App {
 /// repository discovery from this surface's working directory.
 pub(crate) fn file_picker_start_dir() -> PathBuf {
     std::env::current_dir().ok().or_else(dirs::home_dir).unwrap_or_default()
-}
-
-fn view_regard_target(address: &ViewAddress) -> Option<ResourceRef> {
-    match address {
-        ViewAddress::Convoy { namespace, name } => Some(ResourceRef::new("flotilla.work/v1", "Convoy", namespace, name)),
-        ViewAddress::Vessel { namespace, convoy, vessel } => {
-            Some(ResourceRef::new("flotilla.work/v1", "Convoy", namespace, convoy).subresource(format!("vessels/{vessel}")))
-        }
-        ViewAddress::Project { namespace, name } => Some(ResourceRef::new("flotilla.work/v1", "Project", namespace, name)),
-        ViewAddress::Issues { scope } | ViewAddress::Checkouts { scope: Some(scope) } => {
-            Some(ResourceRef::new("flotilla.work/v1", "Project", &scope.namespace, &scope.name))
-        }
-        ViewAddress::Repo { repository_key: Some(key), .. } => Some(ResourceRef::new("flotilla.work/v1", "Repository", "flotilla", &key.0)),
-        ViewAddress::Overview
-        | ViewAddress::Convoys { .. }
-        | ViewAddress::Independents { .. }
-        | ViewAddress::Checkouts { scope: None }
-        | ViewAddress::Repo { repository_key: None, .. } => None,
-    }
 }
 
 #[cfg(test)]

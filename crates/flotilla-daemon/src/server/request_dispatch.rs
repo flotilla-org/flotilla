@@ -494,14 +494,6 @@ impl<'a> RequestDispatcher<'a> {
         }
     }
 
-    async fn dispatch_request_observe_focus(&self, id: u64, request: Request) -> Message {
-        // A surface's focus feeds no salience and is recorded nowhere.
-        let Request::ObserveFocus { .. } = request else {
-            return Message::error_response(id, "ObserveFocus request selected the wrong handler");
-        };
-        Message::ok_response(id, Response::ObserveFocus)
-    }
-
     async fn dispatch_request_subscribe_wait(&self, id: u64, request: Request) -> Message {
         let Request::SubscribeWait { subscription } = request else {
             return Message::error_response(id, "SubscribeWait request selected the wrong handler");
@@ -558,7 +550,6 @@ impl<'a> RequestDispatcher<'a> {
             Request::RecoverQueries { queries } => Box::pin(self.dispatch_request_recover_queries(id, &queries)).await,
             request @ Request::SubscribeQueries { .. } => Box::pin(self.dispatch_request_subscribe_queries(id, request)).await,
             request @ Request::FetchMore { .. } => Box::pin(self.dispatch_request_fetch_more(id, request)).await,
-            request @ Request::ObserveFocus { .. } => Box::pin(self.dispatch_request_observe_focus(id, request)).await,
             request @ Request::SubscribeWait { .. } => Box::pin(self.dispatch_request_subscribe_wait(id, request)).await,
             request @ Request::GetStatus => Box::pin(self.dispatch_request_get_status(id, request)).await,
             request @ Request::GetTopology => Box::pin(self.dispatch_request_get_topology(id, request)).await,

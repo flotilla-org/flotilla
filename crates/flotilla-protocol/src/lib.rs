@@ -385,10 +385,6 @@ pub enum Request {
     FetchMore {
         query: QueryId,
     },
-    /// Replace this connection's current set of focused resource targets.
-    ObserveFocus {
-        targets: Vec<ResourceRef>,
-    },
     /// Register an ephemeral, connection-owned OR-set of condition leaves.
     SubscribeWait {
         subscription: WaitSubscriptionRequest,
@@ -439,7 +435,6 @@ pub enum Response {
     SubscribeQueries(Vec<DaemonEvent>),
     RecoverQueries(Vec<DaemonEvent>),
     FetchMore,
-    ObserveFocus,
     WaitSubscribed {
         subscription_id: uuid::Uuid,
     },

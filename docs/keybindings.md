@@ -28,9 +28,7 @@
 | `a` | Add repo tab |
 | `c` | Toggle providers panel |
 
-On convoy vessel rows, `a` attaches to the vessel's TerminalSession. `o` emits
-only a focus Regard for the convoy or vessel; the connected PM owns realization
-from its catalog recipe. It does not create or select a workspace directly.
+On convoy vessel rows, `a` attaches to the vessel's TerminalSession.
 
 The personal `workspace [select]`, `repo prepare-terminal`, and `agent teleport`
 CLI commands have been retired. Checkout, including `repo checkout --env`,

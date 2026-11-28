@@ -1264,13 +1264,6 @@ impl DaemonHandle for SocketDaemon {
         self.execute_keyed(command, None).await
     }
 
-    async fn observe_focus(&self, _surface_id: uuid::Uuid, targets: Vec<flotilla_protocol::ResourceRef>) -> Result<(), String> {
-        match into_success_response(self.request(Request::ObserveFocus { targets }).await?)? {
-            Response::ObserveFocus => Ok(()),
-            other => Err(format!("unexpected response for focus observation: {other:?}")),
-        }
-    }
-
     /// Execute a query command and return the result directly.
     ///
     /// The `session_id` parameter is ignored by `SocketDaemon` because cursor

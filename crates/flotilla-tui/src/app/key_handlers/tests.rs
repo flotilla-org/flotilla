@@ -1,5 +1,3 @@
-use std::sync::{Arc, Mutex};
-
 use crossterm::event::KeyCode;
 use flotilla_protocol::{qualified_path::HostId, CommandAction, EnvironmentId, HostName, NodeId, NodeInfo, RepoSelector, ViewAddress};
 
@@ -39,13 +37,8 @@ use crate::{
         test_support::{key, stub_app},
         PeerStatus, TuiHostState,
     },
-    pm_open::OpenInPmTarget,
     table_view::{ProjectPanelKind, RowId, TableIntent, TableIssueStart},
 };
-
-fn pm_target(host: HostName) -> OpenInPmTarget {
-    OpenInPmTarget { namespace: "dev".into(), convoy: "tables".into(), vessel: Some("implement".into()), host: Some(host) }
-}
 
 fn issue(id: &str, ready: bool) -> TableIssueStart {
     TableIssueStart {
@@ -80,23 +73,6 @@ fn insert_peer_host(model: &mut crate::app::TuiModel, name: &str) {
             },
         },
     );
-}
-
-// Opening in the PM emits focus for any home, even without a connected PM.
-#[tokio::test]
-async fn open_in_pm_emits_focus_without_a_connector() {
-    let observations = Arc::new(Mutex::new(Vec::new()));
-    let daemon = super::super::test_support::StubDaemon::builder().observations(observations.clone()).build();
-    let mut app = super::super::test_support::stub_app_with_daemon(Arc::new(daemon), vec![]);
-    for host in [HostName::local(), HostName::new("remote")] {
-        let target = pm_target(host);
-        let reference = target.resource_ref();
-        app.execute_table_intent(TableIntent::OpenInPm(target));
-        tokio::task::yield_now().await;
-        assert_eq!(observations.lock().expect("focus observations").last(), Some(&(app.session_id, vec![reference])));
-        assert!(app.proto_commands.take_next().is_none());
-        assert!(app.model.status_message.is_none());
-    }
 }
 
 #[test]

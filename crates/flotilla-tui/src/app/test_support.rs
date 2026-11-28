@@ -23,7 +23,6 @@ use crate::{
     widgets::{file_picker::FilePickerWidget, WidgetContext},
 };
 
-type FocusObservations = Arc<Mutex<Vec<(uuid::Uuid, Vec<flotilla_protocol::ResourceRef>)>>>;
 pub(crate) type ExecuteCalls = Arc<Mutex<Vec<Command>>>;
 pub(crate) type QueryCalls = Arc<Mutex<Vec<(Command, uuid::Uuid)>>>;
 
@@ -47,8 +46,6 @@ pub(crate) struct StubDaemon {
     execute_calls: ExecuteCalls,
     #[builder(default = Arc::new(Mutex::new(Vec::new())))]
     query_calls: QueryCalls,
-    #[builder(default = Arc::new(Mutex::new(Vec::new())))]
-    observations: FocusObservations,
 }
 
 static STUB_APP_CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -141,11 +138,6 @@ impl DaemonHandle for StubDaemon {
 
     async fn get_topology(&self) -> Result<TopologyResponse, String> {
         Err("stub".into())
-    }
-
-    async fn observe_focus(&self, surface_id: uuid::Uuid, targets: Vec<flotilla_protocol::ResourceRef>) -> Result<(), String> {
-        self.observations.lock().expect("observations lock").push((surface_id, targets));
-        Ok(())
     }
 }
 
