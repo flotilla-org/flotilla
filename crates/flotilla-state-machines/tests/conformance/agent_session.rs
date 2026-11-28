@@ -12,6 +12,7 @@
 //! Live and Ended retain the same lifecycle labels, carrying that observation
 //! as data alongside their channel or reason.
 
+use flotilla_quint_testkit::agent_session::agent_session_request;
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::agent_session::{AgentSession, AgentSessionRefusal, Attach, Detach, End, EndReason, MemoryAgentSessionWorld, Receive},
@@ -47,7 +48,7 @@ impl Conformance for SessionConformance {
 
     fn create(_: &Value) -> Home<AgentSession> {
         let mut home = Home::<AgentSession>::new("home").expect("valid declaration");
-        home.create(NAME, (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("created");
+        home.create(NAME, agent_session_request(), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("created");
         home
     }
 

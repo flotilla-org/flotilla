@@ -2,6 +2,7 @@
 //! stored kind, declared by its spec, with pinned kind codes; a resource survives the schema codec,
 //! and an applied edge gives the stored edge persisting it.
 
+use flotilla_quint_testkit::agent_session::agent_session_request;
 use std::collections::BTreeSet;
 
 use flotilla_schema::{
@@ -160,7 +161,7 @@ fn resources_survive_the_codec() {
     assert_eq!((message.spec(), message.since()), (&spec, Timestamp(1)));
 
     let mut sessions = Home::<AgentSession>::new("home").expect("valid");
-    sessions.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(2)).expect("created");
+    sessions.create("s", agent_session_request(), &MemoryAgentSessionWorld::default(), Timestamp(2)).expect("created");
     round_trip(&sessions, "s");
 
     let mut convoys = Home::<Convoy>::new("home").expect("valid");

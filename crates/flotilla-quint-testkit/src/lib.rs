@@ -1,4 +1,5 @@
 //! Dev-only Quint machinery shared by engine and backend tests.
+pub mod agent_session;
 pub mod graph;
 pub mod itf;
 pub mod lifecycle;

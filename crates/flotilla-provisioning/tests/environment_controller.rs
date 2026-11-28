@@ -351,6 +351,7 @@ impl World {
             cwd: "/w".into(),
             env: BTreeMap::new(),
             source: Launch::Tool { command: "sh".into() },
+            agent_session: None,
         };
         self.terminals.request(name, request, now()).expect("terminal");
     }

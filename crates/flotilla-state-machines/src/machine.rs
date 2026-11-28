@@ -16,7 +16,7 @@ use std::{
     marker::PhantomData,
 };
 
-use flotilla_schema::{Code, CodeEnum, RecordsFull};
+use flotilla_schema::{Code, CodeEnum, Described, RecordsFull};
 
 use crate::{code::changed, Admission, Coded, Edge, EdgeArg, Handle, StateValue};
 
@@ -28,6 +28,8 @@ pub trait Machine: Sized + 'static {
     /// ADR 0047 additive integer/bool columns absent from the previous generation.
     /// (table field, column, default); an empty table field names the root.
     const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = &[];
+    /// What the root table's columns mean to a surface (#4438).
+    const DESCRIBED: &'static [Described] = &[];
     /// What a caller asks for when it creates a resource.
     type Request;
     /// What admission fixes. Its columns and collections never change after

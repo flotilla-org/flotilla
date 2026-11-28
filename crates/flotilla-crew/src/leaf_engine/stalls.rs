@@ -293,10 +293,10 @@ fn unhooked_session<'a>(
     (!agent.is_some_and(|agent| agent.hook_seen_since(started))).then_some((crew.adapter.as_str(), vessel.as_str(), started))
 }
 
-/// The AgentSession of crew session `session`: the launch its view shows, at the home its record
-/// came from.
+/// The AgentSession of crew session `session`: the one its view's launch declares, at the home its
+/// record came from.
 pub(super) fn session_key(session: &ResourceObject<TerminalSession>) -> Option<SessionKey> {
-    let name = flotilla_resources::terminal_records::launch_of(session)?;
+    let name = flotilla_resources::terminal_records::agent_session_of(session)?;
     Some((name.to_owned(), session.metadata.annotations.get(flotilla_resources::ORIGIN_ROOT_ANNOTATION).cloned()))
 }
 
@@ -1671,7 +1671,7 @@ impl ReconcilerWake {
                     flotilla_resources::ResourceProvenance::Local => None,
                     flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str().to_owned()),
                 };
-                self.agent_view_at(tick, &(flotilla_resources::terminal_records::launch_of(&source.object)?.to_owned(), origin))
+                self.agent_view_at(tick, &(flotilla_resources::terminal_records::agent_session_of(&source.object)?.to_owned(), origin))
             });
             match agent.as_ref().map(|agent| (agent, agent.live_activity())) {
                 Some((agent, _)) if !agent.current => {

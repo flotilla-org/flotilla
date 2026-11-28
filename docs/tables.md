@@ -14,7 +14,7 @@ Fenced blocks tagged `list <name>` below (routes, messages, column types, `where
 
 All are `GET`. The caller must be a user (socket, bearer or session); anonymous callers get `401`, environment and hook tokens get `403`, code `unauthorized`.
 
-- `/tables` lists the kinds: `{"kinds":[{"kind","root","tables":[...]}]}`. `root` is the kind's root table; `tables` are the names usable in the other two routes. Engine kinds are listed only when the daemon has its store.
+- `/tables` lists the kinds: `{"kinds":[{"kind","root","tables":[...],"subjects":[...],"facets":[...]}]}`. `root` is the kind's root table; `tables` are the names usable in the other two routes. Engine kinds are listed only when the daemon has its store. `subjects` and `facets`, present only where a kind has some, name the tables a surface builds its tree and opens from ([Subjects, parents and facets](#subjects-parents-and-facets)).
 - `/tables/{table}` describes one table (below).
 - `/tables/{table}/rows` streams row messages.
 
@@ -137,8 +137,9 @@ Order: `[resync]` (bad cursor only), `table`, `[count]`, `[values]`…, one or m
 {
   "fields": [ { "name": "…", "type": "…", "constraints": {"required": true}, … } ],
   "primaryKey": ["…"],
-  "foreignKeys": [ { "fields": ["…"], "reference": {"resource": "…", "fields": ["…"]} } ],
-  "subject": {"kind": "convoy", "field": "address"}
+  "foreignKeys": [ { "fields": ["…"], "reference": {"resource": "…", "fields": ["…"]}, "relation": "parent" } ],
+  "subject": {"kind": "convoy", "field": "address"},
+  "facets": [ {"recipe": "command", "label": "Attach", "argv": ["flotilla", "attach", "{address}"]} ]
 }
 ```
 
@@ -159,6 +160,7 @@ Each field has:
 - A stored table's subject is registered by the crate owning its kind, through the same `VerbRegistry` as its verbs (`flotilla_verbs::SubjectTable`): the kind, the table serving it, and how a row finds its canonical address, the one the kind's lookup selects. The table carries that address in a derived `address` field. The daemon names no kind.
 - `convoys` rows are convoys (registered by `flotilla-store`): a live standing convoy's address names its role, `project:<project>/convoy:<role>`, and any other convoy's names its record, `project:<project>/convoy:<record name>`, or `convoy:<record name>` for a convoy without a project, taking the project from the convoy's `flotilla.work/project` label. This is the address `ConvoyName` selects by, so each row's address names that row's convoy wherever a convoy address is taken.
 - An engine table's subject is registered the same way. Its `address` is derived as rows are read, so a `where` reading it is evaluated after the store's read. A subject's row is read at the daemon's own home, by the record name its address names (`flotilla_address::record_name`), and is that subject's only when the row's own address is the one given.
+- `agent_session` rows are sessions (registered by `flotilla-engine-messages`), addressed `host:<convoy home>/convoy:<convoy>/role:<role>/session:<name>`. A session an earlier build created names no convoy and has no address.
 - A described table declares its subject with `Layout::subject`, naming one of its address fields.
 - The subject field is always returned, as key columns are, whatever `columns` asks for.
 
@@ -233,10 +235,19 @@ sortable
 whereOperators
 ```
 
-- `roles`: an array of strings. In use: `key` (part of the primary key), `ref` (identifies a resource), `state` (a state label), `since` (when a state was entered), `sequence` (log position), `time` (an event time), `transition-from` and `transition-to` (the states an event moved between).
+- `roles`: an array of strings. In use: `key` (part of the primary key), `ref` (identifies a resource), `state` (a state label), `since` (when a state was entered), `sequence` (log position), `time` (an event time), `transition-from` and `transition-to` (the states an event moved between); `caption` and `badge`, a card's ([Subjects, parents and facets](#subjects-parents-and-facets)).
 - `title`: a display name.
 - `sortable`: whether `sort` accepts the column.
 - `whereOperators`: the operators `where` accepts on the column, by its type ([Conditions](#conditions)); an empty array means it cannot be filtered.
+
+## Subjects, parents and facets
+
+A surface builds its tree, cards and opens from the descriptions alone, in binnacle-described's vocabulary (#4438). A kind declares what its root table means in `Machine::DESCRIBED` (`flotilla_schema::Described`); storage reads none of it.
+
+- **Subjects** are the tables whose description names a `subject`: `convoys` and `agent_session`. Every subject opens by the command facet `flotilla attach {address}`.
+- **Parents.** A foreign key with `relation: parent` names the row's parent: an agent session's `convoy`. Nothing links back; a surface finds children by their keys. A session's `vessel` is a plain key, for routing and badges.
+- **Facets** are ways to open a row, described where their facts live: a `recipe`, a `label`, and an `endpoint` map from recipe field to table field, or a command `argv` of templates (`{field}`, `{address}`). A row's facet opens the row its `facet-of` key names, else its own subject. A terminal launch's `agent_session`, set for an agent's launch only, makes its `cleat-session` (`session` = `identity`, `pool`, `host` = `resource.home`) open its agent session; it is reachable while `state` is `Realised`, and an ended one gives its `ending` as the reason.
+- **Cards** show `caption`, `state`, `since` and the `badge` fields of the row and of the rows its keys name: a session's `activity`, a launch's `source_adapter` and `source_model`, an environment's `provider`, a vessel's `host` and `class`.
 
 ## Which tables exist
 

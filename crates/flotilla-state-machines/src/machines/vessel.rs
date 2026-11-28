@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_schema::Stored;
+use flotilla_schema::{Described, Stored};
 
 use super::{
     convoy::{ConvoyId, Priority, VesselClass},
@@ -39,6 +39,9 @@ pub struct VesselKind;
 impl LifecycleKind for VesselKind {
     const NAME: &'static str = "Vessel";
     type Request = VesselSpec;
+    // A vessel is no tree level: what runs on it reaches it by key for these badges.
+    const DESCRIBED: &'static [Described] =
+        &[Described::Role { column: "host", role: "badge" }, Described::Role { column: "class", role: "badge" }];
     fn launch(request: &VesselSpec) -> Option<(&str, u64)> {
         Some((&request.launch_of, request.launch))
     }

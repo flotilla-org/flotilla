@@ -1,6 +1,6 @@
 //! SQLite table source. All store operations run on blocking workers.
 use super::{Query, Row, Table};
-use flotilla_schema::{ColumnType, Value as Cell};
+use flotilla_schema::{ColumnType, Described, Value as Cell};
 use flotilla_schema_sqlite::stream::Service;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::Arc};
@@ -20,7 +20,17 @@ pub(super) async fn list(service: &Arc<Service>) -> Result<Vec<Value>, String> {
             .map(|set| {
                 let names: Vec<_> =
                     set.tables.iter().map(|table| table.name.clone()).chain(std::iter::once(set.log_projection().name)).collect();
-                json!({"kind":set.kind,"root":set.tables[0].name,"tables":names})
+                let facets: Vec<_> = set
+                    .tables
+                    .iter()
+                    .filter(|table| table.described.iter().any(|mark| matches!(mark, Described::Facet { .. } | Described::Command { .. })))
+                    .map(|table| &table.name)
+                    .collect();
+                let mut kind = json!({"kind":set.kind,"root":set.tables[0].name,"tables":names});
+                if !facets.is_empty() {
+                    kind["facets"] = json!(facets);
+                }
+                kind
             })
             .collect())
     })

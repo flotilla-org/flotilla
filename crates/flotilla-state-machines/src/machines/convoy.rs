@@ -43,7 +43,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_address::Template;
-use flotilla_schema::{Address, Edge as StoredEdge, EdgeError, Frozen, Position, Records, RecordsFull, RecordsOf, State, Stored};
+use flotilla_schema::{
+    Address, Described, Edge as StoredEdge, EdgeError, Frozen, Position, Records, RecordsFull, RecordsOf, State, Stored,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -1047,6 +1049,7 @@ pub struct Convoy;
 
 impl Machine for Convoy {
     const NAME: &'static str = "Convoy";
+    const DESCRIBED: &'static [Described] = &[Described::Role { column: "launch_of", role: "caption" }];
     type Request = ConvoyRequest;
     type Spec = ConvoySpec;
     type State = ConvoyState;

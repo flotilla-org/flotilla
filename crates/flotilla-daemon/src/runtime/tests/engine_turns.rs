@@ -7,6 +7,7 @@
 //! passes run on events, never on a timer.
 
 use flotilla_engine_messages::MessagePrimitives;
+use flotilla_engine_messages_testkit::agent_session_request;
 use flotilla_resources::{MessagePhase, MessageRelation};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::machines::agent_session::Activity;
@@ -109,8 +110,10 @@ fn request_crew_session(
     })
 }
 
-/// Marks crew launch `launch` running its agent under pool session `session`.
+/// Marks crew launch `launch` running its agent under pool session `session`, with its AgentSession
+/// as its first hook creates it.
 fn run_crew_session(daemon: &Arc<InProcessDaemon>, adapter: &str, launch: &str, session: &str) {
+    daemon.message_primitives().sessions().ensure(launch, agent_session_request(), Timestamp(0)).expect("the launch's session");
     let agent =
         flotilla_resources::terminal_records::AgentLaunch { adapter: adapter.into(), model: None, stance: "trusted-implicit".into() };
     engine(daemon).terminals.ready(

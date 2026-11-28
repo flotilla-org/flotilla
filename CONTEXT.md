@@ -536,6 +536,13 @@ through **Role Bindings** (ADR 0059).
 _Avoid_: Holder (retired), session (bare: cloud agents, cleat and zellij all
 claim it), TerminalSession, agent (the abstract notion).
 
+**Facet**:
+One way to open a subject: a recipe naming an endpoint (`cleat-session`, a
+command, …). It is described in the table its facts already live in, never
+stored on its own: an agent's terminal launch is a facet of the AgentSession it
+declares. Opening a facet never starts anything (#4438).
+_Avoid_: form, view, pane.
+
 **Role Binding**:
 The record that an **AgentSession** fills a **Role Address**, from when until
 when, kept with history. A role resolves to the AgentSession its current

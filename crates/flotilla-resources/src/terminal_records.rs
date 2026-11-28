@@ -87,6 +87,8 @@ pub struct TerminalRecord {
     pub reading: LifecycleReading,
     /// What it was given when it was realised; none before.
     pub facts: Option<TerminalLaunchFacts>,
+    /// The AgentSession an agent's launch is the terminal of, at its home; none for a tool's.
+    pub agent_session: Option<String>,
 }
 
 impl TerminalRecord {
@@ -95,9 +97,9 @@ impl TerminalRecord {
         launched(&self.name)
     }
 
-    /// Its crew's id: the launch name, for an agent's launch. Unique only within its home.
+    /// Its crew's id: its AgentSession's name, for an agent's launch. Unique only within its home.
     pub fn crew_id(&self) -> Option<&str> {
-        matches!(self.source, TerminalLaunchSource::Agent { .. }).then_some(self.name.as_str())
+        self.agent_session.as_deref()
     }
 
     /// The pool's session id it runs under, once realised.
@@ -175,10 +177,18 @@ impl TerminalRecord {
 /// it can tell a session's next launch from this one.
 pub const LAUNCH_ANNOTATION: &str = "flotilla.work/launch";
 
-/// The launch read view `session` shows, which also names its crew's AgentSession; none for a
-/// view that was not read from a launch.
+/// The launch read view `session` shows; none for a view that was not read from a launch.
 pub fn launch_of(session: &crate::ResourceObject<crate::TerminalSession>) -> Option<&str> {
     session.metadata.annotations.get(LAUNCH_ANNOTATION).map(String::as_str)
+}
+
+/// The read view's annotation naming the AgentSession its launch declares (#4438).
+pub const AGENT_SESSION_ANNOTATION: &str = "flotilla.work/agent-session";
+
+/// The AgentSession whose terminal read view `session` shows, at the launch's home; none for a
+/// tool's launch.
+pub fn agent_session_of(session: &crate::ResourceObject<crate::TerminalSession>) -> Option<&str> {
+    session.metadata.annotations.get(AGENT_SESSION_ANNOTATION).map(String::as_str)
 }
 
 /// What a launch's holder Vessel says about it, joined in for readers of the old shape.
@@ -220,6 +230,7 @@ impl TerminalRecord {
         };
         let mut labels = BTreeMap::from([(ROLE_LABEL.to_owned(), self.role.clone())]);
         let mut annotations = BTreeMap::from([(LAUNCH_ANNOTATION.to_owned(), self.name.clone())]);
+        annotations.extend(self.agent_session.clone().map(|session| (AGENT_SESSION_ANNOTATION.to_owned(), session)));
         let mut owner_references = Vec::new();
         if let Some(vessel) = &self.vessel {
             labels.insert(VESSEL_REF_LABEL.to_owned(), vessel.clone());
@@ -590,6 +601,7 @@ mod tests {
             since: DateTime::UNIX_EPOCH,
             reading: LifecycleReading::InProgress,
             facts: None,
+            agent_session: None,
         }
     }
 

@@ -1,6 +1,7 @@
 //! The verb route through the router (#4197): the `verbs` table lists native verbs, and
 //! `POST /verbs/{name}` re-checks, runs once per subject, passes the invocation id into the effect
 //! and traces the invocation.
+use flotilla_engine_messages_testkit::agent_session_request;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -625,7 +626,7 @@ async fn an_engine_kinds_row_address_acts_on_that_rows_record() {
         Home::<AgentSession, flotilla_engine_store::StoreLog>::with_log("home", flotilla_engine_store::StoreLog::new(service.store()))
             .unwrap();
     for (name, at) in [("s-1", 1), ("s-2", 2), ("s-3", 3)] {
-        sessions.create(name, (), &MemoryAgentSessionWorld::default(), flotilla_schema::Timestamp(at)).unwrap();
+        sessions.create(name, agent_session_request(), &MemoryAgentSessionWorld::default(), flotilla_schema::Timestamp(at)).unwrap();
     }
     let mut registry = VerbRegistry::new();
     registry.register_subject(sessions_of_coder()).unwrap();

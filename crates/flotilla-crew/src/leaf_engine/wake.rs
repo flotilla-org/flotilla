@@ -409,7 +409,7 @@ impl ReconcilerWake {
                         schedule.session_changed(&(name.clone(), origin.clone()));
                         let sessions = views.sessions.shared_list().await.map_err(|error| error.to_string())?;
                         let running = sessions.items.iter().filter(|session| {
-                            flotilla_resources::terminal_records::launch_of(&session.object) == Some(name.as_str())
+                            flotilla_resources::terminal_records::agent_session_of(&session.object) == Some(name.as_str())
                                 && session.object.metadata.annotations.get(flotilla_resources::ORIGIN_ROOT_ANNOTATION) == origin.as_ref()
                         });
                         let selected = running.filter_map(|session| session.object.metadata.labels.get(flotilla_resources::CONVOY_LABEL).cloned()).collect();

@@ -10,7 +10,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use flotilla_address::Address;
 use flotilla_protocol::table::{Message, Row, ValueCount};
 use flotilla_resources::{ResourceError, WatchStart};
-use flotilla_schema::{ColumnType, Filterable, Layout, Table, TableSet};
+use flotilla_schema::{ColumnType, Described, Filterable, Layout, Table, TableSet};
 use flotilla_store::{
     get_resource_kind, query_resource_kind, subject_record_name, watch_resource_kind_from, ResourceBackend, StoreQuery,
     REGISTERED_RESOURCE_KINDS,
@@ -37,6 +37,8 @@ const PROGRESS: Duration = Duration::from_secs(15);
 const KEY: &str = "metadata.name";
 /// The derived field holding a subject row's address (#4199).
 pub(crate) const ADDRESS: &str = "address";
+/// Every subject opens by attaching to its address (#4438).
+const ATTACH: Described = Described::Command { label: "Attach", argv: &["flotilla", "attach", "{address}"] };
 
 /// The subject tables the kinds' owning crates register (#4355): which table serves each subject
 /// kind, and how its rows find their address. The daemon names no kind.
@@ -700,6 +702,16 @@ impl TableSource {
         if let Some(service) = &catalog.service {
             kinds.extend(decided::list(service).await?);
         }
+        // A surface finds the tables it builds its tree from without a compiled-in list (#4438).
+        for kind in &mut kinds {
+            let listed = |field: &str| kind[field].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned);
+            let subjects: Vec<String> = listed("tables").filter(|table| catalog.subjects.of_table(table).is_some()).collect();
+            if !subjects.is_empty() {
+                let facets: BTreeSet<String> = listed("facets").chain(subjects.iter().cloned()).collect();
+                kind["facets"] = json!(facets);
+                kind["subjects"] = json!(subjects);
+            }
+        }
         Ok(json!({"kinds":kinds}))
     }
     pub(crate) fn open(name: String, catalog: &Catalog) -> Result<Self, Failure> {
@@ -772,7 +784,10 @@ impl TableSource {
     pub(crate) fn describe_stored(&self) -> Result<Description, Failure> {
         match self {
             Self::Resource { name, subject, .. } => {
-                let table = descriptor(name, subject.as_ref());
+                let mut table = descriptor(name, subject.as_ref());
+                if subject.is_some() {
+                    table.described.push(ATTACH);
+                }
                 Ok(Description { schema: table.frictionless(), markdown: flotilla_schema::render_table_view(&table), table })
             }
             Self::Decided { service, name, subject } => {
@@ -809,6 +824,7 @@ impl TableSource {
                     address.properties.insert("title".into(), json!("Address"));
                     table.columns.push(address);
                     table.subject = Some(flotilla_schema::Subject { kind: subject.kind, field: ADDRESS.into() });
+                    table.described.push(ATTACH);
                 }
                 mark_scalar_columns(&mut table);
                 Ok(Description { schema: set.frictionless(&table), table, markdown })

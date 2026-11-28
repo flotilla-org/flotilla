@@ -351,7 +351,7 @@ impl FleetService {
                 None => role.clone(),
             };
             let origin = remote_origin.map(NodeId::as_str);
-            let launch = flotilla_resources::terminal_records::launch_of(&session);
+            let launch = flotilla_resources::terminal_records::agent_session_of(&session);
             let agent = match launch.map(|launch| lifecycles.agent_sessions().and_then(|reads| reads.read(launch, origin))).transpose() {
                 Ok(agent) => agent.flatten(),
                 Err(error) => {

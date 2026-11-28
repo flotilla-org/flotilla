@@ -109,6 +109,32 @@ pub struct Table {
     pub aliases: Vec<(String, String)>,
     /// What each row is about, when its rows are subjects of one address kind (#4199).
     pub subject: Option<Subject>,
+    /// What its columns mean to a surface (#4438); storage reads none of it.
+    pub described: Vec<Described>,
+}
+
+/// One mark binnacle-described reads from a table's description (#4438): a card role, a
+/// reference's relation to the row it names, or a way the row opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Described {
+    /// The column takes `role`, such as a card's `caption` or `badge`.
+    Role { column: &'static str, role: &'static str },
+    /// The reference column names the row's parent.
+    Parent(&'static str),
+    /// The reference column names the row this row is a way to open.
+    FacetOf(&'static str),
+    /// A facet whose recipe reads each field from a column, reachable while `state` holds one of
+    /// `reachable`, else unreachable for the reason `reason` holds.
+    Facet {
+        recipe: &'static str,
+        label: &'static str,
+        endpoint: &'static [(&'static str, &'static str)],
+        state: &'static str,
+        reachable: &'static [&'static str],
+        reason: &'static str,
+    },
+    /// A command facet: `argv` templates filled from the row's fields and `{address}`.
+    Command { label: &'static str, argv: &'static [&'static str] },
 }
 
 /// The subject of a table's rows (#4182 ruling 1): the ADR 0066 address kind of each row's

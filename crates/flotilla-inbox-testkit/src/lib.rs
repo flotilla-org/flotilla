@@ -1,4 +1,5 @@
 //! One contract suite for every backend, including backends outside this repo.
+use flotilla_quint_testkit::agent_session::agent_session_request;
 use std::sync::{
     atomic::{AtomicI64, Ordering},
     Arc, Mutex,
@@ -79,7 +80,7 @@ pub struct SessionPort<L: Log<AgentSession>> {
 impl<L: Log<AgentSession>> SessionPort<L> {
     pub fn new(name: &str, log: L) -> Self {
         let mut home = Home::with_log("test", log).expect("session declaration");
-        home.create(name, (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("create consumer");
+        home.create(name, agent_session_request(), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("create consumer");
         Self { home, name: name.into() }
     }
     pub fn resource(&self) -> &Resource<AgentSession> {

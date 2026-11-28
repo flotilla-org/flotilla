@@ -8,9 +8,13 @@
 use std::collections::BTreeMap;
 
 use flotilla_resources::TerminalBrief;
-use flotilla_schema::{Frozen, IndexQuery, Ref, Stored};
+use flotilla_schema::{Described, Frozen, IndexQuery, Ref, Stored};
 use flotilla_state_machines::{
-    machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
+    launch_name,
+    machines::{
+        agent_session::AgentSession,
+        lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
+    },
     Resource,
 };
 
@@ -25,9 +29,26 @@ impl LifecycleKind for TerminalSessionKind {
     fn launch(request: &TerminalSessionRequest) -> Option<(&str, u64)> {
         Some((&request.launch_of, request.launch))
     }
+    /// An agent's launch is the terminal of the AgentSession named as the launch.
     fn numbered(request: TerminalSessionRequest, launch: u64) -> TerminalSessionRequest {
-        TerminalSessionRequest { launch, ..request }
+        let agent_session = matches!(request.source, Launch::Agent { .. })
+            .then(|| Ref::new(launch_name(&request.launch_of, launch), request.environment.home.clone()));
+        TerminalSessionRequest { launch, agent_session, ..request }
     }
+    const DESCRIBED: &'static [Described] = &[
+        Described::FacetOf("agent_session"),
+        Described::Role { column: "role", role: "caption" },
+        Described::Role { column: "source_adapter", role: "badge" },
+        Described::Role { column: "source_model", role: "badge" },
+        Described::Facet {
+            recipe: "cleat-session",
+            label: "Terminal",
+            endpoint: &[("host", "resource.home"), ("pool", "pool"), ("session", "identity")],
+            state: "state",
+            reachable: &["Realised"],
+            reason: "ending",
+        },
+    ];
 }
 
 impl super::Launches for TerminalSessionKind {
@@ -55,7 +76,8 @@ pub type TerminalSession = Lifecycle<TerminalSessionKind>;
     index(name = "by_environment", eq(environment)),
     index(name = "by_holder", eq(holder), when(holder is_some)),
     // A name's launches in launch order: the newest is the last.
-    index(name = "by_launch", eq(launch_of), order(launch))
+    index(name = "by_launch", eq(launch_of), order(launch)),
+    index(name = "by_agent_session", eq(agent_session), when(agent_session is_some))
 )]
 pub struct TerminalSessionRequest {
     /// The name this is a launch of (`terminal-<vessel>-<role>`), interned (domain `ln`).
@@ -81,6 +103,8 @@ pub struct TerminalSessionRequest {
     #[store(child)]
     pub env: BTreeMap<String, String>,
     pub source: Launch,
+    /// Set by `numbered` for an agent's launch; ADR 0047: none on one an earlier build created.
+    pub agent_session: Option<Ref<Resource<AgentSession>>>,
 }
 
 /// What the session runs.

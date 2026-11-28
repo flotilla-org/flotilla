@@ -2017,7 +2017,7 @@ impl Aggregator {
         self.terminal_sessions
             .values()
             .filter(|session| {
-                flotilla_resources::terminal_records::launch_of(&session.object) == Some(key.name.as_str())
+                flotilla_resources::terminal_records::agent_session_of(&session.object) == Some(key.name.as_str())
                     && self.agent_session_home_of(session).as_ref() == Some(&key.home)
             })
             .filter_map(|session| {
@@ -2044,7 +2044,7 @@ impl Aggregator {
         let heard = self.agent_session_heard.get(&home).copied();
         let current = own || agent_activity::home_current(heard, now);
         let stale_at = heard.filter(|_| current && !own).map(agent_activity::home_stale_at);
-        let name = flotilla_resources::terminal_records::launch_of(&session.object)?.to_owned();
+        let name = flotilla_resources::terminal_records::agent_session_of(&session.object)?.to_owned();
         let reading = self.agent_sessions.get(&AgentSessionKey { home, name })?.clone();
         Some(AgentActivityView { reading, current, stale_at, progress: None })
     }
@@ -5490,7 +5490,10 @@ mod tests {
             .create(
                 &InputMeta::builder()
                     .name(name.to_string())
-                    .annotations(BTreeMap::from([(flotilla_resources::terminal_records::LAUNCH_ANNOTATION.to_string(), test_launch(name))]))
+                    .annotations(BTreeMap::from([
+                        (flotilla_resources::terminal_records::LAUNCH_ANNOTATION.to_string(), test_launch(name)),
+                        (flotilla_resources::terminal_records::AGENT_SESSION_ANNOTATION.to_string(), test_launch(name)),
+                    ]))
                     .build(),
                 &TerminalSessionSpec::builder()
                     .env_ref("local".to_string())

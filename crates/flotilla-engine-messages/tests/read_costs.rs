@@ -3,6 +3,7 @@
 //! by name loads and converts only the messages it answers with. The generic verb's listing is the
 //! one read that loads the whole table.
 
+use flotilla_engine_messages_testkit::agent_session_request;
 use std::future::Future;
 
 use flotilla_address::Address;
@@ -53,7 +54,10 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     let home = EngineMessagesHome::open("home-a", NAMESPACE, &backend);
     let primitives = home.primitives();
     let inbox: Address = "project:flotilla/role:coder".parse().expect("inbox");
-    let session = primitives.register("session-coder", Timestamp::from_datetime(&chrono::Utc::now())).await.expect("register");
+    let session = primitives
+        .register("session-coder", agent_session_request(), Timestamp::from_datetime(&chrono::Utc::now()))
+        .await
+        .expect("register");
     primitives.inbox().bind(inbox.clone(), session.clone()).await.expect("bind");
 
     for n in 0..SETTLED {

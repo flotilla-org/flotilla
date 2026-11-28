@@ -39,17 +39,18 @@ use flotilla_messaging::MessageResolution;
 use flotilla_resources::convoy::engine::convoy_reference_address;
 use flotilla_resources::{
     address::{artifact_address, record_name as address_record_name, repository_address},
+    vessel_records::VesselRecords,
     Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, Project, ReadResourceObject, Repository,
     ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionSource,
 };
 use flotilla_schema::{
     reads::{self, carry},
-    CreatedAt, Identity, IndexQuery, Kind as StoredKind, Timestamp,
+    CreatedAt, Identity, IndexQuery, Kind as StoredKind, Ref, Timestamp,
 };
 use flotilla_schema_sqlite::{stream::Service, StoreError};
 use flotilla_state_machines::{
     machines::{
-        agent_session::{AgentSession, MemoryAgentSessionWorld, Receive},
+        agent_session::{AgentSession, AgentSessionRequest, MemoryAgentSessionWorld, Receive},
         consumer::{ConsumerKind, Receiver},
         message::{
             Deliver, DropReason, Expectation, MemoryMessageWorld, Message, MessageBody, MessageLabel, MessageRef, MessageReference,
@@ -61,6 +62,7 @@ use flotilla_state_machines::{
     Home, Resource, Transport,
 };
 use flotilla_store::{ResourceBackend, WeakResourceBackend};
+use flotilla_verbs::{Duplicate, SubjectTable, VerbRegistry};
 
 /// The world the Message gates read at this home: a snapshot the delivery
 /// adapter and admission keep current, and the home clock.
@@ -161,15 +163,6 @@ impl Sessions {
         Ok(())
     }
 
-    /// Creates `name`'s record, Live and detached, under the home's lock.
-    fn create(&self, home: &mut Home<AgentSession, StoreLog>, name: &str, now: Timestamp) -> Result<(), String> {
-        home.create(name, (), &MemoryAgentSessionWorld::default(), now).map_err(|error| format!("AgentSession `{name}`: {error:?}"))?;
-        let mut live = self.live.lock().expect("live sessions");
-        live.names.insert(name.to_owned());
-        live.created += 1;
-        Ok(())
-    }
-
     /// The Live records at this home, and how many records it had created when they were read:
     /// a later create changes that count.
     pub fn live(&self) -> (u64, BTreeSet<String>) {
@@ -182,13 +175,17 @@ impl Sessions {
         self.live.lock().expect("live sessions").created
     }
 
-    /// Creates the session's record, Live and detached, unless it exists.
-    pub fn ensure(&self, name: &str, now: Timestamp) -> Result<bool, String> {
+    /// Creates the session's record from `request`, Live and detached, unless it exists.
+    pub fn ensure(&self, name: &str, request: AgentSessionRequest, now: Timestamp) -> Result<bool, String> {
         let mut home = self.home.lock().expect("session home");
         if home.get(name).is_some() {
             return Ok(false);
         }
-        self.create(&mut home, name, now)?;
+        home.create(name, request, &MemoryAgentSessionWorld::default(), now)
+            .map_err(|error| format!("AgentSession `{name}`: {error:?}"))?;
+        let mut live = self.live.lock().expect("live sessions");
+        live.names.insert(name.to_owned());
+        live.created += 1;
         Ok(true)
     }
 
@@ -225,7 +222,8 @@ impl Sessions {
         }))
     }
 
-    /// Records only a real hook activity change; repeated and late hooks write nothing.
+    /// Records only a real hook activity change on the session's record; repeated and late hooks
+    /// write nothing.
     pub fn observe(
         &self,
         name: &str,
@@ -238,12 +236,6 @@ impl Sessions {
             WriteError,
         };
         let mut home = self.home.lock().map_err(|_| "session home lock poisoned".to_string())?;
-        // A hook may precede the delivery adapter's first consumer registration.
-        // Materialize the same minimal record here, named by the validated launch;
-        // the terminal and delivery adapter still own its lifecycle, not the hook.
-        if home.get(name).is_none() {
-            self.create(&mut home, name, now)?;
-        }
         match home.apply(name, Observe { activity, cause }, &MemoryAgentSessionWorld::default(), now) {
             Ok(_) => Ok(true),
             Err(WriteError::Refused(AgentSessionRefusal::UnchangedActivity | AgentSessionRefusal::AlreadyEnded)) => Ok(false),
@@ -286,6 +278,37 @@ impl Sessions {
     pub fn get(&self, name: &str) -> Option<Resource<AgentSession>> {
         self.home.lock().expect("session home").get(name).cloned()
     }
+}
+
+/// What the session of crew `role` aboard vessel launch `vessel` is created with: it works for the
+/// vessel's convoy.
+pub fn session_request(vessels: &dyn VesselRecords, vessel: Option<&str>, role: &str) -> Result<AgentSessionRequest, String> {
+    let vessel = vessel.ok_or("an agent's terminal is aboard no vessel")?;
+    let vessel = vessels.find(vessel)?.ok_or_else(|| format!("vessel {vessel} is not read here"))?;
+    Ok(AgentSessionRequest {
+        convoy: Ref::new(vessel.convoy, vessel.convoy_home),
+        role: role.to_owned(),
+        vessel: Some(Ref::new(vessel.name, vessel.home)),
+    })
+}
+
+/// Registers the session subject table (#4438): an `agent_session` row is addressed as its role's
+/// session in its convoy, `host:<convoy home>/convoy:<convoy>/role:<role>/session:<name>`. A
+/// session an earlier build created names no convoy and has no address.
+pub fn register_subjects(registry: &mut VerbRegistry) -> Result<(), Duplicate> {
+    registry.register_subject(SubjectTable {
+        kind: AddressKind::Session,
+        table: "agent_session",
+        address: |row| {
+            let text = |field: &str| row[field].as_str().filter(|text| !text.is_empty());
+            let (home, convoy, role, name) = (text("convoy.home")?, text("convoy")?, text("role")?, text("resource.name")?);
+            Address::root(AddressKind::Host, home)
+                .and_then(|host| host.child(AddressKind::Convoy, convoy))
+                .and_then(|convoy| convoy.child(AddressKind::Role, role))
+                .and_then(|role| role.child(AddressKind::Session, name))
+                .ok()
+        },
+    })
 }
 
 /// The inbox's consumer port for one session: `Receive` on its own record.
@@ -824,9 +847,9 @@ impl MessagePrimitives {
         Receiver { kind: ConsumerKind::AgentSession, id: session.to_owned(), host: self.home.clone() }
     }
 
-    /// Registers a crew session as a consumer: its record exists, and the
+    /// Registers a crew session as a consumer: its record exists, created from `request`, and the
     /// inbox writes its receipts there.
-    pub async fn register(&self, session: &str, now: Timestamp) -> Result<Receiver, String> {
+    pub async fn register(&self, session: &str, request: AgentSessionRequest, now: Timestamp) -> Result<Receiver, String> {
         let consumer = self.consumer(session);
         // Registered consumers already have their record; skip the blocking hop and the
         // session home's lock, which the Message loop would otherwise take per holder per pass.
@@ -836,7 +859,7 @@ impl MessagePrimitives {
         let sessions = Arc::clone(&self.sessions);
         let name = session.to_owned();
         // A SQLite write: off the async workers.
-        tokio::task::spawn_blocking(carry(move || sessions.ensure(&name, now))).await.map_err(|error| error.to_string())??;
+        tokio::task::spawn_blocking(carry(move || sessions.ensure(&name, request, now))).await.map_err(|error| error.to_string())??;
         if self.consumers.lock().expect("consumers").insert(consumer.clone()) {
             let port =
                 SessionReceipts { sessions: Arc::clone(&self.sessions), name: session.to_owned(), scope: self.receipts.receipt_scope() };
@@ -2683,10 +2706,11 @@ impl ViewLookups for OldStoreRecords {
     fn vessel(&self, convoy: &str, role: &str) -> Option<String> {
         self.convoy(convoy).and_then(|held| keyed_reads::snapshot_work(held, role))
     }
-    /// A receiver names its launch, read from the session's view only while it shows that launch.
+    /// A receiver is the AgentSession a launch declares, read from the session's view only while it
+    /// shows that launch.
     fn session(&self, receiver: &Receiver) -> Option<(String, String)> {
         let terminal = self.terminal(flotilla_resources::terminal_records::launched(&receiver.id))?;
-        if flotilla_resources::terminal_records::launch_of(terminal) != Some(receiver.id.as_str()) {
+        if flotilla_resources::terminal_records::agent_session_of(terminal) != Some(receiver.id.as_str()) {
             return None;
         }
         let status = terminal.status.as_ref()?;
