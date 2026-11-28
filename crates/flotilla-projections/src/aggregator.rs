@@ -2935,16 +2935,24 @@ impl Aggregator {
         })
     }
 
+    /// The Vessel launching work `name` of `convoy` at `host`: the newest, which holds its
+    /// sessions after a handover.
+    fn vessel_launch(&self, convoy: &ResourceRef, name: &str, host: &HostName) -> Option<&ReadResourceObject<Vessel>> {
+        self.convoy_vessels(&convoy.namespace, &convoy.name)
+            .filter(|source| {
+                source.object.metadata.namespace == convoy.namespace
+                    && source.object.spec.convoy_ref == convoy.name
+                    && source.object.spec.vessel_name == name
+                    && self.read_host(&source.provenance).as_ref() == Some(host)
+            })
+            .max_by_key(|source| source.object.metadata.name.rsplit_once('#').and_then(|(_, n)| n.parse::<u64>().ok()).unwrap_or(0))
+    }
+
     /// Resolve the running vessel's execution kind from its observed fulfilment kind.
     /// The spec reference is best-effort when no observed reference is recorded.
     /// Without a recorded version, kind edits since launch cannot be detected.
     fn vessel_environment_kind(&self, convoy: &ResourceRef, name: &str, host: &HostName) -> Option<EnvironmentKind> {
-        let vessel = self.convoy_vessels(&convoy.namespace, &convoy.name).find(|source| {
-            source.object.metadata.namespace == convoy.namespace
-                && source.object.spec.convoy_ref == convoy.name
-                && source.object.spec.vessel_name == name
-                && self.read_host(&source.provenance).as_ref() == Some(host)
-        })?;
+        let vessel = self.vessel_launch(convoy, name, host)?;
         let kind_ref = vessel
             .object
             .status
@@ -2988,11 +2996,10 @@ impl Aggregator {
             .and_then(|value| serde_json::from_value(value.clone()).ok());
         let (vessel_host, carried_by) = self.vessel_hosts(convoy_ref, state);
         let now = self.clock.now();
-        let vessel_resource =
-            placement.and_then(|placement| placement.fields.get("vessel_ref")).and_then(serde_json::Value::as_str).map(|name| {
-                ResourceRef::new(api_version(Vessel::API_PATHS), Vessel::API_PATHS.kind, &convoy_ref.namespace, name)
-                    .on_host(vessel_host.clone())
-            });
+        let vessel_resource = self.vessel_launch(convoy_ref, &definition.name, &vessel_host).map(|vessel| {
+            ResourceRef::new(api_version(Vessel::API_PATHS), Vessel::API_PATHS.kind, &convoy_ref.namespace, &vessel.object.metadata.name)
+                .on_host(vessel_host.clone())
+        });
         let effective_stance = placement
             .and_then(|placement| placement.fields.get("effective_stance"))
             .and_then(serde_json::Value::as_str)
@@ -3939,12 +3946,8 @@ mod tests {
         let (mut aggregator, _engine) =
             with_convoy_engine(Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_origin_resolver(Arc::clone(&resolver)));
         let mut convoy = convoy_with_vessel("convoy-a").await;
-        convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement = Some(PlacementStatus {
-            fields: BTreeMap::from([
-                ("host".to_string(), serde_json::json!("feta")),
-                ("vessel_ref".to_string(), serde_json::json!("convoy-a-implement")),
-            ]),
-        });
+        convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement =
+            Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
         aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
 
         let now = Utc::now();
@@ -7829,22 +7832,6 @@ mod tests {
                 assert_eq!(row.crew[0].session.as_deref(), Some(format!("{host}/terminal-placement-coder").as_str()));
             }
         }
-    }
-
-    #[tokio::test]
-    async fn remotely_placed_vessel_exposes_placement_host() {
-        let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
-        convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work state").placement = Some(PlacementStatus {
-            fields: BTreeMap::from([
-                ("host".to_string(), serde_json::json!("feta")),
-                ("vessel_ref".to_string(), serde_json::json!("convoy-a-implement")),
-            ]),
-        });
-
-        let vessel = emitted_vessel(convoy).await;
-
-        assert_eq!(vessel.host, HostName::new("feta"));
-        assert_eq!(vessel.vessel_resource.expect("vessel resource").host, Some(HostName::new("feta")));
     }
 
     // #4021: a vessel on an SSH host is acted on by the Host's

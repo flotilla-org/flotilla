@@ -13,16 +13,22 @@ use async_trait::async_trait;
 use flotilla_address::{Address, Kind};
 use flotilla_cli::pm_connect::Connector;
 use flotilla_daemon_testkit::daemon::TestDaemon;
-use flotilla_dummy_fleet::catalog::{CrewMix, DUMMY_FULFILMENT_KIND};
+use flotilla_dummy_fleet::{
+    catalog::{CrewMix, DUMMY_FULFILMENT_KIND},
+    DUMMY_CLEAT_DAEMON,
+};
 use flotilla_manifest::{
     entity,
     entity::EntityRef,
-    keys::{KEY_PRIMARY_ACTION_KIND, KEY_PRIMARY_ACTION_TARGET, KEY_READINESS_ATTACH_AVAILABLE},
-    recipe::FlotillaRecipes,
+    keys::{
+        KEY_PRIMARY_ACTION_KIND, KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_DIRECT_PUBLICATION_LABEL, KEY_PRIMARY_DIRECT_PUBLICATION_NAME,
+        KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE, KEY_READINESS_ATTACH_AVAILABLE,
+    },
+    recipe::{FlotillaRecipes, ViewerBinding, ViewerBindings},
     sink::PatchSink,
     wire::{MetadataPatch, MetadataTarget, MetadataValue},
 };
-use flotilla_resources::{Convoy, ConvoyPhase, ResourceObject, TerminalSession, TerminalSessionPhase, CONVOY_LABEL};
+use flotilla_resources::{Convoy, ConvoyPhase, ResourceObject, TerminalSession, TerminalSessionPhase, Vessel, CONVOY_LABEL};
 
 #[derive(Default)]
 struct Sink {
@@ -165,4 +171,26 @@ async fn a_running_crews_vessel_offers_attach_from_its_sessions_facts() {
     assert_eq!(facts[KEY_PRIMARY_ACTION_KIND], MetadataValue::Text("attach".to_owned()));
     assert_eq!(facts[KEY_PRIMARY_ACTION_TARGET], MetadataValue::Text(format!("session:{host}/{}", session.metadata.name)));
     assert_eq!(facts[KEY_READINESS_ATTACH_AVAILABLE], MetadataValue::Bool(true));
+}
+
+// #4482: a running crew's vessel entity names its Cleat daemon's Tender publication once the
+// viewer's Tender holds its Binding: `vessel/<the Vessel launch>` and `cleat/<logical daemon>`,
+// as the daemon carrying the vessel publishes it.
+#[tokio::test(start_paused = true)]
+async fn a_running_crews_vessel_names_its_cleat_publication() {
+    let fleet = TestDaemon::builder().settings("host_name = \"feta\"\n").agent("turn_delay_ms = 60000").start().await;
+    let launch = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let vessel = fleet.wait("a launched Vessel", |vessel: &ResourceObject<Vessel>| vessel.spec.convoy_ref == launch).await;
+    let scope = format!("vessel/{}", vessel.metadata.name);
+    let name = format!("cleat/{DUMMY_CLEAT_DAEMON}");
+    let bindings = ViewerBindings::new(Ok(vec![ViewerBinding { scope: scope.clone(), name: name.clone(), reachable: Ok(()) }]));
+
+    let (sink, connector) = connect(&fleet, FlotillaRecipes::new("flotilla").with_bindings(bindings));
+    let target = entity::vessel(fleet.host_name().as_str(), &launch, &vessel.spec.vessel_name).expect("valid address");
+    let facts = sink.wait_facts(&target, |facts| facts.contains_key(KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE)).await;
+    connector.abort();
+
+    assert_eq!(facts[KEY_PRIMARY_DIRECT_PUBLICATION_SCOPE], MetadataValue::Text(scope));
+    assert_eq!(facts[KEY_PRIMARY_DIRECT_PUBLICATION_NAME], MetadataValue::Text(name));
+    assert_eq!(facts[KEY_PRIMARY_DIRECT_PUBLICATION_LABEL], MetadataValue::Text("cleat".to_owned()));
 }

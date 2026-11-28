@@ -2070,11 +2070,6 @@ pub enum ConvoyStatusPatch {
         reason: Option<String>,
         observed_at: DateTime<Utc>,
     },
-    WorkLaunching {
-        work: String,
-        started_at: DateTime<Utc>,
-        placement: PlacementStatus,
-    },
     WorkRunning {
         work: String,
         started_at: DateTime<Utc>,
@@ -2251,7 +2246,6 @@ impl ConvoyStatusPatch {
             Self::Settle { .. } => "Settle",
             Self::SetSettlementAttention { .. } => "SetSettlementAttention",
             Self::ObserveTurnHookHealth { .. } => "ObserveTurnHookHealth",
-            Self::WorkLaunching { .. } => "WorkLaunching",
             Self::WorkRunning { .. } => "WorkRunning",
             Self::WorkInterrupted { .. } => "WorkInterrupted",
             Self::ForceWorkCompleted { .. } => "ForceWorkCompleted",
@@ -2495,13 +2489,6 @@ impl ConvoyStatusPatch {
                         }
                         None => status.attention = None,
                     }
-                }
-            }
-            Self::WorkLaunching { work, started_at, placement } => {
-                if let Some(state) = status.work.get_mut(work) {
-                    state.phase = WorkPhase::Launching;
-                    state.started_at.get_or_insert(*started_at);
-                    state.placement = Some(placement.clone());
                 }
             }
             Self::WorkRunning { work, started_at, launched_roles } => {
@@ -3072,10 +3059,6 @@ pub mod controller_patches {
 
 pub mod provisioning_patches {
     use super::*;
-
-    pub fn work_launching(work: String, started_at: DateTime<Utc>, placement: PlacementStatus) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::WorkLaunching { work, started_at, placement }
-    }
 
     pub fn work_running(work: String, started_at: DateTime<Utc>, launched_roles: BTreeSet<String>) -> ConvoyStatusPatch {
         ConvoyStatusPatch::WorkRunning { work, started_at, launched_roles }
