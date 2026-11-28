@@ -19,7 +19,7 @@ use crate::{
         PROJECT_IMAGE_MANAGER, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
         WHOLE_REPOSITORY_PROJECT_MANAGER,
     },
-    MANAGED_BY_LABEL, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
+    CONVOY_LABEL, MANAGED_BY_LABEL, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
 };
 
 /// The kinds the engine's definition records serve, by their resource kind names.
@@ -56,8 +56,9 @@ pub enum DefinitionOrigin {
     ProjectOps { project: String, repository: String, commit: String, entry_path: Option<String> },
     /// A project's image layer, read from its primary repository's `.flotilla/image/`.
     ProjectImage { project: String, commit: String },
-    /// A workflow snapshot admission prepared; its name is content-addressed.
-    Snapshot,
+    /// A workflow snapshot admission prepared for `convoy`, which releases it. One a previous
+    /// generation prepared, shared by its convoys, names none.
+    Snapshot { convoy: Option<String> },
     /// A Project project operations materialised from a repository's `project.yaml` declaration.
     ProjectDeclaration { repository: String, commit: String },
     /// A Project project operations generated for one whole repository.
@@ -95,7 +96,7 @@ pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, 
     // Precedence: admission alone writes a snapshot, under a content-addressed name no manifest
     // declares, so the snapshot label is read first; then a project image, a manifest and project ops.
     if labels.get(PREPARED_SNAPSHOT_LABEL).is_some_and(|value| value == WORKFLOW_SNAPSHOT_KIND) {
-        return Ok(DefinitionOrigin::Snapshot);
+        return Ok(DefinitionOrigin::Snapshot { convoy: labels.get(CONVOY_LABEL).cloned() });
     }
     if managed_by == Some(PROJECT_IMAGE_MANAGER) {
         return Ok(DefinitionOrigin::ProjectImage {
@@ -186,7 +187,11 @@ pub fn stamp(origin: &DefinitionOrigin) -> (BTreeMap<String, String>, BTreeMap<S
             pairs(&[(MANAGED_BY_LABEL, PROJECT_IMAGE_MANAGER)]),
             pairs(&[(MATERIALIZED_PROJECT_ANNOTATION, project), (SOURCE_COMMIT_ANNOTATION, commit)]),
         ),
-        DefinitionOrigin::Snapshot => (pairs(&[(PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND)]), BTreeMap::new()),
+        DefinitionOrigin::Snapshot { convoy } => {
+            let mut labels = pairs(&[(PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND)]);
+            labels.extend(convoy.iter().map(|convoy| (CONVOY_LABEL.to_owned(), convoy.clone())));
+            (labels, BTreeMap::new())
+        }
         DefinitionOrigin::ProjectDeclaration { repository, commit } => (
             BTreeMap::new(),
             pairs(&[
@@ -234,7 +239,7 @@ mod tests {
             3 => DefinitionOrigin::ProjectImage { project: text(&tc), commit: text(&tc) },
             4 => DefinitionOrigin::ProjectDeclaration { repository: text(&tc), commit: text(&tc) },
             5 => DefinitionOrigin::WholeRepository,
-            _ => DefinitionOrigin::Snapshot,
+            _ => DefinitionOrigin::Snapshot { convoy: tc.draw(gs::booleans()).then(|| text(&tc)) },
         };
         let (labels, annotations) = stamp(&origin);
         assert_eq!(super::origin(&labels, &annotations), Ok(origin));

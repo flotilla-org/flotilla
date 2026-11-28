@@ -411,7 +411,7 @@ impl ConvoyReconciler {
             return Ok(());
         }
         if let Some(collector) = &self.prepared_snapshot_gc {
-            collector.collect(Some(&obj.metadata.name)).await?;
+            collector.collect(&obj.metadata.name).await?;
         }
         engine.memory().forget(&obj.metadata.name);
         Ok(())

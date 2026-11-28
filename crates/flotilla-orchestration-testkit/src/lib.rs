@@ -132,7 +132,7 @@ async fn assert_independent_placement_snapshots(factory: &dyn EnsureScenarioCont
     // its convoy. The second admission must retain its own frozen placement.
     let first_convoy = first_store.using::<ResourceConvoy>("flotilla").list().await.expect("first convoys").items.remove(0);
     flotilla_store::PreparedSnapshotGarbageCollector::new(first_store.clone(), "flotilla")
-        .collect(Some(&first_convoy.metadata.name))
+        .collect(&first_convoy.metadata.name)
         .await
         .expect("collect first origin snapshots");
     let second_convoy = second_store.using::<ResourceConvoy>("flotilla").list().await.expect("second convoys").items.remove(0);

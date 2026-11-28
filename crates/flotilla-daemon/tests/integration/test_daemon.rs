@@ -751,3 +751,25 @@ async fn a_convoys_change_request_evidence_finds_its_declared_forge() {
         .await;
     daemon.wait("the convoy landed on it", in_phase(&convoy, ConvoyPhase::Landed)).await;
 }
+
+// Each convoy's workflow snapshot is its own, though both convoys run the same workflow: a convoy's
+// teardown releases its own snapshot and leaves the one admission wrote for the convoy admitted
+// beside it, which host occupancy reads that convoy's vessels from.
+#[tokio::test(start_paused = true)]
+async fn a_teardown_releases_its_own_workflow_snapshot_and_no_other() {
+    use flotilla_resources::{WorkflowTemplate, CONVOY_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION};
+    let daemon = TestDaemon::builder().agent("turn_delay_ms = 5000").start().await;
+    let snapshot =
+        |convoy: &ResourceObject<Convoy>| convoy.metadata.annotations.get(WORKFLOW_SNAPSHOT_ANNOTATION).cloned().expect("snapshot");
+    let first = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let first_snapshot = snapshot(&daemon.get::<Convoy>(&first).await.expect("first convoy"));
+    daemon.wait("Landed", in_phase(&first, ConvoyPhase::Landed)).await;
+    let second = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let second_snapshot = snapshot(&daemon.get::<Convoy>(&second).await.expect("second convoy"));
+    assert_ne!(first_snapshot, second_snapshot, "each convoy is admitted with its own snapshot");
+
+    daemon.wait_gone::<WorkflowTemplate>(&first_snapshot).await;
+    let kept = daemon.get::<WorkflowTemplate>(&second_snapshot).await.expect("the second convoy's snapshot is kept");
+    assert_eq!(kept.metadata.labels.get(CONVOY_LABEL), Some(&second));
+    assert!(!kept.spec.vessels.is_empty(), "it names the convoy's vessels");
+}

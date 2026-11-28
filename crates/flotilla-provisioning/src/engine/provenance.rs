@@ -50,6 +50,7 @@ const NAMESPACE: &str = "flotilla";
 const ROOT: KindCode = <Resource<ManifestRoot> as Kind>::CODE;
 const REPOSITORY: KindCode = <RepositoryRecord as Kind>::CODE;
 const PROJECT: KindCode = <ProjectDefinition as Kind>::CODE;
+const CONVOY: KindCode = <Resource<flotilla_state_machines::machines::convoy::Convoy> as Kind>::CODE;
 
 fn item(kind: KindCode, name: &str, home: &str, revision: Option<&str>) -> ChangeItem {
     ChangeItem { record: Identity { kind, name: name.to_owned(), home: home.to_owned() }, revision: revision.map(str::to_owned) }
@@ -116,7 +117,7 @@ pub(crate) fn change_of(origin: &DefinitionOrigin, home: &str, at: Timestamp) ->
             (PROJECT_DECLARATION, vec![item(REPOSITORY, repository, home, Some(commit))])
         }
         DefinitionOrigin::WholeRepository => (WHOLE_REPOSITORY, Vec::new()),
-        DefinitionOrigin::Snapshot => (ADMISSION, Vec::new()),
+        DefinitionOrigin::Snapshot { convoy } => (ADMISSION, convoy.iter().map(|convoy| item(CONVOY, convoy, home, None)).collect()),
     };
     NewChange::new(writer, at).with_items(items)
 }
@@ -315,7 +316,7 @@ pub(crate) fn origin_of(
             None => DefinitionOrigin::Operator,
         },
         WHOLE_REPOSITORY => DefinitionOrigin::WholeRepository,
-        ADMISSION => DefinitionOrigin::Snapshot,
+        ADMISSION => DefinitionOrigin::Snapshot { convoy: named(CONVOY).map(|convoy| convoy.record.name.clone()) },
         _ => DefinitionOrigin::Operator,
     })
 }

@@ -21,20 +21,19 @@ impl PreparedSnapshotGarbageCollector {
         Self { backend, namespace: namespace.into() }
     }
 
-    /// Delete prepared workflow snapshots not referenced by any remaining convoy, and
-    /// `excluding_convoy`'s own placement snapshots that nothing else references.
+    /// Release `releasing`'s own prepared snapshots, workflow and placement, that no other convoy
+    /// references. A snapshot is its convoy's, by its label, to release: admission writes it before
+    /// it admits the convoy, so no other convoy's release may judge it unreferenced. One with no
+    /// owner's label is never released here.
     ///
-    /// `excluding_convoy` is used by the convoy finalizer: the deleting convoy
-    /// still exists until its finalizer returns, but no longer retains a claim,
-    /// and its own placement snapshots are released with it.
-    pub async fn collect(&self, excluding_convoy: Option<&str>) -> Result<PreparedSnapshotGcResult, ResourceError> {
+    /// The releasing convoy may still be listed: a refused admission's launch or an ended convoy
+    /// retains no claim on its snapshots.
+    pub async fn collect(&self, releasing: &str) -> Result<PreparedSnapshotGcResult, ResourceError> {
         let convoys = self.backend.including_replicas::<Convoy>(&self.namespace).list_sources().await?;
         let mut workflow_refs = BTreeSet::new();
         let mut placement_refs = BTreeSet::new();
         for source in convoys.items {
-            if matches!(source.provenance, ResourceProvenance::Local)
-                && excluding_convoy.is_some_and(|excluded| source.object.metadata.name == excluded)
-            {
+            if matches!(source.provenance, ResourceProvenance::Local) && source.object.metadata.name == releasing {
                 continue;
             }
             let convoy = source.object;
@@ -54,36 +53,22 @@ impl PreparedSnapshotGarbageCollector {
                 }
             }
         }
-
-        let workflows = self.backend.clone().using::<WorkflowTemplate>(&self.namespace);
-        let mut result = PreparedSnapshotGcResult::default();
-        for workflow in workflows.list().await?.items {
-            if is_prepared_snapshot(&workflow.metadata.labels, WORKFLOW_SNAPSHOT_KIND) && !workflow_refs.contains(&workflow.metadata.name) {
-                match workflows.delete(&workflow.metadata.name).await {
-                    Ok(()) => result.workflows_deleted += 1,
-                    Err(ResourceError::NotFound { .. }) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-
-        if let Some(releasing) = excluding_convoy {
-            result.placements_deleted += self.collect_placements(&placement_refs, releasing).await?;
-        }
-        Ok(result)
+        Ok(PreparedSnapshotGcResult {
+            workflows_deleted: self.release::<WorkflowTemplate>(WORKFLOW_SNAPSHOT_KIND, &workflow_refs, releasing).await?,
+            placements_deleted: self.release::<FulfilmentKind>(PLACEMENT_SNAPSHOT_KIND, &placement_refs, releasing).await?,
+        })
     }
 
-    /// A placement snapshot is its convoy's, by its label, to release: admission writes it before
-    /// it admits the convoy, so no other convoy's release may judge it unreferenced.
-    async fn collect_placements(&self, referenced: &BTreeSet<String>, releasing: &str) -> Result<usize, ResourceError> {
-        let placements = self.backend.clone().using::<FulfilmentKind>(&self.namespace);
+    /// Deletes `releasing`'s prepared snapshots of `kind`, stored as `R`, that are not `referenced`.
+    async fn release<R: Resource>(&self, kind: &str, referenced: &BTreeSet<String>, releasing: &str) -> Result<usize, ResourceError> {
+        let snapshots = self.backend.clone().using::<R>(&self.namespace);
         let mut deleted = 0;
-        for placement in placements.list().await?.items {
-            if is_prepared_snapshot(&placement.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
-                && placement.metadata.labels.get(CONVOY_LABEL).is_some_and(|owner| owner == releasing)
-                && !referenced.contains(&placement.metadata.name)
+        for snapshot in snapshots.list().await?.items {
+            if is_prepared_snapshot(&snapshot.metadata.labels, kind)
+                && snapshot.metadata.labels.get(CONVOY_LABEL).is_some_and(|owner| owner == releasing)
+                && !referenced.contains(&snapshot.metadata.name)
             {
-                match placements.delete(&placement.metadata.name).await {
+                match snapshots.delete(&snapshot.metadata.name).await {
                     Ok(()) => deleted += 1,
                     Err(ResourceError::NotFound { .. }) => {}
                     Err(error) => return Err(error),
