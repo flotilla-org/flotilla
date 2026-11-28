@@ -514,7 +514,7 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::CompletedWith(result))
             }
             StepAction::LinkIssuesToBranch { branch, issue_ids } => {
-                write_branch_issue_links(effective_repo_root.as_path(), &branch, &issue_ids, &*effective_runner).await;
+                write_branch_issue_links(effective_repo_root.as_path(), &branch, &issue_ids, &*effective_runner).await?;
                 Ok(StepOutcome::Completed)
             }
             StepAction::RemoveCheckout { branch } => {
@@ -553,16 +553,22 @@ impl StepResolver for ExecutorStepResolver {
             }
             StepAction::OpenChangeRequest { id } => {
                 debug!(%id, "opening change request in browser");
-                if let Some(cr) = self.registry.change_requests.preferred() {
-                    let _ = cr.open_in_browser(&id).await;
-                }
+                let cr = self
+                    .registry
+                    .change_requests
+                    .preferred()
+                    .ok_or_else(|| "no change request provider is active for this repository".to_string())?;
+                cr.open_in_browser(&id).await?;
                 Ok(StepOutcome::Completed)
             }
             StepAction::CloseChangeRequest { id } => {
                 debug!(%id, "closing change request");
-                if let Some(cr) = self.registry.change_requests.preferred() {
-                    let _ = cr.close_change_request(&id).await;
-                }
+                let cr = self
+                    .registry
+                    .change_requests
+                    .preferred()
+                    .ok_or_else(|| "no change request provider is active for this repository".to_string())?;
+                cr.close_change_request(&id).await?;
                 Ok(StepOutcome::Completed)
             }
             StepAction::MergeChangeRequest { id } => {
@@ -577,9 +583,11 @@ impl StepResolver for ExecutorStepResolver {
             }
             StepAction::OpenIssue { id } => {
                 debug!(%id, "opening issue in browser");
-                if let Some(provider) = self.registry.issue_provider_for(&issue_source) {
-                    let _ = provider.open_in_browser(&flotilla_protocol::IssueRef { source: issue_source.clone(), id }).await;
-                }
+                let provider = self
+                    .registry
+                    .issue_provider_for(&issue_source)
+                    .ok_or_else(|| "no issue provider is active for this repository".to_string())?;
+                provider.open_in_browser(&flotilla_protocol::IssueRef { source: issue_source.clone(), id }).await?;
                 Ok(StepOutcome::Completed)
             }
             StepAction::LinkIssuesToChangeRequest { change_request_id, issue_ids } => {
