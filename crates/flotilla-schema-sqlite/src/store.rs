@@ -695,6 +695,12 @@ impl Read<'_> {
         self.ctx().latest_change_naming(home, record)
     }
 
+    /// Whether this store logged an expunge of `identity`: the tombstone its home's log keeps
+    /// once the identity and its entries are gone.
+    pub fn expunged(&mut self, identity: &Identity) -> Result<bool, StoreError> {
+        self.ctx().expunged_after(identity, 0)
+    }
+
     /// The sequences of `home`'s changes this store holds strictly between `after` and `before`, in
     /// order: what a stream sends between two entries, so its cursor stays a prefix of the home's
     /// sequence.

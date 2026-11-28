@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use flotilla_engine_store::{
-    archive::{bundle_key, ArchiveKinds, Archiver, Bundle, Due, Prepared, Stage, ARCHIVE_AFTER_MICROS, ARCHIVE_WRITER},
+    archive::{archived, bundle_key, ArchiveKinds, Archiver, Bundle, Due, Prepared, Stage, ARCHIVE_AFTER_MICROS, ARCHIVE_WRITER},
     registry, MessageLog,
 };
 use flotilla_schema::{Address, Cause, Identity, Kind, Timestamp};
@@ -78,7 +78,8 @@ fn follow(source: &mut Store, target: &mut Store, after: Option<u64>) -> bool {
 // into another home's store rebuilds that state. Once shipped it is deleted, then expunged a pass
 // later, so a follower that applied the delete tails the expunge without a fresh snapshot, and
 // only the expunge entry, naming the bundle, stays. An open message beside it is untouched, and a
-// restart between the two writes resumes at the expunge.
+// restart between the two writes resumes at the expunge. From the delete on, the message reads as
+// archived at its home and at the follower; one never written there does not.
 #[test]
 fn a_dropped_message_ships_a_week_later_and_leaves_in_two_writes() {
     let shared = Arc::new(StoreHandle::new(store(HOME)));
@@ -119,14 +120,18 @@ fn a_dropped_message_ships_a_week_later_and_leaves_in_two_writes() {
     let mut elsewhere = self::store("gamma");
     assert_eq!(bundle.replay(&mut elsewhere).expect("replay"), Some(stored), "the entries rebuild the end state");
 
+    let is_archived = |host: &mut Store, name: &str| archived(&mut host.read().expect("read"), &identity(name)).expect("archived");
+    assert!(!is_archived(&mut store, &dropped), "an ended message still stored is not archived");
     let deleted_at = due.saturating_add(1);
     archiver.delete(&mut store, &identity(&dropped), version, deleted_at).expect("delete");
+    assert!(is_archived(&mut store, &dropped), "deleted by the archive");
     assert!(matches!(archiver.prepare(&mut store, &identity(&dropped)).expect("prepare"), Prepared::Gone));
     assert_eq!(archiver.candidates().count(), 0, "a candidate no longer stored at its end is dropped");
     archiver.refresh(&mut store).expect("refresh");
     assert_eq!(archiver.candidates().next().map(|candidate| &candidate.stage), Some(&Stage::Deleted { at: deleted_at }));
     assert!(archiver.due(Timestamp(deleted_at.0 + GRACE - 1), GRACE).is_empty(), "the expunge waits a pass");
     assert!(!follow(&mut store, &mut follower, Some(cursor)), "the delete is tailed");
+    assert!(is_archived(&mut follower, &dropped), "the follower reads the archive's delete");
     cursor = follower.read().expect("read").watermark(HOME).expect("watermark").home_seq;
 
     let mut restarted = Archiver::new(HOME, kinds());
@@ -151,6 +156,10 @@ fn a_dropped_message_ships_a_week_later_and_leaves_in_two_writes() {
         let change = read.change(HOME, tombstone.change).expect("read").expect("its change");
         assert_eq!((change.writer.as_str(), change.at), (ARCHIVE_WRITER, expunge_at));
         assert!(!entries.iter().any(|entry| entry.name == dropped && entry.cause != Cause::Expunge), "its history went with it");
+        drop(read);
+        assert!(is_archived(host, &dropped), "its tombstone says it was archived");
+        assert!(!is_archived(host, &open), "an open message was not");
+        assert!(!is_archived(host, &name("never")), "nor one never written");
     }
 }
 

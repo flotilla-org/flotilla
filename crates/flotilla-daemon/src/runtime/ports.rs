@@ -19,7 +19,7 @@ use flotilla_provisioning::checkout_runtime::{
 };
 use flotilla_provisioning::reconcilers::clone::runtime::CloneControllerRuntime;
 use flotilla_provisioning::reconcilers::{CloneRuntime, ForgeDefaultBranchResolver};
-use flotilla_resources::{canonicalize_repo_url, CloneCredentials, Convoy, Forge, ForgeIdentity};
+use flotilla_resources::{canonicalize_repo_url, checkout_records::CheckoutHolder, CloneCredentials, Convoy, Forge, ForgeIdentity};
 use flotilla_vcs::vcs::CheckoutMaterialisationError;
 use flotilla_vcs::vcs::CheckoutRegistration;
 use flotilla_vcs::vcs::WorktreeMetadata;
@@ -40,34 +40,57 @@ impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for Dae
     async fn may_release(&self, convoy: &str, convoy_home: &str) -> Result<(), String> {
         // The old store's Convoy, until engine Convoy judges its own reclaim (#3108).
         let convoys = self.daemon.resource_backend().including_replicas::<Convoy>(&self.namespace);
-        let convoy = convoys
-            .get_all(convoy)
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-            .into_iter()
-            .find(|source| {
-                source.object.metadata.name == convoy
-                    && match &source.provenance {
-                        flotilla_resources::ResourceProvenance::Local => true,
-                        flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str() == convoy_home,
-                    }
-            })
-            .map(|source| source.object)
-            .ok_or_else(|| format!("convoy {convoy} at {convoy_home} is not read here"))?;
+        let read = convoys.get_all(convoy).await.map_err(|error| error.to_string())?.items.into_iter().find(|source| {
+            source.object.metadata.name == convoy
+                && match &source.provenance {
+                    flotilla_resources::ResourceProvenance::Local => true,
+                    flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str() == convoy_home,
+                }
+        });
+        let Some(convoy) = read.map(|source| source.object) else { return self.may_release_archived(convoy, convoy_home).await };
         let convoy = &convoy;
         // Held for the engine launch the convoy became; a convoy never admitted holds none.
         let held = match flotilla_resources::convoy::engine::checkout_holder(convoy) {
-            Some(holder) => {
-                let reads = self.daemon.lifecycle_reads();
-                tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.checkouts()?.held(&holder)))
-                    .await
-                    .map_err(|error| error.to_string())??
-            }
+            Some(holder) => self.held(holder).await?,
             None => Vec::new(),
         };
         let checkouts = flotilla_resources::checkout_records::latest_launches(held).into_values().collect::<Vec<_>>();
         self.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, &checkouts, false).await
+    }
+}
+
+impl DaemonVesselReleaseGate {
+    /// The checkouts held for `holder`.
+    async fn held(&self, holder: CheckoutHolder) -> Result<Vec<flotilla_resources::checkout_records::CheckoutRecord>, String> {
+        let reads = self.daemon.lifecycle_reads();
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.checkouts()?.held(&holder)))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
+    /// Launch `convoy`, whose record is not read here: released only once its home archived it,
+    /// and then while no checkout held for it is live, since its record no longer says what they
+    /// hold.
+    async fn may_release_archived(&self, convoy: &str, convoy_home: &str) -> Result<(), String> {
+        let reads = self.daemon.lifecycle_reads();
+        let (name, home) = (convoy.to_owned(), convoy_home.to_owned());
+        let archived = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.convoys()?.archived(&name, &home)))
+            .await
+            .map_err(|error| error.to_string())??;
+        if !archived {
+            return Err(format!("convoy {convoy} at {convoy_home} is not read here"));
+        }
+        let held = self.held(CheckoutHolder::Convoy(convoy.to_owned())).await?;
+        let live = flotilla_resources::checkout_records::latest_launches(held)
+            .into_values()
+            .filter(|checkout| !checkout.ended())
+            .map(|checkout| checkout.name)
+            .collect::<Vec<_>>();
+        if live.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("convoy {convoy} at {convoy_home} was archived, and still holds checkouts {}", live.join(", ")))
+        }
     }
 }
 
