@@ -1,6 +1,7 @@
 use super::*;
 use crate::testkits::engine::request_session;
 use flotilla_engine_convoys_testkit::{single_agent, EngineHome};
+use flotilla_engine_messages_testkit::agent_session_request;
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
 #[test]
@@ -359,11 +360,12 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
     let service = daemon.decided_store();
     let primitives = daemon.message_primitives();
     let record = "codex-crew#1";
+    primitives.sessions().ensure(record, agent_session_request(), flotilla_schema::Timestamp(0)).expect("session");
     let agent_activity =
         || primitives.sessions().get(record).and_then(|session| session.state().observation()).map(|observation| observation.activity);
     let target = || {
         let mut target = flotilla_resources::TerminalSessionTarget::from(&spec);
-        target.record = Some(record);
+        target.agent_session = Some(record);
         target
     };
     // Crew attention reads the agent from its AgentSession (#3108): the screen read that

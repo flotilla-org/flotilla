@@ -210,7 +210,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         probe.engine.terminals.ready(&launch, "resume-staging-pool-session", &Default::default());
         let idle = |as_of| TerminalAttention { state: TerminalAttentionState::Idle, as_of, source: TerminalAttentionSource::Hook };
         observe_attention(&probe.engine, &launch, idle(clock.now()));
-        let agents = super::support::agent_sessions(&daemon);
+        let agents = super::support::agent_sessions(&daemon, &[&launch]);
         let hook = |activity, cause: &str, at| {
             agents.observe(&launch, activity, cause.into(), super::support::engine_at(at)).expect("hook activity");
         };
@@ -1174,7 +1174,7 @@ fn idle_coder(
         launch,
         TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Hook },
     );
-    super::support::agent_sessions(daemon)
+    super::support::agent_sessions(daemon, &[launch])
         .observe(launch, Activity::Idle, "Stop".into(), super::support::engine_at(now))
         .expect("hook activity");
 }

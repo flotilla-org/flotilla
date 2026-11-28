@@ -1,5 +1,7 @@
 //! ADR 0067's native-value Frictionless profile, rendered from the shared descriptor.
-use crate::{ColumnType, Layout, Table};
+use std::collections::BTreeMap;
+
+use crate::{ColumnType, Described, Layout, Table};
 use serde_json::{json, Value};
 
 impl Table {
@@ -79,6 +81,14 @@ impl Table {
                     field["constraints"]["enum"] = json!(values);
                 }
                 field.as_object_mut().expect("field object").extend(column.properties.clone());
+                for mark in &this.described {
+                    let Described::Role { column: name, role } = *mark else { continue };
+                    match field["roles"].as_array_mut() {
+                        _ if name != column.name => {}
+                        Some(roles) => roles.push(json!(role)),
+                        None => field["roles"] = json!([role]),
+                    }
+                }
                 field
             })
             .collect();
@@ -96,7 +106,15 @@ impl Table {
                     } else {
                         (vec![format!("{}.home", column.name), column.name.clone()], vec!["resource.home", "resource.name"])
                     };
-                    json!({"fields":fields,"reference":{"resource":target,"fields":keys}})
+                    let mut key = json!({"fields":fields,"reference":{"resource":target,"fields":keys}});
+                    for mark in &this.described {
+                        match *mark {
+                            Described::Parent(name) if name == column.name => key["relation"] = json!("parent"),
+                            Described::FacetOf(name) if name == column.name => key["relation"] = json!("facet-of"),
+                            _ => {}
+                        }
+                    }
+                    key
                 })
             })
             .collect();
@@ -104,6 +122,21 @@ impl Table {
             json!({"fields":fields,"primaryKey":this.key.iter().map(|column| &column.name).collect::<Vec<_>>(),"foreignKeys":foreign_keys});
         if let Some(subject) = &this.subject {
             schema["subject"] = json!({"kind": subject.kind.as_str(), "field": subject.field});
+        }
+        let facets: Vec<_> = this
+            .described
+            .iter()
+            .filter_map(|mark| match *mark {
+                Described::Facet { recipe, label, endpoint, state, reachable, reason } => {
+                    let endpoint: BTreeMap<_, _> = endpoint.iter().copied().collect();
+                    Some(json!({"recipe":recipe,"label":label,"endpoint":endpoint,"state":state,"reachable":reachable,"reason":reason}))
+                }
+                Described::Command { label, argv } => Some(json!({"recipe":"command","label":label,"argv":argv})),
+                _ => None,
+            })
+            .collect();
+        if !facets.is_empty() {
+            schema["facets"] = json!(facets);
         }
         schema
     }

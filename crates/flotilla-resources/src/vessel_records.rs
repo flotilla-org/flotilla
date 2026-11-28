@@ -656,6 +656,7 @@ mod tests {
             since: at(30),
             reading,
             facts: None,
+            agent_session: None,
         }
     }
 

@@ -1,5 +1,6 @@
 //! AgentSession against `specs/primitives/machines/agent_session.qnt`.
 
+use flotilla_quint_testkit::agent_session::agent_session_request;
 use flotilla_schema::{Code, CodeEnum, Timestamp};
 use flotilla_state_machines::{
     machines::agent_session::{
@@ -15,7 +16,7 @@ fn at(micros: i64) -> Timestamp {
 
 fn home() -> Home<AgentSession> {
     let mut home = Home::<AgentSession>::new("kiwi").expect("valid declaration");
-    home.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("created");
+    home.create("s", agent_session_request(), &MemoryAgentSessionWorld::default(), Timestamp(0)).expect("created");
     home
 }
 
@@ -111,7 +112,10 @@ fn a_receipt_is_a_receive_edge_about_its_message() {
 fn create_makes_a_live_detached_session_once() {
     let mut h = home();
     assert_eq!(*state(&h), live(Channel::Detached));
-    assert_eq!(h.create("s", (), &MemoryAgentSessionWorld::default(), Timestamp(0)).err(), Some(WriteError::Exists("s".into())));
+    assert_eq!(
+        h.create("s", agent_session_request(), &MemoryAgentSessionWorld::default(), Timestamp(0)).err(),
+        Some(WriteError::Exists("s".into()))
+    );
     assert_eq!(h.apply("other", attach(), &channel(Some(true)), at(1)).err(), Some(WriteError::Unknown("other".into())));
 }
 

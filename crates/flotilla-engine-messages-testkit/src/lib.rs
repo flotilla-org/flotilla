@@ -12,6 +12,7 @@ use flotilla_engine_messages::{
 };
 use flotilla_inbox::InboxBackend;
 use flotilla_messaging::{EngineMessages, Intent};
+pub use flotilla_quint_testkit::agent_session::agent_session_request;
 use flotilla_resources::{
     attentions::Attentions, Clock, Convoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, FleetDesignation, FleetDesignationSpec,
     InputMeta, Message as OldMessage, MessageRelation, Project, ProjectSpec, ReadResourceObject, ResourceError, Selector, SystemClock,
@@ -155,7 +156,8 @@ pub async fn deliver_turn(
         Err(_) => primitives.inbox_for(namespace, receiver).await.expect("the receiver's inbox"),
     };
     let (id, _) = primitives.locate_in(&address, record).expect("locate").unwrap_or_else(|| panic!("no message `{record}`"));
-    let consumer = primitives.register(session, Timestamp::from_datetime(&at)).await.expect("register the session");
+    let consumer =
+        primitives.register(session, agent_session_request(), Timestamp::from_datetime(&at)).await.expect("register the session");
     let inbox = primitives.inbox();
     inbox.bind(address, consumer.clone()).await.expect("bind the session");
     inbox.receive(&consumer, &id, Transport::Turn).await.expect("receipt");

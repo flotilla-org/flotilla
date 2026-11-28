@@ -114,6 +114,7 @@ fn session(n: usize, which: &str, home: &str, vessel: &str) -> TerminalSessionRe
         cwd: "/workspace".into(),
         env: BTreeMap::from([("FLOTILLA_ROLE".into(), which.into())]),
         source: Launch::Tool { command: format!("{which} --serve") },
+        agent_session: None,
     }
 }
 

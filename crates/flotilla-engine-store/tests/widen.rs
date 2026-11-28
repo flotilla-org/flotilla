@@ -459,3 +459,50 @@ fn a_store_missing_a_required_column_is_refused() {
         refused.err()
     );
 }
+
+// Behaviour (#4438, ADR 0047 N→N+1): a store whose `agent_session` table predates a session's
+// convoy, vessel and role opens under this build, which adds them: the session the earlier build
+// wrote reads back with none of them, and a new session is written with all three.
+#[test]
+fn a_session_table_predating_its_convoy_gains_it_at_open() {
+    use std::sync::Arc;
+
+    use flotilla_engine_store::{open_home, StoreLog};
+    use flotilla_quint_testkit::agent_session::agent_session_request;
+    use flotilla_schema::Ref;
+    use flotilla_state_machines::{
+        machines::agent_session::{AgentSession, AgentSessionRequest, AgentSessionSpec, MemoryAgentSessionWorld},
+        Home,
+    };
+
+    let open = |conn: Connection| Arc::new(StoreHandle::new(Store::open(conn, HOME, registry().expect("registry")).expect("store")));
+    let store = open(Connection::open_in_memory().expect("SQLite"));
+    let mut sessions = Home::<AgentSession, _>::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("session home");
+    sessions.create("earlier", agent_session_request(), &MemoryAgentSessionWorld::default(), Timestamp(1)).expect("session");
+    drop(sessions);
+    let conn = Arc::try_unwrap(store).unwrap_or_else(|_| panic!("store still held")).into_inner().into_connection();
+    // SQLite drops no referencing column, so the earlier table is rebuilt without them.
+    let before: String = rendered(&registry().expect("registry"), "agent_session")
+        .replace("\"agent_session\" (", "\"agent_session_before\" (")
+        .lines()
+        .filter(|line| !["  \"convoy\"", "  \"vessel\"", "  \"role\""].iter().any(|column| line.starts_with(column)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    conn.execute_batch(&format!(
+        "PRAGMA foreign_keys = OFF;
+         DROP VIEW agent_session_view; DROP INDEX agent_session_by_convoy; DROP INDEX agent_session_by_vessel;
+         {before};
+         INSERT INTO agent_session_before SELECT id, version, state, state_since, channel, activity, activity_since, activity_cause, reason
+           FROM agent_session;
+         DROP TABLE agent_session; ALTER TABLE agent_session_before RENAME TO agent_session;
+         PRAGMA foreign_keys = ON;"
+    ))
+    .expect("the earlier build's table");
+
+    let mut sessions = open_home::<AgentSession>(StoreLog::new(open(conn))).expect("restored sessions");
+    assert_eq!(sessions.get("earlier").expect("kept").spec(), &AgentSessionSpec::default(), "an earlier session names no convoy");
+    let request = AgentSessionRequest { vessel: Some(Ref::new("convoy-work#2", HOME)), ..agent_session_request() };
+    sessions.create("later", request.clone(), &MemoryAgentSessionWorld::default(), Timestamp(2)).expect("a session with its convoy");
+    let spec = sessions.get("later").expect("written").spec().clone();
+    assert_eq!((spec.convoy, spec.vessel, spec.role), (Some(request.convoy), request.vessel, Some(request.role)));
+}

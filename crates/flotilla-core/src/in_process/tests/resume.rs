@@ -292,7 +292,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         TerminalAttention { state: TerminalAttentionState::Idle, as_of: clock.now(), source: TerminalAttentionSource::Hook },
     );
     // Each hook is recorded on the launch's AgentSession too, which stall judgement reads.
-    let agents = super::support::agent_sessions(&daemon);
+    let agents = super::support::agent_sessions(&daemon, &[&governor_launch, &source_launch]);
     let hook = |session: &str, activity, cause: &str| {
         agents.observe(session, activity, cause.into(), super::support::engine_at(clock.now())).expect("hook activity");
     };

@@ -174,14 +174,19 @@ fn screen_activity(state: TerminalAttentionState) -> Option<Activity> {
 }
 
 impl TerminalControllerRuntime {
-    /// Records the agent's screen-read activity on its AgentSession, named by
-    /// its launch. Another observer: its errors are logged and
-    /// never fail the terminal's own observation.
-    async fn observe_agent_screen(&self, record: &str, activity: Activity, now: chrono::DateTime<Utc>) {
+    /// Records the agent's screen-read activity on its AgentSession, created
+    /// for its role aboard its vessel if need be. Another observer: its errors
+    /// are logged and never fail the terminal's own observation.
+    async fn observe_agent_screen(&self, spec: TerminalSessionTarget<'_>, record: &str, activity: Activity, now: chrono::DateTime<Utc>) {
         let sessions = Arc::clone(self.state.daemon.message_primitives().sessions());
-        let name = record.to_owned();
+        let (reads, name, role, vessel) =
+            (self.state.daemon.lifecycle_reads(), record.to_owned(), spec.role.clone(), spec.vessel_ref.map(str::to_owned));
         let now = flotilla_schema::Timestamp::from_datetime(&now);
-        match tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || sessions.observe_screen(&name, activity, now))).await {
+        let observe = move || {
+            sessions.ensure_crew(&name, reads.vessels()?, vessel.as_deref(), &role, now)?;
+            sessions.observe_screen(&name, activity, now)
+        };
+        match tokio::task::spawn_blocking(flotilla_schema::reads::carry(observe)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => warn!(session = %record, %error, "failed to record agent session activity from its screen"),
             Err(error) => warn!(session = %record, %error, "agent session screen observation did not finish"),
@@ -716,8 +721,8 @@ impl TerminalControllerRuntime {
         let adapter = self.adapter_for_spec(spec).await?;
         let now = flotilla_resources::clock::now();
         let Some((observation, agent)) = read_terminal_screen(&*pool, adapter.as_deref(), session_id, now).await? else { return Ok(None) };
-        if let (Some(record), Some(activity)) = (spec.record, agent.and_then(screen_activity)) {
-            self.observe_agent_screen(record, activity, now).await;
+        if let (Some(record), Some(activity)) = (spec.agent_session, agent.and_then(screen_activity)) {
+            self.observe_agent_screen(spec, record, activity, now).await;
         }
         Ok(Some(observation))
     }

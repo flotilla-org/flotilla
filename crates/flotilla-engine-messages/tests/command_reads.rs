@@ -4,6 +4,7 @@
 
 use flotilla_address::Address;
 use flotilla_engine_messages::MessagePrimitives;
+use flotilla_engine_messages_testkit::agent_session_request;
 use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
 use flotilla_inbox::InboxBackend;
 use flotilla_messaging::{Intent, IntentExpectation, IntentReference};
@@ -47,7 +48,10 @@ async fn seeded(others: usize) -> (EngineMessagesHome, ResourceBackend) {
     let home = EngineMessagesHome::open("home-a", NAMESPACE, &backend);
     let primitives = home.primitives();
     let inbox: Address = "project:flotilla/role:coder".parse().expect("inbox");
-    let session = primitives.register("session-coder", Timestamp::from_datetime(&chrono::Utc::now())).await.expect("register");
+    let session = primitives
+        .register("session-coder", agent_session_request(), Timestamp::from_datetime(&chrono::Utc::now()))
+        .await
+        .expect("register");
     primitives.inbox().bind(inbox.clone(), session.clone()).await.expect("bind");
     for n in 0..others {
         let name = format!("history-{n}");

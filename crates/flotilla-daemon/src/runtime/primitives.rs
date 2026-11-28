@@ -35,13 +35,14 @@ use chrono::Utc;
 use flotilla_address::Address;
 use flotilla_engine_messages::{
     held_roles::{HeldRoles, RoutingChanges, RoutingInput, Touched},
+    session_request,
     sweep::{held_turns_superseded, OpenMessages, TurnHolds},
     view::turn_header,
     MessagePrimitives,
 };
 use flotilla_inbox::{InboxBackend, Rules};
 use flotilla_messaging::TurnHeader;
-use flotilla_resources::TerminalSession;
+use flotilla_resources::{terminal_records::agent_session_of, TerminalSession, VESSEL_REF_LABEL};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
@@ -417,19 +418,42 @@ impl MessageDelivery {
                 }
             }
             let Some(holder) = self.routing.holders().get(name) else { continue };
-            // One AgentSession per launch, named by it (#3108).
-            let Some(launch) = flotilla_resources::terminal_records::launch_of(&holder.terminal) else {
-                debug!(session = %holder.terminal.metadata.name, "a live session's view names no launch");
+            // One AgentSession per agent's launch, the one it declares (#3108, #4438).
+            let Some(agent_session) = agent_session_of(&holder.terminal) else {
+                debug!(session = %holder.terminal.metadata.name, "a live session's view declares no agent session");
                 continue;
             };
-            let consumer = match self.primitives.register(launch, now).instrument(info_span!("message_delivery.register")).await {
-                Ok(consumer) => consumer,
-                Err(error) => {
-                    // These are routed again at the next refresh, which registers them then.
-                    for name in &changed[index..] {
+            let consumer = if self.primitives.registered(agent_session) {
+                self.primitives.consumer(agent_session)
+            } else {
+                let reads = self.state.daemon.lifecycle_reads();
+                let vessel = holder.terminal.metadata.labels.get(VESSEL_REF_LABEL).cloned();
+                let role = holder.terminal.spec.role.clone();
+                // A store read: off the async workers.
+                let request = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+                    session_request(reads.vessels()?, vessel.as_deref(), &role)
+                }))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|request| request);
+                let request = match request {
+                    Ok(request) => request,
+                    Err(error) => {
+                        // Only this holder waits for its vessel; it is routed again at the next refresh.
+                        warn!(session = %agent_session, %error, "a held launch's AgentSession cannot be created yet");
                         self.routing.retry(name);
+                        continue;
                     }
-                    return Err(error);
+                };
+                match self.primitives.register(agent_session, request, now).instrument(info_span!("message_delivery.register")).await {
+                    Ok(consumer) => consumer,
+                    Err(error) => {
+                        // These are routed again at the next refresh, which registers them then.
+                        for name in &changed[index..] {
+                            self.routing.retry(name);
+                        }
+                        return Err(error);
+                    }
                 }
             };
             for inbox in &holder.inboxes {
@@ -744,7 +768,7 @@ impl MessageDelivery {
             let completed = !took_up
                 && match self.state.daemon.resource_backend().using::<TerminalSession>(&self.namespace).get(session).await {
                     Ok(terminal) => {
-                        flotilla_resources::terminal_records::launch_of(&terminal) == Some(turn.consumer.id.as_str())
+                        agent_session_of(&terminal) == Some(turn.consumer.id.as_str())
                             && terminal
                                 .status
                                 .as_ref()

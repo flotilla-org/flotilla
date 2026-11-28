@@ -1,6 +1,7 @@
 //! The storage port (#3317): the engine's Log over one Store, and receipts
 //! served from `Read::about`.
 
+use flotilla_quint_testkit::agent_session::agent_session_request;
 use std::sync::Arc;
 
 use flotilla_engine_store::{registry, MessageLog, StoreLog};
@@ -85,7 +86,7 @@ fn port_round_trips_every_message_edge_at_the_home_sequence() {
         assert_eq!(&stored(&store, message), resource);
     }
 
-    sessions.create(&session().id, (), &MemoryAgentSessionWorld::default(), Timestamp(2)).expect("session");
+    sessions.create(&session().id, agent_session_request(), &MemoryAgentSessionWorld::default(), Timestamp(2)).expect("session");
     sessions
         .apply(
             &session().id,
@@ -137,7 +138,7 @@ fn poisoned_writer_does_not_take_down_other_homes() {
     let log = MessageLog::new(store.clone());
     let mut messages = Home::<Message, MessageLog>::with_log(HOME, log.clone()).unwrap();
     let mut sessions = Home::<AgentSession, StoreLog>::with_log(HOME, log.consumers()).unwrap();
-    sessions.create("seed", (), &MemoryAgentSessionWorld::default(), Timestamp(1)).unwrap();
+    sessions.create("seed", agent_session_request(), &MemoryAgentSessionWorld::default(), Timestamp(1)).unwrap();
     let seed = sessions.get("seed").unwrap().clone();
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut locked = store.lock().unwrap();
@@ -158,7 +159,7 @@ fn poisoned_writer_does_not_take_down_other_homes() {
     messages.apply(&message, DropMessage { reason: DropReason::Undeliverable }, &world, Timestamp(50)).unwrap();
 
     // Reusing the rolled-back identity exercises the string and identity caches.
-    sessions.create("rolled-back", (), &MemoryAgentSessionWorld::default(), Timestamp(4)).unwrap();
+    sessions.create("rolled-back", agent_session_request(), &MemoryAgentSessionWorld::default(), Timestamp(4)).unwrap();
     sessions
         .apply(
             "rolled-back",

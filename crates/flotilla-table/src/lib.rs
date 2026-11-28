@@ -230,7 +230,7 @@ fn drain(
             Event::Ended => {
                 source.ended();
             }
-            Event::Failed { status, body } => return Err(refusal(status, &body)),
+            Event::Failed { status, body } => return Err(refusal(status.unwrap_or(0), &body)),
             // A message that can't be decoded is lost until the next resync; the rows stay.
             _ => {}
         }
@@ -356,6 +356,8 @@ fn listing_source(listing: &Json) -> Result<DescribedSource> {
                 ],
                 primary_key: vec!["table".into()],
                 foreign_keys: Vec::new(),
+                subject: None,
+                facets: Vec::new(),
             },
             incarnation: None,
             table: Some("tables".into()),

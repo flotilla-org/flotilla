@@ -76,9 +76,10 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
     snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+    // No nudges: the idle agent's stall escalates at once.
     snapshot.stall_nudges.insert(
         "work/coder".into(),
-        flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(3) },
+        flotilla_resources::StallNudgePolicy { max_per_episode: 0, max_refusals: None, idle_grace_seconds: Some(3) },
     );
     let idle_crew = admit_snapshot(
         &daemon,
@@ -98,7 +99,7 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
         TerminalAttention { state: TerminalAttentionState::Idle, as_of: idle_at, source: TerminalAttentionSource::Screen },
     )
     .await;
-    let agents = agent_sessions(&daemon);
+    let agents = agent_sessions(&daemon, &[&launch]);
     agents.observe_screen(&launch, Activity::Idle, engine_at(idle_at)).expect("idle activity");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(convoys.get(&idle_crew).await.expect("convoy").status.expect("status").stalled.is_none());
@@ -170,7 +171,7 @@ async fn an_agent_working_again_clears_its_stall_from_its_session_alone() {
         TerminalAttention { state: TerminalAttentionState::Idle, as_of: idle_at, source: TerminalAttentionSource::Screen },
     )
     .await;
-    let agents = agent_sessions(&daemon);
+    let agents = agent_sessions(&daemon, &[&launch]);
     agents.observe_screen(&launch, Activity::Idle, engine_at(idle_at)).expect("idle activity");
     assert!(wait_for_stall(&backend, &idle_crew, true).await.stalled.is_some());
     agents.observe_screen(&launch, Activity::Working, engine_at(Utc::now())).expect("working activity");

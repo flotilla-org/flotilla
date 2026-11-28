@@ -82,6 +82,7 @@ use crate::testkits::engine::runtime_terminals;
 use crate::testkits::engine::session_request;
 use crate::testkits::server::apply_convoy_replica_feed;
 use crate::testkits::server::seed_trusted_remote_convoy_project;
+use flotilla_engine_messages_testkit::agent_session_request;
 
 #[tokio::test(start_paused = true)]
 async fn aborting_peer_runtime_releases_connection_and_replication_owners() {
@@ -1131,6 +1132,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
         };
         // Running for twenty minutes without a turn hook.
         let launch = request_session(&daemon, &name, &spec);
+        daemon.message_primitives().sessions().ensure(&name, agent_session_request(), flotilla_schema::Timestamp(0)).expect("session");
         let started = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() - chrono::Duration::minutes(20)));
         install_engine(&daemon).terminals.ready_at(&launch, &name, &facts, started);
         let store = flotilla_agent::shared_in_memory_agent_state_store();
@@ -5983,7 +5985,7 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
     let service = daemon.decided_store();
     let home = daemon.node_id().as_str().to_owned();
     let primitives = daemon.message_primitives();
-    primitives.sessions().ensure("other-session", flotilla_schema::Timestamp(0)).unwrap();
+    primitives.sessions().ensure("other-session", agent_session_request(), flotilla_schema::Timestamp(0)).unwrap();
     let other = primitives.sessions().get("other-session").unwrap();
     for harness_name in ["claude-code", "codex"] {
         for http in [false, true] {
@@ -5993,12 +5995,13 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
             let spec = TerminalSessionSpec {
                 env_ref: "host-direct".into(),
                 role: "coder".into(),
-                source: TerminalSessionSource::Tool { command: harness_name.into() },
+                source: hooked_agent(),
                 cwd: "/repo".into(),
                 env: Default::default(),
                 pool: "test".into(),
             };
             let launch = run_session(&daemon, &name, &spec, &Default::default());
+            primitives.sessions().ensure(&launch, agent_session_request(), flotilla_schema::Timestamp(0)).unwrap();
             let router = HttpRouter::for_daemon(
                 Arc::clone(&daemon),
                 Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))),
@@ -6093,6 +6096,15 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
 }
 
 /// A daemon whose session `agent` runs, and the launch its AgentSession is named by.
+/// An agent's launch source, for hook tests that create its AgentSession themselves.
+fn hooked_agent() -> TerminalSessionSource {
+    TerminalSessionSource::Agent {
+        selector: Selector::for_capability("coding"),
+        brief: TerminalBrief { artifact_digest: None, path: ".flotilla/briefs/coder.md".into(), content: "fix".into(), copies: Vec::new() },
+        context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: String::new(), vessel_ref: String::new() }),
+    }
+}
+
 async fn activity_failure_test_daemon(
 ) -> (tempfile::TempDir, Arc<InProcessDaemon>, Arc<flotilla_engine_messages::MessagePrimitives>, String) {
     let (tmp, daemon) = empty_daemon().await;
@@ -6100,7 +6112,7 @@ async fn activity_failure_test_daemon(
     let spec = TerminalSessionSpec {
         env_ref: "host-direct".into(),
         role: "coder".into(),
-        source: TerminalSessionSource::Tool { command: "agent".into() },
+        source: hooked_agent(),
         cwd: "/repo".into(),
         env: Default::default(),
         pool: "test".into(),
@@ -6120,7 +6132,7 @@ async fn agent_activity_store_failure_preserves_legacy_attention() {
         Resource,
     };
     let (_tmp, daemon, primitives, launch) = activity_failure_test_daemon().await;
-    primitives.sessions().ensure(&launch, Timestamp(0)).unwrap();
+    primitives.sessions().ensure(&launch, agent_session_request(), Timestamp(0)).unwrap();
     primitives
         .service()
         .with_store(|store| {
@@ -6163,6 +6175,7 @@ async fn agent_activity_duplicates_skip_the_writer() {
     use flotilla_schema::Timestamp;
     use flotilla_state_machines::machines::agent_session::Activity;
     let (_tmp, daemon, primitives, launch) = activity_failure_test_daemon().await;
+    primitives.sessions().ensure(&launch, agent_session_request(), Timestamp(0)).unwrap();
     primitives.sessions().observe(&launch, Activity::Working, "UserPromptSubmit".into(), Timestamp(1)).unwrap();
     let before = primitives.sessions().get(&launch).unwrap();
     let mut event = AgentHookEvent::builder()

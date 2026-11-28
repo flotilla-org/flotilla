@@ -259,6 +259,7 @@ pub fn reset_or_pass(follower: &mut Follower, read: &mut Read<'_>, homes: &[Stri
 
 #[cfg(test)]
 mod tests {
+    use flotilla_quint_testkit::agent_session::agent_session_request;
     use std::sync::Arc;
 
     use flotilla_schema::{Address, Kind, Timestamp};
@@ -286,7 +287,7 @@ mod tests {
         let sender = tokio::sync::watch::channel(0u64).0;
 
         let mut sessions = Home::<AgentSession, StoreLog>::with_log(HOME, StoreLog::new(service.store())).expect("session home");
-        sessions.create("session", (), &MemoryAgentSessionWorld::default(), Timestamp(1)).expect("session");
+        sessions.create("session", agent_session_request(), &MemoryAgentSessionWorld::default(), Timestamp(1)).expect("session");
         tick(&mut watch, &sender).await.expect("pass");
         assert_eq!(*sender.borrow(), 0, "an AgentSession's entries are no Message: the pass does not tick");
 

@@ -22,7 +22,7 @@
 
 use std::marker::PhantomData;
 
-use flotilla_schema::{EdgeEvent, Stored};
+use flotilla_schema::{Described, EdgeEvent, Stored};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -37,6 +37,8 @@ pub trait LifecycleKind: 'static {
     type Request: Clone;
     /// The kind's ADR 0047 additive column defaults, as [`Machine::STORED_DEFAULTS`].
     const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = &[];
+    /// The kind's [`Machine::DESCRIBED`].
+    const DESCRIBED: &'static [Described] = &[];
     /// The policy `give_up` judges the attempts against.
     fn policy() -> AttemptPolicy {
         DEFAULT_POLICY
@@ -332,6 +334,7 @@ impl Source<Absence> for MemoryLifecycleWorld {
 impl<K: LifecycleKind> Machine for Lifecycle<K> {
     const NAME: &'static str = K::NAME;
     const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = K::STORED_DEFAULTS;
+    const DESCRIBED: &'static [Described] = K::DESCRIBED;
     type Request = K::Request;
     type Spec = K::Request;
     type State = LifecycleState;

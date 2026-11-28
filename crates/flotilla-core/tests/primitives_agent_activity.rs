@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use flotilla_engine_messages::{MessagePrimitives, HOOK_STANDS_FOR, SCREEN_CAUSE};
-use flotilla_engine_messages_testkit::Served;
+use flotilla_engine_messages_testkit::{agent_session_request, Served};
 use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::SystemClock;
 use flotilla_schema::Timestamp;
@@ -15,12 +15,17 @@ use flotilla_state_machines::machines::agent_session::Activity;
 
 const HOME: &str = "home-a";
 
-fn primitives(dir: &tempfile::TempDir) -> Served<MessagePrimitives> {
+/// A home's Message path whose `sessions` are registered.
+fn primitives(dir: &tempfile::TempDir, sessions: &[&str]) -> Served<MessagePrimitives> {
     let service = Arc::new(
         Service::open(&dir.path().join("decided.sqlite"), HOME, flotilla_engine_store::registry().expect("registry")).expect("store"),
     );
     let home = EngineBackend::open(HOME);
-    Served::holding(MessagePrimitives::open(HOME, service, home.backend.clone(), Arc::new(SystemClock)).expect("primitives"), home)
+    let primitives = MessagePrimitives::open(HOME, service, home.backend.clone(), Arc::new(SystemClock)).expect("primitives");
+    for session in sessions {
+        primitives.sessions().ensure(session, agent_session_request(), at(0)).expect("session");
+    }
+    Served::holding(primitives, home)
 }
 
 fn at(seconds: i64) -> Timestamp {
@@ -36,7 +41,7 @@ fn current(primitives: &MessagePrimitives, name: &str) -> Option<(Activity, Stri
 #[test]
 fn a_screen_read_records_activity_on_a_session_no_hook_has_reported() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let primitives = primitives(&dir);
+    let primitives = primitives(&dir, &["codex"]);
     let sessions = primitives.sessions();
     assert!(sessions.observe_screen("codex", Activity::Working, at(0)).unwrap());
     assert_eq!(current(&primitives, "codex"), Some((Activity::Working, SCREEN_CAUSE.to_owned())));
@@ -49,7 +54,7 @@ fn a_screen_read_records_activity_on_a_session_no_hook_has_reported() {
 #[test]
 fn a_fresh_hook_stands_over_a_disagreeing_screen_read_except_input_and_renewed_work() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let primitives = primitives(&dir);
+    let primitives = primitives(&dir, &["agent", "other", "late"]);
     let sessions = primitives.sessions();
     let stands = HOOK_STANDS_FOR.as_secs() as i64;
 
@@ -109,6 +114,7 @@ async fn another_homes_session_is_current_until_its_home_falls_silent() {
         }
     }
 
+    writer.sessions().ensure("agent", agent_session_request(), at(0)).expect("session");
     writer.sessions().observe_screen("agent", Activity::Working, at(0)).expect("observe");
     flotilla_provisioning_testkit::replicate_home_at(&there, "home-b", &here, start);
     until_heard(&mut changes).await;

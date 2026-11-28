@@ -1,6 +1,7 @@
 //! Producers send as their fleet roles on the engine path, and a reply to a
 //! role reaches that role's inbox (#3317).
 
+use flotilla_engine_messages_testkit::agent_session_request;
 use std::sync::Arc;
 
 use flotilla_engine_messages::MessagePrimitives;
@@ -139,7 +140,8 @@ async fn a_reply_to_a_fleet_role_reaches_its_inbox() {
     assert_eq!((in_reply_to.name.as_str(), in_reply_to.home.as_str()), (original_id.as_str(), home.as_str()));
     assert_eq!(*stored.state(), MessageState::Pending);
     let inbox: flotilla_address::Address = "fleet:lab/role:nudge".parse().expect("inbox");
-    let consumer = primitives.register("fleet-nudge-handler", flotilla_schema::Timestamp(1)).await.expect("consumer");
+    let consumer =
+        primitives.register("fleet-nudge-handler", agent_session_request(), flotilla_schema::Timestamp(1)).await.expect("consumer");
     primitives.inbox().bind(inbox.clone(), consumer.clone()).await.expect("bind a handler later");
     let pending: Vec<_> = futures::TryStreamExt::try_collect(
         primitives.inbox().pending(&inbox, &consumer, &flotilla_inbox::Rules::default()).await.expect("pending"),
@@ -163,7 +165,7 @@ async fn the_sweep_reconciles_receipts_and_settles_replies_from_open_messages_on
     let record = flotilla_resources::message_record_name(CREW, "system:turn-rules", "rule@1");
     primitives.admit(&record, &turn).await.expect("turn");
     let message = engine_message(&primitives, CREW, &record).await;
-    let consumer = primitives.register("crew-session", flotilla_schema::Timestamp(1)).await.expect("consumer");
+    let consumer = primitives.register("crew-session", agent_session_request(), flotilla_schema::Timestamp(1)).await.expect("consumer");
     let inbox = primitives.inbox();
     inbox.bind(message.spec().inbox.clone(), consumer.clone()).await.expect("bind");
     // The turn was confirmed and its receipt written; its deliver never was.
@@ -597,7 +599,7 @@ async fn an_undelivered_turn_holds_delivery_for_one_hold() {
     primitives.admit(&delivered, &intent("system:nudge", other)).await.expect("admitted");
     assert!(primitives.delivery_hold(NAMESPACE, other).await.expect("read").until.is_some());
     let message = engine_message(&primitives, other, &delivered).await;
-    let consumer = primitives.register("reviewer-session", flotilla_schema::Timestamp(1)).await.expect("consumer");
+    let consumer = primitives.register("reviewer-session", agent_session_request(), flotilla_schema::Timestamp(1)).await.expect("consumer");
     let inbox = primitives.inbox();
     inbox.bind(message.spec().inbox.clone(), consumer.clone()).await.expect("bind");
     inbox.receive(&consumer, message.name(), flotilla_state_machines::Transport::Turn).await.expect("receipt");

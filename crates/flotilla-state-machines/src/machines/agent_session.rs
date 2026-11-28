@@ -12,14 +12,22 @@
 //! [`AgentSessionSpec`]: the state and the edge log as `history`, receipts
 //! among its edges.
 
-use flotilla_schema::{Stored, Timestamp};
+use flotilla_schema::{Described, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     edges,
-    machines::consumer::{Consumer, ConsumerKind},
-    states, Admission, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, NoRecords, Ref, Source, Table, Transport, Version, WrongState,
+    machines::{
+        consumer::{Consumer, ConsumerKind},
+        convoy::ConvoyId,
+        vessel::Vessel,
+    },
+    states, Admission, EdgeDef, Ended, Handle, Kind, Machine, MachineDef, NoRecords, Ref, Resource, Source, Table, Transport, Version,
+    WrongState,
 };
+
+/// A vessel, at its home.
+type VesselRef = flotilla_schema::Ref<Resource<Vessel>>;
 
 /// Whether a channel to a Live session is attached (spec `Channel`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Stored)]
@@ -229,14 +237,41 @@ pub struct Observe {
     pub cause: String,
 }
 
-/// The session's name is its identity (kind code `as`).
+/// The session's name is its identity (kind code `as`). It acts for a role of its convoy, maybe
+/// on a vessel. Identity removal checks every reference column, so each has an index.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Stored)]
-#[store(kind = "AgentSession", code = "as", state = AgentSessionState)]
-pub struct AgentSessionSpec {}
+#[store(
+    kind = "AgentSession",
+    code = "as",
+    state = AgentSessionState,
+    index(name = "by_convoy", eq(convoy), when(convoy is_some)),
+    index(name = "by_vessel", eq(vessel), when(vessel is_some))
+)]
+pub struct AgentSessionSpec {
+    /// ADR 0047: none only on a session an earlier build created.
+    pub convoy: Option<ConvoyId>,
+    pub vessel: Option<VesselRef>,
+    /// ADR 0047: none only on a session an earlier build created.
+    #[store(intern = "rl")]
+    pub role: Option<String>,
+}
+
+/// What a session is created with: every new session has its convoy and role.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSessionRequest {
+    pub convoy: ConvoyId,
+    pub role: String,
+    pub vessel: Option<VesselRef>,
+}
 
 impl Machine for AgentSession {
     const NAME: &'static str = "AgentSession";
-    type Request = ();
+    const DESCRIBED: &'static [Described] = &[
+        Described::Parent("convoy"),
+        Described::Role { column: "role", role: "caption" },
+        Described::Role { column: "activity", role: "badge" },
+    ];
+    type Request = AgentSessionRequest;
     type Spec = AgentSessionSpec;
     type State = AgentSessionState;
     type Edge = AgentSessionEdge;
@@ -300,8 +335,11 @@ impl Machine for AgentSession {
             .end(Ended, "the session has ended")
     }
 
-    fn admit(_: &mut Admission<'_, AgentSession>, _: ()) -> Result<(AgentSessionSpec, AgentSessionState), AgentSessionRefusal> {
-        Ok((AgentSessionSpec::default(), AgentSessionState::live(Channel::Detached)))
+    fn admit(
+        _: &mut Admission<'_, AgentSession>,
+        AgentSessionRequest { convoy, role, vessel }: AgentSessionRequest,
+    ) -> Result<(AgentSessionSpec, AgentSessionState), AgentSessionRefusal> {
+        Ok((AgentSessionSpec { convoy: Some(convoy), vessel, role: Some(role) }, AgentSessionState::live(Channel::Detached)))
     }
 }
 

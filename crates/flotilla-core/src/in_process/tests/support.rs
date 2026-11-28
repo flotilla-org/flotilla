@@ -1,5 +1,6 @@
 //! Shared scenario fixtures and stand-ins for credential-controller and forge I/O.
 
+use flotilla_engine_messages_testkit::agent_session_request;
 use flotilla_store_memory::engine_home_backend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -761,8 +762,9 @@ pub(super) async fn stall_test_daemon_with_clock(clock: Arc<dyn flotilla_resourc
 }
 
 /// The daemon's AgentSessions, where its harness hooks and screen reads record a crew's activity
-/// beside the TerminalSession's attention; stall judgement reads them (#3108).
-pub(super) fn agent_sessions(daemon: &InProcessDaemon) -> Arc<flotilla_engine_messages::Sessions> {
+/// beside the TerminalSession's attention; stall judgement reads them (#3108). Each of `launches`
+/// has its session, as its registration would create it.
+pub(super) fn agent_sessions(daemon: &InProcessDaemon, launches: &[impl AsRef<str>]) -> Arc<flotilla_engine_messages::Sessions> {
     let service = daemon.decided_store();
     let primitives = flotilla_engine_messages::MessagePrimitives::open(
         daemon.node_id().as_str(),
@@ -771,6 +773,9 @@ pub(super) fn agent_sessions(daemon: &InProcessDaemon) -> Arc<flotilla_engine_me
         daemon.clock_for_scenarios(),
     )
     .expect("open the AgentSessions");
+    for launch in launches {
+        primitives.sessions().ensure(launch.as_ref(), agent_session_request(), flotilla_schema::Timestamp(0)).expect("a launch's session");
+    }
     Arc::clone(primitives.sessions())
 }
 
@@ -817,7 +822,7 @@ pub(super) fn claim_crew(role: &str) -> flotilla_resources::CrewSpec {
         .build()
 }
 
-/// Session `name`, a tool running for convoy `convoy`'s `work` vessel as `role`, whose home
+/// Session `name`, an agent running for convoy `convoy`'s `work` vessel as `role`, whose home
 /// observes `attention`. Its launch.
 pub(super) async fn stall_test_session(
     engine: &flotilla_provisioning_testkit::EngineFixture,
@@ -837,7 +842,17 @@ pub(super) async fn stall_test_session(
         pool: "test".into(),
         cwd: "/tmp".into(),
         env: Default::default(),
-        source: TerminalLaunchSource::Tool { command: "test".into() },
+        source: TerminalLaunchSource::Agent {
+            capability: "code".into(),
+            adapter: None,
+            model: None,
+            brief: flotilla_resources::TerminalBrief {
+                artifact_digest: None,
+                path: "brief.md".into(),
+                content: String::new(),
+                copies: Vec::new(),
+            },
+        },
     });
     engine.terminals.ready(&launch, &format!("session-{name}"), &Default::default());
     observe_attention(engine, &launch, attention);

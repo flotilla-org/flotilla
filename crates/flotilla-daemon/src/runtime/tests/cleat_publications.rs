@@ -150,6 +150,7 @@ pub(super) fn launch(number: u64, environment: &str, root: &Path, daemon: &str) 
         since: Utc::now(),
         reading: LifecycleReading::Ready { identity: format!("terminal-work-coder-{number}") },
         facts: Some(TerminalLaunchFacts { endpoint: Some((root.display().to_string(), daemon.into())), ..Default::default() }),
+        agent_session: None,
     }
 }
 

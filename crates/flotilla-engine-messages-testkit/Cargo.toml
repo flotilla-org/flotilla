@@ -11,6 +11,7 @@ flotilla-engine-messages = { path = "../flotilla-engine-messages" }
 flotilla-engine-store = { path = "../flotilla-engine-store" }
 flotilla-inbox = { path = "../flotilla-inbox" }
 flotilla-messaging = { path = "../flotilla-messaging" }
+flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-schema = { path = "../flotilla-schema" }
 flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }

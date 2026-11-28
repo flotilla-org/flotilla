@@ -1,6 +1,6 @@
 //! Environment: where crews and tools run, realised by one provider instance.
 
-use flotilla_schema::{Address, Frozen, Ref, Stored};
+use flotilla_schema::{Address, Described, Frozen, Ref, Stored};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
     Resource,
@@ -15,6 +15,8 @@ pub struct EnvironmentKind;
 impl LifecycleKind for EnvironmentKind {
     const NAME: &'static str = "Environment";
     type Request = EnvironmentRequest;
+    // The sandbox an agent works in badges it.
+    const DESCRIBED: &'static [Described] = &[Described::Role { column: "provider", role: "badge" }];
 }
 
 /// The Environment machine: the shared lifecycle over its request.
